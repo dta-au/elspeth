@@ -85,7 +85,18 @@ def test_reply_only_history_preserves_attribution_and_echo_check_needs_internal_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "final_kind",
-    ["text", "tools", "timeout", "expired", "advisor_block", "protocol_echo", "protocol_echo_advisor_block", "quoted_json", "quoted_log", "inspected_text"],
+    [
+        "text",
+        "tools",
+        "timeout",
+        "expired",
+        "advisor_block",
+        "protocol_echo",
+        "protocol_echo_advisor_block",
+        "quoted_json",
+        "quoted_log",
+        "inspected_text",
+    ],
 )
 async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytest.MonkeyPatch, final_kind: str) -> None:
     settings = _make_settings(composer_max_discovery_turns=1)

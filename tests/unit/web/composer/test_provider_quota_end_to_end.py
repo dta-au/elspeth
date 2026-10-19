@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 import dataclasses
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Iterator
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -356,6 +356,7 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
     dispatches: list[str] = []
     messages = [{"role": "user", "content": "Build the requested pipeline."}]
     provider_error = APIError(status_code=500, message="provider failed", llm_provider="test", model="test/planner")
+    budget = _budget()
 
     async def provider() -> None:
         # Deliberately below the physical gateway. No LiteLLM/guard callback is patched.
@@ -377,7 +378,9 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
     def fail_first_sql(conn, **kwargs):
         drafts = kwargs["drafts"]
         assert [draft.tool_calls[0]["_kind"] for draft in drafts] == [
-            "llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND, DIAGNOSTIC_EVIDENCE_KIND,
+            "llm_call_audit",
+            DIAGNOSTIC_EVIDENCE_KIND,
+            DIAGNOSTIC_EVIDENCE_KIND,
         ]
         assert all(draft.role == "audit" and len(draft.tool_calls) == 1 for draft in drafts)
         assert dispatches == ["sent"]
@@ -407,13 +410,25 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
             except APIError as original:
                 assert original is provider_error
                 assert provider_attempt_needs_terminal_audit()
-                recorder.record_llm_call(build_llm_call_record(
-                    model_requested="test/planner", messages=messages, tools=None,
-                    status=ComposerLLMCallStatus.API_ERROR, started_at=started_at, started_ns=started_ns,
-                    temperature=None, seed=None, error_class="APIError", error_message="provider failed",
-                    planner_call_ordinal=ordinal, failure=original,
-                    private_request=capture_provider_context(messages=messages, tools=None),
-                ))
+                recorder.record_llm_call(
+                    build_llm_call_record(
+                        model_requested="test/planner",
+                        messages=messages,
+                        tools=None,
+                        status=ComposerLLMCallStatus.API_ERROR,
+                        started_at=started_at,
+                        started_ns=started_ns,
+                        temperature=None,
+                        seed=None,
+                        error_class="APIError",
+                        error_message="provider failed",
+                        max_completion_tokens_requested=budget.max_completion_tokens,
+                        planner_policy_hash=budget.audit_hash,
+                        planner_call_ordinal=ordinal,
+                        failure=original,
+                        private_request=capture_provider_context(messages=messages, tools=None),
+                    )
+                )
                 if ordinal == 2:
                     raise
 

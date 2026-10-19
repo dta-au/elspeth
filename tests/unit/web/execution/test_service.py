@@ -4222,9 +4222,7 @@ class TestBlobOwnership:
         ]
         assert str(other_session_id) not in str(exc_info.value)
 
-        blob_service.get_blob.assert_awaited_once_with(
-            UUID(blob_ref), session_operation_context=authority.calls[0][1]
-        )
+        blob_service.get_blob.assert_awaited_once_with(UUID(blob_ref), session_operation_context=authority.calls[0][1])
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
         blob_service.link_blob_to_run.assert_not_called()
         # Critical: create_run was never called (rejected before run creation)

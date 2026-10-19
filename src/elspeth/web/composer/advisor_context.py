@@ -45,6 +45,8 @@ _ADVISOR_CHECKPOINT_SYSTEM_INSTRUCTIONS: Final[str] = (
     "steps contains step ids from the pipeline excerpt.\n"
     "- findings gives the composer a precise technical repair. A FLAGGED finding must be nonempty. "
     "note is a plain explanation for the user: name the step and option, never quote user text or row data.\n"
+    "- Name the unmet behavior. Give exact option values or tool arguments only when supplied current contracts support them; "
+    "otherwise name the schema or assistance to inspect. Never invent a repair setting.\n"
     "- For CLEAN, steps must be empty and note must be null.\n"
     "- This is advisory review, not authority to change the pipeline. Be specific and brief: under 250 words."
 )
@@ -237,7 +239,21 @@ def build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
 class AdvisorSummaryParts:
     """Semantic summary units retained only by the deterministic producer."""
 
-    values: tuple[str, ...]
+    values: tuple[PromptGuardContentPart, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.values) is not tuple or any(
+            type(value) is not PromptGuardContentPart or value.trust is not None for value in self.values
+        ):
+            raise InvariantError("Advisor summary requires owned untrusted semantic units")
+
+
+def _prefix_advisor_summary_part(part: PromptGuardContentPart, prefix: str) -> PromptGuardContentPart:
+    """Keep owned framing on both projections without decoding authored text."""
+    return PromptGuardContentPart(
+        prefix + part.text,
+        inspection_text=prefix + part.inspection_text if part.inspection_text is not None else None,
+    )
 
 
 def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSummaryParts:
@@ -248,20 +264,20 @@ def advisor_summary_parts(state: CompositionState, published: str) -> AdvisorSum
     selects, clips or withholds another byte.
     """
     remaining = published
-    selected: list[str] = []
+    selected: list[PromptGuardContentPart] = []
     units = (
-        ("\n" if section_index and part_index == 0 else "") + part
+        _prefix_advisor_summary_part(part, "\n" if section_index and part_index == 0 else "")
         for section_index, section in enumerate(_pipeline_advisor_summary_units(state))
         for part_index, part in enumerate(section)
     )
     for unit in units:
-        if not remaining.startswith(unit):
+        if not remaining.startswith(unit.text):
             break
         selected.append(unit)
-        remaining = remaining[len(unit) :]
+        remaining = remaining[len(unit.text) :]
     if remaining:
-        selected.append(remaining)
-    if "".join(selected) != published:
+        selected.append(PromptGuardContentPart(remaining))
+    if "".join(part.text for part in selected) != published:
         raise InvariantError("Advisor summary parts changed published evidence")
     return AdvisorSummaryParts(tuple(selected))
 
@@ -309,7 +325,14 @@ def advisor_user_content_parts(arguments: Mapping[str, Any]) -> tuple[PromptGuar
             replacements[index] = (
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_HEADER + "\n" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n"),
                 *(
-                    PromptGuardContentPart(_neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value)))
+                    PromptGuardContentPart(
+                        _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value.text)),
+                        inspection_text=(
+                            _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(value.inspection_text))
+                            if value.inspection_text is not None
+                            else None
+                        ),
+                    )
                     for value in summary.values
                 ),
                 PromptGuardContentPart("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END),
@@ -393,6 +416,10 @@ _ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
         "feature_types",
         "region",
         "collision_policy",
+        "require_all_rows",
+        "include_audit_context",
+        "include_error_reason",
+        "include_disposition_reason",
     }
 )
 # Generic field-contract keys evolve with the plugin catalog. Render their
@@ -751,7 +778,7 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
     return rendered
 
 
-def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[str, ...], ...]:
+def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[PromptGuardContentPart, ...], ...]:
     """Render pipeline display sections with their owned evidence boundaries.
 
     Produces descriptive text the advisor can reason about for BOTH halves of
@@ -776,69 +803,82 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[str,
     empty->non-empty transition, so ``source``/``nodes``/``outputs`` may each
     be missing. Missing pieces are reported plainly; nothing is fabricated.
     """
-    lines: list[tuple[str, ...]] = []
+    lines: list[tuple[PromptGuardContentPart, ...]] = []
 
     if state.metadata.name:
-        lines.append((f"Pipeline: {state.metadata.name}",))
+        lines.append((PromptGuardContentPart(f"Pipeline: {state.metadata.name}"),))
     if state.metadata.description:
-        lines.append((f"Intent (stated): {state.metadata.description}",))
+        lines.append((PromptGuardContentPart(f"Intent (stated): {state.metadata.description}"),))
 
     # Sources.
     if not state.sources:
-        lines.append(("Source: (none set)",))
+        lines.append((PromptGuardContentPart("Source: (none set)"),))
     else:
         for source_name, source in state.sources.items():
             label = "Source" if source_name == "source" else f"Source '{source_name}'"
             lines.append(
                 (
-                    f"{label}: plugin={source.plugin} -> '{source.on_success}' "
-                    f"on_validation_failure={source.on_validation_failure} [",
+                    PromptGuardContentPart(
+                        f"{label}: plugin={source.plugin} -> '{source.on_success}' on_validation_failure={source.on_validation_failure} ["
+                    ),
                     *_render_options_for_advisor_parts(source.options),
-                    "]",
+                    PromptGuardContentPart("]"),
                 )
             )
 
     # Nodes (topology + control flow + per-node field contract).
     if not state.nodes:
-        lines.append(("Nodes: (none)",))
+        lines.append((PromptGuardContentPart("Nodes: (none)"),))
     else:
-        lines.append(("Nodes:",))
+        lines.append((PromptGuardContentPart("Nodes:"),))
         for node in state.nodes:
             plugin = node.plugin if node.plugin is not None else "-"
             on_success = node.on_success if node.on_success is not None else "-"
             required = _node_required_input_fields(node)
-            required_parts = tuple((", " if index else "") + field for index, field in enumerate(required)) or ("(none declared)",)
+            required_parts = tuple(PromptGuardContentPart((", " if index else "") + field) for index, field in enumerate(required)) or (
+                PromptGuardContentPart("(none declared)"),
+            )
             control = _render_node_control_flow(node)
             control_suffix = f" {control}" if control else ""
             # LLM nodes get a length-independent degeneracy signal: which row
             # fields their prompt interpolates (or NONE). An LLM node is a
             # transform whose plugin is ``llm`` (node_type is never "llm").
             is_llm = node.plugin == "llm"
-            interpolation_parts = (" [", *_render_interpolated_row_fields_parts(node), "]") if is_llm else ()
+            interpolation_parts = (
+                (
+                    PromptGuardContentPart(" ["),
+                    *(PromptGuardContentPart(part) for part in _render_interpolated_row_fields_parts(node)),
+                    PromptGuardContentPart("]"),
+                )
+                if is_llm
+                else ()
+            )
             lines.append(
                 (
-                    f"  - {node.id}: type={node.node_type} plugin={plugin} "
-                    f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}{control_suffix} "
-                    "[requires: ",
+                    PromptGuardContentPart(
+                        f"  - {node.id}: type={node.node_type} plugin={plugin} "
+                        f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}{control_suffix} "
+                        "[requires: "
+                    ),
                     *required_parts,
-                    "] [",
+                    PromptGuardContentPart("] ["),
                     *_render_options_for_advisor_parts(node.options),
-                    "]",
+                    PromptGuardContentPart("]"),
                     *interpolation_parts,
                 )
             )
 
     # Sinks.
     if not state.outputs:
-        lines.append(("Sinks: (none)",))
+        lines.append((PromptGuardContentPart("Sinks: (none)"),))
     else:
-        lines.append(("Sinks:",))
+        lines.append((PromptGuardContentPart("Sinks:"),))
         for output in state.outputs:
             lines.append(
                 (
-                    f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} [",
+                    PromptGuardContentPart(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} ["),
                     *_render_options_for_advisor_parts(output.options),
-                    "]",
+                    PromptGuardContentPart("]"),
                 )
             )
 
@@ -847,7 +887,7 @@ def _pipeline_advisor_summary_units(state: CompositionState) -> tuple[tuple[str,
 
 def _pipeline_advisor_summary_sections(state: CompositionState) -> tuple[str, ...]:
     """Preserve each existing display section's exact rendered text."""
-    return tuple("".join(parts) for parts in _pipeline_advisor_summary_units(state))
+    return tuple("".join(part.text for part in parts) for parts in _pipeline_advisor_summary_units(state))
 
 
 def summarize_pipeline_for_advisor(state: CompositionState) -> str:
@@ -894,7 +934,7 @@ def _render_node_control_flow(node: NodeSpec) -> str:
     return " ".join(f"{label}={truncate_advisor_text(value)}" for label, _evidence_label, value in _advisor_control_flow_fields(node))
 
 
-def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[str, ...]:
+def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[PromptGuardContentPart, ...]:
     """Retain complete rendered option/query values with their owned separators.
 
     The schema key is parsed into an ELSPETH-owned closed structural projection;
@@ -903,8 +943,8 @@ def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[str, 
     with its value withheld. Never raises.
     """
     if not options:
-        return ("no options",)
-    value_parts: list[str] = []
+        return (PromptGuardContentPart("no options"),)
+    value_parts: list[PromptGuardContentPart] = []
     name_only: list[str] = []
     for key in sorted(options.keys()):
         if _advisor_summary_renders_option_value(key):
@@ -921,9 +961,14 @@ def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[str, 
                 for query_key, text, prose_shaped in expansion:
                     if prose_shaped:
                         rendered = truncate_advisor_text(text, _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS)
-                        value_parts.append(f"{query_key}_untrusted_json={json.dumps(rendered)}")
+                        value_parts.append(
+                            PromptGuardContentPart(
+                                f"{query_key}_untrusted_json={json.dumps(rendered)}",
+                                inspection_text=f'{query_key}_untrusted_json="{rendered}"',
+                            )
+                        )
                     else:
-                        value_parts.append(f"{query_key}={truncate_advisor_text(text)}")
+                        value_parts.append(PromptGuardContentPart(f"{query_key}={truncate_advisor_text(text)}"))
                 continue
             if key == "schema":
                 rendered = _render_schema_for_advisor(options[key])
@@ -934,22 +979,27 @@ def _render_options_for_advisor_parts(options: Mapping[str, Any]) -> tuple[str, 
                 limit = _ADVISOR_SUMMARY_VALUE_MAX_CHARS
                 rendered = truncate_advisor_text(str(options[key]), limit)
             if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
-                value_parts.append(f"{key}_untrusted_json={json.dumps(rendered)}")
+                value_parts.append(
+                    PromptGuardContentPart(
+                        f"{key}_untrusted_json={json.dumps(rendered)}",
+                        inspection_text=f'{key}_untrusted_json="{rendered}"',
+                    )
+                )
             else:
-                value_parts.append(f"{key}={rendered}")
+                value_parts.append(PromptGuardContentPart(f"{key}={rendered}"))
         else:
             name_only.append(key)
-    segments: list[str] = []
+    segments: list[PromptGuardContentPart] = []
     for index, value in enumerate(value_parts):
-        segments.append((", " if index else "options: ") + value)
+        segments.append(_prefix_advisor_summary_part(value, ", " if index else "options: "))
     if name_only:
-        segments.append(("; " if value_parts else "") + "values withheld: " + ", ".join(name_only))
+        segments.append(PromptGuardContentPart(("; " if value_parts else "") + "values withheld: " + ", ".join(name_only)))
     return tuple(segments)
 
 
 def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
     """Preserve the public descriptive text while retaining producer boundaries."""
-    return "".join(_render_options_for_advisor_parts(options))
+    return "".join(part.text for part in _render_options_for_advisor_parts(options))
 
 
 def truncate_advisor_text(value: str, limit: int = _ADVISOR_SUMMARY_VALUE_MAX_CHARS) -> str:

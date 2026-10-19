@@ -108,9 +108,17 @@ def test_complete_source_admission_retains_each_rejected_identity_before_writer_
         "discard",
     )
     sinks = {"summary": as_sink(summary), "detail": as_sink(detail), "failed_rows": as_sink(retention)}
-    fork = GateSettings(name="publish", input="checked", condition="True", routes={"true": "fork", "false": "summary"}, fork_to=["summary", "detail"])
+    fork = GateSettings(
+        name="publish", input="checked", condition="True", routes={"true": "fork", "false": "summary"}, fork_to=["summary", "detail"]
+    )
     settings = AggregationSettings(
-        name="compare", plugin=annotator.name, input="batch_in", on_success="annotated", on_error="discard", trigger=TriggerConfig(), output_mode="passthrough"
+        name="compare",
+        plugin=annotator.name,
+        input="batch_in",
+        on_success="annotated",
+        on_error="discard",
+        trigger=TriggerConfig(),
+        output_mode="passthrough",
     )
     graph = ExecutionGraph.from_plugin_instances(
         sources={"primary": as_source(source)},
@@ -123,18 +131,30 @@ def test_complete_source_admission_retains_each_rejected_identity_before_writer_
     aggregation_id = graph.get_aggregation_id_map()[AggregationName("compare")]
     annotator.node_id = aggregation_id
     config = PipelineConfig(
-        sources={"primary": as_source(source)}, transforms=[as_transform(writer), as_transform(annotator)], sinks=sinks, gates=[fork], aggregation_settings={aggregation_id: settings}
+        sources={"primary": as_source(source)},
+        transforms=[as_transform(writer), as_transform(annotator)],
+        sinks=sinks,
+        gates=[fork],
+        aggregation_settings={aggregation_id: settings},
     )
     body = {
-        "id": "completion-admission", "object": "chat.completion", "created": 1700000000, "model": "openai/gpt-4.1-mini",
+        "id": "completion-admission",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "openai/gpt-4.1-mini",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps({"answer": "accepted"})}, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
     }
-    review = {**body, "choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps({"admit": True})}, "finish_reason": "stop"}]}
+    review = {
+        **body,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": json.dumps({"admit": True})}, "finish_reason": "stop"}],
+    }
     db = make_landscape_db()
     try:
         with respx.mock(assert_all_mocked=True) as router:
-            request = router.post("https://openrouter.ai/api/v1/chat/completions").mock(side_effect=[httpx.Response(200, json=value) for value in (body, body, review)])
+            request = router.post("https://openrouter.ai/api/v1/chat/completions").mock(
+                side_effect=[httpx.Response(200, json=value) for value in (body, body, review)]
+            )
             result = Orchestrator(db).run(config, graph=graph, payload_store=payload_store)
             assert request.call_count == 3  # Startup preflight, admitted writer, admitted reviewer.
             requests = [json.loads(call.request.content) for call in request.calls]
@@ -170,8 +190,12 @@ def test_complete_source_admission_retains_each_rejected_identity_before_writer_
             assert record["run_id"] == result.run_id and record["path"] == "on_error_routed"
             assert "complete_source_admitted" in record["error_reason"] and "input_check_false" in record["error_reason"]
         with db.engine.connect() as connection:
-            identities = connection.execute(select(rows_table.c.row_id, rows_table.c.source_row_index).where(rows_table.c.run_id == result.run_id)).all()
-            calls = connection.execute(select(calls_table.c.call_type).join(node_states_table).where(node_states_table.c.run_id == result.run_id)).all()
+            identities = connection.execute(
+                select(rows_table.c.row_id, rows_table.c.source_row_index).where(rows_table.c.run_id == result.run_id)
+            ).all()
+            calls = connection.execute(
+                select(calls_table.c.call_type).join(node_states_table).where(node_states_table.c.run_id == result.run_id)
+            ).all()
         by_id = dict(identities)
         assert {by_id[record["row_id"]] for record in retained} == {0, 2, 3, 4}
         assert sorted(call.call_type for call in calls) == ["http", "http", "llm", "llm"]

@@ -148,6 +148,7 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(
     import json
     from dataclasses import replace
     from uuid import UUID
+
     from sqlalchemy import event
 
     from elspeth.contracts.errors import ComposerOwnedSettlementFailure

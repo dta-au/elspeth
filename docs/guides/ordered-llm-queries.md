@@ -105,6 +105,44 @@ sink's `row_json` retains them. The error text itself names the failed check.
 Omitted/null checks preserve existing behavior; each supplied input/result list
 independently requires 1–64 uniquely named checks.
 
+For complete-source duplicate admission, 0.8.9 provides the deterministic
+`batch_duplicate_annotator` aggregation. Omit its trigger or use `{}`, and use
+`output_mode: passthrough` to keep the original member tokens. Each named rule
+compares all selected canonical fields together across the complete source,
+including different fields in the same row. Comparison requires actual strings
+and preserves case, whitespace and Unicode spelling. For example:
+
+```yaml
+rules:
+  - name: repeated_text
+    cells:
+      - {field: first_text}
+      - {field: second_text, when: "row['second_assessed']"}
+output_prefix: duplicates
+```
+
+These are plugin options alongside `schema: {mode: observed}`. Each cell's
+optional `when` must evaluate to an actual Boolean using literal row-field
+keys. False exempts valid text. Missing/non-string comparison data or invalid
+eligibility marks only that member invalid; other cells still participate.
+Every member continues once, in order, with `duplicates_valid` and
+`duplicates_causes` (a JSON string containing every static rule/field/category
+cause). No text values are copied into causes and no survivor is selected.
+Use `row['duplicates_valid']` in the downstream writer's `input_checks`, and
+retain its entry row in the required error sink. The detailed cause list stays
+in `row_json`; the readable error text names the failed admission check.
+
+This mechanism requires a finite serial flow with one member per source case,
+before report writing, expansion or branching. It does not prove completeness
+across partitions, append operations or separate runs. Early count, timeout
+and condition triggers are refused before intake. Explicit typed/required batch
+schemas retain their normal whole-batch failure behavior; use a nonrestrictive
+schema for per-member malformed-data isolation. Limits are 4096 buffered rows,
+16 rules, 256 selected cells total, 4 Mi characters inspected and 128 Ki
+characters of causes per member. Exceeding a limit refuses the complete batch;
+it never splits the comparison. These process-time limits do not bound memory
+already buffered before EOF.
+
 Single-query and multi-query LLM transforms support optional `result_checks`.
 Each named expression evaluates the actual completed output row, after typed
 extraction and after all queries finish, before downstream release:

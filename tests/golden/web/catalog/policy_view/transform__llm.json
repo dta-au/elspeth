@@ -18,8 +18,12 @@
     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model \u2014 don't hand-add them.",
     "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
+    "Declared inputs reject empty/whitespace strings before provider dispatch by default. For a prompt that must classify unavailable text, set allow_blank_input_fields to only the relevant required_input_fields. This preserves the original string, declared visibility, field presence and types; non-nullable nulls and other blank fields still fail. It does not generate an unavailable result or waive input/result checks.",
     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
-    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries, pool_size=1; allows exact bindings to earlier validated generated fields, never self/forward. Per-query output_fields: <queryname>_<suffix>.",
+    "Optional input_checks are named strict-Boolean expressions on the entry row, before any per-row model request. False/non-Boolean/evaluation errors route a nonretryable failure via on_error without widening prompt visibility. Operation startup preflight remains separate. Keep detailed admission causes in the incoming row for error-sink row_json retention.",
+    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries, pool_size=1; allows exact bindings to earlier validated generated fields, never self/forward. Per-query output_fields default to <queryname>_<suffix>.",
+    "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>. JSON response keys and raw/usage/model names stay unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+    "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release. Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
     "Optional chain compaction is an operator choice. Inspect all consumers, exact output names/types, rendered prompts, effective provider/profile/settings, intermediate shields/gates/mappers/branches and failure policies.",
     "For optional chain compaction, independent entry-row queries can qualify; dependent queries require ordered mode. Never promise fewer calls/tokens. Disclose changed quarantine/audit/checkpoint boundaries.",
@@ -131,8 +135,14 @@
       },
       "OutputFieldConfig": {
         "additionalProperties": false,
-        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement, and the output column's row type\n        (integer -> int, number -> float, boolean -> bool, string/enum -> str)\n    values: Required for enum type - list of allowed values",
+        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement, and the output column's row type\n        (integer -> int, number -> float, boolean -> bool, string/enum -> str)\n    values: Required for enum type - list of allowed values\n    nullable: Whether this required field also admits JSON null",
         "properties": {
+          "nullable": {
+            "default": false,
+            "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+            "title": "Nullable",
+            "type": "boolean"
+          },
           "schema": {
             "anyOf": [
               {
@@ -252,6 +262,20 @@
             "default": "standard",
             "description": "LLM response format mode (standard JSON object vs. enforced json_schema)."
           },
+          "structured_output_prefix": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+            "title": "Structured Output Prefix"
+          },
           "template": {
             "anyOf": [
               {
@@ -289,6 +313,32 @@
         ],
         "title": "ResponseFormat",
         "type": "string"
+      },
+      "ResultCheck": {
+        "additionalProperties": false,
+        "description": "One bounded, named row assertion, compiled before provider startup.",
+        "properties": {
+          "expression": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Expression",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_]*$",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "expression"
+        ],
+        "title": "ResultCheck",
+        "type": "object"
       },
       "SchemaConfig": {
         "description": "Configuration for a plugin's data schema.\n\nA schema can be either observed (accept anything, infer types from data)\nor explicit (validate against specified fields).\n\nSchema Contracts (for DAG validation):\n    - guaranteed_fields: Fields the producer GUARANTEES will exist AND are\n      part of the stable API contract. Downstream can safely depend on these.\n\n      This is a COMPLETE claim, not a partial hint, and that is the one\n      surprising thing about it. Declaring any guarantee makes the producer\n      PARTICIPATE in the effective-guarantee vote, and build-time validation\n      then holds it to exactly the set it named \u2014 so ADDING a guarantee can\n      narrow what validation accepts. An observed source that lists\n      `guaranteed_fields: [id]` while its rows also carry `colour` will be\n      REJECTED at build time by a sink requiring `colour`, even though the\n      same pipeline builds and runs with the line removed.\n\n      Declaring NOTHING is therefore a meaningful choice, not an omission:\n      a producer with no `guaranteed_fields` ABSTAINS, and sink requirements\n      are enforced per row at runtime instead. Declare the complete set to\n      get build-time enforcement; declare nothing to defer to runtime. A\n      partial declaration is the one option that buys neither.\n    - required_fields: Fields the consumer REQUIRES in input.\n    - audit_fields: Fields that exist in output but are NOT part of the\n      stability contract. These are for audit trail reconstruction and may\n      change between versions. DAG validation does NOT enforce these.\n\nFor explicit schemas (mode='fixed' or 'flexible'), the declared fields are\nimplicitly guaranteed. Use guaranteed_fields/required_fields to express\ncontracts for observed schemas that still have known field requirements.\n\nExample YAML for an observed schema with explicit contracts:\n    schema:\n      mode: observed\n      guaranteed_fields: [customer_id, timestamp]  # Producer guarantees these\n\n    schema:\n      mode: observed\n      required_fields: [customer_id, amount]  # Consumer requires these\n\n    schema:\n      mode: observed\n      guaranteed_fields: [response, response_usage]  # Stable API\n      audit_fields: [response_template_hash]  # May change between versions\n\nAttributes:\n    mode: \"fixed\" (exact fields), \"flexible\" (at least these), or \"observed\" (infer from data)\n    fields: List of FieldDefinitions, or None if observed\n    is_observed: True if schema types are inferred from data\n    guaranteed_fields: Field names the producer guarantees (for observed schemas)\n    required_fields: Field names the consumer requires (for observed schemas)\n    audit_fields: Field names that exist but are not part of stability contract",
@@ -379,6 +429,15 @@
     },
     "additionalProperties": false,
     "properties": {
+      "allow_blank_input_fields": {
+        "composer_tier": "advanced",
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "items": {
+          "type": "string"
+        },
+        "title": "Allow Blank Input Fields",
+        "type": "array"
+      },
       "image_inputs": {
         "anyOf": [
           {
@@ -397,6 +456,25 @@
         "default": null,
         "description": "Row columns to resolve as image message parts (absent = text-only)",
         "title": "Image Inputs"
+      },
+      "input_checks": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/ResultCheck"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "composer_tier": "advanced",
+        "default": null,
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "title": "Input Checks"
       },
       "lookup": {
         "anyOf": [
@@ -526,6 +604,25 @@
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "title": "Response Format"
       },
+      "result_checks": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/ResultCheck"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "composer_tier": "advanced",
+        "default": null,
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "title": "Result Checks"
+      },
       "schema": {
         "$ref": "#/$defs/SchemaConfig",
         "composer_description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
@@ -615,6 +712,13 @@
         "type": "string"
       },
       {
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "name": "allow_blank_input_fields",
+        "required": false,
+        "tier": "advanced",
+        "type": "array"
+      },
+      {
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "name": "response_format",
         "required": false,
@@ -624,6 +728,20 @@
       {
         "description": "Typed structured-output field definitions for single-prompt mode (None = unstructured response). Multi-query mode declares output_fields per query instead.",
         "name": "output_fields",
+        "required": false,
+        "tier": "advanced",
+        "type": "object"
+      },
+      {
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "name": "input_checks",
+        "required": false,
+        "tier": "advanced",
+        "type": "object"
+      },
+      {
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "name": "result_checks",
         "required": false,
         "tier": "advanced",
         "type": "object"

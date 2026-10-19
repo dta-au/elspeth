@@ -12,7 +12,9 @@ from tests.unit.plugins.llm.test_transform import _make_config, _make_ctx, _make
 @pytest.mark.parametrize("provider_name", ["azure", "openrouter", "bedrock", "gateway"])
 @pytest.mark.parametrize("mode", ["single", "sequential", "pooled", "ordered"])
 @pytest.mark.parametrize("admitted", [False, True])
-def test_input_admission_runs_before_every_strategy_without_widening_prompt_visibility(provider_name: str, mode: str, admitted: bool) -> None:
+def test_input_admission_runs_before_every_strategy_without_widening_prompt_visibility(
+    provider_name: str, mode: str, admitted: bool
+) -> None:
     options = _ordered_options() if mode == "ordered" else _make_config()
     options.update(provider=provider_name, input_checks=[{"name": "source_admitted", "expression": "row['admitted']"}])
     if provider_name != "azure":
@@ -52,7 +54,15 @@ def test_missing_or_truthy_input_cannot_start_provider_work(expression: str, err
     provider.execute_query.assert_not_called()
 
 
-@pytest.mark.parametrize("checks", [[], ({"name": "okay", "expression": "True"},), [{"name": "unsafe", "expression": "row.__class__"}], [{"name": "same", "expression": "True"}, {"name": "same", "expression": "False"}]])
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [],
+        ({"name": "okay", "expression": "True"},),
+        [{"name": "unsafe", "expression": "row.__class__"}],
+        [{"name": "same", "expression": "True"}, {"name": "same", "expression": "False"}],
+    ],
+)
 def test_input_checks_reject_unsafe_or_ambiguous_configuration(checks: object) -> None:
     with pytest.raises(PluginConfigError):
         _make_transform_with_mock_provider(_make_config(input_checks=checks))

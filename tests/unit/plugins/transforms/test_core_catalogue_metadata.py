@@ -54,12 +54,12 @@ _REQUIRED_GUIDANCE = {
     "report_assemble": (("batch", "page", "section"), ("per-row",)),
     "truncate": (("deterministic", "length"), ("token",)),
     "type_coerce": (("explicit", "type", "normal"), ("arbitrary calculation",)),
-    "value_transform": (("ordered", "expression", "pass-through"), ("filtering", "routing")),
+    "value_transform": (("ordered", "expression", "preserves arriving fields", "successful rows"), ("filtering", "routing")),
 }
 
 _VALUE_TRANSFORM_AVOID = (
-    "Row filtering or routing — value_transform never drops rows; every row passes "
-    "through with its computed fields. Use a gate node for conditional row filtering "
+    "Intentional row filtering or routing — successful rows pass through with computed fields; "
+    "expression or type failures follow on_error. Use a gate node for conditional row filtering "
     "(or keyword_filter for regex pattern blocking)."
 )
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -11,7 +12,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
+import httpx
 import pytest
+import respx
 
 from elspeth.contracts import CallType
 from elspeth.contracts.call_governance import LLMCallGovernance
@@ -428,6 +431,61 @@ def _make_llm_response(
 
 class TestExecuteQuery:
     """Tests for execute_query method."""
+
+    @respx.mock
+    def test_nullable_number_and_enum_schema_survive_the_native_sdk_wire(self, provider: AzureLLMProvider) -> None:
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "NullableAnswer",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": ["number", "null"]},
+                        "label": {"type": ["string", "null"], "enum": ["green", "blue", None]},
+                    },
+                    "required": ["score", "label"],
+                },
+            },
+        }
+        expected = json.dumps(response_format, sort_keys=True)
+        route = respx.post(
+            "https://test.openai.azure.com/openai/deployments/gpt-4o/chat/completions",
+            params={"api-version": "2024-10-21"},
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "nullable-response",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": '{"score":null,"label":null}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                },
+            )
+        )
+        try:
+            provider.execute_query(
+                [ChatMessage(role="user", content="Assess the colour.")],
+                model="gpt-4o",
+                temperature=None,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="op-1", coordination_token=_LEADER_TOKEN),
+                response_format=response_format,
+            )
+
+            assert len(route.calls) == 1
+            sent = json.loads(route.calls[0].request.content)
+            assert json.dumps(sent["response_format"], sort_keys=True) == expected
+        finally:
+            provider.close()
 
     def test_returns_llm_query_result(self, provider: AzureLLMProvider) -> None:
         client = FakeLLMClient(response=_make_llm_response())

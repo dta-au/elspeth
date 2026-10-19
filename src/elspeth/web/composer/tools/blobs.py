@@ -2120,6 +2120,7 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
         "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
         "Each complete JSON tool response, including metadata, is bounded to 4,096 UTF-8 bytes and preserves original Unicode code points. "
         "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+        "page sizes vary, so never guess later offsets or parallelize dependent pages of one blob. "
         "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
         "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
         "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "

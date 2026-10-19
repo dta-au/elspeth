@@ -602,17 +602,10 @@ def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> lis
     can sit on an error branch, so a quarantine sink stays an operator
     decision. A selection whose required bindings only exist as placeholder
     exemplars cannot be auto-wired, so that posture keeps the manual-wiring
-    mandate.
+    mandate. The common controlled-error rules retain the eligible enclosing
+    closer exception and the operator tradeoff without suggesting policy evasion.
     """
-    on_error_rule = (
-        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
-        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
-        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
-        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
-        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
-        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
-        "CLI/batch runtime), never something to author around.",
-    )
+    on_error_rule = _llm_on_error_rules(output_control=safety_plugin)
     if auto_wired:
         return [
             f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
@@ -692,9 +685,16 @@ _USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
     "model behind a profile only when the current session's served evidence supplies that binding; otherwise "
     "say the profile is operator-managed and the concrete model is not exposed here. Never infer a model or "
     "version from an alias. Operator custody exempts a profile from model-choice approval, not disclosure.",
-    "Explain the saved failure policies before asking the user to proceed. For on_error='discard', "
-    "on_validation_failure='discard', or on_write_failure='discard', identify which rows can be absent from "
-    "the output while their failure remains recorded in the audit trail. A require_all merge needs every "
+    "Explain effective saved failure policies before asking the user to proceed. Discard routing can omit rows; "
+    "inspect the selected plugin's schema and assistance before declaring a requested retention policy unsupported. "
+    "CSV require_all_rows=true makes row refusal fail preparation; on_write_failure is still required, and discard does not override it. "
+    "A route named fail is not a stop enum. "
+    "include_audit_context=true requires require_all_rows=true, observed schema, normalized/default headers and mode=write. "
+    "It retains actual run/row/token identity, outcome/path, an audit error reference and the complete carried row_json; "
+    "It synthesizes no readable business reason. Author required readable reasons only from evidence available "
+    "through a supported producer and processing path. If a failure path exposes only an audit reference, "
+    "disclose that gap; do not invent a reason or claim full retention/report compliance. "
+    "Neither option rolls back prior publications. A require_all merge needs every "
     "branch: if one branch is lost, that input has a recorded failed merge and no combined output row. "
     "Do not promise all input rows reach the CSV when those policies permit missing rows. Describe a named "
     "failure sink instead when that is the configured policy; do not claim quarantine exists when it does not.",

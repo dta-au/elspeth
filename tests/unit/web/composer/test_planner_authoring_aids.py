@@ -2177,7 +2177,10 @@ class TestRequiredModeAutoWireAids:
         # Auto-wiring cannot repair an error route — the on_error discipline stays taught.
         assert "on_error" in rendered
         assert "'discard'" in rendered
-        assert "operator decision" in rendered
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="aws_bedrock_content_safety") in rendered
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control="aws_bedrock_content_safety") in rendered
+        assert "enclosing closer" in rendered
+        assert "relax the control mode" not in rendered and "CLI/batch runtime" not in rendered
 
     def test_placeholder_dependent_direct_required_posture_keeps_the_manual_wiring_mandate(self, tmp_path: Path) -> None:
         """Review finding 1 counterpart: an alias-less selection whose required
@@ -2887,3 +2890,32 @@ def test_llm_output_contract_rules_teach_row_prefixed_per_query_variables() -> N
     assert "{{ row.<variable> }}" in rules
     assert "input_fields" in rules
     assert "bare {{ <variable> }} is rejected" in rules
+
+
+@pytest.mark.parametrize("auto_wired", [False, True])
+def test_content_safety_reuses_complete_controlled_error_contract(auto_wired: bool) -> None:
+    rules = planner_authoring_aids._content_safety_rules(safety_plugin="azure_content_safety", auto_wired=auto_wired)
+    common = planner_authoring_aids._llm_on_error_rules(output_control="azure_content_safety")
+    assert all(rule in rules for rule in common)
+    assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+    rendered = "\n".join(rules)
+    assert "enclosing closer" in rendered and "required-control coverage" in rendered
+    assert "Never relax the control or switch execution surfaces" in rendered
+    assert "relax the control mode" not in rendered and "CLI/batch runtime" not in rendered
+
+
+def test_disclosure_teaches_effective_retention_policy_and_grounded_repair() -> None:
+    view, _snapshot = _trained_view()
+    rules = build_planner_authoring_aids(view)["user_disclosure"]["rules"]
+    retention = next(rule for rule in rules if rule.startswith("Explain effective saved failure policies"))
+    assert "schema and assistance" in retention and "unsupported" in retention
+    assert "require_all_rows=true" in retention and "on_write_failure is still required" in retention
+    assert "discard does not override it" in retention and "fail is not a stop enum" in retention
+    assert "include_audit_context=true requires require_all_rows=true" in retention
+    assert "observed schema, normalized/default headers and mode=write" in retention
+    assert "actual run/row/token identity" in retention and "synthesizes no readable business reason" in retention
+    assert "Author required readable reasons only from evidence available through a supported producer and processing path" in retention
+    assert "If a failure path exposes only an audit reference, disclose that gap" in retention
+    assert "do not invent a reason or claim full retention/report compliance" in retention
+    assert "Neither option rolls back prior publications" in retention
+    assert "require_all merge needs every branch" in retention

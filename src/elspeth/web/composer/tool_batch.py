@@ -3197,7 +3197,7 @@ async def run_tool_batch(
         result_json = (
             serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
         )
-        if tool_name == "get_blob_content" and admitted_result is not None and ctx.turn_evidence is not None:
+        if tool_name in {"get_blob_content", "inspect_source"} and admitted_result is not None and ctx.turn_evidence is not None:
             ctx.turn_evidence.register_blob_page(
                 tool_call_id=tool_call.id,
                 admitted=admitted_result,

@@ -416,6 +416,9 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
     with pytest.raises(CredentialMaterialRefused) as caught:
         await provider_gateway._litellm_acompletion(
             model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
             messages=[{"role": "user", "content": "sk-" + "a" * 24}],
         )
 
@@ -437,6 +440,9 @@ async def test_serialized_state_credential_is_refused_before_provider_transport(
     with pytest.raises(CredentialMaterialRefused):
         await provider_gateway._litellm_acompletion(
             model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
             messages=[{"role": "user", "content": '{"password":"low-entropy-secret"}'}],
         )
 

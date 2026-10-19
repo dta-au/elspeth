@@ -330,7 +330,7 @@ def _tool_batch_ends_with_valid_current_preview(tool_outcomes: tuple[_ToolOutcom
 _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 
-def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: TurnEvidence | None = None) -> list[dict[str, Any]]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
     messages: list[dict[str, Any]] = []
     for historical_message in llm_messages:
@@ -356,13 +356,21 @@ def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, A
             *json_content_parts(serialized, ensure_ascii=False, sort_keys=True, string_parts=string_parts),
             PromptGuardContentPart(suffix),
         )
-        messages.append(
-            {
-                "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                "content": _REPLY_ONLY_HISTORY_PREFIX + serialized + suffix,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts,
-            }
-        )
+        quoted_role = "user" if historical_message["role"] == "tool" else historical_message["role"]
+        quoted_content = _REPLY_ONLY_HISTORY_PREFIX + serialized + suffix
+        if (
+            turn_evidence is not None
+            and wire["role"] == "tool"
+            and type(wire.get("tool_call_id")) is str
+            and type(wire.get("content")) is str
+        ):
+            turn_evidence.register_quoted_inspection(
+                tool_call_id=wire["tool_call_id"],
+                original_content=wire["content"],
+                quoted_role=quoted_role,
+                quoted_content=quoted_content,
+            )
+        messages.append({"role": quoted_role, "content": quoted_content, PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts})
     return messages
 
 
@@ -1993,7 +2001,7 @@ class ComposerServiceImpl:
                 # blocks on providers such as Bedrock Converse. Preserve each
                 # complete historical record as attributed text instead; the
                 # planning/audit history stays unchanged and no tool is enabled.
-                reply_messages = _reply_only_messages(llm_messages)
+                reply_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
                 reply_messages.append(
                     {
                         "role": "system",

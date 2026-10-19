@@ -67,8 +67,19 @@ class GuardedQuotaTurn:
         assert len({check["audit_id"] for check in checks}) == guards
         for check in checks:
             assert set(check) == {
-                "schema_version", "audit_id", "operation_id", "operation_epoch", "role", "adapter", "mode",
-                "policy_fingerprint", "request_hash", "disposition", "reason", "started_at", "duration_ms",
+                "schema_version",
+                "audit_id",
+                "operation_id",
+                "operation_epoch",
+                "role",
+                "adapter",
+                "mode",
+                "policy_fingerprint",
+                "request_hash",
+                "disposition",
+                "reason",
+                "started_at",
+                "duration_ms",
             }
             assert check["schema_version"] == 1
             assert check["operation_id"] == self.context.fence.operation_id

@@ -224,7 +224,11 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
         check = rows[0].tool_calls[0]["check"]
         assert check["operation_id"] == context.fence.operation_id and check["operation_epoch"] == context.fence.operation_epoch
         assert (check["role"], check["mode"], check["adapter"], check["disposition"], check["reason"]) == (
-            "composer", "required", "azure_prompt_shields", "allow", "clean"
+            "composer",
+            "required",
+            "azure_prompt_shields",
+            "allow",
+            "clean",
         )
         assert check["policy_fingerprint"] == client.policy_fingerprint
         if mode == "rollback":

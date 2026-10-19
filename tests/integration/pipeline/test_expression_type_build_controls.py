@@ -138,9 +138,42 @@ def test_renamed_nullable_llm_field_reaches_real_graph_contract(tmp_path: Path, 
     settings = load_settings_from_yaml_string(
         yaml.safe_dump(
             {
-                "sources": {"src": {"plugin": "csv", "on_success": "raw", "options": {"path": str(source), "schema": {"mode": "fixed", "fields": ["text: str"]}, "on_validation_failure": "discard"}}},
-                "transforms": [{"name": "writer_review", "plugin": "llm", "input": "raw", "on_success": "output", "on_error": "discard", "options": _ordered_options(prefix=prefix)}],
-                "sinks": {"output": {"plugin": "json", "on_write_failure": "discard", "options": {"path": str(tmp_path / "output.jsonl"), "schema": {"mode": "flexible", "fields": [{"name": field, "type": "int" if wrong_consumer_type else "str", "required": True, "nullable": True}]}}}},
+                "sources": {
+                    "src": {
+                        "plugin": "csv",
+                        "on_success": "raw",
+                        "options": {
+                            "path": str(source),
+                            "schema": {"mode": "fixed", "fields": ["text: str"]},
+                            "on_validation_failure": "discard",
+                        },
+                    }
+                },
+                "transforms": [
+                    {
+                        "name": "writer_review",
+                        "plugin": "llm",
+                        "input": "raw",
+                        "on_success": "output",
+                        "on_error": "discard",
+                        "options": _ordered_options(prefix=prefix),
+                    }
+                ],
+                "sinks": {
+                    "output": {
+                        "plugin": "json",
+                        "on_write_failure": "discard",
+                        "options": {
+                            "path": str(tmp_path / "output.jsonl"),
+                            "schema": {
+                                "mode": "flexible",
+                                "fields": [
+                                    {"name": field, "type": "int" if wrong_consumer_type else "str", "required": True, "nullable": True}
+                                ],
+                            },
+                        },
+                    }
+                },
             }
         )
     )
@@ -199,7 +232,10 @@ def test_scalar_helpers_prove_types_through_real_build_and_execution(tmp_path: P
                 "options": {
                     "path": str(output),
                     "format": "jsonl",
-                    "schema": {"mode": "flexible", "fields": ["prefix: int" if wrong_consumer_type else "prefix: bool", "words: int", "close: bool"]},
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["prefix: int" if wrong_consumer_type else "prefix: bool", "words: int", "close: bool"],
+                    },
                 },
             }
         },

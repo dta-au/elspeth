@@ -7,14 +7,20 @@ from types import MappingProxyType
 
 import pytest
 
-from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.chat_parts import wire_messages
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, QuerySpec
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
-from tests.unit.plugins.llm.test_transform import _make_config, _make_ctx, _make_row, _make_transform_with_mock_provider, _run_post_emission_check
+from tests.unit.plugins.llm.test_transform import (
+    _make_config,
+    _make_ctx,
+    _make_row,
+    _make_transform_with_mock_provider,
+    _run_post_emission_check,
+)
 
 
 def _response(data: object) -> LLMQueryResult:
@@ -98,8 +104,16 @@ def test_invalid_prefix_fails_before_provider_startup(prefix: object) -> None:
 @pytest.mark.parametrize("collision", ["answer", "second_llm_response", "second_llm_response_usage", "second_llm_response_model"])
 def test_any_explicit_override_refuses_all_structured_and_operational_final_collisions(collision: str) -> None:
     queries = {
-        "first": {"input_fields": {"text": "text"}, "structured_output_prefix": "", "output_fields": [{"suffix": collision, "type": "string"}]},
-        "second": {"input_fields": {"text": "text"}, "structured_output_prefix": "", "output_fields": [{"suffix": "answer", "type": "string"}]},
+        "first": {
+            "input_fields": {"text": "text"},
+            "structured_output_prefix": "",
+            "output_fields": [{"suffix": collision, "type": "string"}],
+        },
+        "second": {
+            "input_fields": {"text": "text"},
+            "structured_output_prefix": "",
+            "output_fields": [{"suffix": "answer", "type": "string"}],
+        },
     }
     with pytest.raises(PluginConfigError, match="collision"):
         LLMTransform(_make_config(queries=queries))

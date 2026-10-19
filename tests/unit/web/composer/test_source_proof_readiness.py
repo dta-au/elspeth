@@ -1303,8 +1303,7 @@ async def test_detached_source_stop_reloads_prefix_for_message_and_recompose(
     ]
     assert [check["role"] for check in checks] == ["composer", "advisor", "composer", "advisor"]
     assert all(
-        (check["adapter"], check["mode"], check["disposition"], check["reason"])
-        == ("azure_prompt_shields", "required", "allow", "clean")
+        (check["adapter"], check["mode"], check["disposition"], check["reason"]) == ("azure_prompt_shields", "required", "allow", "clean")
         for check in checks
     )
     assert checks[0]["operation_id"] == checks[1]["operation_id"]

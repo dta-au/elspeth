@@ -1212,7 +1212,9 @@ class SinkExecutor:
                 violation=violation,
             )
             raise
-        if isinstance(failsink, SinkEffectAuditContextCapability) and (failsink.requires_error_reason or failsink.requires_disposition_reason):
+        if isinstance(failsink, SinkEffectAuditContextCapability) and (
+            failsink.requires_error_reason or failsink.requires_disposition_reason
+        ):
             from elspeth.contracts.errors import SinkEffectCapabilityError
 
             raise SinkEffectCapabilityError("Readable CSV error retention lacks a durable linked-diversion cause")

@@ -2101,6 +2101,168 @@ class TestInspectSourceTool:
         with self.engine.begin() as conn:
             conn.execute(blobs_table.update().where(blobs_table.c.id == self.blob_id).values(status=status))
 
+    def _replace_blob_content(self, content: bytes, *, filename: str = "orders.csv", mime_type: str = "text/csv") -> None:
+        from elspeth.web.blobs.service import content_hash as _content_hash
+
+        self.content_bytes = content
+        self.content_hash_hex = _content_hash(content)
+        self.storage_path.write_bytes(content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                blobs_table.update()
+                .where(blobs_table.c.id == self.blob_id)
+                .values(filename=filename, mime_type=mime_type, size_bytes=len(content), content_hash=self.content_hash_hex)
+            )
+
+    @pytest.mark.parametrize(("filename", "delimiter"), [("orders.csv", ","), ("orders.tsv", "\t")])
+    def test_explicit_encoding_resolves_bom_runtime_headers(self, filename: str, delimiter: str) -> None:
+        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+        content = (f"Case study{delimiter}Recorded Score\nExample{delimiter}1.5\n").encode("utf-8-sig")
+        self._replace_blob_content(content, filename=filename)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, "encoding": "UTF_8_SIG"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+        assert result.success is True
+        # Exercise the actual selected response contract and provider serializer,
+        # not a test-authored projection of the handler's result.
+        data = json.loads(serialize_admitted_discovery_result(admit_discovery_result("inspect_source", result)))["data"]
+        assert data["source_kind"] == "csv"
+        assert data["observed_headers"] == ["Case study", "Recorded Score"]
+        assert data["runtime_headers"] == ["case_study", "recorded_score"]
+        assert data["field_name_mapping"] == {"Case study": "case_study", "Recorded Score": "recorded_score"}
+        assert data["sample_row_count"] == 1
+        assert data["byte_range_inspected"] == [0, len(content)]
+        assert data["redacted_identity"]["content_hash_prefix"] == self.content_hash_hex[:8]
+        assert data["redacted_identity"]["byte_size"] == str(len(content))
+        assert any(
+            warning.startswith("csv_explicit_encoding: utf-8-sig;")
+            and "applies only to this bounded inspection" in warning
+            and "does not configure the pipeline source" in warning
+            for warning in data["warnings"]
+        )
+        assert not any(warning.startswith("csv_runtime_encoding_required:") for warning in data["warnings"])
+
+    @pytest.mark.parametrize("encoding_options", [{}, {"encoding": None}], ids=["omitted", "null"])
+    def test_bom_without_explicit_encoding_keeps_runtime_names_unresolved(self, encoding_options: dict[str, Any]) -> None:
+        self._replace_blob_content(b"\xef\xbb\xbfCase study,Recorded Score\nExample,1.5\n")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, **encoding_options},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+        assert result.success is True
+        assert tuple(result.data["observed_headers"]) == ("Case study", "Recorded Score")
+        assert result.data["runtime_headers"] is None
+        assert result.data["field_name_mapping"] is None
+        assert any(warning.startswith("csv_runtime_encoding_required:") for warning in result.data["warnings"])
+        assert not any(warning.startswith("csv_explicit_encoding:") for warning in result.data["warnings"])
+
+    @pytest.mark.parametrize("encoding", [0, True, [], "", "x" * 129], ids=["integer", "boolean", "list", "empty", "too-long"])
+    def test_encoding_argument_requires_a_bounded_string(self, encoding: object) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        with (
+            pytest.raises(ToolArgumentError, match="inspect_source arguments"),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
+            execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, "encoding": encoding},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+    @pytest.mark.parametrize(
+        "encoding", ["not-a-real-csv-codec", "base64_codec", "idna"], ids=["unknown", "non-text", "unsupported-error-mode"]
+    )
+    def test_unsupported_encoding_returns_ordinary_tool_failure(self, encoding: str) -> None:
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, "encoding": encoding},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+        assert result.success is False
+        assert result.data is None
+        assert "encoding" in result.validation.errors[0].message.lower()
+        assert encoding not in result.validation.errors[0].message
+
+    def test_explicit_encoding_does_not_reinterpret_non_csv_blob(self) -> None:
+        self._replace_blob_content(b"Ordinary notes.\n", filename="notes.txt", mime_type="text/plain")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, "encoding": "utf-8"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+        assert result.success is False
+        assert result.data is None
+        assert "csv" in result.validation.errors[0].message.lower()
+
+    def test_explicit_encoding_preserves_header_when_quoted_data_exceeds_sample(self) -> None:
+        marker = "PRIVATE-CELL-MUST-NOT-LEAK"
+        self._replace_blob_content(('Case study,Recorded Score\n"' + marker + "x" * 10_000 + '",1.5\n').encode("utf-8-sig"))
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id, "encoding": "utf-8-sig"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+
+        assert result.success is True
+        assert tuple(result.data["runtime_headers"]) == ("case_study", "recorded_score")
+        assert dict(result.data["field_name_mapping"]) == {"Case study": "case_study", "Recorded Score": "recorded_score"}
+        assert tuple(result.data["byte_range_inspected"]) == (0, 8 * 1024)
+        assert result.data["sample_row_count"] == 0
+        assert result.data["redacted_identity"]["byte_size"] == str(len(self.content_bytes))
+        assert result.data["redacted_identity"]["content_hash_prefix"] == self.content_hash_hex[:8]
+        assert any(warning.startswith("csv_sample_record_truncated:") for warning in result.data["warnings"])
+        assert marker not in json.dumps(deep_thaw(result.data))
+
     def test_returns_csv_facts_for_ready_blob(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -2254,7 +2416,10 @@ class TestInspectSourceTool:
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_inspect_source_does_not_use_unbounded_read_bytes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("encoding_options", [{}, {"encoding": "utf-8"}], ids=["default", "explicit"])
+    def test_inspect_source_does_not_use_unbounded_read_bytes(
+        self, monkeypatch: pytest.MonkeyPatch, encoding_options: dict[str, Any]
+    ) -> None:
         from elspeth.web.blobs.service import content_hash as _content_hash
         from elspeth.web.sessions.models import blobs_table
 
@@ -2279,7 +2444,7 @@ class TestInspectSourceTool:
         with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
             result = execute_tool(
                 "inspect_source",
-                {"blob_id": self.blob_id},
+                {"blob_id": self.blob_id, **encoding_options},
                 _empty_state(),
                 _mock_catalog(),
                 data_dir=str(self.data_dir),
@@ -2291,8 +2456,10 @@ class TestInspectSourceTool:
 
         assert result.success is True
         assert result.data["byte_range_inspected"][1] <= 8 * 1024
+        assert result.data["sample_row_count"] <= 100
 
-    def test_hash_mismatch_raises_blob_integrity_error(self) -> None:
+    @pytest.mark.parametrize("encoding_options", [{}, {"encoding": "utf-8"}], ids=["default", "explicit"])
+    def test_hash_mismatch_raises_blob_integrity_error(self, encoding_options: dict[str, Any]) -> None:
         """Tier-1 invariant — corrupted blob must escalate, not return facts."""
         from elspeth.web.blobs.protocol import BlobIntegrityError
 
@@ -2304,7 +2471,7 @@ class TestInspectSourceTool:
         ):
             execute_tool(
                 "inspect_source",
-                {"blob_id": self.blob_id},
+                {"blob_id": self.blob_id, **encoding_options},
                 _empty_state(),
                 _mock_catalog(),
                 data_dir=str(self.data_dir),

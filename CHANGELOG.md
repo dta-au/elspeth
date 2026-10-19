@@ -62,6 +62,10 @@ verified audit-context output.
 - **Shared-link failures preserve the requested link.** Malformed fragments and
   unavailable private sender links remain link failures rather than falling
   through to the recipient's workspace. Ordinary root-URL SSO resume is retained.
+- **The private blob-helper import boundary is narrower.** `_sync_list_blobs`
+  is no longer re-exported by `elspeth.web.composer.tools`. Its implementation
+  and internal callers remain in `elspeth.web.composer.tools.blobs`; code using
+  the private facade path must update its import.
 - **Configured container token policy is provisioned before serving.** Startup
   creates or verifies the token ceiling without activating container storage.
   Identity storage allowances remain mandatory; explicit numeric container

@@ -109,6 +109,7 @@ from elspeth.plugins.transforms.llm.multi_query import (
     QueryInputMode,
     compile_ordered_query_plan,
     resolve_queries,
+    unique_query_generated_fields,
 )
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
@@ -4496,6 +4497,8 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
         if images is not None:
             required.update(name for image in images for name in (image.field, image.format_field) if name is not None)
         response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
+        if any(spec.structured_output_prefix is not None for spec in specs):
+            unique_query_generated_fields(tuple(specs), response_field)
         node_template: str | None = TypeAdapter(str | None).validate_python(node.options.get("prompt_template"))
         # Every query without an override renders the one node-level template;
         # analyse each distinct effective template once, not once per query.

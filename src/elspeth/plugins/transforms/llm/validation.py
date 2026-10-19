@@ -50,6 +50,9 @@ def parse_field_value(
     expected, boolean where number expected, non-finite floats). Those are
     rejected, never coerced.
 
+    A present JSON null is retained only when the field explicitly permits it;
+    required-key enforcement remains in the structured-field extractor.
+
     The one conversion is a numeric spelling. JSON has one number type, so a
     provider may spell an ``integer`` as ``5.0`` or a ``number`` as ``7``.
     Each declared type is BOUND to one row type (``_OUTPUT_FIELD_TYPE_TO_SCHEMA``:
@@ -82,6 +85,8 @@ def parse_field_value(
         ``(parsed value, None)`` when valid — the value in its bound row type —
         or ``(None, error message)`` when it violates the declared type.
     """
+    if value is None and field_config.nullable:
+        return None, None
     match field_config.type:
         case OutputFieldType.STRING:
             if not isinstance(value, str):

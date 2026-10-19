@@ -13,8 +13,8 @@ from types import MappingProxyType
 import pytest
 
 import elspeth.contracts as contracts
-from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -98,11 +98,11 @@ def test_readable_disposition_preserves_legacy_identity_and_distinguishes_reason
 def test_gate_reason_cannot_create_an_error_or_change_terminal_taxonomy(pair: str) -> None:
     gate = SinkEffectGateRouteReason(text="Recorded gate route.", witness_id="a" * 64, witness_hash="b" * 64)
     outcome = TerminalOutcome.FAILURE if pair == "failure" else TerminalOutcome.SUCCESS
-    path = TerminalPath.DEFAULT_FLOW if pair == "default" else TerminalPath.ON_ERROR_ROUTED if pair == "failure" else TerminalPath.GATE_ROUTED
+    path = (
+        TerminalPath.DEFAULT_FLOW if pair == "default" else TerminalPath.ON_ERROR_ROUTED if pair == "failure" else TerminalPath.GATE_ROUTED
+    )
     with pytest.raises(ValueError):
-        SinkEffectRoutingContext(
-            outcome=outcome, path=path, error_hash=None if pair == "default" else "c" * 16, disposition_reason=gate
-        )
+        SinkEffectRoutingContext(outcome=outcome, path=path, error_hash=None if pair == "default" else "c" * 16, disposition_reason=gate)
 
 
 def test_successful_gate_context_refuses_error_witness_and_impostor() -> None:
@@ -110,7 +110,9 @@ def test_successful_gate_context_refuses_error_witness_and_impostor() -> None:
     with pytest.raises(ValueError, match="requires a source or transform failure"):
         SinkEffectRoutingContext(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None, disposition_reason=error)
     with pytest.raises(TypeError, match="exact error or gate route reason"):
-        SinkEffectRoutingContext(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None, disposition_reason=object())
+        SinkEffectRoutingContext(
+            outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None, disposition_reason=object()
+        )
 
 
 def _member(ordinal: int = 0) -> SinkEffectMember:

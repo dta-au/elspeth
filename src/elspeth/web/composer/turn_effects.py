@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Literal, cast, final
+from uuid import UUID
 
 from pydantic import JsonValue
 
@@ -17,6 +18,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.redaction import GetBlobContentDataModel
+from elspeth.web.composer.source_inspection import SourceKind, facts_from_dict
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
@@ -111,6 +113,33 @@ class _RegisteredBlobPage:
 
 @final
 @dataclass(frozen=True, slots=True)
+class _RegisteredSourceInspection:
+    """A selected inspect_source receipt, not full-file content coverage."""
+
+    tool_call_id: str
+    producer_call_id: str
+    envelope_hash: str
+    blob_id: str
+    total_size_bytes: int
+    byte_range_inspected: tuple[int, int]
+    source_kind: SourceKind
+
+
+type _RegisteredInspection = _RegisteredBlobPage | _RegisteredSourceInspection
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _QuotedInspectionProjection:
+    """One backend-produced representation of an admitted request-local result."""
+
+    owner: TurnEvidence = field(repr=False)
+    page: _RegisteredInspection
+    message_hash: str
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class BlobDeliveryAttempt:
     """A selected request, staged before dispatch and confirmed after settlement."""
 
@@ -121,7 +150,7 @@ class BlobDeliveryAttempt:
     messages_hash: str
     tools_hash: str | None
     previous_call_ids: frozenset[str]
-    pages: tuple[_RegisteredBlobPage, ...]
+    pages: tuple[_RegisteredInspection, ...]
 
 
 @final
@@ -135,9 +164,11 @@ class AdvisorPublicationReview:
     provider_payload_json: str = field(repr=False)
 
 
-def _coverage(pages: Sequence[_RegisteredBlobPage]) -> tuple[BlobInspectionCoverage, ...]:
+def _coverage(pages: Sequence[_RegisteredInspection]) -> tuple[BlobInspectionCoverage, ...]:
     series: dict[tuple[str, str, int], list[tuple[int, int]]] = {}
     for page in pages:
+        if type(page) is not _RegisteredBlobPage:
+            continue
         key = (page.blob_id, page.content_hash, page.total_chars)
         series.setdefault(key, []).append((page.start_char, page.end_char))
     result = []
@@ -214,6 +245,7 @@ class TurnEvidence:
         "_delivery_generations",
         "_historical_pages",
         "_pages",
+        "_quoted_inspections",
         "_registration_revision",
         "_retained_history",
         "effects",
@@ -252,13 +284,14 @@ class TurnEvidence:
         self._retained_history = retained_operation_context.provider_message() if retained_operation_context is not None else None
         # These metadata collections are bounded by the existing request's
         # admitted tool-call/turn limits. They retain no file content.
-        self._pages: dict[str, _RegisteredBlobPage] = {}
+        self._pages: dict[str, _RegisteredInspection] = {}
+        self._quoted_inspections: dict[str, _QuotedInspectionProjection] = {}
         self._conflicting_page_ids: set[str] = set()
         self._registration_revision = 0
         self._delivery_generations: dict[DeliveryScope, int] = {"primary": 0, "planner": 0}
-        self._current_pages: dict[DeliveryScope, tuple[_RegisteredBlobPage, ...]] = {"primary": (), "planner": ()}
+        self._current_pages: dict[DeliveryScope, tuple[_RegisteredInspection, ...]] = {"primary": (), "planner": ()}
         self._current_calls: dict[DeliveryScope, tuple[str, str] | None] = {"primary": None, "planner": None}
-        self._historical_pages: dict[str, _RegisteredBlobPage] = {}
+        self._historical_pages: dict[str, _RegisteredInspection] = {}
         initial_hash = authored_state_hash(initial_state)
         self.effects = PersistedTurnEffects(
             initial_state=initial_state,
@@ -303,26 +336,61 @@ class TurnEvidence:
         selected_content: str,
         producer_call_id: str | None,
     ) -> bool:
-        """Register admission, without claiming provider delivery or inspection."""
+        """Register bounded discovery evidence, without claiming delivery.
+
+        The legacy method name also carries inspect_source metadata. It never
+        converts that bounded structural receipt into get_blob_content coverage.
+        """
         if type(admitted) is not AdmittedDiscoveryResult:
             raise TypeError("Blob coverage requires a nominal admitted discovery result")
-        if admitted.contract is not response_contract_for("get_blob_content") or not admitted.result.success:
+        if (
+            admitted.contract is not response_contract_for("get_blob_content")
+            and admitted.contract is not response_contract_for("inspect_source")
+        ) or not admitted.result.success:
             return False
         if admitted.response is None or producer_call_id is None:
             return False
         if selected_content != serialize_admitted_discovery_result(admitted):
             raise AuditIntegrityError("Blob registration differs from the selected result envelope")
-        payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
-        page = _RegisteredBlobPage(
-            tool_call_id,
-            producer_call_id,
-            stable_hash(selected_content),
-            payload.blob_id,
-            payload.content_hash,
-            payload.total_chars,
-            payload.start_char,
-            payload.end_char,
-        )
+        page: _RegisteredInspection
+        if admitted.contract is response_contract_for("get_blob_content"):
+            payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
+            page = _RegisteredBlobPage(
+                tool_call_id,
+                producer_call_id,
+                stable_hash(selected_content),
+                payload.blob_id,
+                payload.content_hash,
+                payload.total_chars,
+                payload.start_char,
+                payload.end_char,
+            )
+        else:
+            raw_facts = admitted.response.to_wire()
+            if type(raw_facts) is not dict:
+                raise AuditIntegrityError("Source inspection changed its owned object shape")
+            facts = facts_from_dict(raw_facts)
+            identity = facts.redacted_identity
+            if "blob_id" not in identity:
+                raise AuditIntegrityError("Source inspection lost its actual blob identity")
+            if str(UUID(identity["blob_id"])) != identity["blob_id"]:
+                raise AuditIntegrityError("Source inspection blob identity is not canonical")
+            size = identity["byte_size"]
+            if not size.isascii() or not size.isdecimal():
+                raise AuditIntegrityError("Source inspection byte size is not an owned non-negative integer")
+            byte_size = int(size)
+            start, end = facts.byte_range_inspected
+            if not 0 <= start <= end <= byte_size:
+                raise AuditIntegrityError("Source inspection byte range exceeds its immutable blob")
+            page = _RegisteredSourceInspection(
+                tool_call_id,
+                producer_call_id,
+                stable_hash(selected_content),
+                identity["blob_id"],
+                byte_size,
+                facts.byte_range_inspected,
+                facts.source_kind,
+            )
         if tool_call_id in self._conflicting_page_ids:
             return False
         existing = self._pages.get(tool_call_id)
@@ -340,6 +408,26 @@ class TurnEvidence:
         self._registration_revision += 1
         return True
 
+    def register_quoted_inspection(
+        self,
+        *,
+        tool_call_id: str,
+        original_content: str,
+        quoted_role: str,
+        quoted_content: str,
+    ) -> bool:
+        """The backend converter records its exact quote, never authored prose.
+
+        The original must already be an admitted result owned by this request.
+        This does not register new inspections or parse quoted protocol text.
+        """
+        page = self._pages.get(tool_call_id)
+        if page is None or stable_hash(original_content) != page.envelope_hash or quoted_role != "user":
+            return False
+        message_hash = stable_hash({"role": quoted_role, "content": quoted_content})
+        self._quoted_inspections[message_hash] = _QuotedInspectionProjection(self, page, message_hash)
+        return True
+
     def prepare_delivery(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -352,20 +440,34 @@ class TurnEvidence:
         self._delivery_generations[scope] += 1
         self._current_pages[scope] = ()
         self._current_calls[scope] = None
-        selected: dict[str, _RegisteredBlobPage] = {}
+        selected: dict[str, _RegisteredInspection] = {}
         duplicate_ids: set[str] = set()
         seen_ids: set[str] = set()
         for message in messages:
-            if message["role"] != "tool" or "tool_call_id" not in message or "content" not in message:
-                continue
-            tool_id = message["tool_call_id"]
-            if type(tool_id) is not str:
-                continue
+            page = None
+            if message["role"] == "tool" and "tool_call_id" in message and "content" in message:
+                tool_id = message["tool_call_id"]
+                if type(tool_id) is not str:
+                    continue
+                registered = self._pages.get(tool_id)
+                if (
+                    registered is not None
+                    and type(message["content"]) is str
+                    and stable_hash(message["content"]) == registered.envelope_hash
+                ):
+                    page = registered
+            else:
+                if message["role"] != "user" or not self._quoted_inspections or "content" not in message:
+                    continue
+                projection = self._quoted_inspections.get(stable_hash({"role": message["role"], "content": message["content"]}))
+                if projection is None or projection.owner is not self or self._pages.get(projection.page.tool_call_id) != projection.page:
+                    continue
+                tool_id = projection.page.tool_call_id
+                page = projection.page
             if tool_id in seen_ids:
                 duplicate_ids.add(tool_id)
             seen_ids.add(tool_id)
-            page = self._pages.get(tool_id)
-            if page is not None and type(message["content"]) is str and stable_hash(message["content"]) == page.envelope_hash:
+            if page is not None:
                 selected[tool_id] = page
         return BlobDeliveryAttempt(
             self,
@@ -443,6 +545,51 @@ class TurnEvidence:
                 for item in coverage
             ]
 
+        def source_metadata(scope: DeliveryScope | None) -> list[JsonValue]:
+            selected = tuple(self._historical_pages.values()) if scope is None else self._current_pages[scope]
+            return [
+                {
+                    "receipt_envelope_hash": item.envelope_hash,
+                    "blob_id": item.blob_id,
+                    "total_size_bytes": item.total_size_bytes,
+                    "byte_range_inspected": list(item.byte_range_inspected),
+                    "source_kind": item.source_kind,
+                }
+                for item in sorted(selected, key=lambda item: item.tool_call_id)
+                if type(item) is _RegisteredSourceInspection
+            ]
+
+        def semantic_source_metadata(scope: DeliveryScope | None) -> list[JsonValue]:
+            selected = tuple(self._historical_pages.values()) if scope is None else self._current_pages[scope]
+            facts = {
+                (item.blob_id, item.total_size_bytes, item.byte_range_inspected, item.source_kind)
+                for item in selected
+                if type(item) is _RegisteredSourceInspection
+            }
+            return [
+                {
+                    "blob_id": blob_id,
+                    "total_size_bytes": byte_size,
+                    "byte_range_inspected": list(byte_range),
+                    "source_kind": kind,
+                }
+                for blob_id, byte_size, byte_range, kind in sorted(facts)
+            ]
+
+        current_source_metadata = source_metadata(scope)
+        historical_source_metadata = source_metadata(None)
+        source_metadata_projection: dict[str, JsonValue] = {}
+        semantic_source_metadata_projection: dict[str, JsonValue] = {}
+        if current_source_metadata or historical_source_metadata:
+            source_metadata_projection = {
+                "source_metadata_currently_available": current_source_metadata,
+                "source_metadata_historically_delivered": historical_source_metadata,
+            }
+            semantic_source_metadata_projection = {
+                "source_metadata_currently_available": semantic_source_metadata(scope),
+                "source_metadata_historically_delivered": semantic_source_metadata(None),
+            }
+
         payload = {
             "candidate_reply": candidate,
             "current_request": request,
@@ -463,6 +610,7 @@ class TurnEvidence:
                 "currently_available": inspection(scope),
                 "historically_delivered": inspection(None),
                 "semantic_equivalence_established": False,
+                **source_metadata_projection,
             },
         }
         if self._retained_history is not None:
@@ -527,6 +675,7 @@ class TurnEvidence:
                 # This separate history projection is supplied to the advisor;
                 # it never fills a gap in currently available content.
                 "historically_delivered": inspection(None),
+                **semantic_source_metadata_projection,
             }
         )
         if self._retained_history is not None:

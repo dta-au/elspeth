@@ -119,6 +119,7 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
     }
 )
 
+
 def _starts_with(value: object, prefix: object) -> bool:
     """Compare two actual strings without offsets, tuple prefixes or normalization."""
     if type(value) is not str or type(prefix) is not str:

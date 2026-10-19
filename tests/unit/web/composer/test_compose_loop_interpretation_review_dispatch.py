@@ -3846,7 +3846,9 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
                 state, session_id=str(session_id), current_state_id=str(state_id), session_operation_context=context
             )
-        assert await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id)) == ()
+        assert (
+            await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id)) == ()
+        )
     elif card_state == "missing-noop":
         monkeypatch.setattr(
             composer._interpretation_surfacing,

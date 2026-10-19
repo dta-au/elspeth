@@ -29,9 +29,9 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
-from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.model_loaders import (
     CallLoader,

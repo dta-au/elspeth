@@ -416,11 +416,17 @@ _FLAT_PIPELINE = {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": []
 async def test_compose_loop_site_records_honest_class_and_category(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     raw_arguments: str,
     error_class: str,
     category: ToolArgumentErrorCategory,
 ) -> None:
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This control owns P3/P4 classification, not physical END policy. The
+    # existing isolation helper still requires the actual publication binding.
+    monkeypatch.setattr(fake_composer_service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     llm = _raw_tool_call_llm(name=tool_name, raw_arguments=raw_arguments)
 
     result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)

@@ -26,6 +26,7 @@ EXPECTED_BATCH_TAGS = {
     "batch_data_quality_report": ("batch", "data-quality", "profiling"),
     "batch_distribution_profile": ("batch", "distribution", "narrative-summary"),
     "batch_drift_compare": ("batch", "drift", "comparison"),
+    "batch_duplicate_annotator": ("batch", "duplicates", "annotation"),
     "batch_effect_size": ("batch", "effect-size", "comparison"),
     "batch_experiment_compare": ("batch", "experiment", "comparison"),
     "batch_outlier_annotator": ("batch", "outlier", "annotation"),
@@ -64,6 +65,10 @@ _REQUIRED_GUIDANCE = {
     "batch_drift_compare": (
         ("same flushed window", "baseline", "comparison"),
         ("history", "p-value", "alert threshold", "cross-run monitoring"),
+    ),
+    "batch_duplicate_annotator": (
+        ("exact duplicate cells", "end-of-source", "every original member"),
+        ("unbounded", "cross-run", "early-flush", "survivors"),
     ),
     "batch_effect_size": (
         ("cohen's d", "hedges' g", "unpaired numeric variants"),

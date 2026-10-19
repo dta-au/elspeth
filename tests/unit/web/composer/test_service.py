@@ -9940,6 +9940,73 @@ class TestComposeLoopForcedRepair:
         assert final_review["saved_effects"]["net_changed"] is True
 
     @pytest.mark.asyncio
+    async def test_inspect_source_receipt_reaches_actual_end_after_primary_delivery(self) -> None:
+        """Exercise real dispatch, consumer audit and physical END, without direct registration."""
+        request = "Inspect my uploaded CSV and retain its source evidence for review."
+        user_message_id = _insert_user_message(self.engine, self.session_id, request)
+        stall = _make_llm_response(content="I have not inspected the source yet.")
+        inspect_and_build = _make_llm_response(
+            tool_calls=[
+                {"id": "inspect-owned-source", "name": "inspect_source", "arguments": {"blob_id": self.blob_id, "encoding": "utf-8"}},
+                *self._wire_uploaded_blob_to_output_tool_calls(),
+            ]
+        )
+        done = _make_llm_response(content="The source has been inspected and the draft is ready for review.")
+        script = _SemanticRecoveryLLMScript(
+            self.service,
+            request,
+            (stall, inspect_and_build, done),
+            phases=("primary", "end", "primary", "early", "primary", "end"),
+            first_findings="Inspect the uploaded source before reporting its measured size.",
+        )
+        with (
+            _real_semantic_recovery_sdk(script),
+            patch.object(
+                self.service._preflight,
+                "runtime_preflight",
+                return_value=ValidationResult(is_valid=True, checks=[], errors=[]),
+            ),
+        ):
+            await self.service.compose(
+                request,
+                [],
+                _empty_state(),
+                session_id=self.session_id,
+                user_id="test-user",
+                user_message_id=user_message_id,
+            )
+        script.assert_finished()
+        initial = json.loads(script.end_inputs[0].payload_json)["inspection"]
+        assert "source_metadata_currently_available" not in initial
+        inspection_messages = [
+            message
+            for message in script.primary_requests[-1]["messages"]
+            if message["role"] == "tool" and message["tool_call_id"] == "inspect-owned-source"
+        ]
+        assert len(inspection_messages) == 1
+        delivered = json.loads(inspection_messages[0]["content"])["data"]
+        assert delivered["redacted_identity"]["blob_id"] == self.blob_id
+        assert any(
+            warning.startswith("csv_explicit_encoding: utf-8;")
+            and "applies only to this bounded inspection" in warning
+            and "does not configure the pipeline source" in warning
+            for warning in delivered["warnings"]
+        )
+        inspection = json.loads(script.end_inputs[-1].provider_payload_json)["inspection"]
+        assert inspection["currently_available"] == []
+        assert inspection["historically_delivered"] == []
+        metadata = inspection["source_metadata_currently_available"]
+        assert metadata == inspection["source_metadata_historically_delivered"]
+        assert len(metadata) == 1
+        assert metadata[0]["blob_id"] == self.blob_id
+        assert metadata[0]["total_size_bytes"] == int(delivered["redacted_identity"]["byte_size"]) == self.storage_path.stat().st_size
+        assert metadata[0]["byte_range_inspected"] == delivered["byte_range_inspected"]
+        assert metadata[0]["source_kind"] == delivered["source_kind"] == "csv"
+        assert metadata[0]["receipt_envelope_hash"] == stable_hash(inspection_messages[0]["content"])
+        final_end = script.requests[-1]
+        assert script.end_inputs[-1].provider_payload_json in final_end["messages"][1]["content"]
+
+    @pytest.mark.asyncio
     async def test_unsupported_from_json_recovery_retains_authorized_fallback_build(self, tmp_path: Path) -> None:
         """Unsupported requested syntax must not strand the session in empty state.
 

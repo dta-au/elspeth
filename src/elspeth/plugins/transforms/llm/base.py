@@ -697,9 +697,10 @@ class LLMConfig(TransformDataConfig):
         The operator's type is the field's recorded declaration (ADR-050:
         operator > plugin), and every value the transform writes is checked
         against it. The transform writes each such field as one fixed type:
-        the response and model as ``str``, and each ``output_fields`` entry as
-        the type its ``type`` binds at parse (``number`` is always a ``float``,
-        ``integer`` an ``int``). A declaration that type can never satisfy
+        the response and model as ``str``, and each nonnull ``output_fields``
+        entry as the type its ``type`` binds at parse (``number`` is always a
+        ``float``, ``integer`` an ``int``). An explicitly nullable output also
+        needs an authored declaration that admits None. A declaration that type can never satisfy
         (``confidence: int`` over ``type: number``) would fail every row at
         run time with a message blaming a schema bug, so it is refused here,
         as the LLM source refuses the same contradiction. The rule is the one
@@ -722,11 +723,17 @@ class LLMConfig(TransformDataConfig):
                     f"{spec.name}_{self.response_field}", spec.structured_field_prefix, spec.output_fields or ()
                 )
             )
-        written_types = {definition.name: definition.field_type for definition in written}
+        written_by_name = {definition.name: definition for definition in written}
         for field in authored:
-            if field.name not in written_types or field.field_type == "any":
+            if field.name not in written_by_name or field.field_type == "any":
                 continue
-            written_type = written_types[field.name]
+            definition = written_by_name[field.name]
+            if definition.nullable and field.required and not field.nullable:
+                raise ValueError(
+                    f"LLM schema field {field.name!r} must admit null because its output_fields declaration is nullable; "
+                    "declare it nullable or leave it out"
+                )
+            written_type = definition.field_type
             if written_type == "any":
                 raise ValueError(
                     f"LLM schema field {field.name!r} is declared {field.field_type!r}, but this transform writes it as the "

@@ -10,14 +10,14 @@ from pathlib import Path
 import pytest
 
 from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.errors import SinkEffectCapabilityError
+from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.secret_scrub import REDACTED_SECRET_TEXT
-from elspeth.engine._error_hash import compute_error_hash
-from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-from elspeth.engine.executors.sink_error_reason import resolve_sink_error_reason
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.query_repository import QueryRepository
+from elspeth.engine._error_hash import compute_error_hash
+from elspeth.engine.executors.sink_error_reason import resolve_sink_error_reason
+from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.transforms.json_explode import JSONExplode
@@ -86,9 +86,17 @@ def test_source_quarantine_retention_writes_actual_readable_cause(tmp_path: Path
             full_message = "\u00e9" * 3000 + tail
             selected = replace(items[0], pending_error_message=full_message, pending_error_hash=compute_error_hash(full_message))
             monkeypatch.setattr(QueryRepository, "get_sink_error_handoffs", lambda *args, selected=selected, **kwargs: (selected,))
-            witness = resolve_sink_error_reason(factory, run_id=result.run_id, token_id=record["token_id"], row_id=record["row_id"],
-                sink_node_id=effects[0].sink_node_id, sink_name="failed_rows", outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.QUARANTINED_AT_SOURCE, error_hash=selected.pending_error_hash)
+            witness = resolve_sink_error_reason(
+                factory,
+                run_id=result.run_id,
+                token_id=record["token_id"],
+                row_id=record["row_id"],
+                sink_node_id=effects[0].sink_node_id,
+                sink_name="failed_rows",
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash=selected.pending_error_hash,
+            )
             assert len(witness.text) == 2048 and witness.text.endswith(" [truncated]")
             assert tail not in witness.text
             witnesses.append(witness)
@@ -101,10 +109,17 @@ def test_source_quarantine_retention_writes_actual_readable_cause(tmp_path: Path
 @pytest.mark.parametrize("corruption", ["missing", "duplicate", "message", "sink", "row", "token", "run", "hash", "path"])
 def test_required_reason_refuses_corrupt_handoff_before_publication(tmp_path: Path, payload_store, monkeypatch, corruption: str) -> None:
     target = tmp_path / "failed_rows.csv"
-    source = QuarantineSource(valid_rows=[], quarantine_rows=[({"amount": "invalid"}, "Amount must be an integer.")],
-                              quarantine_destination="failed_rows", on_validation_failure="failed_rows")
-    config = PipelineConfig(sources={"primary": as_source(source)}, transforms=[],
-                            sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))})
+    source = QuarantineSource(
+        valid_rows=[],
+        quarantine_rows=[({"amount": "invalid"}, "Amount must be an integer.")],
+        quarantine_destination="failed_rows",
+        on_validation_failure="failed_rows",
+    )
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[],
+        sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))},
+    )
     original = QueryRepository.get_sink_error_handoffs
 
     def corrupt(self, **kwargs):
@@ -150,10 +165,17 @@ def test_readable_reason_configuration_requires_audit_context(tmp_path: Path) ->
 @pytest.mark.parametrize("reason", [REDACTED_SECRET_TEXT, "{'_redaction_status': 'credential_scrub_failure'}"])
 def test_required_reason_refuses_already_redacted_cause(tmp_path: Path, payload_store, reason: str) -> None:
     target = tmp_path / "failed_rows.csv"
-    source = QuarantineSource(valid_rows=[], quarantine_rows=[({"amount": "invalid"}, reason)],
-                              quarantine_destination="failed_rows", on_validation_failure="failed_rows")
-    config = PipelineConfig(sources={"primary": as_source(source)}, transforms=[],
-                            sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))})
+    source = QuarantineSource(
+        valid_rows=[],
+        quarantine_rows=[({"amount": "invalid"}, reason)],
+        quarantine_destination="failed_rows",
+        on_validation_failure="failed_rows",
+    )
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[],
+        sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))},
+    )
     db = make_landscape_db()
     try:
         with pytest.raises(SinkEffectCapabilityError, match="unavailable under credential redaction"):
@@ -170,12 +192,16 @@ def test_source_and_transform_causes_survive_cumulative_csv_rendering(tmp_path: 
     source = QuarantineSource(
         valid_rows=[{"id": "transform-failure", "items": "not-a-list"}],
         quarantine_rows=[({"id": "source-failure", "items": None}, quarantine_reason)],
-        quarantine_destination="failed_rows", on_validation_failure="failed_rows",
+        quarantine_destination="failed_rows",
+        on_validation_failure="failed_rows",
     )
     transform = JSONExplode({"schema": {"mode": "observed"}, "array_field": "items"})
     transform.on_error = "failed_rows"
-    config = PipelineConfig(sources={"primary": as_source(source)}, transforms=[as_transform(transform)],
-                            sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))})
+    config = PipelineConfig(
+        sources={"primary": as_source(source)},
+        transforms=[as_transform(transform)],
+        sinks={"default": as_sink(CollectSink("default")), "failed_rows": as_sink(_retention(target))},
+    )
     db = make_landscape_db()
     original_query = QueryRepository.get_sink_error_handoffs
     predecessor_preimages = []
@@ -185,9 +211,11 @@ def test_source_and_transform_causes_survive_cumulative_csv_rendering(tmp_path: 
         if items and items[0].status is TokenWorkStatus.TERMINAL:
             predecessor_preimages.append(target.read_bytes())
             if corruption is not None:
-                changes = {"message": {"pending_error_message": "Different cause."},
-                           "sink": {"pending_sink_name": "foreign-sink"},
-                           "witness-id": {"work_item_id": "f" * 64}}
+                changes = {
+                    "message": {"pending_error_message": "Different cause."},
+                    "sink": {"pending_sink_name": "foreign-sink"},
+                    "witness-id": {"work_item_id": "f" * 64},
+                }
                 return (replace(items[0], **changes[corruption]),)
         return items
 

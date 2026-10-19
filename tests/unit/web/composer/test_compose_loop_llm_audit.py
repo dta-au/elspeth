@@ -465,11 +465,10 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
     assert result.message.startswith("Done.")
     assert "[ELSPETH-SYSTEM]" in result.message
     assert result.raw_assistant_content == "Done."
-    # Empty build-related prose gets one neutral repair turn. Both physical
-    # calls must retain their own request hashes and provider metadata.
-    assert mock_acomp.call_count == len(result.llm_calls) == 2
-    assert result.repair_turns_used == 1
-    assert result.llm_calls[0].messages_hash != result.llm_calls[1].messages_hash
+    # A no-tool reply without an interpretation-review failure needs no repair.
+    # Every physical call still retains its exact request and provider metadata.
+    assert mock_acomp.call_count == len(result.llm_calls) == 1
+    assert result.repair_turns_used == 0
     for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
         assert call.status is ComposerLLMCallStatus.SUCCESS
         assert call.model_requested == "openrouter/openai/gpt-5.5"
@@ -580,9 +579,15 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
         validation=ValidationSummary(is_valid=True, errors=(), warnings=(), suggestions=(), semantic_contracts=()),
         affected_nodes=(),
     )
+    responses = iter((tool_turn, final_turn))
+    requests: list[dict[str, Any]] = []
+
+    async def complete(**kwargs: Any) -> _FakeLLMResponse:
+        requests.append(deepcopy(kwargs))
+        return next(responses)
 
     with (
-        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=[tool_turn, final_turn]),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=complete) as mock_acomp,
         patch("elspeth.web.composer.tool_batch.execute_tool", return_value=tool_result),
         patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
     ):
@@ -604,6 +609,11 @@ async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
     assert [call.provider_request_id for call in result.llm_calls] == ["chatcmpl-tool", "chatcmpl-final"]
     assert [call.status for call in result.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.SUCCESS]
     assert len(result.tool_invocations) == 1
+    assert mock_acomp.call_count == len(result.llm_calls) == len(requests) == 2
+    assert result.llm_calls[0].messages_hash != result.llm_calls[1].messages_hash
+    for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
+        assert call.messages_hash == stable_hash(request_kwargs["messages"])
+        assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
 
 
 @pytest.mark.asyncio

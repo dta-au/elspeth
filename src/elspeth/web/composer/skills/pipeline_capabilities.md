@@ -41,9 +41,10 @@ authoring:
 5. Author through your surface's terminal authoring tool with the complete
    canonical document. Preserve the requested topology during every repair.
 
-These steps order the facts you need, not the turns you spend. When several of
-them are still unresolved, issue those discovery calls together in a single
-turn rather than one per turn, within the per-turn tool budget. On a
+These steps order the facts you need, not the turns you spend. Batch independent
+missing facts within the per-turn tool budget. Pages of one blob depend on its
+returned continuation offset and content hash; read them sequentially, without
+guessing later offsets. On a
 proposal-only surface, finish discovery in earlier turns: the terminal proposal
 must be the only call in its turn, and a mixed terminal batch executes no calls.
 Batch only calls whose fact is still missing: never issue the same call twice
@@ -108,6 +109,18 @@ omit the field for fail-fast; updates preserve an omitted prior choice and can
 clear it to fail-fast with null. Structural nodes retain their
 own contracts. Public YAML import uses this explicit-choice rule even for
 internal placeholder plugin names; it grants no resume authority.
+
+For a CSV retention sink, `require_all_rows=true` makes a refused row stop
+preparation before ordinary row diversion, including `on_write_failure=discard`.
+It does not roll back earlier publications. `include_audit_context=true`
+requires that option, observed schema, normalized headers and write mode.
+Its two optional reason modes are mutually exclusive: `include_error_reason`
+requires a readable durable source/transform failure; `include_disposition_reason`
+also accepts a unique completed Boolean gate route to that sink without
+reclassifying a successful gate decision as an error. Missing, ambiguous or
+redacted disposition evidence and linked sink diversions stop preparation.
+Inspect current CSV assistance for the full supported contract; a fallback
+route alone does not disprove required-row retention.
 
 Error policies are narrower: transform/aggregation/gate `on_error` ordinarily
 names `discard` or an output `sink_name`, never an arbitrary processing input.

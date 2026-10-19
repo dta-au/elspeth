@@ -7,8 +7,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorGatePassed, AdvisorSignoffGateFact
-from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.completion_gates import (
     ADVISOR_SIGNOFF_PENDING_DETAIL,

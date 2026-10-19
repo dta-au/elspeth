@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Generator, Iterator, Mapping
+from dataclasses import replace
 from functools import reduce
 from operator import or_
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -23,6 +24,7 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
@@ -41,7 +43,7 @@ from elspeth.plugins.sources.llm.config import (
     LLMSourceConfig,
     OpenRouterLLMSourceConfig,
 )
-from elspeth.plugins.transforms.llm import populate_llm_operational_fields
+from elspeth.plugins.transforms.llm import _llm_created_output_fields, populate_llm_operational_fields
 from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langfuse_tracer
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMProvider, LLMQueryResult, classify_finish_reason_failure
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, _configure_azure_monitor
@@ -237,6 +239,15 @@ class LLMSource(BaseSource):
         )
         self.output_schema = self._schema_class
         initial_contract = create_contract_from_config(self._schema_config)
+        nullable_output_fields = tuple(
+            field for field in _llm_created_output_fields(self._response_field, "", self._output_fields) if field.nullable
+        )
+        if self._schema_config.is_observed and nullable_output_fields:
+            # The output descriptor already fixes the scalar type. A null
+            # first value must not replace that required nullable declaration
+            # with a NoneType inference; every other observed field is unchanged.
+            nullable_contract = create_contract_from_config(SchemaConfig(mode="flexible", fields=nullable_output_fields))
+            initial_contract = replace(initial_contract, fields=nullable_contract.fields)
         if initial_contract.locked:
             self.set_schema_contract(initial_contract)
             self._contract_builder: ContractBuilder | None = None

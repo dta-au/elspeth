@@ -16,8 +16,9 @@ from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import OrchestrationInvariantError, SinkEffectCapabilityError, VerificationMismatchError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.sink_effects import (
-    SinkEffectExecutionPurpose,
     SinkEffectErrorReason,
+    SinkEffectExecutionPurpose,
+    SinkEffectGateRouteReason,
     SinkEffectMemberCandidate,
     SinkEffectRole,
     SinkEffectRoutingContext,
@@ -30,6 +31,7 @@ from elspeth.core.landscape.schema import token_outcomes_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
 from elspeth.engine.executors.sink import SinkExecutor
+from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionSeam, SinkEffectInjectedFault
 from elspeth.engine.orchestrator.call_mode_session import AuditedCallModeSession
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -483,28 +485,203 @@ def test_actual_member_candidate_refuses_foreign_routing_context(setup: Recorder
         )
 
 
-def test_finalized_readable_reason_refuses_changed_witness_without_mutating_artifact(setup: RecorderSetup, tmp_path: Path, monkeypatch) -> None:
-    from elspeth.engine.executors import sink_error_reason
+@pytest.mark.parametrize("seam", [None, SinkEffectExecutionSeam.AFTER_PLAN_CAS, SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE])
+@pytest.mark.parametrize("reason_mode", ["error", "disposition-error", "disposition-gate"])
+def test_finalized_readable_reason_refuses_changed_witness_without_mutating_artifact(
+    setup: RecorderSetup, tmp_path: Path, monkeypatch, seam: SinkEffectExecutionSeam | None, reason_mode: str
+) -> None:
+    from elspeth.engine.executors import sink_disposition_reason, sink_error_reason
 
     token = _tokens(setup, [{"value": 1}])[0]
     target = tmp_path / "archive.csv"
-    sink = inject_write_failure(CSVSink({"path": str(target), "schema": {"mode": "observed"},
-        "require_all_rows": True, "include_audit_context": True, "include_error_reason": True}), "discard")
+    sink = inject_write_failure(
+        CSVSink(
+            {
+                "path": str(target),
+                "schema": {"mode": "observed"},
+                "require_all_rows": True,
+                "include_audit_context": True,
+                "include_error_reason" if reason_mode == "error" else "include_disposition_reason": True,
+            }
+        ),
+        "discard",
+    )
     sink.node_id = register_test_node(setup.data_flow, setup.run_id, "archive", node_type=NodeType.SINK, plugin_name="csv")
-    witness = SinkEffectErrorReason(text="Recorded failure.", witness_id="a" * 64, witness_hash="b" * 64)
-    monkeypatch.setattr(sink_error_reason, "resolve_sink_error_reason", lambda *args, **kwargs: witness)
-    pending = PendingOutcome(outcome=TerminalOutcome.FAILURE, path=TerminalPath.ON_ERROR_ROUTED, error_hash="c" * 16)
+    witness: SinkEffectErrorReason | SinkEffectGateRouteReason
+    if reason_mode == "disposition-gate":
+        witness = SinkEffectGateRouteReason(text="Recorded gate route.", witness_id="a" * 64, witness_hash="b" * 64)
+        pending = PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED)
+    else:
+        witness = SinkEffectErrorReason(text="Recorded failure.", witness_id="a" * 64, witness_hash="b" * 64)
+        pending = PendingOutcome(outcome=TerminalOutcome.FAILURE, path=TerminalPath.ON_ERROR_ROUTED, error_hash="c" * 16)
+    if reason_mode == "error":
+        monkeypatch.setattr(sink_error_reason, "resolve_sink_error_reason", lambda *args, **kwargs: witness)
+    else:
+        # Real gate/source proof has separate integration controls; this seam
+        # test isolates propagation and fresh-factory membership verification.
+        monkeypatch.setattr(sink_disposition_reason, "resolve_sink_disposition_reason", lambda *args, **kwargs: witness)
+    active = setup
+    armed = seam is not None
+    original_fault = SinkEffectCoordinator._fault
+
+    def interrupt(self, actual):
+        nonlocal armed
+        if armed and actual is seam:
+            armed = False
+            raise SinkEffectInjectedFault(actual)
+        original_fault(self, actual)
+
+    monkeypatch.setattr(SinkEffectCoordinator, "_fault", interrupt)
 
     def write():
-        _executor(setup).write(sink, [token], _context(setup, sink), 1, sink_name="archive", pending_outcome=pending,
-            effect_mode="write", join_group_id_by_token={token.token_id: None})
+        _executor(active).write(
+            sink,
+            [token],
+            _context(active, sink),
+            1,
+            sink_name="archive",
+            pending_outcome=pending,
+            effect_mode="write",
+            join_group_id_by_token={token.token_id: None},
+        )
 
+    if seam is None:
+        write()
+    else:
+        with pytest.raises(SinkEffectInjectedFault):
+            write()
+    active = RecorderSetup(
+        db=setup.db,
+        factory=make_factory(setup.db, payload_store=FilesystemPayloadStore(tmp_path / "payloads")),
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        coordination_token=setup.coordination_token,
+    )
     write()
     original = target.read_bytes()
     effects = setup.execution.sink_effects.get_effects_for_run(setup.run_id)
     assert len(effects) == 1
-    witness = SinkEffectErrorReason(text="Different recorded failure.", witness_id="d" * 64, witness_hash="e" * 64)
-    with pytest.raises(LandscapeRecordError, match="membership|identity|routing context"):
+    if reason_mode == "disposition-gate":
+        witness = SinkEffectGateRouteReason(text="Different recorded route.", witness_id="d" * 64, witness_hash="e" * 64)
+    else:
+        witness = SinkEffectErrorReason(text="Different recorded failure.", witness_id="d" * 64, witness_hash="e" * 64)
+    with pytest.raises(LandscapeRecordError, match=r"membership|identity|routing context"):
         write()
     assert target.read_bytes() == original
     assert setup.execution.sink_effects.get_effects_for_run(setup.run_id) == effects
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+@pytest.mark.parametrize("reason_mode", ["include_error_reason", "include_disposition_reason"])
+def test_required_readable_failsink_stops_on_unavailable_durable_diversion(
+    setup: RecorderSetup, tmp_path: Path, monkeypatch, interrupted: bool, reason_mode: str
+) -> None:
+    tokens = _tokens(setup, [{"value": "good"}, {"value": "\u00e9"}])
+    primary = _sink(setup, tmp_path / "primary.csv", name="primary", encoding="ascii", require_all_rows=None, route="archive")
+    legacy = _retention_sink(setup, tmp_path / "archive.csv")
+    retention = inject_write_failure(CSVSink({**legacy.config, reason_mode: True}), "discard")
+    retention.node_id = legacy.node_id
+    edge = setup.data_flow.register_edge(
+        primary.node_id, retention.node_id, "__failsink__", RoutingMode.DIVERT, coordination_token=setup.coordination_token
+    )
+    armed = interrupted
+    original_fault = SinkEffectCoordinator._fault
+
+    def interrupt(self, seam):
+        nonlocal armed
+        if armed and seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE:
+            armed = False
+            raise SinkEffectInjectedFault(seam)
+        original_fault(self, seam)
+
+    monkeypatch.setattr(SinkEffectCoordinator, "_fault", interrupt)
+
+    def write():
+        _executor(setup).write(
+            primary,
+            tokens,
+            _context(setup, primary),
+            1,
+            sink_name="primary",
+            pending_outcome=PendingOutcome(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.DEFAULT_FLOW),
+            effect_mode="write",
+            failsink=retention,
+            failsink_name="archive",
+            failsink_effect_mode="write",
+            failsink_edge_id=edge.edge_id,
+            join_group_id_by_token={token.token_id: None for token in tokens},
+        )
+
+    if interrupted:
+        with pytest.raises(SinkEffectInjectedFault):
+            write()
+    with pytest.raises(SinkEffectCapabilityError, match="durable linked-diversion cause"):
+        write()
+    assert not (tmp_path / "archive.csv").exists()
+    assert (tmp_path / "primary.csv").read_text() == "value\ngood\n"
+    assert setup.data_flow.get_token_outcome(tokens[1].token_id) is None
+
+
+@pytest.mark.parametrize("reason_mode", ["error", "disposition"])
+def test_pending_legacy_csv_refuses_reason_opt_in_and_recovers_original_bytes(
+    setup: RecorderSetup, tmp_path: Path, monkeypatch, reason_mode: str
+) -> None:
+    from elspeth.engine.executors import sink_disposition_reason, sink_error_reason
+
+    token = _tokens(setup, [{"value": 1}])[0]
+    target = tmp_path / "archive.csv"
+    legacy = _retention_sink(setup, target)
+    pending = PendingOutcome(outcome=TerminalOutcome.FAILURE, path=TerminalPath.ON_ERROR_ROUTED, error_hash="a" * 16)
+    armed = True
+    original_fault = SinkEffectCoordinator._fault
+
+    def interrupt(self, seam):
+        nonlocal armed
+        if armed and seam is SinkEffectExecutionSeam.AFTER_PLAN_CAS:
+            armed = False
+            raise SinkEffectInjectedFault(seam)
+        original_fault(self, seam)
+
+    monkeypatch.setattr(SinkEffectCoordinator, "_fault", interrupt)
+
+    def write(sink):
+        _executor(setup).write(
+            sink,
+            [token],
+            _context(setup, sink),
+            1,
+            sink_name="archive",
+            pending_outcome=pending,
+            effect_mode="write",
+            join_group_id_by_token={token.token_id: None},
+        )
+
+    with pytest.raises(SinkEffectInjectedFault):
+        write(legacy)
+    effects = setup.execution.sink_effects.get_effects_for_run(setup.run_id)
+    assert len(effects) == 1 and not target.exists()
+    selected = inject_write_failure(
+        CSVSink({**legacy.config, "include_error_reason" if reason_mode == "error" else "include_disposition_reason": True}), "discard"
+    )
+    selected.node_id = legacy.node_id
+    if reason_mode == "error":
+        monkeypatch.setattr(
+            sink_error_reason,
+            "resolve_sink_error_reason",
+            lambda *args, **kwargs: SinkEffectErrorReason(text="Recorded cause.", witness_id="b" * 64, witness_hash="c" * 64),
+        )
+    else:
+        monkeypatch.setattr(
+            sink_disposition_reason,
+            "resolve_sink_disposition_reason",
+            lambda *args, **kwargs: SinkEffectErrorReason(text="Recorded cause.", witness_id="b" * 64, witness_hash="c" * 64),
+        )
+    with pytest.raises((LandscapeRecordError, ValueError), match=r"config|target|membership|routing context"):
+        write(selected)
+    assert setup.execution.sink_effects.get_effects_for_run(setup.run_id) == effects
+    assert not target.exists()
+    write(legacy)
+    with target.open(newline="") as stream:
+        records = list(csv.DictReader(stream))
+    assert len(records) == 1 and "error_reason" not in records[0]
+    assert setup.execution.sink_effects.get_effects_for_run(setup.run_id)[0].effect_id == effects[0].effect_id

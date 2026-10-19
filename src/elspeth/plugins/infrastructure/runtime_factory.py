@@ -207,7 +207,9 @@ def instantiate_plugins_from_config(
             if transform_cls.requires_complete_source_batch and (
                 agg_config.trigger.has_count or agg_config.trigger.has_timeout or agg_config.trigger.has_condition
             ):
-                raise ValueError(f"Aggregation '{agg_config.name}' uses '{agg_config.plugin}', which requires an EOF-only trigger; omit trigger or use {{}}")
+                raise ValueError(
+                    f"Aggregation '{agg_config.name}' uses '{agg_config.plugin}', which requires an EOF-only trigger; omit trigger or use {{}}"
+                )
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success
             transform.on_error = agg_config.on_error

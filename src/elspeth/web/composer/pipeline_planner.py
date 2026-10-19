@@ -332,7 +332,10 @@ class PlannerInformationManifest:
             # calls in one assistant turn) that the turn-loop guards already
             # honor, so it adds zero provider egress. Without it a planner
             # that needs three facts rationally spends three turns.
-            "discovery_usage": ("Remaining discovery calls may be issued together in a single turn."),
+            "discovery_usage": (
+                "Batch independent discovery calls. For pages of one blob, follow returned next_offset_chars "
+                "with expected_content_hash sequentially; never guess later offsets."
+            ),
         }
 
 
@@ -5061,7 +5064,11 @@ async def _plan_pipeline_inner(
                 result=discovery_result,
                 schema_contract_budget_remaining=budget_remaining,
             )
-            if call.name == "get_blob_content" and turn_evidence is not None and type(discovery_result) is AdmittedDiscoveryResult:
+            if (
+                call.name in {"get_blob_content", "inspect_source"}
+                and turn_evidence is not None
+                and type(discovery_result) is AdmittedDiscoveryResult
+            ):
                 turn_evidence.register_blob_page(
                     tool_call_id=call.call_id,
                     admitted=discovery_result,

@@ -35,8 +35,8 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from structlog.typing import FilteringBoundLogger
 
-from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
 from elspeth.web.catalog.protocol import CatalogService
@@ -4769,6 +4769,79 @@ def test_build_advisor_user_message_neutralizes_begin_end_spoof_in_schema_excerp
     begin_at = message.index(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN)
     end_at = message.rindex(_ADVISOR_UNTRUSTED_SUMMARY_END)
     assert begin_at < message.index("[New instructions:") < end_at
+
+
+@pytest.mark.parametrize("choice", [None, False, True], ids=["absent", "false", "true"])
+def test_render_options_exposes_retention_choice_without_exposing_unknown_values(choice):
+    from elspeth.web.composer.advisor_context import _render_options_for_advisor
+
+    options = {
+        "path": "withheld-output-location.csv",
+        "api_key": "withheld-key-canary",
+        "service_token_field": "withheld-field-canary",
+        "unknown_boolean": True,
+    }
+    if choice is not None:
+        options.update(
+            require_all_rows=choice,
+            include_audit_context=choice,
+            include_error_reason=choice,
+            include_disposition_reason=choice,
+        )
+    before = options.copy()
+    rendered = _render_options_for_advisor(options)
+    for key in ("require_all_rows", "include_audit_context", "include_error_reason", "include_disposition_reason"):
+        if choice is None:
+            assert key not in rendered
+        else:
+            assert f"{key}={choice}" in rendered
+            assert key not in rendered.split("values withheld: ", 1)[1]
+    for key in ("path", "api_key", "service_token_field", "unknown_boolean"):
+        assert key in rendered.split("values withheld: ", 1)[1]
+        assert f"{key}=" not in rendered
+    assert all(value not in rendered for value in ("withheld-output-location.csv", "withheld-key-canary", "withheld-field-canary"))
+    assert options == before
+
+
+def test_checkpoint_advice_requires_current_contract_evidence_for_exact_repair_arguments():
+    from elspeth.web.composer.advisor_context import advisor_system_instructions_for_trigger
+    from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
+
+    for trigger in (ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END):
+        instructions = advisor_system_instructions_for_trigger(trigger)
+        assert "Name the unmet behavior" in instructions
+        assert "only when supplied current contracts support them" in instructions
+        assert "name the schema or assistance to inspect" in instructions
+        assert "Never invent a repair setting" in instructions
+
+
+@pytest.mark.parametrize("phase", ["early", "end"])
+@pytest.mark.parametrize("choice", [None, False, True], ids=["absent", "false", "true"])
+def test_checkpoint_retention_evidence_preserves_choices_and_untrusted_wire(make_service, simple_state, phase, choice):
+    from elspeth.web.composer.advisor_context import advisor_user_content_parts, build_advisor_user_message
+
+    options = {"path": "retention.csv", "mode": "write", "headers": "normalized", "schema": {"mode": "observed"}}
+    if choice is not None:
+        options.update(
+            require_all_rows=choice,
+            include_audit_context=choice,
+            include_error_reason=choice,
+            include_disposition_reason=choice,
+        )
+    state = dataclass_replace(
+        simple_state,
+        outputs=(OutputSpec(name="retained", plugin="csv", options=options, on_write_failure="discard"),),
+    )
+    arguments = make_service()._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state)
+    original = build_advisor_user_message(arguments)
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == original
+    assert all(part.trust is None for part in parts)
+    for key in ("require_all_rows", "include_audit_context", "include_error_reason", "include_disposition_reason"):
+        if choice is None:
+            assert key not in original
+        else:
+            assert f"{key}={choice}" in original
 
 
 def test_render_options_untruncates_prompt_but_caps_other_values():

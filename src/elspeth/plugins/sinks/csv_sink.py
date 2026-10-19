@@ -223,7 +223,7 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5fe8460fa910c15b"
+    source_file_hash: str | None = "sha256:198b2883591f0b54"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -749,7 +749,8 @@ class CSVSink(BaseSink, SinkEffectAuditContextCapability):
                     "delimiter (default ',', single character) is an operator concern — pick for the consuming tool (Excel: ','; analytics tools may prefer '\\t'). Quoting is fixed (standard csv quoting); only delimiter and encoding are configurable.",
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
                     "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
-                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation. Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
+                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation.",
+                    "Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
                 ),
             )
         return None

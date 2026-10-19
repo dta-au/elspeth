@@ -150,12 +150,32 @@
                     "nullable": true,
                     "required": false,
                     "tier": "common"
+                  },
+                  {
+                    "default": false,
+                    "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+                    "kind": "checkbox",
+                    "label": "Nullable",
+                    "name": "nullable",
+                    "nullable": false,
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
               "kind": "json-array",
               "label": "output_fields",
               "name": "output_fields",
+              "nullable": true,
+              "required": false,
+              "tier": "common"
+            },
+            {
+              "default": null,
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "kind": "text",
+              "label": "structured_output_prefix",
+              "name": "structured_output_prefix",
               "nullable": true,
               "required": false,
               "tier": "common"
@@ -282,6 +302,20 @@
         }
       },
       {
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Allow Blank Input Fields",
+        "name": "allow_blank_input_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
         "default": "standard",
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "enum": [
@@ -305,6 +339,34 @@
         "kind": "json-array",
         "label": "Output Fields",
         "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Input Checks",
+        "name": "input_checks",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Result Checks",
+        "name": "result_checks",
         "nullable": true,
         "required": false,
         "tier": "advanced",
@@ -696,12 +758,32 @@
                     "nullable": true,
                     "required": false,
                     "tier": "common"
+                  },
+                  {
+                    "default": false,
+                    "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+                    "kind": "checkbox",
+                    "label": "Nullable",
+                    "name": "nullable",
+                    "nullable": false,
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
               "kind": "json-array",
               "label": "output_fields",
               "name": "output_fields",
+              "nullable": true,
+              "required": false,
+              "tier": "common"
+            },
+            {
+              "default": null,
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "kind": "text",
+              "label": "structured_output_prefix",
+              "name": "structured_output_prefix",
               "nullable": true,
               "required": false,
               "tier": "common"
@@ -828,6 +910,20 @@
         }
       },
       {
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Allow Blank Input Fields",
+        "name": "allow_blank_input_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
         "default": "standard",
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "enum": [
@@ -851,6 +947,34 @@
         "kind": "json-array",
         "label": "Output Fields",
         "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Input Checks",
+        "name": "input_checks",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Result Checks",
+        "name": "result_checks",
         "nullable": true,
         "required": false,
         "tier": "advanced",
@@ -1230,12 +1354,32 @@
                     "nullable": true,
                     "required": false,
                     "tier": "common"
+                  },
+                  {
+                    "default": false,
+                    "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+                    "kind": "checkbox",
+                    "label": "Nullable",
+                    "name": "nullable",
+                    "nullable": false,
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
               "kind": "json-array",
               "label": "output_fields",
               "name": "output_fields",
+              "nullable": true,
+              "required": false,
+              "tier": "common"
+            },
+            {
+              "default": null,
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "kind": "text",
+              "label": "structured_output_prefix",
+              "name": "structured_output_prefix",
               "nullable": true,
               "required": false,
               "tier": "common"
@@ -1362,6 +1506,20 @@
         }
       },
       {
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Allow Blank Input Fields",
+        "name": "allow_blank_input_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
         "default": "standard",
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "enum": [
@@ -1385,6 +1543,34 @@
         "kind": "json-array",
         "label": "Output Fields",
         "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Input Checks",
+        "name": "input_checks",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Result Checks",
+        "name": "result_checks",
         "nullable": true,
         "required": false,
         "tier": "advanced",
@@ -1793,12 +1979,32 @@
                     "nullable": true,
                     "required": false,
                     "tier": "common"
+                  },
+                  {
+                    "default": false,
+                    "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+                    "kind": "checkbox",
+                    "label": "Nullable",
+                    "name": "nullable",
+                    "nullable": false,
+                    "required": false,
+                    "tier": "common"
                   }
                 ]
               },
               "kind": "json-array",
               "label": "output_fields",
               "name": "output_fields",
+              "nullable": true,
+              "required": false,
+              "tier": "common"
+            },
+            {
+              "default": null,
+              "description": "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. Any non-null override requires unique final generated names across all queries.",
+              "kind": "text",
+              "label": "structured_output_prefix",
+              "name": "structured_output_prefix",
               "nullable": true,
               "required": false,
               "tier": "common"
@@ -1925,6 +2131,20 @@
         }
       },
       {
+        "description": "Declared required_input_fields whose present string value may be empty or whitespace. Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection.",
+        "item_kind": "text",
+        "kind": "string-list",
+        "label": "Allow Blank Input Fields",
+        "name": "allow_blank_input_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
         "default": "standard",
         "description": "Single-prompt response format mode (standard JSON object vs. enforced json_schema). Multi-query mode declares response_format per query instead.",
         "enum": [
@@ -1948,6 +2168,34 @@
         "kind": "json-array",
         "label": "Output Fields",
         "name": "output_fields",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean admission checks on the actual entry row, before any per-row model request. All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Input Checks",
+        "name": "input_checks",
+        "nullable": true,
+        "required": false,
+        "tier": "advanced",
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Named Boolean expression postconditions on the completed output row, including extracted fields. All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt or prove semantic correctness. Omit to preserve existing behavior.",
+        "kind": "json-array",
+        "label": "Result Checks",
+        "name": "result_checks",
         "nullable": true,
         "required": false,
         "tier": "advanced",

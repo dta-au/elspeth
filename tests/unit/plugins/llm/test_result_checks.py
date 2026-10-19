@@ -6,8 +6,8 @@ import json
 
 import pytest
 
-from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.call_data import LLMCallRequest
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
@@ -79,7 +79,9 @@ def test_check_reads_actual_extracted_result_before_success(provider_name: str, 
 )
 def test_failed_evaluation_or_nonboolean_cannot_admit_a_result(expression: str, error_type: str) -> None:
     transform, provider = _make_transform_with_mock_provider(
-        _make_config(result_checks=[{"name": "must_pass", "expression": expression}], output_fields=[{"suffix": "answer", "type": "integer"}])
+        _make_config(
+            result_checks=[{"name": "must_pass", "expression": expression}], output_fields=[{"suffix": "answer", "type": "integer"}]
+        )
     )
     provider.execute_query.return_value = LLMQueryResult(
         content='{"answer":1}', usage=TokenUsage.known(1, 1), model="approved-model", finish_reason=FinishReason.STOP
@@ -127,7 +129,9 @@ def test_omitted_checks_keep_native_request_and_output() -> None:
     checked, checked_provider = _make_transform_with_mock_provider(
         _make_config(result_checks=[{"name": "response_nonempty", "expression": "len(row['llm_response']) > 0"}])
     )
-    response = LLMQueryResult(content="Generated answer", usage=TokenUsage.known(1, 1), model="approved-model", finish_reason=FinishReason.STOP)
+    response = LLMQueryResult(
+        content="Generated answer", usage=TokenUsage.known(1, 1), model="approved-model", finish_reason=FinishReason.STOP
+    )
     old_provider.execute_query.return_value = response
     checked_provider.execute_query.return_value = response
     old_result, checked_result = old._process_row(row, ctx), checked._process_row(row, ctx)
@@ -168,9 +172,7 @@ def test_nullable_generated_field_is_a_postcondition_not_an_upstream_requirement
 
 @pytest.mark.parametrize("expression", ["row['check_only'] == 'private'", "row[row['selected']] == 'private'"])
 def test_check_only_input_is_not_added_to_provider_template_visibility(expression: str) -> None:
-    transform, provider = _make_transform_with_mock_provider(
-        _make_config(result_checks=[{"name": "local_only", "expression": expression}])
-    )
+    transform, provider = _make_transform_with_mock_provider(_make_config(result_checks=[{"name": "local_only", "expression": expression}]))
     provider.execute_query.return_value = LLMQueryResult(
         content="Generated answer", usage=TokenUsage.known(1, 1), model="approved-model", finish_reason=FinishReason.STOP
     )
@@ -205,11 +207,22 @@ def test_missing_computed_private_key_fails_without_echoing_the_key() -> None:
         (2.35, "number", "decimal_within(row['answer'], 2.30, 0.05)", True),
         (2.351, "number", "decimal_within(row['answer'], 2.30, 0.05)", False),
     ],
-    ids=["leading", "later-substring", "word-lower", "word-upper", "word-too-short", "word-too-long", "decimal-boundary", "decimal-outside"],
+    ids=[
+        "leading",
+        "later-substring",
+        "word-lower",
+        "word-upper",
+        "word-too-short",
+        "word-too-long",
+        "decimal-boundary",
+        "decimal-outside",
+    ],
 )
 def test_scalar_checks_admit_actual_generated_boundaries(value: object, kind: str, expression: str, accepted: bool) -> None:
     transform, provider = _make_transform_with_mock_provider(
-        _make_config(output_fields=[{"suffix": "answer", "type": kind}], result_checks=[{"name": "actual_result", "expression": expression}])
+        _make_config(
+            output_fields=[{"suffix": "answer", "type": kind}], result_checks=[{"name": "actual_result", "expression": expression}]
+        )
     )
     provider.execute_query.return_value = LLMQueryResult(
         content=json.dumps({"answer": value}), usage=TokenUsage.known(1, 1), model="approved-model", finish_reason=FinishReason.STOP
@@ -239,9 +252,7 @@ def test_checks_preserve_real_provider_transport_audit_and_batch_delivery(
     if query_mode == "single":
         config["output_fields"] = [descriptor]
     else:
-        config["queries"] = {
-            name: {"input_fields": {"text": "text"}, "output_fields": [descriptor]} for name in ("first", "second")
-        }
+        config["queries"] = {name: {"input_fields": {"text": "text"}, "output_fields": [descriptor]} for name in ("first", "second")}
     if query_mode == "pooled":
         config["pool_size"] = 2
     if query_mode == "ordered":

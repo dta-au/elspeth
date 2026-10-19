@@ -72,9 +72,7 @@ def _bedrock_service() -> ComposerServiceImpl:
     return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_bedrock_settings())
 
 
-def _required_bedrock_service(
-    monkeypatch: pytest.MonkeyPatch, *, user_prompt: str
-) -> tuple[ComposerServiceImpl, str, list[httpx.Request]]:
+def _required_bedrock_service(monkeypatch: pytest.MonkeyPatch, *, user_prompt: str) -> tuple[ComposerServiceImpl, str, list[httpx.Request]]:
     """Use the real Azure guard and sessions; fake only its external HTTP."""
     guard_settings = PromptGuardSettings(endpoint="https://bedrock-shield.example.test", subscription_key="offline-bedrock-shield")
     requests: list[httpx.Request] = []
@@ -236,8 +234,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     ]
     assert [check["role"] for check in checks] == ["composer", "advisor"]
     assert all(
-        (check["adapter"], check["mode"], check["disposition"], check["reason"])
-        == ("azure_prompt_shields", "required", "allow", "clean")
+        (check["adapter"], check["mode"], check["disposition"], check["reason"]) == ("azure_prompt_shields", "required", "allow", "clean")
         for check in checks
     )
     assert checks[0]["operation_id"] == checks[1]["operation_id"] == context.fence.operation_id

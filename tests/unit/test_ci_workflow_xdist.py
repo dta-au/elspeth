@@ -165,14 +165,14 @@ def test_python_matrix_ci_does_not_hard_disable_xdist() -> None:
     assert "0" not in _pytest_numprocesses_values(no_coverage_run)
 
 
-def test_integration_lane_does_not_force_parallel_xdist() -> None:
-    """Integration lane stays sequential by omitting explicit xdist process flags."""
+def test_integration_lane_caps_xdist_workers_explicitly() -> None:
+    """An explicit cap prevents integration from inheriting the project worker default."""
     workflow = _ci_workflow()
     integration_job = workflow["jobs"]["integration"]
 
     run = _step_run(integration_job, "Run integration tests")
 
-    assert _pytest_numprocesses_values(run) == []
+    assert _pytest_numprocesses_values(run) == ["2"]
 
 
 def test_judge_gates_workflow_mirrors_ci_concurrency_policy() -> None:

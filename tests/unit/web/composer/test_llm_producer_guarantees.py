@@ -298,6 +298,44 @@ def _fork_coalesce_summary(required: list[str] | None) -> ValidationSummary:
 
 
 class TestLlmProducerGuarantees:
+    @pytest.mark.parametrize("consumer_type", ["float", "str"])
+    def test_profile_nullable_number_keeps_its_typed_downstream_contract(self, consumer_type: str) -> None:
+        """The public profile probe must retain a required nullable numeric result."""
+        producer = _llm_node("assess_colour", "rows", "assessed", "assessment_result")
+        producer = replace(
+            producer,
+            options={
+                **producer.options,
+                "schema": {"mode": "flexible", "fields": ["colour: str"]},
+                "output_fields": [{"suffix": "score", "type": "number", "nullable": True}],
+                "response_format": "structured",
+            },
+        )
+        consumer = _consumer("tidy_output", "assessed", None, {"score": "score"})
+        consumer = replace(
+            consumer,
+            options={
+                **consumer.options,
+                "schema": {
+                    "mode": "flexible",
+                    "fields": [{"name": "score", "type": consumer_type, "required": True, "nullable": True}],
+                },
+            },
+        )
+
+        summary = _with_output(_base_state().with_node(producer).with_node(consumer)).validate()
+
+        assert _probe_failed_warnings(summary) == []
+        assert _contract_violations(summary) == []
+        if consumer_type == "float":
+            assert summary.is_valid, [entry.to_dict() for entry in summary.errors]
+        else:
+            # Only the consumer type changed: nullable cannot conceal a real
+            # number-to-string mismatch or make the producer fail closed.
+            assert not summary.is_valid
+            assert [entry.error_code for entry in summary.errors] == ["edge_field_type_incompatible"]
+            assert "score (consumer expects str, producer emits float)" in summary.errors[0].message
+
     def test_approved_profile_keeps_computed_contract(self) -> None:
         """Server-stamped approval evidence is not an authored provider binding."""
         node = _llm_node("recommend_pairing", "rows", "pairing_done", "complementary_colour")

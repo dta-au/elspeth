@@ -824,7 +824,7 @@ class MultiQueryStrategy:
                 return TransformResult.error(extraction_error, retryable=False)
             # Publish typed fields under the spec's resolved row names.
             for suffix, value in extracted.items():
-                partial[f"{spec.name}_{suffix}"] = value
+                partial[spec.structured_field_name(suffix)] = value
             # Also store raw content for audit traceability
             partial[f"{spec.name}_{self.response_field}"] = content
         else:
@@ -1242,7 +1242,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6965560d817e0fa2"
+    source_file_hash: str | None = "sha256:2c0a844e8d80556d"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1605,9 +1605,11 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 prefixed_guaranteed.update(get_llm_guaranteed_fields(prefix))
                 if spec.output_fields:
                     for field in spec.output_fields:
-                        prefixed_guaranteed.add(f"{spec.name}_{field.suffix}")
+                        prefixed_guaranteed.add(spec.structured_field_name(field.suffix))
             self.declared_output_fields = frozenset(prefixed_guaranteed)
-            if self._config.query_input_mode == QueryInputMode.ORDERED or any(spec.structured_output_prefix is not None for spec in query_specs):
+            if self._config.query_input_mode == QueryInputMode.ORDERED or any(
+                spec.structured_output_prefix is not None for spec in query_specs
+            ):
                 self._strict_generated_fields = self.declared_output_fields
 
             # Output schema config with prefixed fields for DAG contract propagation.
@@ -1617,23 +1619,28 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 definition
                 for spec in query_specs
                 for definition in _llm_created_output_fields(
-                    f"{spec.name}_{self._response_field}", f"{spec.name}_", spec.output_fields or ()
+                    f"{spec.name}_{self._response_field}", spec.structured_field_prefix, spec.output_fields or ()
                 )
             )
 
             # Pydantic output schema with prefixed LLM fields
             # Build extracted_fields mapping: query_name → (field_name, schema_type) tuples
             extracted: dict[str, tuple[tuple[str, _FieldType], ...]] = {}
+            nullable_fields = frozenset(
+                spec.structured_field_name(field.suffix) for spec in query_specs for field in spec.output_fields or () if field.nullable
+            )
             for spec in query_specs:
                 if spec.output_fields:
                     extracted[spec.name] = tuple(
-                        (f"{spec.name}_{f.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
+                        (spec.structured_field_name(f.suffix), _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
                     )
             generated_fields = tuple(
                 field
                 for spec in query_specs
                 for field in _llm_generated_output_fields(
-                    f"{spec.name}_{self._response_field}", extracted[spec.name] if spec.name in extracted else ()
+                    f"{spec.name}_{self._response_field}",
+                    extracted[spec.name] if spec.name in extracted else (),
+                    nullable_fields=nullable_fields,
                 )
             )
             self._output_schema_config = _build_llm_output_schema_config(
@@ -1645,6 +1652,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 query_names=tuple(spec.name for spec in query_specs),
                 schema_name=f"{self.name}OutputSchema",
                 extracted_fields=extracted if extracted else None,
+                nullable_fields=nullable_fields,
             )
         else:
             single_output_fields = tuple(self._config.output_fields or ())
@@ -1680,7 +1688,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             extracted_single = tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
-            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single)
+            nullable_fields = frozenset(field.suffix for field in single_output_fields if field.nullable)
+            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single, nullable_fields=nullable_fields)
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed, generated_fields=generated_fields)
             self._created_output_fields = _llm_created_output_fields(self._response_field, "", single_output_fields)
 
@@ -1691,6 +1700,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
                 extracted_fields=extracted_single or None,
+                nullable_fields=nullable_fields,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available
@@ -1817,9 +1827,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         entry is BOUND to the row type of its ``OutputFieldConfig.type`` through
         ``_OUTPUT_FIELD_TYPE_TO_SCHEMA``, and the Tier-3 parse
         (``validation.parse_field_value``, reached through
-        ``extract_structured_fields``) returns every value it admits in exactly
-        that type (``integer`` admits an integral float as an int, ``number``
-        an int as a float), so a value the parse admits always satisfies the
+        ``extract_structured_fields``) returns every nonnull value it admits in
+        exactly that type (``integer`` admits an integral float as an int,
+        ``number`` an int as a float), and admits None only when that field's
+        explicit nullable flag declares it. A value the parse admits satisfies the
         declaration the engine enforces. The binding and the parse landed
         together and a test pins that they agree for every ``OutputFieldType``
         (operator ruling 2026-09-25: never one without the other).

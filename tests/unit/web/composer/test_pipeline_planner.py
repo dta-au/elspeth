@@ -234,12 +234,27 @@ _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES = 1538
 # that growth, preserving the baseline, 10% band, 163 B live-case headroom and
 # existing overflow control. This test allowance changes no production limit.
 _RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES = 4944
+# Composer 0.8.7 refinements consolidated into the 0.8.9 candidate: the same
+# interpreter, installed catalog and native encoder measure 127,120 B at
+# 85e00d616 and 127,334 B here. Complete captured-output reversals account for
+# CSV discovery guidance (+77), declared-type teaching (+68), the blob page
+# description (+8), and reference/schema-evidence partitioning (+61): +214 B.
+# Preserve the prior 163 B live-case headroom before the explicit reserve below.
+_COMPOSER087_REFINEMENTS_CANONICAL_BYTES = 214
+# John's 2026-10-18 direction permits justified budget increases to preserve
+# necessary clear guidance. This 4 KiB working reserve is an engineering choice,
+# separate from measured growth. The pre-clarification 127,334 B capture had
+# 4,259 B of room; corrected guidance measures 129,849 B, leaving 1,744 B.
+# Keep the finite tripwire and exact overflow control; do not renew automatically.
+_FIXED_SCAFFOLDING_WORKING_HEADROOM_BYTES = 4 * 1024
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
     + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
     + _GRAPH_RECOVERY_CONTROLS_CANONICAL_BYTES
     + _RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES
+    + _COMPOSER087_REFINEMENTS_CANONICAL_BYTES
+    + _FIXED_SCAFFOLDING_WORKING_HEADROOM_BYTES
 )
 
 
@@ -1551,8 +1566,11 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     assert "expression.grammar" not in payload["information_manifest"]["discoverable_classes"]
     assert payload["information_manifest"]["unresolved"] == []
     assert "unresolved_classes" not in payload["information_manifest"]
-    # F1: the manifest names the batching affordance as a static usage line.
-    assert payload["information_manifest"]["discovery_usage"] == ("Remaining discovery calls may be issued together in a single turn.")
+    # Independent facts may batch; a continuation offset is a result dependency.
+    discovery_usage = payload["information_manifest"]["discovery_usage"]
+    assert "Batch independent discovery calls" in discovery_usage
+    assert "next_offset_chars" in discovery_usage and "expected_content_hash" in discovery_usage
+    assert "sequentially" in discovery_usage and "never guess later offsets" in discovery_usage
     names = [tool["function"]["name"] for tool in request["tools"]]
     assert not {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"} & set(names)
     # Aid-supplied keys keep their parity tools in the palette (F3/F5).
@@ -6235,6 +6253,155 @@ async def test_planner_blob_pages_require_owned_admitted_delivery(tmp_path: Path
             # A later primary candidate seeing only a planner summary cannot
             # borrow nested delivery, even when planner coverage is complete.
             assert evidence.inspection_coverage("primary") == ()
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["success", "malformed"])
+async def test_planner_inspect_source_metadata_reaches_actual_end_only_after_delivery(
+    tmp_path: Path, tool_context: ToolContext, delivery: str
+) -> None:
+    from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from tests.unit.web.composer._helpers import _make_settings
+
+    engine, origin = await _session_context()
+    intent = "Inspect the uploaded source before describing its measured size."
+    body = b"name,score\nada,42\n"
+    recorder = BufferingRecorder()
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            blob = await BlobServiceImpl(engine, tmp_path).create_blob(
+                UUID(origin.session_id), "inspection.csv", body, "text/csv", session_operation_context=context
+            )
+            state = _empty_state()
+            evidence = TurnEvidence(
+                session_id=origin.session_id,
+                session_operation_context=context,
+                request_id="actual-planner-source-metadata",
+                request=intent,
+                initial_state_id=None,
+                initial_state=state,
+            )
+            pipeline = _inline_pipeline(tmp_path)
+            del pipeline["source"]["inline_blob"]
+            pipeline["source"]["blob_id"] = str(blob.id)
+            completion = _ScriptedCompletion(
+                _response_with_call_id("inspect-owned-source", "inspect_source", {"blob_id": str(blob.id)}),
+                _response_with_call_id("emit-inspected", "emit_pipeline_proposal", {"pipeline": pipeline})
+                if delivery == "success"
+                else _Response(choices=[], usage=_planner_usage()),
+            )
+            custody = replace(
+                _custody(tmp_path),
+                session_engine=engine,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            arguments = {
+                "tmp_path": tmp_path,
+                "tool_context": tool_context,
+                "completion": completion,
+                "recorder": recorder,
+                "originating_message": origin,
+                "custody_config": custody,
+                "budget": _budget(max_total_provider_calls=2),
+                "turn_evidence": evidence,
+                "intent": intent,
+            }
+            if delivery == "malformed":
+                with pytest.raises(PipelinePlannerError):
+                    await _plan(**arguments)
+            else:
+                await _plan(**arguments)
+            assert len(completion.requests) == 2
+            selected = [
+                message
+                for message in completion.requests[-1]["messages"]
+                if message["role"] == "tool" and message["tool_call_id"] == "inspect-owned-source"
+            ]
+            assert len(selected) == 1
+            facts = json.loads(selected[0]["content"])["data"]
+            assert facts["redacted_identity"]["blob_id"] == str(blob.id)
+            review = evidence.review_candidate(
+                candidate="The source evidence is retained for review.", request=intent, current_state=state, scope="planner"
+            )
+            inspection = json.loads(review.provider_payload_json)["inspection"]
+            assert inspection["currently_available"] == inspection["historically_delivered"] == []
+            primary_inspection = json.loads(
+                evidence.review_candidate(candidate="Primary summary only.", request=intent, current_state=state).provider_payload_json
+            )["inspection"]
+            assert not primary_inspection.get("source_metadata_currently_available")
+            if delivery == "malformed":
+                assert "source_metadata_currently_available" not in inspection
+                assert evidence.current_call_id("planner") is None
+            else:
+                metadata = inspection["source_metadata_currently_available"]
+                assert metadata == inspection["source_metadata_historically_delivered"]
+                assert metadata == [
+                    {
+                        "blob_id": str(blob.id),
+                        "total_size_bytes": len(body),
+                        "byte_range_inspected": facts["byte_range_inspected"],
+                        "source_kind": "csv",
+                        "receipt_envelope_hash": stable_hash(selected[0]["content"]),
+                    }
+                ]
+                assert evidence.current_call_id("planner") == recorder.llm_calls[-1].call_id
+
+            # Exercise the real END serializer, SDK seam, verdict parser and binding.
+            # Like _plan, this fixture explicitly uses debug-when-unconfigured;
+            # it proves dispatch/delivery ownership, not Azure guard acceptance.
+            authority = SQLiteLocalSessionOperationAuthority(engine)
+            sessions = SessionServiceImpl(
+                engine,
+                data_dir=tmp_path,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.source-inspection-end"),
+                session_operation_authority=authority,
+            )
+            service = ComposerServiceImpl.for_trained_operator(
+                catalog=create_catalog_service(),
+                settings=_make_settings(data_dir=tmp_path),
+                sessions_service=sessions,
+                session_engine=engine,
+            )
+            coordinator = RequiredWorkCoordinator(
+                RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+            )
+            owner = ProviderInvocationOwner(service=sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+            end_completion = _ScriptedCompletion(
+                _text_response(
+                    json.dumps(
+                        {
+                            "verdict": "CLEAN",
+                            "category": "other",
+                            "steps": [],
+                            "findings": "",
+                            "note": None,
+                            "publication_verdict": "ADMIT",
+                        }
+                    )
+                )
+            )
+            with patch.object(litellm, "acompletion", new=end_completion), prompt_guard_user_scope(intent):
+                verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+                    phase="end",
+                    state=state,
+                    session_id=origin.session_id,
+                    recorder=BufferingRecorder(),
+                    user_message=intent,
+                    session_operation_context=context,
+                    provider_owner=owner,
+                    publication_review=review,
+                )
+            assert verdict.ok and verdict.publication_binding == review.binding
+            assert len(end_completion.requests) == 1
+            assert review.provider_payload_json in end_completion.requests[0]["messages"][1]["content"]
+            coordinator.assert_completed()
     finally:
         engine.dispose()
 

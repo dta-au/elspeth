@@ -860,7 +860,9 @@ class TestFlushOutputJournalDurability:
         db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
         payload_store = FilesystemPayloadStore(tmp_path / "payloads")
         checkpoint_mgr = CheckpointManager(db)
-        source_rows = [{"value": "same"}, {"value": "same"}, {"value": "unrelated"}] if duplicate_annotation else [{"value": 10}, {"value": 20}]
+        source_rows = (
+            [{"value": "same"}, {"value": "same"}, {"value": "unrelated"}] if duplicate_annotation else [{"value": 10}, {"value": 20}]
+        )
         source = _LoadCountingSource(source_rows, on_success="batch_in")
         transform = (
             BatchDuplicateAnnotator({"schema": {"mode": "observed"}, "rules": [{"name": "repeated", "cells": [{"field": "value"}]}]})
@@ -876,7 +878,9 @@ class TestFlushOutputJournalDurability:
 
         monkeypatch.setattr(transform, "process", count_real_process)
         output_sink = CollectSink("output")
-        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, output_mode="passthrough", eof_only=duplicate_annotation)
+        config, graph = _build_eof_aggregation_pipeline(
+            source, transform, output_sink, output_mode="passthrough", eof_only=duplicate_annotation
+        )
         orchestrator = Orchestrator(
             db=db,
             checkpoint_manager=checkpoint_mgr,

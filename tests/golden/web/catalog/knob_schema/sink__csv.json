@@ -102,6 +102,26 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Add a bounded readable error_reason backed by the exact durable source/transform failure handoff. Requires include_audit_context=true. Missing, ambiguous, redacted or unsupported causes stop preparation; hash-only linked sink diversions are unsupported. Earlier publications are not rolled back.",
+        "kind": "checkbox",
+        "label": "Include Error Reason",
+        "name": "include_error_reason",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Add disposition_kind and disposition_reason backed by an exact durable source/transform failure or a unique completed Boolean gate route to this sink. Requires include_audit_context=true; mutually exclusive with include_error_reason. Gate routing remains a successful decision, not an error. Missing, ambiguous or redacted evidence and linked sink diversions stop preparation.",
+        "kind": "checkbox",
+        "label": "Include Disposition Reason",
+        "name": "include_disposition_reason",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

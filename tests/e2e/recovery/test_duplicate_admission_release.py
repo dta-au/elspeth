@@ -57,8 +57,7 @@ _ROWS = [
 ]
 _CAUSES = '[{"rule":"repeated","field":"first","category":"duplicate"},{"rule":"repeated","field":"second","category":"duplicate"}]'
 _EXPECTED = [
-    {**row, "duplicates_valid": index == 1, "duplicates_causes": "[]" if index == 1 else _CAUSES}
-    for index, row in enumerate(_ROWS)
+    {**row, "duplicates_valid": index == 1, "duplicates_causes": "[]" if index == 1 else _CAUSES} for index, row in enumerate(_ROWS)
 ]
 
 

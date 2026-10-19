@@ -17,10 +17,10 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.config import GateSettings
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.query_repository import QueryRepository
-from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.engine.executors.sink_disposition_reason import resolve_sink_disposition_reason
-from elspeth.plugins.sinks.csv_sink import CSVSink
+from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.transforms.json_explode import JSONExplode
 from tests.fixtures.base_classes import as_sink, as_source, as_transform, inject_write_failure
 from tests.fixtures.landscape import make_factory, make_landscape_db
@@ -59,7 +59,11 @@ def _configuration(target: Path, *, error_only: bool = False, mixed: bool = Fals
         PipelineConfig(
             sources={"primary": as_source(source)},
             transforms=[as_transform(transform)] if mixed else [],
-            gates=[GateSettings(name="quality_check", input="checked", condition="row['accepted']", routes={"true": "default", "false": "retained"})],
+            gates=[
+                GateSettings(
+                    name="quality_check", input="checked", condition="row['accepted']", routes={"true": "default", "false": "retained"}
+                )
+            ],
             sinks={"default": as_sink(ordinary), "retained": as_sink(retention)},
         ),
         ordinary,

@@ -443,12 +443,27 @@ def test_advisor_declarative_unknown_argument_keys_are_sentinelised() -> None:
 
 
 @pytest.mark.parametrize(
+    "encoding_options",
+    [{}, {"encoding": None}, {"encoding": "utf-8-sig"}],
+    ids=["omitted", "null", "explicit"],
+)
+def test_inspect_source_encoding_argument_is_preserved(encoding_options: dict[str, object]) -> None:
+    """Persist the actual inspection interpretation rather than an unknown-key marker."""
+    arguments = {"blob_id": "11111111-1111-4111-8111-111111111111", **encoding_options}
+
+    result = redact_tool_call_arguments("inspect_source", arguments, telemetry=NoopRedactionTelemetry())
+
+    assert result == arguments
+
+
+@pytest.mark.parametrize(
     ("tool_name", "arguments"),
     [
         ("list_blobs", {}),
         ("list_composer_blobs", {}),
         ("get_blob_metadata", {"blob_id": "11111111-1111-4111-8111-111111111111"}),
         ("inspect_source", {"blob_id": "11111111-1111-4111-8111-111111111111"}),
+        ("inspect_source", {"blob_id": "11111111-1111-4111-8111-111111111111", "encoding": "utf-8-sig"}),
     ],
 )
 def test_blob_discovery_unknown_argument_keys_are_sentinelised(

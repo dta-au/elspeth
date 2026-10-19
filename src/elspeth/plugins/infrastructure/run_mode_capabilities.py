@@ -50,6 +50,7 @@ _TRANSFORM_CLASSES = {
     "batch_data_quality_report": ("elspeth.plugins.transforms.batch_data_quality_report", "BatchDataQualityReport"),
     "batch_distribution_profile": ("elspeth.plugins.transforms.batch_distribution_profile", "BatchDistributionProfile"),
     "batch_drift_compare": ("elspeth.plugins.transforms.batch_drift_compare", "BatchDriftCompare"),
+    "batch_duplicate_annotator": ("elspeth.plugins.transforms.batch_duplicate_annotator", "BatchDuplicateAnnotator"),
     "batch_effect_size": ("elspeth.plugins.transforms.batch_effect_size", "BatchEffectSize"),
     "batch_experiment_compare": ("elspeth.plugins.transforms.batch_experiment_compare", "BatchExperimentCompare"),
     "batch_outlier_annotator": ("elspeth.plugins.transforms.batch_outlier_annotator", "BatchOutlierAnnotator"),

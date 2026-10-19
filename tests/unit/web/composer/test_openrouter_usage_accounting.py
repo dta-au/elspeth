@@ -14,13 +14,14 @@ pattern).
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from elspeth.web.composer.provider_gateway import (
     _apply_openrouter_usage_accounting,
-    _litellm_acompletion,
 )
+from tests.unit.web.composer.test_openrouter_app_attribution import _required_transport_call
 
 
 def test_openrouter_models_get_the_usage_accounting_opt_in() -> None:
@@ -83,7 +84,7 @@ def test_litellm_puts_the_opt_in_on_the_openrouter_wire_body() -> None:
     assert body["usage"] == {"include": True}
 
 
-def test_the_acompletion_choke_point_applies_the_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_acompletion_choke_point_applies_the_opt_in(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import litellm
 
     captured: dict[str, object] = {}
@@ -94,9 +95,23 @@ def test_the_acompletion_choke_point_applies_the_opt_in(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
 
-    asyncio.run(_litellm_acompletion(model="openrouter/anthropic/claude-sonnet-5", messages=[]))
+    asyncio.run(
+        _required_transport_call(
+            tmp_path / "openrouter",
+            model="openrouter/anthropic/claude-sonnet-5",
+            messages=[{"role": "user", "content": "hi"}],
+            provider=fake_acompletion,
+        )
+    )
     assert captured["usage"] == {"include": True}
 
     captured.clear()
-    asyncio.run(_litellm_acompletion(model="anthropic/claude-sonnet-5", messages=[]))
+    asyncio.run(
+        _required_transport_call(
+            tmp_path / "native",
+            model="anthropic/claude-sonnet-5",
+            messages=[{"role": "user", "content": "hi"}],
+            provider=fake_acompletion,
+        )
+    )
     assert "usage" not in captured

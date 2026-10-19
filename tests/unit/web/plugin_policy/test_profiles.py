@@ -1896,7 +1896,9 @@ def test_llm_result_checks_project_as_closed_public_postconditions_and_lower_unc
     assert knobs["result_checks"]["tier"] == "advanced"
     malformed = {**options, "result_checks": [{**checks[0], "unknown": True}]}
     assert list(validator.iter_errors(malformed))
-    lowered = registry.lower_options(plugin_id, alias="tutorial", safe_options={key: value for key, value in options.items() if key != "profile"})
+    lowered = registry.lower_options(
+        plugin_id, alias="tutorial", safe_options={key: value for key, value in options.items() if key != "profile"}
+    )
     assert deep_thaw(lowered.executable_options)["result_checks"] == checks
     assert deep_thaw(lowered.audit_safe_options) == options
     rendered = public.model_dump_json()

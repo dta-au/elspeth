@@ -58,6 +58,7 @@ class OutputFieldConfig(PluginConfig):
         type: Data type for schema enforcement, and the output column's row type
             (integer -> int, number -> float, boolean -> bool, string/enum -> str)
         values: Required for enum type - list of allowed values
+        nullable: Whether this required field also admits JSON null
     """
 
     # ``OutputFieldConfig`` inherits ``PluginConfig.schema_config`` (surfaced in
@@ -86,6 +87,11 @@ class OutputFieldConfig(PluginConfig):
         ),
     )
     values: list[str] | None = Field(None, description="Allowed values (required for enum type)")
+    nullable: bool = Field(
+        default=False,
+        strict=True,
+        description="Allow JSON null in this required field; the key must still be present. Defaults to false.",
+    )
 
     @model_validator(mode="after")
     def validate_enum_has_values(self) -> OutputFieldConfig:
@@ -105,9 +111,13 @@ class OutputFieldConfig(PluginConfig):
         """
         if self.type == OutputFieldType.ENUM:
             # Enum uses 'enum' keyword with allowed values
+            if self.nullable:
+                return {"type": ["string", "null"], "enum": [*(self.values or ()), None]}
             return {"type": "string", "enum": self.values}
         else:
             # Direct type mapping
+            if self.nullable:
+                return {"type": [self.type.value, "null"]}
             return {"type": self.type.value}
 
 

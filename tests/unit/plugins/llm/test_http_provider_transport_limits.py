@@ -140,6 +140,41 @@ def test_text_only_http_request_keeps_its_existing_shape(harness: _Harness) -> N
 
 
 @respx.mock
+def test_nullable_number_and_enum_schema_survive_the_http_request(harness: _Harness) -> None:
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "NullableAnswer",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "score": {"type": ["number", "null"]},
+                    "label": {"type": ["string", "null"], "enum": ["green", "blue", None]},
+                },
+                "required": ["score", "label"],
+            },
+        },
+    }
+    # Snapshot before dispatch so an in-place adapter mutation cannot change
+    # both the submitted object and the expected result.
+    expected = json.dumps(response_format, sort_keys=True)
+    route = respx.post(harness.url).mock(return_value=_response())
+
+    harness.provider.execute_query(
+        [ChatMessage(role="user", content="Assess the colour.")],
+        model="test-model",
+        temperature=0.0,
+        max_tokens=32,
+        audit_parent=harness.parent,
+        response_format=response_format,
+    )
+
+    assert len(route.calls) == 1
+    sent = json.loads(route.calls[0].request.content)
+    assert json.dumps(sent["response_format"], sort_keys=True) == expected
+
+
+@respx.mock
 def test_image_identity_changes_both_transport_and_semantic_request_hashes(harness: _Harness) -> None:
     respx.post(harness.url).mock(return_value=_response())
     for marker in (b"first", b"second"):

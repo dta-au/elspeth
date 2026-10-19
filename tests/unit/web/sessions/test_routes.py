@@ -767,9 +767,7 @@ def _make_progress_route_app(tmp_path: Path, *, user_id: str = "alice") -> tuple
     return app, service
 
 
-def _install_required_route_prompt_shields(
-    app: FastAPI, monkeypatch: pytest.MonkeyPatch
-) -> tuple[PromptGuardMount, list[dict[str, Any]]]:
+def _install_required_route_prompt_shields(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> tuple[PromptGuardMount, list[dict[str, Any]]]:
     """Exercise the real Azure client/parser; replace only its external HTTP."""
     import httpx
     from pydantic import SecretStr
@@ -815,9 +813,7 @@ def _install_required_route_prompt_shields(
     return PromptGuardMount(build_client(guard_settings)), requests
 
 
-def _assert_required_route_guard_checks(
-    envelopes: Sequence[Mapping[str, Any]], mount: PromptGuardMount, *, roles: list[str]
-) -> None:
+def _assert_required_route_guard_checks(envelopes: Sequence[Mapping[str, Any]], mount: PromptGuardMount, *, roles: list[str]) -> None:
     checks = [envelope["check"] for envelope in envelopes if envelope["_kind"] == "prompt_guard_audit"]
     assert [check["role"] for check in checks] == roles
     assert len({check["audit_id"] for check in checks}) == len(roles)
@@ -6193,8 +6189,14 @@ class TestMessageRoutes:
         passes = [envelope for envelope in envelopes if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND]
         assert len(envelopes) == 9
         assert [envelope["_kind"] for envelope in envelopes] == [
-            "prompt_guard_audit", "llm_call_audit", "prompt_guard_audit", "llm_call_audit",
-            "planner_attempt_audit", "planner_attempt_audit", "prompt_guard_audit", "llm_call_audit",
+            "prompt_guard_audit",
+            "llm_call_audit",
+            "prompt_guard_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "planner_attempt_audit",
+            "prompt_guard_audit",
+            "llm_call_audit",
             ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
         ]
         _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "advisor", "advisor"])
@@ -6984,13 +6986,18 @@ class TestLiteLLMErrorRedaction:
         assert not any(record.role == "assistant" for record in records)
         audit = [record.tool_calls[0] for record in records if record.role == "audit"]
         assert [envelope["_kind"] for envelope in audit] == [
-            "prompt_guard_audit", "llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND, DIAGNOSTIC_EVIDENCE_KIND,
-            "prompt_guard_audit", DIAGNOSTIC_EVIDENCE_KIND,
+            "prompt_guard_audit",
+            "llm_call_audit",
+            DIAGNOSTIC_EVIDENCE_KIND,
+            DIAGNOSTIC_EVIDENCE_KIND,
+            "prompt_guard_audit",
+            DIAGNOSTIC_EVIDENCE_KIND,
         ]
         _assert_required_route_guard_checks(audit, guard_mount, roles=["composer", "composer"])
         private = [
             ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id))
-            for envelope in audit if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+            for envelope in audit
+            if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
         assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
         assert guard_requests and all(request["userPrompt"] == "Hello" for request in guard_requests)
@@ -10972,13 +10979,17 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
     records = asyncio.run(service.get_messages(session_id, limit=None))
     audit = [record.tool_calls[0] for record in records if record.role == "audit"]
     assert [envelope["_kind"] for envelope in audit] == [
-        "prompt_guard_audit", "llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND,
-        DIAGNOSTIC_EVIDENCE_KIND, DIAGNOSTIC_EVIDENCE_KIND,
+        "prompt_guard_audit",
+        "llm_call_audit",
+        DIAGNOSTIC_EVIDENCE_KIND,
+        DIAGNOSTIC_EVIDENCE_KIND,
+        DIAGNOSTIC_EVIDENCE_KIND,
     ]
     _assert_required_route_guard_checks(audit, guard_mount, roles=["composer"])
     private = [
         ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id))
-        for envelope in audit if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+        for envelope in audit
+        if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
     ]
     assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
     assert guard_requests and all(request["userPrompt"] == "Try again" for request in guard_requests)

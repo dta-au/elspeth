@@ -114,7 +114,7 @@ def _llm_created_output_fields(
     return (
         *operational_fields,
         *(
-            FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value])
+            FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value], nullable=field.nullable)
             for field in output_fields
             if f"{prefix}{field.suffix}" not in operational_names
         ),
@@ -202,8 +202,14 @@ def _build_llm_output_schema_config(
 def _llm_generated_output_fields(
     response_field: str,
     extracted_fields: tuple[tuple[str, _FieldType], ...] = (),
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
 ) -> tuple[FieldDefinition, ...]:
-    """Declare successful query fields with operational-field precedence."""
+    """Declare successful query fields with operational-field precedence.
+
+    nullable_fields contains complete extracted names, including query prefixes.
+    A nullable field remains required: only its admitted value domain expands.
+    """
     operational_fields = tuple(
         FieldDefinition(name=f"{response_field}{suffix}", field_type=_SUFFIX_SCHEMA_TYPES[suffix], required=True, nullable=False)
         for suffix in LLM_GUARANTEED_SUFFIXES
@@ -212,7 +218,7 @@ def _llm_generated_output_fields(
     return (
         *operational_fields,
         *(
-            FieldDefinition(name=name, field_type=field_type, required=True, nullable=False)
+            FieldDefinition(name=name, field_type=field_type, required=True, nullable=name in nullable_fields)
             for name, field_type in extracted_fields
             if name not in operational_names
         ),
@@ -249,13 +255,15 @@ def build_llm_source_output_schema_config(
     and guaranteed. ``structured_output_fields`` (the source's top-level
     structured-output declaration) join the emitted set with their declared
     runtime types — extraction fails the row before emission when one is
-    missing, so on success they are always present.
+    missing, so on success they are always present. Their nullable flags govern
+    both explicit authored declarations and added output-field declarations.
     """
     validate_field_name(response_field, "response_field")
     structured_names = tuple(field.suffix for field in structured_output_fields)
     guaranteed_fields = (*get_llm_guaranteed_fields(response_field), *structured_names)
     expected_types = {f"{response_field}{suffix}": _SUFFIX_SCHEMA_TYPES[suffix] for suffix in LLM_GUARANTEED_SUFFIXES}
     expected_types.update({field.suffix: _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value] for field in structured_output_fields})
+    nullable_fields = frozenset(field.suffix for field in structured_output_fields if field.nullable)
 
     authored_fields = schema_config.fields or ()
     authored_by_name = {field.name: field for field in authored_fields}
@@ -291,14 +299,16 @@ def build_llm_source_output_schema_config(
             raise ValueError(f"LLM source schema field {field_name!r} must have type {expected_type!r}, got {actual_type!r}")
         if not authored_field.required:
             raise ValueError(f"LLM source schema field {field_name!r} must be required")
-        if authored_field.nullable:
+        if field_name in nullable_fields and not authored_field.nullable:
+            raise ValueError(f"LLM source schema field {field_name!r} must be nullable")
+        if field_name not in nullable_fields and authored_field.nullable:
             raise ValueError(f"LLM source schema field {field_name!r} must be non-nullable")
 
     if schema_config.fields is None:
         output_fields = None
     else:
         output_fields = authored_fields + tuple(
-            FieldDefinition(name=field_name, field_type=field_type)
+            FieldDefinition(name=field_name, field_type=field_type, nullable=field_name in nullable_fields)
             for field_name, field_type in expected_types.items()
             if field_name not in authored_by_name
         )
@@ -389,6 +399,8 @@ def _build_augmented_output_schema(
     response_field: str,
     schema_name: str,
     extracted_fields: tuple[tuple[str, _FieldType], ...] | None = None,
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
 ) -> type[PluginSchema]:
     """Build an output schema that includes LLM-added fields.
 
@@ -407,6 +419,7 @@ def _build_augmented_output_schema(
         extracted_fields: (field_name, schema_type) tuples from single-mode
             structured output_fields config — unprefixed fields extracted
             from the LLM JSON response (e.g. (("score", "int"),)).
+        nullable_fields: Complete extracted field names that admit None.
 
     Returns:
         A PluginSchema subclass with input fields plus LLM output fields.
@@ -417,7 +430,7 @@ def _build_augmented_output_schema(
         # Observed schemas accept anything — no augmentation needed
         return create_schema_from_config(base_schema_config, schema_name, allow_coercion=False)
 
-    generated_fields = _llm_generated_output_fields(response_field, extracted_fields or ())
+    generated_fields = _llm_generated_output_fields(response_field, extracted_fields or (), nullable_fields=nullable_fields)
     augmented_config = SchemaConfig(
         # Use flexible mode so extra fields from upstream are accepted
         mode="flexible",
@@ -435,6 +448,8 @@ def _build_multi_query_output_schema(
     query_names: tuple[str, ...],
     schema_name: str,
     extracted_fields: dict[str, tuple[tuple[str, _FieldType], ...]] | None = None,
+    *,
+    nullable_fields: frozenset[str] = frozenset(),
 ) -> type[PluginSchema]:
     """Build an output schema for multi-query mode with prefixed fields.
 
@@ -454,6 +469,7 @@ def _build_multi_query_output_schema(
         extracted_fields: Mapping of query name to (field_name, schema_type) tuples
             from structured output_fields config. These are fields extracted from
             LLM JSON responses (e.g., {"quality": (("quality_score", "int"), ("quality_label", "str"))}).
+        nullable_fields: Complete query-prefixed extracted names that admit None.
 
     Returns:
         A PluginSchema subclass with input fields plus prefixed LLM output fields.
@@ -474,6 +490,7 @@ def _build_multi_query_output_schema(
         for field in _llm_generated_output_fields(
             f"{query_name}_{response_field}",
             extracted_fields[query_name] if extracted_fields is not None and query_name in extracted_fields else (),
+            nullable_fields=nullable_fields,
         )
     )
     augmented_config = SchemaConfig(

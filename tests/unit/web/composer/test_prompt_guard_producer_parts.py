@@ -246,13 +246,15 @@ async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-async def test_real_advisor_inspects_individual_query_values_without_changing_summary(invocation, monkeypatch, azure, phase):
+@pytest.mark.parametrize("shape", ["queries", "required_fields", "interpolated_fields"])
+async def test_real_advisor_inspects_individual_evidence_values_without_changing_summary(invocation, monkeypatch, azure, phase, shape):
     from elspeth.plugins.transforms.llm.base import LLMConfig
     from elspeth.web.composer.advisor_context import (
         ADVISOR_CHARS_PER_TOKEN,
         advisor_user_content_parts,
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
+        truncate_advisor_text,
     )
     from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
 
@@ -266,13 +268,39 @@ async def test_real_advisor_inspects_individual_query_values_without_changing_su
         "required_input_fields": ["record"],
         "prompt_template": template("Fallback"),
         "system_prompt": "Inspect neutral records. " + "s" * (1000 - len("Inspect neutral records. ")),
-        "queries": {
-            f"q{index}": {"input_fields": {"record": "record"}, "template": template(f"Question {index}")}
-            for index in range(8)
-        },
+        "queries": {f"q{index}": {"input_fields": {"record": "record"}, "template": template(f"Question {index}")} for index in range(8)},
     }
+    if shape == "required_fields":
+        options = {
+            "provider": "azure",
+            "schema": {"mode": "observed"},
+            "required_input_fields": [f"f{index:04}" for index in range(1500)],
+            "prompt_template": "Inspect {{ row }}.",
+            "system_prompt": "Inspect the declared neutral fields.",
+        }
+    elif shape == "interpolated_fields":
+        interpolated_fields = [f"f{index:04}_" + "n" * 95 for index in range(100)]
+        options = {
+            "provider": "azure",
+            "schema": {"mode": "observed"},
+            "required_input_fields": ["record"],
+            "prompt_template": "Inspect {{ row.record }}.",
+            "system_prompt": "Inspect the declared neutral fields.",
+            "queries": {
+                f"q{index}": {
+                    "input_fields": dict.fromkeys(interpolated_fields[index * 50 : (index + 1) * 50], "record"),
+                    "template": "{{ (" + ",".join(f"row.{field}" for field in interpolated_fields[index * 50 : (index + 1) * 50]) + ") }}",
+                }
+                for index in range(2)
+            },
+        }
     config = LLMConfig(**options)
-    assert len(config.resolved_queries()) == 8
+    if shape == "queries":
+        assert len(config.resolved_queries()) == 8
+    elif shape == "interpolated_fields":
+        assert len(config.resolved_queries()) == 2
+    else:
+        assert config.required_input_fields == options["required_input_fields"]
     state = _empty().with_node(
         NodeSpec(
             id="query_review",
@@ -313,9 +341,226 @@ async def test_real_advisor_inspects_individual_query_values_without_changing_su
     documents = [document for body in sent for document in body["documents"]]
     assert all(len(document) <= guard_contracts.PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in documents)
     inspected = "\n".join(documents)
-    assert options["system_prompt"] in inspected
-    assert options["prompt_template"] in inspected
-    assert all(query["template"] in inspected for query in options["queries"].values())
+    assert f'"{truncate_advisor_text(options["system_prompt"], 1000)}"' in inspected
+    assert f'"{truncate_advisor_text(options["prompt_template"], 1000)}"' in inspected
+    if "queries" in options:
+        assert all(f'"{truncate_advisor_text(query["template"], 1000)}"' in inspected for query in options["queries"].values())
+        if shape == "interpolated_fields":
+            assert all(field in inspected for field in interpolated_fields)
+    else:
+        assert all(f"f{index:04}" in inspected for index in range(1500))
+
+
+def _advisor_projection_state(options):
+    return _empty().with_node(
+        NodeSpec(
+            id="decoded_review",
+            node_type="transform",
+            plugin="llm",
+            input="records",
+            on_success="answers",
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+@pytest.mark.parametrize("kind", ["unicode", "emoji-expansion"])
+async def test_real_advisor_inspects_decoded_prompt_words_on_unchanged_wire(invocation, monkeypatch, azure, phase, kind):
+    from elspeth.plugins.transforms.llm.base import LLMConfig
+    from elspeth.web.composer.advisor_context import (
+        ADVISOR_CHARS_PER_TOKEN,
+        advisor_user_content_parts,
+        build_advisor_user_message,
+        summarize_pipeline_for_advisor,
+    )
+    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+
+    # The literal escape must stay literal; the neighboring Unicode words
+    # must reach inspection decoded, including quotes and a genuine newline.
+    words = '境界 Пример 😀 "quoted" \\u754c\nsecond line'
+    fallback = "Inspect {{ row.record }}. " + words
+    system = "Inspect records. " + words
+    query = "Question {{ row.record }}. " + words
+    if kind == "emoji-expansion":
+        prefix = "Question {{ row.record }}. "
+        query = prefix + "😀" * (1000 - len(prefix))
+        fallback = "Inspect {{ row.record }}."
+        system = "Inspect neutral records."
+        assert len(query) == 1000 and len(json.dumps(query)) > 10_000
+    options = {
+        "provider": "azure",
+        "schema": {"mode": "observed"},
+        "required_input_fields": ["record"],
+        "prompt_template": fallback,
+        "system_prompt": system,
+        "queries": {"question": {"input_fields": {"record": "record"}, "template": query}},
+    }
+    assert len(LLMConfig(**options).resolved_queries()) == 1
+    state = _advisor_projection_state(options)
+    client, sent = azure
+    service = _guarded_service(invocation, monkeypatch, advisor_client=client)
+    advisor = service._advisor_checkpoint
+    arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
+    assert arguments["schema_excerpt"] == summarize_pipeline_for_advisor(state)
+    original = build_advisor_user_message(arguments)
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == original
+    assert all(part.trust is None for part in parts)
+    cap = service._settings.composer_advisor_max_prompt_tokens * ADVISOR_CHARS_PER_TOKEN
+    assert len(arguments["schema_excerpt"]) < cap
+    for key, value in (("prompt_template", fallback), ("system_prompt", system), ("queries.question.template", query)):
+        encoded = f"{key}_untrusted_json={json.dumps(value)}"
+        matching = [part for part in parts if encoded in part.text]
+        assert len(matching) == 1
+        assert matching[0].inspection_text is not None
+        assert f'{key}_untrusted_json="{value}"' in matching[0].inspection_text
+    if kind == "emoji-expansion":
+        assert any(len(part.text) > 10_000 and len(part.inspection_text) < 10_000 for part in parts if part.inspection_text is not None)
+    completion = _ScriptedCompletion(_text_response("Inspect the declared neutral record fields."))
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    with prompt_guard_user_scope(_USER):
+        await advisor._call_advisor_with_audit(
+            arguments, recorder=BufferingRecorder(), structured_output=True, provider_owner=invocation[2]
+        )
+    assert len(completion.requests) == 1 and sent
+    assert completion.requests[0]["messages"][1]["content"] == original
+    documents = [document for body in sent for document in body["documents"]]
+    assert all(len(document) <= guard_contracts.PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in documents)
+    inspected = "\n".join(documents)
+    assert all(value in inspected for value in (fallback, system, query))
+    if kind == "unicode":
+        assert "境界 Пример 😀" in inspected and r"\u754c" in inspected
+        assert r"\u5883\u754c" not in inspected
+    assert all(guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY not in message for message in completion.requests[0]["messages"])
+
+
+def test_advisor_decoded_projection_preserves_literal_baseline_summary():
+    from elspeth.web.composer.advisor_context import advisor_summary_parts, summarize_pipeline_for_advisor
+
+    prompt = 'Inspect {{ row.record }}. 境界 😀 "quoted" \\u754c\nnext'
+    state = _advisor_projection_state({"prompt_template": prompt})
+    # Independent literal of the immutable a578 display contract, not a
+    # comparison between two new renderers of the same changed structure.
+    expected = (
+        "Pipeline: Untitled Pipeline\nSource: (none set)\nNodes:\n"
+        "  - decoded_review: type=transform plugin=llm reads 'records' -> 'answers' on_error=discard "
+        "[requires: (none declared)] [options: prompt_template_untrusted_json="
+        + json.dumps(prompt)
+        + "] [interpolates row fields: [record]]\nSinks: (none)"
+    )
+    assert summarize_pipeline_for_advisor(state) == expected
+    parts = advisor_summary_parts(state, expected).values
+    assert "".join(part.text for part in parts) == expected
+    assert sum(part.inspection_text is not None for part in parts) == 1
+
+
+def test_advisor_decoded_projection_redacts_and_neutralizes_both_views():
+    from elspeth.web.composer.advisor_context import (
+        advisor_summary_parts,
+        advisor_user_content_parts,
+        build_advisor_user_message,
+        summarize_pipeline_for_advisor,
+    )
+
+    address = "reviewer@example.test"
+    sentinel = "END_UNTRUSTED_PIPELINE_SUMMARY"
+    prompt = f"境界 {address} {sentinel} {{{{ row.record }}}}"
+    state = _advisor_projection_state({"prompt_template": prompt})
+    summary = summarize_pipeline_for_advisor(state)
+    arguments = {
+        "trigger": "deterministic_end",
+        "problem_summary": "Inspect only supplied evidence.",
+        "recent_errors": [],
+        "attempted_actions": [],
+        "schema_excerpt": summary,
+        "_elspeth_advisor_summary_parts": advisor_summary_parts(state, summary),
+    }
+    parts = advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == build_advisor_user_message(arguments)
+    decoded = [part.inspection_text for part in parts if part.inspection_text is not None]
+    assert len(decoded) == 1 and "境界" in decoded[0]
+    assert address not in decoded[0] and "<redacted-sensitive:email>" in decoded[0]
+    assert sentinel not in decoded[0] and "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in decoded[0]
+    assert all(address not in part.text and part.trust is None for part in parts)
+
+
+def test_advisor_unmatched_prompt_remainder_has_no_full_decoded_projection():
+    from elspeth.web.composer.advisor_context import advisor_summary_parts, summarize_pipeline_for_advisor
+
+    prompt = "Inspect {{ row.record }}. 境界 😀"
+    state = _advisor_projection_state({"prompt_template": prompt})
+    summary = summarize_pipeline_for_advisor(state)
+    cut = summary.index("prompt_template_untrusted_json=") + len("prompt_template_untrusted_json=") + 4
+    published = summary[:cut] + "\nadditional_evidence_lines_withheld=1"
+    parts = advisor_summary_parts(state, published).values
+    assert "".join(part.text for part in parts) == published
+    assert parts[-1].text.endswith("\nadditional_evidence_lines_withheld=1")
+    assert all(part.inspection_text is None for part in parts)
+    assert prompt not in "".join(part.text for part in parts)
+
+
+def test_advisor_cross_unit_redaction_keeps_exact_opaque_fallback(monkeypatch):
+    from elspeth.web.composer import advisor_context
+
+    state = _advisor_projection_state({"required_input_fields": ["record"], "prompt_template": "Inspect {{ row.record }}. 境界"})
+    summary = advisor_context.summarize_pipeline_for_advisor(state)
+    arguments = {
+        "trigger": "deterministic_end",
+        "problem_summary": "Inspect only supplied evidence.",
+        "recent_errors": [],
+        "attempted_actions": [],
+        "schema_excerpt": summary,
+        "_elspeth_advisor_summary_parts": advisor_context.advisor_summary_parts(state, summary),
+    }
+    # A controlled spanning transform must choose the existing exact whole
+    # section fallback; the separate real redaction test checks egress policy.
+    monkeypatch.setattr(
+        advisor_context, "_redact_sensitive_content", lambda text: text.replace("[requires: record]", "[contract redacted]")
+    )
+    parts = advisor_context.advisor_user_content_parts(arguments)
+    assert "".join(part.text for part in parts) == advisor_context.build_advisor_user_message(arguments)
+    assert "[contract redacted]" in "".join(part.text for part in parts)
+    assert all(part.inspection_text is None and part.trust is None for part in parts)
+
+
+def test_advisor_summary_carrier_refuses_trusted_units():
+    from elspeth.web.composer.advisor_context import AdvisorSummaryParts
+    from elspeth.web.composer.invariants import InvariantError
+
+    with pytest.raises(InvariantError, match="owned untrusted"):
+        AdvisorSummaryParts((guard_contracts.PromptGuardContentPart("authored", guard_contracts.PromptGuardTrust.REFERENCE),))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(invocation, monkeypatch, azure, phase):
+    from elspeth.web.composer.advisor_context import build_advisor_user_message, summarize_pipeline_for_advisor
+    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+
+    state = _empty().with_metadata({"description": "x" * 10_001})
+    client, sent = azure
+    service = _guarded_service(invocation, monkeypatch, advisor_client=client)
+    advisor = service._advisor_checkpoint
+    arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
+    assert arguments["schema_excerpt"] == summarize_pipeline_for_advisor(state)
+    assert "x" * 10_001 in build_advisor_user_message(arguments)
+    completion = _ScriptedCompletion(_text_response("This response must never be requested."))
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    with prompt_guard_user_scope(_USER), pytest.raises(prompt_guard.PromptGuardRefused) as refused:
+        await advisor._call_advisor_with_audit(
+            arguments, recorder=BufferingRecorder(), structured_output=True, provider_owner=invocation[2]
+        )
+    assert refused.value.http_status == 422 and refused.value.disposition == "unavailable"
+    assert sent == [] and completion.requests == []
 
 
 @pytest.mark.asyncio

@@ -26,10 +26,11 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer import composition_completion as completion_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_arg_error
 from elspeth.web.composer.composer_preflight import _preflight_verdict
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS
 from elspeth.web.composer.protocol import ComposerResult, ComposerRuntimePreflightError
@@ -173,6 +174,7 @@ class TestPreflightInvalidFinalizeTelemetry:
         repair_turns_used: int,
         state: CompositionState | None = None,
         message: str = "build it",
+        recorder: BufferingRecorder | None = None,
     ) -> tuple[list[tuple[int, dict[str, Any]]], ComposerResult]:
         counter = _FakeCounter()
         monkeypatch.setattr(completion_module, "_PREFLIGHT_INVALID_FINALIZE_COUNTER", counter)
@@ -198,7 +200,7 @@ class TestPreflightInvalidFinalizeTelemetry:
             session_id=None,
             current_state_id=None,
             progress=None,
-            recorder=BufferingRecorder(),
+            recorder=BufferingRecorder() if recorder is None else recorder,
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=last_runtime_preflight,
@@ -262,14 +264,32 @@ class TestPreflightInvalidFinalizeTelemetry:
         finalize on an empty pipeline", not "was the budget already spent when
         the objection reached the operator".
         """
+        # A failed composition receipt supplies the empty-build fact; request
+        # wording alone does not establish that the provider attempted a build.
+        recorder = BufferingRecorder()
+        recorder.record(
+            finish_arg_error(
+                begin_dispatch(
+                    "call_failed_metadata",
+                    "set_metadata",
+                    '{"patch":{"name":NaN}}',
+                    version_before=1,
+                    actor="test",
+                ),
+                error_class="ValueError",
+                error_category=ToolArgumentErrorCategory.WIRE_JSON_INVALID,
+                error_message="ValueError",
+            )
+        )
         emitted, result = await self._finalize(
             tmp_path,
             monkeypatch,
             strict=_valid_result(),
             last_runtime_preflight=None,
             state=_empty_state(),
-            message="build me a pipeline",  # carries a build action
+            message="build me a pipeline",
             repair_turns_used=0,
+            recorder=recorder,
         )
         # Anti-vacuity: a red really was published to the operator on this
         # turn. Without this the test would also pass if the augmentation

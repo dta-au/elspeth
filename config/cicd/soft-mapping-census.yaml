@@ -265,6 +265,8 @@ files:
     dict[str, object]: 1
   src/elspeth/engine/executors/sink.py:
     dict[str, object]: 9
+  src/elspeth/engine/executors/sink_disposition_reason.py:
+    Mapping[str, object]: 1
   src/elspeth/engine/executors/sink_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/executors/sink_required_fields.py:
@@ -527,6 +529,8 @@ files:
   src/elspeth/plugins/transforms/batch_drift_compare.py:
     dict[str, Any]: 2
     dict[str, object]: 2
+  src/elspeth/plugins/transforms/batch_duplicate_annotator.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_effect_size.py:
     dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_experiment_compare.py:
@@ -759,7 +763,7 @@ files:
     Mapping[str, Any]: 3
     dict[str, Any]: 10
   src/elspeth/web/composer/advisor_context.py:
-    Mapping[str, Any]: 7
+    Mapping[str, Any]: 8
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 1
@@ -871,7 +875,7 @@ files:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
   src/elspeth/web/composer/state.py:
-    Mapping[str, Any]: 16
+    Mapping[str, Any]: 17
     dict[str, Any]: 12
   src/elspeth/web/composer/tool_batch.py:
     Mapping[str, Any]: 10
@@ -1068,10 +1072,10 @@ files:
     Mapping[str, Any]: 15
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 760
-  Mapping[str, object]: 315
+  Mapping[str, Any]: 762
+  Mapping[str, object]: 316
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1078
+  dict[str, Any]: 1080
   dict[str, object]: 396
-  soft: 2557
+  soft: 2562

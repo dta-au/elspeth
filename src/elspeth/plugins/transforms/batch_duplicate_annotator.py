@@ -78,11 +78,16 @@ class DuplicateRule(BaseModel):
 
 class BatchDuplicateConfig(TransformDataConfig):
     rules: tuple[DuplicateRule, ...] = Field(
-        min_length=1, max_length=16,
+        min_length=1,
+        max_length=16,
         description="Independent exact-string domains. Each rule compares all its selected fields across all rows, including different fields in one row. Total selected cells is at most 256.",
     )
     output_prefix: Annotated[str, EmittedToOutput("This prefix forms the emitted admission and cause column names.")] = Field(
-        default="duplicates", strict=True, min_length=1, max_length=64, pattern=r"^[a-z_][a-z0-9_]*$",
+        default="duplicates",
+        strict=True,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z_][a-z0-9_]*$",
         description="Emits <prefix>_valid (bool) and <prefix>_causes (JSON string of static rule/field/category records).",
     )
 
@@ -96,10 +101,18 @@ class BatchDuplicateConfig(TransformDataConfig):
 
 
 class BatchDuplicateAnnotator(BaseTransform):
+    """Annotate every exact duplicate participant after complete source exhaustion.
+
+    Each rule compares its selected fields together, including cross-field and
+    same-row matches. No members are removed. Malformed cells add static causes
+    only to their own member. The shared output contract preserves input values
+    and adds a strict Boolean admission plus a JSON-string cause list.
+    """
+
     name = "batch_duplicate_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0000000000000000"
+    source_file_hash: str | None = "sha256:ac8e4181bdb2164b"
     config_model = BatchDuplicateConfig
     is_batch_aware = True
     flush_emits_one_row_per_buffered_row = True
@@ -108,7 +121,7 @@ class BatchDuplicateAnnotator(BaseTransform):
     passes_through_input = True
     preserves_input_values = True
     capability_tags = ("batch", "duplicates", "annotation")
-    usage_when_to_use = "Annotate exact duplicate cells across one finite complete source, retaining every original member for downstream admission."
+    usage_when_to_use = "Annotate exact duplicate cells at end-of-source across one finite complete source, retaining every original member for downstream admission."
     usage_when_not_to_use = "Not for unbounded, append, cross-run, partitioned or early-flush comparison. Does not judge semantic similarity or choose survivors."
     example_use = """aggregations:
   - name: compare_text
@@ -155,7 +168,8 @@ class BatchDuplicateAnnotator(BaseTransform):
         if issue_code is not None:
             return None
         return PluginAssistance(
-            plugin_name=cls.name, issue_code=None,
+            plugin_name=cls.name,
+            issue_code=None,
             summary="Exact duplicate membership across all selected cells of one complete finite source window.",
             composer_hints=(
                 "Use an aggregation with omitted/empty trigger and output_mode: passthrough before any report writer/fork. Every original member continues in order; no filtering or survivor selection.",
@@ -180,13 +194,15 @@ class BatchDuplicateAnnotator(BaseTransform):
             return self._refuse("comparison_capacity_exceeded")
         window = ctx.aggregation_batch
         if window is None or not (
-            window.trigger_type == "end_of_source" and window.is_end_of_source
+            window.trigger_type == "end_of_source"
+            and window.is_end_of_source
             and window.flush_index == window.row_start == 1
             and window.batch_size == window.rows_seen_total == window.row_end == len(rows)
         ):
             return self._refuse("complete_source_window_required")
-        for member in rows:
-            names = set(member.keys()) | {name for field in member.contract.fields for name in (field.normalized_name, field.original_name)}
+        canonical_rows = [member.to_dict() for member in rows]
+        for member, values in zip(rows, canonical_rows, strict=True):
+            names = set(values) | {name for field in member.contract.fields for name in (field.normalized_name, field.original_name)}
             if names & self.declared_output_fields:
                 return self._refuse("output_field_collision")
 
@@ -194,15 +210,14 @@ class BatchDuplicateAnnotator(BaseTransform):
         inspected_chars = 0
         for rule in self._rules:
             groups: dict[str, list[tuple[int, str]]] = {}
-            for index, member in enumerate(rows):
-                carried_fields = frozenset(member.keys())
+            for index, (member, values) in enumerate(zip(rows, canonical_rows, strict=True)):
                 for cell in rule.cells:
                     # Canonical carried keys only; original header aliases cannot
                     # cause the same physical cell to be compared twice.
-                    if cell.field not in carried_fields or type(member[cell.field]) is not str:
+                    if cell.field not in values or type(values[cell.field]) is not str:
                         causes[index].add((rule.name, cell.field, "invalid_string"))
                         continue
-                    value = member[cell.field]
+                    value = values[cell.field]
                     inspected_chars += len(value)
                     if inspected_chars > _MAX_COMPARISON_CHARS:
                         return self._refuse("comparison_capacity_exceeded")
@@ -216,13 +231,24 @@ class BatchDuplicateAnnotator(BaseTransform):
                     for index, field in group:
                         causes[index].add((rule.name, field, "duplicate"))
 
-        serialized = [json.dumps([{"rule": rule, "field": field, "category": category} for rule, field, category in sorted(member_causes)], separators=(",", ":")) for member_causes in causes]
+        serialized = [
+            json.dumps(
+                [{"rule": rule, "field": field, "category": category} for rule, field, category in sorted(member_causes)],
+                separators=(",", ":"),
+            )
+            for member_causes in causes
+        ]
         if any(len(value) > _MAX_CAUSE_CHARS for value in serialized):
             return self._refuse("cause_capacity_exceeded")
         joined = join_batch_contracts(list({id(member.contract): member.contract for member in rows}.values()))
         additions = tuple(FieldContract(name, name, object, False, "inferred") for name in sorted(self.declared_output_fields))
-        contract = self._align_output_contract(self._apply_declared_output_field_contracts(SchemaContract(mode=joined.mode, fields=(*joined.fields, *additions), locked=True)))
+        contract = self._align_output_contract(
+            self._apply_declared_output_field_contracts(SchemaContract(mode=joined.mode, fields=(*joined.fields, *additions), locked=True))
+        )
         return TransformResult.success_multi(
-            [PipelineRow({**member.to_dict(), self._valid_field: not member_causes, self._causes_field: message}, contract) for member, member_causes, message in zip(rows, causes, serialized, strict=True)],
+            [
+                PipelineRow({**values, self._valid_field: not member_causes, self._causes_field: message}, contract)
+                for values, member_causes, message in zip(canonical_rows, causes, serialized, strict=True)
+            ],
             success_reason={"action": "enriched", "fields_added": sorted(self.declared_output_fields)},
         )
