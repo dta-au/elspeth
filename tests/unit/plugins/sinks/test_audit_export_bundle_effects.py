@@ -887,9 +887,13 @@ def test_private_csv_spool_corruption_is_tier_one_and_output_files_use_fd_permis
         owned_names: list[str] = []
         spool = bundle_effects._RecordSpool("run.csv", io.StringIO("[]\n"), set())
         with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="private spool"):
-            bundle_effects._write_csv_file_at(directory_fd, "run.csv", spool, owned_names)
+            bundle_effects._write_csv_file_at(
+                directory_fd, "run.csv", spool, owned_names, bundle_effects._BundleStorageAdmission(tmp_path / "audit", 0)
+            )
 
-        entry = bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"{}", owned_names)
+        entry = bundle_effects._write_exact_file_at(
+            directory_fd, "audit_manifest.v2.json", b"{}", owned_names, bundle_effects._BundleStorageAdmission(tmp_path / "audit", 0)
+        )
     finally:
         os.close(directory_fd)
 
@@ -921,7 +925,9 @@ def test_output_hash_rejects_file_replacement_after_write(
     directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="changed"):
-            bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"original", [])
+            bundle_effects._write_exact_file_at(
+                directory_fd, "audit_manifest.v2.json", b"original", [], bundle_effects._BundleStorageAdmission(tmp_path / "audit", 0)
+            )
     finally:
         os.close(directory_fd)
 

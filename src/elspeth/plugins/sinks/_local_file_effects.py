@@ -71,12 +71,14 @@ def local_file_storage_admission(roots: Sequence[Path], admit: Callable[[Path, i
 
 
 def local_file_storage_bytes(target: Path) -> int:
-    """Measure retained target and recoverable staging bodies for one target."""
+    """Measure retained target and recoverable file or flat bundle bodies."""
     name = glob.escape(target.name)
     candidates = {
         target,
         *target.parent.glob(f".{name}.elspeth-*.stage"),
         *target.parent.glob(f"..{name}.elspeth-*.stage.*.building"),
+        *target.parent.glob(f".{name}.elspeth-*.bundle-stage"),
+        *target.parent.glob(f".{name}.elspeth-*.building-*"),
     }
     total = 0
     for candidate in candidates:
@@ -84,9 +86,16 @@ def local_file_storage_bytes(target: Path) -> int:
             result = candidate.lstat()
         except FileNotFoundError:
             continue
-        if not stat.S_ISREG(result.st_mode):
+        if stat.S_ISDIR(result.st_mode):
+            for child in candidate.iterdir():
+                child_result = child.lstat()
+                if not stat.S_ISREG(child_result.st_mode):
+                    raise LocalFilePreconditionError("local output bundle member is not a regular file")
+                total += child_result.st_size
+        elif not stat.S_ISREG(result.st_mode):
             raise LocalFilePreconditionError("local output storage is not a regular file")
-        total += result.st_size
+        else:
+            total += result.st_size
     return total
 
 

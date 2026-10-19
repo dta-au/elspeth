@@ -12,7 +12,14 @@ from sqlalchemy import Engine, insert, select, update
 from elspeth.contracts.blobs import BlobQuotaExceededError, IdentityStorageQuotaExceededError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.sink_effects import SinkEffectInputKind, SinkEffectInspectionRequest
-from elspeth.plugins.sinks._local_file_effects import commit_local_effect, inspect_local_effect, prepare_local_effect
+from elspeth.plugins.sinks import _audit_export_bundle_effects as bundle_effects
+from elspeth.plugins.sinks._local_file_effects import (
+    LocalFilePreconditionError,
+    commit_local_effect,
+    inspect_local_effect,
+    local_file_storage_bytes,
+    prepare_local_effect,
+)
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sinks.document_sink import DocumentSink
 from elspeth.plugins.sinks.json_sink import JSONSink
@@ -22,6 +29,7 @@ from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.coordination.quota_authority import storage_bytes_used_on_connection
 from elspeth.web.sessions.models import output_storage_reservations_table, quota_policies_table, runs_table
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
+from tests.unit.plugins.sinks.test_audit_export_bundle_effects import _prepare as prepare_bundle
 from tests.unit.plugins.sinks.test_local_file_sink_effects import _prepare as prepare_sink
 from tests.unit.web.blobs import test_service as fixtures
 
@@ -83,6 +91,98 @@ def _reserved(engine: Engine, target: Path) -> int:
                 output_storage_reservations_table.c.target_path == str(target),
             )
         ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_audit_bundle_refuses_before_writing_and_releases_reservation(
+    blob_service: BlobServiceImpl, db_engine: Engine, compose_context: SessionOperationContext, tmp_path: Path
+) -> None:
+    run, execute = await _run(db_engine, compose_context)
+    _cap(db_engine, "test-user", 1)
+    target = tmp_path / "outputs" / execute.fence.session_id / "audit"
+    target.parent.mkdir(parents=True)
+    with blob_service.run_output_write_admission(run, session_operation_context=execute):
+        with pytest.raises(IdentityStorageQuotaExceededError):
+            prepare_bundle(target)
+        assert not target.exists()
+        assert list(target.parent.iterdir()) == []
+        assert _reserved(db_engine, target) == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_bundle_cumulative_bytes_refuse_manifest_and_cleanup(
+    blob_service: BlobServiceImpl,
+    db_engine: Engine,
+    compose_context: SessionOperationContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run, execute = await _run(db_engine, compose_context)
+    target = tmp_path / "outputs" / execute.fence.session_id / "audit"
+    target.parent.mkdir(parents=True)
+    # This ceiling permits every CSV projection and refuses the next file.
+    # Measure the exact boundary with the ordinary CLI path first.
+    reference = prepare_bundle(tmp_path / "reference")
+    evidence = bundle_effects.BundlePlanEvidence.from_mapping(reference.safe_evidence)
+    csv_size = sum(entry.size_bytes for entry in evidence.files if entry.relative_path.endswith(".csv"))
+    _cap(db_engine, "test-user", csv_size)
+    original_write = bundle_effects._write_exact_file_at
+    observed: list[int] = []
+
+    def observe_manifest(
+        directory_fd: int, name: str, content: bytes, owned_names: list[str], storage: bundle_effects._BundleStorageAdmission
+    ) -> bundle_effects.BundleFileEntry:
+        observed.append(local_file_storage_bytes(target))
+        return original_write(directory_fd, name, content, owned_names, storage)
+
+    monkeypatch.setattr(bundle_effects, "_write_exact_file_at", observe_manifest)
+    with blob_service.run_output_write_admission(run, session_operation_context=execute):
+        with pytest.raises(IdentityStorageQuotaExceededError):
+            prepare_bundle(target)
+        assert observed == [csv_size]
+        assert list(target.parent.iterdir()) == []
+        assert _reserved(db_engine, target) == 0
+
+
+def test_bundle_storage_measurement_counts_all_bodies_and_refuses_symlinks(tmp_path: Path) -> None:
+    target = tmp_path / "audit"
+    candidates = (target, tmp_path / ".audit.elspeth-abc.bundle-stage", tmp_path / ".audit.elspeth-abc.building-crashed")
+    for index, directory in enumerate(candidates, 1):
+        directory.mkdir()
+        (directory / "run.csv").write_bytes(b"x" * index)
+    (tmp_path / "unrelated").write_bytes(b"ignored")
+    assert local_file_storage_bytes(target) == 6
+    (target / "symlink").symlink_to(tmp_path / "unrelated")
+    with pytest.raises(LocalFilePreconditionError, match="not a regular file"):
+        local_file_storage_bytes(target)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", ["staged", "published", "building"])
+async def test_audit_bundle_retained_bytes_remain_charged_across_restart(
+    blob_service: BlobServiceImpl, db_engine: Engine, compose_context: SessionOperationContext, tmp_path: Path, retained: str
+) -> None:
+    run, execute = await _run(db_engine, compose_context)
+    target = tmp_path / "outputs" / execute.fence.session_id / "audit"
+    target.parent.mkdir(parents=True)
+    with blob_service.run_output_write_admission(run, session_operation_context=execute):
+        plan = prepare_bundle(target)
+        assert plan.expected_descriptor is not None
+        expected_size = plan.expected_descriptor.size_bytes
+        assert _reserved(db_engine, target) == expected_size
+        if retained == "published":
+            bundle_effects.commit_audit_export_bundle(plan)
+        elif retained == "building":
+            staging = Path(str(plan.safe_evidence["staging_path"]))
+            staging.rename(target.with_name(f".{target.name}.elspeth-{'e' * 64}.building-crashed"))
+    assert _reserved(db_engine, target) == expected_size
+    _cap(db_engine, "test-user", expected_size)
+    fresh = BlobServiceImpl(db_engine, tmp_path, quota_exceeded_recorder=lambda _event: None)
+    with fresh.run_output_write_admission(run, session_operation_context=execute):
+        assert _reserved(db_engine, target) == expected_size
+        with pytest.raises(IdentityStorageQuotaExceededError):
+            _prepare(target.with_name("other.txt"), (b"x",))
+    assert _reserved(db_engine, target) == expected_size
 
 
 @pytest.mark.asyncio

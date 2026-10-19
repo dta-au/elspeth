@@ -54,6 +54,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
 )
 from elspeth.core.landscape.formatters import CSVFormatter
+from elspeth.plugins.sinks._local_file_effects import _admit_local_file_storage, local_file_storage_bytes
 
 AUDIT_MANIFEST_NAME: Final = AUDIT_EXPORT_DELIVERED_MANIFEST_NAME
 AUDIT_RECORDS_NAME: Final = AUDIT_EXPORT_PORTABLE_RECORDS_NAME
@@ -533,16 +534,39 @@ def _hash_regular_file_at(directory_fd: int, name: str, expected_identity: os.st
         os.close(descriptor)
 
 
+@dataclass(slots=True)
+class _BundleStorageAdmission:
+    target: Path
+    retained_bytes: int
+    written_bytes: int = 0
+
+    def admit(self, size_bytes: int) -> None:
+        total = self.written_bytes + size_bytes
+        _admit_local_file_storage(self.target, size_bytes=self.retained_bytes + total)
+        self.written_bytes = total
+
+
+@dataclass(slots=True)
+class _AdmittedCSVOutput:
+    stream: IO[str]
+    storage: _BundleStorageAdmission
+
+    def write(self, text: str) -> int:
+        self.storage.admit(len(text.encode("utf-8")))
+        return self.stream.write(text)
+
+
 def _write_csv_file_at(
     directory_fd: int,
     name: str,
     spool: _RecordSpool,
     owned_names: list[str],
+    storage: _BundleStorageAdmission,
 ) -> BundleFileEntry:
     descriptor = _open_owned_output(directory_fd, name, owned_names)
     identity = os.fstat(descriptor)
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as text:
-        writer = csv.DictWriter(text, fieldnames=sorted(spool.fieldnames), lineterminator="\r\n")
+        writer = csv.DictWriter(_AdmittedCSVOutput(text, storage), fieldnames=sorted(spool.fieldnames), lineterminator="\r\n")
         writer.writeheader()
         spool.stream.seek(0)
         for line in spool.stream:
@@ -561,10 +585,12 @@ def _write_exact_file_at(
     name: str,
     content: bytes,
     owned_names: list[str],
+    storage: _BundleStorageAdmission,
 ) -> BundleFileEntry:
     descriptor = _open_owned_output(directory_fd, name, owned_names)
     identity = os.fstat(descriptor)
     with os.fdopen(descriptor, "wb") as stream:
+        storage.admit(len(content))
         written = stream.write(content)
         if written != len(content):
             raise AuditExportBundlePreconditionError("bundle output accepted a partial write")
@@ -579,12 +605,14 @@ def _write_spooled_file_at(
     name: str,
     source: BinaryIO,
     owned_names: list[str],
+    storage: _BundleStorageAdmission,
 ) -> BundleFileEntry:
     descriptor = _open_owned_output(directory_fd, name, owned_names)
     identity = os.fstat(descriptor)
     source.seek(0)
     with os.fdopen(descriptor, "wb") as stream:
         while content := source.read(_COPY_CHUNK_BYTES):
+            storage.admit(len(content))
             written = stream.write(content)
             if written != len(content):
                 raise AuditExportBundlePreconditionError("bundle output accepted a partial write")
@@ -854,6 +882,9 @@ def _prepare_audit_export_bundle_with_portable_records(
     try:
         if not parent.is_still_bound():
             raise AuditExportBundlePreconditionError("bundle target parent changed before preparation")
+        retained_bytes = local_file_storage_bytes(target)
+        _admit_local_file_storage(target, size_bytes=retained_bytes)
+        storage = _BundleStorageAdmission(target, retained_bytes)
         building_name, building_descriptor = _create_private_building_tree_at(
             parent.descriptor,
             target.name,
@@ -863,12 +894,13 @@ def _prepare_audit_export_bundle_with_portable_records(
         spools, manifest_bytes, portable_records = _parse_verified_records(effect_input, portable_records)
         entries: list[BundleFileEntry] = []
         for relative_path in sorted(spools):
-            entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path], written_names))
+            entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path], written_names, storage))
         manifest_entry = _write_exact_file_at(
             building_descriptor,
             AUDIT_MANIFEST_NAME,
             manifest_bytes,
             written_names,
+            storage,
         )
         if (
             manifest_entry.content_hash != effect_input.signed_manifest.content_hash
@@ -882,6 +914,7 @@ def _prepare_audit_export_bundle_with_portable_records(
                 AUDIT_RECORDS_NAME,
                 portable_records,
                 written_names,
+                storage,
             )
         )
         files = tuple(sorted(entries, key=lambda entry: entry.relative_path))
@@ -954,6 +987,7 @@ def _prepare_audit_export_bundle_with_portable_records(
         for spool in spools.values():
             spool.stream.close()
         parent.close()
+        _admit_local_file_storage(target)
 
 
 def prepare_audit_export_bundle(
@@ -1072,6 +1106,7 @@ def commit_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectCommitResult:
         return _commit_result(descriptor, "rename_noreplace")
     finally:
         parent.close()
+        _admit_local_file_storage(target)
 
 
 def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileResult:
