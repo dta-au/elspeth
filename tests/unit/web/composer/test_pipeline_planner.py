@@ -245,6 +245,11 @@ _COMPOSER087_REFINEMENTS_CANONICAL_BYTES = 214
 # 4,259 B of room; corrected guidance measures 129,849 B, leaving 1,744 B.
 # Keep the finite tripwire and exact overflow control; do not renew automatically.
 _FIXED_SCAFFOLDING_WORKING_HEADROOM_BYTES = 4 * 1024
+# Reviewed 2026-10-19 (John): the retained attachment declaration and control
+# teaching now measure 131,702 canonical bytes against the 131,593-byte pin.
+# Approve only the measured 109-byte excess, not another working reserve.
+# Keep the finite ceiling and the exact-boundary / +1-byte overflow control.
+_QUALIFICATION_SCAFFOLD_CANONICAL_BYTES = 109
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -253,6 +258,7 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _RELEASE086_PLANNER_SCAFFOLD_CANONICAL_BYTES
     + _COMPOSER087_REFINEMENTS_CANONICAL_BYTES
     + _FIXED_SCAFFOLDING_WORKING_HEADROOM_BYTES
+    + _QUALIFICATION_SCAFFOLD_CANONICAL_BYTES
 )
 
 
@@ -1527,15 +1533,14 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert len(completion.requests) == 2
-    # Tool results land before the budget-pressure, information-closure, and
-    # decline-affordance notices (the discovery round resolved
-    # catalog.selection, so the decline affordance unlocks on the next turn).
-    assert completion.requests[1]["messages"][-4]["role"] == "tool"
-    assert completion.requests[1]["messages"][-3]["role"] == "user"
-    assert completion.requests[1]["messages"][-2]["content"] == (
-        "All declared information gaps are closed; emit the terminal proposal now."
-    )
-    assert 'starting with "DECLINE: "' in str(completion.requests[1]["messages"][-1]["content"])
+    # The completed discovery call precedes information closure and the
+    # newly eligible decline affordance, without budget-pressure steering.
+    messages = completion.requests[1]["messages"]
+    result_index = next(index for index, message in enumerate(messages) if message["role"] == "tool")
+    assert messages[result_index - 1]["tool_calls"][0]["id"] == messages[result_index]["tool_call_id"]
+    assert json.loads(messages[result_index]["content"])["success"] is True
+    assert messages[result_index + 1]["content"] == ("All declared information gaps are closed; emit the terminal proposal now.")
+    assert 'starting with "DECLINE: "' in messages[result_index + 2]["content"]
     assert len(recorder.invocations) == 1
     assert recorder.invocations[0].tool_name == "list_sources"
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
@@ -1565,21 +1570,17 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     reference = json.loads(request["messages"][1]["content"])
     payload = json.loads(request["messages"][2]["content"])
     assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
-    # Complete catalogs are supplied immediately; a grown live catalog must
-    # explicitly retain discovery for the whole provider lists it deferred.
+    # Literal model identifiers are discovered through list_models, regardless
+    # of SDK inventory size. The initial brief supplies aliases and grammar.
     supplied = {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
         "expression_grammar": "authoring_aids",
     }
-    deferred = bool(reference["authoring_aids"]["model_catalog"]["catalog"]["models_omitted"])
-    if catalog_inventory == "small":
-        assert not deferred
-    if not deferred:
-        supplied["model_catalog"] = "authoring_aids"
+    assert "model_catalog" not in reference["authoring_aids"]
     assert payload["information_manifest"]["supplied"] == supplied
     assert "plugin.schema" in payload["information_manifest"]["discoverable_classes"]
-    assert ("model.catalog" in payload["information_manifest"]["discoverable_classes"]) is deferred
+    assert "model.catalog" in payload["information_manifest"]["discoverable_classes"]
     assert "expression.grammar" not in payload["information_manifest"]["discoverable_classes"]
     assert payload["information_manifest"]["unresolved"] == []
     assert "unresolved_classes" not in payload["information_manifest"]
@@ -1868,11 +1869,33 @@ def _generic_document_abstract_pipeline(data_dir: Path) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_generic_linear_plan_reuses_initial_information_and_needs_one_discovery_turn(
+async def test_generic_linear_plan_uses_assistance_for_deferred_schema_contracts(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    completion = _ScriptedCompletion(
+    deferred: list[str] = []
+
+    class SchemaAwareCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            if len(self.requests) == 1:
+                messages = kwargs["messages"]
+                arguments_by_id = {
+                    call["id"]: json.loads(call["function"]["arguments"]) for message in messages for call in message.get("tool_calls", ())
+                }
+                for message in messages:
+                    if message["role"] != "tool":
+                        continue
+                    payload = json.loads(message["content"])
+                    if not payload["success"]:
+                        assert payload["data"]["error_code"] == "schema_contract_budget_exceeded"
+                        assert payload["data"]["next_tool"] == "get_plugin_assistance"
+                        deferred.append(arguments_by_id[message["tool_call_id"]]["name"])
+                if deferred:
+                    self.requests.append(deepcopy(kwargs))
+                    return _response(*(("get_plugin_assistance", {"plugin_type": "transform", "plugin_name": name}) for name in deferred))
+            return await super().__call__(**kwargs)
+
+    completion = SchemaAwareCompletion(
         _response(
             ("get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"}),
             ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
@@ -1891,12 +1914,12 @@ async def test_generic_linear_plan_reuses_initial_information_and_needs_one_disc
         information_aware=True,
     )
 
-    assert len(completion.requests) == 2
+    assert len(completion.requests) == 2 + bool(deferred)
     assert [invocation.tool_name for invocation in recorder.invocations] == [
         "get_plugin_schema",
         "get_plugin_schema",
         "get_plugin_schema",
-    ]
+    ] + ["get_plugin_assistance"] * len(deferred)
     assert result.proposal.repair_count == 0
     pipeline = deep_thaw(result.proposal.pipeline)
     assert [node["plugin"] for node in pipeline["nodes"]] == ["web_scrape", "llm", "field_mapper"]
@@ -1905,14 +1928,33 @@ async def test_generic_linear_plan_reuses_initial_information_and_needs_one_disc
     mapper = pipeline["nodes"][2]["options"]
     assert mapper["select_only"] is True
     assert mapper["mapping"] == {"document_uri": "document_uri", "abstract": "abstract"}
-    final_messages = completion.requests[1]["messages"]
-    assert sum(message["role"] == "tool" for message in final_messages) == 3
-    for message in final_messages:
+    schema_messages = completion.requests[1]["messages"]
+    assert sum(message["role"] == "tool" for message in schema_messages) == 3
+    for message in schema_messages:
         if message["role"] != "tool":
             continue
-        contract = json.loads(message["content"])["data"]
-        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints", "aggregation_output_modes"}
-    assert final_messages[-1]["content"] == "All declared information gaps are closed; emit the terminal proposal now."
+        payload = json.loads(message["content"])
+        if payload["success"]:
+            contract = payload["data"]
+            assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints", "aggregation_output_modes"}
+        else:
+            assert payload["data"]["error_code"] == "schema_contract_budget_exceeded"
+    final_messages = completion.requests[-1]["messages"]
+    if deferred:
+        # Assistance supplies guidance, not the refused complete schema. Keep
+        # both the actual refusal and the successful fallback in the protocol.
+        results = [json.loads(message["content"]) for message in final_messages if message["role"] == "tool"]
+        assert all(result["success"] for result in results[3:])
+        assert len(results[3:]) == len(deferred)
+        assert not any(
+            message.get("content") == "All declared information gaps are closed; emit the terminal proposal now."
+            for message in final_messages
+        )
+    else:
+        assert any(
+            message.get("content") == "All declared information gaps are closed; emit the terminal proposal now."
+            for message in final_messages
+        )
 
 
 @pytest.mark.asyncio
@@ -5938,6 +5980,7 @@ async def test_settlement_failure_does_not_replace_primary_provider_failure(
 async def test_secondary_cancellation_observes_failing_settlement_and_preserves_cancelled_error(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider_entered = asyncio.Event()
     settlement_entered = asyncio.Event()
@@ -5953,15 +5996,29 @@ async def test_secondary_cancellation_observes_failing_settlement_and_preserves_
     class SettlementFailure(RuntimeError):
         pass
 
+    failure = SettlementFailure("secondary settlement failure")
+
     async def fail_settlement(_outcome: str) -> None:
         settlement_entered.set()
         await settlement_release.wait()
-        raise SettlementFailure("secondary settlement failure")
+        raise failure
+
+    settled_errors: list[BaseException] = []
+    settle = pipeline_planner._settle_lifecycle
+
+    async def observe_settlement(lifecycle: PlannerRequestLifecycle, outcome: str) -> None:
+        try:
+            await settle(lifecycle, outcome)
+        except BaseException as error:
+            settled_errors.append(error)
+            raise
+
+    monkeypatch.setattr(pipeline_planner, "_settle_lifecycle", observe_settlement)
 
     loop = asyncio.get_running_loop()
-    unobserved: list[Mapping[str, Any]] = []
+    diagnostics: list[Mapping[str, Any]] = []
     prior_handler = loop.get_exception_handler()
-    loop.set_exception_handler(lambda _loop, context: unobserved.append(context))
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
     task = asyncio.create_task(
         _plan(
             tmp_path=tmp_path,
@@ -5982,7 +6039,20 @@ async def test_secondary_cancellation_observes_failing_settlement_and_preserves_
     finally:
         loop.set_exception_handler(prior_handler)
 
-    assert unobserved == []
+    assert task.cancelled()
+    (settlement_error,) = settled_errors
+    assert isinstance(settlement_error, asyncio.CancelledError)
+    assert settlement_error.__cause__ is failure
+    # Python 3.14 reports this exact shield diagnostic even after its inner
+    # exception has been retrieved and chained above. Older Python emits none.
+    # Unretrieved-task warnings or failures from any other task still fail.
+    assert len(diagnostics) <= 1
+    for diagnostic in diagnostics:
+        assert diagnostic["message"] == "SettlementFailure exception in shielded future"
+        assert diagnostic["exception"] is failure
+        future = diagnostic["future"]
+        assert future.done() and not future.cancelled()
+        assert future.exception() is failure
 
 
 @pytest.mark.asyncio
@@ -6555,7 +6625,7 @@ def test_both_endpoint_pairs_configured_together_is_valid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
+async def test_discovery_result_does_not_inject_removed_budget_pressure(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -6571,15 +6641,11 @@ async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
 
-    # max_discovery_turns defaults to 3: after the first discovery turn two
-    # remain, which is exactly when the budget-pressure steering must land.
-    first_turn = completion.requests[0]["messages"]
+    # The retained discovery limit must not become a pressure instruction
+    # steering the provider away from information it needs.
     second_turn = completion.requests[1]["messages"]
-    assert not any("discovery turns remain" in str(message.get("content")) for message in first_turn)
-    pressure = [
-        message for message in second_turn if message["role"] == "user" and "only 2 discovery turns remain" in str(message.get("content"))
-    ]
-    assert len(pressure) == 1
+    assert not any("discovery turns remain" in str(message.get("content")) for message in second_turn)
+    assert any(message["role"] == "tool" and json.loads(message["content"])["success"] for message in second_turn)
 
 
 @pytest.mark.asyncio
@@ -6616,7 +6682,9 @@ async def test_escape_hatch_overtime_turn_runs_advisor_with_terminal_tool_only(
         "emit_pipeline_proposal",
     ]
     notices = [
-        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+        message
+        for message in hatch_request["messages"]
+        if message["role"] == "user" and "senior advisor model" in str(message.get("content"))
     ]
     assert len(notices) == 1
     # The over-budget discovery attempt is dropped: no dangling assistant
@@ -7040,7 +7108,7 @@ async def test_escape_hatch_retains_actual_terminal_candidate_and_safe_result(
     assert json.loads(candidate_c_call["function"]["arguments"])["pipeline"]["metadata"]["description"] == injection_shaped_data
     assert injection_shaped_data not in hatch_messages[candidate_c_index + 1]["content"]
 
-    notices = [message for message in hatch_messages if message["role"] == "user" and "escape hatch" in str(message.get("content"))]
+    notices = [message for message in hatch_messages if message["role"] == "user" and "senior advisor model" in str(message.get("content"))]
     assert len(notices) == 1
     assert "Only protocol-complete turns are retained above" in notices[0]["content"]
     assert "final candidate (dropped" not in notices[0]["content"]
@@ -7296,8 +7364,10 @@ async def test_escape_hatch_omits_composition_call_rejected_before_execution(
     ]
     assert retained_call_ids == ["retained-rejection"]
     assert "OMITTED-COMPOSITION-CANDIDATE" not in canonical_json(hatch_messages)
-    notice = next(message["content"] for message in hatch_messages if message["role"] == "user" and "escape hatch" in message["content"])
-    assert "discovery/composition budgets are omitted" in notice
+    notice = next(
+        message["content"] for message in hatch_messages if message["role"] == "user" and "senior advisor model" in message["content"]
+    )
+    assert "calls rejected before execution are omitted" in notice
 
 
 @pytest.mark.asyncio
@@ -7325,8 +7395,10 @@ async def test_escape_hatch_omits_truncated_responses(
     hatch_messages = completion.requests[2]["messages"]
     assert not any('"pipeline": {"source"' in str(message.get("content")) for message in hatch_messages)
     assert not any(message["role"] == "assistant" for message in hatch_messages)
-    notice = next(message["content"] for message in hatch_messages if message["role"] == "user" and "escape hatch" in message["content"])
-    assert "truncated responses" in notice
+    notice = next(
+        message["content"] for message in hatch_messages if message["role"] == "user" and "senior advisor model" in message["content"]
+    )
+    assert "incomplete responses" in notice
 
 
 @pytest.mark.asyncio
@@ -8073,7 +8145,9 @@ async def test_escape_hatch_receives_final_rejection_context(
     hatch_request = completion.requests[2]
     assert hatch_request["model"] == "openrouter/advisor-under-test"
     notices = [
-        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+        message
+        for message in hatch_request["messages"]
+        if message["role"] == "user" and "senior advisor model" in str(message.get("content"))
     ]
     assert len(notices) == 1
     notice_content = str(notices[0]["content"])
@@ -8157,9 +8231,10 @@ async def test_escape_hatch_fires_on_discovery_cycle(
     notice = next(
         message["content"]
         for message in completion.requests[3]["messages"]
-        if message["role"] == "user" and "escape hatch" in message["content"]
+        if message["role"] == "user" and "senior advisor model" in message["content"]
     )
-    assert "discovery guards" in notice
+    assert "Only protocol-complete turns are retained above" in notice
+    assert "discovery guards" not in notice
 
 
 @pytest.mark.parametrize("field", ["pricing_model", "escape_hatch_pricing_model"])
@@ -8848,7 +8923,11 @@ async def test_aid_deferral_arms_keep_the_manifest_discoverable(
 
 @pytest.fixture
 def complete_model_catalog_aid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise supplied-aid semantics independently of SDK catalog growth."""
+    """Explicitly supply a complete optional aid to test manifest semantics.
+
+    Ordinary briefs discover model literals through list_models. These cases
+    exercise the retained supplied-aid branch with real helper output.
+    """
     from elspeth.web.composer import planner_authoring_aids
 
     monkeypatch.setattr(planner_authoring_aids, "read_litellm_model_list", lambda: ("bedrock/test-model",))
@@ -8856,6 +8935,17 @@ def complete_model_catalog_aid(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = planner_authoring_aids.planner_model_catalog()
     assert catalog["models_omitted"] == []
     assert catalog["models_by_provider"] == {"bedrock": ["bedrock/test-model"], "openrouter": ["openai/gpt-4o"]}
+    original = pipeline_planner.build_planner_authoring_aids
+
+    def aids_with_complete_catalog(policy_catalog: PolicyCatalogView) -> dict[str, Any]:
+        aids = original(policy_catalog)
+        aids["model_catalog"] = {
+            "guidance": "Complete model catalog supplied for this request; list_models remains available.",
+            "catalog": deepcopy(catalog),
+        }
+        return aids
+
+    monkeypatch.setattr(pipeline_planner, "build_planner_authoring_aids", aids_with_complete_catalog)
 
 
 @pytest.mark.asyncio
@@ -9190,7 +9280,9 @@ async def test_prose_overrun_engages_the_hatch_when_available(
         "emit_pipeline_proposal",
     ]
     notices = [
-        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+        message
+        for message in hatch_request["messages"]
+        if message["role"] == "user" and "senior advisor model" in str(message.get("content"))
     ]
     assert len(notices) == 1
     # The overrun attempt records the handoff, keeping the terminal

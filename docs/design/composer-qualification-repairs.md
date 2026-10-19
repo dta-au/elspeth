@@ -1,9 +1,11 @@
 # Composer qualification repairs
 
 This repair candidate starts from `0b13686a647481761839310013663cdd9b8df5df`
-(version 0.8.9). It repairs the delegated qualification failures. The entire
-candidate is not qualified: the completed wider planner check exposed the
-remaining cases listed below, and the integrator owns the canonical full gate.
+(version 0.8.9). Commit `47860b0227f23298e275803e4dd4afd3e30cf139`
+repairs the original delegated qualification failures. The subsequent test-only
+follow-up repairs the 16 wider planner consumers exposed by that checkpoint.
+The integrator owns the canonical full gate; these focused results do not
+qualify the entire candidate.
 
 ## Repairs and current-source counterevidence
 
@@ -50,21 +52,48 @@ Python 3.13 run remains a separate integration check. Evidence is private under
 Normal staged-file hooks are required by the commit dispatcher. Their result
 is recorded in the final checkpoint handoff.
 
-## Remaining planner failures
+## Planner consumer follow-up
 
 The wider focused planner run completed with exit 1: 38 failed, 357 passed.
-After separating the repaired discovery/palette cases, 16 cases remain for the
-integrator to diagnose or update. Their exact names and assertion categories
-are in the private `remaining-planner-failures.md` handoff:
+After the discovery/palette repairs, a fresh run reproduced the remaining
+16 failures on `47860b022`. The follow-up changes only planner tests:
 
-- One positional protocol assertion expects the last message to be a tool.
-- Five initial-brief consumers read the removed `model_catalog` field.
-- One selected-schema fixture expects a schema but receives a discovery error.
-- One secondary-cancellation case expects a diagnostic that was not recorded.
-- Eight pressure/hatch/prose cases expect removed aggregate boundaries or
-  exhaust their scripted replies.
+- Discovery assertions bind the completed tool result to its actual call ID
+  and retain closure/decline ordering without assuming removed pressure text.
+- Ordinary briefs leave literal model identifiers discoverable. The optional
+  complete-catalog fixture now explicitly supplies real catalog-helper output;
+  supplied/no-gain and deferred-aid coverage remains meaningful.
+- The real three-plugin schema batch can exceed the retained aggregate schema
+  allowance. The scripted provider follows the advertised assistance tool for
+  refused contracts and retains the honest refusal; it does not falsely claim
+  the complete schema was supplied. The actual proposed pipeline is validated.
+- Seven Advisor hatch consumers recognize the retained senior-advisor notice.
+  Provider identity, terminal-only palette, complete protocol pairs, rejected
+  candidate bytes, safe feedback, and truncated-response omission remain pinned.
+  The separate pressure test rejects the removed steering text.
+- Repeated cancellation checks the actual secondary cancellation's settlement
+  failure cause. Python 3.14 intentionally reports that same completed shielded
+  task even when its exception was retrieved; only that exact diagnostic is
+  accepted. Unknown diagnostics and lost causes still fail.
 
-These remaining failures are not evidence for restoring removed caps or
-implementing the future continuation design. No broad suite, PostgreSQL gate,
-live provider acceptance, Gate1 prompt sequence, merge, push, or deployment was
-performed in this lane.
+The measured fixed scaffold is 131,702 canonical bytes, against the previous
+131,593-byte pin. John explicitly approved the 109-byte test-only adjustment
+for the retained attachment declaration and control guidance. The finite
+ceiling, exact-boundary and one-byte overflow controls remain; no production
+request limit or prompt padding changed.
+
+The focused follow-up completed with exit 0: 34 passed, including all 16
+repaired cases and existing schema-budget, deadline, custody, cancellation and
+settlement controls. Three deliberate private negative controls each produced
+the expected exit 1 at the intended assertion: lost settlement cause, unknown
+unobserved-task diagnostic, and restored discovery pressure.
+
+After completing the aid fixture's declared shape, its four cases plus the
+masquerade and mock-discipline gates completed with exit 0: 250 passed, one
+documented PEP-649 skip on Python 3.14. Canonical contracts, Ruff, formatting,
+and whitespace checks also exit 0; the production mapping census stays 2,573.
+
+No remaining red is known in this delegated focused set. Root-owned Advisor
+scoped-stop work and integrated qualification remain separate. No production
+code changed after `47860b022`; no broad suite, PostgreSQL gate, live provider
+acceptance, Gate1 prompt sequence, merge, push, or deployment was performed.
