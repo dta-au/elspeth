@@ -52,9 +52,11 @@ from pydantic import SecretBytes
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import content_hash as _content_hash
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -68,7 +70,10 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.session_fences import seed_session_operation_fence
-from tests.unit.evals.conftest import _clean_advisor_checkpoint
+from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+from tests.unit.web.composer._helpers import (
+    _stub_advisor_end_gate_clean as _stub_advisor_end_gate_clean,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SUITE = _REPO_ROOT / "evals" / "composer-rgr" / "scenarios" / "convergence-suite"
@@ -144,6 +149,36 @@ def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] |
 # --------------------------------------------------------------------------
 
 
+class _AllowPromptGuard(PromptGuardClient):
+    @property
+    def adapter(self) -> str:
+        return "controlled-convergence"
+
+    @property
+    def policy_fingerprint(self) -> str:
+        return "a" * 64
+
+    @property
+    def timeout_seconds(self) -> float:
+        return 1.0
+
+    async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+        return PromptGuardDecision("allow", "clean")
+
+
+@pytest.fixture(autouse=True)
+def _configured_prompt_guard_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply detector dependencies while preserving required-mode admission."""
+    monkeypatch.setattr(
+        "elspeth.web.composer.provider_gateway.build_prompt_guard_mount",
+        lambda _settings: PromptGuardMount(_AllowPromptGuard()),
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.build_prompt_guard_mount",
+        lambda _settings: PromptGuardMount(_AllowPromptGuard()),
+    )
+
+
 def _real_catalog() -> Any:
     """Real PluginManager + CatalogService for authentic schema prevalidation.
 
@@ -168,6 +203,18 @@ def _make_settings(data_dir: Path) -> WebSettings:
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
+
+
+@pytest.mark.parametrize("missing_role", ["composer", "advisor"])
+def test_convergence_fixture_preserves_required_guard_admission(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_role: str) -> None:
+    module = "provider_gateway" if missing_role == "composer" else "service"
+    monkeypatch.setattr(f"elspeth.web.composer.{module}.build_prompt_guard_mount", lambda _settings: None)
+    service = ComposerServiceImpl.for_trained_operator(catalog=_real_catalog(), settings=_make_settings(tmp_path))
+
+    availability = service.get_availability()
+
+    assert not availability.available
+    assert availability.reason == f"Composer is unavailable: required prompt guard configuration is missing for {missing_role}."
 
 
 def _session_engine() -> tuple[Any, str, SessionServiceImpl, SessionOperationContext]:
@@ -325,7 +372,7 @@ def _composer_to_thread_uses_test_worker(monkeypatch: pytest.MonkeyPatch) -> Non
 # source schema to mode=observed; turn 4 claims completion → the mandatory
 # llm_prompt_template interpretation review re-prompts (turn 5) → GREEN. The
 # authored prompt_template now requires an interpretation review, adding a second
-# forced repair turn on top of the schema fix. A sixth, tools-disabled call
+# forced repair turn on top of the schema fix. A sixth, reply-stage call
 # explains the pending reviews without spending another repair turn.
 # --------------------------------------------------------------------------
 
@@ -483,7 +530,8 @@ class TestCsvClassifierScenario:
             #      surfaced) are now RESOLVABLE, with zero orphans. The terminal
             #      preflight is invalid-but-pending, so the finalize path SKIPS the
             #      "runtime preflight failed" suffix → clean message, is_valid=false.
-            #   6. tools-disabled explanation of the pending review, not a repair.
+            #   6. explanation of the pending review, not a repair; ordinary
+            #      authoring tools are unavailable, but recovery controls remain.
             mock_llm.side_effect = [turn1, turn2, turn3, turn4, turn_surface_model_choice, turn_review_reply]
             result = await service.compose(
                 "Classify these tickets",
@@ -497,7 +545,10 @@ class TestCsvClassifierScenario:
         # Convergence behaviour: two forced repair turns (schema-mode repair +
         # the orphan-gate repair that surfaces the llm_model_choice review).
         assert mock_llm.call_count == 6, f"expected 6 LLM calls, got {mock_llm.call_count}"
-        assert mock_llm.call_args_list[-1].args[1] == []
+        assert [tool["function"]["name"] for tool in mock_llm.call_args_list[-1].args[1]] == [
+            "handoff_to_user",
+            "restore_parked_graph",
+        ]
         assert review_reply in result.message
         assert result.repair_turns_used == 2, f"expected 2 repair turns, got {result.repair_turns_used}"
 
