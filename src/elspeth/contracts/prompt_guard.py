@@ -91,9 +91,14 @@ class PromptGuardThinkingParts:
 type PromptGuardTextMessage = dict[str, str | PromptGuardTrust | tuple[PromptGuardContentPart, ...]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class DetachedPromptGuardEvidence:
-    """Detached external wire values and separate, immutable producer evidence."""
+    """Mutable detached wire values and separate, immutable producer evidence.
+
+    SDK preparation needs ordinary lists and dictionaries. The transport
+    envelope therefore stays mutable; only its producer provenance values
+    promise immutability, and coverage is revalidated before dispatch.
+    """
 
     messages: list[dict[str, Any]] = field(repr=False)
     trusted_message_indexes: frozenset[int]

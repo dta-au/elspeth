@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
 
 import httpx
 import litellm
@@ -97,6 +98,28 @@ def test_partition_is_detached_and_never_reaches_legacy_wire_projection():
         detach_prompt_guard_evidence([{**messages[0], PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.REFERENCE}])
     assert "catalog" not in repr(parts[0])
     assert "original" not in repr(evidence)
+
+
+def test_detached_wire_preparation_preserves_immutable_producer_evidence():
+    part = PromptGuardContentPart("catalog", PromptGuardTrust.REFERENCE)
+    messages = [{"role": "tool", "content": "catalog", "metadata": {"observed": ["original"]}, PROMPT_GUARD_CONTENT_PARTS_KEY: (part,)}]
+    evidence = detach_prompt_guard_evidence(messages)
+    original_parts = evidence.content_parts
+
+    # SDK preparation works on mutable, detached JSON values; its carrier
+    # must not claim to freeze those values or the whole transport envelope.
+    evidence.messages = deepcopy(evidence.messages)
+    evidence.messages[0]["metadata"]["observed"].append("prepared")
+    assert messages[0]["metadata"] == {"observed": ["original"]}
+    assert evidence.content_parts is original_parts
+    assert evidence.content_parts == ((part,),)
+    with pytest.raises(FrozenInstanceError):
+        part.text = "changed"
+
+    # Changing wire bytes cannot silently retain the producer's coverage.
+    evidence.messages[0]["content"] = "changed"
+    with pytest.raises(AuditIntegrityError, match="complete wire content"):
+        _prepare(evidence.messages, content_parts=evidence.content_parts)
 
 
 def test_identical_wire_has_distinct_hashes_for_distinct_coverage_and_trust():
