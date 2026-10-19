@@ -56,6 +56,7 @@ from elspeth.web.composer._required_paths_validator import (
     _find_missing_required_paths,
 )
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.advisor_request import advisor_feedback_payload
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -175,7 +176,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
-from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
     require_no_credential_material,
@@ -988,6 +989,24 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    mixed_abandonment_batch = False
+    if len(assistant_tool_calls) > 1:
+        for candidate_call in assistant_tool_calls:
+            if candidate_call.function.name != "request_advisor_hint":
+                continue
+            try:
+                candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+            except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                continue
+            if (
+                type(candidate_arguments) is dict
+                and "trigger" in candidate_arguments
+                and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+            ):
+                mixed_abandonment_batch = True
+                break
+    if ctx.turn_evidence is not None:
+        ctx.turn_evidence.invalidate_abandonment()
     # Scan the complete response metadata before progress, history, audit,
     # proposal, blob, or state effects. Internal adapters can supply an
     # already-admitted completion without passing through ProviderGateway, so
@@ -1048,8 +1067,10 @@ async def run_tool_batch(
     )
 
     # Append the assistant message (with tool_calls metadata)
+    from elspeth.web.composer.provider_thinking import attach_provider_thinking
+
     llm_messages.append(
-        {
+        attach_provider_thinking({
             "role": "assistant",
             "content": assistant_message.content,
             "tool_calls": [
@@ -1063,7 +1084,7 @@ async def run_tool_batch(
                 }
                 for tc in assistant_tool_calls
             ],
-        }
+        }, completion.provider_metadata.thinking_blocks)
     )
 
     # Execute each tool call, tracking whether this turn has
@@ -1162,6 +1183,39 @@ async def run_tool_batch(
                     wire_conformant=_wire.wire_conformant,
                 )
             )
+
+        if mixed_abandonment_batch:
+            detail = "cannot_complete must be the only tool call in its batch; every call in this batch was refused before effects."
+            category = ToolArgumentErrorCategory.MODEL_VALIDATION
+            payload = {"status": "ARG_ERROR", "error": detail, "error_category": category.value}
+            audit = begin_dispatch(
+                tool_call.id,
+                tool_name,
+                tool_call.function.arguments,
+                version_before=state.version,
+                actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=None,
+            )
+            recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
+            recorder.record(
+                finish_arg_error(audit, error_class="ToolArgumentError", error_category=category, error_message=detail, error_payload=payload)
+            )
+            _append_tool_outcome(
+                response=None,
+                error_class="ToolArgumentError",
+                error_category=category,
+                error_message=detail,
+                post_version=state.version,
+            )
+            tool_feedback_json = json.dumps(payload)
+            llm_messages.append({
+                "role": "tool", "tool_call_id": tool_call.id, "content": tool_feedback_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+            })
+            turn_has_discovery = True
+            all_cache_hits = False
+            continue
 
         try:
             decoded_arguments = bounded_json_loads(tool_call.function.arguments, label=f"{tool_name} arguments")
@@ -2239,7 +2293,7 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
-                tool_feedback_json = json.dumps(advisor_rejection_payload)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_rejection_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2283,7 +2337,7 @@ async def run_tool_batch(
                 # it for §7.7 anchor tracking, since the issue isn't
                 # the LLM repeating an identical request, it's the
                 # operator's policy refusing further hints.
-                tool_feedback_json = json.dumps(budget_payload)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(budget_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2344,7 +2398,7 @@ async def run_tool_batch(
                     error_message=None,
                     post_version=state.version,
                 )
-                tool_feedback_json = json.dumps(deadline_payload)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(deadline_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2370,13 +2424,24 @@ async def run_tool_batch(
             # outbound advisor call is made.
             advisor_calls_used += 1
 
+            abandonment_context = None
             try:
+                if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
+                    if ctx.turn_evidence is None or user_message_content is None:
+                        raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
+                    abandonment_context = ctx.turn_evidence.abandonment_context(
+                        request=user_message_content,
+                        current_state=state,
+                        plugin_snapshot=ctx.plugin_snapshot,
+                        messages=llm_messages,
+                    )
                 advisor_outcome = await _await_started_tool_stage(
                     ctx.advisor_checkpoint._call_advisor_for_tool(
                         advisor_arg_error,
                         recorder=recorder,
                         timeout=effective_advisor_timeout,
                         provider_owner=ctx.provider_owner,
+                        abandonment_context=abandonment_context,
                     ),
                     audit=audit,
                     recorder=recorder,
@@ -2438,7 +2503,7 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
-                tool_feedback_json = json.dumps(advisor_error_payload)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2449,6 +2514,9 @@ async def run_tool_batch(
                 )
                 turn_has_discovery = True
                 continue
+
+            except Exception as advisor_context_error:
+                advisor_outcome = _AdvisorFirstPartyFailure(original_exc=advisor_context_error)
 
             if type(advisor_outcome) is _AdvisorProviderFailure:
                 # The service owns the Tier-3 provider taxonomy and returns
@@ -2482,7 +2550,7 @@ async def run_tool_batch(
                 # prompt, exactly the pattern the tracker exists
                 # to break.
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
-                tool_feedback_json = json.dumps(advisor_error_payload)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
@@ -2546,6 +2614,26 @@ async def run_tool_batch(
                     "configuration without verifying it against the schema."
                 ),
             }
+            if advisor_outcome.abandonment_response is not None:
+                if abandonment_context is None or ctx.turn_evidence is None:
+                    raise AuditIntegrityError("Abandonment decision lost its request-owned context")
+                decision = advisor_outcome.abandonment_response
+                ctx.turn_evidence.accept_abandonment(
+                    abandonment_context, decision, current_state=state, plugin_snapshot=ctx.plugin_snapshot
+                )
+                success_payload["abandonment_decision"] = decision.decision
+                success_payload["review_binding"] = abandonment_context.binding
+                success_payload["guidance"] = decision.reason
+                if decision.next_action is not None:
+                    success_payload["guidance"] += "\nSupported next action: " + decision.next_action
+                if decision.question is not None:
+                    success_payload["guidance"] += "\nQuestion for the user: " + decision.question
+                success_payload["note"] = (
+                    "Stop authoring this request. Explain the confirmed limit or ask the precise question; "
+                    "preserve the draft and do not claim completion. The final reply still receives ordinary END review."
+                    if decision.decision == "STOP_CONFIRMED"
+                    else "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
+                )
             recorder.record(
                 finish_success(
                     audit,
@@ -2565,7 +2653,7 @@ async def run_tool_batch(
             # subsequent set_pipeline failure does not inherit a
             # stale advisor anchor count.
             anti_anchor.record_success()
-            tool_feedback_json = json.dumps(success_payload)
+            tool_feedback_json = json.dumps(advisor_feedback_payload(success_payload))
             llm_messages.append(
                 {
                     "role": "tool",
@@ -3197,7 +3285,7 @@ async def run_tool_batch(
         result_json = (
             serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
         )
-        if tool_name in {"get_blob_content", "inspect_source"} and admitted_result is not None and ctx.turn_evidence is not None:
+        if tool_name in {"get_blob_content", "read_attachment", "inspect_source"} and admitted_result is not None and ctx.turn_evidence is not None:
             ctx.turn_evidence.register_blob_page(
                 tool_call_id=tool_call.id,
                 admitted=admitted_result,

@@ -19,6 +19,8 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, JsonBoundaryError, JsonTraversalBudget
 from elspeth.web.composer.diagnostic_evidence import _POLICY, _decode, _DuplicateKeys, _project
 from elspeth.web.composer.redaction import MANIFEST
+from elspeth.web.composer.provider_thinking import native_thinking_blocks
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
 
 _DATA_URL = re.compile(r"\bdata:[^,\s]*,", re.IGNORECASE)
 
@@ -152,13 +154,20 @@ def _check_messages(messages: JsonValue, budget: JsonTraversalBudget) -> None:
     calls: dict[str, str] = {}
     for message_value in messages:
         message = _object(message_value)
-        if set(message) - {"role", "content", "tool_calls", "tool_call_id", "name", "cache_control"}:
+        if set(message) - {"role", "content", "tool_calls", "tool_call_id", "name", "cache_control", "thinking_blocks"}:
             raise _UnavailableContext("unsupported")
         if "role" not in message:
             raise _UnavailableContext("unsupported")
         role = message["role"]
         if type(role) is not str or role not in {"system", "developer", "user", "assistant", "tool"}:
             raise _UnavailableContext("unsupported")
+        if "thinking_blocks" in message:
+            if role != "assistant":
+                raise _UnavailableContext("unsupported")
+            try:
+                native_thinking_blocks(message["thinking_blocks"])
+            except ComposerAdmissionRefused:
+                raise _UnavailableContext("unsupported") from None
         if role != "tool" and "tool_call_id" in message:
             raise _UnavailableContext("unsupported")
         if "name" in message:

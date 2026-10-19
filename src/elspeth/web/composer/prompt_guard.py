@@ -32,8 +32,10 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardReason,
     PromptGuardRequest,
     PromptGuardRole,
+    PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
     validate_prompt_guard_content_parts,
+    validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
 )
 from elspeth.web.composer.provider_quota import ProviderCallCustody
@@ -202,6 +204,7 @@ def _request(
     trusted_message_indexes: frozenset[int],
     content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
 ) -> tuple[PromptGuardRequest, bool]:
     """Bind exact supported wire input and preserve user/document provenance.
 
@@ -217,7 +220,12 @@ def _request(
     validate_prompt_guard_content_parts(messages, partitions)
     argument_partitions = tuple(None for _ in messages) if tool_argument_parts is None else tool_argument_parts
     validate_prompt_guard_tool_argument_parts(messages, argument_partitions)
-    if any(partitions[index] is not None or argument_partitions[index] is not None for index in trusted_message_indexes):
+    thinking_partitions = tuple(None for _ in messages) if thinking_parts is None else thinking_parts
+    validate_prompt_guard_thinking_parts(messages, thinking_partitions)
+    if any(
+        partitions[index] is not None or argument_partitions[index] is not None or thinking_partitions[index] is not None
+        for index in trusted_message_indexes
+    ):
         raise AuditIntegrityError("Prompt guard partition conflicts with whole-message trust")
     exact = {
         "role": role,
@@ -248,6 +256,11 @@ def _request(
             for entries in argument_partitions
         ],
     }
+    if any(entry is not None for entry in thinking_partitions):
+        exact["thinking_parts"] = [
+            None if entry is None else [{"text": part.text, "inspection_text": part.inspection_text} for part in entry.parts]
+            for entry in thinking_partitions
+        ]
     canonical = json.dumps(exact, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
     request_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     documents: list[str] = []
@@ -262,11 +275,14 @@ def _request(
             continue
         parts = partitions[index]
         argument_entries = argument_partitions[index]
+        thinking_entry = thinking_partitions[index]
         shadow = dict(message)
         if index == genuine_index:
             shadow = {key: value for key, value in shadow.items() if key not in ("role", "content")}
         elif parts is not None:
             shadow.pop("content")
+        if thinking_entry is not None:
+            shadow.pop("thinking_blocks")
         if argument_entries:
             shadow = deepcopy(shadow)
             for entry in argument_entries:
@@ -288,6 +304,11 @@ def _request(
                     text = part.text if part.inspection_text is None else part.inspection_text
                     require_no_credential_material(text, surface="composer_prompt_guard_request")
                     documents.append(f"Message {index}, tool call {entry.tool_call_index}, argument part {part_index}:\n{text}")
+        if thinking_entry is not None:
+            for part_index, part in enumerate(thinking_entry.parts):
+                text = part.text if part.inspection_text is None else part.inspection_text
+                require_no_credential_material(text, surface="composer_prompt_guard_request")
+                documents.append(f"Message {index}, provider thinking part {part_index}:\n{text}")
         if parts is not None or index == genuine_index:
             continue
         content = message["content"] if "content" in message else None
@@ -395,6 +416,7 @@ async def enforce_prompt_guard(
     trusted_message_indexes: frozenset[int] = frozenset(),
     content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
 ) -> None:
     """Audit a complete check before any protected model admission or dispatch."""
     if mode not in ("required", "debug-when-unconfigured"):
@@ -435,6 +457,7 @@ async def enforce_prompt_guard(
         trusted_message_indexes=trusted_message_indexes,
         content_parts=content_parts,
         tool_argument_parts=tool_argument_parts,
+        thinking_parts=thinking_parts,
     )
     original_cancellation: asyncio.CancelledError | None = None
     if not supported:

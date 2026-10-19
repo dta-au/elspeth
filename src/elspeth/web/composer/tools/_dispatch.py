@@ -136,24 +136,17 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
     {
         "name": "request_advisor_hint",
         "description": (
-            "ESCAPE HATCH — call when one of the declared trigger criteria applies: "
-            "proactive security/safety wiring review before `set_pipeline`, or "
-            "proactive red-listed plugin review before `set_pipeline`. The proactive "
-            "security trigger covers content moderation, prompt-injection defence, "
-            "secret routing, PII/regulatory sinks, and externally fetched content "
-            "flowing toward LLMs. Forwards your problem statement and context to a "
-            "frontier model and returns guidance text. The reply is ADVICE, not "
-            "configuration — you must still call the appropriate mutation tool "
-            "yourself to apply any change. Budget is finite (sized per compose "
-            "request, not per session lifetime) and exhausting it returns a "
-            "structured error rather than crashing — inspect budget_remaining "
-            "in each response. Do NOT call this tool in a loop, do NOT use it "
-            "as a substitute for reading validator output. Availability is "
-            "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape. Each reply carries `status` "
-            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
-            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
-            "`note` restating that the guidance is advice, not configuration."
+            "ESCAPE HATCH — use cannot_complete as soon as missing or contradictory information, "
+            "an unavailable capability, or an unreasonable requirement prevents a faithful result. "
+            "Give your specific reason, evidence and attempted actions. Call it ALONE in its batch. "
+            "The advisor receives the actual request, graph and available evidence and returns "
+            "STOP_CONFIRMED or CONTINUE with a supported next action. A confirmed stop lets you "
+            "explain the limitation or ask the precise missing question; it does not complete the pipeline. "
+            "Unread available information is a discovery action, not evidence of impossibility. "
+            "Proactive security/safety and red-listed-plugin triggers remain advice before set_pipeline. "
+            "Security covers moderation, injection defence, secrets, PII/regulatory sinks and fetched content sent to LLMs. "
+            "Apply advice through your own verified mutation calls. Inspect status; errors do not confirm a stop. "
+            "Read validator output and do not repeat unsupported attempts. Independent END publication review still applies."
         ),
         "parameters": {
             "type": "object",
@@ -162,7 +155,8 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
                     "type": "string",
                     "enum": list(ADVISOR_TRIGGER_VALUES),
                     "description": (
-                        "Why this advisor call is allowed. Use "
+                        "Why this advisor call is allowed. Use cannot_complete for an early-return review "
+                        "of a specific suspected blocker, without requiring a formal impossibility proof. Use "
                         "proactive_security_safety before "
                         "set_pipeline for security/safety-sensitive flows. Use "
                         "proactive_red_listed_plugin before set_pipeline when the plan "

@@ -61,12 +61,15 @@ _PIPELINE_CAPABILITIES_SKILL, PIPELINE_CAPABILITIES_SKILL_HASH = load_skill_with
 
 
 def _strip_advisor_disabled_fallback(text: str) -> str:
-    """Advisor is mandatory, so strip the on-disk fallback prose that only
-    applied to advisor-disabled deployments. Removes the
-    ``<!-- ADVISOR-DISABLED -->...<!-- /ADVISOR-DISABLED -->`` blocks (markers
-    and content) so the LLM never sees fallback guidance that contradicts the
-    always-on advisor. The advisor-teaching content in the skill is kept."""
-    return re.sub(r"<!-- ADVISOR-DISABLED -->.*?<!-- /ADVISOR-DISABLED -->", "", text, flags=re.DOTALL)
+    """Render interaction guidance without disabled advice or editor metadata.
+
+    Advisor-disabled fallback blocks are obsolete because Advisor is mandatory.
+    Teaching-scope comments remain because the wire teaching gate derives
+    ownership from this rendering. Other HTML comments are generation markers
+    and editor conventions; keep their instructional bodies, not that metadata.
+    """
+    without_fallback = re.sub(r"<!-- ADVISOR-DISABLED -->.*?<!-- /ADVISOR-DISABLED -->", "", text, flags=re.DOTALL)
+    return re.sub(r"<!--(?!\s*taught:).*?-->", "", without_fallback, flags=re.DOTALL)
 
 
 SYSTEM_PROMPT = render_with_pipeline_capabilities(_strip_advisor_disabled_fallback(_PIPELINE_SKILL))
@@ -235,9 +238,10 @@ def build_catalog_context_string(
     # No ``plugin_hints`` block: ``authoring_aids.discovery_digest.plugins`` is
     # the compact, complete selection index. Detailed ``composer_hints`` travel
     # with the chosen plugin's JIT ``get_plugin_schema`` contract. A separate
-    # block restated every visible plugin's hints in this same message — 21-22
-    # KB under the round-3 16-plugin policy (elspeth-8c457883c2). Keep those
-    # tiers separate; do not reintroduce a parallel carrier here.
+    # block restated every visible plugin's hints in this same message. Model
+    # identifiers and optional plugin guides likewise stay in their discovery
+    # tools; profile aliases, complete selection/prohibition facts and the
+    # expression grammar remain supplied. Keep those tiers separate.
     context = {
         "available_plugins": {
             "sources": [p.name for p in source_plugins],

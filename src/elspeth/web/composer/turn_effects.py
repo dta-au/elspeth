@@ -15,6 +15,9 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer._attachment_response import CompleteAttachmentDataModel
+from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentReview, build_abandonment_review
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.redaction import GetBlobContentDataModel
@@ -23,6 +26,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.converters import state_from_record
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.validation import _redact_sensitive_content
 
 CHECKPOINT_CHANGED_SCOPE: Final = (
@@ -239,6 +243,7 @@ class TurnEvidence:
     """One request's private evidence owner; snapshots never cross requests."""
 
     __slots__ = (
+        "_abandonment_review",
         "_conflicting_page_ids",
         "_current_calls",
         "_current_pages",
@@ -277,6 +282,7 @@ class TurnEvidence:
         self.operation_id = session_operation_context.fence.operation_id if session_operation_context is not None else None
         self.request_id = request_id
         self.request_hash = stable_hash(request)
+        self._abandonment_review: tuple[AdvisorAbandonmentReview, AdvisorAbandonmentResponse] | None = None
         if retained_operation_context is not None:
             if type(retained_operation_context) is not RetainedOperationContext:
                 raise TypeError("Turn evidence requires owned retained operation history")
@@ -346,6 +352,7 @@ class TurnEvidence:
         if (
             admitted.contract is not response_contract_for("get_blob_content")
             and admitted.contract is not response_contract_for("inspect_source")
+            and admitted.contract is not response_contract_for("read_attachment")
         ) or not admitted.result.success:
             return False
         if admitted.response is None or producer_call_id is None:
@@ -353,8 +360,12 @@ class TurnEvidence:
         if selected_content != serialize_admitted_discovery_result(admitted):
             raise AuditIntegrityError("Blob registration differs from the selected result envelope")
         page: _RegisteredInspection
-        if admitted.contract is response_contract_for("get_blob_content"):
-            payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
+        if admitted.contract in (response_contract_for("get_blob_content"), response_contract_for("read_attachment")):
+            payload: GetBlobContentDataModel | CompleteAttachmentDataModel
+            if admitted.contract is response_contract_for("read_attachment"):
+                payload = CompleteAttachmentDataModel.model_validate(admitted.response.to_wire())
+            else:
+                payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
             page = _RegisteredBlobPage(
                 tool_call_id,
                 producer_call_id,
@@ -517,6 +528,63 @@ class TurnEvidence:
     def historical_inspection_coverage(self) -> tuple[BlobInspectionCoverage, ...]:
         return _coverage(tuple(self._historical_pages.values()))
 
+    def invalidate_abandonment(self) -> None:
+        """A new tool batch resumes work and cannot reuse an earlier stop."""
+        self._abandonment_review = None
+
+    def abandonment_context(
+        self,
+        *,
+        request: str,
+        current_state: CompositionState,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        messages: Sequence[Mapping[str, Any]],
+    ) -> AdvisorAbandonmentReview:
+        if stable_hash(request) != self.request_hash:
+            raise AuditIntegrityError("Abandonment review belongs to another user request")
+        return build_abandonment_review(
+            request=request,
+            state=current_state,
+            plugin_snapshot=plugin_snapshot,
+            messages=messages,
+            request_identity=self.identity,
+            request_scope=(self.session_id, self.operation_id, self.request_id),
+            registration_revision=self._registration_revision,
+        )
+
+    def accept_abandonment(
+        self,
+        review: AdvisorAbandonmentReview,
+        decision: AdvisorAbandonmentResponse,
+        *,
+        current_state: CompositionState,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+    ) -> None:
+        if type(review) is not AdvisorAbandonmentReview or type(decision) is not AdvisorAbandonmentResponse:
+            raise AuditIntegrityError("Abandonment confirmation lacks owned review and response")
+        if (
+            review.request_scope != (self.session_id, self.operation_id, self.request_id)
+            or review.request_hash != self.request_hash
+            or review.graph_hash != stable_hash(current_state.to_dict())
+            or review.policy_hash != plugin_snapshot.snapshot_hash
+            or review.registration_revision != self._registration_revision
+        ):
+            raise AuditIntegrityError("Abandonment confirmation belongs to stale evidence")
+        self._abandonment_review = (review, decision)
+
+    def confirmed_abandonment(self, *, current_state: CompositionState, plugin_snapshot: PluginAvailabilitySnapshot | None) -> bool:
+        if self._abandonment_review is None or plugin_snapshot is None:
+            return False
+        review, decision = self._abandonment_review
+        return (
+            decision.decision == "STOP_CONFIRMED"
+            and review.request_scope == (self.session_id, self.operation_id, self.request_id)
+            and review.request_hash == self.request_hash
+            and review.graph_hash == stable_hash(current_state.to_dict())
+            and review.policy_hash == plugin_snapshot.snapshot_hash
+            and review.registration_revision == self._registration_revision
+        )
+
     def review_candidate(
         self, *, candidate: str, request: str, current_state: CompositionState, scope: DeliveryScope = "primary"
     ) -> AdvisorPublicationReview:
@@ -613,6 +681,14 @@ class TurnEvidence:
                 **source_metadata_projection,
             },
         }
+        if self._abandonment_review is not None:
+            stop_review, stop_decision = self._abandonment_review
+            if stop_review.graph_hash == stable_hash(current_state.to_dict()) and stop_review.registration_revision == self._registration_revision:
+                payload["authoring_stop_review"] = {
+                    "binding": stop_review.binding,
+                    "policy_snapshot_hash": stop_review.policy_hash,
+                    **stop_decision.model_dump(mode="json"),
+                }
         if self._retained_history is not None:
             payload.update(json.loads(self._retained_history))
         # Preserve owned identities; only authored/provider text is PII-shaped
@@ -630,6 +706,12 @@ class TurnEvidence:
                 )
             },
         }
+        if "authoring_stop_review" in payload:
+            stop_projection = dict(payload["authoring_stop_review"])
+            for key in ("reason", "next_action", "question"):
+                if type(stop_projection[key]) is str:
+                    stop_projection[key] = _redact_sensitive_content(stop_projection[key])
+            provider_payload["authoring_stop_review"] = stop_projection
         if self._retained_history is not None:
             history = json.loads(self._retained_history)["retained_operation_history"]
             provider_payload["retained_operation_history"] = history | {

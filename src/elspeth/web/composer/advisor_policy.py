@@ -274,21 +274,21 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. "
 # pass. END-gate only: the EARLY advisory injection deliberately keeps its
 # "continue if it does not apply" framing, where demanding a mutation would
 # be wrong.
-# Ruling 2026-09-22 (elspeth-032ec69c41): the "say what blocks you" exit
-# now names an outcome that exists — a no-tool reply ends the turn, and on a
-# blocked turn it is published — instead of routing into a deleted reply
-# (session 6990d39f). It stops short of promising the user sees it, for the
-# case-5 reason on ``ADVISOR_OUTPUT_CONTRACT_CLAUSE``. Trailing space is
-# load-bearing: the two clauses concatenate.
+# A user-requested explanation or pause remains conversational. Suspected
+# inability to finish an authorized build uses the structured advisor decision;
+# a large remaining graph must not become a self-selected checkpoint.
+# Trailing space is load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
     "If the user's active request authorizes changes, resolve graph findings through pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
     "lookup-only calls is not a fix, though they can supply evidence. If the user asks for explanation or says not to make changes, "
-    "answer that request without changing the pipeline; the advisor block still prevents completion. If a "
-    "finding needs a decision only the user can make, or no tool call can "
-    "address it, make no change: tell the user what blocks you and what "
-    "their options are. That reply ends the turn. "
+    "answer that request without changing the pipeline; the advisor block still prevents completion. "
+    "For a specific missing decision or suspected technical inability, call request_advisor_hint alone "
+    "with trigger=cannot_complete and the observed evidence. On CONTINUE, take the supported next action; "
+    "on STOP_CONFIRMED, explain the blocker or ask the focused question. For a large remaining graph "
+    "or concern about disconnected intermediate parts, use smaller coherent mutations and compatible "
+    "multi-query nodes where the request permits grouping, then continue from the saved state. "
 )
 
 # elspeth-2306940c70: durable provider-visible disclosure persisted on every

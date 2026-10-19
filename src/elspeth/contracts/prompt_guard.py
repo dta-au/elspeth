@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -22,6 +23,7 @@ PromptGuardReason = Literal[
 PROMPT_GUARD_TRUST_KEY = "_elspeth_prompt_guard_trust"
 PROMPT_GUARD_CONTENT_PARTS_KEY = "_elspeth_prompt_guard_content_parts"
 PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY = "_elspeth_prompt_guard_tool_argument_parts"
+PROMPT_GUARD_THINKING_PARTS_KEY = "_elspeth_prompt_guard_thinking_parts"
 PROMPT_GUARD_MAX_TEXT_CHARACTERS = 10_000
 PROMPT_GUARD_MAX_DOCUMENTS = 128
 # One user prompt plus complete packed documents, with at most four UTF-8
@@ -75,6 +77,17 @@ class PromptGuardToolArgumentParts:
             raise AuditIntegrityError("Prompt guard tool arguments require owned untrusted semantic units")
 
 
+@dataclass(frozen=True, slots=True)
+class PromptGuardThinkingParts:
+    """Lossless untrusted inspection of one provider-native thinking field."""
+
+    parts: tuple[PromptGuardContentPart, ...] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.parts) is not tuple or any(type(part) is not PromptGuardContentPart or part.trust is not None for part in self.parts):
+            raise AuditIntegrityError("Provider thinking partitions require owned untrusted units")
+
+
 type PromptGuardTextMessage = dict[str, str | PromptGuardTrust | tuple[PromptGuardContentPart, ...]]
 
 
@@ -86,6 +99,7 @@ class DetachedPromptGuardEvidence:
     trusted_message_indexes: frozenset[int]
     content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] = field(repr=False)
     tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] = field(repr=False)
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...] = field(default=(), repr=False)
 
 
 def validate_prompt_guard_content_parts(
@@ -113,6 +127,7 @@ def detach_prompt_guard_evidence(messages: Sequence[Mapping[str, Any]]) -> Detac
     trusted: set[int] = set()
     content_parts: list[tuple[PromptGuardContentPart, ...] | None] = []
     tool_argument_parts: list[tuple[PromptGuardToolArgumentParts, ...] | None] = []
+    thinking_parts: list[PromptGuardThinkingParts | None] = []
     for index, message in enumerate(messages):
         if PROMPT_GUARD_TRUST_KEY in message:
             marker = message[PROMPT_GUARD_TRUST_KEY]
@@ -127,11 +142,18 @@ def detach_prompt_guard_evidence(messages: Sequence[Mapping[str, Any]]) -> Detac
         if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message and (arguments is None or PROMPT_GUARD_TRUST_KEY in message):
             raise AuditIntegrityError("Prompt guard tool argument partition conflicts with whole-message provenance")
         tool_argument_parts.append(arguments)
+        thinking = message[PROMPT_GUARD_THINKING_PARTS_KEY] if PROMPT_GUARD_THINKING_PARTS_KEY in message else None
+        if PROMPT_GUARD_THINKING_PARTS_KEY in message and (thinking is None or PROMPT_GUARD_TRUST_KEY in message):
+            raise AuditIntegrityError("Provider thinking partitions conflict with whole-message provenance")
+        thinking_parts.append(thinking)
         wire.append(
             {
                 key: value
                 for key, value in message.items()
-                if key not in (PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY, PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY)
+                if key not in (
+                    PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY,
+                    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY, PROMPT_GUARD_THINKING_PARTS_KEY,
+                )
             }
         )
     detached = deepcopy(wire)
@@ -139,7 +161,33 @@ def detach_prompt_guard_evidence(messages: Sequence[Mapping[str, Any]]) -> Detac
     validate_prompt_guard_content_parts(detached, admitted_parts)
     admitted_arguments = tuple(tool_argument_parts)
     validate_prompt_guard_tool_argument_parts(detached, admitted_arguments)
-    return DetachedPromptGuardEvidence(detached, frozenset(trusted), admitted_parts, admitted_arguments)
+    admitted_thinking = tuple(thinking_parts)
+    validate_prompt_guard_thinking_parts(detached, admitted_thinking)
+    return DetachedPromptGuardEvidence(detached, frozenset(trusted), admitted_parts, admitted_arguments, admitted_thinking)
+
+
+def validate_prompt_guard_thinking_parts(
+    messages: Sequence[Mapping[str, Any]], partitions: tuple[PromptGuardThinkingParts | None, ...]
+) -> None:
+    """Bind nominal inspection units to the complete original native field."""
+    if type(partitions) is not tuple or len(partitions) != len(messages):
+        raise AuditIntegrityError("Provider thinking partition lacks exact message positions")
+    for message, entry in zip(messages, partitions, strict=True):
+        if entry is None:
+            continue
+        if (
+            type(entry) is not PromptGuardThinkingParts
+            or "role" not in message
+            or message["role"] != "assistant"
+            or "thinking_blocks" not in message
+        ):
+            raise AuditIntegrityError("Provider thinking partition has no owned assistant field")
+        try:
+            serialized = json.dumps(message["thinking_blocks"], ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            raise AuditIntegrityError("Provider thinking field is not finite wire JSON") from None
+        if "".join(part.text for part in entry.parts) != serialized:
+            raise AuditIntegrityError("Provider thinking partition does not cover its complete wire field")
 
 
 def validate_prompt_guard_tool_argument_parts(

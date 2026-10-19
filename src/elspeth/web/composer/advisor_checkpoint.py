@@ -46,8 +46,14 @@ from elspeth.web.composer.advisor_audit import (
     persist_advisor_terminal_publication,
 )
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
+from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentContextUnavailable, AdvisorAbandonmentReview
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
-from elspeth.web.composer.advisor_output import AdvisorEndResponse, parse_advisor_checkpoint_response, sanitize_advisor_note
+from elspeth.web.composer.advisor_output import (
+    AdvisorEndResponse,
+    parse_advisor_abandonment_response,
+    parse_advisor_checkpoint_response,
+    sanitize_advisor_note,
+)
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
@@ -99,7 +105,7 @@ from elspeth.web.composer.provider_quota import (
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
-from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
@@ -304,6 +310,7 @@ class AdvisorCheckpointOwner:
         recorder: BufferingRecorder | None,
         timeout: float | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
+        abandonment_context: AdvisorAbandonmentReview | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -314,19 +321,35 @@ class AdvisorCheckpointOwner:
         and P4 to persist the outer tool audit row before an original
         first-party exception is re-raised.
         """
+        internal_request = dict(arguments.to_internal_request())
+        is_abandonment = arguments.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE
+        if is_abandonment:
+            if type(abandonment_context) is not AdvisorAbandonmentReview:
+                raise InvariantError("Abandonment review requires the actual request-owned evidence")
+            internal_request["abandonment_context"] = abandonment_context
+        elif abandonment_context is not None:
+            raise InvariantError("Proactive advice cannot acquire an abandonment review")
         try:
             guidance, metadata = await self._call_advisor_with_audit(
-                arguments.to_internal_request(),
+                internal_request,
                 recorder=recorder,
                 timeout=timeout,
                 provider_owner=provider_owner,
+                structured_output=is_abandonment,
             )
         except TimeoutError:
             raise
+        except AdvisorAbandonmentContextUnavailable:
+            return _AdvisorProviderFailure(error_class="AbandonmentReviewContextUnavailable")
         except advisor_provider_failure_types() as exc:
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except Exception as exc:
             return _AdvisorFirstPartyFailure(original_exc=exc)
+        if is_abandonment:
+            decision = parse_advisor_abandonment_response(guidance)
+            if decision is None:
+                return _AdvisorProviderFailure(error_class="MalformedAbandonmentDecision")
+            return _AdvisorCallSuccess(guidance=guidance, metadata=metadata, abandonment_response=decision)
         return _AdvisorCallSuccess(guidance=guidance, metadata=metadata)
 
     async def _call_advisor_with_audit_body(
@@ -378,8 +401,11 @@ class AdvisorCheckpointOwner:
         trigger_instructions = "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
         system_msg = self._composer_skill_text + trigger_instructions
         checkpoint_phase: AdvisorCheckpointPhase | None = None
+        abandonment_review = trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE
         if structured_output:
-            if trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
+            if abandonment_review:
+                pass
+            elif trigger == ADVISOR_TRIGGER_DETERMINISTIC_EARLY:
                 checkpoint_phase = "early"
             elif trigger == ADVISOR_TRIGGER_DETERMINISTIC_END:
                 checkpoint_phase = "end"
@@ -406,6 +432,11 @@ class AdvisorCheckpointOwner:
                 PROMPT_GUARD_CONTENT_PARTS_KEY: _advisor_context.advisor_user_content_parts(arguments),
             },
         ]
+        if abandonment_review:
+            review = arguments["abandonment_context"]
+            if type(review) is not AdvisorAbandonmentReview:
+                raise InvariantError("Advisor abandonment context lacks producer ownership")
+            messages.extend(review.provider_messages())
         if self._composer_skill_text and supports_anthropic_prompt_cache_markers(advisor_model):
             messages[0]["content"] = [
                 {"type": "text", "text": self._composer_skill_text, "cache_control": {"type": "ephemeral"}},
@@ -429,12 +460,15 @@ class AdvisorCheckpointOwner:
             api_key=self._advisor_endpoint_api_key,
             structured_output=structured_output,
             checkpoint_phase=checkpoint_phase,
+            abandonment_review=abandonment_review,
         )
         guard_evidence = detach_prompt_guard_evidence(messages)
         messages = guard_evidence.messages
         trusted_indexes = guard_evidence.trusted_message_indexes
         kwargs["messages"] = messages
         private_request = capture_provider_context(messages=messages, tools=None)
+        if abandonment_review and private_request.disposition != "retained":
+            raise AdvisorAbandonmentContextUnavailable("Abandonment evidence exceeds an existing safe-input boundary")
         try:
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(

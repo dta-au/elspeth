@@ -20,9 +20,11 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardMode,
     PromptGuardRole,
     PromptGuardTextMessage,
+    PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
     detach_prompt_guard_evidence,
     validate_prompt_guard_content_parts,
+    validate_prompt_guard_thinking_parts,
     validate_prompt_guard_tool_argument_parts,
 )
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -455,6 +457,7 @@ async def _litellm_acompletion(
     prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
     prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
     provider_custody: ProviderCallCustody | None = None,
     on_provider_dispatch: Callable[[], None] | None = None,
     **kwargs: Any,
@@ -480,6 +483,7 @@ async def _litellm_acompletion(
     kwargs["messages"] = evidence.messages
     content_parts = evidence.content_parts
     argument_parts = evidence.tool_argument_parts
+    thinking_parts = evidence.thinking_parts
     if prompt_guard_content_parts is not None:
         validate_prompt_guard_content_parts(evidence.messages, prompt_guard_content_parts)
         if any(
@@ -502,6 +506,17 @@ async def _litellm_acompletion(
             current if current is not None else forwarded
             for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
         )
+    if prompt_guard_thinking_parts is not None:
+        validate_prompt_guard_thinking_parts(evidence.messages, prompt_guard_thinking_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Provider thinking provenance changed before physical dispatch")
+        thinking_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
+        )
     require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
     await enforce_prompt_guard(
         mount=prompt_guard_mount,
@@ -514,6 +529,7 @@ async def _litellm_acompletion(
         trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
         content_parts=content_parts,
         tool_argument_parts=argument_parts,
+        thinking_parts=thinking_parts,
     )
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
@@ -580,6 +596,7 @@ class ProviderGateway:
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -601,6 +618,7 @@ class ProviderGateway:
                 prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
                 prompt_guard_content_parts=prompt_guard_content_parts,
                 prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+                prompt_guard_thinking_parts=prompt_guard_thinking_parts,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -745,7 +763,18 @@ class ProviderGateway:
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
         try:
-            if any(parts is not None for parts in evidence.tool_argument_parts):
+            if any(parts is not None for parts in evidence.thinking_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                    prompt_guard_thinking_parts=evidence.thinking_parts,
+                )
+            elif any(parts is not None for parts in evidence.tool_argument_parts):
                 completion_call = self._call_llm(
                     wire_messages,
                     wire_tools,

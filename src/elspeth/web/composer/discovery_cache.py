@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.web.composer._attachment_response import AdmittedAttachmentResponse
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
@@ -58,7 +59,10 @@ def serialize_tool_result(result: ToolResult) -> str:
 def tool_result_content_parts(result: ToolResult | AdmittedDiscoveryResult, serialized: str) -> tuple[PromptGuardContentPart, ...]:
     """Bind reference authority to nominal current producer data, not JSON keys."""
     references: set[JsonPath] = set()
+    string_parts: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
     if isinstance(result, AdmittedDiscoveryResult):
+        if result.result.success and type(result.response) is AdmittedAttachmentResponse:
+            string_parts[("data", "content")] = result.response.untrusted_content_parts()
         if result.result.success and type(result.response) is AdmittedPluginSchemaResponse:
             references.add(("data",))
         envelope = result.result
@@ -70,7 +74,7 @@ def tool_result_content_parts(result: ToolResult | AdmittedDiscoveryResult, seri
     # not admitted from model tool arguments or a serialized response.
     if envelope.plugin_schemas is not None:
         references.add(("plugin_schemas",))
-    return json_content_parts(serialized, reference_paths=frozenset(references))
+    return json_content_parts(serialized, reference_paths=frozenset(references), string_parts=string_parts)
 
 
 def cached_discovery_payload(result: ToolResult | AdmittedDiscoveryResult) -> CachedDiscoveryPayload:

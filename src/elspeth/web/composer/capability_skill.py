@@ -27,6 +27,7 @@ PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
     "list_transforms",
     "preview_pipeline",
     "get_blob_content",
+    "read_attachment",
     "get_blob_metadata",
     "inspect_source",
     "list_blobs",

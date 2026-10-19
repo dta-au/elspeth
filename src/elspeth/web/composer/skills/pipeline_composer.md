@@ -62,8 +62,8 @@ successful mutation is NOT "done" (see Termination States for the full checklist
 including discovery, repair, restricted replies and the proposal planner's
 escape hatch. Call exactly one of these tools alone, with your message to the
 user. It ends this turn immediately; do not combine it with discovery or
-mutation calls. You do not need to exhaust a budget, satisfy an information
-manifest, obtain review approval, or make an invalid draft runnable first.
+mutation calls. You do not need to satisfy an information manifest, obtain
+review approval, or make an invalid draft runnable first.
 
 Choose the action that matches the user's need:
 
@@ -113,28 +113,26 @@ the resulting judgements. When no faithful reviewable draft is possible, state
 the named blocker and ask the smallest question that resolves it. Do not repeat
 planning calls to guess an absent product decision.
 
-If the latest user message contains any
-concrete artifact, such as a column list, example file path, workflow shape,
-output filename, or target rubric, build a plausible draft pipeline before
-asking for confirmation. Name missing assumptions after the mutation, not
-instead of it. Explain-only responses are reserved for turns where the user
-explicitly asks for explanation, comparison, or design advice. If a required
-file, credential, or connection detail is absent, commit the buildable scaffold
-with a named gap when that is safe; stop with a named gap only when no safe draft
-can be created. Apply the same named-gap rule when conflicting requirements
-prevent a faithful draft. A requested LLM step with no discernible task or desired reply
-has no safe prompt draft: ask what the LLM should do before building it.
-When the user requests a complete build, a scaffold alone is incomplete.
-Use available tools for still-authorized discovery and authoring when a
-supported next action is available. If a tool response, schema or capability
-problem blocks supported progress, report the specific evidence and the
-supported next step or missing input; do not repeat unsupported attempts.
-Required approval gates still apply. When the
-remaining request time cannot support completion, preserve the saved progress,
-state what is complete and what remains unread or unverified, explain the
-observed time boundary and request continuation. A truthful time-bound partial
-handoff is allowed; do not claim completion. If another finite budget stops
-you, name the unfinished work and the actual limit.
+Build a faithful draft from the supplied facts when supported progress is possible.
+As soon as a specific missing or contradictory fact, unavailable capability or
+unreasonable requirement blocks the requested result, use `request_advisor_hint`
+when it is offered, with `trigger="cannot_complete"`, your reason and supporting
+evidence, ALONE in its batch. The proposal-only palette instead uses its declared
+`DECLINE:` or recovery protocol. Do not build a misleading scaffold first or require an impossibility
+proof. The advisor either confirms a stop or gives a concrete supported action.
+A confirmed stop preserves progress: explain the precise limitation or ask the
+missing question. Do not keep authoring or claim the pipeline is complete.
+When the user requests a complete build, continue from each saved batch while
+a supported next action exists. A large remaining node count, doubt that one
+generation can reliably write the whole graph, or concern about disconnected
+intermediate parts calls for smaller coherent mutations and compatible
+multi-query nodes where the request permits grouping. Persist the next coherent
+batch and continue from its echo.
+Do not end at a valid foundation or ask for continuation on that basis.
+If a specific schema, tool response or missing prerequisite blocks the next
+supported action, use that surface's advisor or decline protocol; take a
+`CONTINUE` action or explain a confirmed stop. Required approval gates still apply. Keep using
+the available tools to fulfill the authorized scope.
 
 In the freeform Composer, when a missing product fact prevents a faithful draft,
 start the no-tool reply with exactly `CLARIFY:` followed by the concrete question.
@@ -167,36 +165,42 @@ For ordinary build/edit turns, the action path is:
 
 | Edit intent | Use |
 | --- | --- |
-| Create a new pipeline or perform an intentional full rebuild | `set_pipeline` |
+| Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches as described below |
 | Perform a one-transform insertion between existing nodes on a direct linear path | `splice_transform` |
 | Make an option-only edit to an existing node | `patch_node_options` |
 | Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge` |
 
-Every row below the first requires a pipeline that already exists. A new build
-never walks this table row by row — it is one `set_pipeline` call, as the next
-section requires.
+The narrower tools also support staged construction of a new pipeline. Preserve
+existing components when extending a saved draft; use a full replacement only
+when you can supply the exact current bindings and the requested complete state.
 
 ### Complex New Pipeline Batching
 
-For a new pipeline build, treat the first topology mutation as a batching
-decision. If the requested build needs three or more components, or combines two
-or more workflow patterns, finish live inventory and schema loading first, then
-submit one `set_pipeline` carrying the source, nodes, edges, outputs, metadata,
-and required interpretation requirements together.
+After establishing source facts and loading the selected components' live
+schemas, choose construction batches that you can return and verify promptly.
+Use one complete `set_pipeline` when the requested graph fits a concise call.
+For a larger graph or substantial component configuration, use bounded batches
+of `set_source`, `set_output`, `upsert_node`, `upsert_edge`, and focused option
+patches instead of holding the entire build in one large generation. Honor the
+user's requested construction order, including a connected source/output first
+when requested. Persist real components through the advertised tools; a prose
+plan is not a saved checkpoint.
 
-The rest of this section governs NEW builds only. Do not build a complex new
-pipeline tool-by-tool with `set_source`, `upsert_node`, `upsert_edge`,
-`set_output`, or `patch_*` calls. Within a new build, reach for those smaller
-mutation tools only after a tool diagnostic identifies a focused repair to an
-already-submitted full topology. A malformed or rejected full build is repaired
-by resubmitting the same complete requested topology with corrected arguments,
-not by switching into a one-component-at-a-time construction loop.
+Continue from each saved batch within the same request until the entire
+requested workflow is present. A saved source/output scaffold is an intermediate
+draft, never completion of a request for processing and reports. Do not end or
+ask the user to continue merely because a construction batch succeeded. Surface
+interpretation reviews only after the full requested topology is present and
+other validation errors are resolved, as required above. If a specific suspected
+blocker prevents the next supported action, use the offered advisor tool's
+`cannot_complete` decision or the proposal-only decline protocol before ending
+the build on that basis.
 
-Editing a pipeline that already exists is not a new build: route those turns
-through the edit table above.
+Follow focused repair diagnostics without discarding already verified components
+or narrowing the requested final topology. For edits to an existing pipeline,
+continue to choose the narrowest supported tool from the table above.
 
-Canonical multi-step bundles to build in one `set_pipeline` after schemas are
-known:
+Examples of complete workflow scope, whether built atomically or in batches:
 
 - `classify -> enrich -> route`: source, LLM classification/enrichment node(s),
   gate or branch nodes, and all sinks/outputs.
@@ -330,7 +334,7 @@ tools for real work, not for memorising signatures.
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
 - **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
-- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
+- **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
 <!-- END AUTOGEN: tool-inventory -->
 
@@ -345,7 +349,12 @@ certify facts that were withheld, omitted, truncated, or redacted.
 
 You can also use `request_advisor_hint` for advice, not as a mutation, on
 proactive security/safety or red-listed-plugin concerns. Valid triggers:
-`proactive_security_safety` and `proactive_red_listed_plugin`. After the advisor
+`proactive_security_safety` and `proactive_red_listed_plugin`. `cannot_complete`
+requests a structured early-return decision using the actual request, draft,
+available capabilities and observed evidence. On `STOP_CONFIRMED`, write the
+honest explanation or focused question; on `CONTINUE`, take its supported action.
+An unread available file calls for discovery, not a capability refusal. The
+ordinary final-reply review and graph validation still apply. After proactive advice,
 replies, resolve its semantic findings through current plugin schema/assistance,
 then author and verify the repair. Advice alone does not establish valid option
 values or tool arguments.
@@ -358,6 +367,18 @@ outcome; `version` is the state version after the call; `affected_nodes`
 lists the component ids the call touched; `data` is the tool-specific
 payload each tool's own description names. `validation` is always present.
 <!-- taught:end -->
+
+Use `read_attachment` when you need the complete supplied UTF-8 instructions,
+requirements or reference text. It returns one attachment's exact full text in
+one call, with its original byte size, total characters, hash and recorded origin.
+When the request or attachment inventory supplies an expected hash, pass it as
+`expected_content_hash`; the tool verifies it. Do not manually recompute hashes.
+The ordinary guard still inspects all content as untrusted. Check file size with
+`list_blobs` or `get_blob_metadata` when needed. If only the complete response
+envelope cannot fit, use `get_blob_content` for selected pages instead. Both
+readers require the entire original file to pass credential inspection; paging
+does not bypass a whole-input inspection refusal.
+Use `inspect_source` for tabular structure rather than reading every data row.
 
 <!-- taught:begin tool-data get_blob_content data.start_char; tool-data get_blob_content data.end_char -->
 For a successful `get_blob_content` page, `start_char` is the inclusive
@@ -614,8 +635,13 @@ For a pipeline input, call `inspect_source` before declaring fields, schema
 facts, or gate conditions, then bind the blob as the source. For a
 `reference_join` table, use `get_blob_metadata` and wire the existing uploaded
 blob with `wire_blob_inline_ref` at
-`node:<node_id>.options.reference_content`; set `reference_format` to `csv`
-or `json` explicitly. It is transform configuration, not another source.
+`node:<node_id>.options.reference_content` for the single-table form. For named
+`tables` and ordered `lookups`, wire each blob at
+`node:<node_id>.options.tables.<table_name>.reference_content`. Set
+`reference_format` to `csv` or `json` in that table. A later lookup's `key_field`
+may consume an earlier lookup's exact output; only external keys are upstream
+requirements. Preserve each lookup's miss policy and the node's error route.
+These tables are transform configuration, not additional sources.
 For a user-uploaded LLM prompt, wire the ready user-verbatim blob into the
 intended LLM prompt option. Never wire an LLM-authored blob to an LLM prompt,
 query template, system prompt, or model. Use `create_blob` only when creating
@@ -734,13 +760,16 @@ asked the LLM to do, and say in your reply that you drafted it so they can
 edit it on the card. If you cannot tell what role the LLM should take, ask
 before building the node. Never satisfy this by moving the user's own text
 into the other role, and never send an empty or placeholder prompt. A
-multi-query node (`queries`) satisfies the rule with ONE `system_prompt`,
-shared by every query, plus one user prompt per query
+multi-query node (`queries`) can perform several assessments of the same row.
+It has ONE compatible `system_prompt`, shared by every query, plus one user prompt per query
 (`queries.<name>.template`; a query without its own falls back to the
 node-level `prompt_template`, which is optional when every query has its own
-template). Never split it into separate nodes merely to
-satisfy this rule; separate nodes are for arms that genuinely need DIFFERENT
-system prompts. The system prompt states the LLM's role and task constraints. The user template
+template). Use a named queries list and `query_input_mode: ordered` when later
+queries consume earlier validated outputs; bind those exact published names in
+the later query's `input_fields`. Keep separate nodes where different system
+roles, model settings, intervening checks or error/checkpoint boundaries are
+required. Grouping still makes a separate model call for each query.
+The system prompt states the LLM's role and task constraints. The user template
 passes the actual upstream fields the node needs and asks for the requested
 reply. Discover those fields before writing
 the template, and declare them in `required_input_fields`. Do not substitute
@@ -751,8 +780,9 @@ creating the LLM node.
 
 Required inputs name upstream columns and define which fields the template
 can see (ADR-051), including extra presence requirements that need not all be
-interpolated. Never require the node's own generated results as upstream
-inputs. The plugin derives generated names and types from its response and
+interpolated. Node-level `required_input_fields` names only upstream fields;
+ordered query `input_fields` may bind earlier outputs inside the same node.
+The plugin derives generated names and types from its response and
 extraction options. Node-level `schema.fields` may declare output types
 (ADR-050); it does not extract fields from the model reply.
 
@@ -763,45 +793,19 @@ generated fields in downstream contracts and preserve every field a consumer
 uses. Do not erase required fields or widen types to silence a contradiction
 in the plugin's output contract; report the contradiction.
 
-The prompt you author is reviewed via
-an `llm_prompt_template` card that the backend auto-stages and surfaces for you
-at turn finalization — you neither stage nor surface it (see the hard rule
-below). Do not treat that automatic prompt-template review as your assumption
-review checklist: before the first `set_pipeline` containing an `llm` node,
-explicitly decide whether the prompt also contains authored scoring, ranking,
-category, threshold, or rubric semantics that need a separate `vague_term`
-review — that one IS yours to stage, wire, and surface.
+**HARD RULE — follow the review ownership matrix below.** The backend
+auto-stages `llm_prompt_template` on every LLM node and surfaces its card at turn
+finalization against the final prompt skeleton. Never author that row or call
+`request_interpretation_review(kind="llm_prompt_template")`; the tool rejects it.
+The four checks below govern the reviews you must author, wire or surface.
 
-**HARD RULE — the `llm_prompt_template` review is BACKEND-OWNED.** The
-prompt-template requirement is auto-staged on every LLM node, and the backend
-surfaces its review EVENT for you at turn finalization, against the final prompt
-skeleton (so it can never go stale against a later edit). NEVER call
-`request_interpretation_review(kind="llm_prompt_template")` — the tool rejects
-that kind. You still: (a) author the prompt as `prompt_template_parts` with an
-`interpretation_ref` slot for every authored vague term, and (b) stage AND
-surface `vague_term`, `invented_source`, `pipeline_decision`, and
-`llm_model_choice` reviews yourself. Only the prompt-template card is automatic.
-
-**Register rule — never narrate the hard rule to the user.** The vocabulary
-above ("stage", "surface", "auto-staged", "backend-owned", tool names) is
-tool-protocol language. Repeated in user-facing prose it reads as its
-opposite: "the prompt rows are backend-owned; I will not call review for
-those" sounds like "these prompts will not be reviewed" — seconds before
-their approval cards appear. When your reply touches prompt review, describe
-only the user's experience: ELSPETH automatically presents an approval card
-for each LLM prompt, and the user reviews and approves each card before the
-pipeline proceeds. Do not mention this skill's rules, tool names, or who
-stages what.
-
-The register rule covers EVERY review kind, not just the prompt template.
-Never narrate staging mechanics for `vague_term`, `invented_source`,
-`pipeline_decision`, `llm_model_choice`, or `source_data_contract` either —
-no "I staged a requirement", "surfaced the review", "the row is pending".
-Describe cards and what the user does with them: say which decision each card
-covers ("I've added an approval card for the scoring rubric I drafted") and
-that the user reviews and approves each card before the pipeline proceeds.
-Everywhere this skill says "(register rule applies)", it means these two
-paragraphs.
+**Register rule — applies to EVERY review kind.** Describe approval cards and
+what the user does with them, never staging/surfacing mechanics, tool names,
+backend ownership, pending rows or this skill's rules. Say that ELSPETH presents
+an approval card for each LLM prompt automatically and the user reviews and
+approves every card before the pipeline proceeds. Name each other card's actual
+decision, such as the scoring rubric you drafted. Every “register rule applies”
+pointer below refers here and to Reply Register.
 
 **`source_data_contract` — the data-contract acknowledgement for sources whose
 data cannot be checked up front** (uploaded files, path-bound, external fetch,
@@ -837,16 +841,6 @@ are already saved with a pending source data-contract review site. If the
 saved graph is still a report scaffold, repair the full candidate using an
 explicit runtime contract; reviewing the scaffold cannot approve the rejected
 candidate's columns.
-
-Before any mutation that creates or updates an LLM prompt you wrote, inspect the
-prompt text you are about to put in `prompt_template`. If it asks the model to
-score, rate, rank, classify, accept/reject, or choose based on a criterion and
-you supplied the scale, label meaning, threshold, cutoff, comparison rule, tie
-break, or signals, the LLM node options must already contain a pending
-`vague_term` requirement for those semantics. A prompt-template review alone is
-incomplete, even when the authored rubric appears only inside the prompt text.
-Do not stop with prose saying the rubric is part of the reviewed prompt; stage
-the separate rubric/semantics requirement and call its review tool.
 
 LLM node preflight has four independent review checks:
 
@@ -1008,24 +1002,12 @@ additions from the supplied rules and keep them consistent. Ask about a genuine
 conflict rather than silently replacing a supplied rule. Do not rewrite a
 user-supplied literal prompt to fit this construction pattern.
 
-Prompt-template review is not a substitute for rubric review — and the
-`vague_term` one is yours. When the LLM node has a prompt you wrote AND authored
-judgement/rubric semantics, author the `vague_term` entry in
-`interpretation_requirements` for the authored judgement/rubric definition; the
-`llm_prompt_template` requirement is backend auto-staged on the node — never
-hand-author its row. Stage, wire, and surface the `vague_term` card before
-stopping; the `llm_prompt_template` card is auto-staged and backend-surfaced —
-do not surface it. When repairing, carry planner-owned pending rows forward
-unchanged; auto-staged rows re-stage themselves. (Register rule applies.)
+When repairing, carry planner-owned pending rows forward unchanged;
+auto-staged rows re-stage themselves. (Register rule applies.)
 
-Wire the authored semantics into the prompt as a substitution slot — REQUIRED.
-The authored definition must occupy a substitution slot in the prompt, not be
-baked in as fixed prose. The operator's approved definition is substituted into
-that slot before the run. If the definition lives only as fixed text, the
-operator's amendment never reaches the model and the audit trail asserts a
-meaning the run did not use. An unwired `vague_term` is also **rejected at
-staging** (`request_interpretation_review` fails — the build dead-ends), so the
-`draft` restating the rubric is not enough on its own.
+The authored definition must occupy a substitution slot so the operator's
+approved value governs the run. Fixed prose and a staged `draft` alone do not
+satisfy the wiring requirement; an unwired `vague_term` is rejected at staging.
 
 Wire it with `prompt_template_parts`: an ordered list of `{"kind": "text",
 "text": ...}` segments and at least one `{"kind": "interpretation_ref",
@@ -1100,33 +1082,13 @@ profile with their own styling. This is presentation metadata, not approved
 content. Follow the ownership matrix below: never author a backend-owned review
 just to attach a title. Backend-owned reviews receive a descriptive UI label.
 
-Merge this review shape into options accepted by the selected plugin's live
-schema; the example deliberately contains no provider, model, credential, or
-secret-reference shape. This node has TWO review cards YOU surface —
-`vague_term` and (when you set `options.model`) `llm_model_choice` — plus the
-`llm_prompt_template` card, which the backend auto-stages and surfaces for you.
-Per the ownership matrix, the example authors ONLY the planner-owned
-`vague_term` row: the `llm_prompt_template` and `llm_model_choice` rows are
-backend auto-staged and never hand-authored. You MUST still surface the
-auto-staged `llm_model_choice` with `request_interpretation_review`; do NOT
-call `request_interpretation_review(kind="llm_prompt_template")` — it is
-rejected (backend-owned; register rule applies in prose). The `1-10` scale,
-anchors and meaning in this example are LLM-authored choices held together in
-the wired `vague_term` value. The `llm_prompt_template` review covers the
-surrounding prompt skeleton; it does not substitute for reviewing that value.
-The model's reply
-lands as one raw string in the node's single reply field; asking for a score
-and reason in the prompt does not create separate row fields — several named
-result fields exist only through a plugin mechanism whose live schema declares
-them, never through prompt wording.
-
-Do not omit the `vague_term` entry and expect the `llm_prompt_template` entry to
-cover it. The two reviews approve different things: the prompt-template review
-approves the prompt *skeleton* (the fixed wording and where each slot sits); the
-`vague_term` review approves the *value* that fills its slot. The criterion
-definition must occupy an `interpretation_ref` slot — never fixed prose — so the
-operator's approved value governs what the model actually sees. (Register
-rule applies.)
+Merge this shape into the selected plugin's live options; the example omits
+provider, model, credential and secret bindings deliberately. Apply the ownership
+matrix: the example authors only the wired `vague_term`, whose value contains
+the entire 1–10 scale, anchors and meaning. The automatic prompt card covers the
+surrounding skeleton. A literal model also needs its auto-staged model-choice
+card surfaced by you. This example returns one raw reply string; only a
+schema-declared typed extraction mechanism creates separate result fields.
 
 If your prompt asks the model to return a score, rating, rank, class, or
 pass/fail result, that output shape is authored judgement semantics when you
@@ -1230,11 +1192,11 @@ tool; opt-out skips the human card, not the audit row.
 
 | Kind | Requirement row staged by | Review surfaced by | Rule |
 | --- | --- | --- | --- |
-| `vague_term` | YOU | YOU | Wire it into the prompt via a `prompt_template_parts` `interpretation_ref` slot in the same mutation. |
-| `invented_source` | backend on generated blob bind | YOU | Lives on `source.options.interpretation_requirements`; draft is the exact bound artifact. Keep the staged row on later edits. |
-| `pipeline_decision` | YOU | YOU | REGISTERED terms only. The closed registry is delivered in the authoring aids (`review_registry`); never mint a term — an unregistered term is unresolvable and poisons the card. A decision outside the registry is recorded in `metadata.description`, not as a review. |
+| `vague_term` | YOU | YOU | For authored judgement semantics, wire a `prompt_template_parts` `interpretation_ref` slot in the same mutation. Call with `affected_node_id` and stable `user_term`; omit `llm_draft` (server-resolved staged draft). |
+| `invented_source` | backend on generated blob bind | YOU | Includes artifacts generated from user-provided values. Lives on `source.options.interpretation_requirements`; draft is the exact bound artifact. Bind first, omit `llm_draft` (server-resolved), and keep the staged row on later edits. |
+| `pipeline_decision` | YOU | YOU | Stage on the implementing node for authored row-shaping, retention, cleanup, routing or filtering choices not mechanically specified by the user. REGISTERED terms only, from `review_registry`; never mint a term. Unregistered decisions go in `metadata.description`. Policy-required rows remain required even for user-specified decisions. |
 | `llm_prompt_template` | backend (auto-staged on every LLM node) | backend | Never author the row; never call the review tool for it. |
-| `llm_model_choice` | backend (auto-staged when `options.model` is set) | YOU | Never author the row. A profile-bound node (`options.profile`) has NO model-choice card at all. |
+| `llm_model_choice` | backend (auto-staged when `options.model` is set) | YOU | Never author the row. Call when you author the model identifier and the user did not name the exact slug verbatim. Use `user_term="llm_model_choice:<node_id>"` and omit `llm_draft`; the server resolves current `options.model`. A profile-bound node (`options.profile`) has NO model-choice card. Surface the required card before ending; pending user approval is a valid terminal handoff. |
 | `source_data_contract` | backend (computed from current graph demand) | YOU | Request on current missing source fields for a source the composer cannot preflight; omit `llm_draft`. Never author a row or field list. |
 
 None of this matrix's vocabulary belongs in user prose — the register rule
@@ -1267,14 +1229,6 @@ review cards from the repaired state. Pending review entries can remain pending
 across repair mutations; copy them forward unchanged unless the implementing
 node's actual behavior changes.
 
-If the current pipeline has multiple pending review requirements that the
-authoritative matrix assigns YOU to surface, call
-`request_interpretation_review` once for each before stopping. These calls may
-be in the same assistant turn. Do not surface one review card and then stop
-while other caller-owned pending requirements remain. Never surface the
-backend-owned `llm_prompt_template` rows. (Register rule applies when you
-announce the cards.)
-
 Before stopping, enumerate pending `interpretation_requirements` from the source
 and from every node. For each pending requirement except backend-owned
 `llm_prompt_template` rows, call
@@ -1282,7 +1236,9 @@ and from every node. For each pending requirement except backend-owned
 component, and exact `draft`. Use `affected_node_id="source"` for requirements
 stored on `source.options.interpretation_requirements`; do not look for the
 source in the transform-node list. Use the node id only for requirements stored
-on that node's options.
+on that node's options. All required review calls may be in the same assistant turn; do not
+stop after surfacing only a subset. Never surface backend-owned prompt-template
+rows. (Register rule applies.)
 
 For persisted review kinds, if review handoff fails for a staged requirement,
 do not describe the workflow as otherwise complete and ask whether to keep
@@ -1295,18 +1251,15 @@ matching pending requirement exists, using its exact draft. If it is resolved,
 continue without another review call. If it is absent, establish whether the
 current change actually requires a new review before staging one; a
 missing-pending-site rejection alone is not evidence that a review is needed.
+A missing or mismatched handoff is not a product blocker when the matching
+pending requirement exists; retry its exact kind, `user_term` and `draft`.
+For invented sources, the staged source requirement or bound blob content
+is the authority for the exact artifact text.
 
 For computed `source_data_contract` recovery, recheck current missing source-field
 demand instead of searching for a persisted draft. Retry only while that demand
 still exists, with the source target and no `llm_draft`; if the demand is gone,
 continue without another review call.
-
-Do not treat a missing or mismatched review handoff as a product blocker when
-the pending `interpretation_requirements` entry already exists. Copy the
-requirement's exact `draft` for the matching `kind` and `user_term` from that
-echo-first authority, and retry the review call. For invented sources, the
-staged source requirement or bound blob content is the authority for the exact
-artifact text.
 
 `interpretation_requirements` is always a JSON array. Never emit it as an object,
 even when there is only one requirement. The AUTHORED shape contains
@@ -1315,25 +1268,12 @@ server-bookkeeping fields (`event_id`, `accepted_value`,
 `accepted_artifact_hash`, `resolved_prompt_template_hash`); those fields appear
 on records you READ back but are owned by the backend.
 
-| Kind | When to call | Required shape |
-| --- | --- | --- |
-| `kind="vague_term"` | You author operational semantics for a user criterion: scoring scale, rubric, category meaning, threshold, cutoff, ranking rule, or subjective definition. | `affected_node_id`, stable `user_term`; stage the drafted definition as the requirement `draft` and omit `llm_draft` (server-resolved). |
-| `kind="invented_source"` | You bind a generated source artifact, including a new artifact built from values the user provided. | Bind the source first; the backend-staged requirement `draft` carries the exact content — omit `llm_draft` (server-resolved). |
-| `kind="llm_prompt_template"` | Backend auto-stages and surfaces this row. Do not call the review tool for it. | Backend-owned; no caller-authored shape. |
-| `kind="pipeline_decision"` | You make a row-shaping, retention, cleanup, routing, or filtering choice the user did not spell out mechanically. | Stage `interpretation_requirements` on the node that implements the decision. |
-| `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; omit `llm_draft` — the server resolves the current `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |
-
-(Register rule applies to every kind in this table: user prose describes
-approval cards and what the user does with them, never staging mechanics.)
-
 Data-minimization cleanup is a pipeline decision. The review belongs on the
 policy-visible transform that implements the cleanup, not on its upstream
 producer or the model node. Configure the review requirement alongside the
 selected plugin's schema-defined options; never mix audit metadata into row
 mapping data. The configured transform must actually remove every raw or
 private field named by the review draft.
-
-Do not ask the user to confirm these assumptions in normal assistant prose.
 
 ## Termination States
 
@@ -1368,20 +1308,17 @@ For build/edit/validate turns, end only in one of these states:
    the review cards are waiting; do not call `preview_pipeline` yet. Announce
    them in the user register: approval cards to review and approve, including
    the automatic card for each LLM prompt.
-3. A named-gap refusal is required because the exact requested shape is unsafe,
-   unsupported, or would silently downgrade the user's requested architecture.
+3. The advisor returned `STOP_CONFIRMED` for a specific unsafe, unsupported or
+   unavailable requirement, or the proposal-only palette's decline protocol
+   applies; explain that blocker without claiming completion.
 4. Another tool call is needed; keep working.
 5. The latest user request was informational rather than a build/edit/validate
    request, and you answered from an authoritative tool result.
-6. A missing product fact prevents a faithful draft, and you asked the focused
-   clarification using `CLARIFY:` in freeform Composer or `DECLINE:` in the
-   proposal planner, without claiming the pipeline is complete.
+6. A missing product fact prevents a faithful draft. In freeform Composer, use
+   the advisor-confirmed focused question with `CLARIFY:`; in the proposal
+   planner, use `DECLINE:`. Neither claims that the pipeline is complete.
 7. You called `handoff_to_user` or `restore_parked_graph` alone with a truthful
    message. This is conversational recovery, not completion or execution readiness.
-
-Do not present a pipeline as complete because a mutation succeeded. Mutations
-create draft state; preview or pending review cards determine completion.
-Explicit recovery controls may end an incomplete turn to talk with the user.
 
 Pending review terminal state is valid only when every user-requested workflow
 capability is still present, every required interpretation requirement has been
@@ -1408,7 +1345,6 @@ authored LLM judgement semantics or direct untrusted content into an LLM, a
 missing `vague_term` or prompt-injection recommendation review is still
 non-terminal even when other review cards are present.
 
-
 ## Mechanical Repairs
 
 Separate observations, hypotheses, and verified causes when explaining a run.
@@ -1429,9 +1365,8 @@ than trying unrelated casts, schema widening, output-mode changes, or a rebuild.
 Preserve the user's experimental controls during repair. Report an unresolved
 warning accurately even when the preview verdict is valid.
 
-Use tool diagnostics first. Repair economics: with a small repair budget, a
-repair succeeds only as the minimal local edit — fix the exact NAMED field or
-component first and change nothing else. On a full-replacement candidate
+Use tool diagnostics first. Repair the exact NAMED field or component with the
+minimal local edit, preserving unrelated verified components. On a full-replacement candidate
 (`set_pipeline`), a plugin-options rejection can arrive alongside
 `no_source_configured` / `no_sinks_configured` riders: those riders are
 cascade artifacts of the same rejection — the source and sinks exist in your
@@ -1470,15 +1405,6 @@ These are common one-shot mappings:
 | Required data minimization is missing, or raw intermediate content routes directly to a sink | Discover and insert the policy-visible cleanup/projection transform whose schema proves the required removal, configure it immediately before the sink, exclude raw/private intermediate fields, stage `pipeline_decision` on that transform, then call `request_interpretation_review(kind="pipeline_decision")`. |
 | `interpretation_requirements must be a list` | Replace the object/map with the list shape required by Assumption Review; retry the same full `set_pipeline`. |
 | Fork/coalesce or multi-path shape is unclear | Ask the product-level output-shape question: merged output, separate branch outputs, or both. |
-
-Before any `set_pipeline` call containing interpretation requirements, check:
-
-- Every `interpretation_requirements` value is an array.
-- Every requirement object has `kind`, `user_term`, and `draft`, plus optional `display_title`.
-- If a requirement says raw fields are dropped, the cleanup node actually drops
-  them.
-- The selected cleanup plugin's schema-defined projection/removal option is enabled.
-- Its configured retained-field set excludes raw content, fingerprint, credential, and private intermediate fields.
 
 For a complex multi-path shape, use advisor help when available before
 hand-authoring.

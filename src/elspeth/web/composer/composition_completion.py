@@ -1568,6 +1568,7 @@ class CompositionCompletion:
         """
         no_tool_response = parse_no_tool_response(assistant_message.content or "")
         assistant_message = replace(assistant_message, content=no_tool_response.body)
+        confirmed_stop = turn_evidence.confirmed_abandonment(current_state=state, plugin_snapshot=plugin_snapshot)
         proof = self._assess_source_proof(
             state,
             session_id=session_id,
@@ -1605,7 +1606,8 @@ class CompositionCompletion:
                 provider_owner=provider_owner,
             )
         if (
-            repair_turns_used < _MAX_REPAIR_TURNS
+            not confirmed_stop
+            and repair_turns_used < _MAX_REPAIR_TURNS
             and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
             and _state_is_structurally_empty(state)
             and _last_failure_was_pre_state_interpretation_review(recorder.invocations)
@@ -1621,7 +1623,7 @@ class CompositionCompletion:
             )
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
-        if repair_turns_used < _MAX_REPAIR_TURNS:
+        if not confirmed_stop and repair_turns_used < _MAX_REPAIR_TURNS:
             missing_interpretation_sites = await self._interpretation_surfacing._missing_pending_interpretation_review_sites(
                 state,
                 session_id=session_id,
@@ -1685,7 +1687,7 @@ class CompositionCompletion:
             proof_repair = self._attempt_proof_repair(
                 proof=proof,
                 llm_messages=llm_messages,
-                repair_turns_used=repair_turns_used,
+                repair_turns_used=_MAX_REPAIR_TURNS if confirmed_stop else repair_turns_used,
             )
             if proof_repair.action == "repair_injected":
                 return _TerminateOutcome(action="continue", repair_turns_delta=1)
@@ -1707,7 +1709,7 @@ class CompositionCompletion:
         # proof gate (more-specific blob diagnostics first) and BEFORE the
         # advisor gate (the frontier advisor only reviews a mechanically valid
         # pipeline — same rationale as the orphan pre-check below).
-        if proof_runtime_preflight is None and await self._attempt_preflight_repair(
+        if not confirmed_stop and proof_runtime_preflight is None and await self._attempt_preflight_repair(
             state=state,
             llm_messages=llm_messages,
             user_id=user_id,
@@ -1769,7 +1771,7 @@ class CompositionCompletion:
                 persisted_assistant_message_id=persisted_assistant_message_id,
                 persisted_assistant_content=persisted_assistant_content,
                 persisted_tool_call_turn=persisted_tool_call_turn,
-                allow_repair_continue=proof_runtime_preflight is None,
+                allow_repair_continue=proof_runtime_preflight is None and not confirmed_stop,
                 user_message=message,
                 runtime_preflight=proof_runtime_preflight
                 if proof_runtime_preflight is not None

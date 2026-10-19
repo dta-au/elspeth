@@ -7,7 +7,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Final, Literal, TypedDict, get_args
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
@@ -57,6 +57,55 @@ class AdvisorEndResponse(AdvisorCheckpointResponse):
     """END adds prose permission without changing graph verdict semantics."""
 
     publication_verdict: Literal["ADMIT", "WITHHOLD"]
+
+
+class AdvisorAbandonmentResponse(BaseModel):
+    """A request-scoped stop decision, independent of graph and prose clearance."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    decision: Literal["STOP_CONFIRMED", "CONTINUE"]
+    reason: str = Field(min_length=1, max_length=2000)
+    next_action: str | None = Field(max_length=2000)
+    question: str | None = Field(max_length=2000)
+
+    @field_validator("reason", "next_action", "question")
+    @classmethod
+    def require_nonempty_unicode(cls, value: str | None) -> str | None:
+        if value is not None:
+            _require_unicode_scalars(value)
+            if not value.strip():
+                raise ValueError("Advisor decision text must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def require_actionable_decision(self) -> AdvisorAbandonmentResponse:
+        if self.decision == "CONTINUE" and (self.next_action is None or self.question is not None):
+            raise ValueError("CONTINUE requires a supported action, not a question for the user")
+        if self.decision == "STOP_CONFIRMED" and self.next_action is not None:
+            raise ValueError("A confirmed stop must not require another authoring action")
+        return self
+
+
+def parse_advisor_abandonment_response(text: str) -> AdvisorAbandonmentResponse | None:
+    parsed, error = parse_json_strict(text)
+    if error is not None:
+        return None
+    try:
+        return AdvisorAbandonmentResponse.model_validate(parsed)
+    except ValidationError:
+        return None
+
+
+def advisor_abandonment_response_format() -> dict[str, object]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "advisor_abandonment_response",
+            "strict": True,
+            "schema": AdvisorAbandonmentResponse.model_json_schema(),
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)

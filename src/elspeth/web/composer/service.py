@@ -313,6 +313,11 @@ _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: TurnEvidence | None = None) -> list[dict[str, Any]]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
+    # Native thinking belongs to the original complete assistant/tool exchange.
+    # The caller's explicit recovery-only palette still controls new actions.
+    native_evidence = detach_prompt_guard_evidence(llm_messages)
+    if any(entry is not None for entry in native_evidence.thinking_parts):
+        return list(llm_messages)
     messages: list[dict[str, Any]] = []
     for historical_message in llm_messages:
         if historical_message["role"] != "tool" and "tool_calls" not in historical_message:

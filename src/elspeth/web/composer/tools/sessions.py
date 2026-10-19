@@ -186,9 +186,12 @@ ADVISOR_TRIGGER_PROACTIVE_SECURITY: Final[str] = "proactive_security_safety"
 
 ADVISOR_TRIGGER_PROACTIVE_RED_LISTED: Final[str] = "proactive_red_listed_plugin"
 
+ADVISOR_TRIGGER_CANNOT_COMPLETE: Final[str] = "cannot_complete"
+
 ADVISOR_TRIGGER_VALUES: Final[tuple[str, ...]] = (
     ADVISOR_TRIGGER_PROACTIVE_SECURITY,
     ADVISOR_TRIGGER_PROACTIVE_RED_LISTED,
+    ADVISOR_TRIGGER_CANNOT_COMPLETE,
 )
 
 # Backend-synthesized triggers for the deterministic advisor checkpoints
@@ -212,7 +215,7 @@ _MAX_REPORTED_COMPONENT_REJECTIONS: Final[int] = 8
 
 
 class _AdvisorHintRequest(TypedDict):
-    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin"]
+    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin", "cannot_complete"]
     problem_summary: str
     recent_errors: list[str]
     attempted_actions: list[str]
@@ -222,7 +225,7 @@ class _AdvisorHintRequest(TypedDict):
 class RequestAdvisorHintArgumentsModel(BaseModel):
     """Public advisor input; backend checkpoint fields are not authorable."""
 
-    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin"]
+    trigger: Literal["proactive_security_safety", "proactive_red_listed_plugin", "cannot_complete"]
     problem_summary: str = Field(max_length=2000)
     recent_errors: list[Annotated[str, Field(max_length=2000)]] = Field(max_length=5)
     attempted_actions: list[Annotated[str, Field(max_length=2000)]] = Field(max_length=8)

@@ -53,6 +53,7 @@ from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_TRUST_KEY,
     PromptGuardContentPart,
     PromptGuardMode,
+    PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
     PromptGuardTrust,
     detach_prompt_guard_evidence,
@@ -84,7 +85,7 @@ from elspeth.web.composer.capability_skill import (
     build_planner_capability_manifest,
 )
 from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
-from elspeth.web.composer.discovery_cache import serialize_tool_result
+from elspeth.web.composer.discovery_cache import serialize_tool_result, tool_result_content_parts
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
     admit_discovery_result,
@@ -150,7 +151,7 @@ from elspeth.web.composer.provider_quota import (
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.recovery_controls import parse_recovery_tool_call, recovery_context_message, recovery_tool_definitions
-from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, SetPipelineArgumentsModel
+from elspeth.web.composer.redaction import GetBlobContentArgumentsModel, ReadAttachmentArgumentsModel, SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import (
     COMPOSER_NODE_TYPES,
@@ -468,6 +469,12 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         except PydanticValidationError:
             return ()
         return ("blob.content:" + canonical_json((page.blob_id, page.offset_chars, page.expected_content_hash)),)
+    if name == "read_attachment":
+        try:
+            attachment = ReadAttachmentArgumentsModel.model_validate(deep_thaw(arguments))
+        except PydanticValidationError:
+            return ()
+        return ("blob.attachment:" + canonical_json((attachment.blob_id, attachment.expected_content_hash)),)
     if name == "list_secret_refs":
         return ("secret.index",)
     if name == "validate_secret_ref":
@@ -1572,7 +1579,7 @@ def planner_terminal_tool_definition(
         "type": "function",
         "function": {
             "name": _TERMINAL_TOOL_NAME,
-            "description": "Return one complete canonical pipeline proposal for server validation, alone in its tool-call turn. Finish discovery in earlier turns; after rejection, repair and resubmit within the remaining budget.",
+            "description": "Return one complete canonical pipeline proposal for server validation, alone in its tool-call turn. Finish discovery in earlier turns; after rejection, repair and resubmit the complete proposal.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1884,14 +1891,6 @@ def _parse_response_tool_calls(
     return message, tuple(parsed)
 
 
-def _discovery_pressure_notice(remaining: int) -> str:
-    return (
-        f"Budget notice: only {remaining} discovery turns remain before this planning request is cut off. "
-        "Stop exploring, settle the design, and call emit_pipeline_proposal with one complete proposal "
-        "as soon as possible."
-    )
-
-
 def _truncated_response_notice() -> str:
     return (
         "Your previous response was cut off at the output token limit and has been discarded. "
@@ -1931,9 +1930,9 @@ PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "Use read-only discovery as needed in earlier turns, then call emit_pipeline_proposal "
     "alone in its turn with one complete canonical set_pipeline argument object. Never "
     "batch it with discovery or another call: a mixed terminal batch executes no calls. "
-    "After a rejection, repair and resubmit within the remaining budget. At any stage, you may instead call "
+    "After a rejection, repair and resubmit the complete proposal. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
-    "Recovery needs no discovery, candidate capture, validation or budget exhaustion."
+    "Recovery needs no discovery, candidate capture or validation."
 )
 
 
@@ -1966,10 +1965,9 @@ def _prose_decline_notice() -> str:
 
 def _escape_hatch_notice() -> str:
     return (
-        "The planning budget is exhausted; this is the escape hatch. You are a senior advisor model "
-        "reviewing the retained transcript above as one freeform puzzle. Only protocol-complete turns are retained above; "
-        "truncated responses and tool calls rejected before execution by discovery guards or discovery/composition budgets are omitted. "
-        "You have exactly one turn: either "
+        "You are a senior advisor model reviewing the retained transcript above as one freeform puzzle. "
+        "Only protocol-complete turns are retained above; incomplete responses and calls rejected before execution are omitted. "
+        "Either "
         "call emit_pipeline_proposal once with a complete, valid pipeline that satisfies the request, "
         "or reply in plain text honestly explaining why the request cannot be built with the available "
         "plugins. You may instead call handoff_to_user or restore_parked_graph alone to end authoring "
@@ -1982,8 +1980,12 @@ def _escape_hatch_notice() -> str:
     )
 
 
-def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ...]) -> dict[str, Any]:
-    return {
+def _assistant_tool_calls_message(
+    message: Any, calls: tuple[_ParsedToolCall, ...], *, thinking_blocks: object = None
+) -> dict[str, Any]:
+    from elspeth.web.composer.provider_thinking import attach_provider_thinking
+
+    replay = attach_provider_thinking({
         "role": "assistant",
         "content": _provider_field(message, "content"),
         "tool_calls": [
@@ -2006,7 +2008,10 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
             for index, call in enumerate(calls)
             if call.wire_error is None
         ),
-    }
+    }, thinking_blocks)
+    if "thinking_blocks" in replay and any(call.wire_error is not None for call in calls):
+        raise PipelinePlannerError("Native thinking cannot be replayed with rewritten tool arguments", code="MALFORMED_RESPONSE")
+    return replay
 
 
 def _feedback_error_codes(feedback: _PlannerFeedbackWire) -> tuple[str, ...]:
@@ -3170,6 +3175,7 @@ async def _complete_planner_provider(
     trusted_indexes: frozenset[int],
     content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...],
     tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...],
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
 ) -> Any:
     return await _litellm_acompletion(
         provider_custody=provider_custody,
@@ -3180,6 +3186,7 @@ async def _complete_planner_provider(
         prompt_guard_trusted_message_indexes=trusted_indexes,
         prompt_guard_content_parts=content_parts,
         prompt_guard_tool_argument_parts=tool_argument_parts,
+        prompt_guard_thinking_parts=thinking_parts,
         **dict(request),
     )
 
@@ -3756,6 +3763,7 @@ async def _plan_pipeline_inner(
                         trusted_indexes=trusted_indexes,
                         content_parts=guard_evidence.content_parts,
                         tool_argument_parts=guard_evidence.tool_argument_parts,
+                        thinking_parts=guard_evidence.thinking_parts,
                     )
                     if provider_custody is not None
                     else _litellm_acompletion(
@@ -3769,6 +3777,7 @@ async def _plan_pipeline_inner(
                         prompt_guard_trusted_message_indexes=trusted_indexes,
                         prompt_guard_content_parts=guard_evidence.content_parts,
                         prompt_guard_tool_argument_parts=guard_evidence.tool_argument_parts,
+                        prompt_guard_thinking_parts=guard_evidence.thinking_parts,
                         **kwargs,
                     ),
                     timeout=remaining,
@@ -4169,12 +4178,13 @@ async def _plan_pipeline_inner(
         parsed_calls: tuple[_ParsedToolCall, ...],
         terminal_call: _ParsedToolCall,
         feedback: _PlannerFeedbackWire,
+        thinking_blocks: object,
     ) -> None:
         # A rejected terminal proposal was evaluated and its safe result is
         # known, so retain the exact provider-authored tool call together with
         # that allowlisted result. This closes the tool protocol without
         # projecting any candidate-finalizer authority back to the advisor.
-        messages.append(_assistant_tool_calls_message(provider_message, parsed_calls))
+        messages.append(_assistant_tool_calls_message(provider_message, parsed_calls, thinking_blocks=thinking_blocks))
         messages.append(
             {
                 "role": "tool",
@@ -4371,7 +4381,7 @@ async def _plan_pipeline_inner(
                 )
                 assert hatch_error is not None
                 raise hatch_error from None
-            messages.append(_assistant_tool_calls_message(message, calls))
+            messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
             not_alone_feedback = canonical_json(_terminal_call_not_alone_feedback())
             for rejected_call in calls:
                 messages.append(
@@ -4540,6 +4550,7 @@ async def _plan_pipeline_inner(
                         _retain_terminal_rejection(
                             provider_message=message,
                             parsed_calls=calls,
+                            thinking_blocks=audited_call.thinking_blocks,
                             terminal_call=call,
                             feedback=terminal_feedback,
                         )
@@ -4561,7 +4572,7 @@ async def _plan_pipeline_inner(
                     led_to="repair",
                     repeated_fingerprint=repeated_terminal_fingerprint,
                 )
-                messages.append(_assistant_tool_calls_message(message, calls))
+                messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
                 messages.append(
                     {
                         "role": "tool",
@@ -4617,6 +4628,7 @@ async def _plan_pipeline_inner(
                         _retain_terminal_rejection(
                             provider_message=message,
                             parsed_calls=calls,
+                            thinking_blocks=audited_call.thinking_blocks,
                             terminal_call=call,
                             feedback=argument_feedback,
                         )
@@ -4627,7 +4639,7 @@ async def _plan_pipeline_inner(
                     )
                     raise _rejection_exhausted() from None
                 trail.finish_attempt(attempt_phase, "arg_error", codes=last_rejection_codes, led_to="repair")
-                messages.append(_assistant_tool_calls_message(message, calls))
+                messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
                 argument_feedback_json = canonical_json(_allowlisted_argument_feedback(exc))
                 messages.append(
                     {
@@ -4714,6 +4726,7 @@ async def _plan_pipeline_inner(
                         _retain_terminal_rejection(
                             provider_message=message,
                             parsed_calls=calls,
+                            thinking_blocks=audited_call.thinking_blocks,
                             terminal_call=call,
                             feedback=candidate_feedback,
                         )
@@ -4750,6 +4763,7 @@ async def _plan_pipeline_inner(
                         _retain_terminal_rejection(
                             provider_message=message,
                             parsed_calls=calls,
+                            thinking_blocks=audited_call.thinking_blocks,
                             terminal_call=call,
                             feedback=candidate_feedback,
                         )
@@ -4771,7 +4785,7 @@ async def _plan_pipeline_inner(
                     led_to="repair",
                     repeated_fingerprint=repeated_fingerprint,
                 )
-                messages.append(_assistant_tool_calls_message(message, calls))
+                messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
                 messages.append(
                     {
                         "role": "tool",
@@ -4871,7 +4885,7 @@ async def _plan_pipeline_inner(
             raise PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE")
         seen_discovery.update(keys)
         await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
-        messages.append(_assistant_tool_calls_message(message, calls))
+        messages.append(_assistant_tool_calls_message(message, calls, thinking_blocks=audited_call.thinking_blocks))
         for call in useful_calls:
             await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
 
@@ -5065,7 +5079,7 @@ async def _plan_pipeline_inner(
                 schema_contract_budget_remaining=budget_remaining,
             )
             if (
-                call.name in {"get_blob_content", "inspect_source"}
+                call.name in {"get_blob_content", "read_attachment", "inspect_source"}
                 and turn_evidence is not None
                 and type(discovery_result) is AdmittedDiscoveryResult
             ):
@@ -5082,12 +5096,14 @@ async def _plan_pipeline_inner(
                     "content": serialized_result,
                     PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
                         serialized_result,
-                        reference_paths=frozenset({("data",)})
-                        if isinstance(discovery_result, AdmittedDiscoveryResult)
-                        and discovery_result.result.success
-                        and type(discovery_result.response) is AdmittedPluginSchemaResponse
-                        else frozenset(),
-                    ),
+                        reference_paths=frozenset({("data",)}),
+                    )
+                    if isinstance(discovery_result, AdmittedDiscoveryResult)
+                    and discovery_result.result.success
+                    and type(discovery_result.response) is AdmittedPluginSchemaResponse
+                    else tool_result_content_parts(discovery_result, serialized_result)
+                    if isinstance(discovery_result, AdmittedDiscoveryResult)
+                    else json_content_parts(serialized_result),
                 }
             )
             information_available = result.success
@@ -5183,9 +5199,6 @@ async def _plan_pipeline_inner(
                 _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
                 continue
             raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
-        remaining_discovery = model_config.max_discovery_turns - discovery_turns
-        if remaining_discovery == 2:
-            messages.append({"role": "user", "content": _discovery_pressure_notice(remaining_discovery)})
         if pending_information and all(information_manifest.supplies(key) for key in pending_information):
             messages.append({"role": "user", "content": _ALL_INFORMATION_GAPS_CLOSED_NOTICE})
 

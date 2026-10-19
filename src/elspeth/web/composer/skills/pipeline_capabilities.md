@@ -41,16 +41,15 @@ authoring:
 5. Author through your surface's terminal authoring tool with the complete
    canonical document. Preserve the requested topology during every repair.
 
-These steps order the facts you need, not the turns you spend. Batch independent
-missing facts within the per-turn tool budget. Pages of one blob depend on its
+Batch independent missing facts. Pages of one blob depend on its
 returned continuation offset and content hash; read them sequentially, without
 guessing later offsets. On a
 proposal-only surface, finish discovery in earlier turns: the terminal proposal
 must be the only call in its turn, and a mixed terminal batch executes no calls.
 Batch only calls whose fact is still missing: never issue the same call twice
 in one turn, and never ask for a fact the request already supplies or one an
-earlier call already answered — such a read is refused rather than answered,
-and two refusals can end the request's discovery. A rejection clears the
+earlier call already answered — such a read is refused rather than answered.
+A rejection clears the
 repetition window but does not un-supply anything already read: a fact stays
 supplied for the whole request, so repair through step 3's structured-repair
 reads, which carry what a re-read cannot. Where your palette also carries
@@ -358,7 +357,9 @@ whitespace string unchanged; field presence, types, template visibility and
 input/result checks still apply. Null requires the arriving field's nullable
 contract independently. This option does not produce an unavailable assessment.
 `query_input_mode: upstream` is the default: every query reads the original row.
-`query_input_mode: ordered` requires list-form named queries and `pool_size: 1`.
+`query_input_mode: ordered` runs list-form named queries in their authored order,
+with effective `pool_size: 1`. A profile-bound Composer node omits `pool_size`;
+profile lowering and the runtime default supply sequential execution.
 Its `input_fields` may bind an exact generated name from an earlier successful,
 validated query. Before authoring each binding, obtain the selected plugin's
 exact configuration and generated structured/raw/usage/model output names from
@@ -367,9 +368,29 @@ or prompt prose. Self/forward bindings and
 collisions are refused. Those internal dependencies are not upstream requirements.
 `source_row` and images always remain original-only. A constant first ordered
 query may use `input_fields: {}`; do not invent an external input for it.
+For example, query 1 can consume `animal_type` and publish typed `teeth_count`.
+Query 2 binds `input_fields: {teeth_count: teeth_count}` and reads
+`{{ row.teeth_count }}`. To publish that bare structured name, query 1 uses
+`structured_output_prefix: ""`; the default would publish `<query_name>_teeth_count`.
+Only `animal_type` belongs in the node's upstream `required_input_fields` for
+this chain. Each query still has its own effective user prompt and validated
+outputs under the node's shared system/model configuration.
+Per-query structured extraction checks types before a dependent query runs;
+node-level `result_checks` run after all queries. Keep a separate node boundary
+when a required check must run before another model call.
 No query publishes a partial output row. Failure discards local results and
 routes the original entry row, while completed provider calls and charges remain.
 Recovery restarts at the node boundary and may repeat calls.
+
+For a selected `reference_join`, named `tables` and a `lookups` list support
+the same within-node dependency pattern. Lookups run in list order; a later
+`key_field` may name an earlier lookup's exact output. `reference_key_name`
+names the match column in its table, and `output` expressions read the matched
+entry through `ref`. This plugin uses `tables`/`lookups`, not LLM `queries` or
+`query_input_mode`. Follow its live schema and assistance for configuration.
+Self/forward references, duplicate outputs and overwriting arriving fields are
+refused. A failed lookup releases no partially enriched row; the node's error
+route receives the original entry row.
 
 ### Optional operator-led chain compaction
 
@@ -471,7 +492,7 @@ the schema does not contain; use those when correcting a prior conclusion.
 Validation failures are structured repair input. Preserve the complete
 requested shape, apply required fields/enums/options from the returned schema or
 assistance, correct routing and field guarantees, then resubmit the complete
-proposal within the repair budget. Never delete a requested source, node,
+proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.
 
 ## Capability and trust boundary
