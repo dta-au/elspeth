@@ -27,7 +27,7 @@ under three one-host deployment profiles, and PostgreSQL 16 as the required
 first-class backend for the maintained AWS single-leader Landscape deployment.
 Multi-replica scheduling remains outside the claim.
 
-The [application API design](../../specs/application-api-design.md) owns the
+The archived [application API design](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/specs/application-api-design.md) owns the
 future compiler boundary. Runtime admission binds the actual engine/runtime
 contracts and execution inputs; a dated assessment records evidence at one
 baseline, not a portable execution permit or runtime contract identity.

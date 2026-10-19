@@ -38,7 +38,7 @@ eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
 effects, incomplete sources and identity/compatibility failures remain
 `recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
 Integrated verification is recorded in the
-[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+[ACA plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
 Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification.
@@ -48,7 +48,7 @@ no-affinity deployment qualification.
 > (environment, workload, jobs, parameter examples, KQL evidence queries and
 > the thin `scripts/acceptance.sh` driver). Every platform literal below is
 > measured in the
-> [platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
+> [platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
 > cite that file by section, never restate a fact from memory. For an ordinary
 > image rollout to an existing app use
 > [Azure Container Apps existing-service redeploy](azure-container-apps-existing-service-redeploy.md);
@@ -620,7 +620,7 @@ cross-checks every replica name against `az containerapp replica list`.
 Both runtime roles need write access to `web_instances`. Each replica registers
 itself in that table at boot, so a role holding only `SELECT` fails startup with
 `permission denied for table web_instances` and P3 never gets a row to expire.
-From 0.8.7, startup also needs `UPDATE` on `quota_policies` to authorize its
+In 0.8.9, startup also needs `UPDATE` on `quota_policies` to authorize its
 population lock, even when no container ceiling is configured. For a startup
 proof with no configured quota, the session-database minimum is:
 
@@ -632,7 +632,7 @@ GRANT UPDATE ON quota_policies TO elspeth_runtime_a;
 ```
 
 Repeat for `elspeth_runtime_b`. Existing restricted roles following the older
-minimum need the quota-table grant before upgrading to 0.8.7. These grants do
+minimum need the quota-table grant before upgrading to 0.8.9. These grants do
 not grant DDL or the full DML needed for normal application use. In particular,
 creating a configured policy additionally needs `INSERT` on `quota_policies`
 and the normal Landscape audit-write permissions. Use the maintained bootstrap

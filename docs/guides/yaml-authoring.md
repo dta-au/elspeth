@@ -5,7 +5,7 @@ text. YAML and the Web Composer feed the same plugin contracts, graph validator,
 runtime, and Landscape audit trail. You do not need Composer or an LLM provider
 to run a pipeline made entirely from local data plugins.
 
-This guide describes the 0.8.6 YAML interface. It assumes ELSPETH is already
+This guide describes the 0.8.9 YAML interface. It assumes ELSPETH is already
 installed in an activated environment; check with `elspeth --version`. For
 source installation, see [Your First Pipeline](your-first-pipeline.md#step-1-install-elspeth).
 Use an approved checkout or installed version that supports the features you

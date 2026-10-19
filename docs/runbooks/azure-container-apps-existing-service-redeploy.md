@@ -9,7 +9,7 @@ For a first installation use
 the release-specific replica > 1 acceptance program use
 [Full disposable Azure Container Apps acceptance](azure-container-apps-deployment.md).
 Every platform literal below is measured in the
-[platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md).
+[platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md).
 
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
@@ -39,7 +39,7 @@ eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
 effects, incomplete sources and identity/compatibility failures remain
 `recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
 Integrated verification is recorded in the
-[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+[ACA plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
 Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification. The legacy v2 P4b receipt remains

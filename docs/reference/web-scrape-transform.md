@@ -298,15 +298,14 @@ Authenticated execution remains unavailable: configured `auth` is hidden
 from Composer's catalog and refuses the row before DNS or HTTP. Response
 validation does not protect confidential authenticated bodies, which the
 ordinary audit client persists before extraction. Enabling auth requires the
-retention and access policy and protected evidence boundary described in the
-[authenticated response design gate](../design/2026-09-29-web-auth-response-evidence-gate.md).
+retention and access policy and a protected response-evidence boundary before
+authenticated response bodies can be fetched or persisted.
 
 Live browser execution is also unavailable. The
 [`core/browser` boundary](../../src/elspeth/core/browser/boundary.py) supplies
 bounded request-admission and archived-output replay contracts; it opens no
-sockets, launches no browser, and registers no pipeline plugin. The
-[browser egress release gate](../design/2026-09-29-web-browser-egress-gate.md)
-requires a separately isolated worker and enforcing gateway, with deployment
+sockets, launches no browser, and registers no pipeline plugin. Enabling live
+browser execution requires a separately isolated worker and enforcing gateway, with deployment
 proof that browser traffic cannot bypass audit and destination policy.
 
 ## Output Fields

@@ -2046,8 +2046,9 @@ service, unhealthy target, or failed browser round trip blocks the candidate.
 
 ## ECS probe wiring
 
-This runbook is the canonical operator entry point. Keep these four facts in
-sync with [AWS ECS health and readiness](../operator/aws-ecs-health-and-readiness.md):
+This runbook is the canonical operator entry point. The current wiring is
+recorded below; [historical AWS ECS health and readiness](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/operator/aws-ecs-health-and-readiness.md)
+provides earlier context.
 
 | Surface | Wiring | Meaning |
 |---|---|---|
@@ -3900,6 +3901,6 @@ lean digest must never receive the generic release tag (whose label is `all`).
 
 ## See also
 
-- [AWS ECS health and readiness](../operator/aws-ecs-health-and-readiness.md)
+- [AWS ECS health and readiness](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/operator/aws-ecs-health-and-readiness.md)
 - [Configure Azure Key Vault](configure-keyvault-secrets.md)
 - [Docker guide](../guides/docker.md)

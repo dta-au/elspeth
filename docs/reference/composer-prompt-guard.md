@@ -113,10 +113,10 @@ audit lifecycle.
 ## Support boundary
 
 0.8.9 implements Azure text checking with subscription-key authentication.
-Bedrock and GCP adapters and open integrations remain reserved. Their earlier
-planning labels, 0.8.8 and 0.8.9 respectively, do not make those APIs
-configurable in release 0.8.9. Runtime graph prompt-shield/content-safety transforms are configured
-separately and are not executed by this authoring mount.
+Bedrock and GCP adapters and open integrations remain reserved and are not
+configurable in release 0.8.9. Runtime graph prompt-shield/content-safety
+transforms are configured separately and are not executed by this authoring
+mount.
 
 An API version identifies the Azure protocol, not immutable detector model
 bytes. Offline contract tests verify integration and refusal behavior; they

@@ -4,7 +4,7 @@ Use this procedure to install a complete ELSPETH stack on Azure Container Apps
 from an empty resource group with the tracked Bicep bundle at
 [`deploy/azure-container-apps/`](../../deploy/azure-container-apps/README.md).
 The bundle composes Azure Verified Modules (versions pinned in the
-[platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md) §1.2)
+[platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md) §1.2)
 into a virtual network, a Container Apps environment, Azure Database for
 PostgreSQL Flexible Server, an NFS 4.1 Azure Files share, Key Vault, Log
 Analytics, separate runtime and schema-owner managed identities and vaults,
@@ -35,7 +35,7 @@ eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
 effects, incomplete sources and identity/compatibility failures remain
 `recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
 Integrated verification is recorded in the
-[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+[ACA plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
 Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification. The legacy v2 P4b receipt remains

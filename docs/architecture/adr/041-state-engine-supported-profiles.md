@@ -105,12 +105,12 @@ currently have no automatic pruning policy.
 
 The integrated implementation has completed default-suite and serial
 PostgreSQL verification, including local process-crash evidence; see
-[final verification](../../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+[final verification](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
 The executable surfaces are
 `tests/testcontainer/web/test_cross_process_run_control_postgres.py`,
 `tests/testcontainer/web/test_cross_process_run_reconciliation_postgres.py`
 and the engine handoff regressions described in the
-[ACA resumption plan](../../plans/2026-09-10-aca-pivot-and-replica-residuals.md#b-durable-run-admission-handoff-and-cancellation).
+[ACA resumption plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#b-durable-run-admission-handoff-and-cancellation).
 These results do not claim a live ACA run, unrestricted effect replay,
 automatic restart of an interrupted Composer provider request, or routing
 qualification without affinity. Preserve

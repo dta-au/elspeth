@@ -116,6 +116,24 @@ existing-service redeploy, transition and rollback holds remain in place.
 
 ## 0.8.7 - Unreleased (Composer correctness and recovery)
 
+- **Empty-session conversations reach the planner without wording heuristics.**
+  Graph and session prerequisites select the authoring surface. The model can
+  build, explain, clarify or decline using ordinary bounded prose; it no longer
+  needs a special decline marker or completed discovery before replying.
+  Prior assistant messages retain clarification context separately from
+  authenticated user requirements.
+- **Cleanup review follows structured decisions and actual source fields.**
+  Registered decision identity and declared web-scrape fields determine cleanup
+  obligations. Draft wording, node names and HTML-like field names no longer
+  decide admission; review provenance and artifact binding remain required.
+- **Advisor input reviews assess the requested task.** Constant prompts,
+  URL-only inputs and absent named field references alone no longer establish
+  a defect. Review guidance requires a concrete mismatch between the task and
+  available inputs, including whole-row and dynamic references.
+- **Public tool evidence excludes private inline custody data.** New pipeline
+  evidence removes private inline values before public retention. Unsafe or
+  unparseable historical inline custody evidence refuses public replay while
+  preserving the original audit record.
 - **Composer and advisor protection uses Azure Prompt Shields.** Each role has
   an independent Azure AI Content Safety configuration. Required guard checks
   precede protected model dispatch and record sanitized decisions; missing
