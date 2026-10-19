@@ -91,7 +91,12 @@ from elspeth.web.coordination.mutation_connection_registry import (
     _resolve_mutation_connection,
     _unregister_mutation_connection,
 )
-from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
+from elspeth.web.coordination.quota_authority import (
+    QuotaExceeded,
+    RepositoryQuotaAuthority,
+    refuse_unrecorded_quota_exceeded,
+    session_storage_bytes_on_connection,
+)
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
 from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
 from elspeth.web.sessions.composer_operations import (
@@ -116,6 +121,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     library_entries_table,
+    output_storage_reservations_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     quota_provider_attempts_table,
@@ -2312,9 +2318,7 @@ class _RepositoryBlobMutations:
             accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
         )
         connection = _resolve_mutation_connection(state._connection_token)
-        current_total = connection.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == state._session_id)
-        ).scalar_one()
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
         if type(current_total) is not int:
             raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
         if current_total - actual.size_bytes + replacement.size_bytes > max_storage_per_session:
@@ -2471,9 +2475,7 @@ class _RepositoryBlobMutations:
             accepting_tool_name="update_blob" if accepting_proposal_id is not None else None,
         )
         connection = _resolve_mutation_connection(state._connection_token)
-        current_total = connection.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == state._session_id)
-        ).scalar_one()
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
         if type(current_total) is not int:
             raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
         if current_total - actual.size_bytes + exact.replacement_blob.size_bytes > max_storage_per_session:
@@ -2519,6 +2521,17 @@ class _RepositoryBlobMutations:
         )
         if replaced.rowcount != 1:
             raise AuditIntegrityError("ready blob changed during exact replacement commit")
+        # Preserve recoverable sink-stage overhead when this formerly generated
+        # output is edited. Shrinkage is released only after backup cleanup.
+        growth = max(replacement.size_bytes - actual.size_bytes, 0)
+        connection.execute(
+            update(output_storage_reservations_table)
+            .where(
+                output_storage_reservations_table.c.target_path == replacement.storage_path,
+                output_storage_reservations_table.c.session_id == state._session_id,
+            )
+            .values(size_bytes=output_storage_reservations_table.c.size_bytes + growth)
+        )
         self._record_applied_blob_proposal_effect(
             accepting_proposal_id=accepting_proposal_id,
             tool_name="update_blob",
@@ -2532,7 +2545,7 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob replacement commit metadata postcondition failed")
         return committed
 
-    def retire_blob_replacement(self, *, plan: BlobReplacementPlan) -> bool:
+    def retire_blob_replacement(self, *, plan: BlobReplacementPlan, remaining_output_storage_bytes: int | None = None) -> bool:
         state = self.__state
         state._require_active()
         self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
@@ -2547,6 +2560,9 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("only a purge-pending replacement can retire")
         if self._blob_record(state._require_blob(exact.blob_id)) != exact.replacement_blob:
             raise AuditIntegrityError("replacement retirement requires exact committed metadata")
+        self._settle_purged_blob_output_storage(
+            target_path=exact.replacement_blob.storage_path, remaining_bytes=remaining_output_storage_bytes
+        )
         result = _resolve_mutation_connection(state._connection_token).execute(
             delete(blob_replacement_cleanups_table).where(and_(*self._blob_replacement_plan_predicates(exact)))
         )
@@ -2652,12 +2668,7 @@ class _RepositoryBlobMutations:
         connection = _resolve_mutation_connection(state._connection_token)
         if status == "ready":
             assert size_bytes is not None
-            current_total = connection.execute(
-                select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(
-                    blobs_table.c.session_id == state._session_id,
-                    blobs_table.c.id != str(blob_id),
-                )
-            ).scalar_one()
+            current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id) - row.size_bytes
             if type(current_total) is not int:
                 raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
             if current_total + size_bytes > max_storage_per_session:
@@ -2774,9 +2785,7 @@ class _RepositoryBlobMutations:
             ):
                 return False
             raise AuditIntegrityError("standalone blob reservation identity already exists")
-        current_total = connection.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == state._session_id)
-        ).scalar_one()
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
         if type(current_total) is not int:
             raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
         if current_total + record.size_bytes > max_storage_per_session:
@@ -3350,7 +3359,9 @@ class _RepositoryBlobMutations:
         except (TypeError, ValueError) as exc:
             raise AuditIntegrityError("atomic blob deletion obligation contains malformed durable evidence") from exc
 
-    def retire_atomic_blob_deletion(self, *, obligation: BlobAtomicDeletionObligation) -> bool:
+    def retire_atomic_blob_deletion(
+        self, *, obligation: BlobAtomicDeletionObligation, remaining_output_storage_bytes: int | None = None
+    ) -> bool:
         """Retire exact atomic evidence through the successor's live authority."""
         state = self.__state
         state._require_active()
@@ -3374,6 +3385,7 @@ class _RepositoryBlobMutations:
             return False
         if exact != obligation:
             raise AuditIntegrityError("atomic blob deletion obligation no longer matches exact evidence")
+        self._settle_purged_blob_output_storage(target_path=obligation.storage_path, remaining_bytes=remaining_output_storage_bytes)
         result = _resolve_mutation_connection(state._connection_token).execute(
             delete(blob_deletion_cleanups_table).where(
                 blob_deletion_cleanups_table.c.blob_id == str(obligation.blob_id),
@@ -3490,7 +3502,34 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob deletion commit postcondition failed")
         return committed
 
-    def retire_blob_deletion(self, *, plan: BlobDeletionPlan) -> bool:
+    def _settle_purged_blob_output_storage(self, *, target_path: str, remaining_bytes: int | None) -> None:
+        """Reclaim measured capacity only after physical cleanup completes."""
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        reservation = connection.execute(
+            select(output_storage_reservations_table).where(output_storage_reservations_table.c.target_path == target_path)
+        ).one_or_none()
+        if reservation is None:
+            return
+        if reservation.session_id != state._session_id:
+            raise SessionDerivedCustodyError
+        if type(remaining_bytes) is not int or remaining_bytes < 0:
+            raise AuditIntegrityError("output reservation retirement requires measured remaining physical bytes")
+        blob_size = connection.execute(
+            select(blobs_table.c.size_bytes).where(blobs_table.c.storage_path == target_path)
+        ).scalar_one_or_none()
+        if remaining_bytes > max(reservation.size_bytes, 0 if blob_size is None else blob_size):
+            raise AuditIntegrityError("purged output gained unreserved physical bytes")
+        predicate = (
+            output_storage_reservations_table.c.target_path == target_path,
+            output_storage_reservations_table.c.session_id == state._session_id,
+        )
+        if remaining_bytes:
+            connection.execute(update(output_storage_reservations_table).where(*predicate).values(size_bytes=remaining_bytes))
+        else:
+            connection.execute(delete(output_storage_reservations_table).where(*predicate))
+
+    def retire_blob_deletion(self, *, plan: BlobDeletionPlan, remaining_output_storage_bytes: int | None = None) -> bool:
         """Retire exact cleanup evidence after the caller settles filesystem state."""
         state = self.__state
         state._require_active()
@@ -3502,6 +3541,7 @@ class _RepositoryBlobMutations:
         if exact.phase == "purge_pending":
             if exact.blob is not None:
                 raise AuditIntegrityError("purge-pending deletion still has live blob metadata")
+            self._settle_purged_blob_output_storage(target_path=plan.storage_path, remaining_bytes=remaining_output_storage_bytes)
         else:
             if exact.blob is None or blob_record_snapshot_hash(exact.blob) != exact.blob_snapshot_hash:
                 raise AuditIntegrityError("uncommitted deletion cannot retire without exact live metadata")
@@ -3704,6 +3744,141 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("run output finalization requires exact EXECUTE custody")
         return row
 
+    def reserve_run_output_storage(
+        self,
+        *,
+        run_id: UUID,
+        target_path: str,
+        size_bytes: int,
+        max_storage_per_session: int,
+    ) -> None:
+        self._set_run_output_storage(
+            run_id=run_id,
+            target_path=target_path,
+            size_bytes=size_bytes,
+            max_storage_per_session=max_storage_per_session,
+            admit_growth=True,
+        )
+
+    def reconcile_run_output_storage(
+        self,
+        *,
+        run_id: UUID,
+        target_path: str,
+        size_bytes: int,
+        max_storage_per_session: int,
+    ) -> None:
+        """Account already-existing bytes, including an oversized crash remnant.
+
+        This grants no write capacity. The blob service measures disk under
+        the run fence; all subsequent physical growth uses reserve instead.
+        """
+        self._set_run_output_storage(
+            run_id=run_id,
+            target_path=target_path,
+            size_bytes=size_bytes,
+            max_storage_per_session=max_storage_per_session,
+            admit_growth=False,
+        )
+
+    def _set_run_output_storage(
+        self,
+        *,
+        run_id: UUID,
+        target_path: str,
+        size_bytes: int,
+        max_storage_per_session: int,
+        admit_growth: bool,
+    ) -> None:
+        """Commit physical output capacity before a sink writes another byte.
+
+        A target's reservation includes its retained predecessor and every
+        recoverable staging body. Reclaimed capacity is released only after
+        filesystem removal has completed. Session custody serializes same-path
+        writers; quota authority serializes shared identity/container budgets.
+        """
+        state = self.__state
+        state._require_active()
+        context = self._require_execute()
+        state._require_run(run_id)
+        if type(target_path) is not str or not target_path.strip():
+            raise ValueError("target_path must be nonblank")
+        if type(size_bytes) is not int or size_bytes < 0:
+            raise ValueError("size_bytes must be a non-negative exact integer")
+        if type(max_storage_per_session) is not int or max_storage_per_session < 1:
+            raise ValueError("max_storage_per_session must be a positive exact integer")
+        connection = _resolve_mutation_connection(state._connection_token)
+        reservation = connection.execute(
+            select(output_storage_reservations_table).where(output_storage_reservations_table.c.target_path == target_path)
+        ).one_or_none()
+        if reservation is not None and reservation.session_id != state._session_id:
+            raise SessionDerivedCustodyError
+        reserved_bytes = 0 if reservation is None else reservation.size_bytes
+        blob = connection.execute(select(blobs_table).where(blobs_table.c.storage_path == target_path)).one_or_none()
+        if blob is not None:
+            if blob.session_id != state._session_id:
+                raise SessionDerivedCustodyError
+            previous_bytes = max(blob.size_bytes, reserved_bytes)
+            if blob.status == "pending":
+                self._require_pending_run_output(run_id=run_id, blob_id=UUID(blob.id))
+                next_bytes = size_bytes
+            else:
+                # Finalizer cleanup can release reservation overhead, but a
+                # sink may never overwrite immutable ready/error blob bytes.
+                if size_bytes > previous_bytes:
+                    raise AuditIntegrityError("local sink cannot overwrite a finalized blob")
+                next_bytes = max(blob.size_bytes, size_bytes)
+        else:
+            previous_bytes = reserved_bytes
+            next_bytes = size_bytes
+        additional_bytes = next_bytes - previous_bytes
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id)
+        if admit_growth and additional_bytes > 0 and current_total + additional_bytes > max_storage_per_session:
+            from elspeth.contracts.blobs import BlobQuotaExceededError
+
+            raise BlobQuotaExceededError(state._session_id, current_bytes=current_total, limit_bytes=max_storage_per_session)
+        if admit_growth:
+            RepositoryQuotaAuthority.admit_storage_bytes(
+                state._connection_token,
+                session_id=state._session_id,
+                additional_bytes=additional_bytes,
+                operation="run_output_finalize",
+                record=state._quota_exceeded_recorder,
+            )
+        values = {
+            "session_id": state._session_id,
+            "run_id": str(run_id),
+            "size_bytes": size_bytes,
+            "custody_operation_id": context.fence.operation_id,
+            "custody_operation_epoch": context.fence.operation_epoch,
+        }
+        if reservation is None:
+            connection.execute(insert(output_storage_reservations_table).values(target_path=target_path, **values))
+        else:
+            connection.execute(
+                update(output_storage_reservations_table)
+                .where(output_storage_reservations_table.c.target_path == target_path)
+                .values(**values)
+            )
+        if blob is not None and blob.status == "pending":
+            connection.execute(update(blobs_table).where(blobs_table.c.id == blob.id).values(size_bytes=size_bytes))
+
+    def list_run_output_storage_paths(self, *, run_id: UUID) -> tuple[str, ...]:
+        state = self.__state
+        state._require_active()
+        self._require_execute()
+        state._require_run(run_id)
+        return tuple(
+            _resolve_mutation_connection(state._connection_token)
+            .execute(
+                select(output_storage_reservations_table.c.target_path).where(
+                    output_storage_reservations_table.c.session_id == state._session_id,
+                    output_storage_reservations_table.c.run_id == str(run_id),
+                )
+            )
+            .scalars()
+        )
+
     def mark_run_output_blob_ready(
         self,
         *,
@@ -3716,7 +3891,7 @@ class _RepositoryBlobMutations:
         state = self.__state
         state._require_active()
         operation_context = self._require_execute()
-        self._require_pending_run_output(run_id=run_id, blob_id=blob_id)
+        pending = self._require_pending_run_output(run_id=run_id, blob_id=blob_id)
         if type(size_bytes) is not int or size_bytes < 0:
             raise ValueError("size_bytes must be a non-negative exact integer")
         if (
@@ -3728,12 +3903,7 @@ class _RepositoryBlobMutations:
         if type(max_storage_per_session) is not int or max_storage_per_session < 1:
             raise ValueError("max_storage_per_session must be a positive exact integer")
         connection = _resolve_mutation_connection(state._connection_token)
-        current_total = connection.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(
-                blobs_table.c.session_id == state._session_id,
-                blobs_table.c.id != str(blob_id),
-            )
-        ).scalar_one()
+        current_total = session_storage_bytes_on_connection(connection, session_id=state._session_id) - pending.size_bytes
         if type(current_total) is not int:
             raise AuditIntegrityError("Tier 1: blob quota total must be an exact integer")
         if current_total + size_bytes > max_storage_per_session:

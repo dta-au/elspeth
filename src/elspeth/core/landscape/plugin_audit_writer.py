@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts import (
@@ -77,6 +78,8 @@ class PluginAuditWriterAdapter:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         return self._execution.record_call(
             state_id,
@@ -94,6 +97,8 @@ class PluginAuditWriterAdapter:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
         )
 
     def record_operation_call(
@@ -113,6 +118,8 @@ class PluginAuditWriterAdapter:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         return self._execution.record_operation_call(
             operation_id,
@@ -129,6 +136,8 @@ class PluginAuditWriterAdapter:
             approved_prompt_artifact_hash=approved_prompt_artifact_hash,
             token_usage=token_usage,
             source_call_id=source_call_id,
+            call_id=call_id,
+            created_at=created_at,
         )
 
     def get_node_state(self, state_id: str) -> NodeState | None:

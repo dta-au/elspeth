@@ -65,7 +65,10 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # from optional storage ceilings, and enforces a single active container policy
 # across all granting actors. Both predecessor epoch-76 contracts are incompatible.
 # There is no migration path; preserve incompatible stores and prior access.
-SESSION_SCHEMA_EPOCH = 77
+# Epoch 78 binds settled provider attempts to the exact ledger custody tuple,
+# rejects negative token measures, records shared rate bucket policy, and
+# reserves local run output storage before writing physical bytes.
+SESSION_SCHEMA_EPOCH = 78
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -803,7 +806,7 @@ session_operation_receipts_table = Table(
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('stale_conflict', 'integrity_error', 'custody_error', "
-        "'quota_exceeded', 'operation_failed', 'request_cancelled')",
+        "'quota_exceeded', 'storage_accounting_unavailable', 'operation_failed', 'request_cancelled')",
         name="ck_session_operation_receipts_failure_code",
     ),
     CheckConstraint(
@@ -1975,6 +1978,7 @@ runs_table = Table(
         ["composition_states.id", "composition_states.session_id"],
         name="fk_runs_state_session",
     ),
+    UniqueConstraint("id", "session_id", name="uq_runs_id_session"),
     # The constraint mirrors SessionRunStatus in web/sessions/protocol.py;
     # adding a value to the Literal without updating this CheckConstraint
     # would let the dataclass validator pass while the DB rejects the row,
@@ -2251,10 +2255,12 @@ rate_limit_buckets_table = Table(
     metadata,
     Column("subject_digest", String, primary_key=True),
     Column("window_seconds", Integer, nullable=False),
+    Column("request_limit", BigInteger, nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
     *_lower_sha256_constraints("subject_digest", name="ck_rate_limit_buckets_digest_sha256"),
     CheckConstraint("window_seconds > 0", name="ck_rate_limit_buckets_positive_window"),
+    CheckConstraint("request_limit > 0", name="ck_rate_limit_buckets_positive_limit"),
 )
 
 rate_limit_events_table = Table(
@@ -3427,7 +3433,7 @@ quota_policies_table = Table(
         ForeignKey("identities.identity_id", ondelete="RESTRICT"),
         nullable=True,
     ),
-    Column("tokens_per_day", BigInteger, nullable=False),
+    Column("tokens_per_day", BigInteger, nullable=True),
     # A standing LEVEL, not a daily rate. Usage is SUM(blobs.size_bytes)
     # joined through sessions.identity_id over live rows, evaluated at each
     # byte-admitting site. The bound is eventually consistent, not exact: the
@@ -3456,6 +3462,8 @@ quota_policies_table = Table(
     CheckConstraint(_QUOTA_SET_BY_ACTOR_CHECK, name="ck_quota_policies_set_by_actor"),
     CheckConstraint("container_slot = 1", name="ck_quota_policies_container_slot"),
     CheckConstraint("identity_id IS NULL OR storage_bytes IS NOT NULL", name="ck_quota_policies_identity_storage_required"),
+    CheckConstraint("identity_id IS NULL OR tokens_per_day IS NOT NULL", name="ck_quota_policies_identity_tokens_required"),
+    CheckConstraint("tokens_per_day IS NOT NULL OR storage_bytes IS NOT NULL", name="ck_quota_policies_has_limit"),
     CheckConstraint(
         "(set_by_actor = 'identity') = (set_by_identity_id IS NOT NULL)",
         name="ck_quota_policies_identity_actor_names_an_identity",
@@ -3484,6 +3492,28 @@ Index(
 # Deliberately excluded from ``durable_history_exists``: its session_id is
 # nullable and an accounting row is not history worth refusing an archive
 # over.
+output_storage_reservations_table = Table(
+    "output_storage_reservations",
+    metadata,
+    Column("target_path", Text, primary_key=True),
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("run_id", String, nullable=False),
+    Column("size_bytes", BigInteger, nullable=False),
+    Column("custody_operation_id", String, nullable=False),
+    Column("custody_operation_epoch", BigInteger, nullable=False),
+    ForeignKeyConstraint(
+        ["run_id", "session_id"],
+        ["runs.id", "runs.session_id"],
+        name="fk_output_storage_reservations_run_session",
+        ondelete="CASCADE",
+    ),
+    CheckConstraint("size_bytes >= 0", name="ck_output_storage_reservations_size_nonnegative"),
+    CheckConstraint("custody_operation_epoch > 0", name="ck_output_storage_reservations_epoch_positive"),
+    *_non_blank_text_constraints("target_path", name="ck_output_storage_reservations_target_nonblank"),
+    *_non_blank_text_constraints("custody_operation_id", name="ck_output_storage_reservations_operation_nonblank"),
+)
+
+
 token_usage_ledger_table = Table(
     "token_usage_ledger",
     metadata,
@@ -3511,6 +3541,16 @@ token_usage_ledger_table = Table(
     Column("reasoning_tokens", Integer, nullable=True),
     Column("recorded_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(_TOKEN_USAGE_SOURCE_CHECK, name="ck_token_usage_ledger_source"),
+    CheckConstraint("prompt_tokens IS NULL OR prompt_tokens >= 0", name="ck_token_usage_ledger_prompt_nonnegative"),
+    CheckConstraint("completion_tokens IS NULL OR completion_tokens >= 0", name="ck_token_usage_ledger_completion_nonnegative"),
+    CheckConstraint("cached_prompt_tokens IS NULL OR cached_prompt_tokens >= 0", name="ck_token_usage_ledger_cached_nonnegative"),
+    CheckConstraint("reasoning_tokens IS NULL OR reasoning_tokens >= 0", name="ck_token_usage_ledger_reasoning_nonnegative"),
+    CheckConstraint(
+        "(source = 'run' AND run_id IS NOT NULL) OR (source <> 'run' AND run_id IS NULL)",
+        name="ck_token_usage_ledger_run",
+    ),
+    UniqueConstraint("entry_id", "identity_id", "session_id", "source", name="uq_token_usage_ledger_custody"),
+    UniqueConstraint("entry_id", "run_id", name="uq_token_usage_ledger_run"),
 )
 
 quota_provider_attempts_table = Table(
@@ -3527,7 +3567,23 @@ quota_provider_attempts_table = Table(
     Column("lease_token", String, nullable=False),
     Column("run_id", String, nullable=True),
     CheckConstraint("source IN ('composer', 'run', 'auto_title')", name="ck_quota_provider_attempts_source"),
-    Column("ledger_entry_id", String, ForeignKey("token_usage_ledger.entry_id", ondelete="RESTRICT"), nullable=True),
+    Column("ledger_entry_id", String, nullable=True),
+    # The nullable link permits pending attempts. Settled links bind the exact
+    # owner/session/source; the separate run FK covers non-NULL run IDs. The
+    # ledger's source/run CHECK makes NULL safe for all non-run sources.
+    ForeignKeyConstraint(
+        ["ledger_entry_id", "identity_id", "session_id", "source"],
+        ["token_usage_ledger.entry_id", "token_usage_ledger.identity_id", "token_usage_ledger.session_id", "token_usage_ledger.source"],
+        name="fk_quota_provider_attempts_ledger_custody",
+        ondelete="RESTRICT",
+    ),
+    ForeignKeyConstraint(
+        ["ledger_entry_id", "run_id"],
+        ["token_usage_ledger.entry_id", "token_usage_ledger.run_id"],
+        name="fk_quota_provider_attempts_ledger_run",
+        ondelete="RESTRICT",
+    ),
+    UniqueConstraint("ledger_entry_id", name="uq_quota_provider_attempts_ledger_entry"),
     CheckConstraint(
         "(settled_at IS NULL AND ledger_entry_id IS NULL) OR (settled_at IS NOT NULL AND ledger_entry_id IS NOT NULL)",
         name="ck_quota_provider_attempts_settlement",

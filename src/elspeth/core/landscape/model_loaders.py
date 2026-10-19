@@ -331,6 +331,7 @@ class CallLoader:
             completion_tokens=row.completion_tokens,
             cached_prompt_tokens=row.cached_prompt_tokens,
             reasoning_tokens=row.reasoning_tokens,
+            returned_model=row.returned_model,
         )
 
 

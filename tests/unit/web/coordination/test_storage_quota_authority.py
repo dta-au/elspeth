@@ -4,18 +4,33 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import event, insert, update
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.exc import OperationalError
 from tests.helpers.fenced_session import FencedSession
 
 from elspeth.contracts.blobs import IdentityStorageQuotaExceededError, StorageAccountingUnavailableError
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
-from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority
+from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, _storage_aggregate_integer
 from elspeth.web.sessions.models import blobs_table, quota_policies_table, sessions_table
 
 SET_AT = datetime(2026, 9, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("value", [0, 2**70, Decimal("0"), Decimal("2.0"), Decimal(2**70)])
+def test_storage_aggregate_admits_only_exact_integral_database_values(value: int | Decimal) -> None:
+    result = _storage_aggregate_integer(value)
+    assert type(result) is int
+    assert result == value
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, -1, Decimal("-1"), Decimal("1.1"), Decimal("NaN"), Decimal("Infinity")])
+def test_storage_aggregate_rejects_corrupt_or_lossy_values(value: object) -> None:
+    with pytest.raises(AuditIntegrityError, match="non-negative exact integers"):
+        _storage_aggregate_integer(value)
 
 
 def _seed(fenced: FencedSession, *, cap: int, ceiling: int) -> None:
@@ -94,6 +109,8 @@ def test_storage_admission_uses_identity_and_container_policy_rows(
                 usage=90,
                 identity_policy_id="identity",
                 container_policy_id="container",
+                scope="identity" if cap <= ceiling else "container",
+                limit=min(cap, ceiling),
             )
         ]
     else:
@@ -113,6 +130,59 @@ def test_zero_net_growth_does_not_measure_or_refuse(fenced_session: FencedSessio
     )
     assert admitted.usage is None
     assert recorded == []
+
+
+def test_container_storage_aggregates_other_identities(fenced_session: FencedSession) -> None:
+    """An unrelated owner's retained bytes consume the shared ceiling."""
+    from tests.fixtures.identities import ensure_test_identity
+
+    _seed(fenced_session, cap=1000, ceiling=100)
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    ensure_test_identity(conn, identity_id="other-storage-owner")
+    other_session = str(uuid.uuid4())
+    conn.execute(
+        insert(sessions_table).values(
+            id=other_session,
+            user_id="other-storage-owner",
+            auth_provider_type="local",
+            title="other",
+            created_at=SET_AT,
+            updated_at=SET_AT,
+        )
+    )
+    conn.execute(
+        insert(blobs_table).values(
+            id=str(uuid.uuid4()),
+            session_id=other_session,
+            filename="other.csv",
+            mime_type="text/csv",
+            size_bytes=9,
+            content_hash="b" * 64,
+            storage_path="/nonexistent/other.csv",
+            created_at=SET_AT,
+            created_by="user",
+            status="ready",
+        )
+    )
+    recorded: list[QuotaExceeded] = []
+    RepositoryQuotaAuthority.admit_storage_bytes(
+        fenced_session.connection_token,
+        session_id=fenced_session.session_id,
+        additional_bytes=1,
+        operation="blob_create",
+        record=recorded.append,
+    )
+    with pytest.raises(IdentityStorageQuotaExceededError) as caught:
+        RepositoryQuotaAuthority.admit_storage_bytes(
+            fenced_session.connection_token,
+            session_id=fenced_session.session_id,
+            additional_bytes=2,
+            operation="blob_create",
+            record=recorded.append,
+        )
+    assert caught.value.usage == 99
+    assert recorded[0].usage == 99
+    assert conn.execute(select(blobs_table.c.size_bytes).where(blobs_table.c.session_id == other_session)).scalar_one() == 9
 
 
 def test_revoked_identity_policy_suspends_storage_growth(fenced_session: FencedSession) -> None:

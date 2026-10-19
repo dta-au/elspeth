@@ -66,13 +66,41 @@ verified audit-context output.
   is no longer re-exported by `elspeth.web.composer.tools`. Its implementation
   and internal callers remain in `elspeth.web.composer.tools.blobs`; code using
   the private facade path must update its import.
-- **Configured container token policy is provisioned before serving.** Startup
-  creates or verifies the token ceiling without activating container storage.
-  Identity storage allowances remain mandatory; explicit numeric container
-  storage and policy precedence are preserved. A cross-actor singleton prevents
-  duplicate active container policies. Startup joins provisioning through
-  cancellation before finalizing its database owners. Daily accounting,
-  overshoot and token reservation semantics are unchanged.
+- **Configured container quotas are provisioned before serving.** Token and
+  storage ceilings are independent. Container storage admission measures aggregate
+  retained and reserved bytes across identities, including run-output reservations.
+  Identity allowances remain mandatory. A cross-actor singleton prevents duplicate
+  active container policies, and startup joins provisioning through cancellation
+  before finalizing database owners.
+- **Quota accounting survives durable run-call recovery.** Landscape calls retain
+  their provider-attempt binding so recovery can settle completed calls without
+  an in-memory association. Quota chronology uses database time, and returned
+  model identity is retained independently of response payload retention. Exported
+  row-call and operation-call records add nullable `returned_model`; consumers
+  enforcing a closed export shape must admit this field. Closed receipt failures preserve storage accounting
+  outages as 503 responses on both first response and replay.
+- **Web storage admission covers retained run artifacts and stage reservations.**
+  Archiving a session preserves those artifacts and does not reclaim quota.
+  The file manager can delete uploads; generic run artifacts have no user-facing
+  purge action. Web execution refuses local SQLite database sinks and persistent
+  Chroma sinks, retrieval and collection probes because their library-owned files
+  cannot obey byte reservations. Existing graphs using those modes must change;
+  standalone CLI plugin behavior is unchanged. Remote service modes remain subject
+  to the existing plugin policy and security restrictions.
+- **Quota administration shows enforced policy state and exact quantities.**
+  Revoked allowances show suspension, durable policies remain editable after
+  defaults are removed, and shared ceilings include shared usage. Quota API
+  quantities are decimal strings over the positive signed-64-bit range; request
+  bodies still accept exact JSON integers through `2**53-1`, while larger values
+  require strings. API consumers must adapt response parsing. Application-owned
+  Composer 429 refusals surface immediately with retry guidance instead of silently
+  resubmitting the action; uncertain gateway responses retain reconciliation.
+- **Shared request limits bind their durable policy.** A replica with a different
+  configured cap refuses admission while the shared bucket remains active;
+  configuration changes take effect after its expiry. Forwarded client addresses
+  are trusted only from explicit numeric `trusted_proxy_hosts`; the default trusts
+  no forwarding headers. Proxy deployments must configure their actual connecting
+  peers. The Compose host-nginx bundle supplies its bridge gateway explicitly.
 - **Automatic titles disable adapter and SDK retries.** Both existing title
   custody modes supply zero retry settings. This does not claim universal
   physical-dispatch accounting under arbitrary dependency fallback settings.
@@ -123,13 +151,14 @@ verified audit-context output.
   initialization/final-verification connections and later web connections remain
   outside this measurement; it does not establish live Azure acceptance.
 
-Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
+Session epoch advances from 77 to 78; Landscape advances from epoch 49 to 50. The combined
 contract retains committed graph-review authority over immutable graph snapshots
-and adds optional container storage with mandatory identity storage and the
-active-container singleton. Preserve epoch-75 stores and both distinct epoch-76
-predecessors with compatible prior application access; configure an explicitly
-new epoch-77 target. Older readers ignore those completion blockers or cannot
-admit the new quota shape. This authorizes no migration,
+and adds durable quota custody, aggregate container storage, rate-limit policy
+binding and run provider-attempt evidence. Preserve epoch-75 stores, both distinct epoch-76
+predecessors, epoch-77 session stores and epoch-49 Landscape stores with compatible
+prior application access; configure an explicitly
+new epoch-78 target and an explicitly new epoch-50 Landscape target. Older readers
+ignore those completion blockers or cannot admit the new quota shape. This authorizes no migration,
 reset, restamping or downgrade. Drain and isolate old/new deployments; they
 cannot share session stores or replicas.
 

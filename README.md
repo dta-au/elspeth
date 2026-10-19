@@ -104,7 +104,8 @@ describe what is exported and how to configure it.
 retain their distinct candidate and saved-graph meanings, safe path diagnostics
 and repair guidance. Shared-link failures preserve the requested link instead
 of opening the recipient's workspace. Configured container token ceilings are
-provisioned before serving without inventing a storage ceiling; automatic title
+provisioned before serving; configured container storage ceilings bound aggregate
+retained and reserved bytes. Automatic title
 requests disable the adapter and SDK retry paths. See the [release notes](CHANGELOG.md).
 
 Primary Composer and advisor requests use independently configured Azure AI
@@ -127,10 +128,12 @@ verification and later web connections are outside that measurement. Offline
 instruction rehearsal does not establish live cloud acceptance. These ACA
 enhancements are attributed to 0.8.8 within the combined 0.8.9 candidate.
 
-Session epoch 77 replaces session epoch 76 and retains its committed graph-review
-authority while adding the quota representation. Landscape epoch 49 is unchanged.
-Preserve epoch 75 and both epoch 76 session-store contracts and use a separately
-provisioned epoch 77 session store. Keep old workers isolated from the new store.
+Session epoch 78 replaces session epoch 77 and retains its committed graph-review
+authority while strengthening quota custody and shared rate-limit policy binding.
+Landscape epoch 50 replaces epoch 49 and records durable provider-attempt identity
+on run calls. Preserve epoch 75, both epoch 76 session-store contracts, epoch 77
+session stores and epoch 49 Landscape stores; use a separately provisioned epoch 78
+session store and epoch 50 Landscape store. Keep old workers isolated from the new stores.
 Compatible stores still require exact schema admission; unsupported stores are
 preserved and refused before incompatible writes. Backwards compatibility is
 permitted and considered from 0.8.5 within explicitly supported boundaries. This
@@ -138,6 +141,11 @@ candidate authorizes no in-place migration, reset or downgrade. Package metadata
 is 0.8.9; the package version alone does not establish qualification or image
 publication. Automatic image publication from main is held; verify the release
 tag and image digest before installing a published image.
+
+Quota API quantities now use decimal strings for exact signed-64-bit values;
+older numeric clients must adapt their response parsing. Proxy deployments must
+explicitly configure `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` with their actual numeric
+forwarding peers; the default trusts no forwarding headers.
 
 ## Previously in 0.8.6
 

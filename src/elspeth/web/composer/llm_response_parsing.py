@@ -34,7 +34,7 @@ import math
 import re
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
@@ -742,6 +742,7 @@ def build_llm_call_record(
             strict_tool_count = 0
         else:
             raise AuditIntegrityError("sent tool list mixes strict-stamped and unstamped tools")
+    elapsed_ns = time.monotonic_ns() - started_ns
     call = ComposerLLMCall(
         model_requested=model_requested,
         pricing_model=pricing_model if pricing_model is not None else model_requested,
@@ -760,13 +761,13 @@ def build_llm_call_record(
         thinking_blocks=reasoning_metadata["thinking_blocks"],
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
-        latency_ms=(time.monotonic_ns() - started_ns) // 1_000_000,
+        latency_ms=elapsed_ns // 1_000_000,
         provider_request_id=provider_request_id,
         messages_hash=stable_hash(messages),
         tools_spec_hash=stable_hash(tools) if tools is not None else None,
         declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),
         started_at=started_at,
-        finished_at=datetime.now(UTC),
+        finished_at=started_at + timedelta(microseconds=elapsed_ns // 1_000),
         error_class=error_class,
         error_message=_safe_llm_error_message(error_message),
         private_failure=capture_failure_facts(failure) if failure is not None else None,

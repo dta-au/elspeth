@@ -50,7 +50,6 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
-    admit_provider_attempt,
     provider_call_scope,
     quota_provider_calls,
     required_provider_audit_scope,
@@ -471,7 +470,7 @@ async def _litellm_acompletion(
     :func:`_apply_openrouter_usage_accounting`) so provider cost and cache
     detail arrive in-band for the call audit.
     """
-    if provider_custody is not None and type(provider_custody) is not ProviderCallCustody:
+    if type(provider_custody) is not ProviderCallCustody:
         raise AuditIntegrityError("Physical provider requires exact explicit custody")
     import litellm
 
@@ -546,16 +545,11 @@ async def _litellm_acompletion(
     )
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
-    if provider_custody is None:
-        await admit_provider_attempt(model=kwargs["model"])
-    else:
-        await provider_custody.admit(model=kwargs["model"])
+    await provider_custody.admit(model=kwargs["model"])
     if on_provider_dispatch is not None:
         try:
             on_provider_dispatch()
         except BaseException as callback_failure:
-            if provider_custody is None:
-                raise
             try:
                 cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
             except BaseException as disposition_failure:
@@ -567,8 +561,7 @@ async def _litellm_acompletion(
                     "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
                 ) from None
             raise
-    if provider_custody is not None:
-        provider_custody.mark_sdk_entered()
+    provider_custody.mark_sdk_entered()
     return await litellm.acompletion(**kwargs)
 
 

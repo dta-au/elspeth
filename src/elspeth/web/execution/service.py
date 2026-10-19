@@ -23,6 +23,7 @@ import traceback
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -166,6 +167,7 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
+from elspeth.web.execution.provider_clock import RunProviderAttemptClock
 from elspeth.web.execution.retained_inputs import read_retained_input, retain_execution_inputs, retain_source_bytes
 from elspeth.web.execution.schemas import (
     CHECK_PROOF_DIAGNOSTICS,
@@ -856,9 +858,9 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
 
     Reads the Landscape ``calls`` token columns (epoch 40): ``call_type='llm'``
     rows are the logical LLM calls, parented by a node state or by an operation;
-    transport rows never carry the charge (sso-design.md:855). The model is the
-    calling node's configured ``model`` (Azure configures ``deployment_name``),
-    and the plugin name when the node configures neither. Missing usage stays
+    transport rows never carry the charge (sso-design.md:855). Prefer the
+    provider-returned model persisted with the outcome. Calls without a
+    returned model use node configuration, then plugin name. Missing usage stays
     unknown even for errors: a dispatched timeout may already have been billed.
     Call identity and creation time preserve replay and UTC-day attribution.
     """
@@ -870,6 +872,7 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
         calls_table.c.completion_tokens,
         calls_table.c.cached_prompt_tokens,
         calls_table.c.reasoning_tokens,
+        calls_table.c.returned_model,
         nodes_table.c.plugin_name,
         nodes_table.c.config_json,
     )
@@ -897,11 +900,13 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
     entries: list[TokenUsageEntry] = []
     for row in sorted([*state_calls, *operation_calls], key=lambda call: (call.created_at, call.call_id)):
         config = json.loads(row.config_json)
-        model = row.plugin_name
-        for key in ("model", "deployment_name"):
-            if key in config and config[key] is not None:
-                model = config[key]
-                break
+        model = row.returned_model
+        if model is None:
+            model = row.plugin_name
+            for key in ("model", "deployment_name"):
+                if key in config and config[key] is not None:
+                    model = config[key]
+                    break
         entries.append(
             TokenUsageEntry(
                 model=model,
@@ -3974,6 +3979,11 @@ class ExecutionServiceImpl:
             session_operation_lease.guard_external_effect()
             if landscape_db is None:
                 landscape_db = open_landscape_db(self._settings)
+            if resume_existing:
+                # Replay committed outcomes before the resumed executor can
+                # request another admission. This is independent of whether
+                # the previous worker received its settlement receipt.
+                self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=run_id)
 
             # Fold aggregations into transforms, assemble PipelineConfig, and
             # run the four orchestrator route-target validators. The
@@ -4098,6 +4108,7 @@ class ExecutionServiceImpl:
                 telemetry_manager = create_telemetry_manager(telemetry_config)
             checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled or resume_existing else None
 
+            provider_clock = RunProviderAttemptClock()
             orchestrator = Orchestrator(
                 db=landscape_db,
                 event_bus=event_bus,
@@ -4107,7 +4118,7 @@ class ExecutionServiceImpl:
                 checkpoint_config=checkpoint_config,
                 telemetry_manager=telemetry_manager,
                 llm_call_governance=LLMCallGovernance(
-                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease),
+                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease, clock=provider_clock),
                     after_call=partial(
                         self._settle_run_llm_call,
                         run_uuid,
@@ -4115,6 +4126,7 @@ class ExecutionServiceImpl:
                         landscape_db=landscape_db,
                         landscape_run_id=run_id,
                     ),
+                    outcome_timestamp=provider_clock.timestamp_for_outcome,
                 ),
             )
 
@@ -4145,56 +4157,62 @@ class ExecutionServiceImpl:
                 )
 
             session_operation_lease.guard_external_effect()
-            if resume_existing:
-                assert checkpoint_manager is not None
-                if checkpoint_manager.get_latest_checkpoint(run_id) is None:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
-                lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
-                if not lifecycle.check.can_resume:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
-                recovery = RecoveryManager(landscape_db, checkpoint_manager)
-                resume_point = recovery.get_resume_point(run_id, graph)
-                if resume_point is None:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
-                result = orchestrator.resume(
-                    resume_point,
-                    pipeline_config,
-                    graph,
-                    payload_store=payload_store,
-                    settings=settings,
-                    shutdown_event=shutdown_event,
-                    pre_effect_guard=session_operation_lease.guard_external_effect,
-                    check_coordination_latch=session_operation_lease.guard_external_effect,
-                )
-            else:
-                result = orchestrator.run(
-                    pipeline_config,
-                    graph=graph,
-                    settings=settings,
-                    payload_store=payload_store,
-                    audit_export_content_store=audit_export_content_store,
-                    audit_export_content_store_resolver=audit_export_content_store_resolver,
-                    secret_resolutions=secret_resolution_inputs or None,
-                    shutdown_event=shutdown_event,  # B2: NEVER omit this
-                    sink_factory=make_policy_bound_sink_factory(
-                        settings,
-                        plugin_snapshot=plugin_snapshot,
-                    ),
-                    run_id=run_id,
-                    initiated_by_user_id=user_id,
-                    auth_provider_type=auth_provider_type,
-                    openrouter_catalog_sha256=catalog_sha,
-                    openrouter_catalog_source=catalog_source,
-                    web_plugin_policy_evidence=replace(
-                        restored_envelope.web_plugin_policy_evidence
-                        if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
-                        else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
-                        admission_decision=admission_decision,
-                    ),
-                    check_coordination_latch=session_operation_lease.guard_external_effect,
-                    pre_effect_guard=session_operation_lease.guard_external_effect,
-                    run_start_permit=run_start_permit,
-                )
+            output_admission = (
+                self._blob_service.run_output_write_admission(run_uuid, session_operation_context=session_operation_context)
+                if self._blob_service is not None
+                else nullcontext()
+            )
+            with output_admission:
+                if resume_existing:
+                    assert checkpoint_manager is not None
+                    if checkpoint_manager.get_latest_checkpoint(run_id) is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
+                    lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
+                    if not lifecycle.check.can_resume:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
+                    recovery = RecoveryManager(landscape_db, checkpoint_manager)
+                    resume_point = recovery.get_resume_point(run_id, graph)
+                    if resume_point is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                    result = orchestrator.resume(
+                        resume_point,
+                        pipeline_config,
+                        graph,
+                        payload_store=payload_store,
+                        settings=settings,
+                        shutdown_event=shutdown_event,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                    )
+                else:
+                    result = orchestrator.run(
+                        pipeline_config,
+                        graph=graph,
+                        settings=settings,
+                        payload_store=payload_store,
+                        audit_export_content_store=audit_export_content_store,
+                        audit_export_content_store_resolver=audit_export_content_store_resolver,
+                        secret_resolutions=secret_resolution_inputs or None,
+                        shutdown_event=shutdown_event,  # B2: NEVER omit this
+                        sink_factory=make_policy_bound_sink_factory(
+                            settings,
+                            plugin_snapshot=plugin_snapshot,
+                        ),
+                        run_id=run_id,
+                        initiated_by_user_id=user_id,
+                        auth_provider_type=auth_provider_type,
+                        openrouter_catalog_sha256=catalog_sha,
+                        openrouter_catalog_source=catalog_source,
+                        web_plugin_policy_evidence=replace(
+                            restored_envelope.web_plugin_policy_evidence
+                            if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
+                            else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+                            admission_decision=admission_decision,
+                        ),
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        run_start_permit=run_start_permit,
+                    )
 
             # Orchestrator.run() returns normally ONLY on completion.
             # If shutdown was requested, it raises GracefulShutdownError
@@ -4810,13 +4828,21 @@ class ExecutionServiceImpl:
                 )
         return None
 
-    def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
+    def _admit_run_llm_call(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        *,
+        clock: RunProviderAttemptClock | None = None,
+    ) -> str:
         """Persist an admitted pending attempt before the provider can spend."""
         session_operation_lease.guard_external_effect()
         attempt = self._session_service.begin_run_provider_attempt_sync(
             session_operation_context=session_operation_lease.context,
             run_id=run_uuid,
         )
+        if clock is not None:
+            clock.bind(attempt)
         return attempt.attempt_id
 
     def _settle_run_llm_call(

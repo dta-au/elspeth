@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 from elspeth.contracts import SinkProtocol
 from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
@@ -18,8 +20,16 @@ from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_N
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
+from elspeth.core.config import (
+    AggregationSettings,
+    CollectorSettings,
+    ElspethSettings,
+    TransformSettings,
+    load_bounded_pipeline_yaml,
+    resolve_config,
+)
 from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.runtime_factory import (
     PluginBundle,
     instantiate_plugins_from_config,
@@ -258,6 +268,63 @@ def require_settings_plugins_available(
     unavailable = tuple(plugin_id for plugin_id in _configured_plugin_ids(settings) if plugin_id not in plugin_snapshot.available)
     if unavailable:
         raise ValueError("Configured plugin is not available in the frozen plugin snapshot.")
+    for sink_name in settings.sinks:
+        _require_metered_web_sink_storage(settings, sink_name)
+    plugin_nodes: tuple[TransformSettings | AggregationSettings | CollectorSettings, ...] = (
+        *settings.transforms,
+        *settings.aggregations,
+        *settings.collectors,
+    )
+    for transform in plugin_nodes:
+        if transform.plugin != "rag_retrieval":
+            continue
+        options = transform.options
+        if "provider" not in options or options["provider"] != "chroma" or "provider_config" not in options:
+            continue
+        provider_config = options["provider_config"]
+        if isinstance(provider_config, Mapping) and "mode" in provider_config and provider_config["mode"] == "persistent":
+            detail = (
+                "Web execution cannot enforce storage quotas for local persistent Chroma retrieval. "
+                "Use provider_config.mode='client' with a remote Chroma server."
+            )
+            raise PluginConfigError(detail, cause=detail, plugin_name=transform.plugin, component_type="transform")
+    for probe in settings.collection_probes:
+        if probe.provider == "chroma" and "mode" in probe.provider_config and probe.provider_config["mode"] == "persistent":
+            detail = (
+                "Web execution cannot enforce storage quotas for a local persistent Chroma collection probe. "
+                "Use provider_config.mode='client' with a remote Chroma server."
+            )
+            raise PluginConfigError(detail, cause=detail)
+
+
+def _require_metered_web_sink_storage(settings: ElspethSettings, sink_name: str) -> None:
+    """Refuse embedded database writers outside byte-reservation custody.
+
+    These libraries allocate database, journal and index files directly. A
+    pathname allowlist cannot make those writes obey Web storage reservations.
+    Remote service modes keep their existing sink-effect admission contracts.
+    This Web-only boundary leaves standalone CLI plugin behavior unchanged.
+    """
+    sink = settings.sinks[sink_name]
+    detail: str | None = None
+    if sink.plugin == "chroma_sink" and "mode" in sink.options and sink.options["mode"] == "persistent":
+        detail = (
+            "Web execution cannot enforce storage quotas for Chroma mode='persistent'. "
+            "Use mode='client' with a remote Chroma server, or choose a file output."
+        )
+    elif sink.plugin == "database" and "url" in sink.options and type(sink.options["url"]) is str:
+        try:
+            backend = make_url(sink.options["url"]).get_backend_name()
+        except ArgumentError:
+            detail = "The database sink URL is invalid. Configure a remote PostgreSQL target."
+        else:
+            if backend == "sqlite":
+                detail = (
+                    "Web execution cannot enforce storage quotas for a local SQLite database sink. "
+                    "Use a remote PostgreSQL target, or choose a file output."
+                )
+    if detail is not None:
+        raise PluginConfigError(detail, cause=detail, plugin_name=sink.plugin, component_type="sink")
 
 
 def require_settings_sink_available(
@@ -271,6 +338,7 @@ def require_settings_sink_available(
     plugin_id = PluginId("sink", settings.sinks[sink_name].plugin)
     if plugin_id not in plugin_snapshot.available:
         raise ValueError("Configured sink is not available in the frozen plugin snapshot.")
+    _require_metered_web_sink_storage(settings, sink_name)
 
 
 def instantiate_runtime_plugins(

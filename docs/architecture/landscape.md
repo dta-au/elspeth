@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Maintained subsystem reference for the 0.8.3 candidate release line.
+Maintained subsystem reference for the unreleased 0.8.9 candidate.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution
@@ -16,12 +16,14 @@ Landscape subsystem.
 
 [`schema.py`](../../src/elspeth/core/landscape/schema.py) owns the SQLAlchemy
 metadata, constraints, indexes, and `SQLITE_SCHEMA_EPOCH`. The current release
-requires Landscape epoch 49 and Sessions epoch 72. Startup accepts an empty
+requires Landscape epoch 50 and Sessions epoch 78. Startup accepts an empty
 store or the exact current schema; it does not migrate or relabel earlier
-evidence. Epoch 49 adds the `pending_identities_purged` authentication event.
-The [schema reset runbook](../runbooks/staging-session-db-recreation.md) covers
-the session-only 71-to-72 cutover, earlier paired cutovers, and preservation
-of the separate local authentication store.
+evidence. Epoch 50 adds durable provider-attempt identity on run calls; epoch 49
+added the `pending_identities_purged` authentication event.
+The [schema compatibility runbook](../runbooks/staging-session-db-recreation.md)
+requires preserving incompatible stores and provisioning explicitly new compatible
+targets. It also retains earlier cutovers as historical reference and covers
+preservation of the separate local authentication store.
 
 Source-file and tool counts are transient inventories, not subsystem contracts.
 Use the live schema metadata and the [MCP guide](../guides/landscape-mcp-analysis.md)

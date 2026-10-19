@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchRecoveryTranscript, parseResponse, submitComposerOperation } from "./client";
+import { fetchRecoveryTranscript, isDefinitiveComposerRefusal, parseResponse, submitComposerOperation } from "./client";
 import type { ApiError, CompositionState } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -33,6 +33,23 @@ describe("api/client recovery contracts", () => {
 
   afterEach(() => {
     fetchSpy.mockRestore();
+  });
+
+  it.each(["rate_limited", "composer_queue_full"])("surfaces structured %s admission refusal with its retry delay", async (errorType) => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ detail: {
+      error_type: errorType, detail: "Retry later.", retry_after: 60,
+    } }), { status: 429, headers: { "Retry-After": "60" } }));
+    const error: unknown = await submitComposerOperation({
+      mode: "submitted", scope: { principalId: "alice", authProvider: "local" },
+      sessionId: "session-1", operationId: clientRequestId, kind: "compose_message", createdAt: Date.now(),
+      body: { operation_id: clientRequestId, content: "hello", state_id: null },
+    }).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 429, error_type: errorType, retry_after: 60 });
+    expect(isDefinitiveComposerRefusal(error)).toBe(true);
+  });
+
+  it.each([{ status: 429 }, { status: 429, error_type: "gateway_overloaded" }, { status: 408 }, { status: 503, error_type: "rate_limited" }])("preserves uncertain custody for %j", (error) => {
+    expect(isDefinitiveComposerRefusal(error)).toBe(false);
   });
 
   it("sends immutable operation identity and parses a canonical active-operation refusal", async () => {

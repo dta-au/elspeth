@@ -385,6 +385,7 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("calls", "completion_tokens"),
     ("calls", "cached_prompt_tokens"),
     ("calls", "reasoning_tokens"),
+    ("calls", "returned_model"),
     # Phase 4 tutorial audit-story projection fields.
     ("runs", "llm_call_count"),
     ("runs", "seeded_from_cache"),

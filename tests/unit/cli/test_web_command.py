@@ -138,6 +138,37 @@ class TestWebCommandHappyPath:
 
         assert uvicorn.run.calls[0].kwargs["reload"] is True
 
+    def test_forwarding_defaults_ignore_ambient_uvicorn_wildcard(self) -> None:
+        uvicorn = FakeUvicornModule()
+        with patch.dict(os.environ, {"FORWARDED_ALLOW_IPS": "*"}), patch.dict("sys.modules", {"uvicorn": uvicorn}):
+            os.environ.pop("ELSPETH_WEB__TRUSTED_PROXY_HOSTS", None)
+            result = runner.invoke(app, ["--no-dotenv", "web"])
+        assert result.exit_code == 0
+        assert uvicorn.run.calls[0].kwargs["proxy_headers"] is False
+        assert uvicorn.run.calls[0].kwargs["forwarded_allow_ips"] == []
+
+    def test_explicit_forwarding_peers_reach_uvicorn(self) -> None:
+        uvicorn = FakeUvicornModule()
+        with (
+            patch.dict(os.environ, {"ELSPETH_WEB__TRUSTED_PROXY_HOSTS": '["172.30.85.1", "::1"]'}),
+            patch.dict("sys.modules", {"uvicorn": uvicorn}),
+        ):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
+        assert result.exit_code == 0
+        assert uvicorn.run.calls[0].kwargs["proxy_headers"] is True
+        assert uvicorn.run.calls[0].kwargs["forwarded_allow_ips"] == ["172.30.85.1", "::1"]
+
+    def test_invalid_forwarding_peers_refuse_server_startup(self) -> None:
+        uvicorn = FakeUvicornModule()
+        with (
+            patch.dict(os.environ, {"ELSPETH_WEB__TRUSTED_PROXY_HOSTS": '["*"]'}),
+            patch.dict("sys.modules", {"uvicorn": uvicorn}),
+        ):
+            result = runner.invoke(app, ["--no-dotenv", "web"])
+        assert result.exit_code == 1
+        assert "TRUSTED_PROXY_HOSTS" in result.output
+        assert uvicorn.run.calls == []
+
     def test_default_host_requires_no_secret_key(self) -> None:
         """Default host (127.0.0.1) should work with the default secret_key."""
         uvicorn = FakeUvicornModule()

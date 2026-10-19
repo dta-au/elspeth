@@ -232,6 +232,7 @@ class CallExportRecord(TypedDict):
     completion_tokens: int | None
     cached_prompt_tokens: int | None
     reasoning_tokens: int | None
+    returned_model: str | None
     latency_ms: float | None
     request_ref: str | None
     response_ref: str | None

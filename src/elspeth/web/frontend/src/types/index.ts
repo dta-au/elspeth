@@ -1232,9 +1232,11 @@ export interface ApiError {
 }
 
 export interface StorageQuotaRefusal {
-  cap: number | null;
-  ceiling: number | null;
-  usage: number;
+  scope: "identity" | "container";
+  limit: string | number;
+  cap: string | number | null;
+  ceiling: string | number | null;
+  usage: string | number;
 }
 
 /**

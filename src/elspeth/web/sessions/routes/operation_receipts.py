@@ -43,6 +43,7 @@ _SAFE_FAILURES: dict[OperationReceiptFailureCode, tuple[int, str]] = {
     "integrity_error": (500, "The operation could not verify its audit evidence."),
     "custody_error": (500, "The operation could not establish result custody."),
     "quota_exceeded": (413, "The operation exceeded the session storage quota."),
+    "storage_accounting_unavailable": (503, "Storage accounting is unavailable. Try again later."),
     "operation_failed": (500, "The operation failed."),
     "request_cancelled": (499, "The request was cancelled before durable staging completed."),
 }

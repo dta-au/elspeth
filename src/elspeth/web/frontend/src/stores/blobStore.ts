@@ -150,6 +150,8 @@ export const useBlobStore = create<BlobState>((set, get) => ({
       const detail =
         (err as { status?: number }).status === 413 && quotaRefusal !== undefined
           ? storageQuotaMessage(quotaRefusal)
+          : (err as Partial<ApiError>).status === 413 && (err as Partial<ApiError>).error_type === "storage_quota_exceeded"
+          ? "Storage quota reached. Free storage or ask an administrator to review the applicable limit, then try again."
           : (err as { status?: number }).status === 413
           ? "File exceeds the maximum upload size."
           : (err as { status?: number }).status === 415

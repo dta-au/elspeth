@@ -14,6 +14,7 @@ import json
 from collections import OrderedDict
 from collections.abc import Collection, Iterator
 from concurrent.futures import Future
+from datetime import datetime
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -24,7 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import Call, CallStatus, CallType, FrameworkBugError
 from elspeth.contracts.audit import CallVerification, validate_approved_prompt_artifact_hash
-from elspeth.contracts.call_data import CallPayload
+from elspeth.contracts.call_data import CallPayload, LLMCallResponse
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
@@ -245,6 +246,7 @@ class CallAuditRepository:
         parent_column: str,
         parent_id: str,
         allocation_is_owned: bool,
+        preserve_call_id: bool = False,
     ) -> dict[str, object]:
         """Insert under the parent lock, remapping an owned proposal collision."""
         proposed_index = values["call_index"]
@@ -266,7 +268,7 @@ class CallAuditRepository:
                 if proposal_count:
                     candidate = existing_max + 1
                     candidate_values["call_index"] = candidate
-                    if parent_column == "operation_id":
+                    if parent_column == "operation_id" and not preserve_call_id:
                         candidate_values["call_id"] = f"call_{parent_id}_{candidate}"
             conn.execute(calls_table.insert().values(**candidate_values))
             return candidate_values
@@ -510,6 +512,8 @@ class CallAuditRepository:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         """Record an external call for a node state.
 
@@ -557,8 +561,16 @@ class CallAuditRepository:
         if not isinstance(token_usage, TokenUsage):
             raise TypeError("token_usage must be TokenUsage")
 
-        call_id = generate_id()
-        timestamp = now()
+        explicit_call_id = call_id is not None
+        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+        call_id = generate_id() if call_id is None else call_id
+        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+            raise ValueError("Explicit call created_at must be an aware datetime")
+        timestamp = now() if created_at is None else created_at
         prepared = self._prepare_call_payloads(
             request_data,
             response_data,
@@ -578,6 +590,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
+            "returned_model": returned_model,
             "source_call_id": source_call_id,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
@@ -611,6 +624,7 @@ class CallAuditRepository:
                     parent_column="state_id",
                     parent_id=state_id,
                     allocation_is_owned=allocation_is_owned,
+                    preserve_call_id=explicit_call_id,
                 )
             call_id = str(values["call_id"])
             recorded_value = values["call_index"]
@@ -651,6 +665,7 @@ class CallAuditRepository:
             request_ref=request_ref,
             response_hash=prepared.response_hash,
             response_ref=response_ref,
+            returned_model=returned_model,
             source_call_id=source_call_id,
             error_json=prepared.error_json,
             latency_ms=latency_ms,
@@ -678,6 +693,8 @@ class CallAuditRepository:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         """Record an external call made during an operation.
 
@@ -711,8 +728,16 @@ class CallAuditRepository:
 
         if call_index is None:
             call_index = self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
-        call_id = f"call_{operation_id}_{call_index}"
-        timestamp = now()
+        explicit_call_id = call_id is not None
+        if explicit_call_id and (type(call_id) is not str or not call_id or len(call_id) > 64):
+            raise ValueError("Explicit call_id must be a non-empty string of at most 64 characters")
+        if explicit_call_id and (call_type is not CallType.LLM or source_call_id is not None):
+            raise ValueError("Explicit call_id is reserved for physical LLM outcomes")
+        call_id = f"call_{operation_id}_{call_index}" if call_id is None else call_id
+        returned_model = response_data.model if isinstance(response_data, LLMCallResponse) else None
+        if created_at is not None and (type(created_at) is not datetime or created_at.tzinfo is None):
+            raise ValueError("Explicit call created_at must be an aware datetime")
+        timestamp = now() if created_at is None else created_at
         prepared = self._prepare_call_payloads(
             request_data,
             response_data,
@@ -732,6 +757,7 @@ class CallAuditRepository:
             "request_ref": prepared.request_ref,
             "response_hash": prepared.response_hash,
             "response_ref": prepared.response_ref,
+            "returned_model": returned_model,
             "source_call_id": source_call_id,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "prompt_tokens": token_usage.prompt_tokens,
@@ -765,6 +791,7 @@ class CallAuditRepository:
                     parent_column="operation_id",
                     parent_id=operation_id,
                     allocation_is_owned=allocation_is_owned,
+                    preserve_call_id=explicit_call_id,
                 )
             call_id = str(values["call_id"])
             recorded_value = values["call_index"]
@@ -805,6 +832,7 @@ class CallAuditRepository:
             request_ref=request_ref,
             response_hash=prepared.response_hash,
             response_ref=response_ref,
+            returned_model=returned_model,
             source_call_id=source_call_id,
             error_json=prepared.error_json,
             latency_ms=latency_ms,

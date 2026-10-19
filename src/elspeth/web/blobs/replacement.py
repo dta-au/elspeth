@@ -161,6 +161,8 @@ class BlobReplacementCoordinator:
 
     def _recover_plan(self, context: SessionOperationContext, plan: BlobReplacementPlan) -> None:
         """Choose bytes from the durable phase, never from a failed acknowledgement."""
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+
         if str(plan.session_id) != context.fence.session_id:
             raise AuditIntegrityError("replacement recovery escaped exact session custody")
         current = self._authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=plan.blob_id))
@@ -197,7 +199,13 @@ class BlobReplacementCoordinator:
             return
         try:
             if committed:
-                settled = self._authority.mutate(context, lambda transaction: transaction.blobs.retire_blob_replacement(plan=plan))
+                remaining_output_storage_bytes = local_file_storage_bytes(storage)
+                settled = self._authority.mutate(
+                    context,
+                    lambda transaction: transaction.blobs.retire_blob_replacement(
+                        plan=plan, remaining_output_storage_bytes=remaining_output_storage_bytes
+                    ),
+                )
             else:
                 settled = self._authority.mutate(context, lambda transaction: transaction.blobs.abort_blob_replacement(plan=plan))
         except Exception as exc:

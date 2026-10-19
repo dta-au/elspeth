@@ -479,7 +479,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        item that the new resume refuses as corruption, so only a bump — not
 #        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 49
+SQLITE_SCHEMA_EPOCH = 50
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -2338,6 +2338,8 @@ calls_table = Table(
     Column("request_ref", String(256)),
     Column("response_hash", String(64)),
     Column("response_ref", String(256)),
+    # Retain provider attribution independently of optional response retention.
+    Column("returned_model", Text, nullable=True),
     Column("source_call_id", String(64), ForeignKey("calls.call_id"), nullable=True),
     # Cross-DB hash anchor for interpretation events (Option A — Phase 5b).
     # Populated by the LLM-transform plugin at execution time when the runtime

@@ -54,6 +54,8 @@ def _assert_websocket_contract(config: str) -> None:
     assert ("proxy_http_version", "1.1") in directives
     assert ("proxy_set_header", "Upgrade", "$http_upgrade") in directives
     assert ("proxy_set_header", "Connection", "$elspeth_connection_upgrade") in directives
+    assert ("proxy_set_header", "X-Forwarded-For", "$remote_addr") in directives
+    assert ("proxy_set_header", "X-Forwarded-Proto", "$scheme") in directives
     assert ("proxy_pass", "http://127.0.0.1:8451") in directives
     compose = yaml.safe_load((ROOT / "deploy/compose/web-postgres.yaml").read_text())
     environment = compose["services"]["web"]["environment"]
@@ -81,6 +83,8 @@ def test_shipped_nginx_scopes_forward_websocket_upgrade_and_match_transport_budg
         "proxy_set_header Upgrade $http_upgrade;",
         "proxy_set_header Connection $elspeth_connection_upgrade;",
         "proxy_http_version 1.1;",
+        "proxy_set_header X-Forwarded-For $remote_addr;",
+        "proxy_set_header X-Forwarded-Proto $scheme;",
     ],
 )
 def test_contract_rejects_missing_upgrade_forwarding(directive: str) -> None:
@@ -94,3 +98,9 @@ def test_parser_rejects_unbalanced_scope() -> None:
     assert _parse("map $http_upgrade $connection { default upgrade; '' close; }")
     with pytest.raises(AssertionError):
         _parse("map $http_upgrade $connection { default upgrade;")
+
+
+def test_contract_rejects_appending_untrusted_client_forwarding_chain() -> None:
+    config = (ROOT / "deploy/compose/nginx.conf").read_text()
+    with pytest.raises(AssertionError):
+        _assert_websocket_contract(config.replace("X-Forwarded-For $remote_addr", "X-Forwarded-For $proxy_add_x_forwarded_for"))

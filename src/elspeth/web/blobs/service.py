@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Never, TypedDict, TypeVar, cast
 from uuid import UUID, uuid4, uuid5
@@ -68,6 +69,7 @@ from elspeth.web.coordination.quota_authority import (
     QuotaExceeded,
     admit_storage_bytes_on_connection,
     refuse_unrecorded_quota_exceeded,
+    session_storage_bytes_on_connection,
 )
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import _blob_custody_session_lock as _blob_custody_session_lock
@@ -1280,10 +1282,13 @@ def _enforce_session_blob_quota(
     Runs against the caller's connection inside the caller's transaction and
     quota lock; it owns no locking or commit protocol of its own.
     """
-    query = select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
+    current_total = session_storage_bytes_on_connection(conn, session_id=session_id)
     if exclude_blob_id is not None:
-        query = query.where(blobs_table.c.id != exclude_blob_id)
-    current_total = conn.execute(query).scalar()
+        excluded_size = conn.execute(
+            select(blobs_table.c.size_bytes).where(blobs_table.c.id == exclude_blob_id, blobs_table.c.session_id == session_id)
+        ).scalar_one_or_none()
+        if excluded_size is not None:
+            current_total -= excluded_size
     # COALESCE guarantees an exact int; bool/subclasses or any other type
     # are Tier 1 anomalies. Explicit raise so the guard survives python -O.
     if type(current_total) is not int:
@@ -3067,6 +3072,8 @@ class BlobServiceImpl:
         context: SessionOperationContext,
         plan: BlobDeletionPlan,
     ) -> None:
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+
         storage, tombstone, temp = self._validated_blob_deletion_paths(plan)
         self._session_operation_authority.compare_and_swap(context)
         if storage.exists() or storage.is_symlink():
@@ -3086,10 +3093,13 @@ class BlobServiceImpl:
             atomic_temp.unlink()
         _fsync_parent_directory(storage.parent)
         self._session_operation_authority.compare_and_swap(context)
+        remaining_output_storage_bytes = local_file_storage_bytes(storage)
         try:
             retired = self._session_operation_authority.mutate(
                 context,
-                lambda transaction: transaction.blobs.retire_blob_deletion(plan=plan),
+                lambda transaction: transaction.blobs.retire_blob_deletion(
+                    plan=plan, remaining_output_storage_bytes=remaining_output_storage_bytes
+                ),
             )
         except Exception as exc:
             observed = self._observe_after_uncertain_deletion_mutation(
@@ -3113,6 +3123,7 @@ class BlobServiceImpl:
         accepting_proposal_id: UUID | None = None,
     ) -> None:
         """Drive one idempotent deletion state machine without holding DB over FS."""
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
         from elspeth.web.coordination.repository import SessionDerivedCustodyError
 
         atomic = self._session_operation_authority.mutate(
@@ -3123,13 +3134,16 @@ class BlobServiceImpl:
             stage = _atomic_blob_deletion_stage(atomic, data_dir=self._data_dir)
             self._session_operation_authority.compare_and_swap(context)
             _finalize_staged_blob_deletion(stage)
+            remaining_output_storage_bytes = local_file_storage_bytes(Path(atomic.storage_path))
             # Retirement is fenced in its own transaction, not a raw write
             # justified by an earlier compare-and-swap. A failed retirement
             # retains durable evidence and is safe to retry after bytes vanish.
             try:
                 self._session_operation_authority.mutate(
                     context,
-                    lambda transaction: transaction.blobs.retire_atomic_blob_deletion(obligation=atomic),
+                    lambda transaction: transaction.blobs.retire_atomic_blob_deletion(
+                        obligation=atomic, remaining_output_storage_bytes=remaining_output_storage_bytes
+                    ),
                 )
             except (OSError, SQLAlchemyError) as exc:
                 try:
@@ -3138,7 +3152,9 @@ class BlobServiceImpl:
                     # Lost custody cannot authorize this observation.
                     self._session_operation_authority.mutate(
                         context,
-                        lambda transaction: transaction.blobs.retire_atomic_blob_deletion(obligation=atomic),
+                        lambda transaction: transaction.blobs.retire_atomic_blob_deletion(
+                            obligation=atomic, remaining_output_storage_bytes=remaining_output_storage_bytes
+                        ),
                     )
                 except Exception as recovery_exc:
                     exc.add_note(
@@ -3517,6 +3533,73 @@ class BlobServiceImpl:
 
         return await self._run_sync(_sync)
 
+    @contextmanager
+    def run_output_write_admission(
+        self,
+        run_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> Iterator[None]:
+        """Bind physical output writes to durable capacity under the run fence.
+
+        Directory binding reaches sink worker threads without relying on
+        implicit context propagation. Existing reservations survive process
+        death; fresh-process recovery measures the retained target and staging
+        files before allowing another byte.
+        """
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_admission
+        from elspeth.web.paths import allowed_sink_directories
+
+        _require_blob_operation_context(session_operation_context, allowed_kinds=frozenset({SessionOperationKind.EXECUTE}))
+        context = session_operation_context
+        roots = allowed_sink_directories(str(self._data_dir), session_id=context.fence.session_id)
+
+        def _admit(target: Path, size_bytes: int) -> None:
+            canonical = target.resolve(strict=False)
+            if canonical != target or not any(canonical.is_relative_to(root) for root in roots):
+                raise AuditIntegrityError("output storage target escaped session custody")
+            self._session_operation_authority.mutate(
+                context,
+                lambda transaction: transaction.blobs.reserve_run_output_storage(
+                    run_id=run_id,
+                    target_path=str(canonical),
+                    size_bytes=size_bytes,
+                    max_storage_per_session=self._max_storage_per_session,
+                ),
+            )
+
+        with local_file_storage_admission(roots, _admit):
+            self._reconcile_run_output_storage(run_id, context=context)
+            try:
+                yield
+            finally:
+                self._reconcile_run_output_storage(run_id, context=context)
+
+    def _reconcile_run_output_storage(self, run_id: UUID, *, context: SessionOperationContext) -> None:
+        from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
+        from elspeth.web.paths import allowed_sink_directories
+
+        roots = allowed_sink_directories(str(self._data_dir), session_id=context.fence.session_id)
+        paths = self._session_operation_authority.mutate(
+            context, lambda transaction: transaction.blobs.list_run_output_storage_paths(run_id=run_id)
+        )
+
+        def _record(transaction: SessionOperationMutationTransaction, *, target: Path, size_bytes: int) -> None:
+            transaction.blobs.reconcile_run_output_storage(
+                run_id=run_id,
+                target_path=str(target),
+                size_bytes=size_bytes,
+                max_storage_per_session=self._max_storage_per_session,
+            )
+
+        for path in paths:
+            target = Path(path)
+            if target.resolve(strict=False) != target or not any(target.is_relative_to(root) for root in roots):
+                raise AuditIntegrityError("output storage reconciliation escaped session custody")
+            size_bytes = local_file_storage_bytes(target)
+
+            self._session_operation_authority.mutate(context, partial(_record, target=target, size_bytes=size_bytes))
+
     async def finalize_run_output_blobs(
         self,
         run_id: UUID,
@@ -3584,6 +3667,7 @@ class BlobServiceImpl:
                         finalized.append(outcome)
                     else:
                         errors.extend(outcome)
+                self._reconcile_run_output_storage(run_id, context=session_operation_context)
                 return BlobFinalizationResult(finalized=finalized, errors=errors)
 
         return await self._run_sync(_sync)

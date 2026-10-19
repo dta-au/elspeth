@@ -568,6 +568,7 @@ class Call:
     completion_tokens: int | None = None
     cached_prompt_tokens: int | None = None
     reasoning_tokens: int | None = None
+    returned_model: str | None = None
 
     def __post_init__(self) -> None:
         """Validate enum fields and structural invariants — Tier 1 crash on invalid types."""
@@ -579,6 +580,8 @@ class Call:
         require_int(self.completion_tokens, "completion_tokens", optional=True, min_value=0)
         require_int(self.cached_prompt_tokens, "cached_prompt_tokens", optional=True, min_value=0)
         require_int(self.reasoning_tokens, "reasoning_tokens", optional=True, min_value=0)
+        if self.returned_model is not None and (type(self.returned_model) is not str or not self.returned_model):
+            raise ValueError("returned_model must be a non-empty string when present")
         # XOR: exactly one of state_id or operation_id must be set
         has_state = self.state_id is not None
         has_operation = self.operation_id is not None

@@ -1,4 +1,5 @@
 import { authFetch } from "./authSession";
+import { parseIdentityQuota } from "@/utils/quota";
 /** Authenticated workflow requests. Every response uses the shared error parser. */
 import { authHeaders, parseResponse } from "./client";
 import type {
@@ -64,12 +65,16 @@ export function fetchWorkflowInspect(sessionId: string, stateId: string): Promis
   return get(`/api/workflow/inspect/${segment(sessionId)}/${segment(stateId)}`);
 }
 
-export const fetchMyQuota = (): Promise<IdentityQuota> => get("/api/workflow/quota/me");
+export const fetchMyQuota = (): Promise<IdentityQuota> => get<unknown>("/api/workflow/quota/me").then(parseIdentityQuota);
 
 export function fetchIdentityQuota(identityId: string): Promise<IdentityQuota> {
-  return get(`/api/workflow/quota/identities/${segment(identityId)}`);
+  return get<unknown>(`/api/workflow/quota/identities/${segment(identityId)}`).then(parseIdentityQuota);
 }
 
-export function setIdentityQuota(identityId: string, dimension: QuotaDimension, value: number): Promise<IdentityQuota> {
-  return post(`/api/workflow/quota/identities/${segment(identityId)}`, { dimension, value });
+export function setIdentityQuota(identityId: string, dimension: QuotaDimension, value: string): Promise<IdentityQuota> {
+  return post<unknown>(`/api/workflow/quota/identities/${segment(identityId)}`, { dimension, value }).then(parseIdentityQuota);
+}
+
+export function revokeIdentityQuota(identityId: string): Promise<IdentityQuota> {
+  return post<unknown>(`/api/workflow/quota/identities/${segment(identityId)}/revoke`, {}).then(parseIdentityQuota);
 }

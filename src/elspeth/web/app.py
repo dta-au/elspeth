@@ -691,6 +691,7 @@ async def _initialize_container_token_policy(app: FastAPI) -> None:
     work = run_sync_in_worker(
         app.state.quota_policy_authority.ensure_container_token_policy,
         tokens_per_day=app.state.settings.quota_container_tokens_per_day,
+        storage_bytes=app.state.settings.quota_container_storage_bytes,
         record=record,
     )
     try:

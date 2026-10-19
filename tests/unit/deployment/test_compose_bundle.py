@@ -268,9 +268,18 @@ def test_web_service_uses_distinct_external_postgresql_state_and_one_persistent_
     assert environment["ELSPETH_WEB__PAYLOAD_STORE_PATH"] == "/app/state/payloads"
     assert environment["WEB_CONCURRENCY"] == "1"
     assert web["deploy"]["replicas"] == 1
-    assert web["ports"] == ["8451:8451"]
+    assert web["ports"] == ["127.0.0.1:8451:8451"]
     assert _volume_targets(web).count("/app/state") == 1
     assert "elspeth_state" in document["volumes"]
+
+
+def test_host_proxy_trust_matches_only_the_private_bridge_gateway() -> None:
+    document = _rendered_bundle()
+    web = _service(document, "web")
+    network = document["networks"]["default"]["ipam"]["config"][0]
+    assert network == {"subnet": "172.30.85.0/24", "gateway": "172.30.85.1"}
+    assert _environment(web)["ELSPETH_WEB__TRUSTED_PROXY_HOSTS"] == '["172.30.85.1"]'
+    assert web["ports"] == [{"mode": "ingress", "host_ip": "127.0.0.1", "target": 8451, "published": "8451", "protocol": "tcp"}]
 
 
 def test_web_and_initializer_share_the_container_serving_bind_address() -> None:

@@ -164,4 +164,5 @@ def test_every_terminal_run_path_charges_the_run_token_ledger() -> None:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_record_run_token_usage"
         )
 
-    assert (charges("_run_pipeline"), charges("_persist_failed_run_status")) == (2, 1)
+    # The extra pipeline call reconciles a resumed worker before new dispatch.
+    assert (charges("_run_pipeline"), charges("_persist_failed_run_status")) == (3, 1)

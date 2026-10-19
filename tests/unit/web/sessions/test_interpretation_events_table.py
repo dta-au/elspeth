@@ -248,7 +248,7 @@ def test_current_session_schema_epoch() -> None:
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
     # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
     # Epoch 76 makes atomic terminal graph-review facts part of read semantics.
-    assert SESSION_SCHEMA_EPOCH == 77
+    assert SESSION_SCHEMA_EPOCH == 78
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

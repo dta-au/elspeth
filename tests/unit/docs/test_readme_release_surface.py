@@ -26,12 +26,13 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     current_section = readme.split(heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     text = " ".join(current_section.split())
 
-    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 76" in text
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch 77" in text
     assert "retains its committed graph-review authority" in text
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} is unchanged." in text
-    assert "Preserve epoch 75 and both epoch 76 session-store contracts" in text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} replaces epoch 49" in text
+    assert "Preserve epoch 75, both epoch 76 session-store contracts, epoch 77 session stores and epoch 49 Landscape stores" in text
     assert f"use a separately provisioned epoch {SESSION_SCHEMA_EPOCH} session store" in text
-    assert "Keep old workers isolated from the new store" in text
+    assert f"epoch {SQLITE_SCHEMA_EPOCH} Landscape store" in text
+    assert "Keep old workers isolated from the new stores" in text
     assert "Compatible stores still require exact schema admission" in text
     assert "unsupported stores are preserved and refused before incompatible writes" in text
     assert "Backwards compatibility is permitted and considered from 0.8.5 within explicitly supported boundaries" in text
@@ -40,6 +41,8 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
     assert "the package version alone does not establish qualification or image publication" in text
     assert "Automatic image publication from main is held" in text
     assert "verify the release tag and image digest" in text
+    assert "Quota API quantities now use decimal strings for exact signed-64-bit values" in text
+    assert "ELSPETH_WEB__TRUSTED_PROXY_HOSTS" in text
 
 
 def test_readme_release_links_resolve() -> None:

@@ -9,7 +9,7 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
-from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX, StorageAccountingUnavailableError
 from elspeth.web.blobs.protocol import (
     BlobContentMissingError,
     BlobError,
@@ -1064,6 +1064,8 @@ def register_session_routes(router: APIRouter) -> None:
                 failure_code: OperationReceiptFailureCode = (
                     "quota_exceeded"
                     if isinstance(primary_exc, BlobQuotaExceededError)
+                    else "storage_accounting_unavailable"
+                    if isinstance(primary_exc, StorageAccountingUnavailableError)
                     else "integrity_error"
                     if isinstance(primary_exc, (AuditIntegrityError, BlobContentMissingError, BlobIntegrityError))
                     else "operation_failed"
