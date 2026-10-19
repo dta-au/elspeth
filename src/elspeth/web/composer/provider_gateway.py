@@ -6,14 +6,25 @@ import asyncio
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, Final, cast
+from typing import Any, Final
 
 from openai import OpenAIError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import (
+    PromptGuardContentPart,
+    PromptGuardMode,
+    PromptGuardRole,
+    PromptGuardTextMessage,
+    PromptGuardToolArgumentParts,
+    detach_prompt_guard_evidence,
+    validate_prompt_guard_content_parts,
+    validate_prompt_guard_tool_argument_parts,
+)
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.composer._compose_loop_carriers import (
@@ -31,6 +42,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
@@ -435,7 +447,17 @@ def build_composer_loop_request_kwargs(
 
 
 async def _litellm_acompletion(
-    *, provider_custody: ProviderCallCustody | None = None, on_provider_dispatch: Callable[[], None] | None = None, **kwargs: Any
+    *,
+    prompt_guard_mount: PromptGuardMount | None,
+    prompt_guard_mode: PromptGuardMode,
+    prompt_guard_role: PromptGuardRole,
+    prompt_guard_user_prompt: str | None = None,
+    prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+    prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    provider_custody: ProviderCallCustody | None = None,
+    on_provider_dispatch: Callable[[], None] | None = None,
+    **kwargs: Any,
 ) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
 
@@ -453,7 +475,46 @@ async def _litellm_acompletion(
     # Endpoint credentials are purpose-specific transport configuration and
     # intentionally excluded.  The dynamic messages are the Web/Composer
     # control content that crosses the provider boundary.
+    kwargs = deepcopy(kwargs)
+    evidence = detach_prompt_guard_evidence(kwargs["messages"])
+    kwargs["messages"] = evidence.messages
+    content_parts = evidence.content_parts
+    argument_parts = evidence.tool_argument_parts
+    if prompt_guard_content_parts is not None:
+        validate_prompt_guard_content_parts(evidence.messages, prompt_guard_content_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard content provenance changed before physical dispatch")
+        content_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
+        )
+    if prompt_guard_tool_argument_parts is not None:
+        validate_prompt_guard_tool_argument_parts(evidence.messages, prompt_guard_tool_argument_parts)
+        if any(
+            current is not None and forwarded is not None and current != forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        ):
+            raise AuditIntegrityError("Prompt guard tool argument provenance changed before physical dispatch")
+        argument_parts = tuple(
+            current if current is not None else forwarded
+            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
+        )
     require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
+    await enforce_prompt_guard(
+        mount=prompt_guard_mount,
+        mode=prompt_guard_mode,
+        role=prompt_guard_role,
+        provider_custody=provider_custody,
+        messages=kwargs["messages"],
+        tools=kwargs["tools"] if "tools" in kwargs else (),
+        user_prompt=prompt_guard_user_prompt,
+        trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+        content_parts=content_parts,
+        tool_argument_parts=argument_parts,
+    )
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
     if provider_custody is None:
@@ -501,6 +562,13 @@ class ProviderGateway:
         self._settings = settings
         self._endpoint_base_url = endpoint_base_url
         self._endpoint_api_key = endpoint_api_key
+        self._prompt_guard_mount = build_prompt_guard_mount(settings.composer_prompt_guard)
+        self._prompt_guard_mode = settings.composer_prompt_guard_mode
+
+    @property
+    def prompt_guard_mount(self) -> PromptGuardMount | None:
+        """The immutable deployment dependency shared with primary-role callers."""
+        return self._prompt_guard_mount
 
     async def _call_llm(
         self,
@@ -509,6 +577,9 @@ class ProviderGateway:
         *,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -522,10 +593,15 @@ class ProviderGateway:
                 api_base=self._endpoint_base_url,
                 api_key=self._endpoint_api_key,
             )
-            response = (
-                await _litellm_acompletion(provider_custody=provider_custody, **kwargs)
-                if provider_custody is not None
-                else await _litellm_acompletion(**kwargs)
+            response = await _litellm_acompletion(
+                provider_custody=provider_custody,
+                prompt_guard_mount=self.prompt_guard_mount,
+                prompt_guard_mode=self._prompt_guard_mode,
+                prompt_guard_role="composer",
+                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+                **kwargs,
             )
         except LiteLLMBadRequestError as exc:
             raise _BadRequestLLMError(
@@ -553,7 +629,14 @@ class ProviderGateway:
         )
         return completion
 
-    async def _call_text_llm(self, messages: list[dict[str, str]], *, provider_custody: ProviderCallCustody | None = None) -> Any:
+    async def _call_text_llm(
+        self,
+        messages: list[PromptGuardTextMessage],
+        *,
+        provider_custody: ProviderCallCustody | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+    ) -> Any:
         """Call the LLM for non-tool text generation."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
@@ -566,10 +649,15 @@ class ProviderGateway:
                 api_base=self._endpoint_base_url,
                 api_key=self._endpoint_api_key,
             )
-            response = (
-                await _litellm_acompletion(provider_custody=provider_custody, **kwargs)
-                if provider_custody is not None
-                else await _litellm_acompletion(**kwargs)
+            response = await _litellm_acompletion(
+                provider_custody=provider_custody,
+                prompt_guard_mount=self.prompt_guard_mount,
+                prompt_guard_mode=self._prompt_guard_mode,
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt="",
+                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                prompt_guard_content_parts=prompt_guard_content_parts,
+                **kwargs,
             )
         except LiteLLMBadRequestError as exc:
             raise _BadRequestLLMError(
@@ -639,7 +727,8 @@ class ProviderGateway:
         credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call the primary model once and record the exact marked request."""
-        wire_messages = [dict(message) for message in messages]
+        evidence = detach_prompt_guard_evidence(messages)
+        wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         wire_tools = [dict(tool) for tool in tools]
         if supports_anthropic_prompt_cache_markers(self._model):
             wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
@@ -656,12 +745,36 @@ class ProviderGateway:
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
         try:
-            completion = await asyncio.wait_for(
-                self._call_llm(wire_messages, wire_tools, provider_custody=provider_custody, credential_state=credential_state)
-                if provider_custody is not None or credential_state is not None
-                else self._call_llm(wire_messages, wire_tools),
-                timeout=timeout,
-            )
+            if any(parts is not None for parts in evidence.tool_argument_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                )
+            elif any(parts is not None for parts in evidence.content_parts):
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or credential_state is not None or trusted_indexes:
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                )
+            else:
+                completion_call = self._call_llm(wire_messages, wire_tools)
+            completion = await asyncio.wait_for(completion_call, timeout=timeout)
             _require_no_credential_material_in_completion(
                 completion,
                 surface="composer_provider_response",
@@ -687,6 +800,8 @@ class ProviderGateway:
                 )
             status = ComposerLLMCallStatus.SUCCESS
             return completion
+        except PromptGuardRefused:
+            raise
         except TimeoutError as exc:
             failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
@@ -809,13 +924,15 @@ class ProviderGateway:
 
     async def _call_text_llm_with_audit_body(
         self,
-        messages: list[dict[str, str]],
+        messages: list[PromptGuardTextMessage],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
+        evidence = detach_prompt_guard_evidence(messages)
+        messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -825,12 +942,20 @@ class ProviderGateway:
         error_message: str | None = None
         failure_to_capture: Exception | None = None
         try:
-            provider_response = await asyncio.wait_for(
-                self._call_text_llm(messages, provider_custody=provider_custody)
-                if provider_custody is not None
-                else self._call_text_llm(messages),
-                timeout=timeout,
-            )
+            if any(parts is not None for parts in evidence.content_parts):
+                response_call = self._call_text_llm(
+                    messages,
+                    provider_custody=provider_custody,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                )
+            elif provider_custody is not None or trusted_indexes:
+                response_call = self._call_text_llm(
+                    messages, provider_custody=provider_custody, prompt_guard_trusted_message_indexes=trusted_indexes
+                )
+            else:
+                response_call = self._call_text_llm(messages)
+            provider_response = await asyncio.wait_for(response_call, timeout=timeout)
             choice = provider_response.choices[0] if provider_response.choices else None
             message = choice.message if choice is not None else None
             admitted_metadata = admit_llm_provider_metadata(
@@ -860,6 +985,8 @@ class ProviderGateway:
             response_metadata = admitted_metadata
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
+        except PromptGuardRefused:
+            raise
         except TimeoutError as exc:
             failure_to_capture = exc
             status = ComposerLLMCallStatus.TIMEOUT
@@ -921,7 +1048,7 @@ class ProviderGateway:
                         call = build_llm_call_record(
                             model_requested=self._model,
                             pricing_model=self._settings.composer_pricing_model,
-                            messages=cast(list[dict[str, Any]], messages),
+                            messages=messages,
                             tools=None,
                             status=status,
                             started_at=started_at,
@@ -981,13 +1108,13 @@ class ProviderGateway:
 
     @quota_provider_calls
     async def _call_text_llm_with_audit_legacy(
-        self, messages: list[dict[str, str]], *, timeout: float, recorder: BufferingRecorder | None
+        self, messages: list[PromptGuardTextMessage], *, timeout: float, recorder: BufferingRecorder | None
     ) -> str:
         return await self._call_text_llm_with_audit_body(messages, timeout=timeout, recorder=recorder)
 
     async def _call_text_llm_with_audit(
         self,
-        messages: list[dict[str, str]],
+        messages: list[PromptGuardTextMessage],
         *,
         timeout: float,
         recorder: BufferingRecorder | None,

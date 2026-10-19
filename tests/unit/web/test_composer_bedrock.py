@@ -6,15 +6,27 @@ import json
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import httpx
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
+from elspeth.web.prompt_guard_config import PromptGuardSettings
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_settings, _mock_catalog
 from tests.unit.web.composer.test_service import _assert_checkpoint_reply
@@ -58,6 +70,47 @@ def _bedrock_settings() -> WebSettings:
 
 def _bedrock_service() -> ComposerServiceImpl:
     return ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_bedrock_settings())
+
+
+def _required_bedrock_service(
+    monkeypatch: pytest.MonkeyPatch, *, user_prompt: str
+) -> tuple[ComposerServiceImpl, str, list[httpx.Request]]:
+    """Use the real Azure guard and sessions; fake only its external HTTP."""
+    guard_settings = PromptGuardSettings(endpoint="https://bedrock-shield.example.test", subscription_key="offline-bedrock-shield")
+    requests: list[httpx.Request] = []
+
+    def shield_response(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST" and request.url.host == "bedrock-shield.example.test"
+        assert request.url.path == "/contentsafety/text:shieldPrompt"
+        assert request.url.params["api-version"] == "2024-09-01"
+        payload = json.loads(request.content)
+        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
+        assert payload["userPrompt"] == user_prompt
+        assert type(payload["documents"]) is list and all(type(document) is str for document in payload["documents"])
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in payload["documents"]],
+            },
+        )
+
+    def mount(settings: PromptGuardSettings | None) -> PromptGuardMount:
+        assert type(settings) is PromptGuardSettings
+        return PromptGuardMount(AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(shield_response)))
+
+    monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", mount, raising=True)
+    monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount, raising=True)
+    settings = _bedrock_settings().model_copy(
+        update={
+            "composer_prompt_guard_mode": "required",
+            "composer_prompt_guard": guard_settings,
+            "composer_advisor_prompt_guard": guard_settings,
+        }
+    )
+    service, session_id = _composer_service_with_session(_mock_catalog(), settings)
+    return service, session_id, requests
 
 
 @pytest.mark.asyncio
@@ -106,7 +159,7 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     # Fake only the native SDK seam, after custody/callback handling. END
     # request construction, strict parser, binding and durable audit run.
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    service, session_id = _composer_service_with_session(_mock_catalog(), _bedrock_settings())
+    service, session_id, shield_requests = _required_bedrock_service(monkeypatch, user_prompt="No pipeline changes are needed.")
 
     availability = service.get_availability()
     assert availability.available is True
@@ -116,9 +169,30 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     engine = service._require_sessions_service()._engine
     try:
         with fenced_operation_context(engine, session_id) as context:
-            result = await service.compose(
-                "No pipeline changes are needed.", [], _empty_state(), session_id=session_id, session_operation_context=context
+            sessions = service._require_sessions_service()
+            user_message = await sessions.add_message(
+                UUID(session_id),
+                "user",
+                "No pipeline changes are needed.",
+                writer_principal="route_user_message",
+                session_operation_context=context,
             )
+            coordinator = RequiredWorkCoordinator(
+                RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+            )
+            binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+            owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+            result = await service.compose(
+                "No pipeline changes are needed.",
+                [],
+                _empty_state(),
+                session_id=session_id,
+                session_operation_context=context,
+                user_message_id=str(user_message.id),
+                required_work=binding,
+                provider_owner=owner,
+            )
+            coordinator.assert_completed()
         stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
     finally:
         engine.dispose()
@@ -155,11 +229,25 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert passes[0]["verdict"] == "clean" and passes[0]["publication_verdict"] == "ADMIT"
     assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
     assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
+    checks = [
+        row.tool_calls[0]["check"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+    ]
+    assert [check["role"] for check in checks] == ["composer", "advisor"]
+    assert all(
+        (check["adapter"], check["mode"], check["disposition"], check["reason"])
+        == ("azure_prompt_shields", "required", "allow", "clean")
+        for check in checks
+    )
+    assert checks[0]["operation_id"] == checks[1]["operation_id"] == context.fence.operation_id
+    assert shield_requests
 
 
 @pytest.mark.asyncio
 async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overrides(
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
     import litellm
 
@@ -184,7 +272,9 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
 
     # Observe actual SDK arguments after the wrapper consumes its callback.
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
-    service = _bedrock_service()
+    service, session_id, shield_requests = _required_bedrock_service(monkeypatch, user_prompt="Review the complete pipeline.")
+    engine = service._require_sessions_service()._engine
+    request.addfinalizer(engine.dispose)
     recorder = BufferingRecorder()
 
     arguments = {
@@ -204,12 +294,31 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
         )
     assert dispatches == [] and captured == [] and recorder.llm_calls == ()
     arguments["trigger"] = ADVISOR_TRIGGER_DETERMINISTIC_END
-    guidance, metadata = await service._advisor_checkpoint._call_advisor_with_audit(
-        arguments,
-        recorder=recorder,
-        structured_output=True,
-        on_provider_dispatch=lambda: dispatches.append(True),
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        sessions = service._require_sessions_service()
+        user_message = await sessions.add_message(
+            UUID(session_id),
+            "user",
+            "Review the complete pipeline.",
+            writer_principal="route_user_message",
+            session_operation_context=context,
+        )
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+        )
+        owner = ProviderInvocationOwner(service=sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+        # This low-level request test grants no standalone publication signoff.
+        # The primary-service control above exercises the actual bound END.
+        with prompt_guard_user_scope(user_message.content):
+            guidance, metadata = await service._advisor_checkpoint._call_advisor_with_audit(
+                arguments,
+                recorder=recorder,
+                structured_output=True,
+                on_provider_dispatch=lambda: dispatches.append(True),
+                provider_owner=owner,
+            )
+        coordinator.assert_completed()
+    stored = await sessions.get_messages(UUID(session_id), limit=None)
 
     assert guidance == reply
     assert metadata["model"] == _BEDROCK_ADVISOR
@@ -236,6 +345,21 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[-1].model_requested == _BEDROCK_ADVISOR
+    checks = [
+        row.tool_calls[0]["check"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+    ]
+    assert len(checks) == 1
+    assert (
+        checks[0]["role"],
+        checks[0]["adapter"],
+        checks[0]["mode"],
+        checks[0]["disposition"],
+        checks[0]["reason"],
+        checks[0]["operation_id"],
+    ) == ("advisor", "azure_prompt_shields", "required", "allow", "clean", context.fence.operation_id)
+    assert shield_requests
 
 
 def test_openrouter_primary_still_fails_closed_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

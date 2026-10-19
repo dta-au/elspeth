@@ -82,6 +82,26 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "For pipeline rows, fail preparation before publication if any row cannot be represented, instead of diverting or discarding it. Use for required retention outputs. False preserves on_write_failure routing. Does not roll back earlier publications.",
+        "kind": "checkbox",
+        "label": "Require All Rows",
+        "name": "require_all_rows",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Write a fixed retention envelope with actual run/row/token identity, outcome/path, audit error reference and the complete carried row as canonical row_json. Requires require_all_rows=true, observed schema, normalized headers and mode=write. References depend on retained Landscape evidence; no raw diagnostic text or business failure explanation is synthesized.",
+        "kind": "checkbox",
+        "label": "Include Audit Context",
+        "name": "include_audit_context",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

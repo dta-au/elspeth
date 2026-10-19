@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import litellm
 import pytest
 import structlog
 from sqlalchemy import insert, select, update
@@ -25,7 +26,6 @@ from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, Charg
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
-from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
 from elspeth.web.coordination import chargeable_admission_authority
@@ -34,7 +34,6 @@ from elspeth.web.coordination.contracts import StartPermitState
 from elspeth.web.coordination.quota_authority import QuotaExceeded, TokenUsageEntry, TokenUsageSource
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
-from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
@@ -50,6 +49,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.auto_title import RecordingTitleService, call_auto_title
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.coordination.test_durable_run_admission import _admission
@@ -209,16 +209,21 @@ async def test_undispatched_cancellation_rejects_changed_model_and_dispatched_se
 
 @pytest.mark.asyncio
 async def test_auto_title_cancellation_after_committed_admission_never_dispatches(
-    harness: FencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    session_id, context = _seed_compose_session(engine)
+    harness = RecordingTitleService()
+    engine = harness._engine
     admitted = asyncio.Event()
     release_result = asyncio.Event()
     begin = harness.begin_provider_attempt
     sdk_entries = 0
 
-    async def _delayed_result(*, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None):
-        attempt = await begin(session_operation_context=session_operation_context, source=source, run_id=run_id)
+    async def _delayed_result(
+        *, session_operation_context: SessionOperationContext, source: TokenUsageSource, run_id: UUID | None = None, required_work=None
+    ):
+        attempt = await begin(
+            session_operation_context=session_operation_context, source=source, run_id=run_id, required_work=required_work
+        )
         admitted.set()
         await release_result.wait()
         return attempt
@@ -229,16 +234,14 @@ async def test_auto_title_cancellation_after_committed_admission_never_dispatche
         raise AssertionError("A cancelled admission must not dispatch the provider")
 
     monkeypatch.setattr(harness, "begin_provider_attempt", _delayed_result)
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _provider)
+    monkeypatch.setattr(litellm, "acompletion", _provider)
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=harness,
-            session_id=UUID(session_id),
             user_message="Build a CSV pipeline",
             model="test/model",
             temperature=None,
             seed=None,
-            session_operation_context=context,
         )
     )
     await asyncio.wait_for(admitted.wait(), timeout=5)
@@ -254,10 +257,12 @@ async def test_auto_title_cancellation_after_committed_admission_never_dispatche
         ledger = conn.execute(select(token_usage_ledger_table)).all()
         attempt = conn.execute(select(quota_provider_attempts_table)).one()
     assert sdk_entries == 0
-    assert len(events) == len(ledger) == 1
-    assert events[0].tool_calls is None
-    assert "provider_attempt.cancelled_before_dispatch" in events[0].content
-    assert '"source":"auto_title"' in events[0].content
+    guard_events = [event for event in events if event.tool_calls and event.tool_calls[0]["_kind"] == "prompt_guard_audit"]
+    cancellation_events = [event for event in events if event.tool_calls is None]
+    assert len(events) == 2 and len(guard_events) == len(cancellation_events) == len(ledger) == 1
+    assert guard_events[0].tool_calls[0]["check"]["disposition"] == "debug_bypass"
+    assert "provider_attempt.cancelled_before_dispatch" in cancellation_events[0].content
+    assert '"source":"auto_title"' in cancellation_events[0].content
     assert (ledger[0].prompt_tokens, ledger[0].completion_tokens) == (0, 0)
     assert attempt.settled_at is not None
 

@@ -141,14 +141,20 @@ async def _admit(app, service, authority, *, operation_id: str, deadline_seconds
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_turn_caller", (False, True))
-async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_path, monkeypatch: pytest.MonkeyPatch, cancel_turn_caller):
+@pytest.mark.parametrize("failure_kind", ("settlement", "deadline", "sql-deadline", "settlement-with-deadline"))
+async def test_worker_retains_late_original_cause_after_durable_call_cohort(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, cancel_turn_caller, failure_kind
+):
     import json
     from dataclasses import replace
     from uuid import UUID
+    from sqlalchemy import event
 
     from elspeth.contracts.errors import ComposerOwnedSettlementFailure
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
+    from elspeth.web.coordination import composer_operation_authority
     from elspeth.web.sessions import composer_turn
+    from elspeth.web.sessions.composer_operations import ComposerTurnDeadlineExpired
     from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
     from tests.unit.web.sessions.test_freeform_route_custody import _ActualCustodyGate
 
@@ -161,6 +167,14 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
     turn_tasks = []
     actual_capture = worker_module.capture_failure_facts
     original_failure = RuntimeError("B7_LATE_ORIGINAL_CANARY")
+    deadline_only = failure_kind in ("deadline", "sql-deadline")
+    projection_sql = threading.local()
+    observed_sql_deadlines = []
+
+    def capture_projection_connection(conn, *_args):
+        projection_sql.connection = conn
+
+    event.listen(engine, "before_cursor_execute", capture_projection_connection)
     caller_marker = "B7_CALLER_CANCEL_CANARY"
     gate = _ActualCustodyGate(asyncio.get_running_loop())
     worker = _worker(app, authority)
@@ -188,6 +202,21 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
 
     def fail_projection(*args, **kwargs):
         gate.park_sql()
+        if failure_kind == "sql-deadline":
+            connection = projection_sql.connection
+            actual_now = composer_operation_authority.database_now
+
+            def expired_on_projection_connection(conn):
+                return record.deadline_at if conn is connection else actual_now(conn)
+
+            with monkeypatch.context() as cutoff:
+                cutoff.setattr(composer_operation_authority, "database_now", expired_on_projection_connection)
+                try:
+                    composer_operation_authority.require_composer_operation_mutation_on_connection(connection, gate.leases[0].context)
+                except ComposerTurnDeadlineExpired as expired:
+                    observed_sql_deadlines.append(expired)
+                    raise
+            raise AssertionError("The actual SQL mutation boundary admitted an expired job")
         raise original_failure
 
     def capture(root):
@@ -200,6 +229,17 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
     drive = None
     try:
         record = await _admit(app, service, authority, operation_id=str(uuid4()))
+        if failure_kind not in ("settlement", "sql-deadline"):
+            deadline = ComposerTurnDeadlineExpired(
+                session_id=record.session_id,
+                operation_id=record.operation_id,
+                remaining_seconds=-0.01,
+                budget_seconds_at_running=85.0,
+            )
+            if failure_kind == "deadline":
+                original_failure = deadline
+            else:
+                original_failure.__cause__ = deadline
         drive = asyncio.create_task(worker.run_until_idle())
         await asyncio.wait_for(gate.entered.wait(), timeout=10)
         if cancel_turn_caller:
@@ -210,7 +250,8 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
         gate.release.set()
         await asyncio.wait_for(drive, timeout=10)
         terminal = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-        assert terminal.status == "failed" and terminal.failure_code == "operation_failed"
+        assert terminal.status == "failed"
+        assert terminal.failure_code == ("deadline_expired" if deadline_only else "operation_failed")
         assert composer.calls == 1
         assert len(captured) == 1
         originals = []
@@ -226,25 +267,37 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
                 pending.append(root.__cause__)
             if root.__context__ is not None:
                 pending.append(root.__context__)
-        assert any(root is original_failure for root in originals)
+        expected_original = observed_sql_deadlines[0] if failure_kind == "sql-deadline" else original_failure
+        assert any(root is expected_original for root in originals)
+        if failure_kind == "sql-deadline":
+            assert len(observed_sql_deadlines) == 1
+            assert expected_original.session_id == record.session_id and expected_original.operation_id == record.operation_id
+            assert expected_original.remaining_seconds == 0
         assert any(isinstance(root, asyncio.CancelledError) and root.args == (caller_marker,) for root in originals) is cancel_turn_caller
-        (owned_primary,) = [root for root in originals if type(root) is ComposerOwnedSettlementFailure]
-        if cancel_turn_caller:
-            assert isinstance(owned_primary.__cause__, BaseExceptionGroup)
-            original_cause, joined_cancellation = owned_primary.__cause__.exceptions
-            assert original_cause is original_failure
-            assert joined_cancellation in originals and joined_cancellation.args == (caller_marker,)
+        owned = [root for root in originals if type(root) is ComposerOwnedSettlementFailure]
+        if deadline_only:
+            assert owned == []
         else:
-            assert owned_primary.__cause__ is original_failure
+            (owned_primary,) = owned
+            if cancel_turn_caller:
+                assert isinstance(owned_primary.__cause__, BaseExceptionGroup)
+                original_cause, joined_cancellation = owned_primary.__cause__.exceptions
+                assert original_cause is original_failure
+                assert joined_cancellation in originals and joined_cancellation.args == (caller_marker,)
+            else:
+                assert owned_primary.__cause__ is original_failure
         rows = await service.get_messages(record.session_id, limit=None)
+        assert not [row for row in rows if row.role == "assistant"]
         calls = [item for row in rows for item in row.tool_calls or () if item.get("_kind") == "llm_call_audit"]
         assert len(calls) == 1
         private = [item for row in rows for item in row.tool_calls or () if item.get("_kind") == "composer_diagnostic_evidence"]
         evidence = [ComposerDiagnosticEvidence.from_envelope(item, expected_session_id=str(record.session_id)) for item in private]
         (failure_evidence,) = [item for item in evidence if item.status == "operation_failure"]
         selected = ComposerOperationError.model_validate_json(terminal.result_json, strict=True)
+        assert selected.http_status == (504 if deadline_only else 500)
         assert json.loads(failure_evidence.arguments.content)["diagnostic_id"] == selected.diagnostic_id
-        assert "B7_LATE_ORIGINAL_CANARY" in failure_evidence.result.content
+        assert ("B7_LATE_ORIGINAL_CANARY" in failure_evidence.result.content) is not deadline_only
+        assert ("Composer job budget expired before provider dispatch" in failure_evidence.result.content) is (failure_kind != "settlement")
         assert (caller_marker in failure_evidence.result.content) is cancel_turn_caller
         assert "B7_LATE_ORIGINAL_CANARY" not in terminal.result_json and caller_marker not in terminal.result_json
     finally:
@@ -252,6 +305,7 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(tmp_
         if drive is not None and not drive.done():
             await asyncio.wait_for(drive, timeout=10)
         engine.dispose()
+        event.remove(engine, "before_cursor_execute", capture_projection_connection)
 
 
 @pytest.mark.asyncio

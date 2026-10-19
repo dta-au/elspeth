@@ -85,10 +85,13 @@ def test_reply_only_history_preserves_attribution_and_echo_check_needs_internal_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "final_kind",
-    ["text", "tools", "timeout", "expired", "advisor_block", "protocol_echo", "protocol_echo_advisor_block", "quoted_json", "quoted_log"],
+    ["text", "tools", "timeout", "expired", "advisor_block", "protocol_echo", "protocol_echo_advisor_block", "quoted_json", "quoted_log", "inspected_text"],
 )
 async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytest.MonkeyPatch, final_kind: str) -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(composer_max_discovery_turns=1))
+    settings = _make_settings(composer_max_discovery_turns=1)
+    if final_kind == "inspected_text":
+        settings = _make_settings(composer_max_discovery_turns=1, composer_model="anthropic/claude-sonnet-5-5")
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=settings)
     state = (
         _empty_state()
         .with_source(
@@ -108,9 +111,24 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             )
         )
     )
+    first_calls = [{"id": "preview", "name": "preview_pipeline", "arguments": {}}]
+    if final_kind == "inspected_text":
+        from elspeth.web.composer import tool_batch
+        from tests.unit.web.composer.test_turn_effects import _page
+
+        admitted, _content = _page(0, 6)
+        execute = tool_batch.execute_tool
+
+        def execute_with_page(tool_name, arguments, current_state, catalog, *args, **kwargs):
+            if tool_name == "get_blob_content":
+                return replace(admitted.result, updated_state=current_state)
+            return execute(tool_name, arguments, current_state, catalog, *args, **kwargs)
+
+        monkeypatch.setattr(tool_batch, "execute_tool", execute_with_page)
+        first_calls.insert(0, {"id": "page", "name": "get_blob_content", "arguments": {"blob_id": "blob"}})
     replies = iter(
         [
-            _make_llm_response(tool_calls=[{"id": "preview", "name": "preview_pipeline", "arguments": {}}]),
+            _make_llm_response(tool_calls=first_calls),
             _make_llm_response(content="The pipeline preview passed."),
         ]
     )
@@ -150,6 +168,14 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
 
     async def advisor(*args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
         advisor_phases.append(kwargs["phase"])
+        if final_kind == "inspected_text":
+            from elspeth.contracts.hashing import stable_hash
+
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            inspection = json.loads(review.payload_json)["inspection"]
+            assert inspection["currently_available"][0]["ranges"] == [[0, 6]]
+            assert inspection["current_candidate_call"][1] == stable_hash(provider_messages[1])
         if final_kind in {"advisor_block", "protocol_echo_advisor_block"}:
             review = kwargs["publication_review"]
             assert type(review) is AdvisorPublicationReview
@@ -228,7 +254,8 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
         else:
             _assert_checkpoint_reply(result, "The pipeline preview passed.", count=0)
     assert len(advertised_tools) == (1 if final_kind == "expired" else 2)
-    assert dispatched_batches == [("preview_pipeline",)]
+    expected_batches = [("get_blob_content", "preview_pipeline")] if final_kind == "inspected_text" else [("preview_pipeline",)]
+    assert dispatched_batches == expected_batches
     assert advertised_tools[0]
     if len(advertised_tools) == 2:
         assert {tool["function"]["name"] for tool in advertised_tools[1]} == {"handoff_to_user", "restore_parked_graph"}

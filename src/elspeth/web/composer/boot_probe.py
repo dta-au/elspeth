@@ -1,6 +1,7 @@
-"""Boot-time validation of configured Composer provider capabilities.
+"""Boot-time request descriptions for configured Composer provider capabilities.
 
-The probe sends the requests production sends. Each probe request is built by
+Sessionless boot cannot qualify a protected call without durable audit custody,
+so physical probes are skipped. Each retained request description is built by
 the same function the production call site uses:
 
 - ``loop_tools``: the freeform compose loop's request
@@ -35,12 +36,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
-import httpx
-
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.web.composer import provider_gateway
-from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_response
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 from elspeth.web.composer.pipeline_planner import (
@@ -49,12 +46,7 @@ from elspeth.web.composer.pipeline_planner import (
     planner_tool_definitions,
 )
 from elspeth.web.composer.protocol import ComposerSettings
-from elspeth.web.composer.provider_gateway import (
-    _capture_composer_llm_completion_fields,
-    _MalformedLLMResponseError,
-    build_composer_loop_request_kwargs,
-    composer_loop_tool_definitions,
-)
+from elspeth.web.composer.provider_gateway import build_composer_loop_request_kwargs, composer_loop_tool_definitions
 from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.composer.strict_transport import resolve_composer_tool_contract
 
@@ -258,50 +250,12 @@ def build_composer_probe_requests(settings: ComposerSettings, *, env: Mapping[st
     )
 
 
-async def probe_composer_config(request: ComposerProbeRequest) -> bool:
-    """Send one probe request; return False on a transient provider or transport failure.
+async def probe_composer_config(request: ComposerProbeRequest) -> bool | None:
+    """Skip a sessionless physical probe that has no durable guard audit sink.
 
-    A 400 raises :class:`ComposerBootConfigError`: the configured request was
-    rejected, and boot must fail rather than the first user turn. The tool
-    surfaces pass on any accepted response. The advisor surface also checks
-    structured-output admission: a prose-seeking prompt exposes providers that
-    ignore the schema and reply in prose. A passing probe does not prove
-    enforcement on every request, and checkpoint semantic rules do not apply
-    to this configuration check. The application bounds every probe request
-    with one shared boot deadline.
+    The request builders remain the capability contract. Neither required nor
+    debug mode grants a sessionless call permission to omit its guard audit.
+    None is explicitly not qualified; application startup reports that outcome.
+    No model, guard service, or synthetic session is created here.
     """
-    from litellm.exceptions import APIError as LiteLLMAPIError
-    from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
-    from openai import OpenAIError as OpenAIProviderError
-
-    kwargs = request.to_litellm_kwargs()
-    try:
-        response = await provider_gateway._litellm_acompletion(on_provider_dispatch=None, **kwargs)
-    except LiteLLMBadRequestError as exc:
-        # A 400 identifies a rejected request, not which option caused it.
-        # Provider exception text may carry secrets; expose only owned facts
-        # about the actual outbound request while retaining the original cause.
-        raise ComposerBootConfigError(
-            f"composer {request.role} boot request rejected by {request.model}: "
-            f"surface={request.surface}, "
-            f"tool_count={request.tool_count}, "
-            f"strict_true_count={request.strict_true_count}, "
-            f"strict_false_count={request.strict_false_count}, "
-            f"strict_key_omitted={request.strict_key_omitted}, "
-            f"temperature_present={'temperature' in kwargs}, "
-            f"seed_present={'seed' in kwargs}, "
-            f"reasoning_effort_present={'reasoning_effort' in kwargs or 'reasoning' in kwargs}, "
-            f"response_format_present={'response_format' in kwargs}, "
-            f"provider_routing_present={'provider' in kwargs}"
-        ) from exc
-    except (LiteLLMAPIError, OpenAIProviderError, TimeoutError, httpx.HTTPError):
-        return False
-
-    if request.surface == "advisor":
-        try:
-            message, tool_calls, _metadata = _capture_composer_llm_completion_fields(response, pricing_model=request.model)
-        except _MalformedLLMResponseError as exc:
-            raise ComposerBootConfigError(f"advisor {request.model} structured-output probe returned a malformed response") from exc
-        if message.content is None or tool_calls or not parse_advisor_checkpoint_response(message.content, phase="end").schema_valid:
-            raise ComposerBootConfigError(f"advisor {request.model} structured-output probe failed JSON/schema admission")
-    return True
+    return None

@@ -2688,12 +2688,14 @@ class TestGetBlobContentGuards:
         import json
 
         from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+        from elspeth.web.composer.prompt_guard import _request
+        from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 
         digest = self._replace_content(content)
         offset = 0
         chunks = []
         with _blob_operation(self.engine, self.session_id) as (authority, context):
-            for _ in range(32):
+            for _ in range(256):
                 arguments = {"blob_id": self.blob_id, "offset_chars": offset, "expected_content_hash": digest}
                 result = execute_tool(
                     "get_blob_content",
@@ -2708,6 +2710,7 @@ class TestGetBlobContentGuards:
                 )
                 assert result.success, result.validation.errors
                 assert result.data["content_hash"] == digest
+                assert result.data["size_bytes"] == len(content.encode("utf-8"))
                 assert result.data["total_chars"] == len(content)
                 assert result.data["start_char"] == offset
                 end = result.data["end_char"]
@@ -2715,8 +2718,19 @@ class TestGetBlobContentGuards:
                 assert end - offset <= 50_000
                 assert result.data["truncated"] is (end < len(content))
                 serialized = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
-                assert len(serialized.encode("utf-8")) <= 65_536
+                assert len(serialized.encode("utf-8")) <= 4_096
                 assert json.loads(serialized)["data"]["content"] == content[offset:end]
+                guard_request, supported = _request(
+                    policy_fingerprint="a" * 64,
+                    role="composer",
+                    messages=[{"role": "tool", "content": serialized, "tool_call_id": "inspect-page"}],
+                    tools=(),
+                    user_prompt="Inspect the uploaded file.",
+                    trusted_message_indexes=frozenset(),
+                    content_parts=(json_content_parts(serialized),),
+                )
+                assert supported
+                assert all(len(document) <= 10_000 for document in guard_request.documents)
                 chunks.append(result.data["content"])
                 if result.data["next_offset_chars"] is None:
                     assert end == len(content)
@@ -2844,7 +2858,41 @@ class TestGetBlobContentGuards:
             )
         assert result.success
         encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
-        assert len(encoded.encode("utf-8")) <= 65_536
+        assert len(encoded.encode("utf-8")) <= 4_096
+
+    @pytest.mark.parametrize("position", ["across", "after"])
+    def test_credentials_across_or_after_actual_page_boundary_refuse_without_prefix(self, position: str) -> None:
+        self._replace_content("x" * 50_001)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            initial = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert initial.success and initial.data["truncated"]
+        boundary = initial.data["end_char"]
+        offset = boundary - 2 if position == "across" else boundary + 20
+        self._replace_content("x" * offset + "\nsk-" + "A" * 48)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            refused = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+        assert not refused.success and refused.data is None
+        assert refused.validation.errors[0].error_code == "credential_material_rejected"
 
     def test_pending_blob_refused(self) -> None:
         """Status guard — pending blobs may be partial writes."""

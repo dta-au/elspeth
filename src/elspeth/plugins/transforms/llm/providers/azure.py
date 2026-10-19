@@ -66,7 +66,7 @@ class AzureOpenAIConfig(LLMConfig):
     Extends LLMConfig with Azure-specific settings:
     - deployment_name: Azure deployment name (required) - used as model identifier
     - endpoint: Azure OpenAI endpoint URL (required)
-    - api_key: Azure OpenAI API key (required)
+    - api_key (str): Azure OpenAI API key (required)
     - api_version: Azure API version (default: 2024-10-21)
 
     Pooling options (inherited from LLMConfig):

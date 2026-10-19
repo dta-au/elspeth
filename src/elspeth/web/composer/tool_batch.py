@@ -27,6 +27,11 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PromptGuardToolArgumentParts,
+)
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -82,6 +87,7 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.discovery_cache import (
     admitted_result_from_cached_discovery_payload,
+    tool_result_content_parts,
 )
 from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
@@ -101,6 +107,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
     admit_discovery_result,
+    preview_source_proof_stop,
     serialize_admitted_discovery_result,
 )
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
@@ -125,6 +132,8 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -165,6 +174,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
@@ -488,8 +498,29 @@ def _pre_dispatch_argument_error(tool_name: str, category: ToolArgumentErrorCate
     )
 
 
+def _retain_llm_tool_argument_parts(llm_messages: Sequence[dict[str, Any]], *, tool_call_id: str) -> None:
+    """Attach all-untrusted semantic units only after argument admission."""
+    for message in reversed(llm_messages):
+        if message["role"] != "assistant" or "tool_calls" not in message:
+            continue
+        for index, call in enumerate(message["tool_calls"]):
+            if call["id"] != tool_call_id:
+                continue
+            entry = PromptGuardToolArgumentParts(index, json_argument_content_parts(call["function"]["arguments"]))
+            existing = (
+                cast(tuple[PromptGuardToolArgumentParts, ...], message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY])
+                if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message
+                else ()
+            )
+            message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY] = tuple(
+                sorted((*[part for part in existing if part.tool_call_index != index], entry), key=lambda part: part.tool_call_index)
+            )
+            return
+    raise AuditIntegrityError("Admitted tool argument was not present in the active LLM transcript")
+
+
 def _replace_llm_tool_call_arguments(
-    llm_messages: Sequence[Mapping[str, Any]],
+    llm_messages: Sequence[dict[str, Any]],
     *,
     tool_call_id: str,
     arguments: Mapping[str, Any],
@@ -540,6 +571,7 @@ def _replace_llm_tool_call_arguments(
                 provider_arguments = {"pipeline": arguments}
             encoded = json.dumps(provider_arguments, separators=(",", ":"))
             function["arguments"] = encoded
+            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call_id)
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
@@ -1202,11 +1234,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1279,11 +1313,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1342,11 +1378,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(error_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 all_cache_hits = False
@@ -1357,6 +1395,7 @@ async def run_tool_batch(
             call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
+        _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call.id)
         try:
             private_arguments_canonical = canonical_json(arguments)
             if tool_name == "set_pipeline":
@@ -1424,11 +1463,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1456,7 +1497,15 @@ async def run_tool_batch(
             recorder.record(finish_success(audit, result_payload=blocked.to_dict(), version_after=state.version))
             _append_tool_outcome(response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version)
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
-            llm_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": _serialize_tool_result(blocked)})
+            tool_feedback_json = _serialize_tool_result(blocked)
+            llm_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+                }
+            )
             await emit_progress(progress, tool_completed_progress_event(tool_name, False))
             turn_has_mutation = True
             all_cache_hits = False
@@ -1539,6 +1588,9 @@ async def run_tool_batch(
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": cached_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                            cached_admitted if cached_admitted is not None else cached_result, cached_json
+                        ),
                     }
                 )
                 continue
@@ -1584,11 +1636,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             continue
@@ -2116,11 +2170,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_success()
+                tool_feedback_json = _serialize_tool_result(proposal_result)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": _serialize_tool_result(proposal_result),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_mutation = True
@@ -2183,11 +2239,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
+                tool_feedback_json = json.dumps(advisor_rejection_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_rejection_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2225,11 +2283,13 @@ async def run_tool_batch(
                 # it for §7.7 anchor tracking, since the issue isn't
                 # the LLM repeating an identical request, it's the
                 # operator's policy refusing further hints.
+                tool_feedback_json = json.dumps(budget_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(budget_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2284,11 +2344,13 @@ async def run_tool_batch(
                     error_message=None,
                     post_version=state.version,
                 )
+                tool_feedback_json = json.dumps(deadline_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(deadline_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2376,11 +2438,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(advisor_error_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2418,11 +2482,13 @@ async def run_tool_batch(
                 # prompt, exactly the pattern the tracker exists
                 # to break.
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(advisor_error_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2434,6 +2500,20 @@ async def run_tool_batch(
                 # driver re-raise this exact exception object after the tool
                 # row has been published.
                 first_party_exc = advisor_outcome.original_exc
+                if isinstance(first_party_exc, PromptGuardRefused):
+                    # The tool completed with a semantic refusal. It is neither
+                    # provider-outage feedback nor a plugin implementation fault.
+                    refusal_payload = {"success": False, "outbound_call_made": False, **first_party_exc.to_payload()}
+                    recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                    _append_tool_outcome(
+                        response=refusal_payload,
+                        error_class=None,
+                        error_category=None,
+                        error_message=None,
+                        post_version=state.version,
+                    )
+                    advisor_failure = first_party_exc
+                    break
                 recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
                 _append_tool_outcome(
                     response=None,
@@ -2485,11 +2565,13 @@ async def run_tool_batch(
             # subsequent set_pipeline failure does not inherit a
             # stale advisor anchor count.
             anti_anchor.record_success()
+            tool_feedback_json = json.dumps(success_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(success_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             continue
@@ -2603,7 +2685,15 @@ async def run_tool_batch(
         # before it enters the worker thread pool.
         runtime_preflight_callback: RuntimePreflight | None = None
         structural_preflight_callback: RuntimePreflight | None = None
+        preview_claims_admitted = True
         if tool_name == "preview_pipeline":
+            try:
+                _admit_source_proof_claims(state)
+            except MalformedSourceProofClaim:
+                # The ordinary producer owns the saved-graph refusal. Do not
+                # inspect any resource before its complete scalar admission.
+                preview_claims_admitted = False
+        if tool_name == "preview_pipeline" and preview_claims_admitted:
             try:
                 preview_preflight = await ctx.preflight.cached_runtime_preflight(
                     state,
@@ -2889,11 +2979,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
+            tool_feedback_json = json.dumps(arg_error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(arg_error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             continue
@@ -3131,6 +3223,9 @@ async def run_tool_batch(
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": result_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                    admitted_result if admitted_result is not None else result, result_json
+                ),
             }
         )
 
@@ -3138,6 +3233,12 @@ async def run_tool_batch(
             turn_has_mutation = True
         else:
             turn_has_discovery = True
+
+        # The completed preview has its ordinary audit, message, outcome and
+        # classification. An unavailable saved claim closes this issued batch;
+        # P4 will persist only this executed prefix before the loop terminates.
+        if admitted_result is not None and preview_source_proof_stop(admitted_result, state) is not None:
+            break
 
     dispatch = _DispatchOutcome(
         state=state,

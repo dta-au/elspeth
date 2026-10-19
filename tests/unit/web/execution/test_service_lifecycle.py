@@ -731,8 +731,8 @@ class TestExecutionFlow:
         assert isinstance(run_id, UUID)
         merge.assert_called_once()
         proof_result, merged_facts, fingerprint_state = merge.call_args.args
-        assert proof_result.checks[-1].name == "proof_diagnostics"
-        assert proof_result.checks[-1].passed is True
+        assert proof_result is valid
+        assert proof_result.checks == []
         assert merged_facts == CompletionGateFacts(advisor_signoff=fact)
         assert fingerprint_state == authored_state
         mock_session_service.get_current_state.assert_not_awaited()
@@ -878,7 +878,7 @@ class TestExecutionFlow:
             CompletionGateFacts,
             completion_gate_fingerprint,
         )
-        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
+        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE, ValidationCheck
 
         state = state_from_record(mock_session_service.get_current_state.return_value)
         facts = CompletionGateFacts(
@@ -891,9 +891,10 @@ class TestExecutionFlow:
             )
         )
 
+        core = _successful_core_validation_result()
         with patch(
             "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
+            return_value=core,
         ):
             session_id = uuid4()
             result = await service.validate_state(
@@ -909,8 +910,16 @@ class TestExecutionFlow:
         assert result.readiness.execution_ready is True
         assert result.readiness.completion_ready is False
         assert [blocker.code for blocker in result.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
-        assert len(result.checks) == 25
-        assert [check.name for check in result.checks[23:]] == ["advisor_signoff", "proof_diagnostics"]
+        assert result.checks == [
+            *core.checks,
+            ValidationCheck(
+                name="advisor_signoff",
+                passed=False,
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                affected_nodes=(),
+                outcome_code=None,
+            ),
+        ]
 
     @pytest.mark.asyncio
     async def test_validate_passes_record_completion_gates_to_validate_state(

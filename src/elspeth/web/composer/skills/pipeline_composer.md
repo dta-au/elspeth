@@ -617,7 +617,11 @@ become `case_study`; to require the literal `case_study_` row key, configure
 `field_mapping: {case_study: case_study_}` and declare `case_study_` consistently.
 A null runtime-name projection means inspection cannot certify runtime names;
 read the warnings for header parsing, encoding, sample truncation, or normalization
-collisions. Resolve that issue before declaring fields; do not invent names or
+collisions. For CSV/TSV with a known intended encoding, pass `encoding` to
+`inspect_source` (for example `utf-8-sig` for a UTF-8 BOM), and configure that
+encoding on the pipeline source separately. The returned warning records the
+selected inspection interpretation; it does not establish full-file coverage.
+Resolve remaining issues before declaring fields; do not invent names or
 alter a valid label merely because the bounded sample cut its header. Header `Approved`
 is declared `approved`, `First Name` is `first_name`, `Price USD` is
 `price_usd`. A source `field_mapping` renames after normalizing: under
@@ -850,21 +854,18 @@ LLM node preflight has four independent review checks:
   recommending a policy-visible authorized prompt-injection control discovered
   through the capability catalog and its plugin assistance.
 
-**HARD RULE — never leave a bare `{{interpretation:<term>}}` token.** Any
-`{{interpretation:<term>}}` token you place in a prompt (in `prompt_template` or
-anywhere a prompt is authored) MUST be accompanied, in the SAME `set_pipeline`
-call, by a staged and wired `vague_term` requirement for that term: a pending
-`vague_term` entry in the node's `interpretation_requirements` wired into the
-prompt via a `prompt_template_parts` `interpretation_ref` slot (preferred), or
-the legacy flat token referencing that requirement. A token with no matching
-co-staged requirement is an **orphan**: nothing can resolve it, no review card
-appears, and the run is **blocked** at execution
-(`UnresolvedInterpretationPlaceholderError`). Never write the token first and
-plan to stage the review later. If you are not staging the matching wired
-requirement in the same mutation, do not write the token at all — use plain
-prose. (`request_interpretation_review(kind="vague_term", ...)` is still called
-after the mutation succeeds, per the wiring rule below; staging and wiring happen
-in the `set_pipeline`.)
+**HARD RULE — stage and wire every new structured interpretation together.** A
+new pending `vague_term` entry in the node's `interpretation_requirements` MUST
+be wired into the prompt via a matching `prompt_template_parts`
+`interpretation_ref` slot in the SAME `set_pipeline` call. A legacy flat token
+is not an alternative to structured wiring.
+Render each slot's draft in readable `prompt_template` text. A bare
+`{{interpretation:<term>}}` token without a matching review site is an **orphan**:
+no resolver or review card exists; execution is **blocked**
+(`UnresolvedInterpretationPlaceholderError`). Never write a token first and
+stage its review later; use plain prose without a co-staged wired requirement.
+Call `request_interpretation_review(kind="vague_term", ...)` after the mutation
+succeeds; staging and wiring happen in the same mutation.
 
 These checks stack. A web-scrape-to-LLM scoring node may need all four LLM-node
 review requirements in the same `interpretation_requirements` list before
@@ -1024,9 +1025,11 @@ criterion slot is a readable draft in `prompt_template` and an
 Anchor the structure, not the bytes: the `llm_prompt_template` review is checked
 against the prompt *skeleton* (the parts structure), so resolving the
 `vague_term` — which rewrites the rendered prompt — does not drift it, in either
-operator resolution order. A flat `{{interpretation:<term>}}` placeholder also
-wires the slot, but it drifts the prompt-template review when the operator
-resolves the prompt-template card first; prefer `prompt_template_parts`.
+operator resolution order. Historical legacy-only flat tokens remain supported
+when no pending `vague_term` requirement matches that term. Other review kinds
+may coexist with that legacy token. This compatibility does not replace the
+structured wiring required for new requirements; a legacy token can drift the
+prompt-template review when the operator resolves the prompt-template card first.
 
 Construction pattern for an LLM-authored scoring prompt (criterion "cool", node
 id "rate_cool"):
@@ -1146,6 +1149,22 @@ A field-scoped prompt-injection control proves coverage from a model node's
 declared `required_input_fields` and each query's `input_fields`. With an omitted
 declaration or `[]`, coverage is unprovable unless a dominating control scans
 `fields: all`.
+
+### Required failure retention
+
+For a required CSV failure report, inspect the current CSV options. With
+`require_all_rows: true` and `include_audit_context: true`, the fixed envelope
+retains owned run/row/token identity and the complete carried row in `row_json`.
+Its `error_hash` is an audit reference, not a readable explanation. If a readable
+recorded cause is required, `include_error_reason: true` appends `error_reason`
+from the exact durable source-validation or routed-transform failure handoff.
+This option requires the audit envelope's observed schema, normalized headers
+and configured write mode. The cause is bounded and truncation is marked.
+Missing, ambiguous, redacted or unsupported causes stop explicitly; linked sink
+diversions with hash-only recovery evidence are unsupported. Do not invent a
+reason or call the report complete after such a failure. Earlier publications
+are not rolled back. Ordinary business-gate explanations must be authored in
+the carried row; they are not inferred from the route.
 
 ### Output data minimization
 

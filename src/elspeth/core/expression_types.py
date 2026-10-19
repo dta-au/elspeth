@@ -103,8 +103,10 @@ def expression_kinds(parser: ExpressionParser, lookup: Callable[[str], ResultKin
                     return _union(lookup(node.args[0].value), frozenset({"none"}))
                 return None
             if isinstance(func, ast.Name):
-                if func.id == "len":
+                if func.id in {"len", "word_count"}:
                     return frozenset({"int"})
+                if func.id in {"starts_with", "decimal_within"}:
+                    return frozenset({"bool"})
                 if func.id in {"lower", "upper", "strip", "casefold"}:
                     return frozenset({"str"})
                 if func.id == "abs" and len(node.args) == 1:

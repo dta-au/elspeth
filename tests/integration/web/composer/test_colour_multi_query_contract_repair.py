@@ -22,6 +22,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.authority_hashing import composer_authority_hash
@@ -247,7 +248,14 @@ async def _author(harness: _Harness, tmp_path: Path, content: str) -> Compositio
     snapshots: list[list[dict[str, Any]]] = []
 
     async def planner(
-        messages: list[dict[str, Any]], _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: list[dict[str, Any]],
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         snapshots.append(deepcopy(messages))
         assert responses, messages[-1]["content"]

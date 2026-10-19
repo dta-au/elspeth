@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 from importlib import import_module
 from pathlib import Path
 
@@ -403,6 +404,246 @@ def test_exception_channel_recursive_helpers_do_not_loop(tmp_path: Path) -> None
     )
 
     assert _exception_channel_findings(tmp_path, source) == []
+
+
+_OWNED_GUARD_PREAMBLE = (
+    "from dataclasses import dataclass\n"
+    "from collections.abc import Callable\n"
+    "from typing import Any, final\n"
+    "@final\n@dataclass(frozen=True, slots=True)\nclass Owned:\n    field: str\n"
+    "@dataclass(frozen=True)\nclass Other:\n    field: str\n"
+)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    if type(value) is not Owned:\n        raise TypeError('owned')\n",
+        "    if type(value) not in (Owned, Other):\n        raise TypeError('owned')\n",
+        "    if value is not None and type(value) not in (Owned, Other):\n        raise TypeError('owned')\n",
+        "    resolved = resolver('key')\n    if resolved is None or type(resolved) is Other:\n        return None\n"
+        "    if type(resolved) is not Owned:\n        raise TypeError('owned')\n",
+    ],
+)
+def test_exception_channel_accepts_proven_internal_nominal_guard(tmp_path: Path, body: str) -> None:
+    source = _OWNED_GUARD_PREAMBLE + "def handler(value: Owned | Other | None, resolver: Callable[[str], Owned | Other | None]):\n" + body
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    if type(value) is not str:\n        raise TypeError('guard')\n",
+        "    if type(value) not in (Owned, str):\n        raise TypeError('guard')\n",
+        "    if type(value) is Owned:\n        raise TypeError('guard')\n",
+        "    if value is None or type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    if arguments is not None and type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    if type(None) is not Owned:\n        raise TypeError('guard')\n",
+        "    if type(arguments['payload']) is not Owned:\n        raise TypeError('guard')\n",
+        "    local = arguments['payload']\n    if type(local) is not Owned:\n        raise TypeError('guard')\n",
+        "    value = arguments['payload']\n    if type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    resolved = resolver('key')\n    resolved = arguments['payload']\n"
+        "    if type(resolved) is not Owned:\n        raise TypeError('guard')\n",
+        "    resolved = resolver('key')\n    alias = resolved\n    if type(alias) is not Owned:\n        raise TypeError('guard')\n",
+        "    get = resolver\n    resolved = get('key')\n    if type(resolved) is not Owned:\n        raise TypeError('guard')\n",
+        "    resolver = arguments['resolver']\n    resolved = resolver('key')\n"
+        "    if type(resolved) is not Owned:\n        raise TypeError('guard')\n",
+        "    type = arguments['type']\n    if type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    TypeError = ValueError\n    if type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    class Owned:\n        pass\n    if type(value) is not Owned:\n        raise TypeError('guard')\n",
+        "    if arguments:\n        if type(value) is not Owned:\n            raise TypeError('guard')\n",
+        "    if type(value) is not Owned:\n        pass\n    else:\n        raise TypeError('guard')\n",
+        "    if type(value) is not Owned:\n        def later():\n            raise TypeError('guard')\n        return later\n",
+        "    if type(value) is not Owned:\n        raise ValueError('guard')\n",
+        "    if type(value) is not Owned:\n        observe(value)\n        raise TypeError('guard')\n",
+        "    if value is not None and type(value) is not Owned and arguments:\n        raise TypeError('guard')\n",
+        "    if type(value) is not Owned:\n        raise TypeError\n",
+        "    raise TypeError('guard')\n",
+    ],
+)
+def test_exception_channel_keeps_unproved_nominal_sites_red(tmp_path: Path, body: str) -> None:
+    source = (
+        _OWNED_GUARD_PREAMBLE
+        + ("def handler(value: Owned | Other | None, resolver: Callable[[str], Owned | Other | None], arguments):\n")
+        + body
+    )
+    expected = [node.lineno for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Raise)]
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == sorted(expected)
+
+
+@pytest.mark.parametrize("annotation", ["", ": Any", ": object", ": dict[str, object]"])
+def test_exception_channel_requires_closed_subject_contract(tmp_path: Path, annotation: str) -> None:
+    source = (
+        _OWNED_GUARD_PREAMBLE + f"def handler(value{annotation}):\n    if type(value) is not Owned:\n        raise TypeError('guard')\n"
+    )
+    assert len(_exception_channel_findings(tmp_path, source)) == 1
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("frozen=True", "frozen=False"),
+        ("frozen=True", "frozen=1"),
+        ("from dataclasses import dataclass", "from elsewhere import dataclass"),
+        ("from dataclasses import dataclass", "from dataclasses import dataclass as renamed\ndataclass = renamed"),
+        ("from dataclasses import dataclass", "if available:\n    from dataclasses import dataclass"),
+        ("from collections.abc import Callable", "if available:\n    from collections.abc import Callable"),
+        ("from typing import Any, final", "if available:\n    from typing import Any, final"),
+        ("from typing import Any, final", "from typing import Any\nfrom elsewhere import final"),
+        ("class Owned:", "class Owned(Protocol):"),
+        ("@final", "@unknown\n@final"),
+        ("@dataclass(frozen=True, slots=True)", "@dataclass(frozen=False)\n@dataclass(frozen=True)"),
+        ("def handler", "Owned = Other\ndef handler"),
+        ("def handler", "class Owned:\n    pass\ndef handler"),
+        ("def handler", "if flag:\n    class Owned:\n        pass\ndef handler"),
+        ("def handler", "from elsewhere import Owned\ndef handler"),
+        ("def handler", "type = custom_type\ndef handler"),
+        ("def handler", "TypeError = ValueError\ndef handler"),
+        ("def handler", "dataclass = replacement\ndef handler"),
+        ("def handler", "final = replacement\ndef handler"),
+        ("def handler", "Callable = replacement\ndef handler"),
+        ("def handler", "def change():\n    global Owned\n    Owned = Other\ndef handler"),
+        ("def handler", "@unknown\ndef handler"),
+        ("resolver: Callable[[str], Owned]", "resolver: Callable[[str], Any]"),
+        ("resolver: Callable[[str], Owned]", "resolver: Callable[[str], Owned | object]"),
+        ("resolver: Callable[[str], Owned]", "resolver: Callable"),
+        ("resolver: Callable[[str], Owned]", "resolver: object"),
+        ("resolver: Callable[[str], Owned]", "resolver: Any"),
+        ("resolver: Callable[[str], Owned]", "resolver: Callable[[str], Owned], type=object"),
+        ("resolver: Callable[[str], Owned]", "resolver: Callable[[str], Owned], TypeError=ValueError"),
+        ("value: Owned", "value: External"),
+        ("value: Owned", "value: Owned | object"),
+    ],
+)
+def test_exception_channel_rejects_ambiguous_nominal_bindings(tmp_path: Path, old: str, new: str) -> None:
+    source = _OWNED_GUARD_PREAMBLE + (
+        "def handler(value: Owned, resolver: Callable[[str], Owned]):\n"
+        "    resolved = resolver('key')\n    if type(resolved) is not Owned:\n        raise TypeError('guard')\n"
+    )
+    if old == "value: Owned":
+        source = source.replace("type(resolved)", "type(value)")
+    source = source.replace(old, new)
+    assert len(_exception_channel_findings(tmp_path, source)) == 1
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "def helper(default=(value := arguments['payload'])):\n        pass",
+        "async def helper(*, default=(value := arguments['payload'])):\n        pass",
+        "@(value := arguments['payload'])\n    def helper():\n        pass",
+        "class Helper((value := arguments['payload'])):\n        pass",
+        "class Helper(metaclass=(value := arguments['payload'])):\n        pass",
+        "@(value := arguments['payload'])\n    class Helper:\n        pass",
+        "helper = lambda default=(value := arguments['payload']): None",
+    ],
+)
+def test_exception_channel_reports_subject_rebound_in_definition_header(tmp_path: Path, definition: str) -> None:
+    source = _OWNED_GUARD_PREAMBLE + (
+        "def handler(value: Owned, arguments):\n"
+        f"    {definition}\n"
+        "    if type(value) is not Owned:\n        raise TypeError('raw argument')\n"
+    )
+    compile(source, "<definition-header-control>", "exec")
+    expected = next(node.lineno for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Raise))
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == [expected]
+
+
+@pytest.mark.parametrize("name, replacement", [("Owned", "str"), ("type", "custom_type"), ("TypeError", "ValueError")])
+def test_exception_channel_reports_module_binding_rebound_in_definition_header(tmp_path: Path, name: str, replacement: str) -> None:
+    source = _OWNED_GUARD_PREAMBLE + (
+        f"def helper(default=({name} := {replacement})):\n    pass\n"
+        "def handler(value: Owned):\n"
+        "    if type(value) is not Owned:\n        raise TypeError('rebound binding')\n"
+    )
+    compile(source, "<module-definition-header-control>", "exec")
+    expected = next(node.lineno for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Raise))
+
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == [expected]
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "def helper(default=value):\n        pass",
+        "def helper(value: Owned, type=None):\n        value = type",
+        "class Helper:\n        value = None\n        type = None",
+        "helper = lambda value, type=None: (value := type)",
+        "def helper(default=lambda: (value := arguments['payload'])):\n        pass",
+    ],
+)
+def test_exception_channel_keeps_definition_headers_and_child_namespaces_distinct(tmp_path: Path, definition: str) -> None:
+    source = _OWNED_GUARD_PREAMBLE + (
+        f"def handler(value: Owned, arguments):\n    {definition}\n    if type(value) is not Owned:\n        raise TypeError('owned')\n"
+    )
+    compile(source, "<child-namespace-control>", "exec")
+
+    assert _exception_channel_findings(tmp_path, source) == []
+
+
+def test_exception_channel_nominal_guard_does_not_exempt_other_raises(tmp_path: Path) -> None:
+    source = _OWNED_GUARD_PREAMBLE + (
+        "def handler(value: Owned, arguments):\n"
+        "    if type(value) is not Owned:\n        raise TypeError('owned')\n"
+        "    if type(arguments['payload']) is not str:\n        raise TypeError('external')\n"
+        "    raise ValueError('other')\n"
+    )
+    expected = [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Call)
+        and node.exc.args
+        and isinstance(node.exc.args[0], ast.Constant)
+        and node.exc.args[0].value != "owned"
+    ]
+    assert [finding.line for finding in _exception_channel_findings(tmp_path, source)] == sorted(expected)
+
+
+def test_exception_channel_actual_generation_guards_and_mutated_contracts(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[3]
+    target = root / "src/elspeth/web/composer/tools/generation.py"
+    tree = ast.parse(target.read_text(), filename=str(target))
+    context = RuleContext(root=root / "src/elspeth")
+    assert EXCEPTION_CHANNEL_RULE.analyze(tree, target, context) == []
+    targets = {
+        "_compute_proof_diagnostics_for_source": "blob_resolver",
+        "compute_proof_diagnostics": "context",
+    }
+    for function_name, parameter_name in targets.items():
+        for mutation in ("contract", "builtin_guard", "unrelated_guard"):
+            mutated = copy.deepcopy(tree)
+            function = next(node for node in mutated.body if isinstance(node, ast.FunctionDef) and node.name == function_name)
+            guard_raise = next(
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Raise)
+                and isinstance(node.exc, ast.Call)
+                and isinstance(node.exc.func, ast.Name)
+                and node.exc.func.id == "TypeError"
+            )
+            if mutation == "contract":
+                parameter = next(
+                    arg for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs) if arg.arg == parameter_name
+                )
+                parameter.annotation = ast.Name(id="object", ctx=ast.Load())
+            else:
+                guard = next(node for node in function.body if isinstance(node, ast.If) and guard_raise in node.body)
+                subject = "resolved_blob" if parameter_name == "blob_resolver" else "context"
+                guard.test = (
+                    ast.parse(f"type({subject}) is not str", mode="eval").body if mutation == "builtin_guard" else ast.Constant(True)
+                )
+            findings = EXCEPTION_CHANNEL_RULE.analyze(mutated, target, context)
+            assert guard_raise.lineno in {finding.line for finding in findings}
+
+
+def test_exception_channel_existing_native_fixtures_remain_exact() -> None:
+    from elspeth_lints.core.fixture_harness import assert_fixture_case, discover_rule_fixture_cases, find_fixture_inventory_errors
+
+    assert find_fixture_inventory_errors([EXCEPTION_CHANNEL_RULE]) == []
+    for case in discover_rule_fixture_cases(EXCEPTION_CHANNEL_RULE):
+        assert_fixture_case(case)
 
 
 def _exception_channel_findings(tmp_path: Path, source: str) -> list[Finding]:

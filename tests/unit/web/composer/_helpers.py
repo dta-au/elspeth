@@ -314,10 +314,12 @@ def _make_llm_response(
 
 
 def _make_settings(**overrides: Any) -> WebSettings:
-    """Build WebSettings with Pydantic-enforced defaults.
+    """Build WebSettings for historical Composer tests.
 
     Use keyword arguments to override specific fields for a test.
-    Defaults come from the Pydantic model — no drift possible.
+    These tests explicitly use the unconfigured development guard mode;
+    physical provider calls still need real fenced audit custody. Tests of
+    required guard admission must override the mode explicitly.
 
     data_dir defaults to /data (absolute) so test paths like
     /data/blobs/file.csv pass S2 path validation.
@@ -328,6 +330,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     defaults.update(overrides)

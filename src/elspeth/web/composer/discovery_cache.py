@@ -9,10 +9,14 @@ from typing import Any
 from pydantic import BaseModel
 
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.response_contracts import AdmittedResponse
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
 from elspeth.web.composer.tools._registry import response_contract_for
 from elspeth.web.execution.runtime_preflight import RuntimePreflightEntry, RuntimePreflightKey
 
@@ -49,6 +53,24 @@ def pydantic_default(obj: Any) -> Any:
 def serialize_tool_result(result: ToolResult) -> str:
     """Serialize a ToolResult to JSON, handling Pydantic models in data."""
     return json.dumps(result.to_dict(), default=pydantic_default)
+
+
+def tool_result_content_parts(result: ToolResult | AdmittedDiscoveryResult, serialized: str) -> tuple[PromptGuardContentPart, ...]:
+    """Bind reference authority to nominal current producer data, not JSON keys."""
+    references: set[JsonPath] = set()
+    if isinstance(result, AdmittedDiscoveryResult):
+        if result.result.success and type(result.response) is AdmittedPluginSchemaResponse:
+            references.add(("data",))
+        envelope = result.result
+    else:
+        if result.success and type(result.data) is PluginSchemaInfo:
+            references.add(("data",))
+        envelope = result
+    # This field is created only by the policy-bound failure augmentation,
+    # not admitted from model tool arguments or a serialized response.
+    if envelope.plugin_schemas is not None:
+        references.add(("plugin_schemas",))
+    return json_content_parts(serialized, reference_paths=frozenset(references))
 
 
 def cached_discovery_payload(result: ToolResult | AdmittedDiscoveryResult) -> CachedDiscoveryPayload:

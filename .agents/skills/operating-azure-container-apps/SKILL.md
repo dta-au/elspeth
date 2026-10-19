@@ -40,7 +40,7 @@ procedures are `docs/runbooks/azure-container-apps-cold-install.md`,
 > Single/sticky routing, with PostgreSQL progress and shared budgets verified
 > through local mechanism/integration evidence. No live cloud
 > acceptance is claimed. A future receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.7.json` must come from actual
+> `docs/operator/evidence/azure-container-apps/0.8.9.json` must come from actual
 > operator execution; it is no longer a closure or documentation-promotion gate.
 
 ## Scope first
@@ -188,9 +188,11 @@ without a new unhandled startup or runtime failure (Log Analytics lags by
 minutes).
 For a first launch, verify first-admin login and grant an explicit workload
 role, then make a real Composer request and a small LLM pipeline run. An admin
-grant alone does not grant author/run access. The ACA doctor does not emit
-`session_tls`/`landscape_tls`; keep verified TLS URLs and use the cold-install
-runbook's separate connection check.
+grant alone does not grant author/run access. Require the ACA doctor's
+`session_tls`/`landscape_tls` checks: these measure its initial preflight
+schema-inspection connections, using the configured runtime URLs. They do not
+measure every web connection or initialization's separate final verification
+connection. Keep verified TLS URLs and follow the cold-install runbook.
 
 For the disposable acceptance, `scripts/acceptance.sh all` includes the final
 `single-revision` stage after the labelled P1/P2/P4/P3 probes. It deploys

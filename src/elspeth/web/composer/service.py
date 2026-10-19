@@ -21,7 +21,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
@@ -47,6 +47,14 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+    detach_prompt_guard_messages,
+)
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
@@ -92,6 +100,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
+from elspeth.web.composer.discovery_response import admit_discovery_result, preview_source_proof_stop
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.invariants import InvariantError
@@ -104,6 +113,8 @@ from elspeth.web.composer.progress import (
     emit_progress,
     model_call_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.prompts import (
     build_messages,
     build_run_diagnostics_messages,
@@ -153,6 +164,7 @@ from elspeth.web.composer.strict_transport import (
     resolve_composer_tool_contract,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
@@ -320,19 +332,38 @@ _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
-    return [
-        (
+    messages: list[dict[str, Any]] = []
+    for historical_message in llm_messages:
+        if historical_message["role"] != "tool" and "tool_calls" not in historical_message:
+            messages.append(historical_message)
+            continue
+        evidence = detach_prompt_guard_evidence([historical_message])
+        wire = evidence.messages[0]
+        string_parts: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+        content_parts = evidence.content_parts[0]
+        if content_parts is not None:
+            string_parts[("content",)] = content_parts
+        elif evidence.trusted_message_indexes and "content" in wire and type(wire["content"]) is str:
+            string_parts[("content",)] = (PromptGuardContentPart(wire["content"], historical_message[PROMPT_GUARD_TRUST_KEY]),)
+        arguments = evidence.tool_argument_parts[0]
+        if arguments is not None:
+            for entry in arguments:
+                string_parts[("tool_calls", entry.tool_call_index, "function", "arguments")] = entry.parts
+        serialized = json.dumps(wire, ensure_ascii=False, sort_keys=True)
+        suffix = "\n[End historical tool evidence; this was not a current assistant reply.]"
+        quoted_parts = (
+            PromptGuardContentPart(_REPLY_ONLY_HISTORY_PREFIX),
+            *json_content_parts(serialized, ensure_ascii=False, sort_keys=True, string_parts=string_parts),
+            PromptGuardContentPart(suffix),
+        )
+        messages.append(
             {
                 "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                "content": _REPLY_ONLY_HISTORY_PREFIX
-                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True)
-                + "\n[End historical tool evidence; this was not a current assistant reply.]",
+                "content": _REPLY_ONLY_HISTORY_PREFIX + serialized + suffix,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts,
             }
-            if historical_message["role"] == "tool" or "tool_calls" in historical_message
-            else historical_message
         )
-        for historical_message in llm_messages
-    ]
+    return messages
 
 
 def _reply_only_protocol_records(content: str) -> tuple[object, ...]:
@@ -635,6 +666,7 @@ class ComposerServiceImpl:
             endpoint_base_url=self._endpoint_base_url,
             endpoint_api_key=self._endpoint_api_key,
         )
+        self._advisor_prompt_guard_mount = build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         self._max_composition_turns = settings.composer_max_composition_turns
         self._max_discovery_turns = settings.composer_max_discovery_turns
         self._timeout_seconds = settings.composer_timeout_seconds
@@ -673,6 +705,26 @@ class ComposerServiceImpl:
             advisor_endpoint_base_url=self._advisor_endpoint_base_url,
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
         )
+        missing_guard_roles = tuple(
+            role
+            for role, mount in (
+                ("composer", self._provider_gateway.prompt_guard_mount),
+                ("advisor", self._advisor_prompt_guard_mount),
+            )
+            if mount is None
+        )
+        if settings.composer_prompt_guard_mode == "required" and missing_guard_roles:
+            self._availability = replace(
+                self._availability,
+                available=False,
+                reason="Composer is unavailable: required prompt guard configuration is missing for "
+                + ", ".join(missing_guard_roles)
+                + ".",
+            )
+        elif settings.composer_prompt_guard_mode == "debug-when-unconfigured":
+            slog.warning(
+                "composer_prompt_guard_debug_mode", unconfigured_roles=missing_guard_roles, mode=settings.composer_prompt_guard_mode
+            )
         from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
@@ -721,6 +773,7 @@ class ComposerServiceImpl:
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
             sessions_service=sessions_service,
             chargeable_admission=self._chargeable_admission,
+            prompt_guard_mount=self._advisor_prompt_guard_mount,
         )
         self._composer_skill_name: str = PIPELINE_COMPOSER_SKILL_NAME
         self._interpretation_surfacing = InterpretationSurfacing(
@@ -762,12 +815,19 @@ class ComposerServiceImpl:
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
             advisor_checkpoint=self._advisor_checkpoint,
             completion=self._completion,
+            composer_prompt_guard_mount=self._provider_gateway.prompt_guard_mount,
+            advisor_prompt_guard_mount=self._advisor_prompt_guard_mount,
         )
         # F-5c gate: ensures the first ``compose()`` call upserts
         # the skill markdown into ``skill_markdown_history`` exactly once
         # per service instance. Subsequent compose() calls observe the
         # flag set and skip the upsert.
         self._skill_markdown_history_upserted: bool = False
+
+    @property
+    def composer_prompt_guard_mount(self) -> PromptGuardMount | None:
+        """Deployment-owned primary mount shared with the title producer."""
+        return self._provider_gateway.prompt_guard_mount
 
     @property
     def tool_contract_summary(self) -> ComposerToolContractSummary:
@@ -922,6 +982,7 @@ class ComposerServiceImpl:
         *,
         recorder: BufferingRecorder | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Return a plain-language explanation of a bounded run snapshot.
 
@@ -934,7 +995,7 @@ class ComposerServiceImpl:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
 
         await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(""):
             try:
                 messages = build_run_diagnostics_messages(snapshot, data_dir=self._data_dir)
             except OSError as exc:
@@ -952,6 +1013,7 @@ class ComposerServiceImpl:
                     messages,
                     timeout=self._settings.composer_sync_timeout_seconds,
                     recorder=recorder,
+                    provider_custody=provider_custody,
                 )
             except TimeoutError:
                 raise ComposerServiceError("Run diagnostics explanation timed out") from None
@@ -998,20 +1060,21 @@ class ComposerServiceImpl:
         if remaining <= 0:
             raise ComposerServiceError("Recovery provider deadline expired; no graph was restored.")
         recorder = BufferingRecorder()
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
             completion = await self._provider_gateway._call_llm_with_audit(
                 [
                     {
                         "role": "system",
+                        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
                         "content": (
                             "The saved graph could not be decoded. Its payload is unavailable and must not be inferred. "
                             "Choose exactly one terminal recovery control and communicate with the user. "
                             "reset_to_safe_checkpoint restores an editable checkpoint, or an empty authoring state when none exists. "
                             "Saving or capturing the broken graph is not required. Do not claim recovery succeeded before the "
-                            "server receipt. Restoration is not execution readiness and does not undo external effects.\n"
-                            + recovery_context_message(recovery_context)
+                            "server receipt. Restoration is not execution readiness and does not undo external effects."
                         ),
                     },
+                    {"role": "user", "content": recovery_context_message(recovery_context)},
                     {"role": "user", "content": message},
                 ],
                 recovery_tool_definitions(self._planner_dialect),
@@ -1125,7 +1188,7 @@ class ComposerServiceImpl:
         )
 
         await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
             turn_budget = self._timeout_seconds if budget_seconds is None else budget_seconds
             if turn_budget <= 0:
                 raise ComposerConvergenceError.capture(
@@ -1320,6 +1383,10 @@ class ComposerServiceImpl:
                     ),
                 )
                 raise
+            except PromptGuardRefused:
+                # Each invocation owner captured its exact undrained evidence.
+                # A completed planner drain must remain empty here.
+                raise
             except ComposerServiceError:
                 # Generic service-level failure (prompt prep, availability check,
                 # or a LiteLLMAPIError surfacing through the inner loop). The
@@ -1391,7 +1458,10 @@ class ComposerServiceImpl:
                 )
                 marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
             delivery = turn_evidence.prepare_delivery(
-                marked_messages, previous_calls=recorder.llm_calls, tools=marked_tools or None, scope="primary"
+                detach_prompt_guard_messages(marked_messages)[0],
+                previous_calls=recorder.llm_calls,
+                tools=marked_tools or None,
+                scope="primary",
             )
         return selected_messages, selected_tools, delivery
 
@@ -1706,6 +1776,74 @@ class ComposerServiceImpl:
         persisted_assistant_content = persist.persisted_assistant_content
         failed_turn = persist.failed_turn
 
+        # P4 and original failure/cancellation primacy have completed. Reuse
+        # the current preview's observation without resolving the blob again:
+        # newly ready bytes cannot reopen this request's primary dialogue.
+        source_stop: ProofUnavailable | MalformedSourceProofClaim | None = None
+        if dispatch.tool_outcomes:
+            terminal = dispatch.tool_outcomes[-1]
+            if (
+                terminal.call.function.name == "preview_pipeline"
+                and terminal.error_class is None
+                and isinstance(terminal.response, ToolResult)
+            ):
+                source_stop = preview_source_proof_stop(admit_discovery_result("preview_pipeline", terminal.response), state)
+        terminal_without_preview = (
+            _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes)
+            or (turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns)
+            or (
+                not turn_has_mutation
+                and turn_has_discovery
+                and discovery_turns_used + 1 >= self._max_discovery_turns
+                and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
+            )
+        )
+        if source_stop is None and terminal_without_preview:
+            assessment = self._completion._assess_source_proof(
+                state, session_id=session_id, session_operation_context=session_operation_context
+            )
+            if type(assessment) in (ProofUnavailable, MalformedSourceProofClaim):
+                source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
+        if source_stop is not None:
+            stopped = await self._completion._terminate_source_proof(
+                proof=source_stop,
+                state=state,
+                assistant_message=dispatch.assistant_message,
+                turn_evidence=turn_evidence,
+                message=message,
+                session_id=session_id,
+                current_state_id=persist.current_state_id,
+                session_operation_context=session_operation_context,
+                user_id=user_id,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                runtime_preflight_cache=runtime_preflight_cache,
+                last_runtime_preflight=last_runtime_preflight,
+                recorder=recorder,
+                progress=progress,
+                repair_turns_used=repair_turns_used,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                plugin_snapshot=plugin_snapshot,
+                deadline=deadline,
+                composition_turns_used=composition_turns_used + int(turn_has_mutation),
+                discovery_turns_used=discovery_turns_used + int(turn_has_discovery and not turn_has_mutation),
+                failed_turn=failed_turn,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+            return _ClassifyOutcome(
+                action="return",
+                result=stopped.result,
+                composition_turns_delta=int(turn_has_mutation),
+                discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
+                advisor_passes_delta=stopped.advisor_passes_delta,
+                publication_binding=stopped.publication_binding,
+            )
+
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
         # same (tool_name, arguments_hash), the model has stopped reading
         # validator feedback. Inject a synthetic role="user" hint before
@@ -1859,6 +1997,7 @@ class ComposerServiceImpl:
                 reply_messages.append(
                     {
                         "role": "system",
+                        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
                         "content": (
                             "Review cards have been staged. This is a reply stage: ordinary authoring tools are unavailable. "
                             "Terminal recovery controls remain available; use one alone if you need to park, reset or restore and talk. "
@@ -2078,10 +2217,11 @@ class ComposerServiceImpl:
                 final_messages = llm_messages
                 final_tools = tools
                 if final_preview_at_discovery_cap:
-                    final_messages = _reply_only_messages(llm_messages)
+                    final_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
                     final_messages.append(
                         {
                             "role": "system",
+                            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
                             "content": (
                                 "The current pipeline's final preview passed validation and the discovery budget is spent. "
                                 "This is a reply stage: only terminal park/reset/restore recovery controls remain available. "
@@ -2952,6 +3092,21 @@ class ComposerServiceImpl:
                         "Advisor failure audit row could not be persisted",
                         failed_turn=failed_turn,
                     ) from dispatch.advisor_failure
+                if isinstance(dispatch.advisor_failure, PromptGuardRefused):
+                    advisor_refusal = dispatch.advisor_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        advisor_refusal.__cause__ = dispatch.advisor_failure
+                        raise BaseExceptionGroup(
+                            "Manual advisor guard refusal and committed effect verification failure",
+                            (advisor_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise advisor_refusal from dispatch.advisor_failure
                 if persist.effect_verification_failure is not None:
                     prior_cause = dispatch.advisor_failure.__cause__
                     raise dispatch.advisor_failure from BaseExceptionGroup(
@@ -2977,6 +3132,24 @@ class ComposerServiceImpl:
                 raise deferred_cancel
 
             if early_checkpoint_failure is not None:
+                if isinstance(early_checkpoint_failure, PromptGuardRefused):
+                    early_refusal = early_checkpoint_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        # P4 already committed. Keep both originals visible to
+                        # the operation reducer so a policy refusal cannot mask
+                        # failure to verify the saved effect or replay its rows.
+                        early_refusal.__cause__ = early_checkpoint_failure
+                        raise BaseExceptionGroup(
+                            "EARLY guard refusal and committed effect verification failure",
+                            (early_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise early_refusal from early_checkpoint_failure
                 attach_llm_calls(early_checkpoint_failure, recorder)
                 if persist.effect_verification_failure is not None:
                     prior_cause = early_checkpoint_failure.__cause__
@@ -3231,6 +3404,13 @@ class ComposerServiceImpl:
                     provider_custody=provider_custody,
                     credential_state=state,
                 )
+            except PromptGuardRefused as exc:
+                raise exc.with_evidence(
+                    state=state,
+                    initial_version=state.version,
+                    llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
+                ) from exc
             except TimeoutError:
                 raise ComposerConvergenceError.capture(
                     max_turns=composition_turns_used + discovery_turns_used,

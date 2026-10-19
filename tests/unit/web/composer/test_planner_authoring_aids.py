@@ -2507,9 +2507,9 @@ class TestCoalesceVocabulary:
         view, _snapshot = _profile_view(tmp_path)
 
         rules = " ".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
-        assert "require_all, quorum, best_effort, first" in rules
-        assert "union, nested, select" in rules
-        assert "best_effort" in rules
+        assert "policy require_all, best_effort (requires timeout_seconds), or first" in rules
+        assert "merge union or nested" in rules
+        assert "quorum/select require fields this surface cannot author" in rules
 
     def test_exemplar_sets_coalesce_input_to_a_branch_connection(self, tmp_path: Path) -> None:
         view, _snapshot = _profile_view(tmp_path)
@@ -2628,7 +2628,8 @@ class TestRun3PackEdits:
         rendered = "\n".join(build_planner_authoring_aids(view)["fork_coalesce"]["rules"])
         assert "SHAPE SELECTION" in rendered
         assert "SAME input field" in rendered
-        assert "INDEPENDENT inputs" in rendered
+        assert "compatible node-wide model, system prompt and sampling settings" in rendered
+        assert "Preserve requested separate branches even when their input is the same" in rendered
 
     def test_output_prefix_contract_is_stated(self) -> None:
         view, _snapshot = _trained_view()

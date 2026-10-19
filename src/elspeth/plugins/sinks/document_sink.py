@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f98cae971ef1fc89"
+    source_file_hash: str | None = "sha256:a407d8e72f27e85c"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -126,9 +126,9 @@ class DocumentSink(BaseSink):
     )
     usage_when_not_to_use: str = (
         "Do not use for one record per row — that is the text sink, which writes each value as its own LF-delimited line. "
-        "Do not use to concatenate several rows into one file: this sink publishes only for a run that delivers exactly one "
-        "value to it and diverts every row it can see beyond the first, so join rows with the report_assemble aggregation "
-        "first. Do not use for a field that can be empty: a zero-byte document is diverted rather than published, because an "
+        "Do not use to concatenate several rows into one file: a delivery already known to contain multiple values is diverted. "
+        "A first single-value delivery may publish before later rows arrive; those later rows divert and the published document remains. "
+        "Use report_assemble first to produce one aggregate value. Do not use for a field that can be empty: a zero-byte document is diverted rather than published, because an "
         "empty value would otherwise write a file or not depending on whether the target already existed."
     )
     example_use: str = """sinks:

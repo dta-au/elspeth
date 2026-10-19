@@ -14,6 +14,7 @@ import pytest
 
 import elspeth.contracts as contracts
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -32,6 +33,8 @@ from elspeth.contracts.sink_effects import (
     SinkEffectAuditExportSnapshotInput,
     SinkEffectCommitResult,
     SinkEffectDescriptorMode,
+    SinkEffectErrorReason,
+    SinkEffectGateRouteReason,
     SinkEffectIdentity,
     SinkEffectInputKind,
     SinkEffectInspection,
@@ -45,6 +48,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileKind,
     SinkEffectReconcileResult,
     SinkEffectRole,
+    SinkEffectRoutingContext,
     SinkEffectState,
     _AuditExportReaderBinding,
     _create_restricted_audit_export_snapshot_reader,
@@ -61,6 +65,52 @@ EXACT_DESCRIPTOR = ArtifactDescriptor(
     size_bytes=12,
 )
 SAFE_EVIDENCE = {"content_hash": "abc123", "versions": ["v1", "v2"]}
+
+
+def test_readable_disposition_preserves_legacy_identity_and_distinguishes_reason_kinds() -> None:
+    error = SinkEffectErrorReason(text="Recorded failure.", witness_id="a" * 64, witness_hash="b" * 64)
+    gate = SinkEffectGateRouteReason(text="Recorded gate route.", witness_id="a" * 64, witness_hash="b" * 64)
+    legacy = SinkEffectRoutingContext(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None)
+    assert legacy.pending_identity() == {"outcome": "success", "path": "gate_routed", "error_hash": None}
+    old_error = SinkEffectRoutingContext(
+        outcome=TerminalOutcome.FAILURE, path=TerminalPath.ON_ERROR_ROUTED, error_hash="c" * 16, error_reason=error
+    )
+    assert old_error.pending_identity() == {
+        "outcome": "failure",
+        "path": "on_error_routed",
+        "error_hash": "c" * 16,
+        "error_reason": {"schema": "sink-error-reason-v1", "text": "Recorded failure.", "witness_id": "a" * 64, "witness_hash": "b" * 64},
+    }
+    new_error = SinkEffectRoutingContext(
+        outcome=TerminalOutcome.FAILURE, path=TerminalPath.ON_ERROR_ROUTED, error_hash="c" * 16, disposition_reason=error
+    )
+    new_gate = replace(legacy, disposition_reason=gate)
+    assert new_error.identity_hash != old_error.identity_hash
+    assert new_gate.identity_hash != legacy.identity_hash
+    assert "error_reason" not in new_error.pending_identity()
+    assert new_error.pending_identity()["disposition_reason"]["schema"] == "sink-error-reason-v1"
+    assert new_gate.pending_identity()["disposition_reason"]["schema"] == "sink-gate-route-reason-v1"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        replace(old_error, disposition_reason=error)
+
+
+@pytest.mark.parametrize("pair", ["default", "failure", "gate-error"])
+def test_gate_reason_cannot_create_an_error_or_change_terminal_taxonomy(pair: str) -> None:
+    gate = SinkEffectGateRouteReason(text="Recorded gate route.", witness_id="a" * 64, witness_hash="b" * 64)
+    outcome = TerminalOutcome.FAILURE if pair == "failure" else TerminalOutcome.SUCCESS
+    path = TerminalPath.DEFAULT_FLOW if pair == "default" else TerminalPath.ON_ERROR_ROUTED if pair == "failure" else TerminalPath.GATE_ROUTED
+    with pytest.raises(ValueError):
+        SinkEffectRoutingContext(
+            outcome=outcome, path=path, error_hash=None if pair == "default" else "c" * 16, disposition_reason=gate
+        )
+
+
+def test_successful_gate_context_refuses_error_witness_and_impostor() -> None:
+    error = SinkEffectErrorReason(text="Recorded failure.", witness_id="a" * 64, witness_hash="b" * 64)
+    with pytest.raises(ValueError, match="requires a source or transform failure"):
+        SinkEffectRoutingContext(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None, disposition_reason=error)
+    with pytest.raises(TypeError, match="exact error or gate route reason"):
+        SinkEffectRoutingContext(outcome=TerminalOutcome.SUCCESS, path=TerminalPath.GATE_ROUTED, error_hash=None, disposition_reason=object())
 
 
 def _member(ordinal: int = 0) -> SinkEffectMember:
@@ -327,9 +377,10 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
                 "pending_identity_hash",
                 "member_effect_id",
                 "primary_effect_id",
+                "routing_context",
             ),
         ),
-        (SinkEffectMemberCandidate, ("token_id", "row", "pending_identity", "primary_effect_id")),
+        (SinkEffectMemberCandidate, ("token_id", "row", "pending_identity", "primary_effect_id", "routing_context")),
         (
             SinkEffectIdentity,
             (

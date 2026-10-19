@@ -225,7 +225,7 @@ class OpenRouterConfig(LLMConfig):
     """OpenRouter-specific configuration.
 
     Extends LLMConfig with OpenRouter API settings:
-    - api_key: OpenRouter API key (required)
+    - api_key (str): OpenRouter API key (required)
     - base_url: API base URL (default: https://openrouter.ai/api/v1)
     - timeout_seconds: Request timeout (default: 60.0)
 

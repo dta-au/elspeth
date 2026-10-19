@@ -34,6 +34,7 @@ import pytest
 
 import elspeth.web.composer.tool_batch as tool_batch
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
@@ -175,10 +176,26 @@ class _RecordingLLM(_FakeComposeLLM):
         self.seen: list[list[dict[str, Any]]] = []
 
     async def __call__(
-        self, messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        messages: Any,
+        tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         self.seen.append(copy.deepcopy(list(messages)))
-        return await super().__call__(messages, tools)
+        return await super().__call__(
+            messages,
+            tools,
+            provider_custody=provider_custody,
+            credential_state=credential_state,
+            prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+            prompt_guard_content_parts=prompt_guard_content_parts,
+            prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+        )
 
 
 def _record_replay_callers(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -206,6 +223,15 @@ async def test_success_path_replay_keeps_model_order_on_next_provider_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every set_pipeline is re-serialised through the custody projection before dispatch."""
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This replay unit does not qualify physical END review. The existing
+    # isolation helper still requires the actual publication binding.
+    monkeypatch.setattr(
+        fake_composer_service._advisor_checkpoint,
+        "_run_advisor_checkpoint",
+        _clean_advisor_checkpoint,
+    )
     pipeline = _reversed_order_pipeline()
     caller_lines = _record_replay_callers(monkeypatch)
     llm = _RecordingLLM(

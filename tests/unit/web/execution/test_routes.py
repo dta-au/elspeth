@@ -31,6 +31,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorSignoffGateFact
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.protocol import ComposerService
+from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
@@ -1395,9 +1396,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 raise AssertionError("LLM evaluation must not run when the audit store is unavailable")
 
         app = _create_test_app(execution_service=svc)
@@ -1467,9 +1472,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run is processing data",'
@@ -1550,9 +1559,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 nonlocal calls
                 calls += 1
                 return "provider must not be reached"
@@ -1659,9 +1672,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: BufferingRecorder | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1806,9 +1823,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: BufferingRecorder | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -1915,9 +1936,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: BufferingRecorder | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 assert recorder is not None
                 recorder.record_llm_call(
                     build_llm_call_record(
@@ -2098,9 +2123,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 captured.update(snapshot)
                 return (
                     '{"headline":"The run failed",'
@@ -2181,9 +2210,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 return "The run is still working through the data."
 
         app = _create_test_app(execution_service=svc)
@@ -2263,9 +2296,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",
@@ -2353,9 +2390,13 @@ class TestRunDiagnosticsEndpoint:
                 *,
                 recorder: object | None = None,
                 session_operation_context: SessionOperationContext | None = None,
+                provider_custody: ProviderCallCustody | None = None,
             ) -> str:
                 assert session_operation_context is not None
                 assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+                assert isinstance(provider_custody, ProviderCallCustody)
+                assert provider_custody.context is session_operation_context
+                assert provider_custody.service is app.state.session_service
                 raise _BadRequestLLMError(
                     "LLM request rejected (BadRequestError)",
                     provider_detail="Model `gpt-foo` does not exist",

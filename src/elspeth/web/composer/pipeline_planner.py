@@ -45,6 +45,18 @@ from elspeth.contracts.composer_planner_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.hashing import canonical_json as _primitive_canonical_json
+from elspeth.contracts.hashing import canonical_json_loads
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardMode,
+    PromptGuardToolArgumentParts,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+)
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
@@ -93,6 +105,7 @@ from elspeth.web.composer.pipeline_proposal import PipelineProposal, ProposalBas
 from elspeth.web.composer.planner_authoring_aids import (
     PlannerPluginContract,
     SchemaContractProjectionUnsupported,
+    _SchemaContractEvidenceEntry,
     build_planner_authoring_aids,
     build_schema_contract_evidence,
     discovery_digest_detail_tools,
@@ -107,6 +120,8 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
+from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 
 # Private by name, deliberate import: one derivation of "plugins the current
 # state names" for every authoring path that builds schema evidence — the
@@ -150,7 +165,6 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
     coalesce_reachability_facts,
-    gate_condition_is_constant,
     route_destination_facts,
 )
 from elspeth.web.composer.tool_error_payloads import INVALID_TOOL_ARGUMENTS_REDACTION_STATUS, wire_argument_repair_message
@@ -820,6 +834,18 @@ class PlannerBudgetPolicy:
         )
 
 
+class _PlannerCatalogSchemaReference(TypedDict):
+    """Registered catalog bytes, excluding graph-derived omission labels."""
+
+    policy_hash: str
+    snapshot_hash: str
+    max_entries: int
+    max_omissions: int
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    schemas: list[_SchemaContractEvidenceEntry]
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerModelConfig:
     completion: _Completion
@@ -850,6 +876,9 @@ class PlannerModelConfig:
     tool_contract_dialect: ToolContractDialect
     escape_hatch_tool_contract_dialect: ToolContractDialect
     pricing_model: str | None = None
+    prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
+    escape_hatch_prompt_guard_mount: PromptGuardMount | None = field(default=None, repr=False)
+    prompt_guard_mode: PromptGuardMode = "required"
     # Senior advisor model for the one-shot escape-hatch overtime turn.
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
@@ -1540,7 +1569,7 @@ def planner_terminal_tool_definition(
         "type": "function",
         "function": {
             "name": _TERMINAL_TOOL_NAME,
-            "description": "Return one complete canonical pipeline proposal for server validation.",
+            "description": "Return one complete canonical pipeline proposal for server validation, alone in its tool-call turn. Finish discovery in earlier turns; after rejection, repair and resubmit within the remaining budget.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1896,8 +1925,10 @@ _SELECTED_SCHEMA_CONTRACTS_BUDGET_BYTES: Final[int] = 48 * 1024
 
 # The terminal instruction rides every planner request.
 PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
-    "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
-    "with one complete canonical set_pipeline argument object. At any stage, you may instead call "
+    "Use read-only discovery as needed in earlier turns, then call emit_pipeline_proposal "
+    "alone in its turn with one complete canonical set_pipeline argument object. Never "
+    "batch it with discovery or another call: a mixed terminal batch executes no calls. "
+    "After a rejection, repair and resubmit within the remaining budget. At any stage, you may instead call "
     "handoff_to_user or restore_parked_graph alone with your message to end authoring and talk to the user. "
     "Recovery needs no discovery, candidate capture, validation or budget exhaustion."
 )
@@ -1967,201 +1998,17 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
             }
             for call in calls
         ],
+        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY: tuple(
+            PromptGuardToolArgumentParts(index, json_argument_content_parts(call.raw_arguments))
+            for index, call in enumerate(calls)
+            if call.wire_error is None
+        ),
     }
 
 
 def _feedback_error_codes(feedback: _PlannerFeedbackWire) -> tuple[str, ...]:
     """Extract the closed error codes from a structural feedback envelope."""
     return tuple(entry["error_code"] for entry in feedback["validation"]["errors"])
-
-
-# A stated routing threshold: a comparison operator, or comparison wording,
-# bound to a NUMBER. Requiring the number is what keeps this conservative —
-# "the transform above the gate" and "source -> sink" are ordinary authoring
-# prose and must never trip the guard. The operator lookbehind rejects arrow
-# and fat-arrow forms outright.
-_THRESHOLD_NUMBER: Final[str] = r"\$?\d+(?:[.,]\d+)*(?!\d)"
-# A number immediately followed by a unit noun measures a LIMIT — prompt
-# length, a row cap, a branch count — not a value a row is routed on. The
-# trailing ``(?!\d)`` on the number above is load-bearing: without it the
-# engine backtracks to a shorter number ("5" out of "50 words") and slips past
-# this lookahead.
-_THRESHOLD_UNIT_NOUN: Final[str] = (
-    r"(?!\s*(?:%|(?:words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|"
-    r"seconds?|secs?|minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b))"
-)
-_THRESHOLD_QUANTITY: Final[str] = _THRESHOLD_NUMBER + _THRESHOLD_UNIT_NOUN
-_THRESHOLD_OPERATOR: Final[str] = r"(?<![-=<>!])(?:>=|<=|==|>|<)"
-_THRESHOLD_WORDING: Final[str] = (
-    r"(?:greater than|less than|more than|fewer than|at least|at most|no more than|no less than|above|below|over|under)"
-)
-_STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
-    rf"[A-Za-z_]\w*\s*{_THRESHOLD_OPERATOR}\s*{_THRESHOLD_QUANTITY}"
-    rf"|{_THRESHOLD_NUMBER}\s*{_THRESHOLD_OPERATOR}\s*[A-Za-z_]\w*"
-    rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_QUANTITY}",
-    re.IGNORECASE,
-)
-_ROUTING_THRESHOLD_REVOCATION_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:remove|drop|delete|disable|omit|stop\s+using)\s+(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\bwithout\s+(?:a\s+|the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\bno\s+(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:use|apply|keep)\s+"
-    r"(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
-    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:route|send|split|divert|separate)\b"
-    r"|\b(?:fan(?:\s+out)?|route|send)\s+(?:every|all)\s+rows?\s+(?:to\s+)?(?:both|all|every)\s+(?:the\s+)?sinks?\b",
-    re.IGNORECASE,
-)
-
-
-# Routing intent. A comparison alone is not enough: "summarise each row in
-# under 50 words" and "keep at most 100 rows" bind comparison wording to a
-# number while asking for nothing about routing, and firing on those would
-# tell the model to author a gate condition a correct pipeline never needed —
-# turning a right answer into a wrong one. Both halves must hold.
-_ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
-    re.IGNORECASE,
-)
-_ROUTING_CONTROL_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\b(?:routing\s+)?(?:threshold|gate|condition|filter)\b",
-    re.IGNORECASE,
-)
-# Clause boundaries. "Split the rows into two sinks AND keep at most 100 rows"
-# states a routing action and an unrelated cap; only a comparison in the SAME
-# clause as the routing verb is plausibly the rule that routes.
-_CLAUSE_BOUNDARY_PATTERN: Final[re.Pattern[str]] = re.compile(
-    # ``\.(?!\d)`` splits sentences without splitting decimals: a decimal
-    # point is always followed by a digit, a full stop never is.
-    r"\.(?!\d)|[;:!?\n]|\band\b|\bthen\b|\bbut\b|\bwhile\b|\balso\b",
-    re.IGNORECASE,
-)
-
-
-def _stated_threshold_in(instruction: str) -> str | None:
-    """Return the routing comparison the instruction states, or None.
-
-    Deliberately conservative on three axes, because a false positive here is
-    worse than a miss: the rejection asserts the instruction stated a routing
-    rule and tells the model to author a gate condition, so on a pipeline that
-    is already correct a compliant model makes it wrong — and under a repair
-    budget of one that ends in REPAIR_EXHAUSTED with no proposal at all. A
-    comparison counts only when
-
-    1. an operator (or comparison wording) is bound to a literal number;
-    2. the number is NOT followed by a unit noun (``under 50 words``,
-       ``at most 100 rows``, ``more than 2 branches`` measure a limit, not a
-       row value); and
-    3. it shares a clause with a routing verb.
-
-    Known false negative, accepted: the expression form
-    ``row['amount'] > 500`` is missed, because the ``]`` breaks the
-    ``[A-Za-z_]\\w*`` operand. Widening the operand to swallow bracket
-    subscripts would also swallow ordinary prose ahead of an operator, and
-    false negatives are the safe direction — the non-blocking
-    ``gate_fan_out_advisory`` still names the shape at review.
-    """
-    for clause in _CLAUSE_BOUNDARY_PATTERN.split(instruction):
-        if _ROUTING_INTENT_PATTERN.search(clause) is None:
-            continue
-        match = _STATED_THRESHOLD_PATTERN.search(clause)
-        if match is not None:
-            return match.group(0).strip()
-    return None
-
-
-def _stated_threshold_for_planner_request(
-    intent: str,
-    conversation_context: PlannerConversationContext | None,
-) -> str | None:
-    """Resolve the latest authoritative routing threshold for this request.
-
-    The current user message has precedence. A referential turn may otherwise
-    inherit the latest retained earlier user request.
-    """
-    if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(intent) is not None:
-        return None
-    current_threshold = _stated_threshold_in(intent)
-    if current_threshold is not None:
-        return current_threshold
-    if _ROUTING_INTENT_PATTERN.search(intent) is not None or _ROUTING_CONTROL_REFERENCE_PATTERN.search(intent) is not None:
-        return None
-    if conversation_context is None:
-        return None
-    retained_requests = conversation_context.prior_user_requests
-    if conversation_context.additional_prior_user_requests_omitted > 0:
-        # The service retains the first request as a provider-visible anchor,
-        # followed by recent tail entries. The omission gap between them may
-        # hide a correction or revocation, so deterministic enforcement must
-        # never scan across that gap back to the anchor.
-        retained_requests = retained_requests[1:]
-    for prior_request in reversed(retained_requests):
-        if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(prior_request.content) is not None:
-            return None
-        prior_threshold = _stated_threshold_in(prior_request.content)
-        if prior_threshold is not None:
-            return prior_threshold
-        # A newer routing instruction with no safely recognized comparison is
-        # a supersession barrier. Searching past it would revive an older rule
-        # that may have been replaced by an unconditional route or by syntax
-        # the deliberately conservative detector cannot prove. A missed nudge
-        # is safe; enforcing a stale threshold is not.
-        if (
-            _ROUTING_INTENT_PATTERN.search(prior_request.content) is not None
-            or _ROUTING_CONTROL_REFERENCE_PATTERN.search(prior_request.content) is not None
-        ):
-            return None
-    return None
-
-
-def _threshold_homeless_gate_id(pipeline: Mapping[str, Any]) -> str | None:
-    """Return a constant-condition gate id when NO gate carries a real condition.
-
-    Both halves matter. A candidate that authored a row-reading condition
-    somewhere has a home for the stated comparison and is left alone, even if
-    it also contains a constant fan-out gate; only a candidate whose every
-    gate is constant has provably dropped the rule.
-    """
-    gates = [node for node in cast(list[Mapping[str, Any]], pipeline["nodes"]) if node["node_type"] == "gate"]
-    constant_gate_ids = [
-        str(gate["id"])
-        for gate in gates
-        if "condition" in gate and type(gate["condition"]) is str and gate_condition_is_constant(gate["condition"])
-    ]
-    if not constant_gate_ids or len(constant_gate_ids) != len(gates):
-        return None
-    return constant_gate_ids[0]
-
-
-def _stated_threshold_ignored_rejection(state: CompositionState, *, node_id: str, stated: str) -> ToolResult:
-    """Synthesize the coded rejection for a dropped routing threshold.
-
-    AWS acceptance run 2 (R2-F17, elspeth-5c0c09db31): asked to route rows on
-    ``amount > 500``, the planner authored a constant-condition gate forking
-    every row to BOTH sinks. That shape is legal — it is the documented
-    fan-out macro, generated by our own authoring aids — so it can never be a
-    structural rejection. What makes it wrong HERE is the instruction, which
-    only the planner loop can see.
-
-    The message quotes the comparison span from the instruction the planner's
-    own prompt was built from — content already verbatim in its context, the
-    same custody judgment ``plugin_options_invalid`` detail rides on — because
-    a bare code cannot tell the model which rule it dropped.
-    """
-    entry = ValidationEntry(
-        component=f"node:{node_id}",
-        message=(
-            f"Gate '{node_id}' has a constant condition, so it makes no per-row decision, but the "
-            f'instruction states the comparison "{stated}". Every row would take the same path.'
-        ),
-        severity="high",
-        error_code="gate_condition_ignores_stated_threshold",
-    )
-    return ToolResult(
-        success=False,
-        updated_state=state,
-        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
-        affected_nodes=(node_id,),
-    )
 
 
 def _missing_source_rejection(state: CompositionState) -> ToolResult:
@@ -2592,18 +2439,9 @@ def _compile_candidate_feedback(feedback: _CandidateFeedback) -> _PlannerFeedbac
                 "unknown_requirement_id": entry.review_reference.unknown_requirement_id,
                 "valid_requirement_ids": list(entry.review_reference.valid_requirement_ids),
             }
-        if (
-            code
-            in (
-                "plugin_options_invalid",
-                "gate_condition_ignores_stated_threshold",
-            )
-            and not withhold_candidate_facts
-        ):
-            # Same custody judgment: the message quotes only
-            # content the planner itself already holds verbatim — the options
-            # of the candidate it just authored, the comparison span from the
-            # instruction its own prompt was built from.
+        if code == "plugin_options_invalid" and not withhold_candidate_facts:
+            # The message quotes only options from the candidate the planner
+            # itself just authored under the same custody judgment.
             projected["detail"] = entry.message
         if code == "plugin_options_invalid" and not withhold_candidate_facts and plugin_contract_resolver is not None:
             # The detail above names only the VIOLATED keys; the contract names
@@ -3112,6 +2950,24 @@ def _serialize_provider_discovery_result(
     return serialize_admitted_discovery_result(admitted)
 
 
+def _feedback_content_parts(feedback: _PlannerFeedbackWire) -> tuple[PromptGuardContentPart, ...]:
+    """Only the compiler's current policy-rehydrated contracts are references."""
+    references = frozenset(
+        ("validation", "errors", index, "plugin_contracts")
+        for index, entry in enumerate(feedback["validation"]["errors"])
+        if "plugin_contracts" in entry
+    )
+    return json_content_parts(
+        canonical_json(feedback),
+        reference_paths=references,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        encoder=_primitive_canonical_json,
+        decoder=canonical_json_loads,
+    )
+
+
 async def _await_custody_settlement(awaitable: Awaitable[Any]) -> Any:
     """Finish idempotent custody after cancellation, then preserve cancellation."""
 
@@ -3167,7 +3023,8 @@ def _attach_planner_evidence(
     planner_attempt_start: int,
 ) -> None:
     """Attach both halves of this planner operation's paired audit evidence."""
-    attach_llm_calls(exc, recorder, start_index=llm_call_start)
+    if not isinstance(exc, PromptGuardRefused):
+        attach_llm_calls(exc, recorder, start_index=llm_call_start)
     exc_with_evidence = cast(Any, exc)
     exc_with_evidence.planner_attempts = recorder.planner_attempts[planner_attempt_start:]
 
@@ -3299,8 +3156,29 @@ def _new_planner_custody(provider_owner: ProviderInvocationOwner) -> ProviderCal
     return provider_owner.mint(ProviderInvocationFamily.PLANNER)
 
 
-async def _complete_planner_provider(*, provider_custody: ProviderCallCustody, request: Mapping[str, Any]) -> Any:
-    return await _litellm_acompletion(provider_custody=provider_custody, **dict(request))
+async def _complete_planner_provider(
+    *,
+    provider_custody: ProviderCallCustody,
+    request: Mapping[str, Any],
+    mount: PromptGuardMount | None,
+    mode: PromptGuardMode,
+    advisor_hatch: bool,
+    user_prompt: str,
+    trusted_indexes: frozenset[int],
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...],
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...],
+) -> Any:
+    return await _litellm_acompletion(
+        provider_custody=provider_custody,
+        prompt_guard_mount=mount,
+        prompt_guard_mode=mode,
+        prompt_guard_role="advisor" if advisor_hatch else "composer",
+        prompt_guard_user_prompt=user_prompt,
+        prompt_guard_trusted_message_indexes=trusted_indexes,
+        prompt_guard_content_parts=content_parts,
+        prompt_guard_tool_argument_parts=tool_argument_parts,
+        **dict(request),
+    )
 
 
 async def plan_pipeline(
@@ -3411,6 +3289,15 @@ async def plan_pipeline(
         outcome = "complete"
         trail.log_summary("accepted")
         return proposal
+    except PromptGuardRefused as exc:
+        captured = exc.with_evidence(
+            state=current_state, initial_version=current_state.version, llm_calls=recorder.llm_calls[llm_call_start:]
+        )
+        primary_error = captured
+        trail.finalize_active_exception(captured)
+        _attach_planner_evidence(captured, recorder, llm_call_start=llm_call_start, planner_attempt_start=planner_attempt_start)
+        trail.log_summary(type(captured).__name__)
+        raise captured from exc
     except BaseException as exc:
         primary_error = exc
         trail.finalize_active_exception(exc)
@@ -3553,11 +3440,24 @@ async def _plan_pipeline_inner(
     declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
     pending_information = set(declared_pending_information)
     tools = planner_tool_definitions(discovery_policy, dialect=model_config.tool_contract_dialect)
+    # Only registered schema entries and owned policy metadata are catalog
+    # reference. Omission labels can originate in arbitrary graph plugin names.
+    catalog_schema_reference = _PlannerCatalogSchemaReference(
+        policy_hash=schema_contract_evidence["policy_hash"],
+        snapshot_hash=schema_contract_evidence["snapshot_hash"],
+        max_entries=schema_contract_evidence["max_entries"],
+        max_omissions=schema_contract_evidence["max_omissions"],
+        max_canonical_bytes=schema_contract_evidence["max_canonical_bytes"],
+        canonical_bytes_used=schema_contract_evidence["canonical_bytes_used"],
+        schemas=schema_contract_evidence["schemas"],
+    )
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state,
-        "authoring_aids": authoring_aids,
-        "schema_contract_evidence": schema_contract_evidence,
+        "schema_contract_evidence": {
+            "omitted": schema_contract_evidence["omitted"],
+            "omissions_withheld_count": schema_contract_evidence["omissions_withheld_count"],
+        },
         "information_manifest": information_manifest.provider_payload(
             discoverable_classes=discovery_policy.unresolved_classes,
             unresolved_keys=frozenset(pending_information),
@@ -3571,10 +3471,23 @@ async def _plan_pipeline_inner(
     provider_request.update(json.loads(retained_operation_context_message(retained_operation_context)))
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": rendered_skill},
+        {"role": "system", "content": rendered_skill, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
+        {
+            "role": "user",
+            "content": canonical_json({"authoring_aids": authoring_aids, "schema_contract_evidence": catalog_schema_reference}),
+            PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.REFERENCE,
+        },
         {
             "role": "user",
             "content": canonical_json(provider_request),
+            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                canonical_json(provider_request),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                encoder=_primitive_canonical_json,
+                decoder=canonical_json_loads,
+            ),
         },
     ]
     total_calls = 0
@@ -3586,10 +3499,6 @@ async def _plan_pipeline_inner(
     repair_count = 0
     prose_nudges = 0
     decline_notice_given = False
-    threshold_nudge_given = False
-    # Computed once: the current instruction and bounded earlier-user context
-    # are fixed for the whole planning request.
-    stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
     no_gain_calls_in_round = 0
@@ -3674,6 +3583,9 @@ async def _plan_pipeline_inner(
             else (list(messages), list(active_tools))
         )
         assert cache_marked_tools is not None
+        guard_evidence = detach_prompt_guard_evidence(cache_marked_messages)
+        cache_marked_messages = guard_evidence.messages
+        trusted_indexes = guard_evidence.trusted_message_indexes
         call_input_snapshot = json.loads(
             canonical_json(
                 {
@@ -3829,9 +3741,33 @@ async def _plan_pipeline_inner(
 
             try:
                 response = await asyncio.wait_for(
-                    _complete_planner_provider(provider_custody=provider_custody, request=kwargs)
+                    _complete_planner_provider(
+                        provider_custody=provider_custody,
+                        request=kwargs,
+                        mount=model_config.escape_hatch_prompt_guard_mount
+                        if model_override is not None
+                        else model_config.prompt_guard_mount,
+                        mode=model_config.prompt_guard_mode,
+                        advisor_hatch=model_override is not None,
+                        user_prompt=intent,
+                        trusted_indexes=trusted_indexes,
+                        content_parts=guard_evidence.content_parts,
+                        tool_argument_parts=guard_evidence.tool_argument_parts,
+                    )
                     if provider_custody is not None
-                    else model_config.completion(**kwargs),
+                    else _litellm_acompletion(
+                        provider_custody=None,
+                        prompt_guard_mount=model_config.escape_hatch_prompt_guard_mount
+                        if model_override is not None
+                        else model_config.prompt_guard_mount,
+                        prompt_guard_mode=model_config.prompt_guard_mode,
+                        prompt_guard_role="advisor" if model_override is not None else "composer",
+                        prompt_guard_user_prompt=intent,
+                        prompt_guard_trusted_message_indexes=trusted_indexes,
+                        prompt_guard_content_parts=guard_evidence.content_parts,
+                        prompt_guard_tool_argument_parts=guard_evidence.tool_argument_parts,
+                        **kwargs,
+                    ),
                     timeout=remaining,
                 )
             except asyncio.CancelledError as exc:
@@ -3866,7 +3802,10 @@ async def _plan_pipeline_inner(
                 if not (
                     provider_custody.needs_terminal_audit() if provider_custody is not None else provider_attempt_needs_terminal_audit()
                 ):
-                    raise
+                    # The enclosing planner timer also covers the guard. An
+                    # undispatched check owes no provider attempt, but expiry
+                    # still belongs to this operation's wall-clock budget.
+                    raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
                 with required_provider_audit_scope(provider_custody):
                     timed_out_call = build_llm_call_record(
                         private_request=private_request,
@@ -4226,7 +4165,7 @@ async def _plan_pipeline_inner(
         provider_message: Any,
         parsed_calls: tuple[_ParsedToolCall, ...],
         terminal_call: _ParsedToolCall,
-        feedback: Mapping[str, Any],
+        feedback: _PlannerFeedbackWire,
     ) -> None:
         # A rejected terminal proposal was evaluated and its safe result is
         # known, so retain the exact provider-authored tool call together with
@@ -4238,6 +4177,7 @@ async def _plan_pipeline_inner(
                 "role": "tool",
                 "tool_call_id": terminal_call.call_id,
                 "content": canonical_json(feedback),
+                PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(feedback),
             }
         )
 
@@ -4294,6 +4234,12 @@ async def _plan_pipeline_inner(
                     ),
                 )
         except PipelinePlannerError as exc:
+            if exc.code == "TIMEOUT" and _planner_deadline_time() >= deadline:
+                # A spent operation budget takes precedence over the hatch's
+                # earlier exhaustion. Short provider timeouts with remaining
+                # operation budget keep the ordinary hatch fallback below.
+                trail.finalize_active_exception(exc)
+                raise
             if exc.code == "PROSE_REPLY":
                 # A no-tool-call reply (thinking aloud) mid-plan: nudge the
                 # model back to tool calling on its own bounded budget —
@@ -4345,6 +4291,10 @@ async def _plan_pipeline_inner(
             trail.finish_attempt("repair", "truncated", led_to="repair")
             messages.append({"role": "user", "content": _truncated_response_notice()})
             continue
+        except PromptGuardRefused:
+            # A dedicated-service refusal terminates this physical invocation;
+            # it is not the hatch's ordinary failure-to-propose fallback.
+            raise
         except Exception as exc:
             if is_hatch_turn:
                 trail.finalize_active_exception(exc)
@@ -4421,7 +4371,21 @@ async def _plan_pipeline_inner(
             messages.append(_assistant_tool_calls_message(message, calls))
             not_alone_feedback = canonical_json(_terminal_call_not_alone_feedback())
             for rejected_call in calls:
-                messages.append({"role": "tool", "tool_call_id": rejected_call.call_id, "content": not_alone_feedback})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": rejected_call.call_id,
+                        "content": not_alone_feedback,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            not_alone_feedback,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
+                        ),
+                    }
+                )
             repair_count += 1
             if repair_count > repair_budget:
                 if _hatch_available():
@@ -4600,6 +4564,7 @@ async def _plan_pipeline_inner(
                         "role": "tool",
                         "tool_call_id": call.call_id,
                         "content": canonical_json(terminal_feedback),
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(terminal_feedback),
                     }
                 )
                 continue
@@ -4615,27 +4580,6 @@ async def _plan_pipeline_inner(
                 composer_provider=effective_provider,
             )
             try:
-                if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
-                    # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
-                    # The instruction named a comparison and no gate in the
-                    # candidate reads a row to apply it, so the rule was
-                    # dropped: a constant gate forking to several destinations
-                    # writes every row everywhere. Structurally the shape is
-                    # legal — this can only be caught here, where the
-                    # instruction is in scope — so it is ONE coded repair with
-                    # the same omit-valve as the nodeless nudge: re-emitting
-                    # the same pipeline confirms a deliberate fan-out. Never
-                    # on the hatch turn, which gets one clean shot.
-                    homeless_gate_id = _threshold_homeless_gate_id(finalized_pipeline)
-                    if homeless_gate_id is not None:
-                        threshold_nudge_given = True
-                        raise _PipelineCandidateRejected(
-                            _stated_threshold_ignored_rejection(
-                                current_state,
-                                node_id=homeless_gate_id,
-                                stated=stated_threshold,
-                            )
-                        )
                 accepted_plan = await _build_valid_pipeline_plan(
                     pipeline=finalized_pipeline,
                     current_state=current_state,
@@ -4681,11 +4625,20 @@ async def _plan_pipeline_inner(
                     raise _rejection_exhausted() from None
                 trail.finish_attempt(attempt_phase, "arg_error", codes=last_rejection_codes, led_to="repair")
                 messages.append(_assistant_tool_calls_message(message, calls))
+                argument_feedback_json = canonical_json(_allowlisted_argument_feedback(exc))
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(_allowlisted_argument_feedback(exc)),
+                        "content": argument_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            argument_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
+                        ),
                     }
                 )
                 continue
@@ -4821,6 +4774,7 @@ async def _plan_pipeline_inner(
                         "role": "tool",
                         "tool_call_id": call.call_id,
                         "content": canonical_json(candidate_feedback),
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: _feedback_content_parts(candidate_feedback),
                     }
                 )
                 continue
@@ -4927,17 +4881,26 @@ async def _plan_pipeline_inner(
                 tool_calls=len(calls),
             )
             for call in no_gain_calls:
+                no_gain_feedback_json = canonical_json(
+                    {
+                        "success": False,
+                        "error_code": "DISCOVERY_NO_GAIN",
+                        "information_keys": list(information_keys[call.call_id]),
+                        "message": "The requested information is already supplied or unavailable.",
+                    }
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(
-                            {
-                                "success": False,
-                                "error_code": "DISCOVERY_NO_GAIN",
-                                "information_keys": list(information_keys[call.call_id]),
-                                "message": "The requested information is already supplied or unavailable.",
-                            }
+                        "content": no_gain_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            no_gain_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
                         ),
                     }
                 )
@@ -5063,17 +5026,26 @@ async def _plan_pipeline_inner(
         new_information: list[ComposerPlannerInformationClass] = []
         for call in calls:
             if call in no_gain_calls:
+                no_gain_feedback_json = canonical_json(
+                    {
+                        "success": False,
+                        "error_code": "DISCOVERY_NO_GAIN",
+                        "information_keys": list(information_keys[call.call_id]),
+                        "message": "The requested information is already supplied or unavailable.",
+                    }
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(
-                            {
-                                "success": False,
-                                "error_code": "DISCOVERY_NO_GAIN",
-                                "information_keys": list(information_keys[call.call_id]),
-                                "message": "The requested information is already supplied or unavailable.",
-                            }
+                        "content": no_gain_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                            no_gain_feedback_json,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            encoder=_primitive_canonical_json,
+                            decoder=canonical_json_loads,
                         ),
                     }
                 )
@@ -5101,6 +5073,14 @@ async def _plan_pipeline_inner(
                     "role": "tool",
                     "tool_call_id": call.call_id,
                     "content": serialized_result,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(
+                        serialized_result,
+                        reference_paths=frozenset({("data",)})
+                        if isinstance(discovery_result, AdmittedDiscoveryResult)
+                        and discovery_result.result.success
+                        and type(discovery_result.response) is AdmittedPluginSchemaResponse
+                        else frozenset(),
+                    ),
                 }
             )
             information_available = result.success

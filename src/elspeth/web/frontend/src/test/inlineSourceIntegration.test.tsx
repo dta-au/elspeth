@@ -5,17 +5,17 @@ import { authenticateComposerCustody, purgeComposerCustody } from "@/stores/comp
 //
 // End-to-end frontend integration: chat input dispatch → mocked LLM
 // `set_pipeline` tool-call response → `compositionState.sources` with
-// `blob_ref` → `getBlobMetadata` + `previewBlobContent` lookup → projection
+// `blob_ref` → `getBlobMetadata` + `downloadBlobContent` lookup → projection
 // into `useInlineSourceStore` → `<InlineSourceCreatedTurn>` rendered.
 //
 // This is NOT a full backend integration test: `sendMessage`,
-// `getBlobMetadata`, and `previewBlobContent` are mocked at the API
+// `getBlobMetadata`, and `downloadBlobContent` are mocked at the API
 // boundary. The contract being pinned here is the FRONTEND wiring:
 //
 //   user types → useComposer.sendMessage → sessionStore.sendMessage
 //     → api.sendMessage (mocked) returns state with sources.source.blob_ref
 //     → sessionStore updates compositionState
-//     → ChatPanel's projection effect calls getBlobMetadata + preview
+//     → ChatPanel's projection effect calls getBlobMetadata + content download
 //     → inlineSourceStore.setSummary populates the per-session summary
 //     → InlineSourceCreatedTurn renders with provenance-gated Edit button
 //
@@ -185,7 +185,7 @@ vi.mock("../api/client", async (importOriginal) => ({
   // defined on the mock" as an unhandled error and fails the run.
   listInterpretationEvents: vi.fn().mockResolvedValue([]),
   getBlobMetadata: vi.fn(),
-  previewBlobContent: vi.fn(),
+  downloadBlobContent: vi.fn(),
   // toInlineSourceProvenance is a pure function the projection effect
   // calls inside ChatPanel; mocking it would defeat the test's purpose
   // (we want to verify the wire→display translation works). Re-export
@@ -229,6 +229,10 @@ const LLM_INLINE_SOURCE_TEXT =
   "url\nhttps://gov.au/1\nhttps://gov.au/2\nhttps://gov.au/3\nhttps://gov.au/4\nhttps://gov.au/5";
 const LLM_INLINE_SOURCE_HASH =
   "c85e8a7843f8d4b014a8cde944256635cddbfa882f817d7f503d5623cfa1bc3f";
+
+async function sourceDownload(content: string) {
+  return { data: await new Response(content).blob(), filename: "chat.csv" };
+}
 
 /**
  * Build a CompositionState whose default named source is an `inline_blob`
@@ -456,7 +460,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     vi.spyOn(api, "getBlobMetadata").mockResolvedValue(
       makeBlobMetadata("verbatim", VERBATIM_INLINE_SOURCE_HASH),
     );
-    vi.spyOn(api, "previewBlobContent").mockResolvedValue(VERBATIM_INLINE_SOURCE_TEXT);
+    vi.spyOn(api, "downloadBlobContent").mockResolvedValue(await sourceDownload(VERBATIM_INLINE_SOURCE_TEXT));
 
     render(<App />);
 
@@ -537,7 +541,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     vi.spyOn(api, "getBlobMetadata").mockResolvedValue(
       makeBlobMetadata("llm_generated", LLM_INLINE_SOURCE_HASH),
     );
-    vi.spyOn(api, "previewBlobContent").mockResolvedValue(LLM_INLINE_SOURCE_TEXT);
+    vi.spyOn(api, "downloadBlobContent").mockResolvedValue(await sourceDownload(LLM_INLINE_SOURCE_TEXT));
 
     render(<App />);
 

@@ -11,10 +11,12 @@ from tests.unit.plugins.llm.test_azure_multi_query import _make_provider
 from tests.unit.plugins.llm.test_ordered_query_contract import ordered_options
 
 
-def make_transform() -> LLMTransform:
+def make_transform(prefix: str | None = None) -> LLMTransform:
     options = ordered_options()
     options.update(deployment_name="gpt-4o", endpoint="https://test.openai.azure.com", api_key="test-key")
     options["queries"][0]["response_format"] = "structured"
+    options["queries"][0]["structured_output_prefix"] = prefix
+    options["queries"][1]["input_fields"]["score"] = "extract_score" if prefix is None else (f"{prefix}_score" if prefix else "score")
     options["queries"][1]["template"] = "score={{ row.score }} original={{ row.source_row.text }}"
     return LLMTransform(options)
 
@@ -65,8 +67,9 @@ def test_declared_value_violation_stops_before_b(monkeypatch: pytest.MonkeyPatch
     assert "value-must-not-leak" not in str(exc.value)
 
 
-def test_retry_keeps_b_snapshot_and_does_not_repeat_a(monkeypatch: pytest.MonkeyPatch) -> None:
-    transform = make_transform()
+@pytest.mark.parametrize("prefix", [None, "", "published"])
+def test_retry_keeps_b_snapshot_and_does_not_repeat_a(monkeypatch: pytest.MonkeyPatch, prefix: str | None) -> None:
+    transform = make_transform(prefix)
     provider = _make_provider([{"score": 5}, "accepted"])
     original_execute = provider.execute_query.side_effect
     attempts: list[str] = []
@@ -139,10 +142,11 @@ def test_interleaved_rows_never_share_intermediate_values() -> None:
     assert set(later_prompts) == {"score=1 original=alpha", "score=2 original=beta"}
 
 
-def test_shutdown_after_a_preserves_atomic_failure_and_stops_b() -> None:
+@pytest.mark.parametrize("prefix", [None, "", "published"])
+def test_shutdown_after_a_preserves_atomic_failure_and_stops_b(prefix: str | None) -> None:
     import threading
 
-    transform = make_transform()
+    transform = make_transform(prefix)
     provider = _make_provider([{"score": 5}])
     execute = provider.execute_query.side_effect
     shutdown = threading.Event()
@@ -163,10 +167,11 @@ def test_shutdown_after_a_preserves_atomic_failure_and_stops_b() -> None:
     assert result.reason["discarded_successful_queries"] == 1
 
 
-def test_replay_miss_on_b_propagates_without_live_fallback_or_repeating_a() -> None:
+@pytest.mark.parametrize("prefix", [None, "", "published"])
+def test_replay_miss_on_b_propagates_without_live_fallback_or_repeating_a(prefix: str | None) -> None:
     from elspeth.plugins.infrastructure.clients.replayer import ReplayMissError
 
-    transform = make_transform()
+    transform = make_transform(prefix)
     provider = _make_provider([{"score": 5}])
     execute = provider.execute_query.side_effect
 

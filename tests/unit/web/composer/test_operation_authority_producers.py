@@ -14,6 +14,7 @@ from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
+from elspeth.web.composer.tools.generation import ProofNotApplicable
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from tests.unit.web.composer.test_pipeline_planner import (
     _custody,
@@ -29,12 +30,11 @@ from tests.unit.web.composer.test_pipeline_planner import (
 def test_proof_check_without_blob_effects_remains_available_without_sessions(
     composer_service_without_sessions_service: ComposerServiceImpl,
 ) -> None:
-    messages: list[dict[str, Any]] = []
-    outcome = composer_service_without_sessions_service._completion._attempt_proof_repair(
-        state=_empty_state(), llm_messages=messages, session_id=None, repair_turns_used=0
+    assert composer_service_without_sessions_service._sessions_service is None
+    proof = composer_service_without_sessions_service._completion._assess_source_proof(
+        _empty_state(), session_id=None, session_operation_context=None
     )
-    assert outcome.action == "clear"
-    assert messages == []
+    assert type(proof) is ProofNotApplicable
 
 
 def test_dispatch_preserves_operation_context_and_authority(

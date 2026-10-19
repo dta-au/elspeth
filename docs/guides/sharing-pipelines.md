@@ -70,7 +70,7 @@ accept this trade-off.
 ## First-deploy operator action
 
 Since 0.8.1, shareable-review state is part of the broader web session
-database contract. The unreleased 0.8.7 candidate expects `SESSION_SCHEMA_EPOCH=77`
+database contract. The unreleased 0.8.9 candidate expects `SESSION_SCHEMA_EPOCH=77`
 and `SQLITE_SCHEMA_EPOCH=49`; confirm both against the deployed service's
 live schema constants before a fresh installation.
 

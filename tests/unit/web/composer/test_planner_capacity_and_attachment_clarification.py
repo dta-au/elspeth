@@ -240,8 +240,8 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
         policies.append(policy)
         return policy
 
-    # Use the real information-aware policy: an empty injected manifest does
-    # not supply catalog.selection and cannot authorize a first-turn decline.
+    # Use the real information-aware policy. The helper's default injected
+    # empty manifest would not authorize this first-turn model-authored decline.
     with (
         patch.object(pipeline_planner.PlannerDiscoveryPolicy, "initial", side_effect=capture_initial),
         pytest.raises(PlannerDeclined) as caught,
@@ -267,7 +267,13 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
     assert isinstance(policy.manifest, pipeline_planner.PlannerInformationManifest)
     assert policy.manifest.supplies("catalog.selection")
     assert not policy.manifest.unresolved
-    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    messages = completion.requests[0]["messages"]
+    # Catalog/schema reference and mixed request are distinct owned messages;
+    # this gapless request also receives the decline notice before its SDK call.
+    assert [message["role"] for message in messages] == ["system", "user", "user", "user"]
+    reference = json.loads(messages[1]["content"])
+    assert set(reference) == {"authoring_aids", "schema_contract_evidence"}
+    payload = json.loads(messages[2]["content"])
     assert payload["information_manifest"]["supplied"]["plugin_selection"] == "policy_snapshot"
     assert payload["information_manifest"]["unresolved"] == []
     assert 'starting with "DECLINE: "' in completion.requests[0]["messages"][-1]["content"]

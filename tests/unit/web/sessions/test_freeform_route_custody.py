@@ -17,7 +17,9 @@ from sqlalchemy.sql.dml import Insert
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.invariants import InvariantError
+from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions import composer_turn
 from elspeth.web.sessions.composer_operations import ComposerOperationError
@@ -35,7 +37,7 @@ from tests.helpers.composer_operations import (
     submit_and_settle,
 )
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
-from tests.unit.web.sessions.test_routes import _llm_call, _make_app, _ProgressAwareComposer
+from tests.unit.web.sessions.test_routes import _install_required_route_prompt_shields, _llm_call, _make_app, _ProgressAwareComposer
 
 
 class _AuditedComposer(_ProgressAwareComposer):
@@ -418,7 +420,16 @@ async def test_reused_key_conflicts_before_state_validation_without_cross_sessio
 async def test_completed_turn_stays_completed_when_caller_cancels_during_auto_title_join(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.web.sessions.routes import _helpers as helpers_module
 
-    app, service, engine, composer = _file_app(tmp_path)
+    app, service, engine, _composer = _file_app(tmp_path)
+    guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
+
+    class _TitleJoinComposer(_AuditedComposer):
+        @property
+        def composer_prompt_guard_mount(self) -> PromptGuardMount:
+            return guard_mount
+
+    composer = _TitleJoinComposer()
+    app.state.composer_service = composer
     title_entered = asyncio.Event()
     title_release = asyncio.Event()
     title_finished = asyncio.Event()
@@ -430,6 +441,13 @@ async def test_completed_turn_stays_completed_when_caller_cancels_during_auto_ti
         real_finish(*args, status=status, **kwargs)
 
     async def block_auto_title(**kwargs) -> None:
+        assert kwargs["service"] is service
+        assert kwargs["prompt_guard_mount"] is guard_mount
+        assert kwargs["prompt_guard_mode"] == "required"
+        custody = kwargs["provider_custody"]
+        assert type(custody) is ProviderCallCustody
+        assert custody.service is service and custody.context is kwargs["session_operation_context"]
+        assert custody.context.fence.session_id == str(kwargs["session_id"])
         title_entered.set()
         await title_release.wait()
         title_finished.set()
@@ -469,6 +487,7 @@ async def test_completed_turn_stays_completed_when_caller_cancels_during_auto_ti
             final = await client.get(f"/api/sessions/{session_id}/operations/{key}")
             SettledComposerOperation(accepted, final).result()
             assert statuses == ["completed"]
+            assert guard_requests == [], "this join test isolates the title helper before guard/SDK dispatch"
             assert composer.calls == 1
             records = await service.get_messages(UUID(session_id), limit=None)
             assert sum(row.role == "assistant" for row in records) == 1

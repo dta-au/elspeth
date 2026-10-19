@@ -90,6 +90,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BLOB_CREATORS
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.config import validate_runtime_node_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
@@ -614,8 +615,12 @@ class _FakeComposeLLM:
         *,
         provider_custody: object | None = None,
         credential_state: CompositionState | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
-        del provider_custody, credential_state
+        del provider_custody, credential_state, prompt_guard_trusted_message_indexes
+        del prompt_guard_content_parts, prompt_guard_tool_argument_parts
         if not self._responses:
             return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))
@@ -706,12 +711,18 @@ def make_tool_context() -> Any:
 
 
 def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
+    """Use explicit development guard mode for this fake-provider harness.
+
+    Actual physical calls still require fenced custody and durable guard audit.
+    Guard-policy tests can override the mode to exercise required admission.
+    """
     values: dict[str, Any] = {
         "data_dir": data_dir,
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     values.update(overrides)

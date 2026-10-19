@@ -2222,8 +2222,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "input": {
                             "type": "string",
                             "description": (
-                                "Connection-name string this node CONSUMES: must equal some "
-                                "upstream's on_success/routes value/on_error, NOT the upstream node's id."
+                                "Upstream published connection this node consumes, normally an on_success or gate route. "
+                                "Valid implicit aggregation/queue/coalesce publications can equal the publisher's node id. "
+                                "For coalesce/row_union use their branch/input rules. Error routes cannot feed arbitrary "
+                                "processing nodes; only a permitted enclosing bound-region closer is eligible."
                             ),
                         },
                         "on_success": {
@@ -2241,7 +2243,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "minLength": 1,
                             "description": (
                                 "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink "
-                                "name. Transforms/aggregations require an explicit non-empty choice; full replacement "
+                                "name. A transform or gate inside a valid bound region may instead divert loss to that "
+                                "enclosing region's closer; aggregations cannot. Arbitrary processing inputs are forbidden. "
+                                "Transforms/aggregations require an explicit non-empty choice; full replacement "
                                 "does not reuse prior choices. For a gate it covers row expression-evaluation errors and is authored on the "
                                 "node, never as an edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
                             ),
@@ -2365,9 +2369,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "sink_name": {
                             "type": "string",
                             "description": (
-                                "Sink name: BOTH the sink's identifier AND the connection-name the sink "
-                                "consumes — it MUST equal some upstream's on_success value; it need not "
-                                "match any node id."
+                                "Sink identifier and routing target: name it from an upstream success/gate route or "
+                                "an eligible source-validation, processing-error or sink-write-failure policy. "
+                                "It need not match a node id."
                             ),
                         },
                         "plugin": {"type": "string"},
@@ -2808,7 +2812,7 @@ def _assert_affected_component(
     # A pending vague_term requirement is only a *resolvable* handoff when the
     # prompt actually carries the substitution wiring the resolver consumes. A
     # requirement staged without a matching ``prompt_template_parts``
-    # ``interpretation_ref`` (or legacy placeholder) produces a review the
+    # ``interpretation_ref`` produces a review the
     # operator can approve but never resolve — the resolver raises at
     # ``prompt_template_parts is required`` (a dead-end 422) or, worse, silently
     # drops the accepted value from the prompt. Reject at the Tier-3 boundary so
@@ -2818,9 +2822,9 @@ def _assert_affected_component(
             argument="affected_node_id",
             expected=(
                 f"node {affected_node_id!r} to wire the requested interpretation into the prompt — "
-                "exactly one prompt_template_parts entry "
-                '{"kind": "interpretation_ref", "requirement_id": "<the pending requirement id>"} '
-                "referencing the requirement, or exactly one legacy interpretation placeholder in options.prompt_template"
+                "one matching pending vague_term requirement with at least one matching interpretation_ref "
+                "in prompt_template_parts (repeated slots are supported); "
+                "legacy-only: exactly one placeholder with no matching pending vague_term requirement"
             ),
             actual_type=("pending vague_term requirement with no resolvable prompt wiring (the operator's resolve would dead-end)"),
         )

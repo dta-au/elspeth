@@ -54,7 +54,6 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
@@ -63,6 +62,7 @@ from elspeth.web.composer.diagnostic_evidence import (
 )
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.protocol import (
     ComposerPluginCrashError,
     ComposerResult,
@@ -767,6 +767,71 @@ def _make_progress_route_app(tmp_path: Path, *, user_id: str = "alice") -> tuple
     return app, service
 
 
+def _install_required_route_prompt_shields(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> tuple[PromptGuardMount, list[dict[str, Any]]]:
+    """Exercise the real Azure client/parser; replace only its external HTTP."""
+    import httpx
+    from pydantic import SecretStr
+
+    from elspeth.web.composer import prompt_guard_clients
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
+
+    guard_settings = PromptGuardSettings(
+        endpoint="https://route-shields.example.test",
+        subscription_key=SecretStr("route-shields-fixture-key"),
+    )
+    requests: list[dict[str, Any]] = []
+
+    def inspect_http(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://route-shields.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+        assert request.headers["Ocp-Apim-Subscription-Key"] == "route-shields-fixture-key"
+        payload = json.loads(request.content)
+        assert type(payload) is dict and set(payload) == {"userPrompt", "documents"}
+        assert type(payload["userPrompt"]) is str and payload["userPrompt"]
+        assert type(payload["documents"]) is list and all(type(item) is str for item in payload["documents"])
+        requests.append(payload)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in payload["documents"]],
+            },
+        )
+
+    def build_client(settings: PromptGuardSettings) -> prompt_guard_clients.AzurePromptGuardClient:
+        assert settings is guard_settings
+        return prompt_guard_clients.AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(inspect_http))
+
+    monkeypatch.setattr(prompt_guard_clients, "build_prompt_guard_client", build_client)
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "composer_prompt_guard_mode": "required",
+            "composer_prompt_guard": guard_settings,
+            "composer_advisor_prompt_guard": guard_settings,
+        }
+    )
+    return PromptGuardMount(build_client(guard_settings)), requests
+
+
+def _assert_required_route_guard_checks(
+    envelopes: Sequence[Mapping[str, Any]], mount: PromptGuardMount, *, roles: list[str]
+) -> None:
+    checks = [envelope["check"] for envelope in envelopes if envelope["_kind"] == "prompt_guard_audit"]
+    assert [check["role"] for check in checks] == roles
+    assert len({check["audit_id"] for check in checks}) == len(roles)
+    assert len({(check["operation_id"], check["operation_epoch"]) for check in checks}) == 1
+    for check in checks:
+        assert check["schema_version"] == 1
+        assert check["mode"] == "required"
+        assert check["adapter"] == "azure_prompt_shields"
+        assert check["policy_fingerprint"] == mount.client.policy_fingerprint
+        assert check["disposition"] == "allow" and check["reason"] == "clean"
+        assert type(check["operation_epoch"]) is int and check["operation_epoch"] > 0
+        assert len(check["request_hash"]) == 64
+
+
 def _make_app(
     tmp_path: Path,
     user_id: str = "alice",
@@ -999,17 +1064,22 @@ def test_send_message_response_includes_empty_proposals_array(tmp_path) -> None:
 def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     import httpx
 
+    physical_title_calls = 0
+
     async def title_provider_failure(**_kwargs: object) -> object:
+        nonlocal physical_title_calls
+        physical_title_calls += 1
+        assert guard_requests
         raise httpx.ConnectError("private upstream response body")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", title_provider_failure)
+    monkeypatch.setattr("litellm.acompletion", title_provider_failure)
     app, _service = _make_app(tmp_path)
+    guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
     # Auto-title and compose use independent workers. A single StaticPool
     # connection cannot model their overlapping SQLite transactions.
     engine = create_session_engine(f"sqlite:///{tmp_path / 'auto-title-sessions.db'}")
     initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="alice")
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
     app.state.session_service = FencedSessionServiceHarness(
         engine,
         telemetry=app.state.sessions_telemetry,
@@ -1018,7 +1088,9 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
     app.state.session_engine = engine
     install_composer_rate_limiter(app, limit=100)
     install_composer_async_worker(app)
-    app.state.composer_service = _make_composer_mock(response_text="Here is your answer.")
+    composer = _make_composer_mock(response_text="Here is your answer.")
+    composer.composer_prompt_guard_mount = guard_mount
+    app.state.composer_service = composer
     client = TestClient(app)
     session = client.post("/api/sessions", json={}).json()
 
@@ -1035,6 +1107,14 @@ def test_send_message_keeps_assistant_reply_when_auto_title_transport_fails(tmp_
     messages = client.get(f"/api/sessions/{session['id']}/messages")
     assert messages.status_code == 200
     assert any(row["role"] == "assistant" and row["content"] == "Here is your answer." for row in messages.json())
+
+    assert physical_title_calls == 1
+    assert all(request["userPrompt"] == "Build a CSV pipeline" for request in guard_requests)
+    records = asyncio.run(app.state.session_service.get_messages(uuid.UUID(session["id"]), limit=None))
+    audit = [record.tool_calls[0] for record in records if record.role == "audit"]
+    assert [envelope["_kind"] for envelope in audit] == ["prompt_guard_audit", "llm_call_audit"]
+    _assert_required_route_guard_checks(audit, guard_mount, roles=["composer"])
+    assert audit[1]["call"]["error_class"] == "_AutoTitleProviderTransportError"
 
 
 def test_send_message_response_includes_pending_proposals_created_during_compose(tmp_path) -> None:
@@ -5900,6 +5980,7 @@ class TestMessageRoutes:
         }
 
         app, service = _make_app(tmp_path)
+        guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
         app.state.settings = app.state.settings.model_copy(
             update={
                 "composer_model": "test/planner",
@@ -6110,7 +6191,18 @@ class TestMessageRoutes:
         physical = [envelope for envelope in envelopes if envelope["_kind"] == "llm_call_audit"]
         attempts = [envelope for envelope in envelopes if envelope["_kind"] == "planner_attempt_audit"]
         passes = [envelope for envelope in envelopes if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND]
-        assert len(envelopes) == 6
+        assert len(envelopes) == 9
+        assert [envelope["_kind"] for envelope in envelopes] == [
+            "prompt_guard_audit", "llm_call_audit", "prompt_guard_audit", "llm_call_audit",
+            "planner_attempt_audit", "planner_attempt_audit", "prompt_guard_audit", "llm_call_audit",
+            ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
+        ]
+        _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "advisor", "advisor"])
+        assert guard_requests
+        assert all(
+            request["userPrompt"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
+            for request in guard_requests
+        )
         assert len(physical) == 3 and len(attempts) == 2 and len(passes) == 1
         planner_cohort = [
             envelope
@@ -6853,6 +6945,7 @@ class TestLiteLLMErrorRedaction:
             lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
         )
         app, service = _make_app(tmp_path, quota_enabled=True)
+        guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
         app.state.settings = app.state.settings.model_copy(update={"composer_model": "test/planner", "composer_boot_probe_enabled": False})
         app.state.composer_service = ComposerServiceImpl(
             app.state.catalog_service,
@@ -6889,6 +6982,18 @@ class TestLiteLLMErrorRedaction:
         assert audit_rows[0][1]["call"]["error_class"] == "ServiceUnavailableError"
         assert secret not in str(audit_rows)
         assert not any(record.role == "assistant" for record in records)
+        audit = [record.tool_calls[0] for record in records if record.role == "audit"]
+        assert [envelope["_kind"] for envelope in audit] == [
+            "prompt_guard_audit", "llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND, DIAGNOSTIC_EVIDENCE_KIND,
+            "prompt_guard_audit", DIAGNOSTIC_EVIDENCE_KIND,
+        ]
+        _assert_required_route_guard_checks(audit, guard_mount, roles=["composer", "composer"])
+        private = [
+            ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id))
+            for envelope in audit if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+        ]
+        assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
+        assert guard_requests and all(request["userPrompt"] == "Hello" for request in guard_requests)
         with service._engine.connect() as connection:
             attempts = connection.execute(select(quota_provider_attempts_table)).all()
             usage = connection.execute(select(token_usage_ledger_table)).all()
@@ -10793,6 +10898,7 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
     from elspeth.web.sessions.routes import _composer_chat_history
 
     app, service = _make_app(tmp_path)
+    guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
     app.state.settings = app.state.settings.model_copy(
         update={"composer_model": "test/planner", "composer_boot_probe_enabled": False, "composer_planner_repair_budget": 0}
     )
@@ -10862,6 +10968,20 @@ def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
     assert provider_history.count({"role": "user", "content": "Try again"}) == 1
     assert not any(message["role"] == "assistant" and message["content"] == "" for message in provider_history)
     assert operator_suffix not in str(provider_history)
+
+    records = asyncio.run(service.get_messages(session_id, limit=None))
+    audit = [record.tool_calls[0] for record in records if record.role == "audit"]
+    assert [envelope["_kind"] for envelope in audit] == [
+        "prompt_guard_audit", "llm_call_audit", DIAGNOSTIC_EVIDENCE_KIND,
+        DIAGNOSTIC_EVIDENCE_KIND, DIAGNOSTIC_EVIDENCE_KIND,
+    ]
+    _assert_required_route_guard_checks(audit, guard_mount, roles=["composer"])
+    private = [
+        ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id))
+        for envelope in audit if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+    ]
+    assert [evidence.status for evidence in private] == ["provider_request", "provider_failure", "operation_failure"]
+    assert guard_requests and all(request["userPrompt"] == "Try again" for request in guard_requests)
 
 
 def test_composer_chat_history_skips_audit_tool_messages() -> None:

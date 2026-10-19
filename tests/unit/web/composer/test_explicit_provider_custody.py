@@ -1,14 +1,20 @@
 """Explicit provider boundary accounting uses the real session authority and SQL."""
 
+import json
 from contextlib import suppress
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.composer import prompt_guard_clients
+from elspeth.web.composer.prompt_guard import build_prompt_guard_mount, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -18,7 +24,51 @@ from elspeth.web.required_work import (
     RequiredWorkSource,
 )
 from tests.unit.web.composer.test_llm_sampling_config import _settings
+from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
+
+
+def _required_guard_settings(tmp_path, monkeypatch):
+    """Keep real required admission and replace only the external Azure HTTP boundary."""
+    requests = []
+
+    def serve(request):
+        requests.append(request)
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in body["documents"]],
+            },
+        )
+
+    def client_factory(settings):
+        return AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(serve))
+
+    monkeypatch.setattr(prompt_guard_clients, "build_prompt_guard_client", client_factory)
+    guard = PromptGuardSettings(endpoint="https://guard.example.test", subscription_key="fixture-guard-credential")
+    settings = _settings(
+        tmp_path,
+        composer_prompt_guard=guard,
+        composer_advisor_prompt_guard=guard,
+        composer_prompt_guard_mode="required",
+    )
+    return settings, requests
+
+
+def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt):
+    checks = _checks(engine)
+    assert len(checks) == 1
+    check = checks[0]
+    assert check["operation_id"] == context.fence.operation_id
+    assert check["operation_epoch"] == context.fence.operation_epoch
+    assert check["role"] == role
+    assert check["adapter"] == "azure_prompt_shields"
+    assert check["mode"] == "required"
+    assert (check["disposition"], check["reason"]) == ("allow", "clean")
+    assert requests
+    assert all(json.loads(request.content)["userPrompt"] == user_prompt for request in requests)
 
 
 @pytest.mark.asyncio
@@ -27,6 +77,8 @@ async def test_required_gateway_without_recorder_retains_and_settles_actual_audi
     import litellm
     from litellm import ModelResponse
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Reply to this ordinary custody request."
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="explicit", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -42,6 +94,7 @@ async def test_required_gateway_without_recorder_retains_and_settles_actual_audi
     physical_calls = []
 
     async def completion(**kwargs):
+        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         assert "provider_custody" not in kwargs
         assert custody.attempt is not None
         physical_calls.append(custody.attempt)
@@ -52,15 +105,18 @@ async def test_required_gateway_without_recorder_retains_and_settles_actual_audi
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    gateway = ProviderGateway(model="test/model", settings=_settings(tmp_path), endpoint_base_url=None, endpoint_api_key=None)
-    result = await gateway._call_llm_with_audit([], [], timeout=5, recorder=None, provider_custody=custody)
+    gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
+    with prompt_guard_user_scope(user_prompt):
+        result = await gateway._call_llm_with_audit(
+            [{"role": "user", "content": user_prompt}], [], timeout=5, recorder=None, provider_custody=custody
+        )
     assert result.message.content == "An ordinary provider reply."
     assert len(physical_calls) == 1
     assert len(_ledger(engine)) == 1
     assert custody.attempt is None and custody.call is None
     coordinator.assert_completed()
     sources = {ticket.key.source for ticket in coordinator._tickets.values()}
-    assert sources == (
+    assert sources == {RequiredWorkSource.DISPATCH_AUDIT_SQL, RequiredWorkSource.DISPATCH_AUDIT_PROJECTION} | (
         {
             RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL,
             RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION,
@@ -112,6 +168,8 @@ async def test_sdk_and_audit_construction_failure_retain_originals_and_unknown_a
 
     from elspeth.web.composer import provider_gateway
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Reply before the deliberate SDK and audit faults."
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="audit failure", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -128,6 +186,7 @@ async def test_sdk_and_audit_construction_failure_retain_originals_and_unknown_a
     audit_error = RuntimeError("audit-construction error canary")
 
     async def completion(**kwargs):
+        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         raise sdk_error
 
     def broken_audit(**kwargs):
@@ -135,9 +194,11 @@ async def test_sdk_and_audit_construction_failure_retain_originals_and_unknown_a
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(provider_gateway, "build_llm_call_record", broken_audit)
-    gateway = ProviderGateway(model="test/model", settings=_settings(tmp_path), endpoint_base_url=None, endpoint_api_key=None)
-    with pytest.raises(BaseExceptionGroup) as caught:
-        await gateway._call_llm_with_audit([], [], timeout=5, recorder=None, provider_custody=custody)
+    gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
+    with prompt_guard_user_scope(user_prompt), pytest.raises(BaseExceptionGroup) as caught:
+        await gateway._call_llm_with_audit(
+            [{"role": "user", "content": user_prompt}], [], timeout=5, recorder=None, provider_custody=custody
+        )
 
     def leaves(error):
         if isinstance(error, BaseExceptionGroup):
@@ -162,6 +223,8 @@ async def test_actual_title_producer_settles_provider_then_owned_title_sql(tmp_p
 
     from elspeth.web.sessions._auto_title import _maybe_auto_title_session_required
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Name this session"
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="New session", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -177,6 +240,7 @@ async def test_actual_title_producer_settles_provider_then_owned_title_sql(tmp_p
     dispatched = []
 
     async def completion(**kwargs):
+        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         assert custody.attempt is not None
         dispatched.append(custody.attempt)
         return ModelResponse(
@@ -186,18 +250,22 @@ async def test_actual_title_producer_settles_provider_then_owned_title_sql(tmp_p
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    audit_messages = [{"role": "user", "content": "Name this session"}]
-    await _maybe_auto_title_session_required(
-        service=service,
-        session_id=session.id,
-        model="test/model",
-        temperature=None,
-        seed=None,
-        session_operation_context=context,
-        kwargs={"model": "test/model", "messages": audit_messages},
-        audit_messages=audit_messages,
-        provider_custody=custody,
-    )
+    audit_messages = [{"role": "user", "content": user_prompt}]
+    with prompt_guard_user_scope(user_prompt):
+        await _maybe_auto_title_session_required(
+            service=service,
+            session_id=session.id,
+            model="test/model",
+            temperature=None,
+            seed=None,
+            session_operation_context=context,
+            kwargs={"model": "test/model", "messages": audit_messages},
+            audit_messages=audit_messages,
+            provider_custody=custody,
+            prompt_guard_mount=build_prompt_guard_mount(settings.composer_prompt_guard),
+            prompt_guard_mode=settings.composer_prompt_guard_mode,
+            user_message=user_prompt,
+        )
     assert len(dispatched) == 1
     assert (await service.get_session(session.id)).title == "Reviewed provider title"
     assert len(_ledger(engine)) == 1
@@ -208,6 +276,8 @@ async def test_actual_title_producer_settles_provider_then_owned_title_sql(tmp_p
         RequiredWorkSource.TITLE_PROVIDER_SETTLEMENT_SQL,
         RequiredWorkSource.TITLE_ACCOUNTING_SQL,
         RequiredWorkSource.TITLE_ACCOUNTING_PROJECTION,
+        RequiredWorkSource.DISPATCH_AUDIT_SQL,
+        RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
     }
     authority.release(context)
     engine.dispose()
@@ -224,6 +294,8 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
     from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
     from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Review the source fields for this ordinary request."
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="Advisor", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -236,7 +308,7 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
     )
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
     advisor = AdvisorCheckpointOwner(
-        settings=_settings(tmp_path),
+        settings=settings,
         composer_skill_text="Ordinary composer instructions",
         advisor_endpoint_base_url=None,
         advisor_endpoint_api_key=None,
@@ -247,6 +319,7 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
     cancellations = []
 
     async def completion(**kwargs):
+        _assert_required_guard_admitted(engine, context, guard_requests, role="advisor", user_prompt=user_prompt)
         entered.set()
         if cancel_sdk:
             try:
@@ -261,14 +334,15 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    task = asyncio.create_task(
-        advisor._call_advisor_with_audit(
-            {"trigger": "reactive", "problem_summary": "Review source fields", "recent_errors": [], "attempted_actions": []},
-            recorder=None,
-            timeout=5,
-            provider_owner=owner,
+    with prompt_guard_user_scope(user_prompt):
+        task = asyncio.create_task(
+            advisor._call_advisor_with_audit(
+                {"trigger": "reactive", "problem_summary": "Review source fields", "recent_errors": [], "attempted_actions": []},
+                recorder=None,
+                timeout=5,
+                provider_owner=owner,
+            )
         )
-    )
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
     except TimeoutError:
@@ -293,6 +367,8 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
         RequiredWorkSource.PROVIDER_ADMISSION_PROJECTION,
         RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,
         RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION,
+        RequiredWorkSource.DISPATCH_AUDIT_SQL,
+        RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
     }
     authority.release(context)
     engine.dispose()
@@ -320,6 +396,8 @@ async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call
         _ScriptedCompletion,
     )
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Build the requested pipeline."
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="Planner", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -338,13 +416,14 @@ async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call
     physical_calls = []
 
     async def completion(**kwargs):
+        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         physical_calls.append(kwargs)
         raise sdk_error
 
     monkeypatch.setattr(litellm, "acompletion", completion)
-    with pytest.raises(ValueError) as caught:
+    with prompt_guard_user_scope(user_prompt), pytest.raises(ValueError) as caught:
         await plan_pipeline(
-            intent="Build the requested pipeline.",
+            intent=user_prompt,
             current_state=_empty_state(),
             provider_current_state=_empty_state().to_dict(),
             schemas_loaded=frozenset(),
@@ -355,7 +434,11 @@ async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call
                 session_id=str(session.id), message_id=str(uuid4()), content="Build the requested pipeline.", user_id="alice"
             ),
             base=AbsentBase(),
-            model_config=_model(_ScriptedCompletion([])),
+            model_config=_model(
+                _ScriptedCompletion([]),
+                prompt_guard_mount=build_prompt_guard_mount(settings.composer_prompt_guard),
+                prompt_guard_mode=settings.composer_prompt_guard_mode,
+            ),
             rendered_skill=load_pipeline_capability_core() + "\nOrdinary bounded planner instructions.",
             repair_budget=0,
             budget_policy=_budget(),
@@ -386,6 +469,8 @@ async def test_callback_failure_is_actual_undispatched_disposition_and_never_sdk
     from elspeth.web.composer.provider_quota import provider_call_scope
     from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Exercise the owned pre-dispatch callback."
     engine, authority, service = _quota_service(tmp_path)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="Callback", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
@@ -406,6 +491,7 @@ async def test_callback_failure_is_actual_undispatched_disposition_and_never_sdk
         raise AssertionError("Physical SDK must not begin after callback failure")
 
     def callback():
+        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         assert custody.attempt is not None
         assert not custody.needs_terminal_audit()
         raise callback_error
@@ -414,9 +500,18 @@ async def test_callback_failure_is_actual_undispatched_disposition_and_never_sdk
     with pytest.raises(AssertionError):
         await litellm.acompletion(model="test/model", messages=[])
     sdk_entries.clear()
-    with pytest.raises(ValueError) as caught:
+    with prompt_guard_user_scope(user_prompt), pytest.raises(ValueError) as caught:
         async with provider_call_scope(custody):
-            await _litellm_acompletion(provider_custody=custody, on_provider_dispatch=callback, model="test/model", messages=[])
+            await _litellm_acompletion(
+                provider_custody=custody,
+                on_provider_dispatch=callback,
+                prompt_guard_mount=build_prompt_guard_mount(settings.composer_prompt_guard),
+                prompt_guard_mode=settings.composer_prompt_guard_mode,
+                prompt_guard_role="composer",
+                prompt_guard_user_prompt=user_prompt,
+                model="test/model",
+                messages=[{"role": "user", "content": user_prompt}],
+            )
     assert caught.value is callback_error
     assert sdk_entries == []
     assert custody.attempt is None and custody.call is None
@@ -425,12 +520,21 @@ async def test_callback_failure_is_actual_undispatched_disposition_and_never_sdk
         attempt = connection.execute(select(quota_provider_attempts_table)).one()
         messages = connection.execute(select(chat_messages_table)).all()
     assert attempt.settled_at is not None
-    assert len(messages) == 1
-    assert "provider_attempt.cancelled_before_dispatch" in messages[0].content
+    assert len(messages) == 2
+    cancelled_messages = [row for row in messages if row.tool_calls is None]
+    assert len(cancelled_messages) == 1
+    assert "provider_attempt.cancelled_before_dispatch" in cancelled_messages[0].content
+    cancellation = json.loads(cancelled_messages[0].content)
+    assert cancellation["kind"] == "provider_attempt.cancelled_before_dispatch"
+    assert cancellation["attempt_id"] == attempt.attempt_id
+    assert cancellation["operation_id"] == context.fence.operation_id
+    assert cancellation["operation_epoch"] == context.fence.operation_epoch
     assert {ticket.key.source for ticket in coordinator._tickets.values()} == {
         RequiredWorkSource.PROVIDER_ADMISSION_SQL,
         RequiredWorkSource.PROVIDER_ADMISSION_PROJECTION,
         RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
+        RequiredWorkSource.DISPATCH_AUDIT_SQL,
+        RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
     }
     authority.release(context)
     engine.dispose()

@@ -339,7 +339,9 @@ class TestGatewayPrivateOptionsCoverage:
     # these AND NOT added to _LLM_PRIVATE_OPTIONS fails this test loudly.
     _DELIBERATELY_PUBLIC_FIELDS = frozenset(
         {
+            "allow_blank_input_fields",
             "image_inputs",
+            "input_checks",
             "lookup",
             "max_image_bytes",
             "max_images_per_call",
@@ -348,6 +350,7 @@ class TestGatewayPrivateOptionsCoverage:
             "queries",
             "query_input_mode",
             "response_format",
+            "result_checks",
             "required_input_fields",
             "response_field",
             "schema_config",

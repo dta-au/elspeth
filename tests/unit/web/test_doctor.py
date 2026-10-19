@@ -694,7 +694,7 @@ def test_trust_root_check_formats_real_digest_mismatch_detail(
     "target",
     ["docker-compose", "linux-systemd", "aws-ecs", "azure-container-apps", "kubernetes"],
 )
-def test_deployment_collector_has_identical_common_contract_for_every_external_target(
+def test_deployment_collector_retains_common_contract_and_aca_tls_checks(
     target: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -727,6 +727,7 @@ def test_deployment_collector_has_identical_common_contract_for_every_external_t
         "psycopg_dependency",
         "psycopg2_dependency",
         "jinja2_dependency",
+        *(["session_tls", "landscape_tls"] if target == "azure-container-apps" else []),
         "session_schema",
         "landscape_schema",
     ]
@@ -773,6 +774,52 @@ def test_deployment_init_schema_rejects_sqlite_mode_before_any_database_work(
     )
     assert checks["session_schema"].ok is False
     assert checks["landscape_schema"].ok is False
+
+
+@pytest.mark.parametrize("field", ["session_db_url", "landscape_url"])
+def test_aca_failed_tls_url_blocks_all_database_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str) -> None:
+    settings = _settings(tmp_path, deployment_target="azure-container-apps").model_copy(
+        update={field: "postgresql+psycopg://user:password@db/unverified?sslmode=require"}
+    )
+    inspector = create_autospec(doctor._inspect_database, side_effect=AssertionError("must not inspect"))
+    initializer = create_autospec(doctor._initialize_database, side_effect=AssertionError("must not initialize"))
+    monkeypatch.setattr(doctor, "_inspect_database", inspector)
+    monkeypatch.setattr(doctor, "_initialize_database", initializer)
+
+    checks = _by_name(collect_deployment_checks(settings, init_schema=True))
+
+    assert checks[field].ok is False
+    assert checks["session_tls"].ok is False
+    assert checks["landscape_tls"].ok is False
+    inspector.assert_not_called()
+    initializer.assert_not_called()
+
+
+@pytest.mark.parametrize("tls_ok", [False, True])
+def test_aca_collects_preflight_tls_and_blocks_initialization_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_ok: bool
+) -> None:
+    def inspect(
+        label: str, _url: str, _probe: object, *, require_authenticated_tls: bool
+    ) -> tuple[SchemaState | None, ContractCheck, ContractCheck | None]:
+        assert require_authenticated_tls is True
+        tls_name = "session_tls" if label == "session_schema" else "landscape_tls"
+        return SchemaState.MISSING, schema_check(label, SchemaState.MISSING), ContractCheck(tls_name, tls_ok, "TLS result")
+
+    initializer = create_autospec(doctor._initialize_database, return_value=ContractCheck("initialized", True, "initialized"))
+    monkeypatch.setattr(doctor, "_inspect_database", inspect)
+    monkeypatch.setattr(doctor, "_initialize_database", initializer)
+    _patch_auxiliary_checks_green(monkeypatch)
+    monkeypatch.setattr(doctor, "plugin_and_dependency_checks", lambda **_kwargs: [])
+
+    checks = _by_name(collect_deployment_checks(_settings(tmp_path, deployment_target="azure-container-apps"), init_schema=True))
+
+    assert checks["session_tls"].ok is tls_ok
+    assert checks["landscape_tls"].ok is tls_ok
+    if tls_ok:
+        assert initializer.call_count == 2
+    else:
+        initializer.assert_not_called()
 
 
 def test_aws_compatibility_collector_rejects_non_aws_target_before_common_collection(

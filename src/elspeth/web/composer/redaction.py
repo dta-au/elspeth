@@ -3443,8 +3443,9 @@ class _ToolResultResponseModel(BaseModel):
 _INSPECT_SOURCE_REASON = HandlesNoSensitiveDataReason(
     sensitive_data_locations=("source inspection facts — headers / types / URL candidates, never raw row content",),
     why_arguments_safe=(
-        "inspect_source accepts a single blob_id scalar string selecting one inventory "
-        "row; the handler reads at most 8 KiB and parses at most 100 rows, returning only "
+        "inspect_source accepts a blob_id scalar string selecting one inventory row "
+        "and an optional bounded encoding scalar selecting CSV/TSV decoding. "
+        "The handler reads at most 8 KiB and parses at most 100 rows, returning only "
         "structural facts; the schema and redaction allowlist reject or strip any other keys."
     ),
     why_responses_safe=(
@@ -3942,7 +3943,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         ),
         "inspect_source": ToolRedaction(
             policy=ToolRedactionPolicy(
-                known_argument_keys=("blob_id",),
+                known_argument_keys=("blob_id", "encoding"),
                 redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_INSPECT_SOURCE_REASON,

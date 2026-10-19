@@ -419,16 +419,15 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     # run-3 E1: the old unconditional fork-over-queries preference produced a
     # wrong-topology V-pass and 0/3 multi_query adoption where it fit. Shape
     # SELECTION is decided by what varies per assessment, not by preference.
-    "SHAPE SELECTION: several assessments of the SAME input field (aspects, "
-    "angles, questions about one piece of content) belong on a SINGLE llm "
-    "node's queries map (multi_query) — one node, one pass, prefixed output "
-    "fields. Use THIS fork/coalesce shape only when the branches take "
-    "genuinely INDEPENDENT inputs or independent per-branch processing "
-    "chains (different fields, different upstream transforms, different "
-    "plugins per branch).",
-    "When the user explicitly asks for separate nodes or one model call per "
-    "branch over independent inputs, fork with a gate fanning out to one "
-    "branch transform per branch, rejoined by a coalesce.",
+    "SHAPE SELECTION: for several assessments of the SAME input field using "
+    "compatible node-wide model, system prompt and sampling settings, prefer "
+    "a SINGLE llm node's queries map (multi_query) when separate nodes or calls "
+    "were not requested — one node, one pass, default prefixed output fields. Preserve "
+    "requested separate branches even when their input is the same. Use "
+    "fork/coalesce when branch settings, inputs or processing chains differ.",
+    "When the user explicitly asks for separate branches or one model call per "
+    "branch, fork with a gate fanning out to one branch transform per branch, "
+    "rejoined by a coalesce; do not compact away the requested topology.",
     "Key the coalesce branches map by FORK BRANCH NAME; each value names the "
     "connection arriving at the coalesce after that branch's transforms.",
     "When branches rejoin at a coalesce, each branch transform MUST publish "
@@ -443,10 +442,14 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
     # only, and a planner asked for an A/B of two prompts cloned it key for
     # key — both arms shipped with no system prompt.
-    "Every llm node carries BOTH prompt roles: options.system_prompt (the "
-    "model's role and task constraints) and options.prompt_template (the row "
-    "data and the requested reply). Validation rejects an llm node missing "
-    "either. When the user supplies only one role, keep theirs verbatim and "
+    "Every llm node needs BOTH prompt roles: options.system_prompt (the "
+    "model's role and task constraints) and an effective user template for "
+    "the row data and requested reply. In single-prompt mode use "
+    "options.prompt_template. In multi_query, each query's template may "
+    "supply the user role, with options.prompt_template as the fallback; a "
+    "node-level template is unnecessary when every query supplies its own. "
+    "Validation rejects missing effective roles. When the user supplies only "
+    "one role, keep theirs verbatim and "
     "author the other from the task, or ask. Arms that differ only in role or "
     "persona keep the SAME prompt_template and vary system_prompt — which is "
     "itself a reason to fork: system_prompt is shared by every query on a "
@@ -465,11 +468,11 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "via prompt_template_parts, registered pipeline_decision, "
     "invented_source), each in the short form {kind, user_term, draft} with "
     "user_term mandatory.",
-    "Coalesce policy and merge are the engine's closed vocabularies: policy "
-    "is one of require_all, quorum, best_effort, first; merge is one of "
-    "union, nested, select. Use best_effort when some branches may "
-    "legitimately produce no row for an id — it merges whichever branches "
-    "arrive, where require_all would drop the whole row.",
+    "Composer-authored coalesces support policy require_all, best_effort "
+    "(requires timeout_seconds), or first, and merge union or nested. Engine "
+    "quorum/select require fields this surface cannot author. Use best_effort "
+    "with an explicit timeout when partial branch arrival is intended; it "
+    "merges arriving branches where require_all would drop an incomplete row.",
     "A coalesce consumes ONLY the connections named in its branches values. "
     "Its input field is required by the schema but is not a consuming "
     "binding — set it to the first branch's arriving connection by "
@@ -649,7 +652,7 @@ def _raw_html_cleanup_rules(*, untrusted_producers: tuple[str, ...]) -> list[str
         f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}} '
         "— copy the user_term and draft strings verbatim.",
         "The row is RECOGNIZED only when the draft text names both the raw HTML "
-        "and the fingerprint fields — a paraphrased draft is treated as absent "
+        "and the fingerprint fields — a paraphrase omitting either marker is treated as absent "
         "and the same rejection fires again.",
         "An explicit user instruction to drop the fields does NOT waive the row — it records that decision for the audit trail.",
     ]
@@ -774,33 +777,30 @@ _LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
     "quarantine sink instead of discard."
 )
 
-# Rendered with the deployment's selected output control. A quarantine sink is
-# genuinely unavailable to an llm node here: on_error may only name a sink or
-# 'discard' (core/dag/builder.py:1108), so no control transform can be
-# interposed on an error branch, and any sink it names is an uncontrolled write.
+# Direct error-to-sink routes before the selected output control bypass it.
+# The enclosing-closer exception does not waive topology or control coverage.
 _LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE: Final[str] = (
     "This deployment REQUIRES the {control} control on every path carrying llm "
-    "output, so an llm node's on_error MUST be 'discard'. An on_error edge "
-    "names a SINK (or 'discard') and nothing else — no control transform can "
-    "sit on an error branch — so a quarantine sink for an llm node is an "
-    "uncontrolled write path and the pipeline is rejected. Do NOT try to wire "
-    "{control} onto the error branch; that connection has no producer and fails "
-    "graph construction. The same applies to any transform between the llm node "
-    "and the {control} transform; downstream OF that control, on_error may name "
-    "a quarantine sink normally, as may transforms that never carry llm output."
+    "output. Before that control, use on_error='discard' rather than a direct "
+    "quarantine sink: that sink would be an uncontrolled write path and is rejected. "
+    "An arbitrary processing transform cannot consume an on_error route, so do not "
+    "try to insert {control} directly on that route. A transform or gate inside a "
+    "valid bound region may divert loss to its enclosing closer; this exception "
+    "still must satisfy topology and required-control coverage and does not "
+    "authorize an uncontrolled sink. The same coverage rule applies to transforms "
+    "between the llm node and {control}. Downstream OF that control, or for "
+    "transforms that never carry llm output, a quarantine sink may be eligible."
 )
 
-# The author cannot satisfy "retain the failed rows" here, so the rule names who
-# can. Without this the planner reads the requirement as a bug and burns its
-# repair budget re-attempting quarantine shapes.
+# Name the tradeoff when the supported controlled topology requires discard.
 _LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE: Final[str] = (
     "'discard' costs the failed row's CONTENT, not the record of it: nothing "
     "reaches a sink to inspect later, while the audit trail still records the "
-    "row's terminal outcome and content hash. If the user needs failed llm rows "
-    "preserved in a quarantine sink, say plainly that this is an operator "
-    "decision, not something to author around — the operator relaxes the "
-    "{control} control mode to 'recommend', or the pipeline runs under the "
-    "CLI/batch runtime. Do not keep re-attempting quarantine shapes."
+    "row's terminal outcome and content hash. If failed llm rows must be "
+    "preserved and no supported topology satisfies the required {control} "
+    "coverage, disclose that limitation and ask the operator for a supported "
+    "workflow or an explicit policy decision. Never relax the control or switch "
+    "execution surfaces to evade it. Do not keep re-attempting rejected quarantine shapes."
 )
 
 
@@ -834,16 +834,21 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # prompt fed reference_join key_field with on_miss:fail + on_error:
     # discard — one 'Billing.' or lowercase reply silently drops the row.
     # The API-native constraint exists and was untaught.
-    "When an llm node's output field feeds a downstream EXACT-MATCH "
-    "consumer — a reference_join key_field, a gate condition comparing "
-    "against literals, or any lookup key — declare that field via "
+    "When an llm node's output field must match a known CLOSED STRING "
+    "VOCABULARY — for example a reference_join label key or an exact-label "
+    "gate condition — declare that field via "
     "output_fields with type: 'enum' and the closed values list, and set "
-    "response_format: 'structured' so the constraint is API-enforced "
-    "(off-vocabulary replies become structurally impossible). Never rely "
-    "on a free-text prompt instruction for a value another node matches "
+    "response_format: 'structured' to request a native schema where the "
+    "provider supports it. ELSPETH validates the reply and rejects invalid "
+    "values; do not assume off-vocabulary replies are impossible. Numeric "
+    "threshold fields retain their numeric type; open-domain identifiers "
+    "retain their actual schema type rather than an invented enum. Validate "
+    "them and choose a suitable miss policy. Never rely only "
+    "on a free-text prompt instruction for a closed label another node matches "
     "exactly: reference_join has no normalization option, so one "
-    "mis-spelled, punctuated, or re-cased reply errors the join and, "
-    "under on_error: 'discard', silently drops the row.",
+    "mis-spelled, punctuated, or re-cased reply can miss the lookup. The "
+    "reference_join on_miss policy chooses fail, null or default; with fail, "
+    "the row follows on_error, and discard is audited row loss.",
     # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
     # widened field_mapper AND the sink's fixed schema to 'any' instead of
     # narrowing once at a type_coerce.
@@ -868,20 +873,23 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # fields, so downstream nodes can require them by exact name.
     "Each query key names its output row fields by PREFIX: the raw reply "
     "lands in <query_key>_<response_field>, and each typed output_fields "
-    "entry lands in <query_key>_<suffix>. Downstream mappers and sinks "
-    "reference those exact prefixed names.",
+    "entry defaults to <query_key>_<suffix>. Per-query structured_output_prefix null/omitted keeps that default; "
+    "empty string publishes the bare suffix; a nonempty ASCII identifier stem (at most 64 characters) publishes <stem>_<suffix>. "
+    "This changes only structured row-field names, never response JSON keys or raw/usage/model names. "
+    "Any non-null override requires unique final generated names across ALL queries, including raw/usage/model fields. "
+    "Downstream mappers and sinks reference the exact published names.",
     # run-4 E1: the CLOSED per-query key set + namespace arbitration.
     # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,
     # and list-form name — all valid QueryDefinition keys — so the rule
     # forbade supported configuration by omission and steered planners to
     # drop it or produce a nameless list entry validation rejects.
     "The per-query keys you author are input_fields (REQUIRED), template, "
-    "output_fields, response_format ('standard' or 'structured'; default "
+    "output_fields, structured_output_prefix, response_format ('standard' or 'structured'; default "
     "standard), and max_tokens (a per-query override of the node-level "
     "max_tokens). In mapping form the mapping key supplies the query name; "
     "in LIST form each entry additionally REQUIRES its own name key. There "
     "is NO per-query response_field or schema — output naming comes "
-    "from the query-key prefix and output_fields suffix. Node-level schema output declarations use "
+    "from the query-key prefix (or explicit structured_output_prefix for structured outputs) and output_fields suffix. Node-level schema output declarations use "
     "the exact generated names and must admit the configured output_fields types.",
     "For example, two queries good_colour_pair and approximate_hex can each map input_fields "
     "{shade: colour} and declare output_fields [{suffix: answer, type: string}]. The LLM input "

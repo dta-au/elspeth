@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import create_autospec, patch
+from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from litellm.exceptions import (
@@ -27,38 +27,44 @@ from litellm.exceptions import (
     GuardrailRaisedException,
 )
 
-from elspeth.contracts.chargeable_admission import AdmissionPolicyEvidence, ChargeableAdmissionDecision, QuotaDisposition
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.protocol import ComposerServiceError
+from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
-from elspeth.web.coordination.quota_authority import ProviderAttempt
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.sessions.protocol import SessionServiceProtocol
+from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
 
 
 @pytest.fixture
-def admission_context(composer_service_without_sessions_service: ComposerServiceImpl) -> Iterator[SessionOperationContext]:
-    """Provider error tests begin after an explicit no-quota admission."""
-    sessions = create_autospec(SessionServiceProtocol, instance=True)
-    sessions.assess_chargeable_operation.return_value = ChargeableAdmissionDecision(
-        refusal_reason=None,
-        evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
+def admission_context(composer_service_without_sessions_service: ComposerServiceImpl, tmp_path) -> Iterator[ProviderCallCustody]:
+    """Provider error tests retain the real diagnostics lease and guard audit."""
+    engine, authority, sessions = _quota_service(tmp_path)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="Diagnostics", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
     )
-    sessions.begin_provider_attempt.return_value = ProviderAttempt(attempt_id="diagnostics-attempt", started_at=datetime.now(UTC))
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
     composer_service_without_sessions_service._sessions_service = sessions
     composer_service_without_sessions_service._chargeable_admission = ComposerChargeableAdmission(sessions)
-    context = SessionOperationContext(
-        fence=SessionOperationFence(session_id="diagnostics-session", operation_id="operation", lease_token="token", operation_epoch=1),
-        operation_kind=SessionOperationKind.COMPOSE,
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
     )
-    yield context
-    sessions.begin_provider_attempt.assert_awaited_once_with(session_operation_context=context, source="composer")
-    sessions.finish_provider_attempt.assert_awaited_once()
-    settlement = sessions.finish_provider_attempt.await_args.kwargs
-    assert settlement["session_operation_context"] == context
-    assert settlement["call"].call_id == "diagnostics-attempt"
+    owner = ProviderInvocationOwner(service=sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    yield owner.mint(ProviderInvocationFamily.PRIMARY)
+    coordinator.assert_completed()
+    authority.release(context)
+    engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -75,7 +81,7 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
     composer_service_without_sessions_service: ComposerServiceImpl,
     outcome: str,
     expected_status: ComposerLLMCallStatus,
-    admission_context: SessionOperationContext,
+    admission_context: ProviderCallCustody,
 ) -> None:
     service = composer_service_without_sessions_service
     recorder = BufferingRecorder()
@@ -100,12 +106,16 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
     with patch("litellm.acompletion", new=fake_call_text_llm):
         if outcome == "success":
             assert (
-                await service.explain_run_diagnostics(snapshot, recorder=recorder, session_operation_context=admission_context)
+                await service.explain_run_diagnostics(
+                    snapshot, recorder=recorder, session_operation_context=admission_context.context, provider_custody=admission_context
+                )
                 == "The run is processing one row."
             )
         else:
             with pytest.raises(ComposerServiceError):
-                await service.explain_run_diagnostics(snapshot, recorder=recorder, session_operation_context=admission_context)
+                await service.explain_run_diagnostics(
+                    snapshot, recorder=recorder, session_operation_context=admission_context.context, provider_custody=admission_context
+                )
 
     assert len(recorder.llm_calls) == 1
     call = recorder.llm_calls[0]
@@ -119,7 +129,7 @@ async def test_explain_run_diagnostics_records_each_outbound_call_once(
 @pytest.mark.asyncio
 async def test_explain_run_diagnostics_without_recorder_settles_success_and_usage(
     composer_service_without_sessions_service: ComposerServiceImpl,
-    admission_context: SessionOperationContext,
+    admission_context: ProviderCallCustody,
 ) -> None:
     service = composer_service_without_sessions_service
     sessions = service._sessions_service
@@ -137,7 +147,8 @@ async def test_explain_run_diagnostics_without_recorder_settles_success_and_usag
     ):
         result = await service.explain_run_diagnostics(
             {"run_id": "run-default-recorder", "status": "completed", "rows": []},
-            session_operation_context=admission_context,
+            session_operation_context=admission_context.context,
+            provider_custody=admission_context,
         )
 
     assert result == "The run completed."
@@ -172,7 +183,7 @@ async def test_explain_run_diagnostics_without_recorder_settles_success_and_usag
 async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
     composer_service_without_sessions_service: ComposerServiceImpl,
     exc_factory: Any,
-    admission_context: SessionOperationContext,
+    admission_context: ProviderCallCustody,
 ) -> None:
     """Policy-gate LiteLLM exceptions surface as ``ComposerServiceError``.
 
@@ -200,7 +211,9 @@ async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
         ),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.explain_run_diagnostics(snapshot, session_operation_context=admission_context)
+        await service.explain_run_diagnostics(
+            snapshot, session_operation_context=admission_context.context, provider_custody=admission_context
+        )
 
     # Wrap message mirrors the existing ``LLM unavailable ({type})`` pattern.
     assert "LLM unavailable" in str(exc_info.value)
@@ -212,7 +225,7 @@ async def test_explain_run_diagnostics_wraps_litellm_policy_exceptions(
 async def test_unrelated_exceptions_propagate(
     composer_service_without_sessions_service: ComposerServiceImpl,
     exc_cls: type[BaseException],
-    admission_context: SessionOperationContext,
+    admission_context: ProviderCallCustody,
 ) -> None:
     """Widened catch must NOT swallow unrelated exception types.
 
@@ -237,7 +250,9 @@ async def test_unrelated_exceptions_propagate(
         ) as finish,
         pytest.raises(exc_cls) as exc_info,
     ):
-        await service.explain_run_diagnostics(snapshot, session_operation_context=admission_context)
+        await service.explain_run_diagnostics(
+            snapshot, session_operation_context=admission_context.context, provider_custody=admission_context
+        )
 
     assert exc_info.value is unrelated_exception
     finish.assert_awaited_once()

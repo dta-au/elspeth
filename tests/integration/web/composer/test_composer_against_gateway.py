@@ -40,8 +40,9 @@ both of which are now FIXED; this module is the end-to-end proof of both.
    ``max_tokens=16`` and ``app.py`` re-raises ``ComposerBootConfigError``, so
    the web app failed to boot whenever ``composer_endpoint_base_url``
    pointed at this gateway. The gateway now accepts the alias;
-   ``test_boot_probe_succeeds_against_gateway`` below is the proof at the
-   boot-probe level.
+   sessionless boot probes now remain unqualified because they have no
+   durable guard audit custody. Request-description parity is covered
+   separately by ``test_boot_probe_production_parity.py``.
 
 Note which paths each defect touched, because the asymmetry explains why the
 text round trip passed all along: the primary role's ordinary compose-loop
@@ -59,8 +60,8 @@ What is proven here, durably:
   Composer's actual compose loop against the live gateway -- the provider's
   tool call is admitted, dispatched, and its result recorded.
 - A real text (non-tool) round trip through the same loop.
-- The composer boot probe succeeds against the live gateway with default
-  settings.
+- Sessionless boot descriptions remain unqualified without contacting the
+  gateway or guard, including when operator sampling needs verification.
 - No gateway/agency internals (the inbound bearer, the OAuth client
   secret) leak into persisted chat history, log output, or a raised
   exception's message on a real gateway-side failure.
@@ -70,6 +71,7 @@ What is proven here, durably:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -89,8 +91,22 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import provider_gateway
-from tests.fixtures.identities import ensure_test_identity
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner, composer_quota_scope
+from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl, _ComposeLoopDiagnostics
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --- sys.path shim ------------------------------------------------------
@@ -111,7 +127,6 @@ from mock.upstream import create_mock_upstream_app  # noqa: E402
 
 from elspeth.web.catalog.protocol import CatalogService  # noqa: E402
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary  # noqa: E402
-from elspeth.web.composer.service import ComposerServiceImpl  # noqa: E402
 from elspeth.web.config import WebSettings  # noqa: E402
 from elspeth.web.sessions.engine import create_session_engine  # noqa: E402
 from elspeth.web.sessions.models import chat_messages_table, sessions_table  # noqa: E402
@@ -333,6 +348,7 @@ def _insert_session_row(sessions_service: SessionServiceImpl, session_id: str) -
     now = datetime.now(UTC)
     with sessions_service._engine.begin() as conn:
         ensure_test_identity(conn, identity_id="gateway-e2e-user")
+        grant_test_pipeline_user(conn, identity_id="gateway-e2e-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -345,15 +361,90 @@ def _insert_session_row(sessions_service: SessionServiceImpl, session_id: str) -
                 updated_at=now,
             )
         )
+        seed_session_operation_fence(
+            conn,
+            session_id,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            created_at=now,
+        )
 
 
 def _build_service(tmp_path: Path, base_url: str, sessions_service: SessionServiceImpl, **settings_overrides: Any) -> ComposerServiceImpl:
-    settings = _settings(tmp_path, endpoint_base_url=f"{base_url}/v1", endpoint_api_key=_INBOUND_BEARER, **settings_overrides)
+    local_overrides = {"composer_prompt_guard_mode": "debug-when-unconfigured", **settings_overrides}
+    settings = _settings(tmp_path, endpoint_base_url=f"{base_url}/v1", endpoint_api_key=_INBOUND_BEARER, **local_overrides)
     return ComposerServiceImpl.for_trained_operator(
         catalog=_mock_catalog(),
         settings=settings,
         sessions_service=sessions_service,
     )
+
+
+async def _run_gateway_loop_turn(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str,
+    message: str,
+) -> ComposeLoopTestResult:
+    """Mirror the direct loop test driver under actual provider audit custody."""
+    sessions = service._require_sessions_service()
+    async with await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    ) as lease:
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(
+                RequiredAuthorityKind.SYNCHRONOUS_COMPOSE,
+                lease.context,
+                invocation_id=str(uuid4()),
+            )
+        )
+        lease.bind_required_work(coordinator)
+        binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+        owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+        state = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        plugin_snapshot, policy_catalog = service._policy_context.build(None)
+        diagnostics = _ComposeLoopDiagnostics()
+        with composer_quota_scope(sessions, lease.context), prompt_guard_user_scope(message):
+            result = await service._compose_loop(
+                message,
+                [],
+                state,
+                session_id=session_id,
+                initial_current_state_id=None,
+                deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
+                plugin_snapshot=plugin_snapshot,
+                policy_catalog=policy_catalog,
+                session_operation_context=lease.context,
+                diagnostics=diagnostics,
+                required_work=binding,
+                provider_owner=owner,
+            )
+        outcome = ComposeLoopTestResult(
+            assistant_message=result.message,
+            raw_assistant_content=result.raw_assistant_content,
+            persisted_assistant_content=result.persisted_assistant_content,
+            persisted_assistant_matches_terminal_model_turn=result.persisted_assistant_matches_terminal_model_turn,
+            tool_outcomes=diagnostics.tool_outcomes,
+            persisted_assistant_tool_calls=diagnostics.redacted_assistant_tool_calls,
+            persisted_tool_row_content=tuple(row.content for row in diagnostics.redacted_tool_rows),
+            audit_outcome=diagnostics.audit_outcome,
+            pre_state_id=diagnostics.pre_state_id,
+            tool_invocations=result.tool_invocations,
+            runtime_preflight=result.runtime_preflight,
+            advisor_gate_decision=result.advisor_gate_decision,
+        )
+    coordinator.assert_completed()
+    return outcome
 
 
 # ---------------------------------------------------------------------------
@@ -435,9 +526,8 @@ class TestGatewayResponseShapeSatisfiesFreeformAttributeAccess:
 
 @pytest.mark.asyncio
 async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_base_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Drive one real compose-loop turn (``_run_one_turn_for_test``, the
-    dedicated test-only driver that still exercises the real
-    ``_compose_loop`` body) with ``llm=None`` so the REAL ``self._call_llm``
+    """Drive one real compose-loop turn with exact fenced provider custody
+    through the local direct-loop driver so the REAL ``self._call_llm``
     -> real ``litellm.acompletion`` -> live gateway path runs, end to end,
     for a plain text turn. Only the independent END role's SDK response is
     faked; its request construction, strict parser, binding, and audit run."""
@@ -527,7 +617,7 @@ async def test_composer_text_round_trip_against_gateway(tmp_path: Path, gateway_
 
     monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
-    result = await service._run_one_turn_for_test(session_id=session_id, message="hello composer-against-gateway")
+    result = await _run_gateway_loop_turn(service, session_id=session_id, message="hello composer-against-gateway")
     assert unexpected_models == []
     assert len(primary_requests) == len(end_requests) == 1
 
@@ -679,7 +769,7 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
     monkeypatch.setattr(litellm, "acompletion", role_bound_acompletion)
 
-    result = await service._run_one_turn_for_test(session_id=session_id, message="USE_TOOL list_sources {}")
+    result = await _run_gateway_loop_turn(service, session_id=session_id, message="USE_TOOL list_sources {}")
     assert unexpected_models == []
     assert len(primary_calls) == len(primary_replies) == len(conversations) == 2
     assert len(end_calls) == 1
@@ -727,13 +817,10 @@ async def test_composer_tool_round_trip_against_gateway(tmp_path: Path, gateway_
 
 
 # ---------------------------------------------------------------------------
-# The boot probe against the live gateway. The probe sends the planner's
-# production-shaped requests: the 44-tool compose-loop list with
-# ``max_tokens=16`` (which LiteLLM's ``openai`` path translates to the wire
-# field ``max_completion_tokens``; the gateway's ``extra="forbid"``
-# ``ChatRequest`` once rejected that as an unknown field, so boot failed
-# against this gateway), and the pipeline planner's discovery tools plus its
-# terminal with the planner's own token cap. Both must be accepted.
+# Sessionless boot describes the gateway requests without dispatching them.
+# It has no durable guard audit custody, so neither required nor debug mode
+# can qualify the request. Fenced production/request-description parity is
+# covered separately; this section makes no live gateway acceptance claim.
 # ---------------------------------------------------------------------------
 
 
@@ -745,63 +832,60 @@ def _planner_probe_requests(tmp_path: Path, gateway_base_url: str, **overrides: 
 
 
 @pytest.mark.asyncio
-async def test_boot_probe_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
-    """Default settings, real probe, live gateway -- boot is not fatal.
-
-    ``ComposerBootConfigError`` is asserted by absence deliberately rather
-    than caught: a raise here IS the failure this test exists to catch, and
-    letting it propagate names the real error rather than an assertion
-    message.
-    """
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+@pytest.mark.parametrize(
+    ("model", "temperature", "seed"),
+    [(_MODEL_ALIAS, None, None), (_SAMPLING_MODEL_ALIAS, 0.2, 7), (_MODEL_ALIAS, 0.2, 7)],
+    ids=["default", "supported-sampling", "unqualified-incompatible-sampling"],
+)
+async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
+) -> None:
+    """Boot cannot verify gateway or sampling compatibility without custody."""
     from elspeth.web.composer.boot_probe import probe_composer_config
 
-    requests = _planner_probe_requests(tmp_path, gateway_base_url)
+    sdk_calls: list[dict[str, Any]] = []
+    guard_calls: list[object] = []
+
+    async def forbid_sdk(**kwargs: Any) -> Any:
+        sdk_calls.append(kwargs)
+        raise AssertionError("sessionless gateway probe called the model")
+
+    async def forbid_guard(*args: object, **kwargs: object) -> Any:
+        guard_calls.append((args, kwargs))
+        raise AssertionError("sessionless gateway probe called the guard")
+
+    monkeypatch.setattr("litellm.acompletion", forbid_sdk)
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+    monkeypatch.setattr(provider_gateway, "enforce_prompt_guard", forbid_guard)
+    requests = _planner_probe_requests(
+        tmp_path,
+        "https://unqualified-gateway.example.test",
+        composer_model=model,
+        composer_temperature=temperature,
+        composer_seed=seed,
+        composer_prompt_guard_mode=mode,
+    )
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
     assert requests[0].tool_count == 44
 
     for request in requests:
-        # True (not the transient-failure False) -- the request was accepted
-        # and answered, so this proves acceptance rather than a swallowed
-        # transport error.
-        assert await probe_composer_config(request) is True, request.surface
-
-
-@pytest.mark.asyncio
-async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(tmp_path: Path, gateway_base_url: str) -> None:
-    """The probe's other real payload shape: temperature + seed alongside the
-    translated token cap. ``seed`` is a gated capability the reference
-    adapter declares, so this also proves the alias did not disturb the
-    capability path. Use a sampling-capable model explicitly: the default
-    gpt-5.5 rejects nondefault temperature while reasoning is active."""
-    from elspeth.web.composer.boot_probe import probe_composer_config
-
-    requests = _planner_probe_requests(
-        tmp_path, gateway_base_url, composer_model=_SAMPLING_MODEL_ALIAS, composer_temperature=0.2, composer_seed=7
-    )
-
-    for request in requests:
-        assert await probe_composer_config(request) is True, request.surface
-
-
-@pytest.mark.asyncio
-async def test_boot_probe_rejects_incompatible_reasoning_model_sampling(tmp_path: Path, gateway_base_url: str) -> None:
-    """An endpoint override must not silently drop rejected operator sampling."""
-    from litellm.exceptions import UnsupportedParamsError
-
-    from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
-
-    loop_request = _planner_probe_requests(tmp_path, gateway_base_url, composer_temperature=0.2, composer_seed=7)[0]
-    with pytest.raises(ComposerBootConfigError, match="composer planner boot request rejected") as caught:
-        await probe_composer_config(loop_request)
-    assert isinstance(caught.value.__cause__, UnsupportedParamsError)
-    assert f"by {_MODEL_ALIAS}:" in str(caught.value)
-    assert "surface=loop_tools" in str(caught.value)
-    assert "tool_count=44" in str(caught.value)
-    assert "temperature_present=True" in str(caught.value)
-    assert "seed_present=True" in str(caught.value)
-    assert "reasoning_effort_present=False" in str(caught.value)
-    assert "response_format_present=False" in str(caught.value)
-    assert "provider_routing_present=False" in str(caught.value)
+        assert request.model == model
+        if temperature is None:
+            assert "temperature" not in request.kwargs
+        else:
+            assert request.kwargs["temperature"] == temperature
+        if seed is None:
+            assert "seed" not in request.kwargs
+        else:
+            assert request.kwargs["seed"] == seed
+        assert await probe_composer_config(request) is None, request.surface
+    assert sdk_calls == guard_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +974,7 @@ async def test_gateway_internals_never_leak_on_a_real_failure(
     # turn must not satisfy this `raises` and cause the leak assertions
     # below to scan the wrong exception's message and pass vacuously.
     with pytest.raises(ServiceUnavailableError) as excinfo:
-        await service._run_one_turn_for_test(session_id=session_id, message=trigger)
+        await _run_gateway_loop_turn(service, session_id=session_id, message=trigger)
 
     assert len(primary_requests) == len(conversations) == len(sdk_failures) == LLM_API_MAX_ATTEMPTS
     assert upstream_statuses == [503] * LLM_API_MAX_ATTEMPTS

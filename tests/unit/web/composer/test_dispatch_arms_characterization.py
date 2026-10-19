@@ -101,6 +101,7 @@ import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
@@ -343,7 +344,15 @@ async def test_invalid_json_arg_error_sends_replayable_tool_call_history(
             self.requests: list[list[dict[str, Any]]] = []
 
         async def __call__(
-            self, messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+            self,
+            messages: Any,
+            tools: Any,
+            *,
+            provider_custody: object | None = None,
+            credential_state: object | None = None,
+            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         ) -> Any:
             self.requests.append(deepcopy(messages))
             return await super().__call__(messages, tools)

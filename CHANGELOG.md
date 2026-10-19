@@ -4,8 +4,53 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.7 - Unreleased (Composer refusal and quota fixes)
+## 0.8.9 - Unreleased (Composer, Azure Container Apps and engine enhancements)
 
+This combined candidate carries the Composer changes prepared for 0.8.7,
+Azure Container Apps enhancements attributed to 0.8.8, and engine changes
+attributed to 0.8.9. The engine work adds CSV required-row retention and
+verified audit-context output.
+
+- **Composer and advisor protection uses Azure Prompt Shields.** Each role has
+  an independent Azure AI Content Safety configuration. Required guard checks
+  precede protected model dispatch and record sanitized decisions; missing
+  configuration, blocked input or unavailable inspection refuses dispatch.
+  Historical advisor prescan audits remain readable. Runtime graph transforms
+  remain separately configured.
+
+- **CSV sinks can require retention and include verified audit context.** The
+  opt-in `require_all_rows` stops a rejected member before publishing that
+  effect. With `include_audit_context`, a retention envelope carries owned row
+  and token identity, recorded outcomes, audit reason references and the complete
+  canonical carried row. Unprovable predecessor context refuses publication.
+  Defaults remain ordinary CSV, and earlier published effects are not rolled
+  back. These options require a supporting runtime beginning with 0.8.9; see
+  [CSV required-row retention](docs/runbooks/csv-required-row-retention.md) for
+  configuration constraints and recovery limits.
+- **Required CSV retention can include a readable recorded cause.** Opt-in
+  `include_error_reason` appends a bounded cause to the audit envelope, backed by
+  the exact durable source or transform failure handoff and verified on recovery.
+  Missing, ambiguous or redacted evidence and unsupported linked sink diversions
+  stop explicitly. Existing envelope defaults and earlier publications are
+  preserved; this option requires a supporting 0.8.9 runtime.
+- **LLM output fields can explicitly admit null.** The opt-in `nullable: true`
+  descriptor supports unavailable values in single-query and multi-query
+  transforms and LLM sources while retaining required keys and typed nullable
+  row contracts. Defaults preserve non-null extraction. The new option requires
+  a supporting 0.8.9 runtime; existing plugin implementation compatibility checks
+  still govern resume and replay.
+- **Composer repair guidance distinguishes replies from graph changes.** A
+  publication-only review can request a prose correction without demanding graph
+  mutations; graph-blocking reviews retain their tool-call requirement. Plugin
+  option repair guidance tells the planner to preserve explicit user requirements
+  and report unsupported capabilities. Discovery follows actual continuation
+  offsets, and blocked or time-limited work can return truthful saved progress
+  for continuation. Advisor repairs use current schema evidence and distinguish
+  strict CSV retention from audit references and readable failure reasons.
+- **Source inspection accepts an explicit CSV encoding.** A bounded read can
+  resolve BOM-bearing CSV/TSV headers using the runtime name resolver and report
+  the selected interpretation. This read-only option does not configure a source
+  or claim full-file coverage; omitted encoding retains the previous behavior.
 - **Refusals retain the correct graph context.** Full-replacement candidate
   refusals exclude errors from the old saved graph; incremental output refusals
   retain standing validation and the original version. Producer-owned codes,
@@ -27,6 +72,52 @@ All notable changes to ELSPETH are documented here.
 - **Automatic titles disable adapter and SDK retries.** Both existing title
   custody modes supply zero retry settings. This does not claim universal
   physical-dispatch accounting under arbitrary dependency fallback settings.
+- **Composer prompt inspection accommodates its supported content limits.**
+  The aggregate byte limit now derives from the existing user-text,
+  document-size and document-count limits, so supported whole content is no
+  longer refused by a smaller aggregate allowance. Azure per-call limits and
+  required fail-closed inspection remain enforced. Policy fingerprints include
+  the numeric limits even when no guard is configured.
+- **Advisor checkpoint budgeting preserves complete review evidence.** The
+  configured checkpoint input allowance now limits the optional summary,
+  retaining the full request, candidate, guidance and evidence with their
+  review binding. Both default and explicit settings relax the previous input
+  cost bound; calls may cost more or take longer. Public Advisor hints retain
+  their complete-message limit. This allowance does not reserve model context
+  tokens or account credit. Checkpoint inspection retains separate option,
+  query and field units without changing the published summary or guard limits.
+  Unicode prompt text is inspected decoded while provider text remains unchanged.
+  Reviews receive bounded source-inspection facts only after successful delivery;
+  these facts do not imply complete file-content coverage.
+- **Prompt guard input refusals report their local cause.** Unsupported
+  authoring input returns `prompt_guard_unsupported_input` with status 422;
+  guard service failures retain status 503. Audit decisions and previously
+  stored operation replies remain unchanged.
+- **Planner routing semantics stay with the model.** Quoted comparisons no
+  longer trigger the prose-based threshold rejection. Removing that heuristic
+  also removes its automatic second authoring opportunity for an incorrect
+  constant gate, including under auto-commit; no replacement semantic review
+  is added. Structural checks and artifact-bound approval retain their
+  existing behavior.
+- **Azure Container Apps first-install instructions can be rehearsed offline.**
+  The instructions select an explicit GHCR account, export the transport ceiling
+  required by configuration resolution and distinguish model routing aliases
+  from pricing identities. The application example supplies primary and advisor
+  pricing settings and versioned secret references for both required authoring
+  guard configurations. Command rehearsal does not qualify cloud deployment,
+  guard health or provider access. Existing-service redeploy, transition and
+  rollback holds remain in place.
+- **ACA enforces authenticated PostgreSQL TLS settings.** Startup and deployment
+  doctor require one explicit `sslmode=verify-full` and one `sslrootcert`, either
+  `system` or an absolute CA-file path. Duplicate TLS parameters, legacy
+  `requiressl` and GSS settings other than a single optional `gssencmode=disable`
+  are refused. Correctly URL-escaped credentials remain supported. Existing
+  insecure ACA configurations must be corrected before using this version.
+- **ACA doctor reports TLS before schema initialization.** Sessions and Landscape
+  checks measure each initial preflight connection used for schema inspection.
+  Failed prerequisites or TLS checks prevent schema initialization. Separate
+  initialization/final-verification connections and later web connections remain
+  outside this measurement; it does not establish live Azure acceptance.
 
 Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
 contract retains committed graph-review authority over immutable graph snapshots
@@ -40,7 +131,7 @@ cannot share session stores or replicas.
 
 These unreleased notes describe implemented source changes, not completed
 integrated qualification. Automatic image publication from main remains held.
-The 0.8.7 tag and container publication follow successful required checks and
+The 0.8.9 tag and container publication follow successful required checks and
 the protected merge; operator signing and deployment remain separate.
 
 ## 0.8.6 - Candidate (Composer correctness and recovery)

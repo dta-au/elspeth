@@ -584,13 +584,13 @@ class TestStep3DiscoveryTierMigration:
     def test_diff_pipeline(self) -> None:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
-            "description": "Show what changed since the session was loaded or created. "
+            "description": "Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
             "On success `data` carries `from_version` (the baseline; the version it "
             "changed TO is the envelope's own `version`), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
             "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
-            "baseline (no session loaded or created yet) it fails with `error` and "
+            "baseline it fails with `error` and "
             "`error_code` only.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -947,8 +947,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "get_blob_content",
             "description": (
                 "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-                "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+                "Each complete JSON tool response, including metadata, is bounded to 4,096 UTF-8 bytes and preserves original Unicode code points. "
                 "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+                "page sizes vary, so never guess later offsets or parallelize dependent pages of one blob. "
                 "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
                 "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
                 "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
@@ -988,14 +989,17 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
                 "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
                 "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
-                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
-                "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
-                "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window "
+                "inspected) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+                "`content_hash_prefix` — nothing secret). Inspects at most an 8 KiB prefix and parses at most 100 rows; "
+                "streams the full file to verify its integrity hash. Use this "
                 "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
                 "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
                 "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
                 "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
                 "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+                "For CSV/TSV, pass encoding when the intended source encoding is known (for example utf-8-sig for a UTF-8 BOM). "
+                "This selects only the inspection's decoding; configure the same encoding on the source separately. "
                 "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
                 "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
                 "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
@@ -1008,6 +1012,12 @@ class TestStep3BlobDiscoveryTierMigration:
                     "blob_id": {
                         "type": "string",
                         "description": "ID of the blob to inspect.",
+                    },
+                    "encoding": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Explicit CSV/TSV text encoding for this bounded inspection only. Use null for default blob inspection.",
                     },
                 },
                 "required": ["blob_id"],

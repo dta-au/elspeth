@@ -22,11 +22,11 @@ import { parseCsvRows } from "@/utils/contentStructure";
 const INLINE_SOURCE_PREVIEW_CHARS = 1024;
 const CONTENT_TYPE_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
-const TEXT_ENCODER = new TextEncoder();
+const TEXT_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 interface InlineSourceProjectionInput {
   metadata: BlobMetadata;
-  contentText: string;
+  contentBytes: ArrayBuffer;
   toProvenance: (
     wire: BlobCreationModalityWire,
   ) => InlineSourceProvenance;
@@ -69,10 +69,10 @@ function parseContentType(mimeType: string): string | null {
   return baseType;
 }
 
-async function sha256Hex(text: string): Promise<string> {
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest(
     "SHA-256",
-    TEXT_ENCODER.encode(text),
+    bytes,
   );
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
@@ -93,7 +93,7 @@ export function deriveInlineSourceRowCount(
 
 export async function projectInlineSourceSummary({
   metadata,
-  contentText,
+  contentBytes,
   toProvenance,
 }: InlineSourceProjectionInput): Promise<InlineSourceSummary> {
   if (metadata.content_hash === null || metadata.content_hash === "") {
@@ -115,7 +115,9 @@ export async function projectInlineSourceSummary({
         "SHA-256 lowercase hex — refusing projection",
     );
   }
-  const actualHash = await sha256Hex(contentText);
+  // The audit hash covers the original bytes, including any UTF-8 BOM.
+  // Decoding first would remove the BOM and falsely report tampering.
+  const actualHash = await sha256Hex(contentBytes);
   if (actualHash !== metadata.content_hash) {
     throw new Error(
       `inline blob ${metadata.id} content_hash mismatch — ` +
@@ -123,6 +125,7 @@ export async function projectInlineSourceSummary({
     );
   }
 
+  const contentText = TEXT_DECODER.decode(contentBytes);
   return {
     blobId: metadata.id,
     filename: metadata.filename,

@@ -78,6 +78,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PresentBase,
     composition_content_hash,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.prompts import project_server_owned_option_metadata
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
@@ -266,6 +267,8 @@ class PlanningApplication:
         advisor_endpoint_api_key: str | None,
         advisor_checkpoint: AdvisorCheckpointOwner,
         completion: CompositionCompletion,
+        composer_prompt_guard_mount: PromptGuardMount | None = None,
+        advisor_prompt_guard_mount: PromptGuardMount | None = None,
     ) -> None:
         self._sessions_service_optional = sessions_service
         self._policy_context = policy_context
@@ -287,6 +290,16 @@ class PlanningApplication:
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
         self._advisor_checkpoint = advisor_checkpoint
         self._completion = completion
+        self._composer_prompt_guard_mount = (
+            composer_prompt_guard_mount
+            if composer_prompt_guard_mount is not None
+            else build_prompt_guard_mount(settings.composer_prompt_guard)
+        )
+        self._advisor_prompt_guard_mount = (
+            advisor_prompt_guard_mount
+            if advisor_prompt_guard_mount is not None
+            else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
+        )
         self._model = settings.composer_model
         self._max_composition_turns = settings.composer_max_composition_turns
         self._max_discovery_turns = settings.composer_max_discovery_turns
@@ -974,6 +987,8 @@ class PlanningApplication:
                 blocked, session_id=session_id, session_operation_context=session_operation_context
             )
             return blocked
+        except PromptGuardRefused as error:
+            raise error.with_evidence(state=state, initial_version=state.version, llm_calls=recorder.llm_calls[end_call_start:]) from error
         except BaseException as error:
             attach_llm_calls(error, recorder, start_index=end_call_start)
             raise
@@ -1092,7 +1107,12 @@ class PlanningApplication:
                 originating_message=origin,
                 base=base,
                 model_config=PlannerModelConfig(
-                    completion=provider_gateway._litellm_acompletion,
+                    completion=functools.partial(
+                        provider_gateway._litellm_acompletion,
+                        prompt_guard_mount=self._composer_prompt_guard_mount,
+                        prompt_guard_mode=self._settings.composer_prompt_guard_mode,
+                        prompt_guard_role="composer",
+                    ),
                     model_identifier=self._model,
                     provider=self._availability.provider or "unknown",
                     temperature=self._settings.composer_temperature,
@@ -1115,6 +1135,9 @@ class PlanningApplication:
                     api_key=self._endpoint_api_key,
                     escape_hatch_api_base=self._advisor_endpoint_base_url,
                     escape_hatch_api_key=self._advisor_endpoint_api_key,
+                    prompt_guard_mount=self._composer_prompt_guard_mount,
+                    escape_hatch_prompt_guard_mount=self._advisor_prompt_guard_mount,
+                    prompt_guard_mode=self._settings.composer_prompt_guard_mode,
                 ),
                 rendered_skill=rendered_skill,
                 repair_budget=self._settings.composer_planner_repair_budget,
@@ -1188,6 +1211,28 @@ class PlanningApplication:
                 turn_evidence=turn_evidence,
                 deadline=deadline,
             )
+        except PromptGuardRefused as exc:
+            calls = recorder.llm_calls[planner_llm_start:]
+            if exc.llm_calls != calls:
+                raise AuditIntegrityError("pipeline guard refusal carried unrelated LLM audit evidence") from exc
+            _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+                self._persist_pipeline_planner_audit(
+                    session_id=session_uuid,
+                    current_state_id=state_uuid,
+                    llm_calls=calls,
+                    planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+                    invocations=recorder.invocations[planner_invocation_start:],
+                    withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+                    private_candidates=recorder.private_candidates[planner_private_start:],
+                    session_operation_context=session_operation_context,
+                    required_work=required_work,
+                )
+            )
+            if deferred is not None:
+                raise deferred from exc
+            # All prior planner work is durable. Preserve the terminal guard
+            # identity without replaying that cohort in the route unwind.
+            raise exc.with_evidence(state=state, initial_version=state.version) from exc
         except BaseException as exc:
             exc_dict = exc.__dict__
             attached_calls = exc_dict["llm_calls"] if "llm_calls" in exc_dict else ()

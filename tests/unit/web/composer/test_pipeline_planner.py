@@ -8,6 +8,7 @@ candidate state as a provider result.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import threading
@@ -15,12 +16,14 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import litellm
 import pytest
 import structlog
 from litellm import ModelResponse, Usage
@@ -30,7 +33,7 @@ from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
     ComposerPlannerAttemptOutcome,
@@ -40,12 +43,23 @@ from elspeth.contracts.composer_planner_audit import (
 )
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_MAX_DOCUMENTS,
+    PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+    PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    PromptGuardClient,
+    PromptGuardDecision,
+    PromptGuardMode,
+    PromptGuardRequest,
+)
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import pipeline_planner
-from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
+from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope, planner_attempt_audit_envelope
+from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.pipeline_planner import (
     _FINALIZER_OWNS_NOTHING,
@@ -77,7 +91,9 @@ from elspeth.web.composer.pipeline_planner import (
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, planner_plugin_contract
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import (
     CoalesceUnionTypeDetail,
     CompositionState,
@@ -114,11 +130,25 @@ from elspeth.web.plugin_policy.models import (
     PluginUnavailableReason,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, composition_proposals_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    composition_proposals_table,
+    quota_provider_attempts_table,
+    token_usage_ledger_table,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -647,8 +677,12 @@ def _budget(**overrides: object) -> PlannerBudgetPolicy:
 
 
 def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModelConfig:
+    # Scripted replies live at the physical SDK boundary in _plan, so this
+    # configuration cannot bypass guard/provider admission through a callback.
+    del completion
     values: dict[str, object] = {
-        "completion": completion,
+        "completion": pipeline_planner._litellm_acompletion,
+        "prompt_guard_mode": "debug-when-unconfigured",
         "model_identifier": "anthropic/claude-planner",
         "provider": "test-provider",
         "temperature": 0.0,
@@ -762,42 +796,95 @@ async def _plan(
         policy_context = patch.object(planner_module.PlannerDiscoveryPolicy, "initial", return_value=full_policy)
     origin = originating_message or _origin()
     custody = custody_config or _custody(tmp_path)
+    owns_engine = custody.session_engine is None
+    if owns_engine and custody.session_operation_context is not None:
+        raise AssertionError("Caller-owned operation context requires its exact provider engine")
+    provider_engine = custody.session_engine
+    if provider_engine is None:
+        provider_engine = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
+        initialize_session_schema(provider_engine)
+    authority = custody.session_operation_authority or SQLiteLocalSessionOperationAuthority(provider_engine)
+    with provider_engine.begin() as connection:
+        ensure_test_identity(connection, identity_id=origin.user_id)
+        grant_test_pipeline_user(connection, identity_id=origin.user_id)
+    if owns_engine:
+        # Control only session creation's UUID. Operation, lease, message and
+        # provider identities remain minted by their actual production owners.
+        with patch("elspeth.web.coordination.repository._new_session_id", return_value=UUID(origin.session_id)):
+            authority.create_session_with_initial_fence(
+                user_id=origin.user_id,
+                title="Planner provider accounting",
+                auth_provider_type="local",
+                owner_instance_id="planner-test-owner",
+                lease_seconds=300,
+            )
+    provider_service = SessionServiceImpl(
+        provider_engine,
+        data_dir=tmp_path,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.pipeline-planner-provider"),
+        session_operation_authority=authority,
+    )
     operation_scope = (
-        fenced_operation_context(custody.session_engine, origin.session_id)
-        if custody.session_engine is not None and custody.session_operation_context is None
+        fenced_operation_context(provider_engine, origin.session_id)
+        if custody.session_operation_context is None
         else nullcontext(custody.session_operation_context)
     )
-    with policy_context, operation_scope as operation_context:
-        if custody.session_engine is not None and custody.session_operation_context is None:
+    try:
+        with policy_context, operation_scope as operation_context, patch.object(litellm, "acompletion", new=completion):
+            if type(operation_context) is not SessionOperationContext:
+                raise AssertionError("Planner fixture requires an actual COMPOSE operation context")
             custody = replace(
                 custody,
                 session_operation_context=operation_context,
-                session_operation_authority=SQLiteLocalSessionOperationAuthority(custody.session_engine),
+                session_operation_authority=authority,
             )
-        return await plan_pipeline(
-            intent=intent,
-            current_state=current_state or _empty_state(),
-            provider_current_state=(
-                provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
-            ),
-            schemas_loaded=schemas_loaded,
-            mark_schema_loaded=mark_schema_loaded,
-            conversation_context=conversation_context,
-            retained_operation_context=retained_operation_context,
-            turn_evidence=turn_evidence,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=plugin_snapshot,
-            originating_message=origin,
-            base=AbsentBase(),
-            model_config=_model(completion, **dict(model_overrides or {})),
-            rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
-            repair_budget=repair_budget,
-            budget_policy=budget or _budget(),
-            custody_config=custody,
-            lifecycle=lifecycle or _lifecycle(),
-            recorder=recorder or BufferingRecorder(),
-            candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
-        )
+            coordinator = RequiredWorkCoordinator(
+                RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, operation_context, invocation_id=str(uuid4()))
+            )
+            owner = ProviderInvocationOwner(
+                service=provider_service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+            )
+            try:
+                result = await plan_pipeline(
+                    intent=intent,
+                    current_state=current_state or _empty_state(),
+                    provider_current_state=(
+                        provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
+                    ),
+                    schemas_loaded=schemas_loaded,
+                    mark_schema_loaded=mark_schema_loaded,
+                    conversation_context=conversation_context,
+                    retained_operation_context=retained_operation_context,
+                    turn_evidence=turn_evidence,
+                    policy_catalog=policy_catalog,
+                    plugin_snapshot=plugin_snapshot,
+                    originating_message=origin,
+                    base=AbsentBase(),
+                    model_config=_model(completion, **dict(model_overrides or {})),
+                    rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
+                    repair_budget=repair_budget,
+                    budget_policy=budget or _budget(),
+                    custody_config=custody,
+                    lifecycle=lifecycle or _lifecycle(),
+                    recorder=recorder or BufferingRecorder(),
+                    candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
+                    provider_service=provider_service,
+                    provider_owner=owner,
+                )
+            except BaseException as primary:
+                try:
+                    coordinator.assert_completed()
+                except BaseException as completion_failure:
+                    raise BaseExceptionGroup(
+                        "Planner fixture body and required completion failures", [primary, completion_failure]
+                    ) from None
+                raise
+            coordinator.assert_completed()
+            return result
+    finally:
+        if owns_engine:
+            provider_engine.dispose()
 
 
 def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> None:
@@ -865,7 +952,7 @@ async def test_retained_operation_context_reaches_selected_planner_wire(tmp_path
     )
     assert len(completion.requests) == 1
     sent = completion.requests[0]
-    payload = json.loads(sent["messages"][1]["content"])
+    payload = json.loads(sent["messages"][2]["content"])
     assert payload["retained_operation_history"] == json.loads(context.provider_message())["retained_operation_history"]
     assert recorder.llm_calls[0].messages_hash == stable_hash(sent["messages"])
 
@@ -1246,17 +1333,46 @@ async def test_real_planner_call_builds_manifest_from_exact_audited_inputs(
 
 
 @pytest.mark.asyncio
-async def test_provider_side_call_input_mutation_is_detected_as_audit_integrity_failure(
+async def test_physical_sdk_mutation_cannot_change_planner_owned_inputs(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
+    mutated_tools: list[list[dict[str, Any]]] = []
+
     class _MutatingCompletion(_ScriptedCompletion):
-        async def __call__(self, **kwargs: Any) -> _Response:
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            response = await super().__call__(**kwargs)
             kwargs["tools"][-1]["function"]["parameters"]["properties"]["pipeline"]["properties"].pop("edges")
-            return await super().__call__(**kwargs)
+            mutated_tools.append(deepcopy(kwargs["tools"]))
+            return response
 
     completion = _MutatingCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
+    result = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    assert isinstance(result.proposal, PipelineProposal)
+    assert len(completion.requests) == len(mutated_tools) == len(recorder.llm_calls) == 1
+    sent = completion.requests[0]
+    assert "edges" in sent["tools"][-1]["function"]["parameters"]["properties"]["pipeline"]["properties"]
+    assert "edges" not in mutated_tools[0][-1]["function"]["parameters"]["properties"]["pipeline"]["properties"]
+    assert recorder.llm_calls[0].messages_hash == stable_hash(sent["messages"])
+    assert recorder.llm_calls[0].tools_spec_hash == stable_hash(sent["tools"])
 
+
+@pytest.mark.asyncio
+async def test_owned_planner_tool_mutation_after_manifest_is_an_integrity_failure(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_builder = pipeline_planner.build_planner_capability_manifest
+
+    def corrupt_owned_tools(**kwargs: Any) -> Any:
+        manifest = real_builder(**kwargs)
+        kwargs["tools"][-1]["function"]["parameters"]["properties"]["pipeline"]["properties"].pop("edges")
+        return manifest
+
+    monkeypatch.setattr(pipeline_planner, "build_planner_capability_manifest", corrupt_owned_tools)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
     with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
@@ -1278,7 +1394,7 @@ async def test_provider_side_call_input_mutation_is_detected_as_audit_integrity_
         (asyncio.CancelledError(), ComposerLLMCallStatus.CANCELLED),
     ),
 )
-async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
+async def test_owned_planner_input_mutation_is_audited_once_before_integrity_failure(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -1286,17 +1402,6 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
     expected_status: ComposerLLMCallStatus,
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
-
-    # This tests audit identity, independent of catalog work or scheduling delay.
-    # Deadline enforcement has separate tests that retain the real loop clock.
-    loop = asyncio.get_running_loop()
-    fixed_time = loop.time()
-    monkeypatch.setattr(loop, "time", lambda: fixed_time)
-
-    class _MutatingCompletion(_ScriptedCompletion):
-        async def __call__(self, **kwargs: Any) -> _Response:
-            kwargs["messages"][0]["content"] += "\nprovider-side mutation"
-            return await super().__call__(**kwargs)
 
     recorder = BufferingRecorder()
     await _plan(
@@ -1312,24 +1417,39 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
     def capture_manifest(**kwargs: Any) -> Any:
         manifest = real_builder(**kwargs)
         captured_manifests.append(manifest)
+        # Corrupt the actual planner-owned request immediately after its
+        # manifest was built. SDK kwargs are detached by the real gateway.
+        kwargs["messages"][0]["content"] += "\ncontrolled owned-request mutation"
         return manifest
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
 
-    with pytest.raises(AuditIntegrityError, match="planner call inputs changed") as caught:
+    expected_exception = BaseExceptionGroup if isinstance(provider_outcome, BaseException) else AuditIntegrityError
+    with pytest.raises(expected_exception) as caught:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
-            completion=_MutatingCompletion(provider_outcome),
+            completion=_ScriptedCompletion(provider_outcome),
             recorder=recorder,
         )
 
+    if isinstance(provider_outcome, BaseException):
+        assert isinstance(caught.value, BaseExceptionGroup)
+        assert caught.value.message == "Provider original body and audit construction outcomes"
+        assert len(caught.value.exceptions) == 2
+        assert caught.value.exceptions[0] is provider_outcome
+        integrity = caught.value.exceptions[1]
+    else:
+        integrity = caught.value
+    assert type(integrity) is AuditIntegrityError
+    assert str(integrity) == "planner call inputs changed after capability manifest construction"
     assert len(captured_manifests) == 1
     assert len(recorder.llm_calls) == 2
     (manifest,) = captured_manifests
     audit_call = recorder.llm_calls[-1]
-    assert caught.value.llm_calls == (audit_call,)  # type: ignore[attr-defined]
-    assert unrelated_prior_call not in caught.value.llm_calls  # type: ignore[attr-defined]
+    attached_calls = cast(Any, caught.value).llm_calls
+    assert attached_calls == (audit_call,)
+    assert unrelated_prior_call not in attached_calls
     assert audit_call.status is expected_status
     assert audit_call.messages_hash != manifest.rendered_prompt_hash
     assert audit_call.tools_spec_hash == manifest.effective_tool_hash
@@ -1407,9 +1527,11 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     request = completion.requests[0]
-    # messages[1] is the canonical request payload; a gapless request is
+    # messages[2] is the mixed request; the separate catalog reference is [1].
+    # A gapless request is
     # decline-eligible from turn 1, so the affordance notice follows it.
-    payload = json.loads(request["messages"][1]["content"])
+    reference = json.loads(request["messages"][1]["content"])
+    payload = json.loads(request["messages"][2]["content"])
     assert 'starting with "DECLINE: "' in str(request["messages"][-1]["content"])
     # Complete catalogs are supplied immediately; a grown live catalog must
     # explicitly retain discovery for the whole provider lists it deferred.
@@ -1418,7 +1540,7 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "plugin_selection": "policy_snapshot",
         "expression_grammar": "authoring_aids",
     }
-    deferred = bool(payload["authoring_aids"]["model_catalog"]["catalog"]["models_omitted"])
+    deferred = bool(reference["authoring_aids"]["model_catalog"]["catalog"]["models_omitted"])
     if catalog_inventory == "small":
         assert not deferred
     if not deferred:
@@ -1440,7 +1562,7 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         key: value for key, value in payload.items() if key not in {"intent", "conversation_context", "current_state", "reviewed_facts"}
     }
     fixed_scaffolding = {
-        "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
+        "messages": [request["messages"][0], request["messages"][1], {"role": "user", "content": canonical_json(fixed_payload)}],
         "tools": request["tools"],
     }
     fixed_bytes = len(canonical_json(fixed_scaffolding).encode("utf-8"))
@@ -1486,8 +1608,8 @@ async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     request = completion.requests[0]
-    payload = json.loads(request["messages"][1]["content"])
-    assert payload["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"][kind][0]["name"] == ("named_but_prohibited")
+    reference = json.loads(request["messages"][1]["content"])
+    assert reference["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"][kind][0]["name"] == ("named_but_prohibited")
     names = {tool["function"]["name"] for tool in request["tools"]}
     assert not {"list_sources", "list_transforms", "list_sinks"} & names
 
@@ -1529,12 +1651,13 @@ async def test_digest_omission_advertises_only_its_kind_inventory_until_details_
     )
 
     initial = completion.requests[0]
+    reference = json.loads(initial["messages"][1]["content"])
     payload = json.loads(initial["messages"][-1]["content"])
     initial_names = [tool["function"]["name"] for tool in initial["tools"]]
     omissions = [
         omitted
         for section in ("sources", "transforms", "sinks")
-        for entry in payload["authoring_aids"]["discovery_digest"]["plugins"][section]
+        for entry in reference["authoring_aids"]["discovery_digest"]["plugins"][section]
         for omitted in (entry.get("purpose_omitted"), entry.get("not_for_omitted"))
         if omitted is not None
     ]
@@ -2190,14 +2313,16 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", PLANNER_DISCOVERY_TOOL_NAMES)
 async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
     tmp_path: Path,
     tool_context: ToolContext,
+    tool_name: str,
 ) -> None:
     assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
     current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
     provider_state = current_state.to_dict()
-    calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
+    calls = ((tool_name, dict(_DISCOVERY_TEST_ARGUMENTS[tool_name])),)
     completion = _ScriptedCompletion(
         _response(*calls),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
@@ -2212,6 +2337,80 @@ async def test_every_freeform_planner_discovery_tool_returns_admitted_state(
         model_overrides={"max_tool_calls_per_turn": len(calls)},
     )
 
+    assert len(completion.requests) == 2
+    actual_discovery_names = tuple(
+        tool["function"]["name"] for tool in completion.requests[0]["tools"] if tool["function"]["name"] in PLANNER_DISCOVERY_TOOL_NAMES
+    )
+    assert actual_discovery_names == PLANNER_DISCOVERY_TOOL_NAMES
+    actual_authored_names = [
+        call["function"]["name"]
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "assistant" and "tool_calls" in message
+        for call in message["tool_calls"]
+    ]
+    assert actual_authored_names == [tool_name]
+    tool_messages = {
+        message["tool_call_id"]: message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool"
+    }
+    assert len(tool_messages) == len(calls)
+    for index, (name, _arguments) in enumerate(calls, start=1):
+        content = tool_messages[f"call-{index}"]
+        assert _VALIDATION_MESSAGE_CANARY in content
+        assert _HIDDEN_CONNECTION_COMPONENT_CANARY in content
+        assert _HIDDEN_EDGE_COMPONENT_CANARY in content
+        if name == "get_pipeline_state":
+            assert _DISCLOSURE_CANARIES[1] in content
+
+
+@pytest.mark.asyncio
+async def test_full_discovery_batch_preserves_complete_results_above_old_aggregate_cap(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Individually supported discovery results retain the full logical envelope."""
+    from elspeth.web.composer import prompt_guard
+
+    assert set(_DISCOVERY_TEST_ARGUMENTS) == set(PLANNER_DISCOVERY_TOOL_NAMES)
+    current_state = _state_with_all_provider_disclosure_canaries(tmp_path)
+    calls = tuple((name, dict(_DISCOVERY_TEST_ARGUMENTS[name])) for name in PLANNER_DISCOVERY_TOOL_NAMES)
+    completion = _ScriptedCompletion(
+        _response(*calls),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    guard_requests: list[tuple[PromptGuardRequest, bool]] = []
+    original_request = prompt_guard._request
+
+    def observe_request(**kwargs: Any) -> tuple[PromptGuardRequest, bool]:
+        request, supported = original_request(**kwargs)
+        guard_requests.append((request, supported))
+        return request, supported
+
+    monkeypatch.setattr(prompt_guard, "_request", observe_request)
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        current_state=current_state,
+        provider_current_state=current_state.to_dict(),
+        model_overrides={"max_tool_calls_per_turn": len(calls)},
+    )
+
+    assert len(guard_requests) == 2
+    assert guard_requests[0][1] is True
+    request, supported = guard_requests[1]
+    assert supported is True
+    assert len(request.user_prompt) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
+    assert len(request.documents) <= PROMPT_GUARD_MAX_DOCUMENTS
+    assert all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in request.documents)
+    inspected_bytes = len(request.user_prompt.encode("utf-8")) + sum(len(document.encode("utf-8")) for document in request.documents)
+    assert 262_144 < inspected_bytes <= PROMPT_GUARD_MAX_INPUT_UTF8_BYTES
+    assert len(completion.requests) == len(recorder.llm_calls) == 2
+    assert all(call.status is ComposerLLMCallStatus.SUCCESS for call in recorder.llm_calls)
+    assert len({call.call_id for call in recorder.llm_calls}) == 2
+    assert all(call.call_id is not None for call in recorder.llm_calls)
     tool_messages = {
         message["tool_call_id"]: message["content"] for message in completion.requests[1]["messages"] if message["role"] == "tool"
     }
@@ -2407,7 +2606,7 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
 
 
 @pytest.mark.asyncio
-async def test_exact_intent_appears_in_the_sole_user_role_message(
+async def test_exact_intent_appears_only_in_the_mixed_user_request(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -2422,22 +2621,23 @@ async def test_exact_intent_appears_in_the_sole_user_role_message(
     )
 
     user_messages = [message for message in completion.requests[0]["messages"] if message["role"] == "user"]
-    assert len(user_messages) == 1
-    assert json.loads(user_messages[0]["content"])["intent"] == exact_intent
+    assert len(user_messages) == 2
+    assert "intent" not in json.loads(user_messages[0]["content"])
+    assert json.loads(user_messages[1]["content"])["intent"] == exact_intent
 
 
 @pytest.mark.asyncio
-async def test_live_authoring_aids_ride_in_the_reviewed_context_user_message(
+async def test_live_authoring_aids_ride_in_the_separate_catalog_reference_message(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """Deployment plugin exemplars enter through the live user-message channel.
+    """Deployment plugin exemplars enter through the live catalog reference.
 
     The static system prompt must stay free of deployment plugin facts (the
     ``no_deployment_plugin_facts`` gate), so the worked exemplars render at
-    prompt-build from the policy-visible catalog into the same reviewed-context
-    message that carries the intent — present on every turn, not only after a
-    failure.
+    prompt-build from the policy-visible catalog into its own user-role
+    reference message. The intent and graph remain in the separate mixed
+    request, and every leaf reaches the physical SDK.
     """
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
 
@@ -2445,12 +2645,16 @@ async def test_live_authoring_aids_ride_in_the_reviewed_context_user_message(
 
     request = completion.requests[0]
     user_messages = [message for message in request["messages"] if message["role"] == "user"]
-    assert len(user_messages) == 1
-    payload = json.loads(user_messages[0]["content"])
+    assert len(user_messages) == 2
+    reference = json.loads(user_messages[0]["content"])
+    payload = json.loads(user_messages[1]["content"])
+    assert set(reference) == {"authoring_aids", "schema_contract_evidence"}
+    assert "authoring_aids" not in payload
+    assert "intent" not in reference
     full_catalog = create_catalog_service()
     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
     expected = build_planner_authoring_aids(PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot))
-    assert payload["authoring_aids"] == json.loads(canonical_json(expected))
+    assert reference["authoring_aids"] == json.loads(canonical_json(expected))
     # The aids PAYLOAD stays out of the system message: skill-hash identity is
     # pinned to the static pack, and the capability core's
     # no-deployment-inventory claim about system text must remain true. (The
@@ -4640,13 +4844,7 @@ async def test_pre_dispatch_failure_does_not_invent_provider_call(
     monkeypatch.setattr("elspeth.web.composer.pipeline_planner.build_planner_request_kwargs", fail_request_construction)
     completion = _ScriptedCompletion()
     recorder = BufferingRecorder()
-    loop = asyncio.get_running_loop()
-    clock_origin = loop.time()
-
-    # This tests request-construction audit attribution, not deadline behavior.
-    # Host scheduling must not expire the unrelated budget before the rejection;
-    # the dedicated deadline tests separately exercise timeout enforcement.
-    with patch.object(loop, "time", lambda: clock_origin), pytest.raises(ValueError, match="pre-dispatch"):
+    with pytest.raises(ValueError, match="pre-dispatch"):
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert completion.requests == []
@@ -4737,6 +4935,206 @@ async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n
     )
 
 
+def _assert_no_persisted_credential(rows: list[dict[str, Any]], credential: str) -> None:
+    # Inspect every persisted column, including raw content and private audit
+    # envelopes, rather than filtering to the public LLM-call projection.
+    credential_persisted = credential in repr(rows)
+    assert not credential_persisted, "credential persisted in chat history"
+
+
+def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationContext) -> None:
+    assert row["role"] == "audit"
+    assert row["writer_principal"] == "compose_loop"
+    assert len(row["tool_calls"]) == 1
+    envelope = row["tool_calls"][0]
+    assert set(envelope) == {"_kind", "check"}
+    assert envelope["_kind"] == "prompt_guard_audit"
+    check = envelope["check"]
+    assert UUID(check["audit_id"]).version == 4
+    assert datetime.fromisoformat(check["started_at"]).tzinfo is not None
+    assert type(check["duration_ms"]) is int and check["duration_ms"] >= 0
+    assert len(check["request_hash"]) == 64
+    assert int(check["request_hash"], 16) >= 0
+    assert check == {
+        "schema_version": 1,
+        "audit_id": check["audit_id"],
+        "operation_id": context.fence.operation_id,
+        "operation_epoch": context.fence.operation_epoch,
+        "role": "composer",
+        "adapter": "unconfigured",
+        "mode": "debug-when-unconfigured",
+        "policy_fingerprint": hashlib.sha256(
+            json.dumps(
+                {
+                    "mount": None,
+                    "mode": "debug-when-unconfigured",
+                    "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+                    "max_documents": PROMPT_GUARD_MAX_DOCUMENTS,
+                    "max_input_utf8_bytes": PROMPT_GUARD_MAX_INPUT_UTF8_BYTES,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "request_hash": check["request_hash"],
+        "disposition": "debug_bypass",
+        "reason": "guard_not_configured",
+        "started_at": check["started_at"],
+        "duration_ms": check["duration_ms"],
+    }
+    assert row["content"] == json.dumps(envelope, sort_keys=True)
+
+
+def _assert_credential_refusal_history(
+    *,
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    call: ComposerLLMCall,
+    context: SessionOperationContext,
+    credential: str,
+    private_statuses: tuple[str, ...],
+) -> None:
+    _assert_no_persisted_credential(after, credential)
+    before_ids = {row["id"] for row in before}
+    assert [row for row in after if row["id"] in before_ids] == before
+    added = [row for row in after if row["id"] not in before_ids]
+    assert [row for row in after if row["role"] != "audit"] == [row for row in before if row["role"] != "audit"]
+    drafts = private_diagnostic_drafts(call, context=context)
+    assert tuple(draft.tool_calls[0]["evidence"]["status"] for draft in drafts) == private_statuses
+    assert len(added) == 2 + len(private_statuses)
+    _assert_debug_guard_audit(added[0], context)
+    expected = [
+        ("Provider call result recorded.", [llm_call_audit_envelope(call)]),
+        *((draft.content, deep_thaw(draft.tool_calls)) for draft in drafts),
+    ]
+    assert [(row["content"], row["tool_calls"]) for row in added[1:]] == expected
+    for row in added:
+        assert row["session_id"] == context.fence.session_id
+        assert row["role"] == "audit"
+        assert row["writer_principal"] == "compose_loop"
+        assert row["raw_content"] is None
+        assert row["tool_call_id"] is None
+        assert row["parent_assistant_id"] is None
+        assert row["composition_state_id"] is None
+        # A controlled leak in each actual new audit must make the privacy
+        # instrument fail, including private evidence and raw-content fields.
+        for column in ("content", "raw_content", "tool_calls"):
+            mutant = deepcopy(row)
+            mutant[column] = {"planted": credential} if column == "tool_calls" else credential
+            with pytest.raises(AssertionError, match="credential persisted in chat history"):
+                _assert_no_persisted_credential([*before, mutant], credential)
+
+
+@pytest.mark.asyncio
+async def test_planner_fixture_uses_real_guard_fence_and_settled_provider_accounting(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    engine, origin = await _session_context()
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path, session_id=origin.session_id)})))
+    recorder = BufferingRecorder()
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    try:
+        with fenced_operation_context(engine, origin.session_id) as context:
+            result = await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                originating_message=origin,
+                custody_config=replace(
+                    _custody(tmp_path),
+                    session_engine=engine,
+                    session_operation_context=context,
+                    session_operation_authority=authority,
+                ),
+            )
+            assert isinstance(result.proposal, PipelineProposal)
+            assert len(completion.requests) == len(recorder.llm_calls) == 1
+            with engine.connect() as connection:
+                attempt = dict(connection.execute(select(quota_provider_attempts_table)).mappings().one())
+                ledger = dict(connection.execute(select(token_usage_ledger_table)).mappings().one())
+                rows = [
+                    dict(row)
+                    for row in connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings()
+                ]
+            assert attempt["attempt_id"] == recorder.llm_calls[0].call_id
+            assert attempt["identity_id"] == ledger["identity_id"] == origin.user_id
+            assert attempt["session_id"] == ledger["session_id"] == origin.session_id
+            assert attempt["source"] == ledger["source"] == "composer"
+            assert attempt["operation_id"] == context.fence.operation_id
+            assert attempt["operation_epoch"] == context.fence.operation_epoch
+            assert attempt["lease_token"] == context.fence.lease_token
+            assert attempt["settled_at"] is not None
+            assert attempt["ledger_entry_id"] == ledger["entry_id"]
+            assert (ledger["model"], ledger["prompt_tokens"], ledger["completion_tokens"]) == ("provider/planner-v1", 10, 5)
+            _assert_debug_guard_audit(rows[1], context)
+            assert rows[2]["tool_calls"] == [llm_call_audit_envelope(recorder.llm_calls[0])]
+            # The exact caller-owned authority remains live after the helper;
+            # only the surrounding context manager owns its release.
+            authority.compare_and_swap(context)
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_planner_provider_accounting_does_not_supply_missing_inline_custody(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
+    custody = _custody(tmp_path)
+    assert custody.session_engine is None
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            custody_config=custody,
+            repair_budget=0,
+        )
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    assert caught.value.detail_codes == ("source_binding_context_unavailable",)
+    assert len(completion.requests) == len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].call_id is not None
+    assert custody.session_engine is None
+    assert not (tmp_path / "blobs").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+async def test_planner_physical_helper_refuses_missing_custody_even_with_live_fence(
+    mode: PromptGuardMode,
+) -> None:
+    engine, origin = await _session_context()
+    completion = _ScriptedCompletion()
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    try:
+        with engine.connect() as connection:
+            before = [dict(row) for row in connection.execute(select(chat_messages_table)).mappings()]
+        with fenced_operation_context(engine, origin.session_id) as context, patch.object(litellm, "acompletion", new=completion):
+            with pytest.raises(AuditIntegrityError, match="exact mount and fenced invocation custody"):
+                await pipeline_planner._litellm_acompletion(
+                    prompt_guard_mount=None,
+                    prompt_guard_mode=mode,
+                    prompt_guard_role="composer",
+                    prompt_guard_user_prompt=origin.content,
+                    provider_custody=None,
+                    model="anthropic/claude-planner",
+                    messages=[{"role": "user", "content": origin.content}],
+                )
+            authority.compare_and_swap(context)
+        assert completion.requests == []
+        with engine.connect() as connection:
+            assert [dict(row) for row in connection.execute(select(chat_messages_table)).mappings()] == before
+            assert connection.execute(select(func.count()).select_from(quota_provider_attempts_table)).scalar_one() == 0
+            assert connection.execute(select(func.count()).select_from(token_usage_ledger_table)).scalar_one() == 0
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch_or_persistence(
     tmp_path: Path,
@@ -4785,9 +5183,11 @@ async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch
         return candidate
 
     with engine.begin() as conn:
-        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        messages_before = [
+            dict(row) for row in conn.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings()
+        ]
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
+    with fenced_operation_context(engine, origin.session_id) as context, pytest.raises(CredentialMaterialRefused) as caught:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
@@ -4800,6 +5200,8 @@ async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch
                 max_storage_per_session=1_000_000,
                 secret_service=None,
                 runtime_preflight=None,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
             ),
             current_state=state,
             mark_schema_loaded=mark_schema_loaded,
@@ -4817,7 +5219,18 @@ async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch
     assert credential not in canonical_json([call.to_dict() for call in recorder.llm_calls])
     assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
     with engine.begin() as conn:
-        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        messages_after = [
+            dict(row) for row in conn.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings()
+        ]
+        assert len(recorder.llm_calls) == 1
+        _assert_credential_refusal_history(
+            before=messages_before,
+            after=messages_after,
+            call=recorder.llm_calls[0],
+            context=context,
+            credential=credential,
+            private_statuses=("provider_request", "received_response", "received_response"),
+        )
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
@@ -4863,9 +5276,11 @@ async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_
         return candidate
 
     with engine.begin() as conn:
-        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        messages_before = [
+            dict(row) for row in conn.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings()
+        ]
 
-    with pytest.raises(CredentialMaterialRefused) as caught:
+    with fenced_operation_context(engine, origin.session_id) as context, pytest.raises(CredentialMaterialRefused) as caught:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
@@ -4878,6 +5293,8 @@ async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_
                 max_storage_per_session=1_000_000,
                 secret_service=None,
                 runtime_preflight=None,
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
             ),
             current_state=state,
             mark_schema_loaded=mark_schema_loaded,
@@ -4903,7 +5320,17 @@ async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_
     assert credential not in canonical_json([refused_call.to_dict()])
     assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
     with engine.begin() as conn:
-        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        messages_after = [
+            dict(row) for row in conn.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings()
+        ]
+        _assert_credential_refusal_history(
+            before=messages_before,
+            after=messages_after,
+            call=refused_call,
+            context=context,
+            credential=credential,
+            private_statuses=("provider_request", "received_response"),
+        )
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
@@ -5158,6 +5585,12 @@ async def test_multiturn_authoring_settles_with_deployed_deadline(
         async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
             nonlocal elapsed
             elapsed += 40.0
+            if elapsed > timeout_seconds:
+                # This simulated duration crosses the configured request
+                # budget. Let the real asyncio timer cancel the SDK attempt.
+                self.requests.append(deepcopy(kwargs))
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
             return await super().__call__(**kwargs)
 
     completion = TimedCompletion(
@@ -5167,7 +5600,7 @@ async def test_multiturn_authoring_settles_with_deployed_deadline(
     )
     recorder = BufferingRecorder()
     events: list[str] = []
-    with patch.object(loop, "time", lambda: clock_origin + elapsed):
+    with patch.object(pipeline_planner, "_planner_deadline_time", lambda: clock_origin + elapsed):
         operation = _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
@@ -5229,7 +5662,10 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     completion = SlowCompletion()
     recorder = BufferingRecorder()
     events: list[str] = []
-    with patch.object(loop, "time", deadline_clock), pytest.raises(PipelinePlannerError, match="wall-clock") as error:
+    with (
+        patch.object(pipeline_planner, "_planner_deadline_time", deadline_clock),
+        pytest.raises(PipelinePlannerError, match="wall-clock") as error,
+    ):
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
@@ -5244,6 +5680,151 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     (call,) = recorder.llm_calls
     assert call.status is ComposerLLMCallStatus.TIMEOUT
     assert events[-1] == "settled:failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["primary-operation", "hatch-operation", "guard-bound"])
+async def test_guard_deadline_preserves_operation_timeout_without_provider_attempt(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    scope: str,
+) -> None:
+    engine, origin = await _session_context()
+    guard_started_at: float | None = None
+    guard_cancelled = False
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    # Warm catalog validation before the operation's real deadline starts.
+    build_planner_authoring_aids(policy)
+    policy.validate_composition_state(_empty_state())
+
+    class DeadlineGuard(PromptGuardClient):
+        def __init__(self, *, slow: bool) -> None:
+            self.slow = slow
+
+        @property
+        def adapter(self) -> str:
+            return "controlled-local"
+
+        @property
+        def policy_fingerprint(self) -> str:
+            return "a" * 64
+
+        @property
+        def timeout_seconds(self) -> float:
+            return 0.02 if scope == "guard-bound" else 5.0
+
+        async def inspect(self, request: PromptGuardRequest) -> PromptGuardDecision:
+            nonlocal guard_started_at, guard_cancelled
+            if not self.slow:
+                return PromptGuardDecision("allow", "clean")
+            guard_started_at = asyncio.get_running_loop().time()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                guard_cancelled = True
+                raise
+            raise AssertionError("unreachable")
+
+    hatch = scope == "hatch-operation"
+    slow_guard = DeadlineGuard(slow=True)
+    primary_guard = DeadlineGuard(slow=False) if hatch else slow_guard
+    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else _ScriptedCompletion()
+    recorder = BufferingRecorder()
+    events: list[str] = []
+    failure: BaseException | None = None
+    try:
+        try:
+            await _plan(
+                tmp_path=tmp_path,
+                tool_context=tool_context,
+                completion=completion,
+                recorder=recorder,
+                originating_message=origin,
+                custody_config=replace(_custody(tmp_path), session_engine=engine),
+                policy_override=(policy, snapshot),
+                model_overrides={
+                    "timeout_seconds": 1.0,
+                    "max_discovery_turns": 1,
+                    "prompt_guard_mode": "required",
+                    "prompt_guard_mount": PromptGuardMount(primary_guard),
+                    "escape_hatch_model": "anthropic/claude-planner" if hatch else None,
+                    "escape_hatch_provider": "test-provider" if hatch else None,
+                    "escape_hatch_prompt_guard_mount": PromptGuardMount(slow_guard) if hatch else None,
+                },
+                lifecycle=_lifecycle(events),
+            )
+        except BaseException as exc:
+            failure = exc
+
+        with engine.connect() as connection:
+            rows = connection.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).mappings().all()
+            attempts = connection.execute(select(quota_provider_attempts_table)).mappings().all()
+            ledger = connection.execute(select(token_usage_ledger_table)).mappings().all()
+        guards = [
+            row["tool_calls"][0]["check"] for row in rows if row["tool_calls"] and row["tool_calls"][0]["_kind"] == "prompt_guard_audit"
+        ]
+        expected_attempts = 2 if hatch else 0
+        assert guard_started_at is not None
+        assert guard_cancelled
+        assert len(completion.requests) == len(recorder.llm_calls) == len(attempts) == len(ledger) == expected_attempts
+        assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS] * expected_attempts
+        assert [(check["role"], check["disposition"], check["reason"]) for check in guards] == (
+            [("composer", "allow", "clean")] * expected_attempts
+            + [
+                (
+                    "advisor" if hatch else "composer",
+                    "unavailable" if scope == "guard-bound" else "cancelled",
+                    "timeout" if scope == "guard-bound" else "cancelled",
+                )
+            ]
+        )
+        assert events[-1] == "settled:failed"
+        if scope == "guard-bound":
+            assert isinstance(failure, PromptGuardRefused)
+            assert failure.disposition == "unavailable"
+        else:
+            assert isinstance(failure, PipelinePlannerError)
+            assert failure.code == "TIMEOUT"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["timeout", "outage"])
+async def test_hatch_provider_weather_keeps_original_exhaustion_while_operation_budget_remains(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    failure_kind: str,
+) -> None:
+    provider_failure = (
+        LiteLLMTimeout(message="controlled timeout", llm_provider="test-provider", model="test/planner")
+        if failure_kind == "timeout"
+        else ServiceUnavailableError(message="controlled outage", llm_provider="test-provider", model="test/planner")
+    )
+    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {})), provider_failure)
+    recorder = BufferingRecorder()
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            model_overrides={
+                "max_discovery_turns": 1,
+                "max_api_attempts": 1,
+                "escape_hatch_model": "anthropic/claude-planner",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+    assert caught.value.code == "DISCOVERY_EXHAUSTED"
+    assert len(completion.requests) == 3
+    assert [call.status for call in recorder.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.TIMEOUT if failure_kind == "timeout" else ComposerLLMCallStatus.API_ERROR,
+    ]
 
 
 @pytest.mark.asyncio
@@ -5525,17 +6106,19 @@ async def test_terminal_cannot_replace_server_base_and_proposal_is_created_once(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ("prefix", "complete", "cost_refused", "malformed"))
-async def test_legacy_planner_blob_pages_do_not_invent_owned_delivery(tmp_path: Path, tool_context: ToolContext, delivery: str) -> None:
+async def test_planner_blob_pages_require_owned_admitted_delivery(tmp_path: Path, tool_context: ToolContext, delivery: str) -> None:
     from elspeth.web.blobs.service import BlobServiceImpl
-    from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.composer.turn_effects import BlobInspectionCoverage, TurnEvidence
 
     engine, origin = await _session_context()
-    content = "name,score\n" + "ada,42\n" * 8_000
+    # Exercise exactly two real bounded pages within the existing three-call
+    # success walk; this is a delivery-coverage test, not a large-file workload.
+    content = "name,score\n" + "ada,42\n" * 600
     recorder = BufferingRecorder()
     observed_pages = []
 
-    # Every dispatch is the explicitly injected local completion, including
-    # malformed-response repair attempts. No SDK fallback exists in _plan.
+    # Every physical SDK dispatch reaches the scoped scripted completion,
+    # including malformed-response repair attempts.
     async def complete(**kwargs):
         completion.requests.append(deepcopy(kwargs))
         selected = [
@@ -5622,10 +6205,33 @@ async def test_legacy_planner_blob_pages_do_not_invent_owned_delivery(tmp_path: 
                 assert suffix["start_char"] == prefix["end_char"]
                 assert suffix["end_char"] == suffix["total_chars"] == len(content)
                 assert suffix["content_hash"] == prefix["content_hash"]
-            # This legacy direct planner harness has no physical provider owner.
-            # Real selected pages cannot manufacture the missing owned call IDs.
-            assert all(call.call_id is None for call in recorder.llm_calls)
-            assert evidence.inspection_coverage("planner") == evidence.historical_inspection_coverage() == ()
+            with engine.connect() as connection:
+                attempts = {row["attempt_id"]: dict(row) for row in connection.execute(select(quota_provider_attempts_table)).mappings()}
+                ledger_ids = set(connection.execute(select(token_usage_ledger_table.c.entry_id)).scalars())
+            assert len(recorder.llm_calls) == len(attempts) == len(ledger_ids) == len(completion.requests)
+            assert set(attempts) == {call.call_id for call in recorder.llm_calls}
+            for call in recorder.llm_calls:
+                attempt = attempts[call.call_id]
+                assert attempt["settled_at"] is not None
+                assert attempt["ledger_entry_id"] in ledger_ids
+                assert attempt["operation_id"] == context.fence.operation_id
+                assert attempt["operation_epoch"] == context.fence.operation_epoch
+                assert attempt["lease_token"] == context.fence.lease_token
+            if delivery in ("cost_refused", "malformed"):
+                assert evidence.current_call_id("planner") is None
+                assert evidence.inspection_coverage("planner") == evidence.historical_inspection_coverage() == ()
+            else:
+                expected = (
+                    BlobInspectionCoverage(
+                        str(blob.id),
+                        prefix["content_hash"],
+                        len(content),
+                        ((0, len(content) if delivery == "complete" else prefix["end_char"]),),
+                    ),
+                )
+                assert evidence.current_call_id("planner") == recorder.llm_calls[-1].call_id
+                assert evidence.inspection_coverage("planner") == evidence.historical_inspection_coverage() == expected
+                assert expected[0].complete is (delivery == "complete")
             # A later primary candidate seeing only a planner summary cannot
             # borrow nested delivery, even when planner coverage is complete.
             assert evidence.inspection_coverage("primary") == ()
@@ -5775,14 +6381,7 @@ async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
     recorder = BufferingRecorder()
-    loop = asyncio.get_running_loop()
-    clock_origin = loop.time()
-
-    # This tests turn-count steering through the real planner and provider
-    # parser. Host scheduling must not consume its unrelated wall-clock budget;
-    # the deadline tests above separately exercise timeout enforcement.
-    with patch.object(loop, "time", lambda: clock_origin):
-        proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert len(completion.requests) == 2
@@ -7816,7 +8415,7 @@ async def test_session_loaded_schema_rides_the_planner_request_rehydrated(
     """
     catalog = _EvidenceSchemaCatalog()
 
-    async def _declined_payload() -> dict[str, Any]:
+    async def _declined_payload() -> tuple[dict[str, Any], dict[str, Any]]:
         completion = _ScriptedCompletion(_text_response("DECLINE: nothing to build here."))
         with pytest.raises(PlannerDeclined):
             await _plan(
@@ -7827,10 +8426,21 @@ async def test_session_loaded_schema_rides_the_planner_request_rehydrated(
                 catalog_service=catalog,
                 schemas_loaded=frozenset({("source", "csv")}),
             )
-        return cast(dict[str, Any], json.loads(completion.requests[0]["messages"][1]["content"]))
+        messages = completion.requests[0]["messages"]
+        return json.loads(messages[1]["content"]), json.loads(messages[2]["content"])
 
-    payload = await _declined_payload()
-    evidence = payload["schema_contract_evidence"]
+    reference, payload = await _declined_payload()
+    evidence = reference["schema_contract_evidence"]
+    assert set(evidence) == {
+        "policy_hash",
+        "snapshot_hash",
+        "max_entries",
+        "max_omissions",
+        "max_canonical_bytes",
+        "canonical_bytes_used",
+        "schemas",
+    }
+    assert payload["schema_contract_evidence"] == {"omitted": [], "omissions_withheld_count": 0}
     assert [entry["plugin_id"] for entry in evidence["schemas"]] == ["source/csv"]
     assert evidence["schemas"][0]["json_schema"]["properties"]["mode"]["enum"] == ["strict", "lenient"]
     # No llm surface is policy-visible on this toy catalog, so the
@@ -7841,10 +8451,11 @@ async def test_session_loaded_schema_rides_the_planner_request_rehydrated(
     assert payload["information_manifest"]["supplied"]["expression_grammar"] == "authoring_aids"
 
     catalog.mode_values = ["strict", "recover"]
-    second = await _declined_payload()
-    rehydrated = second["schema_contract_evidence"]["schemas"][0]
+    second_reference, second_payload = await _declined_payload()
+    rehydrated = second_reference["schema_contract_evidence"]["schemas"][0]
     assert rehydrated["json_schema"]["properties"]["mode"]["enum"] == ["strict", "recover"]
-    assert "lenient" not in canonical_json(second["schema_contract_evidence"])
+    assert "lenient" not in canonical_json(second_reference["schema_contract_evidence"])
+    assert second_payload["schema_contract_evidence"] == {"omitted": [], "omissions_withheld_count": 0}
 
 
 @pytest.mark.asyncio
@@ -7879,13 +8490,14 @@ async def test_policy_hidden_identity_marked_earlier_never_reenters_evidence(
             schemas_loaded=frozenset({("source", "csv")}),
         )
 
-    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    reference = json.loads(completion.requests[0]["messages"][1]["content"])
+    payload = json.loads(completion.requests[0]["messages"][2]["content"])
     evidence = payload["schema_contract_evidence"]
-    assert evidence["schemas"] == []
+    assert reference["schema_contract_evidence"]["schemas"] == []
     # An unreferenced hidden identity earns no omission row either: naming it
     # would itself redisclose the name the policy withdrew.
     assert evidence["omitted"] == []
-    assert "csv" not in canonical_json(evidence)
+    assert "csv" not in canonical_json([reference["schema_contract_evidence"], evidence])
 
 
 @pytest.mark.asyncio
@@ -7941,14 +8553,15 @@ async def test_referenced_policy_hidden_identity_yields_only_the_closed_omission
             schemas_loaded=frozenset({("source", "csv")}),
         )
 
-    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    reference = json.loads(completion.requests[0]["messages"][1]["content"])
+    payload = json.loads(completion.requests[0]["messages"][2]["content"])
     evidence = payload["schema_contract_evidence"]
-    assert evidence["schemas"] == []
+    assert reference["schema_contract_evidence"]["schemas"] == []
     assert evidence["omitted"] == [{"plugin_id": "source/csv", "reason": "unavailable_in_current_policy"}]
     assert evidence["omissions_withheld_count"] == 0
     # The identity appears exactly once — as the marker — and no schema
     # content (the toy schema's enum) rides anywhere in the evidence.
-    rendered = canonical_json(evidence)
+    rendered = canonical_json([reference["schema_contract_evidence"], evidence])
     assert rendered.count("csv") == 1
     assert "lenient" not in rendered
 
@@ -8039,7 +8652,7 @@ async def test_aid_deferral_arms_keep_the_manifest_discoverable(
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
 
     request = completion.requests[0]
-    payload = json.loads(request["messages"][1]["content"])
+    payload = json.loads(request["messages"][2]["content"])
     assert payload["information_manifest"]["supplied"] == {
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
@@ -8095,7 +8708,7 @@ async def test_aid_supplied_no_gain_pair_in_one_turn_never_escalates(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    initial_payload = json.loads(completion.requests[0]["messages"][2]["content"])
     assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 2
     # Not the hatch: the follow-up turn stays on the planner model.
@@ -8132,7 +8745,7 @@ async def test_aid_supplied_no_gain_calls_across_turns_never_escalate(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-    initial_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    initial_payload = json.loads(completion.requests[0]["messages"][2]["content"])
     assert initial_payload["information_manifest"]["supplied"]["model_catalog"] == "authoring_aids"
     assert len(completion.requests) == 3
     assert [request["model"] for request in completion.requests] == ["anthropic/claude-planner"] * 3
@@ -8925,7 +9538,7 @@ async def test_planner_summary_on_exhaustion_carries_the_full_code_history(
     assert all(entry["codes"] for entry in summary["rejection_history"])
 
 
-# ── Stated-threshold fidelity guard (R2-F17, elspeth-5c0c09db31) ────────────
+# ── Provider-owned routing semantics (retired ST-02 heuristic scenarios) ──
 
 
 def _pipeline_with_constant_gate(data_dir: Path) -> dict[str, Any]:
@@ -8972,8 +9585,22 @@ def _pipeline_with_conditional_gate(data_dir: Path) -> dict[str, Any]:
     return pipeline
 
 
-class TestStatedThresholdDetector:
-    """False-positive posture: the detector fires only on a real comparison."""
+async def _assert_provider_authored_fanout_admitted(tmp_path: Path, tool_context: ToolContext, instruction: str) -> None:
+    """Check input delivery/admission, never semantic correctness of the fanout."""
+    candidate = _pipeline_with_constant_gate(tmp_path)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": candidate})))
+    recorder = BufferingRecorder()
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, intent=instruction, recorder=recorder)
+    assert len(completion.requests) == len(recorder.llm_calls) == 1
+    assert json.loads(completion.requests[0]["messages"][-1]["content"])["intent"] == instruction
+    assert deep_thaw(proposal.proposal.pipeline) == candidate
+    assert proposal.proposal.repair_count == 0
+    assert [attempt.outcome for attempt in recorder.planner_attempts] == [ComposerPlannerAttemptOutcome.ACCEPTED]
+    assert [attempt.rejection_codes for attempt in recorder.planner_attempts] == [()]
+
+
+class TestRoutingProseAdmission:
+    """Preserve former detector inputs without giving prose a server verdict."""
 
     @pytest.mark.parametrize(
         ("instruction", "expected"),
@@ -8985,41 +9612,34 @@ class TestStatedThresholdDetector:
             ("Split on amount below 100.", "below 100"),
         ],
     )
-    def test_comparison_language_is_detected(self, instruction: str, expected: str) -> None:
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) == expected
+    @pytest.mark.asyncio
+    async def test_comparison_language_is_delivered_without_server_rejection(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str, expected: str
+    ) -> None:
+        assert expected in instruction
+        await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
 
     @pytest.mark.parametrize(
         "instruction",
         [
-            # Comparison wording bound to a number, but about a LIMIT, not a
-            # route. Firing here would tell a model to author a gate condition
-            # for a pipeline that never asked for one — and a compliant model
-            # would turn a correct fan-out into a wrong pipeline. Under a
-            # repair_budget of 1 that is REPAIR_EXHAUSTED with no proposal.
+            # Retain the former unit-limit and clause-boundary scenarios as
+            # exact provider inputs, not a replacement prose classifier.
             "Summarise each row in under 50 words, then fan out to both sinks.",
             "Truncate descriptions over 40 characters and write both copies.",
             "Keep at most 100 rows and fan every row out to both sinks.",
             "Use a temperature below 0.5 for the summariser.",
-            # The same limit prose alongside a REAL routing verb from
-            # _ROUTING_INTENT_PATTERN — the cases the disjoint-vocabulary
-            # negatives above never exercise. Two independent defences must
-            # hold: the unit noun after the number, and the clause boundary
-            # between the limit and the routing verb.
             "Summarise each row in under 50 words and send the results to the sink.",
             "Split the rows into two sinks and keep at most 100 rows.",
             "Split into more than 2 branches.",
             "Route the summary (limit under 50 words) to both sinks.",
-            # Clause separation alone, with a unit noun that is not listed.
             "Summarise in under 50 milliseconds. Route every row to both sinks.",
         ],
     )
-    def test_limit_prose_is_not_read_as_a_routing_threshold(self, instruction: str) -> None:
-        """Three halves must hold: a comparison, routing intent, same clause, no unit noun."""
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) is None
+    @pytest.mark.asyncio
+    async def test_limit_prose_reaches_provider_without_server_rejection(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str
+    ) -> None:
+        await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
 
     @pytest.mark.parametrize(
         "instruction",
@@ -9031,26 +9651,26 @@ class TestStatedThresholdDetector:
             "",
         ],
     )
-    def test_prose_without_a_threshold_is_not_detected(self, instruction: str) -> None:
-        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
-
-        assert _stated_threshold_in(instruction) is None
+    @pytest.mark.asyncio
+    async def test_ordinary_prose_is_delivered_and_empty_request_is_still_refused(
+        self, tmp_path: Path, tool_context: ToolContext, instruction: str
+    ) -> None:
+        if instruction:
+            await _assert_provider_authored_fanout_admitted(tmp_path, tool_context, instruction)
+        else:
+            completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})))
+            with pytest.raises(ValueError, match="intent must be a non-empty exact string"):
+                await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, intent=instruction)
+            assert completion.requests == []
 
 
 @pytest.mark.asyncio
-async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_then_valve(
+async def test_constant_gate_against_a_stated_threshold_keeps_wrong_first_candidate(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """AWS acceptance run 2, R2-F17: the stated threshold never reached the gate.
-
-    Asked to route on ``amount > 500``, the planner authored a constant-condition
-    fan-out that would write every row to BOTH sinks. The shape is legal, so it
-    draws ONE coded repair naming the comparison verbatim; re-emitting the same
-    pipeline is the valve for a genuinely intended fan-out.
-    """
+    """Admission is not semantic success: this wrong first graph is no longer nudged."""
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
     )
 
@@ -9061,27 +9681,19 @@ async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_the
         intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
     )
 
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert feedback["success"] is False
-    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
-    assert codes == ["gate_condition_ignores_stated_threshold"]
-    error = feedback["validation"]["errors"][0]
-    assert error["explanation"]
-    assert error["suggested_fix"]
-    # The comparison the operator stated, verbatim — without it the planner
-    # cannot author the condition it dropped.
-    assert "amount > 500" in error["detail"]
+    assert proposal.proposal.repair_count == 0 and len(completion.requests) == 1
+    accepted = deep_thaw(proposal.proposal.pipeline)
+    assert accepted == _pipeline_with_constant_gate(tmp_path)
+    assert accepted["nodes"][0]["condition"] != "row['amount'] > 500"
 
 
 @pytest.mark.asyncio
-async def test_referential_freeform_threshold_gets_the_same_coded_nudge(
+async def test_referential_freeform_threshold_keeps_wrong_first_candidate(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    """A referential build retains the latest earlier user routing rule."""
+    """The model gets the earlier rule; admission no longer supplies a second chance."""
     completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
     )
 
@@ -9100,10 +9712,14 @@ async def test_referential_freeform_threshold_gets_the_same_coded_nudge(
         ),
     )
 
-    assert proposal.proposal.repair_count == 1
-    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
-    assert [error["error_code"] for error in feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
-    assert "amount > 500" in feedback["validation"]["errors"][0]["detail"]
+    assert proposal.proposal.repair_count == 0 and len(completion.requests) == 1
+    payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+    assert payload["conversation_context"]["prior_user_requests"][0]["content"] == (
+        "Route rows with amount > 500 to high_value and every other row to standard."
+    )
+    accepted = deep_thaw(proposal.proposal.pipeline)
+    assert accepted == _pipeline_with_constant_gate(tmp_path)
+    assert accepted["nodes"][0]["condition"] != "row['amount'] > 500"
 
 
 @pytest.mark.asyncio

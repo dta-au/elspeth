@@ -14,7 +14,7 @@ the web app and its Jobs.
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.7.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.9.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 > **Temporary deployment policy:** only fresh/new stores are supported until
@@ -334,6 +334,14 @@ Required names: `elspeth-session-db-url-runtime`, `elspeth-landscape-url-runtime
 `elspeth-operator-metrics-bearer-token`. PostgreSQL URLs use
 `sslmode=verify-full&sslrootcert=system`: the runtime image's CA store carries
 both Azure roots (facts §4.4). Never print a secret value.
+ACA startup and doctor reject URLs without a single explicit `sslmode=verify-full`
+and `sslrootcert=system` or an absolute CA-file path. Existing ACA configurations
+that omitted these settings must be corrected before using this version.
+Repeated TLS parameters and the legacy `requiressl` option are rejected. If
+`gssencmode` is supplied, it must be a single `disable` value. The supported
+configuration uses TCP/TLS, without competing GSS transport. An explicit CA
+file must exist and contain the trusted server roots in the runtime image;
+static URL validation does not establish that the file is usable.
 Store URL-escaped role passwords in those URLs; never put raw passwords into
 the shell command line. Clear `PGPASSWORD`, `ELSPETH_SCHEMA_OWNER_PASSWORD`
 and `ELSPETH_RUNTIME_PASSWORD` after storing their Key Vault versions.
@@ -364,6 +372,38 @@ unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD
 ```
 
 Only the two schema-owner database URLs belong in the schema-owner vault.
+Before protected authoring, configure both Azure AI Content Safety Prompt
+Shields roles. Put one complete guard JSON object in each operator-private file
+`$SECRET_VALUE_DIR/elspeth-composer-prompt-guard` and
+`$SECRET_VALUE_DIR/elspeth-composer-advisor-prompt-guard`. Keep these files mode
+`0600`, outside Git, and populate them through the operator's secret manager.
+Each object contains `adapter: azure_prompt_shields`, the HTTPS Content Safety
+resource-origin `endpoint`, its dedicated `subscription_key`, and optionally
+`timeout_seconds` (a JSON number, default `10.0`). The exact object shape and
+validation rules are in the [Composer prompt guard reference](../reference/composer-prompt-guard.md).
+These are separate from model-provider credentials; neither role inherits the
+other role's guard.
+
+Store each entire JSON object as a versioned secret in the runtime vault:
+
+```bash
+for secret_name in elspeth-composer-prompt-guard elspeth-composer-advisor-prompt-guard; do
+  test -s "$SECRET_VALUE_DIR/$secret_name"
+  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$secret_name" \
+    --file "$SECRET_VALUE_DIR/$secret_name" --encoding utf-8 --query id --output tsv \
+    >"$SECRET_VERSION_DIR/$secret_name.version"
+done
+```
+
+The application example uses ACA `secretRef` entries to inject these complete
+objects into `ELSPETH_WEB__COMPOSER_PROMPT_GUARD` and
+`ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD`. The settings loader parses each
+value as JSON; a secret pointer or environment reference inside
+`subscription_key` is not expanded. Leave the default guard mode `required`:
+a missing role disables Composer, and a configured refusal prevents dispatch.
+Configuration and availability do not establish guard service health or detector
+accuracy; qualify the configured resource separately as described in the reference.
+
 Upload the primary/advisor endpoint keys and SSO/provider secrets the same way
 to the runtime vault, recording each returned ID in
 `$SECRET_VERSION_DIR/<secret-name>.version`. The tracked application example
@@ -403,12 +443,16 @@ test ! -e "$APPLICATION_PARAMETERS"
 ENVIRONMENT_DOMAIN=$(jq -er '.environmentDefaultDomain.value' "$OPERATOR_DIR/environment-outputs.json")
 FQDN="elspeth-web.${ENVIRONMENT_DOMAIN}"
 PUBLIC_BASE_URL="https://${FQDN}"
-jq --rawfile azure "$SECRET_VERSION_DIR/elspeth-azure-api-key.version" \
+jq --rawfile guard "$SECRET_VERSION_DIR/elspeth-composer-prompt-guard.version" \
+  --rawfile advisor_guard "$SECRET_VERSION_DIR/elspeth-composer-advisor-prompt-guard.version" \
+  --rawfile azure "$SECRET_VERSION_DIR/elspeth-azure-api-key.version" \
   --rawfile client "$SECRET_VERSION_DIR/elspeth-sso-client-secret.version" \
   --rawfile transaction "$SECRET_VERSION_DIR/elspeth-sso-transaction-secret.version" \
   --arg public_base_url "$PUBLIC_BASE_URL" '
   .extraSecrets |= map(
-    if .name == "azure-api-key" then .keyVaultUrl = ($azure | rtrimstr("\n"))
+    if .name == "composer-prompt-guard" then .keyVaultUrl = ($guard | rtrimstr("\n"))
+    elif .name == "composer-advisor-prompt-guard" then .keyVaultUrl = ($advisor_guard | rtrimstr("\n"))
+    elif .name == "azure-api-key" then .keyVaultUrl = ($azure | rtrimstr("\n"))
     elif .name == "sso-client-secret" then .keyVaultUrl = ($client | rtrimstr("\n"))
     elif .name == "sso-transaction-secret" then .keyVaultUrl = ($transaction | rtrimstr("\n"))
     else . end) |
@@ -542,16 +586,20 @@ bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-run
 ```
 
 `doctor-runtime` runs `elspeth doctor deployment --json` with the runtime
-URLs; every reported check must be OK, including schema and storage checks.
-The ACA collector does not emit `session_tls` or `landscape_tls`; a successful
-Job does not establish those named checks ran. The configured runtime URLs
-must retain `sslmode=verify-full&sslrootcert=system`. From the connected
-operator host, test each runtime database with `psql`, using separate `PGHOST`,
-`PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE=verify-full` and a trusted
-`PGSSLROOTCERT` bundle. This query must return `t` and the negotiated protocol:
-`SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();`.
-That proves the operator's connection; runtime Jobs prove connectivity using
-their configured URLs. Retrieve the report from Log
+URLs; every reported check must be OK, including schema, storage,
+`session_tls` and `landscape_tls`. The TLS checks query `pg_stat_ssl` on the
+same initial preflight connections used to inspect each schema. A failed TLS
+preflight prevents schema initialization. Initialization and its final schema
+verification use separate connections with the validated URLs; those connections
+are not independently measured by these checks. Run this runtime doctor after
+schema initialization, as shown here.
+
+The configured runtime URLs must retain
+`sslmode=verify-full&sslrootcert=system`. The report proves the doctor's
+connections using runtime credentials, not every subsequent web connection,
+the production image's CA store in isolation, or completed Azure acceptance.
+An operator-host `psql` query measures only that operator connection and cannot
+substitute for these Job checks. Retrieve the report from Log
 Analytics by execution name (ingestion lags by minutes, facts §5.1).
 
 ## 8. Deploy the workload

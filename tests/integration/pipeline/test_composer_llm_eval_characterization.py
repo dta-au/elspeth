@@ -11,22 +11,26 @@ import asyncio
 import contextlib
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
+import litellm
 import pytest
 import structlog
 import yaml
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.core.secrets import SecretResolutionError, resolve_secret_refs
@@ -64,6 +68,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import quota_provider_attempts_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -132,7 +137,15 @@ class _ReplayLLM:
         self._responses = list(responses)
 
     async def __call__(
-        self, _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         if not self._responses:
             return _make_llm_response(content="Done.")
@@ -222,6 +235,7 @@ def _web_settings(data_dir: Path, **overrides: Any) -> WebSettings:
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 180.0,
         "composer_rate_limit_per_minute": 60,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     defaults.update(overrides)
@@ -294,6 +308,97 @@ async def _run_one_turn_for_characterization(
         # lease acquisition the autouse adapter would otherwise perform.
         kwargs["session_operation_context"] = session_operation_context
     return await driver._run_one_turn_for_test(**kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class _PersistedCharacterizationTurn:
+    persisted_assistant_tool_calls: tuple[Mapping[str, Any], ...]
+    persisted_tool_row_content: tuple[str, ...]
+
+
+async def _run_owned_replay_for_characterization(
+    service: ComposerServiceImpl,
+    *,
+    llm: _ReplayLLM,
+    session_id: str,
+) -> _PersistedCharacterizationTurn:
+    """Run successful replay cases through actual compose ownership and SDK calls.
+
+    Failure-injection cases keep their existing direct driver: they terminate at
+    the exact tool-commit/cancellation/cap seam before a physical END advisor.
+    """
+    sessions = service._require_sessions_service()
+    message = "one-turn compose-loop test driver"
+    # This ordinary ingress lease is released before the compose adapter acquires
+    # its sole turn lease/coordinator/provider owner.
+    async with acquire_compose_context(sessions, session_id) as ingress:
+        human = await sessions.add_message(
+            UUID(session_id), "user", message, writer_principal="route_user_message", session_operation_context=ingress
+        )
+    assert human.role == "user" and human.writer_principal == "route_user_message"
+    primary_calls = 0
+    advisor_calls = 0
+
+    async def complete(**kwargs: Any) -> litellm.ModelResponse:
+        nonlocal primary_calls, advisor_calls
+        if kwargs["model"] == service._settings.composer_advisor_model:
+            advisor_calls += 1
+            assert advisor_calls == 1, "Only one real terminal advisor attempt is supplied"
+            raise litellm.APIConnectionError(
+                message="Synthetic terminal advisor transport unavailable", llm_provider="test", model=kwargs["model"]
+            )
+        assert kwargs["model"] == service._model
+        primary_calls += 1
+        assert primary_calls <= 2, "No extra primary completion is supplied"
+        response = await llm(kwargs["messages"], kwargs["tools"])
+        calls = [
+            {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+            for call in response.tool_batch.calls
+        ]
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": response.message.content, "tool_calls": calls or None}}],
+        )
+
+    with patch("litellm.acompletion", side_effect=complete):
+        result = await service.compose(
+            message,
+            [],
+            CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            session_id=session_id,
+            user_id=EVAL_USER_ID,
+            user_message_id=str(human.id),
+        )
+    assert primary_calls == 2 and advisor_calls == 1
+    assert [call.status for call in result.llm_calls] == [
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.SUCCESS,
+        ComposerLLMCallStatus.API_ERROR,
+    ]
+    stored = await sessions.get_messages(UUID(session_id), limit=None)
+    assistants = [row for row in stored if row.role == "assistant" and row.tool_calls]
+    tools = [row for row in stored if row.role == "tool"]
+    assert len(assistants) == len(tools) == 1
+    assert assistants[0].tool_calls is not None
+    assert tools[0].parent_assistant_id == assistants[0].id
+    assert tools[0].tool_call_id == assistants[0].tool_calls[0]["id"]
+    checks = [
+        row.tool_calls[0]["check"]
+        for row in stored
+        if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == "prompt_guard_audit"
+    ]
+    assert [check["role"] for check in checks] == ["composer", "composer", "advisor"]
+    assert all(check["disposition"] == "debug_bypass" for check in checks)
+    with sessions._engine.connect() as connection:
+        attempts = connection.execute(
+            select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == session_id)
+        ).all()
+    assert len(attempts) == 3
+    assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
+    # Read the same persisted surfaces the old driver exposed. Do not re-run a
+    # redactor or derive a replacement result from the scripted provider values.
+    return _PersistedCharacterizationTurn(tuple(assistants[0].tool_calls), tuple(row.content for row in tools))
 
 
 def _chat_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list[Any]:
@@ -472,7 +577,7 @@ async def test_cl_pp_9_mixed_redaction_policy_persists_sensitive_sentinel_and_pu
         )
     )
 
-    result = await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    result = await _run_owned_replay_for_characterization(service, llm=llm, session_id=session_id)
 
     persisted_arguments = json.loads(result.persisted_assistant_tool_calls[0]["function"]["arguments"])
     expected_arguments = redact_tool_call_arguments(
@@ -867,7 +972,7 @@ async def test_cl_pp_13_unknown_response_key_redacted_in_persisted_tool_row(
         )
     )
 
-    result = await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    result = await _run_owned_replay_for_characterization(service, llm=llm, session_id=session_id)
 
     persisted_tool_row = json.loads(result.persisted_tool_row_content[0])
     assert "stray_provider_field" not in persisted_tool_row

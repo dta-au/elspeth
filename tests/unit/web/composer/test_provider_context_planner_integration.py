@@ -8,10 +8,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
@@ -21,10 +22,18 @@ from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.planning_application import _PlannerPreviewPreflightCallbacks
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX, build_context_string, build_messages
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer import _helpers as composer_helpers
 from tests.unit.web.composer._helpers import _composer_service_with_session, _make_settings
@@ -46,13 +55,15 @@ def test_rendered_prompt_parts_are_exact_and_capture_bounds_are_honest(large: bo
     options = json.loads(content.split("\n", 1)[1])["current_state"]["nodes"][0]["options"]
     assert options["prompt_template_parts"][0]["text"] == prefix + "Classify "
     assert options["prompt_template"].startswith(prefix + "Classify support categories")
-    captured = capture_provider_context(messages=messages, tools=None)
+    wire_messages = detach_prompt_guard_evidence(messages).messages
+    assert wire_messages == [{"role": row["role"], "content": row["content"]} for row in messages]
+    captured = capture_provider_context(messages=wire_messages, tools=None)
     if large:
         assert captured.disposition == "unavailable" and captured.reasons == ("bounds",)
         assert captured.canonical is None
     else:
         assert captured.disposition == "retained"
-        assert json.loads(captured.canonical)["messages"] == messages
+        assert json.loads(captured.canonical)["messages"] == wire_messages
     # Diagnostic capture bounds do not assert refusal at a provider entrance.
 
 
@@ -114,33 +125,74 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
     before_hash = composition_content_hash(state)
     completion = _ScriptedCompletion(_response(("handoff_to_user", {"action": "park", "message": "Keep the approved wording."})))
 
+    sessions = service._require_sessions_service()
+    user_request = "Inspect this approved prompt before editing its route."
+
     async def request(recorder):
-        return await application._plan_and_stage_empty_pipeline(
-            message="Inspect this approved prompt before editing its route.",
-            messages=[],
-            state=state,
-            session_id=session_id,
-            current_state_id=None,
-            user_id="test-user",
-            session_operation_context=operation,
-            progress=None,
-            user_message_id=str(uuid4()),
-            recorder=recorder,
-            plugin_snapshot=snapshot,
-            policy_catalog=policy,
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, operation, invocation_id=str(uuid4()))
         )
+        binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+        owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+        try:
+            result = await application._plan_and_stage_empty_pipeline(
+                message=user_request,
+                messages=[],
+                state=state,
+                session_id=session_id,
+                current_state_id=None,
+                user_id="test-user",
+                session_operation_context=operation,
+                progress=None,
+                user_message_id=str(user_message.id),
+                recorder=recorder,
+                plugin_snapshot=snapshot,
+                policy_catalog=policy,
+                required_work=binding,
+                provider_owner=owner,
+            )
+        except BaseException as primary:
+            try:
+                coordinator.assert_completed()
+            except BaseException as completion_failure:
+                raise BaseExceptionGroup(
+                    "Planner context fixture body and required completion failures", [primary, completion_failure]
+                ) from None
+            raise
+        coordinator.assert_completed()
+        return result
 
     with (
         fenced_operation_context(service._session_engine, session_id) as operation,
         patch.object(application, "_planner_preview_preflight", autospec=True, return_value=_PlannerPreviewPreflightCallbacks()),
         patch("litellm.acompletion", autospec=True, side_effect=completion.__call__) as sdk,
     ):
+        user_message = await sessions.add_message(
+            UUID(session_id),
+            "user",
+            user_request,
+            writer_principal="route_user_message",
+            session_operation_context=operation,
+        )
         recorder = BufferingRecorder()
         result = await request(recorder)
         assert result.state is state and result.graph_recovery_intent.action == "park"
         assert sdk.await_count == len(completion.requests) == 1
         wire = completion.requests[0]
-        payload = json.loads(wire["messages"][1]["content"])
+        assert [row["role"] for row in wire["messages"]] == ["system", "user", "user", "user"]
+        assert wire["messages"][3] == {
+            "role": "user",
+            "content": (
+                "If this request cannot be built with the capabilities available to this planning session, "
+                'reply in plain text starting with "DECLINE: " and state plainly, in the '
+                "user's terms, what is missing. If required artifacts are absent or product requirements "
+                "conflict and no faithful reviewable draft is possible, use the same prefix to explain "
+                "the blocker and ask a focused question. Use that prefix only when you cannot build "
+                "the requested workflow from the available information; otherwise continue with tool calls."
+            ),
+        }
+        payload = json.loads(wire["messages"][2]["content"])
+        assert payload["intent"] == user_request
         options = payload["current_state"]["nodes"][0]["options"]
         assert options["prompt_template_parts"] == before["nodes"][0]["options"]["prompt_template_parts"]
         assert options["prompt_template"] == before["nodes"][0]["options"]["prompt_template"]
@@ -156,9 +208,9 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
         assert len(recorder.llm_calls) == 1
         actual_size = len(canonical_json({"messages": wire["messages"], "tools": wire["tools"]}).encode("utf-8"))
         without_parts = deepcopy(wire["messages"])
-        smaller_payload = json.loads(without_parts[1]["content"])
+        smaller_payload = json.loads(without_parts[2]["content"])
         del smaller_payload["current_state"]["nodes"][0]["options"]["prompt_template_parts"]
-        without_parts[1]["content"] = canonical_json(smaller_payload)
+        without_parts[2]["content"] = canonical_json(smaller_payload)
         smaller_size = len(canonical_json({"messages": without_parts, "tools": wire["tools"]}).encode("utf-8"))
         assert smaller_size < actual_size - 1
         # This cap would admit the old lossy view, but the complete real view
@@ -244,7 +296,8 @@ async def test_public_plan_freezes_original_nested_context_before_first_provider
         provider_current_state=context,
     )
     assert len(completion.requests) == 2
-    initial = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert [row["role"] for row in completion.requests[0]["messages"]] == ["system", "user", "user"]
+    initial = json.loads(completion.requests[0]["messages"][2]["content"])
     assert initial["current_state"] == expected
     tool_payload = next(json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool")
     assert "PRIVATE-MUTATED" not in json.dumps(tool_payload)

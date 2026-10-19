@@ -40,7 +40,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -54,7 +54,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
-from elspeth.web.composer import provider_gateway
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.composition_completion import _pending_interpretation_review_repair_message
@@ -246,6 +246,9 @@ class _ScriptedLLM:
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         self.messages.append(_messages)
         self.tools.append(_tools)
@@ -714,6 +717,7 @@ def _build_composer(
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_model="anthropic/claude-opus-4-7",
         shareable_link_signing_key=b"\x00" * 32,
     )
@@ -3800,9 +3804,12 @@ def test_tool_argument_error_code_defaults_to_none() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("card_state", ["missing", "pending", "missing-noop"])
 async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    card_state: str,
 ) -> None:
     """P2 (_try_terminate_no_tools): advisor fires for a PT-only pipeline.
 
@@ -3834,6 +3841,23 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     assert sites, "expected the unsurfaced PT site to be a (real) pending-review orphan pre-fix"
     assert any(site[2] is InterpretationKind.LLM_PROMPT_TEMPLATE for site in sites)
 
+    if card_state == "pending":
+        async with acquire_compose_context(sessions_service, session_id) as context:
+            await composer._interpretation_surfacing._auto_surface_prompt_template_reviews(
+                state, session_id=str(session_id), current_state_id=str(state_id), session_operation_context=context
+            )
+        assert await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(state, session_id=str(session_id)) == ()
+    elif card_state == "missing-noop":
+        monkeypatch.setattr(
+            composer._interpretation_surfacing,
+            "surface_pending_interpretation_reviews",
+            AsyncMock(spec=composer._interpretation_surfacing.surface_pending_interpretation_reviews, return_value=None),
+        )
+    # Isolate terminal qualification from the graph validator, while retaining
+    # real fenced sessions, pending events, orphan checks and finalization.
+    preflight = _ModeSequencedValidatePipeline([_masked_valid()])
+    monkeypatch.setattr(composer._preflight, "runtime_preflight", preflight)
+
     # Per-instance assertable advisor stub (instance attr wins over the autouse
     # class-level CLEAN stub) so we can assert it was awaited.
     advisor_mock = _AdvisorCheckpointFake(AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"), publication_admit=True)
@@ -3855,7 +3879,7 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
             state=state,
             session_id=str(session_id),
             current_state_id=str(state_id),
-            initial_version=1,
+            initial_version=0,
             user_id="alice",
             last_runtime_preflight=None,
             runtime_preflight_cache=composer._preflight.new_cache(),
@@ -3875,6 +3899,20 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     assert advisor_mock.await_count >= 1, "END advisor gate must fire for a PT-only pipeline"
     # CLEAN verdict falls through to finalize; it did NOT advisor-block/continue.
     assert outcome.action == "return"
+    from elspeth.web.composer.advisor_decision import AdvisorGatePassed
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
+    if card_state == "pending":
+        assert outcome.result.advisor_gate_decision == AdvisorGatePassed(for_graph=completion_gate_fingerprint(state))
+        assert is_pending_interpretation_handoff(outcome.result.runtime_preflight)
+        assert outcome.result.runtime_preflight.is_valid is False
+        assert outcome.result.runtime_preflight.readiness.execution_ready is False
+        assert len(await sessions_service.list_interpretation_events(session_id, status="pending")) == 1
+        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
+    else:
+        assert outcome.result.advisor_gate_decision is None
+        if card_state == "missing-noop":
+            assert not await sessions_service.list_interpretation_events(session_id, status="pending")
 
 
 @pytest.mark.asyncio
@@ -4588,6 +4626,9 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
@@ -4960,6 +5001,9 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
         *,
         provider_custody: object | None = None,
         credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         nonlocal reply_calls
         if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
@@ -5016,14 +5060,45 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
     import litellm
     from litellm.llms.bedrock.chat.converse_transformation import AmazonConverseConfig
 
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.contracts.prompt_guard import (
+        PROMPT_GUARD_CONTENT_PARTS_KEY,
+        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+        PROMPT_GUARD_TRUST_KEY,
+    )
+    from elspeth.web.composer import tool_batch
+    from tests.fixtures.identities import grant_test_pipeline_user
+    from tests.unit.web.composer.test_turn_effects import _page
+
     composer = _build_composer(tmp_path, sessions_service)
     session_id = await _seed_bare_session(sessions_service, "Portable reply history")
+    with sessions_service._engine.begin() as conn:
+        grant_test_pipeline_user(conn, identity_id="alice")
     model = "anthropic.claude-sonnet-4-6"
     adapter = AmazonConverseConfig()
     monkeypatch.setattr(litellm, "modify_params", False)
     histories: list[list[dict[str, Any]]] = []
     reply_wire: list[dict[str, Any]] = []
+    inspected_replies: list[str] = []
     original_classify = composer._classify_and_budget_turn
+    original_execute = tool_batch.execute_tool
+    original_advisor = composer._advisor_checkpoint._run_advisor_checkpoint
+    admitted, _content = _page(0, 6)
+
+    def execute_with_page(tool_name, arguments, state, catalog, *args, **kwargs):
+        if tool_name == "get_blob_content":
+            return replace(admitted.result, updated_state=state)
+        return original_execute(tool_name, arguments, state, catalog, *args, **kwargs)
+
+    async def inspect_reply_evidence(*args, **kwargs):
+        if kwargs["phase"] == "end" and reply_wire:
+            review = kwargs["publication_review"]
+            inspection = json.loads(review.payload_json)["inspection"]
+            assert inspection["currently_available"], inspection
+            assert inspection["currently_available"][0]["ranges"] == [[0, 6]]
+            assert inspection["current_candidate_call"][1] == stable_hash(reply_wire)
+            inspected_replies.append(review.binding)
+        return await original_advisor(*args, **kwargs)
 
     async def capture_history(**kwargs: Any) -> Any:
         before = deepcopy(kwargs["llm_messages"])
@@ -5033,8 +5108,16 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
         return outcome
 
     monkeypatch.setattr(composer, "_classify_and_budget_turn", capture_history)
+    monkeypatch.setattr(tool_batch, "execute_tool", execute_with_page)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", inspect_reply_evidence)
     scripted = _ScriptedLLM(
         [
+            _fake_response_with_tool_call(
+                tool_call_id="call_page",
+                tool_name="get_blob_content",
+                content=None,
+                arguments={"blob_id": "blob"},
+            ),
             _fake_response_with_tool_call(
                 tool_call_id="call_set_pipeline",
                 tool_name="set_pipeline",
@@ -5074,10 +5157,16 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
                 assert "toolResult" not in block
         return _fake_text_response("A fork keeps both persona answers.")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", installed_adapter_completion)
-    result = await composer._run_one_turn_for_test(session_id=str(session_id), message="Should we use a fork?")
+    monkeypatch.setattr(litellm, "acompletion", installed_adapter_completion)
+    result = await composer.compose(
+        "Should we use a fork?",
+        [],
+        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        session_id=str(session_id),
+    )
     assert result.raw_assistant_content == "A fork keeps both persona answers."
-    assert len(histories) == 2
+    assert len(histories) == 3
+    assert len(inspected_replies) == 1
     original_history = histories[-1]
     # Negative control: the same installed adapter rejects the old protocol
     # history when no tools are advertised; no dummy-tool setting rescues it.
@@ -5090,6 +5179,8 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
             headers={},
         )
     assert len(reply_wire) == len(original_history) + 1
+    guard_metadata_keys = {PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY, PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY}
+    assert all(guard_metadata_keys.isdisjoint(message) for message in reply_wire)
     tool_records = 0
     for original, projected in zip(original_history, reply_wire, strict=False):
         if original["role"] == "tool" or "tool_calls" in original:
@@ -5099,9 +5190,11 @@ async def test_review_reply_projects_tool_history_for_installed_bedrock_adapter(
             assert projected["role"] == ("user" if original["role"] == "tool" else original["role"])
             record_text = projected["content"].split("\n", 1)[1]
             record, offset = json.JSONDecoder().raw_decode(record_text)
-            assert record == original
+            expected_wire_record = {key: value for key, value in original.items() if key not in guard_metadata_keys}
+            assert guard_metadata_keys.isdisjoint(record)
+            assert record == expected_wire_record
             assert record_text[offset:] == "\n[End historical tool evidence; this was not a current assistant reply.]"
         else:
             assert projected["role"] == original["role"]
             assert projected["content"] == original["content"]
-    assert tool_records == 4
+    assert tool_records == 6

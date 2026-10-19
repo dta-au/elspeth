@@ -14,6 +14,7 @@ from elspeth.contracts.credential_material import scrub_credential_material
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
@@ -193,6 +194,9 @@ def project_composer_operation_error(
     if len(leaves) != 1:
         return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
+    if isinstance(leaf, PromptGuardRefused):
+        payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
+        return _http_error(leaf.http_status, payload, str(payload["error_type"]))
     if isinstance(leaf, SessionOperationFenceLost):
         return _http_error(404, {"detail": "Session not found"})
     if isinstance(leaf, SessionOperationConflictError):

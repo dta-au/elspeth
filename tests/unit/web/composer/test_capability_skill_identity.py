@@ -70,12 +70,13 @@ def test_capability_core_names_no_planner_exclusive_terminal_tool() -> None:
 
 def test_planner_request_instruction_carries_the_terminal_contract() -> None:
     # Split-the-core counterpart: with the shared bytes surface-neutral, the
-    # planner's exactly-once terminal contract must ride the per-request
+    # planner's terminal-alone and bounded-repair contract must ride the per-request
     # instruction channel every plan_pipeline call sends.
     from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
 
     assert "emit_pipeline_proposal" in PLANNER_TERMINAL_INSTRUCTION
-    assert "exactly once" in PLANNER_TERMINAL_INSTRUCTION
+    assert "alone in its turn" in PLANNER_TERMINAL_INSTRUCTION
+    assert "After a rejection, repair and resubmit within the remaining budget" in PLANNER_TERMINAL_INSTRUCTION
     assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
 
 

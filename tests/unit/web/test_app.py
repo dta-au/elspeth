@@ -1987,6 +1987,85 @@ class TestLifespanShutdown:
         assert called is False
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+    async def test_lifespan_real_sessionless_probe_reports_not_qualified(self, monkeypatch, tmp_path, mode: str) -> None:
+        """Actual skipped verification reaches serving without claiming provider acceptance."""
+        import elspeth.web.composer.boot_probe as boot_probe
+        from elspeth.web.prompt_guard_config import PromptGuardSettings
+
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="openrouter/z-ai/glm-5.3",
+                composer_prompt_guard_mode=mode,
+                composer_prompt_guard=PromptGuardSettings(
+                    endpoint="https://primary-shield.example.test",
+                    subscription_key="primary-shield-test-key",  # secret-scan: allow-this-line
+                ),
+                composer_advisor_prompt_guard=PromptGuardSettings(
+                    endpoint="https://advisor-shield.example.test",
+                    subscription_key="advisor-shield-test-key",  # secret-scan: allow-this-line
+                ),
+            )
+        )
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+        real_probe = boot_probe.probe_composer_config
+        probed: list[tuple[str, str, bool | None]] = []
+        sdk_calls: list[object] = []
+        guard_calls: list[object] = []
+
+        async def record_real_probe(request: ComposerProbeRequest) -> bool | None:
+            result = await real_probe(request)
+            probed.append((request.surface, request.role, result))
+            return result
+
+        async def forbid_sdk(**kwargs):
+            sdk_calls.append(kwargs)
+            raise AssertionError("sessionless startup called the model")
+
+        async def forbid_guard(*args, **kwargs):
+            guard_calls.append((args, kwargs))
+            raise AssertionError("sessionless startup called Prompt Shields")
+
+        monkeypatch.setattr(boot_probe, "probe_composer_config", record_real_probe)
+        monkeypatch.setattr("litellm.acompletion", forbid_sdk)
+        monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", forbid_guard)
+        monkeypatch.setattr("elspeth.web.composer.provider_gateway.enforce_prompt_guard", forbid_guard)
+        monkeypatch.setattr(app_module, "_COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr(app_module, "_COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+        reached_serving = False
+
+        with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                reached_serving = True
+
+        surfaces = ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+        roles = ["planner", "planner", "planner", "advisor"]
+        status = "skipped_no_durable_guard_audit"
+        assert reached_serving
+        assert probed == list(zip(surfaces, roles, [None] * 4, strict=True))
+        assert sdk_calls == guard_calls == []
+        warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_not_qualified"]
+        assert [entry["probed_surface"] for entry in warnings] == surfaces
+        assert [entry["probed_role"] for entry in warnings] == roles
+        assert [entry["mode"] for entry in warnings] == [mode] * 4
+        assert {entry["reason"] for entry in warnings} == {
+            "No durable lifecycle prompt-guard audit sink is available for sessionless probes."
+        }
+        outcomes = [entry for entry in logs if entry["event"] == "composer_boot_probe_outcome"]
+        assert [(entry["probed_surface"], entry["probed_role"], entry["probe_status"]) for entry in outcomes] == list(
+            zip(surfaces, roles, [status] * 4, strict=True)
+        )
+        assert [amount for amount, _attributes in counter.calls] == [1] * 4
+        attributes = [attrs for _amount, attrs in counter.calls]
+        assert [(attrs["probed_surface"], attrs["probe_status"]) for attrs in attributes] == list(zip(surfaces, [status] * 4, strict=True))
+        assert [attrs for _value, attrs in latency.calls] == attributes
+        assert all(type(value) is int and value >= 0 for value, _attrs in latency.calls)
+        assert not any(entry["event"] == "composer_boot_probe_transient_failure" for entry in logs)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("terminal", [False, True])
     async def test_lifespan_recovers_terminal_truth_and_defers_live_landscape_leader(self, tmp_path, terminal) -> None:
         app = create_app(

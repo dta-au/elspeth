@@ -15,6 +15,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 from elspeth.web.composer.tools import _prevalidate_plugin_options
+from elspeth.web.composer.tools.generation import ComposerProofContext, ProofEvaluated, ProofUnavailable
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.schemas import ValidationCheck, ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.sessions.models import blobs_table
@@ -2599,15 +2600,16 @@ class TestPreviewProofStep:
             assert result.success is True
             assert result.data["proof_diagnostics"] == ()
 
-    def test_proof_empty_when_no_session_context(self) -> None:
-        """Blob source with no session_engine — proof step degrades to empty."""
+    def test_proof_unavailable_when_no_session_context(self) -> None:
+        """A claimed blob without authenticated context is not a performed proof."""
         with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
             state = self._state_with_csv_source(
                 session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
             )
             result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
             assert result.success is True
-            assert result.data["proof_diagnostics"] == ()
+            assert result.data["preview_is_valid"] is False
+            assert [diagnostic["code"] for diagnostic in result.data["proof_diagnostics"]] == ["source_blob_unavailable"]
 
     def test_proof_inspects_named_sources_beyond_compatibility_source(self) -> None:
         """A non-first named source must not bypass proof diagnostics."""
@@ -2819,13 +2821,14 @@ class TestPreviewProofStep:
             assert content_reads == [self.csv_storage_path]
 
     @pytest.mark.parametrize("status", ["pending", "error"])
-    def test_non_ready_blob_metadata_abstains_before_any_path_or_integrity_access(
+    def test_non_ready_blob_metadata_is_unavailable_before_any_path_or_integrity_access(
         self,
         status: str,
     ) -> None:
         """Lifecycle status is checked before touching concurrent blob bytes."""
         from sqlalchemy import update
 
+        from elspeth.web.composer.tools import blobs as blobs_module
         from elspeth.web.composer.tools import generation as generation_module
 
         with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
@@ -2848,21 +2851,18 @@ class TestPreviewProofStep:
                 side_effect=AssertionError("non-ready proof blob must not read bytes"),
             ) as read_bytes,
             patch.object(
-                generation_module,
+                blobs_module,
                 "_verify_blob_content_integrity",
                 side_effect=AssertionError("non-ready proof blob must not verify content"),
             ) as verify,
         ):
-            diagnostics = generation_module.compute_proof_diagnostics(
+            proof = generation_module.compute_proof_diagnostics(
                 state,
-                data_dir=str(self.data_dir),
-                session_operation_authority=blob_authority,
-                session_operation_context=blob_operation_context,
-                session_engine=self.engine,
-                session_id=self.session_id,
+                context=ComposerProofContext(self.engine, self.session_id, str(self.data_dir), blob_operation_context, blob_authority),
             )
 
-        assert diagnostics == []
+        assert type(proof) is ProofUnavailable
+        assert [diagnostic["code"] for diagnostic in proof.diagnostics] == ["source_blob_unavailable"]
         exists.assert_not_called()
         read_bytes.assert_not_called()
         verify.assert_not_called()
@@ -4296,7 +4296,7 @@ class TestPreviewProofStep:
                 session_operation_context=context,
             )
             codes = [d["code"] for d in result.data["proof_diagnostics"]]
-            assert "source_inspection_failed" in codes
+            assert "source_blob_unavailable" in codes
             assert result.data["preview_is_valid"] is False
 
     def test_blocking_proof_overrides_authoring_validation(self, passing_runtime_preflight: _SyncCallRecorder) -> None:
@@ -4405,14 +4405,12 @@ class TestPreviewProofStep:
             state = self._state_with_tampered_source_options(
                 authority, context, {"blob_ref": self.csv_blob_id, "schema": {"mode": "not_a_real_mode"}}
             )
-            diagnostics = compute_proof_diagnostics(
+            proof = compute_proof_diagnostics(
                 state,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                data_dir=str(self.data_dir),
-                session_operation_authority=authority,
-                session_operation_context=context,
+                context=ComposerProofContext(self.engine, self.session_id, str(self.data_dir), context, authority),
             )
+            assert type(proof) is ProofEvaluated
+            diagnostics = proof.diagnostics
             blocking = [d for d in diagnostics if d["severity"] == "blocking"]
             assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
             # The schema-block builder's repair text must point at the schema knob,
@@ -4431,14 +4429,12 @@ class TestPreviewProofStep:
             state = self._state_with_tampered_source_options(
                 authority, context, {"blob_ref": self.csv_blob_id, "columns": ["order_id", 123]}
             )
-            diagnostics = compute_proof_diagnostics(
+            proof = compute_proof_diagnostics(
                 state,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                data_dir=str(self.data_dir),
-                session_operation_authority=authority,
-                session_operation_context=context,
+                context=ComposerProofContext(self.engine, self.session_id, str(self.data_dir), context, authority),
             )
+            assert type(proof) is ProofEvaluated
+            diagnostics = proof.diagnostics
             blocking = [d for d in diagnostics if d["severity"] == "blocking"]
             assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
 
@@ -4450,14 +4446,12 @@ class TestPreviewProofStep:
         # ValueError inside _csv_source_delimiter, surfaced by the inspect wrap.
         with _blob_operation(self.engine, self.session_id) as (authority, context):
             state = self._state_with_tampered_source_options(authority, context, {"blob_ref": self.csv_blob_id, "delimiter": "||"})
-            diagnostics = compute_proof_diagnostics(
+            proof = compute_proof_diagnostics(
                 state,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                data_dir=str(self.data_dir),
-                session_operation_authority=authority,
-                session_operation_context=context,
+                context=ComposerProofContext(self.engine, self.session_id, str(self.data_dir), context, authority),
             )
+            assert type(proof) is ProofEvaluated
+            diagnostics = proof.diagnostics
             blocking = [d for d in diagnostics if d["severity"] == "blocking"]
             assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
 

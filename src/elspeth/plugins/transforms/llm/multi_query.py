@@ -8,7 +8,7 @@ ResponseFormat) used by both single and multi-query modes.
 from __future__ import annotations
 
 import re
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
@@ -117,6 +117,13 @@ class OutputFieldConfig(PluginConfig):
 _QUERY_CONTEXT_RESERVED_NAMES: frozenset[str] = frozenset({"source_row"} | {name for name in dir(dict) if not name.startswith("_")})
 
 
+def _validate_structured_output_prefix(value: str | None) -> str | None:
+    """Preserve null and empty distinctly; refuse silently normalized stems."""
+    if value is not None and (not isinstance(value, str) or (value != "" and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", value) is None)):
+        raise ValueError("structured_output_prefix must be null, empty, or an ASCII identifier of at most 64 characters")
+    return value
+
+
 class QueryDefinition(BaseModel):
     """Typed authoring model for a single multi-query LLM query.
 
@@ -160,6 +167,22 @@ class QueryDefinition(BaseModel):
         default=None,
         description="Typed structured-output field definitions (None = unstructured response).",
     )
+    structured_output_prefix: str | None = Field(
+        default=None,
+        strict=True,
+        max_length=64,
+        description=(
+            "Structured row-field stem: null/omitted uses the query name; empty emits bare suffixes; otherwise an ASCII identifier "
+            "of at most 64 characters emits <stem>_<suffix>. Response JSON keys and raw/usage/model fields are unchanged. "
+            "Any non-null override requires unique final generated names across all queries."
+        ),
+    )
+
+    @field_validator("structured_output_prefix")
+    @classmethod
+    def validate_structured_output_prefix(cls, value: str | None) -> str | None:
+        return _validate_structured_output_prefix(value)
+
     template: str | None = Field(
         default=None,
         description="Per-query Jinja2 template override (None = use the config-level prompt_template).",
@@ -249,6 +272,8 @@ class QuerySpec:
         output_fields: Typed output field definitions (None = unstructured)
         template: Per-query template override (None = use config-level template)
         max_tokens: Per-query max_tokens override (None = use config-level)
+        structured_output_prefix: Structured row-field stem (None = query name,
+            empty = bare suffix); raw response and operational names are unchanged.
     """
 
     name: str
@@ -258,12 +283,14 @@ class QuerySpec:
     template: str | None = None
     max_tokens: int | None = None
     allow_empty_inputs: InitVar[bool] = False
+    structured_output_prefix: str | None = field(default=None, kw_only=True)
 
     def __post_init__(self, allow_empty_inputs: bool) -> None:
         if not self.name:
             raise ValueError("name must be non-empty")
         if not self.input_fields and not allow_empty_inputs:
             raise ValueError("input_fields must be non-empty")
+        _validate_structured_output_prefix(self.structured_output_prefix)
         if self.max_tokens is not None:
             if isinstance(self.max_tokens, bool):
                 raise TypeError(f"max_tokens must be int, got bool ({self.max_tokens!r})")
@@ -274,6 +301,15 @@ class QuerySpec:
         object.__setattr__(self, "input_fields", MappingProxyType(dict(self.input_fields)))
         if self.output_fields is not None:
             object.__setattr__(self, "output_fields", tuple(self.output_fields))
+
+    @property
+    def structured_field_prefix(self) -> str:
+        """The sole publication prefix, including its optional separator."""
+        stem = self.name if self.structured_output_prefix is None else self.structured_output_prefix
+        return f"{stem}_" if stem else ""
+
+    def structured_field_name(self, suffix: str) -> str:
+        return f"{self.structured_field_prefix}{suffix}"
 
     def build_template_context(
         self, row: PipelineRow, projection: RowProjection, *, original_row: PipelineRow | None = None
@@ -314,6 +350,7 @@ def _query_spec_from_definition(name: str, definition: QueryDefinition, *, allow
         output_fields=output_fields,
         template=definition.template,
         max_tokens=definition.max_tokens,
+        structured_output_prefix=definition.structured_output_prefix,
         allow_empty_inputs=allow_empty_inputs,
     )
 
@@ -421,10 +458,9 @@ def resolve_queries(
                         f"Choose a different suffix to prevent silent data loss."
                     )
                 # Check for cross-query output key collisions.
-                # Output keys are "{query_name}_{suffix}" (see MultiQueryStrategy),
-                # so different queries MAY share the same suffix as long as the full
-                # key is unique.
-                output_key = f"{spec.name}_{field.suffix}"
+                # Compare publication names, including explicit prefix overrides;
+                # different queries may share a suffix only when final keys differ.
+                output_key = spec.structured_field_name(field.suffix)
                 if output_key in seen_output_keys:
                     raise ValueError(
                         f"Output field key collision: key '{output_key}' "
@@ -453,6 +489,28 @@ class OrderedQueryPlanError(ValueError):
     """A compiler diagnostic containing structural field/query identities only."""
 
 
+def unique_query_generated_fields(specs: tuple[QuerySpec, ...], response_field: str) -> tuple[frozenset[str], ...]:
+    """Inventory all actual publications, refusing even within-query collisions.
+
+    Ordered mode always uses this strict contract. Upstream mode opts in when
+    any query explicitly overrides its structured publication stem.
+    """
+    from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
+
+    seen: set[str] = set()
+    generated: list[frozenset[str]] = []
+    for spec in specs:
+        prefix = f"{spec.name}_{response_field}"
+        names = [f"{prefix}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES]
+        names.extend(spec.structured_field_name(item.suffix) for item in spec.output_fields or ())
+        for name in names:
+            if name in seen:
+                raise OrderedQueryPlanError(f"Generated output field collision: '{name}' in query '{spec.name}'")
+            seen.add(name)
+        generated.append(frozenset(names))
+    return tuple(generated)
+
+
 def compile_ordered_query_plan(
     specs: tuple[QuerySpec, ...],
     response_field: str,
@@ -467,23 +525,13 @@ def compile_ordered_query_plan(
     dictionary precedence. Per-row admission additionally checks actual aliases.
     """
     from elspeth.plugins.sources.field_normalization import normalize_field_name
-    from elspeth.plugins.transforms.llm import LLM_GUARANTEED_SUFFIXES
 
     if not list_form:
         raise OrderedQueryPlanError("ordered query_input_mode requires list-form queries")
     if pool_size != 1:
         raise OrderedQueryPlanError("ordered query_input_mode requires pool_size=1")
-    producers: dict[str, int] = {}
-    generated_by_query: list[frozenset[str]] = []
-    for index, spec in enumerate(specs):
-        prefix = f"{spec.name}_{response_field}"
-        names = [f"{prefix}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES]
-        names.extend(f"{spec.name}_{field.suffix}" for field in spec.output_fields or ())
-        for name in names:
-            if name in producers:
-                raise OrderedQueryPlanError(f"Generated output field collision: '{name}' in query '{spec.name}'")
-            producers[name] = index
-        generated_by_query.append(frozenset(names))
+    generated_by_query = unique_query_generated_fields(specs, response_field)
+    producers = {name: index for index, names in enumerate(generated_by_query) for name in names}
     for name in original_only_fields:
         canonical = normalize_field_name(name)
         if name in producers or canonical in producers:
@@ -501,4 +549,4 @@ def compile_ordered_query_plan(
             else:
                 external.add(name)
         external_by_query.append(frozenset(external))
-    return OrderedQueryPlan(specs, tuple(generated_by_query), tuple(external_by_query))
+    return OrderedQueryPlan(specs, generated_by_query, tuple(external_by_query))

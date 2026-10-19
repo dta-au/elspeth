@@ -28,7 +28,9 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInputKind,
     SinkEffectMember,
     SinkEffectMemberCandidate,
+    SinkEffectMembershipEntry,
     SinkEffectRole,
+    SinkEffectRoutingContext,
 )
 from elspeth.core.canonical import stable_hash as type_faithful_stable_hash
 
@@ -246,7 +248,9 @@ def resolve_sink_effect_members(
     if len(set(token_ids)) != len(token_ids):
         raise _audit_error("candidate token IDs must be unique")
 
-    ordered_inputs: list[tuple[int, LineageStructure, str, str, str, str, Mapping[str, object], str, str | None]] = []
+    ordered_inputs: list[
+        tuple[int, LineageStructure, str, str, str, str, Mapping[str, object], str, str | None, SinkEffectRoutingContext | None]
+    ] = []
     for candidate in candidate_tuple:
         root = query.get_token(candidate.token_id)
         if root is None:
@@ -279,6 +283,7 @@ def resolve_sink_effect_members(
                 candidate.row,
                 pending_identity_hash,
                 candidate.primary_effect_id,
+                candidate.routing_context,
             )
         )
 
@@ -295,6 +300,7 @@ def resolve_sink_effect_members(
             row=item[6],
             pending_identity_hash=item[7],
             primary_effect_id=item[8],
+            routing_context=item[9],
         )
         for ordinal, item in enumerate(ordered_inputs)
     )
@@ -307,6 +313,27 @@ def _derived_ids(effect_id: str, member_count: int) -> tuple[str, str, tuple[str
         _labeled_hash("sink-effect-member-v1", {"effect_id": effect_id, "ordinal": ordinal}) for ordinal in range(member_count)
     )
     return artifact_id, idempotency_key, member_ids
+
+
+def _pipeline_membership(members: Sequence[SinkEffectMember]) -> list[SinkEffectMembershipEntry]:
+    return [
+        {
+            "ingest_sequence": member.ingest_sequence,
+            "lineage_hash": member.lineage_hash,
+            "ordinal": member.ordinal,
+            "payload_hash": member.payload_hash,
+            "pending_identity_hash": member.pending_identity_hash,
+            "primary_effect_id": member.primary_effect_id,
+            "row_id": member.row_id,
+            "token_id": member.token_id,
+        }
+        for member in members
+    ]
+
+
+def compute_pipeline_membership_hash(members: Sequence[SinkEffectMember]) -> str:
+    """Bind the original complete member manifest, including pending context."""
+    return _labeled_hash("sink-effect-membership-v1", _pipeline_membership(members))
 
 
 def compute_pipeline_effect_identity(
@@ -330,19 +357,7 @@ def compute_pipeline_effect_identity(
         raise ValueError("pipeline members must be dense and ordered")
     config_hash = _credential_free_hash("sink-effect-config-v1", sink_config, "sink_config")
     requested_target_hash = compute_sink_effect_target_hash(target_config)
-    membership = [
-        {
-            "ingest_sequence": member.ingest_sequence,
-            "lineage_hash": member.lineage_hash,
-            "ordinal": member.ordinal,
-            "payload_hash": member.payload_hash,
-            "pending_identity_hash": member.pending_identity_hash,
-            "primary_effect_id": member.primary_effect_id,
-            "row_id": member.row_id,
-            "token_id": member.token_id,
-        }
-        for member in member_tuple
-    ]
+    membership = _pipeline_membership(member_tuple)
     membership_hash = _labeled_hash("sink-effect-membership-v1", membership)
     group_payload_hash = _labeled_hash("sink-effect-group-payload-v1", [member.payload_hash for member in member_tuple])
     effect_id = _labeled_hash(
@@ -468,6 +483,7 @@ __all__ = [
     "compute_audit_export_effect_identity",
     "compute_effect_identity",
     "compute_pipeline_effect_identity",
+    "compute_pipeline_membership_hash",
     "compute_sink_effect_target_hash",
     "resolve_sink_effect_members",
 ]

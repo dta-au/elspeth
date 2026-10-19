@@ -1434,10 +1434,11 @@ recovery details.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `name` | string | List form: **Yes**. Mapping form: no — the key supplies it | — | Query identifier; prefixes this query's output fields |
+| `name` | string | List form: **Yes**. Mapping form: no — the key supplies it | — | Query identifier; prefixes raw/operational fields and supplies the default structured-output stem |
 | `input_fields` | mapping | **Yes** | — | Template variable name → row column name |
 | `response_format` | `standard` \| `structured` | No | `standard` | `structured` enforces a JSON schema built from `output_fields` |
 | `output_fields` | list | No | (none) | Typed structured-output definitions; omit for an unstructured response |
+| `structured_output_prefix` | string or null | No | null | Structured row-field stem: null uses the query name; empty emits bare suffixes; an ASCII identifier of at most 64 characters emits `<stem>_<suffix>` |
 | `template` | string | No | (the node's `prompt_template`) | Per-query Jinja2 template override |
 | `max_tokens` | int | No | (the node's `max_tokens`) | Per-query override |
 
@@ -1445,9 +1446,10 @@ Each `output_fields` entry:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `suffix` | string | **Yes** | Column suffix; the output column is `<query_name>_<suffix>` |
+| `suffix` | string | **Yes** | Response JSON key; the row column defaults to `<query_name>_<suffix>` and follows `structured_output_prefix` when supplied |
 | `type` | `string` \| `integer` \| `number` \| `boolean` \| `enum` | **Yes** | Declared type, enforced against the response and declared as the output column's row type |
 | `values` | list of strings | For `enum` only | Allowed values; required for `enum` and rejected for every other type |
+| `nullable` | boolean | No; defaults to `false` | Also permit JSON `null`; the field's key must still be present |
 
 Each `type` is bound to one row type, which is the output column's declared
 type downstream: `integer` → int, `number` → float, `boolean` → bool,
@@ -1456,16 +1458,43 @@ into that type: an `integer` returned as `5.0` arrives as `5` (a non-integral
 value such as `3.5` fails the row), and a `number` returned as `7` arrives as
 `7.0`. A boolean is never accepted as a number.
 
+Set `nullable: true` when an unavailable value is a valid result, for example
+`{suffix: score, type: number, nullable: true}`. This applies to single-query
+and multi-query transforms and LLM sources. A present JSON `null` becomes
+`None` in the row and retains the declared scalar type with nullable metadata.
+A missing key still fails extraction. Without the option, or with `false`,
+null remains invalid. For an enum, null is admitted in addition to the listed
+strings; those strings remain unchanged.
+
+Downstream expressions and schemas must handle the nullable value explicitly.
+An authored required scalar declaration for the generated field must also set
+`nullable: true`; `score: float?` permits both absence and null, whereas
+`{name: score, type: float, required: true, nullable: true}` requires the key.
+The output-field option requires a supporting runtime beginning with 0.8.9;
+older runtimes reject the new configuration key. Existing configurations retain
+their previous behavior. Changed plugin implementation hashes remain subject
+to the existing resume/replay compatibility checks; this option does not
+authorize resuming an old run with changed code.
+
 A per-query `template` may not contain `{{interpretation:...}}` tokens —
 interpretation review rewrites only the node-level `prompt_template`, so a token
 here would survive to the run and fail as a Jinja error. Put reviewed slots in
 the node-level template.
 
-Multi-query mode emits **suffixed fields only** — there is no unprefixed base
-field. Each query contributes `<query_name>_<response_field>` plus
+Each query contributes `<query_name>_<response_field>` plus
 `<query_name>_<response_field>_usage` and `<query_name>_<response_field>_model`,
-and each structured output field lands at `<query_name>_<suffix>`. Suffixes may
-not collide across queries, and `usage`, `model`, and `error` are reserved.
+and each structured output field defaults to `<query_name>_<suffix>`.
+`structured_output_prefix: ""` publishes bare suffixes; a nonempty override
+publishes `<stem>_<suffix>`. The override changes neither provider JSON keys nor
+raw/usage/model names. It is supported by multi-query transforms beginning with
+0.8.9; older runtimes reject the key. It does not apply to LLM sources or single-query mode.
+
+Structured final keys must be unique; `usage`, `model`, and `error` remain
+reserved suffixes. Ordered mode rejects every generated-name collision. Any
+non-null prefix override also opts upstream mode into that complete check for
+**all** queries, including structured/raw/usage/model overlaps. With all overrides
+omitted or null, upstream mode preserves its legacy operational and later-query
+overwrite precedence. No trimming or name normalization is applied to an override.
 
 ```yaml
 transforms:
@@ -1540,7 +1569,8 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `batch_stats` | Compute statistics over a batch, optionally one row per `group_by` value |
 | `batch_replicate` | Batch deaggregation; configure as an aggregation with `output_mode: transform` |
 | `batch_distribution_profile` | Numeric-only batch distribution statistics; use `batch_top_k` for categorical counts/frequencies |
-| `batch_rank` | Add each row's rank and percentile of a numeric field within its batch, keeping every row; the batch plugin `output_mode: passthrough` accepts |
+| `batch_rank` | Add each row's rank and percentile of a numeric field within its batch, keeping every row; supports `output_mode: passthrough` |
+| `batch_duplicate_annotator` | Annotate every exact duplicate participant across selected string fields in one finite complete source; requires EOF-only aggregation and supports `output_mode: passthrough` ([admission guide](../guides/ordered-llm-queries.md#checking-the-completed-result)) |
 | `report_assemble` | Assemble a batch of text rows into one report/text row with pagination metadata |
 | `web_scrape` | HTML content extraction with SSRF prevention |
 | `llm` | Unified LLM transform (azure/openrouter/bedrock providers, single/multi-query) |
@@ -2329,10 +2359,13 @@ trigger:
 
 `passthrough` carries only a plugin whose flush emits exactly one row per
 buffered row, in order (the plugin class declares
-`flush_emits_one_row_per_buffered_row`). One shipped batch plugin does:
+`flush_emits_one_row_per_buffered_row`). Two shipped batch plugins do:
 `batch_rank`, which adds each row's rank and percentile within the batch and
 emits every buffered row, an unranked one (null or non-finite value) included
-([example](../../examples/batch_rank_passthrough/README.md)). Every other
+([example](../../examples/batch_rank_passthrough/README.md)), and
+`batch_duplicate_annotator`, which retains every member with complete-source
+duplicate admission and cause annotations. The latter requires an omitted/empty
+trigger; configured count, timeout and condition triggers are refused. Every other
 shipped batch plugin reduces the batch (`batch_stats`, `report_assemble`, …),
 replicates rows (`batch_replicate`) or skips rows (`batch_outlier_annotator`
 skips a null or non-finite value), so `elspeth validate` and the composer
@@ -3444,7 +3477,7 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 ## Expression Syntax
 
 Gate conditions, aggregation triggers, commencement-gate conditions, and
-`value_transform` operations use a restricted expression language.
+`value_transform` operations and LLM `input_checks`/`result_checks` use a restricted expression language.
 
 Row-scoped expressions (gates, aggregation triggers, `value_transform`
 operations) bind a single name, `row`. Commencement-gate conditions run before
@@ -3457,7 +3490,7 @@ by the same grammar, so everything below applies to them too.
 | Construct | Example |
 |-----------|---------|
 | Field access | `row['field']`, `row.get('field')` |
-| Built-in functions | `len()`, `abs()` |
+| Built-in functions | `len()`, `abs()`, `lower()`, `upper()`, `strip()`, `casefold()`, `starts_with()`, `word_count()`, `decimal_within()` |
 | Comparisons | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | Boolean operators | `and`, `or`, `not` |
 | Arithmetic | `+`, `-`, `*`, `/`, `%` |
@@ -3466,6 +3499,27 @@ by the same grammar, so everything below applies to them too.
 | Ternary | `x if condition else y` |
 
 **`row.get()` does not accept default values.** `row.get('field')` returns `None` if the key is missing. `row.get('field', 'fallback')` is **forbidden** — default values fabricate data the source never provided. Use `row.get('field') is not None` to test for field presence.
+
+`starts_with(value, prefix)` requires two strings and tests the exact,
+case-sensitive leading prefix, without trimming. An empty prefix matches.
+Tuple prefixes, start/end offsets and keyword arguments are unavailable.
+
+`word_count(value)` requires a string and counts tokens separated by runs of
+Python-recognized whitespace, including tabs and newlines. Empty or
+whitespace-only text has zero tokens; punctuation inside a token does not
+split it. This scans the full input and temporarily allocates split tokens.
+
+`decimal_within(left, right, tolerance)` returns whether the absolute difference
+of the numbers' decimal spellings is inclusively within the tolerance. It
+accepts finite built-in integers/floats, excludes booleans and numeric strings,
+and requires a nonnegative tolerance. For example,
+`decimal_within(2.35, 2.30, 0.05)` is true. It adds no epsilon and is independent
+of ambient Decimal precision. It compares the actual values received: earlier
+binary-float calculation artifacts remain, and original source text is not
+recovered. Invalid operands produce expression evaluation errors.
+
+These scalar helpers expose no arbitrary string methods, splitting operation,
+regex, slice syntax or type-coercion functions.
 
 ### Forbidden Constructs
 

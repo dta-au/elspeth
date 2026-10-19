@@ -741,6 +741,350 @@ transforms:
         assert resp.status_code == 404
 
 
+class TestRevertSurfacingDebt:
+    """Receipt replay reads may avoid authority; actual repair remains fenced."""
+
+    _REVIEW_YAML = """
+transforms:
+- name: label_record
+  plugin: llm
+  input: source
+  on_success: main
+  on_error: discard
+  options:
+    model: anthropic/claude-haiku-4.5
+    prompt_template: 'Label {{ row.label }}'
+"""
+
+    async def _missing_review_case(self, tmp_path: Path) -> tuple:
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Replay review debt", "local")
+        imported = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": self._REVIEW_YAML})
+        assert imported.status_code == 200, imported.text
+        originals = await service.list_interpretation_events(session.id, status="pending")
+        assert {event.kind for event in originals} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        for event in originals:
+            resolved = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert resolved.status_code == 200, resolved.text
+        body = {"operation_id": str(uuid.uuid4()), "state_id": imported.json()["id"]}
+        with (
+            patch(
+                "elspeth.web.sessions.routes.composer.state._surface_reverted_interpretation_reviews",
+                side_effect=RuntimeError("post-commit review publication interrupted"),
+            ),
+            pytest.raises(RuntimeError, match="post-commit review publication interrupted"),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        record = await service.get_current_state(session.id)
+        assert record is not None and record.metadata_ is not None
+        assert str(record.id) != imported.json()["id"]
+        assert await service.list_interpretation_events(session.id, status="all", composition_state_id=record.id) == []
+        return app, service, client, session, record, body, originals
+
+    async def _snapshot(self, service, session_id: uuid.UUID) -> tuple:
+        return (
+            await service.get_state_versions(session_id),
+            await service.get_messages(session_id, limit=None),
+            await service.list_interpretation_events(session_id, status="all"),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("metadata", [None, {"name": "No review sites", "description": ""}])
+    async def test_no_site_replay_keeps_unrelated_writer_and_stored_response(self, tmp_path: Path, metadata: dict[str, str] | None) -> None:
+        from elspeth.web.composer import interpretation_surfacing
+        from elspeth.web.sessions.routes.composer import state as state_routes
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "No review replay", "local")
+        target = await _save_test_composition_state(
+            service, session.id, CompositionStateData(metadata_=metadata, is_valid=True), provenance="session_seed"
+        )
+        body = {"operation_id": str(uuid.uuid4()), "state_id": str(target.id)}
+        first = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert first.status_code == 200, first.text
+        before = await self._snapshot(service, session.id)
+        authority = service.session_operation_authority
+        writer = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=30,
+        )
+        try:
+            with (
+                patch.object(authority, "acquire", wraps=authority.acquire) as acquisition,
+                patch.object(
+                    interpretation_surfacing,
+                    "has_pending_interpretation_review_surfacing_debt",
+                    wraps=interpretation_surfacing.has_pending_interpretation_review_surfacing_debt,
+                ) as query,
+                patch.object(state_routes, "_state_from_record", wraps=state_routes._state_from_record) as hydrate,
+            ):
+                replay = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+            assert replay.status_code == 200, replay.text
+            assert replay.content == first.content
+            acquisition.assert_not_called()
+            if metadata is None:
+                query.assert_not_called()
+                hydrate.assert_not_called()
+            else:
+                query.assert_called_once()
+                hydrate.assert_called_once()
+            authority.compare_and_swap(writer)
+            assert await self._snapshot(service, session.id) == before
+            # A different operation is a fresh revert and still needs authority.
+            with pytest.raises(SessionOperationConflictError):
+                client.post(
+                    f"/api/sessions/{session.id}/state/revert",
+                    json={**body, "operation_id": str(uuid.uuid4())},
+                )
+            authority.compare_and_swap(writer)
+        finally:
+            authority.release(writer)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("evidence_status", ["pending", "accepted_as_drafted", "superseded"])
+    async def test_evidenced_replay_uses_all_statuses_without_acquiring_writer(self, tmp_path: Path, evidence_status: str) -> None:
+        _app, service, client, session, record, body, _originals = await self._missing_review_case(tmp_path)
+        first = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert first.status_code == 200, first.text
+        events = await service.list_interpretation_events(session.id, composition_state_id=record.id)
+        assert len(events) == 2
+        if evidence_status == "accepted_as_drafted":
+            for event in events:
+                response = client.post(
+                    f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                    json={"choice": "accepted_as_drafted"},
+                )
+                assert response.status_code == 200, response.text
+        elif evidence_status == "superseded":
+            await _save_test_composition_state(
+                service,
+                session.id,
+                CompositionStateData(metadata_={"name": "Different head", "description": ""}, is_valid=False),
+                provenance="session_seed",
+            )
+        evidence = await service.list_interpretation_events(session.id, status="all", composition_state_id=record.id)
+        assert {event.choice.value for event in evidence} == {evidence_status}
+        before = await self._snapshot(service, session.id)
+        authority = service.session_operation_authority
+        writer = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=30,
+        )
+        try:
+            with patch.object(authority, "acquire", wraps=authority.acquire) as acquisition:
+                replay = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+            assert replay.status_code == 200, replay.text
+            assert replay.content == first.content
+            acquisition.assert_not_called()
+            authority.compare_and_swap(writer)
+            assert await self._snapshot(service, session.id) == before
+        finally:
+            authority.release(writer)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("partial_evidence", [False, True], ids=["wrong-state-only", "mixed-sites"])
+    async def test_missing_sites_still_require_authority_then_repair(self, tmp_path: Path, partial_evidence: bool) -> None:
+        _app, service, client, session, record, body, originals = await self._missing_review_case(tmp_path)
+        original_create = service.create_pending_interpretation_event
+        if partial_evidence:
+            event = originals[0]
+            await original_create(
+                session_id=session.id,
+                composition_state_id=record.id,
+                affected_node_id=event.affected_node_id,
+                tool_call_id=f"backend_auto_surface:{uuid.uuid4()}",
+                user_term=event.user_term,
+                kind=event.kind,
+                llm_draft=event.llm_draft,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
+                surface_origin=InterpretationSurfaceOrigin.STATE_REVERT,
+            )
+        evidence = await service.list_interpretation_events(session.id, composition_state_id=record.id)
+        assert len(evidence) == int(partial_evidence)
+        assert len(await service.list_interpretation_events(session.id, status="all")) > len(evidence)
+        before = await self._snapshot(service, session.id)
+        authority = service.session_operation_authority
+        writer = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=30,
+        )
+        try:
+            with pytest.raises(SessionOperationConflictError):
+                client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+            authority.compare_and_swap(writer)
+            assert await self._snapshot(service, session.id) == before
+        finally:
+            authority.release(writer)
+        repaired = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert repaired.status_code == 200, repaired.text
+        assert repaired.json()["id"] == str(record.id)
+        assert repaired.json()["version"] == record.version
+        assert await service.get_state_versions(session.id) == before[0]
+        assert await service.get_messages(session.id, limit=None) == before[1]
+        events = await service.list_interpretation_events(session.id, composition_state_id=record.id)
+        assert {event.kind for event in events} == {
+            InterpretationKind.LLM_PROMPT_TEMPLATE,
+            InterpretationKind.LLM_MODEL_CHOICE,
+        }
+        assert len(events) == 2
+        assert all(event.surface_origin is InterpretationSurfaceOrigin.STATE_REVERT for event in events)
+        assert all(event.model_identifier is event.model_version is event.provider is event.composer_skill_hash is None for event in events)
+        for event in events:
+            response = client.post(
+                f"/api/sessions/{session.id}/interpretations/{event.id}/resolve",
+                json={"choice": "accepted_as_drafted"},
+            )
+            assert response.status_code == 200, response.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("change", ["evidence", "head"])
+    async def test_repair_rereads_after_acquisition_and_refuses_stale_new_cards(self, tmp_path: Path, change: str) -> None:
+        _app, service, client, session, record, body, originals = await self._missing_review_case(tmp_path)
+        authority = service.session_operation_authority
+        original_acquire = authority.acquire
+        original_read = service.list_interpretation_events
+        original_create = service.create_pending_interpretation_event
+        contexts: list[SessionOperationContext] = []
+        reads: list[tuple[SessionOperationContext | None, tuple]] = []
+        attempts: list[dict] = []
+        changed_head = None
+
+        def acquired(*args, **kwargs):
+            context = original_acquire(*args, **kwargs)
+            contexts.append(context)
+            return context
+
+        async def read(*args, **kwargs):
+            nonlocal changed_head
+            events = await original_read(*args, **kwargs)
+            assert kwargs["status"] == "all" and kwargs["composition_state_id"] == record.id
+            context = contexts[-1] if contexts else None
+            if context is not None:
+                authority.compare_and_swap(context)
+            reads.append((context, tuple(event.id for event in events)))
+            if len(reads) == 1:
+                assert events == [] and contexts == [], "initial advisory read must precede repair authority"
+                if change == "evidence":
+                    for event in originals:
+                        await original_create(
+                            session_id=session.id,
+                            composition_state_id=record.id,
+                            affected_node_id=event.affected_node_id,
+                            tool_call_id=f"backend_auto_surface:{uuid.uuid4()}",
+                            user_term=event.user_term,
+                            kind=event.kind,
+                            llm_draft=event.llm_draft,
+                            model_identifier=None,
+                            model_version=None,
+                            provider=None,
+                            composer_skill_hash=None,
+                            surface_origin=InterpretationSurfaceOrigin.STATE_REVERT,
+                        )
+                else:
+                    changed_head = await _save_test_composition_state(
+                        service,
+                        session.id,
+                        CompositionStateData(metadata_={"name": "Removed review sites", "description": ""}, is_valid=False),
+                        provenance="session_seed",
+                    )
+            return events
+
+        async def create(*args, **kwargs):
+            context = kwargs["session_operation_context"]
+            authority.compare_and_swap(context)
+            assert context.operation_kind is SessionOperationKind.COMPOSE
+            assert context.fence.session_id == str(session.id)
+            assert kwargs["composition_state_id"] == record.id
+            attempts.append(kwargs)
+            return await original_create(*args, **kwargs)
+
+        with (
+            patch.object(authority, "acquire", side_effect=acquired),
+            patch.object(service, "list_interpretation_events", side_effect=read),
+            patch.object(service, "create_pending_interpretation_event", side_effect=create),
+        ):
+            replay = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["id"] == str(record.id) and replay.json()["version"] == record.version
+        assert len(reads) == 2 and reads[0] == (None, ())
+        assert reads[1][0] is contexts[-1] and contexts[-1].operation_kind is SessionOperationKind.COMPOSE
+        events = await original_read(session.id, status="all", composition_state_id=record.id)
+        if change == "evidence":
+            assert len(reads[1][1]) == len(events) == 2
+            assert attempts == [], "under-writer reread must skip evidenced sites before writer dedup"
+            assert await service.get_current_state(session.id) == record
+        else:
+            assert reads[1][1] == () and len(attempts) == 2
+            assert events == [], "stale reviewed content must not mint new cards"
+            assert changed_head is not None and await service.get_current_state(session.id) == changed_head
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", [RuntimeError("evidence storage unavailable"), AuditIntegrityError("corrupt evidence")])
+    async def test_advisory_read_failure_propagates_without_acquisition(self, tmp_path: Path, failure: Exception) -> None:
+        _app, service, client, session, _record, body, _originals = await self._missing_review_case(tmp_path)
+        before = await self._snapshot(service, session.id)
+        authority = service.session_operation_authority
+        with (
+            patch.object(service, "list_interpretation_events", side_effect=failure),
+            patch.object(authority, "acquire", wraps=authority.acquire) as acquisition,
+            pytest.raises(type(failure), match=str(failure)) as caught,
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert caught.value is failure
+        acquisition.assert_not_called()
+        assert await self._snapshot(service, session.id) == before
+
+    @pytest.mark.asyncio
+    async def test_replay_hash_is_verified_before_advisory_query(self, tmp_path: Path) -> None:
+        from elspeth.web.composer import interpretation_surfacing
+        from elspeth.web.sessions.routes.composer import state as state_routes
+        from elspeth.web.sessions.schemas import CompositionValidationErrorResponse
+
+        _app, service, client, session, record, body, _originals = await self._missing_review_case(tmp_path)
+        before = await self._snapshot(service, session.id)
+        original_response = state_routes._state_response
+
+        def corrupted_response(record, **kwargs):
+            return original_response(record, **kwargs).model_copy(
+                update={
+                    "validation_errors": [CompositionValidationErrorResponse(message="altered response", error_code=None, component=None)]
+                }
+            )
+
+        with (
+            patch.object(state_routes, "_state_response", side_effect=corrupted_response),
+            patch.object(
+                interpretation_surfacing,
+                "has_pending_interpretation_review_surfacing_debt",
+                side_effect=AssertionError("unverified replay reached advisory query"),
+            ) as query,
+            pytest.raises(AuditIntegrityError, match="Operation receipt replay response hash does not match stored evidence"),
+        ):
+            client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        query.assert_not_called()
+        assert await self._snapshot(service, session.id) == before
+        repaired = client.post(f"/api/sessions/{session.id}/state/revert", json=body)
+        assert repaired.status_code == 200 and repaired.json()["id"] == str(record.id)
+        assert len(await service.list_interpretation_events(session.id, composition_state_id=record.id)) == 2
+
+
 class TestYamlEndpoint:
     """Tests for GET /api/sessions/{id}/state/yaml."""
 

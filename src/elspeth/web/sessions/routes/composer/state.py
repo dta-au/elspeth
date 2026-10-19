@@ -133,7 +133,19 @@ async def _surface_reverted_interpretation_reviews(
     # revert compatibility instead of turning this additive repair into a 500.
     if state_record.metadata_ is None:
         return
-    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
+    from elspeth.web.composer.interpretation_surfacing import (
+        has_pending_interpretation_review_surfacing_debt,
+        surface_pending_interpretation_reviews_for_state,
+    )
+
+    state = _state_from_record(state_record)
+    if not await has_pending_interpretation_review_surfacing_debt(
+        state,
+        sessions_service=service,
+        session_id=str(session_id),
+        current_state_id=str(state_record.id),
+    ):
+        return
 
     # The replay joiner released the operation's session lease before this
     # post-verification repair runs, and the settling caller's receipt lease
@@ -148,7 +160,7 @@ async def _surface_reverted_interpretation_reviews(
         lease_seconds=service.session_operation_lease_seconds,
     ) as repair_lease:
         await surface_pending_interpretation_reviews_for_state(
-            _state_from_record(state_record),
+            state,
             sessions_service=service,
             session_id=str(session_id),
             current_state_id=str(state_record.id),

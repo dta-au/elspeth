@@ -26,6 +26,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
@@ -320,14 +321,24 @@ class TestCacheMarkersWiredAtCallSite:
         # Bypass availability check (no real Anthropic API key needed).
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
+        initial_state = state.to_dict()
         captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="No pipeline changes were saved.")
         anthropic_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
+        missing_patch_response = _make_llm_response(
+            tool_calls=[{"id": "cache_probe_missing_patch", "name": "set_metadata", "arguments": {}}]
+        )
+        responses = iter(
+            (
+                _Resp(choices=missing_patch_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2}),
+                anthropic_response,
+            )
+        )
 
         async def fake_acompletion(**kwargs: Any) -> Any:
             captured.append(deepcopy(kwargs))
-            return anthropic_response
+            return next(responses)
 
         with patch(
             "litellm.acompletion",
@@ -336,11 +347,11 @@ class TestCacheMarkersWiredAtCallSite:
             result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
         assert len(captured) == len(result.llm_calls) == 2
-        assert result.repair_turns_used == 1
+        assert result.repair_turns_used == 0
         for request, call in zip(captured, result.llm_calls, strict=True):
-            # Cache markers must survive the neutral rootless retry as well
-            # as the initial call. The state stays in its original position;
-            # the sliding tail advances past the prior assistant response.
+            # Cache markers must survive a real argument-error continuation.
+            # The state stays in its original position; the sliding tail
+            # advances past the actual assistant call and tool error.
             sent_messages = request["messages"]
             system_messages = [m for m in sent_messages if m.get("role") == "system"]
             assert len(system_messages) == 2
@@ -386,6 +397,40 @@ class TestCacheMarkersWiredAtCallSite:
             assert call.tools_spec_hash == stable_hash(sent_tools)
             assert call.messages_hash == stable_hash(sent_messages)
         assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2
+        # Missing schema-required patch is an actual ARG_ERROR, not a repair turn.
+        assert state.to_dict() == initial_state
+        assert result.state.to_dict() == initial_state
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.tool_name == "set_metadata"
+        assert invocation.tool_call_id == "cache_probe_missing_patch"
+        assert invocation.status is ComposerToolStatus.ARG_ERROR
+        assert invocation.error_category is ToolArgumentErrorCategory.MISSING_REQUIRED_PATH
+        assert invocation.error_class == "ToolArgumentError"
+        assert invocation.error_message == "missing: patch"
+        assert invocation.version_before == initial_state["version"]
+        assert invocation.version_after is None
+        assert json.loads(invocation.arguments_canonical) == {}
+        assert invocation.arguments_hash == stable_hash({})
+        error_payload = {"error": "Tool 'set_metadata' missing required argument(s): patch"}
+        assert invocation.result_canonical is not None
+        assert json.loads(invocation.result_canonical) == error_payload
+        assert invocation.result_hash == stable_hash(error_payload)
+        assistant_tail, tool_tail = captured[1]["messages"][-2:]
+        assert assistant_tail == {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "cache_probe_missing_patch",
+                    "type": "function",
+                    "function": {"name": "set_metadata", "arguments": "{}"},
+                }
+            ],
+        }
+        assert tool_tail["role"] == "tool"
+        assert tool_tail["tool_call_id"] == invocation.tool_call_id
+        assert json.loads(tool_tail["content"]) == error_payload
 
     @pytest.mark.asyncio
     async def test_openai_model_does_not_emit_cache_control(self) -> None:
@@ -421,14 +466,24 @@ class TestCacheMarkersWiredAtCallSite:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         service._availability = ComposerAvailability(available=True, model=service._model, provider="test")
         state = _empty_state()
+        initial_state = state.to_dict()
         captured: list[dict[str, Any]] = []
 
         text_response = _make_llm_response(content="No pipeline changes were saved.")
         oai_response = _Resp(choices=text_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2})
+        missing_patch_response = _make_llm_response(
+            tool_calls=[{"id": "cache_probe_missing_patch", "name": "set_metadata", "arguments": {}}]
+        )
+        responses = iter(
+            (
+                _Resp(choices=missing_patch_response.choices, usage={"prompt_tokens": 10, "completion_tokens": 2}),
+                oai_response,
+            )
+        )
 
         async def fake_acompletion(**kwargs: Any) -> Any:
             captured.append(deepcopy(kwargs))
-            return oai_response
+            return next(responses)
 
         with patch(
             "litellm.acompletion",
@@ -437,7 +492,7 @@ class TestCacheMarkersWiredAtCallSite:
             result = await service.compose("Build a CSV pipeline.", [], state, session_id=session_id)
 
         assert len(captured) == len(result.llm_calls) == 2
-        assert result.repair_turns_used == 1
+        assert result.repair_turns_used == 0
         for request, call in zip(captured, result.llm_calls, strict=True):
             sent_messages = request["messages"]
             system_messages = [m for m in sent_messages if m.get("role") == "system"]
@@ -464,4 +519,40 @@ class TestCacheMarkersWiredAtCallSite:
             for tool in sent_tools:
                 assert "cache_control" not in tool
             assert call.messages_hash == stable_hash(sent_messages)
+            assert call.tools_spec_hash == stable_hash(sent_tools)
+            assert call.declared_tool_names == tuple(tool["function"]["name"] for tool in sent_tools)
         assert len(captured[1]["messages"]) == len(captured[0]["messages"]) + 2
+        # Missing schema-required patch is an actual ARG_ERROR, not a repair turn.
+        assert state.to_dict() == initial_state
+        assert result.state.to_dict() == initial_state
+        assert len(result.tool_invocations) == 1
+        invocation = result.tool_invocations[0]
+        assert invocation.tool_name == "set_metadata"
+        assert invocation.tool_call_id == "cache_probe_missing_patch"
+        assert invocation.status is ComposerToolStatus.ARG_ERROR
+        assert invocation.error_category is ToolArgumentErrorCategory.MISSING_REQUIRED_PATH
+        assert invocation.error_class == "ToolArgumentError"
+        assert invocation.error_message == "missing: patch"
+        assert invocation.version_before == initial_state["version"]
+        assert invocation.version_after is None
+        assert json.loads(invocation.arguments_canonical) == {}
+        assert invocation.arguments_hash == stable_hash({})
+        error_payload = {"error": "Tool 'set_metadata' missing required argument(s): patch"}
+        assert invocation.result_canonical is not None
+        assert json.loads(invocation.result_canonical) == error_payload
+        assert invocation.result_hash == stable_hash(error_payload)
+        assistant_tail, tool_tail = captured[1]["messages"][-2:]
+        assert assistant_tail == {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "cache_probe_missing_patch",
+                    "type": "function",
+                    "function": {"name": "set_metadata", "arguments": "{}"},
+                }
+            ],
+        }
+        assert tool_tail["role"] == "tool"
+        assert tool_tail["tool_call_id"] == invocation.tool_call_id
+        assert json.loads(tool_tail["content"]) == error_payload

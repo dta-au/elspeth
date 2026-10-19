@@ -15,7 +15,7 @@ Every platform literal below is measured in the
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.7.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.9.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 > **Temporary deployment hold:** the current candidate supports only fresh/new

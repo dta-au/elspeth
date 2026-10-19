@@ -30,7 +30,9 @@ from elspeth.plugins.transforms.llm.multi_query import (
     ResponseFormat,
     compile_ordered_query_plan,
     resolve_queries,
+    unique_query_generated_fields,
 )
+from elspeth.plugins.transforms.llm.result_checks import ResultCheck
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
 # The names PromptTemplate.render actually supplies (templates.py builds the
@@ -112,7 +114,7 @@ def multi_query_generated_input_conflicts(
         generated.add(prefix)
         generated.update(f"{prefix}{suffix}" for suffix in LLM_GUARANTEED_SUFFIXES)
         if spec.output_fields is not None:
-            generated.update(f"{spec.name}_{field.suffix}" for field in spec.output_fields)
+            generated.update(spec.structured_field_name(field.suffix) for field in spec.output_fields)
         consumed.update(spec.input_fields.values())
     return tuple(sorted(generated & consumed))
 
@@ -285,6 +287,15 @@ class LLMConfig(TransformDataConfig):
         json_schema_extra={"composer_tier": "advanced"},
     )
     response_field: str = Field("llm_response", description="Field name for LLM response in output")
+    allow_blank_input_fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Declared required_input_fields whose present string value may be empty or whitespace. "
+            "Use only when the prompt explicitly handles unavailable text. Does not permit missing fields, "
+            "non-nullable nulls, other types, or additional template visibility; omitted/empty keeps blank rejection."
+        ),
+        json_schema_extra={"composer_tier": "advanced"},
+    )
 
     # Single-prompt structured output. These are the top-level lift of the
     # per-query structured-output surface (QueryDefinition.response_format /
@@ -312,6 +323,40 @@ class LLMConfig(TransformDataConfig):
         ),
         json_schema_extra={"composer_tier": "advanced"},
     )
+
+    input_checks: list[ResultCheck] | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        strict=True,
+        description=(
+            "Named Boolean admission checks on the actual entry row, before any per-row model request. "
+            "All must return true; false, non-Boolean or row-data evaluation errors route a nonretryable failure via on_error. "
+            "Checks do not widen prompt visibility. Operation startup preflight remains separate. Omit to preserve existing behavior."
+        ),
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
+    result_checks: list[ResultCheck] | None = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        strict=True,
+        description=(
+            "Named Boolean expression postconditions on the completed output row, including extracted fields. "
+            "All must return the Boolean true before downstream release; false, a non-Boolean result or a row-data "
+            "evaluation error produces a nonretryable transform error via on_error. Does not add fields to the prompt "
+            "or prove semantic correctness. Omit to preserve existing behavior."
+        ),
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
+    @field_validator("result_checks", "input_checks")
+    @classmethod
+    def _distinct_result_check_names(cls, checks: list[ResultCheck] | None) -> list[ResultCheck] | None:
+        if checks is not None and len({check.name for check in checks}) != len(checks):
+            raise ValueError("Check names must be distinct within each input_checks or result_checks list")
+        return checks
 
     # Image inputs (docs/specs/2026-08-25-llm-image-input-design.md §4):
     # absent (None) is exactly today's text-only behavior. Each entry names a
@@ -480,6 +525,28 @@ class LLMConfig(TransformDataConfig):
             raise ValueError(f"Invalid Jinja2 template: {e}") from e
         return v
 
+    @field_validator("allow_blank_input_fields", mode="before")
+    @classmethod
+    def _validate_blank_input_field_names(cls, value: object) -> list[str]:
+        from elspeth.contracts.identifiers import validate_field_names
+
+        if type(value) is list:
+            names = value
+        elif type(value) is tuple:
+            names = list(value)
+        else:
+            raise ValueError("allow_blank_input_fields must be a list or tuple of exact field-name strings")
+        if any(type(name) is not str for name in names):
+            raise ValueError("allow_blank_input_fields must contain exact field-name strings")
+        return list(validate_field_names(names, "allow_blank_input_fields", strip=False))
+
+    @model_validator(mode="after")
+    def _validate_blank_input_permissions(self) -> LLMConfig:
+        undeclared = set(self.allow_blank_input_fields) - set(self.required_input_fields or ())
+        if undeclared:
+            raise ValueError(f"allow_blank_input_fields must be a subset of required_input_fields; undeclared: {sorted(undeclared)}")
+        return self
+
     @model_validator(mode="after")
     def _validate_approved_prompt_artifact(self) -> LLMConfig:
         """Refuse runtime configs whose interpretation hash anchor drifted."""
@@ -527,12 +594,15 @@ class LLMConfig(TransformDataConfig):
         Only *validation* moves earlier; the frozen ``QuerySpec`` runtime
         resolution still happens in ``LLMTransform.__init__`` (the second call is
         idempotent). This validator is deliberately scoped to config-shape errors:
-        it delegates solely to ``resolve_queries`` and does not catch or reshape
-        any exception, so a genuine framework failure would still propagate.
+        it resolves typed queries and, for explicit prefix overrides, checks the
+        complete generated-name inventory. It does not catch or reshape any
+        exception, so a genuine framework failure would still propagate.
         """
         if self.queries is None:
             return self
-        self.resolved_queries()
+        specs = self.resolved_queries()
+        if any(spec.structured_output_prefix is not None for spec in specs):
+            unique_query_generated_fields(tuple(specs), self.response_field)
         return self
 
     @model_validator(mode="after")
@@ -649,7 +719,7 @@ class LLMConfig(TransformDataConfig):
                 definition
                 for spec in self.resolved_queries()
                 for definition in _llm_created_output_fields(
-                    f"{spec.name}_{self.response_field}", f"{spec.name}_", spec.output_fields or ()
+                    f"{spec.name}_{self.response_field}", spec.structured_field_prefix, spec.output_fields or ()
                 )
             )
         written_types = {definition.name: definition.field_type for definition in written}

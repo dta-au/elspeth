@@ -12,6 +12,7 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.transforms.type_coerce import ConversionSpec
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.tools.generation import ProofEvaluated
 from elspeth.web.execution import _validation_authoring as authoring
 from elspeth.web.execution import _validation_diagnostics as diagnostics
 from elspeth.web.execution import service as execution_service
@@ -254,12 +255,14 @@ def test_proof_blocker_is_labelled_with_the_node_kind_the_detector_recorded(node
 
     merged = execution_service._merge_authoritative_proof_diagnostics(
         _valid_result(),
-        [
-            _proof_diagnostic(
-                code="aggregation_numeric_value_field_type_mismatch_against_source_schema",
-                evidence={"node_id": "summarize", "node_type": node_kind},
+        ProofEvaluated(
+            (
+                _proof_diagnostic(
+                    code="aggregation_numeric_value_field_type_mismatch_against_source_schema",
+                    evidence={"node_id": "summarize", "node_type": node_kind},
+                ),
             )
-        ],
+        ),
     )
 
     assert [error.component_type for error in merged.errors] == [node_kind]
@@ -277,16 +280,18 @@ def test_proof_blocker_falls_back_to_the_code_when_no_kind_was_recorded() -> Non
 
     merged = execution_service._merge_authoritative_proof_diagnostics(
         _valid_result(),
-        [
-            _proof_diagnostic(
-                code="gate_expression_type_mismatch_against_source_schema",
-                evidence={"node_id": "amount_gate"},
-            ),
-            _proof_diagnostic(
-                code="csv_duplicate_headers",
-                evidence={"source": "blob"},
-            ),
-        ],
+        ProofEvaluated(
+            (
+                _proof_diagnostic(
+                    code="gate_expression_type_mismatch_against_source_schema",
+                    evidence={"node_id": "amount_gate"},
+                ),
+                _proof_diagnostic(
+                    code="csv_duplicate_headers",
+                    evidence={"source": "blob"},
+                ),
+            )
+        ),
     )
 
     assert [error.component_type for error in merged.errors] == ["gate", "source"]

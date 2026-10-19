@@ -1756,6 +1756,12 @@ def _known_transform_plugins_requiring_aggregation_batch_context() -> frozenset[
     return frozenset(cls.name for cls in transforms if cls.requires_aggregation_batch_context)
 
 
+def _known_transform_plugins_requiring_complete_source_batch() -> frozenset[str]:
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    return frozenset(cls.name for cls in get_shared_plugin_manager().get_transforms() if cls.requires_complete_source_batch)
+
+
 def _declared_input_fields_option(options: Mapping[str, Any]) -> object:
     """Return the raw declared-input-field option, including wrapper-shaped aggregations."""
     if _DECLARED_INPUT_FIELDS_OPTION in options:
@@ -1796,6 +1802,7 @@ def _batch_aware_placement_error(
     node_type: str,
     plugin_name: str | None,
     output_mode: str | None,
+    trigger: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Reject a batch-aware transform from a node kind it cannot run in.
 
@@ -1808,6 +1815,14 @@ def _batch_aware_placement_error(
     """
     if plugin_name is None:
         return None
+
+    if node_type == "aggregation" and plugin_name in _known_transform_plugins_requiring_complete_source_batch():
+        parsed, error = _parse_aggregation_trigger(node_id, trigger or {})
+        if error is not None:
+            return error.message
+        assert parsed is not None
+        if parsed.has_count or parsed.has_timeout or parsed.has_condition:
+            return f"Node '{node_id}' uses '{plugin_name}', which requires an EOF-only trigger; omit trigger or use {{}}"
 
     if node_type == "collector" and plugin_name in _known_transform_plugins_requiring_aggregation_batch_context():
         return (
@@ -8571,7 +8586,7 @@ class CompositionState:
             # parsed at ONE boundary — see the helper's decorator.
             errors.extend(_unregistered_pipeline_decision_term_errors(node))
 
-            batch_placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode)
+            batch_placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode, node.trigger)
             if batch_placement_error is not None:
                 errors.append(_err(f"node:{node.id}", batch_placement_error, "high", "batch_transform_misplaced"))
 

@@ -261,6 +261,10 @@ ELSPETH_WEB__COMPOSER_ALLOW_SAME_ADVISOR_MODEL=true
 
 Restart the web service after changing these settings.
 
+Composer and advisor also require independently configured authoring prompt
+guards. See [Composer prompt guard](composer-prompt-guard.md) for the Azure
+endpoint/credential objects and the explicit development mode.
+
 Composer credentials come from the web process environment, keyed by the
 inferred provider. Both the primary and the advisor contract must be
 satisfied:
@@ -303,6 +307,32 @@ provider, auth, or network failures do not block boot; they are logged as
 conformance unverified at boot), and the Composer is exercised again at
 first use. The routes each Composer role resolved to are logged once at
 startup as `composer_tool_contract_resolved`.
+
+### Advisor input allowance
+
+`ELSPETH_WEB__COMPOSER_ADVISOR_MAX_PROMPT_TOKENS` keeps its existing name and
+default of `4000`. It is a rough input-cost proxy: ELSPETH multiplies the value
+by four and counts rendered characters, including framing and escaping. It
+does not measure provider tokens, the model's context window or available
+account credit.
+
+Public `request_advisor_hint` calls apply this allowance to their complete
+variable user message. Backend EARLY and END checkpoints apply it only to the
+rendered optional pipeline-summary contribution. Optional evidence is fitted
+by whole lines with explicit omission counts. Mandatory checkpoint instructions,
+request/candidate publication evidence and prior review context stay intact;
+they do not spend that optional allowance. A scoped graph review does not
+certify omitted evidence or grant permission to publish a candidate reply.
+
+In 0.8.9 this replaces the inherited complete-variable-message checkpoint
+limit for both default and explicitly configured old values. Required reviews
+with longer mandatory evidence can now reach the provider, increasing cost or
+latency despite unchanged call, retry, output and time limits. Required prompt
+guards, actual quota admission, evidence binding and fail-closed publication
+remain in force. Daily quotas compare recorded usage; they do not reserve the
+next call's input/output tokens or guarantee context fit. The operator remains
+responsible for the selected model and gateway's actual capacity. Restart the
+service after changing the setting.
 
 ### Strict tool contracts (`ELSPETH_WEB__COMPOSER_STRICT_TOOLS`)
 

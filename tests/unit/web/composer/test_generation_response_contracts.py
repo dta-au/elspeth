@@ -69,13 +69,16 @@ def collect():
     results["preview_empty"] = execute_tool("preview_pipeline", {}, state, catalog)
     proof_state = replace(
         state,
-        sources={"proof": SourceSpec(plugin="csv", on_success="rows", options={"blob_ref": "claimed-id"}, on_validation_failure="discard")},
+        sources={
+            "proof": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"blob_ref": "fd818d69-6dc4-4202-8aa4-851288431b2d"},
+                on_validation_failure="discard",
+            )
+        },
     )
-    diagnostics = generation.compute_proof_diagnostics(
-        proof_state, session_id="safe-session", blob_resolver=lambda _id: generation.UnresolvedClaimedProofBlob()
-    )
-    with patch.object(generation, "compute_proof_diagnostics", autospec=True, return_value=diagnostics):
-        results["preview_proof"] = execute_tool("preview_pipeline", {}, proof_state, catalog)
+    results["preview_proof"] = execute_tool("preview_pipeline", {}, proof_state, catalog)
     results["preview_structural"] = execute_tool(
         "preview_pipeline",
         {},

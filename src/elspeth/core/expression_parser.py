@@ -19,6 +19,7 @@ import ast
 import math
 import operator
 from dataclasses import dataclass
+from fractions import Fraction
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -118,6 +119,41 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
     }
 )
 
+def _starts_with(value: object, prefix: object) -> bool:
+    """Compare two actual strings without offsets, tuple prefixes or normalization."""
+    if type(value) is not str or type(prefix) is not str:
+        raise TypeError("starts_with requires two strings")
+    return str.startswith(value, prefix)
+
+
+def _word_count(value: object) -> int:
+    """Count whitespace-delimited tokens without exposing a list or coercing data."""
+    if type(value) is not str:
+        raise TypeError("word_count requires a string")
+    return len(str.split(value))
+
+
+def _numeric_decimal_fraction(value: object) -> Fraction:
+    """Represent an already numeric value's decimal spelling, not its binary expansion."""
+    if type(value) is int:
+        return Fraction(value)
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("decimal_within requires finite numbers")
+        return Fraction(str(value))
+    raise TypeError("decimal_within requires numbers, excluding booleans")
+
+
+def _decimal_within(left: object, right: object, tolerance: object) -> bool:
+    """Inclusive absolute comparison of decimal spellings, independent of Decimal context."""
+    left_value = _numeric_decimal_fraction(left)
+    right_value = _numeric_decimal_fraction(right)
+    bound = _numeric_decimal_fraction(tolerance)
+    if bound < 0:
+        raise ValueError("decimal_within requires a nonnegative tolerance")
+    return abs(left_value - right_value) <= bound
+
+
 # Safe built-in functions allowed in expressions (immutable to prevent runtime tampering).
 # Only non-coercive operations are permitted. Coercive builtins (str, int, float, bool)
 # are forbidden because they silently normalize Tier 2 data in gate expressions,
@@ -128,8 +164,9 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
 # str.lower(5) raises TypeError, which visit_Call wraps into a clean
 # ExpressionEvaluationError; a lambda's AttributeError would ride evaluate()'s
 # crash-through tuple into the caller unwrapped. Do NOT add str-returning
-# entries to _ALWAYS_NUMERIC_BUILTINS, and stop at these four — no replace,
-# split, or format (format is a known sandbox-escape vector).
+# entries to _ALWAYS_NUMERIC_BUILTINS. The separate typed scalar helpers expose
+# no string methods or intermediate containers; arbitrary split/format/replace
+# calls remain forbidden (format is a known sandbox-escape vector).
 _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
     {
         "len": len,
@@ -138,6 +175,9 @@ _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
         "upper": str.upper,
         "strip": str.strip,
         "casefold": str.casefold,
+        "starts_with": _starts_with,
+        "word_count": _word_count,
+        "decimal_within": _decimal_within,
     }
 )
 
@@ -153,7 +193,8 @@ _UNSPELLED_INDEX = "<an index the expression does not spell out>"
 # Allowed builtins whose result is statically guaranteed to be numeric (never
 # bool or str). Used by is_provably_non_routable() to reject gate conditions
 # that can never produce a route label.
-_ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
+_ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs", "word_count"})
+_ALWAYS_BOOLEAN_BUILTINS: frozenset[str] = frozenset({"starts_with", "decimal_within"})
 
 _SAFE_BUILTIN_ARITIES: MappingProxyType[str, tuple[int, int]] = MappingProxyType(
     {
@@ -163,6 +204,9 @@ _SAFE_BUILTIN_ARITIES: MappingProxyType[str, tuple[int, int]] = MappingProxyType
         "upper": (1, 1),
         "strip": (1, 2),
         "casefold": (1, 1),
+        "starts_with": (2, 2),
+        "word_count": (1, 1),
+        "decimal_within": (3, 3),
     }
 )
 
@@ -888,7 +932,8 @@ class ExpressionParser:
     Allowed operations:
     - Subscript access: name['field'], name['key1']['key2']
     - Method: name.get('field') (single-arg only — defaults are fabrication)
-    - Safe builtins: len(), abs(), lower(), upper(), strip(), casefold()
+    - Safe builtins: len(), abs(), lower(), upper(), strip(), casefold(),
+      starts_with(), word_count(), decimal_within()
       (case folding is function-call form only — row['x'].lower() stays
       forbidden; attribute access remains closed to name.get)
     - Comparisons: ==, !=, <, >, <=, >=
@@ -984,6 +1029,7 @@ class ExpressionParser:
         - Boolean operators (and, or)
         - Unary not
         - Boolean literals (True, False)
+        - Direct calls to the Boolean scalar helpers starts_with/decimal_within
         - Ternary expressions where both branches are boolean expressions
 
         This is used for config validation: boolean expressions must have
@@ -998,7 +1044,8 @@ class ExpressionParser:
         suppresses=("R5",),
         invariant=(
             "returns True for comparisons, unary not, boolean literals, boolean-only and/or operands, "
-            "and ternaries with two boolean branches; other syntax returns False without evaluation; never raises"
+            "ternaries with two boolean branches, and direct calls to registered Boolean helpers; "
+            "other syntax returns False without evaluation; never raises"
         ),
         non_raising=True,
     )
@@ -1006,6 +1053,9 @@ class ExpressionParser:
         """Recursively check if an AST node returns a boolean."""
         # Comparisons always return bool
         if isinstance(node, ast.Compare):
+            return True
+
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ALWAYS_BOOLEAN_BUILTINS:
             return True
 
         # Boolean operators (and, or) only return bool if ALL operands are boolean
@@ -1132,7 +1182,7 @@ class ExpressionParser:
         many copies of one large input, even when the final expression wraps
         that container in ``len()`` and returns only a small integer.
         """
-        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS
+        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS - _ALWAYS_BOOLEAN_BUILTINS
         for child in ast.walk(self._ast.body):
             if not isinstance(child, (ast.List, ast.Tuple, ast.Dict)):
                 continue
@@ -1150,7 +1200,7 @@ class ExpressionParser:
         siblings, so even without a container literal, N calls can hold N
         copies of one large input before the outer expression returns.
         """
-        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS
+        string_copying_calls = _SAFE_BUILTINS.keys() - _ALWAYS_NUMERIC_BUILTINS - _ALWAYS_BOOLEAN_BUILTINS
         count = 0
         for child in ast.walk(self._ast.body):
             if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in string_copying_calls:

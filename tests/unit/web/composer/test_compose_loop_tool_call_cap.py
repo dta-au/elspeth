@@ -4,14 +4,19 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import tool_batch as tool_batch_module
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
+from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.protocol import ComposerConvergenceError
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 
 _UNSET = object()
@@ -268,7 +273,7 @@ async def test_cap_exceeded_increments_counter(
 
 @pytest.mark.asyncio
 async def test_cap_not_exceeded_does_not_increment(
-    fake_composer_service: object,
+    fake_composer_service: ComposerServiceImpl,
     fake_llm_emitting_n_tool_calls: Any,
     result_session_id: str,
 ) -> None:
@@ -279,7 +284,23 @@ async def test_cap_not_exceeded_does_not_increment(
     fake_composer_service._max_tool_calls_per_turn = 16  # type: ignore[attr-defined]
     fake_llm = fake_llm_emitting_n_tool_calls(n=16)
 
-    await _run_one_turn(fake_composer_service, llm=fake_llm, session_id=result_session_id)
+    # Isolate the END dependency without granting publication in this cap unit.
+    checkpoint = AsyncMock(
+        spec=fake_composer_service._advisor_checkpoint._run_advisor_checkpoint,
+        return_value=AdvisorCheckpointVerdict(
+            ok=False,
+            blocking=False,
+            findings_text="Advisor unavailable in this cap-counter unit fixture.",
+            failure_class="unavailable",
+            retryable=False,
+        ),
+    )
+    with patch.object(fake_composer_service._advisor_checkpoint, "_run_advisor_checkpoint", new=checkpoint):
+        result = await _run_one_turn(fake_composer_service, llm=fake_llm, session_id=result_session_id)
+    checkpoint.assert_awaited_once()
+    assert checkpoint.await_args is not None and checkpoint.await_args.kwargs["phase"] == "end"
+    assert type(result.advisor_gate_decision) is AdvisorGateBlocked
+    assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
 
     assert observed_value(telemetry.tool_call_cap_exceeded_total) == 0
 
@@ -324,7 +345,14 @@ async def test_bonus_over_cap_raises_shared_cap_error_before_bonus_dispatch(
     )
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 
@@ -372,7 +400,14 @@ async def test_bonus_exactly_at_cap_keeps_generic_composition_exhaustion(
     )
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 

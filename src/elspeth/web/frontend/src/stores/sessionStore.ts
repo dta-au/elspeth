@@ -1012,8 +1012,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     let session;
     try {
       session = await api.createSession();
-    } catch {
-      set({ error: "Failed to create session. Please try again." });
+    } catch (err) {
+      // API errors carry public refusal/recovery copy. Do not expose arbitrary
+      // transport exception messages or discard an actionable role denial.
+      const apiError = typeof err === "object" && err !== null &&
+        "status" in err && typeof err.status === "number" &&
+        "detail" in err && typeof err.detail === "string"
+        ? err as ApiError : null;
+      const publicMessages = apiError === null ? [] :
+        [apiError.detail, apiError.guidance, apiError.recovery_text]
+          .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+          .map((value) => value.trim());
+      set({
+        error: [...new Set(publicMessages)].join(" ") || "Failed to create session. Please try again.",
+        errorDetails: null,
+      });
       return;
     }
     clearComposerProgressPollTimer();

@@ -643,7 +643,9 @@ queries:
 in `input_fields`. Do not add generated fields to `required_input_fields` or
 the node's input schema. Self/forward references and generated-name collisions
 are rejected. Structured outputs support `string`, `integer`, `number`,
-`boolean`, and `enum` (with `values`); nullable structured outputs are unsupported.
+`boolean`, and `enum` (with `values`). Add `nullable: true` to an output-field
+descriptor to admit JSON null while still requiring the key. Consumers must
+handle null explicitly; omitting the option retains non-null extraction.
 
 Every query still calls the provider. The node publishes one complete row only
 after all queries succeed; a terminal failure routes the original entry row

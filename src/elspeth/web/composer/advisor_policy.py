@@ -262,11 +262,10 @@ _ADVISOR_FINDINGS_UNTRUSTED_END: Final[str] = "END_UNTRUSTED_ADVISOR_FINDINGS"
 # The clause does NOT promise the reply reaches the user: a no-tool reply
 # after which the next advisor pass returns CLEAN falls through to finalize
 # and case 5 (``_replace_advisor_repair_public_result``) replaces it.
-ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
-    "Fix the findings via tool calls. The end user has not read these "
-    "findings: write your final reply to stand on its own and do not quote "
-    "the fenced text."
+ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE: Final[str] = (
+    "The end user has not read these findings: write your final reply to stand on its own and do not quote the fenced text."
 )
+ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = "Fix the findings via tool calls. " + ADVISOR_FINAL_REPLY_CONTRACT_CLAUSE
 
 # elspeth-71617f1d21: the END-gate repair-continue message must state that
 # MUTATIONS are expected. In session 2e0c8ea3 both advisor repair turns were

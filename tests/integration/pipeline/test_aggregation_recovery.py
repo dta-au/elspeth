@@ -100,7 +100,7 @@ class _LoadCountingSource(_TestSourceBase):
     name = "load_counting_source"
     output_schema = ListSource.output_schema
 
-    def __init__(self, rows: list[dict[str, int]], *, on_success: str) -> None:
+    def __init__(self, rows: list[dict[str, Any]], *, on_success: str) -> None:
         super().__init__()
         self._rows = rows
         self.on_success = on_success
@@ -273,6 +273,7 @@ def _build_eof_aggregation_pipeline(
     *,
     output_mode: str = "transform",
     error_sink: CollectSink | None = None,
+    eof_only: bool = False,
 ) -> tuple[PipelineConfig, ExecutionGraph]:
     """Count-triggered transform-mode aggregation whose flush only fires at EOF.
 
@@ -281,6 +282,7 @@ def _build_eof_aggregation_pipeline(
     """
     aggregation_output = "aggregate_ready" if downstream is not None else "output"
     transform.on_success = aggregation_output
+    transform.on_error = error_sink.name if error_sink is not None else "discard"
     sinks = {"output": as_sink(output_sink)}
     if error_sink is not None:
         sinks[error_sink.name] = as_sink(error_sink)
@@ -290,7 +292,7 @@ def _build_eof_aggregation_pipeline(
         input="batch_in",
         on_success=aggregation_output,
         on_error=error_sink.name if error_sink is not None else "discard",
-        trigger=TriggerConfig(count=100, timeout_seconds=3600),
+        trigger=TriggerConfig() if eof_only else TriggerConfig(count=100, timeout_seconds=3600),
         output_mode=output_mode,
     )
     wired_transforms = (
@@ -843,22 +845,38 @@ class TestFlushOutputJournalDurability:
             {("success", "filter_dropped"), ("failure", "quarantined_at_source")} if mixed_quarantine else {("success", "filter_dropped")}
         )
 
+    @pytest.mark.parametrize("duplicate_annotation", [False, True], ids=["enrichment", "duplicate-admission"])
     def test_committed_passthrough_result_before_routing_resumes_without_plugin_replay(
         self,
         tmp_path: Any,
         monkeypatch: pytest.MonkeyPatch,
+        duplicate_annotation: bool,
     ) -> None:
         """Passthrough rows and same-token continuation survive pre-routing death."""
         from elspeth.core.payload_store import FilesystemPayloadStore
         from elspeth.engine.executors.aggregation import AggregationExecutor
+        from elspeth.plugins.transforms.batch_duplicate_annotator import BatchDuplicateAnnotator
 
         db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
         payload_store = FilesystemPayloadStore(tmp_path / "payloads")
         checkpoint_mgr = CheckpointManager(db)
-        source = _LoadCountingSource([{"value": 10}, {"value": 20}], on_success="batch_in")
-        transform = _EnrichingPassthroughBatchTransform()
+        source_rows = [{"value": "same"}, {"value": "same"}, {"value": "unrelated"}] if duplicate_annotation else [{"value": 10}, {"value": 20}]
+        source = _LoadCountingSource(source_rows, on_success="batch_in")
+        transform = (
+            BatchDuplicateAnnotator({"schema": {"mode": "observed"}, "rules": [{"name": "repeated", "cells": [{"field": "value"}]}]})
+            if duplicate_annotation
+            else _EnrichingPassthroughBatchTransform()
+        )
+        batch_calls = []
+        real_process = transform.process
+
+        def count_real_process(*args: Any, **kwargs: Any) -> TransformResult:
+            batch_calls.append(True)
+            return real_process(*args, **kwargs)
+
+        monkeypatch.setattr(transform, "process", count_real_process)
         output_sink = CollectSink("output")
-        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, output_mode="passthrough")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, output_mode="passthrough", eof_only=duplicate_annotation)
         orchestrator = Orchestrator(
             db=db,
             checkpoint_manager=checkpoint_mgr,
@@ -899,8 +917,8 @@ class TestFlushOutputJournalDurability:
         assert receipt["output_mode"] == "passthrough"
         assert receipt["output_shape"] == "multi"
         assert receipt["expansion_parent_token_id"] is None
-        assert member_actions == ("continue_passthrough", "continue_passthrough")
-        assert len(output_refs) == 2
+        assert member_actions == ("continue_passthrough",) * len(source_rows)
+        assert len(output_refs) == len(source_rows)
 
         resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
         assert resume_point is not None
@@ -912,11 +930,19 @@ class TestFlushOutputJournalDurability:
         )
 
         assert resumed.status is RunStatus.COMPLETED
-        assert output_sink.results == [
-            {"value": 10, "batch_enriched": True},
-            {"value": 20, "batch_enriched": True},
-        ]
-        assert transform.batch_calls == 1
+        if duplicate_annotation:
+            cause = '[{"rule":"repeated","field":"value","category":"duplicate"}]'
+            assert output_sink.results == [
+                {"value": "same", "duplicates_valid": False, "duplicates_causes": cause},
+                {"value": "same", "duplicates_valid": False, "duplicates_causes": cause},
+                {"value": "unrelated", "duplicates_valid": True, "duplicates_causes": "[]"},
+            ]
+        else:
+            assert output_sink.results == [
+                {"value": 10, "batch_enriched": True},
+                {"value": 20, "batch_enriched": True},
+            ]
+        assert len(batch_calls) == 1
         assert source.load_invocations == 1
         with db.connection() as conn:
             sink_token_ids = tuple(
