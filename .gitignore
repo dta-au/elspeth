@@ -336,7 +336,18 @@ docs/release/pdf/fonts/public-sans/fonts/*
 docs/release/pdf/out/
 docs/release/pdf/output/
 
+# Planning and review documents
+docs/analysis
+docs/arch-analysis*
+docs/audit
+docs/composer
+docs/diagnostics
+docs/operator
 docs/reviews
+docs/github-issues
+docs/plans
+docs/specs
+docs/quality-audit
 
 # ---------------------------------------------------------------------------
 # OS
