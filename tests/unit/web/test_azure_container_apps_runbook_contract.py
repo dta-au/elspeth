@@ -35,7 +35,10 @@ PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-contai
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
-FACTS_LINK = "../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+FACTS_LINK = (
+    "https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/"
+    "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+)
 CURRENT_VERSION = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 RECEIPT_PATH = f"docs/operator/evidence/azure-container-apps/{CURRENT_VERSION}.json"
 HISTORICAL_REDEPLOY_SCHEMA_STATEMENT = "**Historical 0.8.6:** The 0.8.6 candidate expects session epoch 76 and Landscape epoch 49."
