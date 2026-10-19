@@ -201,6 +201,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/batch_classifier_metrics.py:BatchClassifierMetrics.probe_config:return"
   - "src/elspeth/plugins/transforms/batch_paired_preference.py:BatchPairedPreference.probe_config:return"
   - "src/elspeth/plugins/transforms/batch_drift_compare.py:BatchDriftCompare.probe_config:return"
+  - "src/elspeth/plugins/transforms/batch_duplicate_annotator.py:BatchDuplicateAnnotator.probe_config:return"
   - "src/elspeth/plugins/transforms/batch_outlier_annotator.py:BatchOutlierAnnotator.probe_config:return"
   - "src/elspeth/plugins/transforms/batch_rank.py:BatchRank.probe_config:return"
   - "src/elspeth/plugins/transforms/batch_data_quality_report.py:BatchDataQualityReport.probe_config:return"
@@ -250,6 +251,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/batch_classifier_metrics.py:BatchClassifierMetrics.__init__:config"
   - "src/elspeth/plugins/transforms/batch_paired_preference.py:BatchPairedPreference.__init__:config"
   - "src/elspeth/plugins/transforms/batch_drift_compare.py:BatchDriftCompare.__init__:config"
+  - "src/elspeth/plugins/transforms/batch_duplicate_annotator.py:BatchDuplicateAnnotator.__init__:config"
   - "src/elspeth/plugins/transforms/batch_outlier_annotator.py:BatchOutlierAnnotator.__init__:config"
   - "src/elspeth/plugins/transforms/batch_rank.py:BatchRank.__init__:config"
   - "src/elspeth/plugins/transforms/batch_data_quality_report.py:BatchDataQualityReport.__init__:config"
@@ -992,6 +994,12 @@ allowed_dict_patterns:
   # untyped external-library completion surface, not a contract this codebase
   # owns the shape of.
   - "src/elspeth/web/composer/provider_gateway.py:_apply_openrouter_usage_accounting:kwargs"
+  # Native thinking augments an external LiteLLM message while preserving all
+  # existing wire fields and producer guard partitions. The native blocks are
+  # admitted separately by parse_native_thinking_blocks; this helper does not
+  # claim ownership of LiteLLM's open message schema.
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:message"
+  - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:return"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
@@ -1029,6 +1037,9 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_execute_update_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_delete_blob:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_get_blob_content:arguments"
+  # Same LLM-owned arguments as the paged reader above; parsed immediately
+  # through ReadAttachmentArgumentsModel before any blob access.
+  - "src/elspeth/web/composer/tools/blobs.py:_execute_read_attachment:arguments"
   - "src/elspeth/web/composer/tools/blobs.py:_execute_wire_blob_inline_ref:arguments"
   - "src/elspeth/web/composer/tools/generation.py:_execute_diff_pipeline:args"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state:args"
@@ -1093,6 +1104,17 @@ allowed_dict_patterns:
   # Advisor argument validator (F3 fix). Receives the same LLM-tool-call
   # payload; returns the admitted model or an owned AdvisorArgumentRejection.
   - "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._validate_advisor_arguments:arguments"
+  # Advisor transcript wire adapters carry heterogeneous provider messages and
+  # ordinary chat/audit event variants. Owned history/event classes validate
+  # session, call, parent and payload bindings; these mappings only serialize,
+  # redact or enrich that evidence and never confer dispatch authority.
+  - "src/elspeth/web/composer/advisor_transcript.py:_json_object:return"
+  - "src/elspeth/web/composer/advisor_transcript.py:_visible_calls:return (list)"
+  - "src/elspeth/web/composer/advisor_transcript.py:_wire_event:return"
+  - "src/elspeth/web/composer/advisor_transcript.py:_redacted_events:events (list)"
+  - "src/elspeth/web/composer/advisor_transcript.py:_recover_read_bodies:events (list)"
+  - "src/elspeth/web/composer/visible_tool_event.py:VisibleToolEvent.to_envelope:return"
+  - "src/elspeth/web/composer/visible_tool_event.py:visible_response_gap:return"
   # elspeth-4e79436719 §Phase 3: Anthropic cache_control marker transform
   # operates on the same provider-call payload shape as the call sites above.
   # The `tools` parameter is typed `list | None`, so the contracts check

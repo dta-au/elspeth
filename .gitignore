@@ -336,6 +336,23 @@ docs/release/pdf/fonts/public-sans/fonts/*
 docs/release/pdf/out/
 docs/release/pdf/output/
 
+# Planning and review documents
+docs/analysis
+docs/arch-analysis*
+docs/audit
+docs/composer
+docs/design
+docs/diagnostics
+docs/operator/*
+!docs/operator/migrations/
+docs/operator/migrations/*
+!docs/operator/migrations/adr-019.md
+docs/reviews
+docs/github-issues
+docs/plans
+docs/specs
+docs/quality-audit
+
 # ---------------------------------------------------------------------------
 # OS
 # ---------------------------------------------------------------------------
@@ -344,3 +361,4 @@ Thumbs.db
 
 # FINAL RULE: keep .gitkeep files everywhere (overrides earlier ignores).
 !.gitkeep
+evals/composer-battery/planner_probe.py

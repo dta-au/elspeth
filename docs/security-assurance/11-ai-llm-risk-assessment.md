@@ -192,11 +192,24 @@ Defaults measured from the Web settings model at the review baseline
 | Composition turns, discovery turns and compose timeout | corresponding Composer settings | Required operator settings; no product default |
 | Composer messages per user per minute | `composer_rate_limit_per_minute` | Required operator setting; no product default |
 | Advisor calls per compose and checkpoint passes | advisor settings | 4 and 2 |
-| Advisor prompt / completion tokens and timeout | advisor settings | 4,000 / 8,192; 60 seconds |
+| Advisor input proxy / completion tokens and timeout | advisor settings | 4,000 configured input units / 8,192 completion tokens; 60 seconds |
 | Identical rejected planner calls | fixed | 6 |
 | Daily tokens | user/container quota settings | Off unless configured |
 | External calls from Web runs | `execution_rate_limit` | 60 per minute per service |
 | LLM profile timeout and output tokens | profile settings | 60 seconds; provider default unless set |
+
+**0.8.9 Advisor input-scope change.** Four rendered characters per configured
+input unit is a rough cost proxy, not measured provider tokens. Public hints
+count the complete variable message; backend checkpoints count only optional
+pipeline-summary evidence, retaining mandatory request/candidate, critical
+instructions and review context. Removing the inherited complete checkpoint
+input-cost proxy applies to both default and explicitly configured values and
+can increase input cost and latency. Required guards, quota admission and
+current publication binding remain unchanged. Actual daily usage checks do
+not reserve the next call's tokens, and this proxy does not establish provider
+context fit. The selected model/gateway capacity remains a deployment fact.
+See [Advisor input allowance](../reference/environment-variables.md#advisor-input-allowance).
+This scoped change does not requalify the historical assessment pin above.
 
 Web runs admit a chargeable LLM attempt before sending it and settle usage from
 the Landscape record afterwards. Configured token quotas can refuse a later

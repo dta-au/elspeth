@@ -368,14 +368,32 @@ bootstrap reapplies scoped grants and initializes a missing application database
 
 ### TLS proxy and WebSocket acceptance
 
-The Compose backend listens on port 8451. For host nginx, use the tracked
+The Compose backend publishes port 8451 on host loopback only. For host nginx, use the tracked
 [`deploy/compose/nginx.conf`](../../deploy/compose/nginx.conf) as an include
 inside nginx's `http` context, such as `/etc/nginx/conf.d/elspeth.conf`.
 Provision a certificate valid for the public hostname and its private key at
-`/etc/nginx/tls/elspeth/fullchain.pem` and `privkey.pem` first. Restrict direct
-access to port 8451 with the host firewall or change the Compose port binding
-to `127.0.0.1:8451:8451`. Set the public hostname in `server_name` and configure
+`/etc/nginx/tls/elspeth/fullchain.pem` and `privkey.pem` first. Keep the Compose
+port binding `127.0.0.1:8451:8451`; public access must go through nginx.
+Set the public hostname in `server_name` and configure
 the application's allowed origins for that HTTPS origin.
+
+The overlay pins its private network to `172.30.85.0/24`, gateway
+`172.30.85.1`, and sets `ELSPETH_WEB__TRUSTED_PROXY_HOSTS` to that gateway alone.
+Host nginx reaches the app through this gateway, allowing the application to
+use each real client address for authentication quotas and audit events.
+nginx overwrites `X-Forwarded-For` with `$remote_addr`; it must not append a
+client-supplied chain at this public ingress. Other containers are not trusted
+forwarders. Local host processes share the host proxy's trust boundary, so host
+access must remain restricted to trusted operators.
+
+If this network overlaps an existing route, set `ELSPETH_COMPOSE_SUBNET` and
+`ELSPETH_COMPOSE_GATEWAY` together in the repository-root `.env` before creating
+the network. The trusted peer setting follows the selected gateway. An existing
+Compose network must be recreated during an operator maintenance window to
+change its IPAM configuration; preserve the named state volumes. For a different
+ingress topology, configure its actual numeric proxy peers explicitly and block
+direct public backend access. Forwarding is disabled by default outside this
+overlay, and the ambient Uvicorn `FORWARDED_ALLOW_IPS` variable is ignored.
 
 For an existing deployment, review the installed configuration against this
 template and carry the changes into its owning Ansible or deployment source.
@@ -647,7 +665,7 @@ docker run --rm \
 - [AWS ECS Full Acceptance Runbook](../runbooks/aws-ecs-deployment.md) - Disposable two-scenario provisioning and acceptance
 - [Azure Container Apps Cold Install](../runbooks/azure-container-apps-cold-install.md) - Bicep environment with external PostgreSQL and NFS Azure Files
 - [Azure Container Apps Existing-Service Redeploy](../runbooks/azure-container-apps-existing-service-redeploy.md) - Digest-pinned revision rollout
-- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.6 test and fix-on-fail procedure
+- [Azure Container Apps Full Acceptance Runbook](../runbooks/azure-container-apps-deployment.md) - Disposable 0.8.9 test and fix-on-fail procedure
 - [Your First Pipeline](your-first-pipeline.md) - Getting started guide
 - [Configuration Reference](../reference/configuration.md) - Complete config options
 - [Runbooks](../runbooks/) - Operational procedures

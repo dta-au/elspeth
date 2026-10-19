@@ -82,6 +82,46 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "For pipeline rows, fail preparation before publication if any row cannot be represented, instead of diverting or discarding it. Use for required retention outputs. False preserves on_write_failure routing. Does not roll back earlier publications.",
+        "kind": "checkbox",
+        "label": "Require All Rows",
+        "name": "require_all_rows",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Write a fixed retention envelope with actual run/row/token identity, outcome/path, audit error reference and the complete carried row as canonical row_json. Requires require_all_rows=true, observed schema, normalized headers and mode=write. References depend on retained Landscape evidence; no raw diagnostic text or business failure explanation is synthesized.",
+        "kind": "checkbox",
+        "label": "Include Audit Context",
+        "name": "include_audit_context",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Add a bounded readable error_reason backed by the exact durable source/transform failure handoff. Requires include_audit_context=true. Missing, ambiguous, redacted or unsupported causes stop preparation; hash-only linked sink diversions are unsupported. Earlier publications are not rolled back.",
+        "kind": "checkbox",
+        "label": "Include Error Reason",
+        "name": "include_error_reason",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": false,
+        "description": "Add disposition_kind and disposition_reason backed by an exact durable source/transform failure or a unique completed Boolean gate route to this sink. Requires include_audit_context=true; mutually exclusive with include_error_reason. Gate routing remains a successful decision, not an error. Missing, ambiguous or redacted evidence and linked sink diversions stop preparation.",
+        "kind": "checkbox",
+        "label": "Include Disposition Reason",
+        "name": "include_disposition_reason",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

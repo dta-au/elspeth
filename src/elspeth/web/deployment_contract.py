@@ -1,4 +1,4 @@
-"""Pure deployment contract resolution and AWS ECS validation.
+"""Pure deployment contract resolution and provider-specific validation.
 
 No I/O, no network, no filesystem. Diagnostics and ``ContractCheck.detail``
 are pre-redacted -- never a URL, path, or secret value.
@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from sqlalchemy.engine.url import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -133,12 +134,13 @@ def _check_external_postgres_url(
     env_var: str,
     url: str | None,
     *,
-    require_aws_authenticated_tls: bool,
+    deployment_target: DeploymentTarget,
 ) -> ContractCheck:
     if url is None:
         return ContractCheck(name, False, f"{env_var} must be explicitly set for external PostgreSQL state")
     try:
         parsed = make_url(url)
+        aca_tls_approved = deployment_target != "azure-container-apps" or _has_approved_aca_tls_query(url, parsed)
     except (ArgumentError, TypeError, ValueError):
         return ContractCheck(name, False, f"{env_var} must be a supported synchronous PostgreSQL SQLAlchemy URL")
     if parsed.drivername not in _SUPPORTED_EXTERNAL_POSTGRES_DRIVERS or not parsed.host or not parsed.database:
@@ -147,13 +149,55 @@ def _check_external_postgres_url(
             False,
             f"{env_var} must be a supported synchronous PostgreSQL SQLAlchemy URL",
         )
-    if require_aws_authenticated_tls and not _has_approved_aws_ecs_tls_query(parsed):
+    if deployment_target == DEPLOYMENT_TARGET_AWS_ECS and not _has_approved_aws_ecs_tls_query(parsed):
         return ContractCheck(
             name,
             False,
             f"{env_var} must require authenticated PostgreSQL TLS with sslmode=verify-full and the immutable ELSPETH AWS RDS trust root",
         )
+    if not aca_tls_approved:
+        return ContractCheck(
+            name,
+            False,
+            f"{env_var} must use one sslmode=verify-full and one sslrootcert=system or absolute CA path; "
+            "requiressl and competing GSS encryption options are not supported",
+        )
     return ContractCheck(name, True, f"{env_var} is configured for supported synchronous PostgreSQL access")
+
+
+def _has_approved_aca_tls_query(raw_url: str, parsed: URL) -> bool:
+    # SQLAlchemy discards blank query values. Preserve raw decoded occurrences
+    # for policy checks, while leaving connection interpretation to SQLAlchemy.
+    parts = urlsplit(raw_url, allow_fragments=False)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    # An unescaped '?' in SQLAlchemy userinfo can move the standard parser's
+    # query boundary and conceal its first real parameter. Refuse disagreement.
+    username = None if parts.username is None else unquote(parts.username)
+    password = None if parts.password is None else unquote(parts.password)
+    if username != parsed.username or password != parsed.password:
+        return False
+    modes = [value for key, value in pairs if key == "sslmode"]
+    roots = [value for key, value in pairs if key == "sslrootcert"]
+    gss_modes = [value for key, value in pairs if key == "gssencmode"]
+    if modes != ["verify-full"] or len(roots) != 1:
+        return False
+    root = roots[0]
+    if root != "system" and not Path(root).is_absolute():
+        return False
+    if "requiressl" in parsed.query or any(key == "requiressl" for key, _value in pairs) or gss_modes not in ([], ["disable"]):
+        return False
+    if "gssencmode" in parsed.query:
+        if parsed.query["gssencmode"] != "disable" or gss_modes != ["disable"]:
+            return False
+    elif gss_modes:
+        return False
+    # Refuse ambiguous noncanonical URLs when the two parsers disagree.
+    return (
+        "sslmode" in parsed.query
+        and parsed.query["sslmode"] == modes[0]
+        and "sslrootcert" in parsed.query
+        and parsed.query["sslrootcert"] == root
+    )
 
 
 def _check_required_path(name: str, env_var: str, value: Path | None, *, explicitly_set: bool) -> ContractCheck:
@@ -370,13 +414,13 @@ def validate_external_postgresql_settings(
         "session_db_url",
         "ELSPETH_WEB__SESSION_DB_URL",
         settings.session_db_url,
-        require_aws_authenticated_tls=settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS,
+        deployment_target=settings.deployment_target,
     )
     landscape_check = _check_external_postgres_url(
         "landscape_url",
         "ELSPETH_WEB__LANDSCAPE_URL",
         settings.landscape_url,
-        require_aws_authenticated_tls=settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS,
+        deployment_target=settings.deployment_target,
     )
     distinct_targets_check = _check_distinct_postgres_targets(
         settings,

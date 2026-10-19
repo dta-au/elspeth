@@ -242,8 +242,14 @@ async def test_planner_sources_argument_error_persists_through_the_compose_loop(
     spec: object,
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Characterization: an argument-error ``sources`` spec persists instead of raising."""
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This control owns P3/P4 authority evidence, not physical END policy. The
+    # existing isolation helper still requires the actual publication binding.
+    monkeypatch.setattr(fake_composer_service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     arguments = {
         "sources": {"main": spec},
         "nodes": [],

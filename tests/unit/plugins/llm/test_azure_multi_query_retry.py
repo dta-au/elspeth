@@ -72,6 +72,8 @@ class _ExecutionRepositoryDouble:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         assert source_call_id is None
         call_kwargs = {
@@ -87,6 +89,8 @@ class _ExecutionRepositoryDouble:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
@@ -108,6 +112,8 @@ class _ExecutionRepositoryDouble:
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> Call:
         assert source_call_id is None
         actual_call_index = (
@@ -128,19 +134,21 @@ class _ExecutionRepositoryDouble:
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
             "token_usage": token_usage,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         self.recorded_calls.append(call_kwargs)
         return self._recorded_call(call_kwargs)
 
     def _recorded_call(self, call_kwargs: dict[str, Any]) -> Call:
         return Call(
-            call_id=f"call_{len(self.recorded_calls)}",
+            call_id=call_kwargs["call_id"] if call_kwargs["call_id"] is not None else f"call_{len(self.recorded_calls)}",
             call_index=call_kwargs["call_index"],
             call_type=call_kwargs["call_type"],
             status=call_kwargs["status"],
             request_hash="req_hash_123",
             response_hash="resp_hash_456" if call_kwargs["response_data"] is not None else None,
-            created_at=datetime.now(UTC),
+            created_at=call_kwargs["created_at"] if call_kwargs["created_at"] is not None else datetime.now(UTC),
             state_id=call_kwargs.get("state_id"),
             operation_id=call_kwargs.get("operation_id"),
             latency_ms=call_kwargs["latency_ms"],

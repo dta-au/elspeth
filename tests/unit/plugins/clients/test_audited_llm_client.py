@@ -522,7 +522,7 @@ class FakeExecutionRepository:
 
     def record_call(self, **kwargs: Any) -> SimpleNamespace:
         self.recorded_calls.append(kwargs)
-        return SimpleNamespace(call_id=f"call-{len(self.recorded_calls)}", **kwargs)
+        return SimpleNamespace(**{**kwargs, "call_id": kwargs.get("call_id") or f"call-{len(self.recorded_calls)}"})
 
     def assert_recorded_once(self) -> None:
         assert len(self.recorded_calls) == 1
@@ -2268,7 +2268,7 @@ def test_each_attempt_accounts_once_after_its_audit_outcome(provider_fails: bool
 
     def settle(attempt: str, call_id: str) -> None:
         assert attempt == f"attempt-{len(execution.recorded_calls)}"
-        assert call_id == f"call-{len(execution.recorded_calls)}"
+        assert call_id == attempt
         observed.append(("after", len(execution.recorded_calls)))
 
     governance = LLMCallGovernance(before_call=admit, after_call=settle)
@@ -2290,6 +2290,7 @@ def test_each_attempt_accounts_once_after_its_audit_outcome(provider_fails: bool
     assert observed == [("before", 0), ("after", 1), ("before", 1), ("after", 2)]
     assert len(provider.create_calls) == 2
     assert [record["call_index"] for record in execution.recorded_calls] == [0, 1]
+    assert [record["call_id"] for record in execution.recorded_calls] == ["attempt-1", "attempt-2"]
     assert execution.recorded_calls[-1]["token_usage"] == (TokenUsage.unknown() if provider_fails else TokenUsage.known(10, 5))
 
 

@@ -65,6 +65,7 @@ async def test_hatch_keeps_recovery_controls_and_stops(tmp_path: Path, tool_cont
         )
     assert len(completion.requests) == 2
     assert {tool["function"]["name"] for tool in completion.requests[-1]["tools"]} == {
+        *pipeline_planner.PLANNER_DISCOVERY_TOOL_NAMES,
         "handoff_to_user",
         "restore_parked_graph",
         "emit_pipeline_proposal",

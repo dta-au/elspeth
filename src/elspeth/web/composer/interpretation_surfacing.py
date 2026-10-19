@@ -546,6 +546,28 @@ def _has_unsurfaced_site(
     return False
 
 
+async def has_pending_interpretation_review_surfacing_debt(
+    state: CompositionState,
+    *,
+    sessions_service: SessionServiceProtocol,
+    session_id: str,
+    current_state_id: str,
+) -> bool:
+    """Read whether this committed state's surfaceable sites lack evidence.
+
+    This is advisory, not write authority or an atomic completion guarantee:
+    unresolved evidence can be removed by orphan recovery after this read.
+    A caller finding debt must acquire its own writer authority and run the
+    surfacer, which rereads evidence under that authority before writing.
+    """
+    already_surfaced = await _surfaced_evidence_keys(
+        sessions_service,
+        session_id=session_id,
+        current_state_id=current_state_id,
+    )
+    return _has_unsurfaced_site(state, already_surfaced)
+
+
 async def _surface_pending_interpretation_reviews_under_writer(
     state: CompositionState,
     *,

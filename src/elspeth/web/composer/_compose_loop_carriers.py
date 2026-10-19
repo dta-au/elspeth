@@ -45,6 +45,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
@@ -135,6 +136,7 @@ class _AdvisorCallSuccess:
 
     guidance: str
     metadata: Mapping[str, Any]
+    abandonment_response: AdvisorAbandonmentResponse | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "metadata")
@@ -144,7 +146,7 @@ class _AdvisorCallSuccess:
 class _AdvisorProviderFailure:
     """Recognised Tier-3 provider failure that may become tool feedback."""
 
-    error_class: str
+    error_class: str | None
 
 
 @dataclass(frozen=True, slots=True)

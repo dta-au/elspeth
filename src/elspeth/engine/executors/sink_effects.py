@@ -19,9 +19,9 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import ClassVar, Literal, Protocol, cast, overload
 
-from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMemberRecord
+from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMemberRecord, TokenOutcome
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.enums import CallType
+from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, canonical_json_loads, stable_hash
@@ -57,6 +57,8 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileKind,
     SinkEffectReconcileResult,
     SinkEffectReservationRequest,
+    SinkEffectRole,
+    SinkEffectRoutingContext,
     SinkEffectState,
 )
 from elspeth.core.clock import Clock
@@ -66,6 +68,7 @@ from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
 )
+from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_membership_hash
 from elspeth.core.landscape.execution.sink_effects import SinkEffectRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.clock import DEFAULT_CLOCK, SystemClock
@@ -391,6 +394,31 @@ class SinkEffectCoordinator:
             while True:
                 refreshed = self._require_effect(effect.effect_id)
                 if refreshed.state is SinkEffectState.FINALIZED:
+                    if type(request.effect_input) is SinkEffectPipelineMembersInput and any(
+                        member.routing_context is not None
+                        and (member.routing_context.error_reason is not None or member.routing_context.disposition_reason is not None)
+                        for member in request.effect_input.members
+                    ):
+                        durable_members = self._effects.get_members(refreshed.effect_id)
+                        restored = self._restore_routing_context_members(
+                            refreshed,
+                            durable_members,
+                            include_error_reason=any(
+                                member.routing_context is not None and member.routing_context.error_reason is not None
+                                for member in request.effect_input.members
+                            ),
+                            include_disposition_reason=any(
+                                member.routing_context is not None and member.routing_context.disposition_reason is not None
+                                for member in request.effect_input.members
+                            ),
+                        )
+                        restored_by_token = {member.token_id: member for member in restored}
+                        for member in request.effect_input.members:
+                            if (
+                                member.token_id in restored_by_token
+                                and member.pending_identity_hash != restored_by_token[member.token_id].pending_identity_hash
+                            ):
+                                raise LandscapeRecordError("readable sink routing context disagrees with finalized membership identity")
                     results.append(self._load_finalized(refreshed.effect_id))
                     break
                 try:
@@ -1118,6 +1146,11 @@ class SinkEffectCoordinator:
             )
             current_finalization.append(replace(finalization, ordinal=durable.ordinal))
         members = tuple(current_members)
+        if any(member.routing_context is not None for member in members):
+            if any(member.routing_context is None for member in members):
+                raise LandscapeRecordError("sink routing context is incomplete for the current effect")
+            if compute_pipeline_membership_hash(members) != effect.membership_or_manifest_hash:
+                raise LandscapeRecordError("sink routing context does not bind the current effect membership")
         snapshot, delivered_count = self._target_snapshot_members(
             effect,
             members,
@@ -1163,8 +1196,29 @@ class SinkEffectCoordinator:
         # above raises SinkEffectPredecessorPending otherwise — so the count
         # is complete for the stream, whichever workers prepared it.
         delivered_count = len(current_members)
+        include_routing_context = any(member.routing_context is not None for member in current_members)
+        include_error_reason = any(
+            member.routing_context is not None and member.routing_context.error_reason is not None for member in current_members
+        )
+        include_disposition_reason = any(
+            member.routing_context is not None and member.routing_context.disposition_reason is not None for member in current_members
+        )
         for predecessor in chain:
-            for durable in self._effects.get_members(predecessor.effect_id):
+            durable_members = self._effects.get_members(predecessor.effect_id)
+            restored = (
+                {
+                    member.token_id: member
+                    for member in self._restore_routing_context_members(
+                        predecessor,
+                        durable_members,
+                        include_error_reason=include_error_reason,
+                        include_disposition_reason=include_disposition_reason,
+                    )
+                }
+                if include_routing_context
+                else {}
+            )
+            for durable in durable_members:
                 delivered_count += 1
                 # Diverted members never reached the target: replaying them in
                 # a cumulative successor would republish rejected rows as if
@@ -1176,7 +1230,9 @@ class SinkEffectCoordinator:
                         f"finalized sink effect predecessor {predecessor.effect_id} member ordinal "
                         f"{durable.ordinal} is missing its accepted/diverted disposition"
                     )
-                if durable.token_id in known_members:
+                if include_routing_context:
+                    member = restored[durable.token_id]
+                elif durable.token_id in known_members:
                     known = known_members[durable.token_id]
                     member = replace(known, member_effect_id=durable.member_effect_id)
                 else:
@@ -1185,6 +1241,114 @@ class SinkEffectCoordinator:
         current_start = len(snapshot)
         snapshot.extend(replace(member, ordinal=current_start + ordinal) for ordinal, member in enumerate(current_members))
         return tuple(snapshot), delivered_count
+
+    def _restore_routing_context_members(
+        self,
+        effect: SinkEffect,
+        durable_members: tuple[SinkEffectMemberRecord, ...],
+        *,
+        include_error_reason: bool = False,
+        include_disposition_reason: bool = False,
+    ) -> tuple[SinkEffectMember, ...]:
+        """Prove complete, all-accepted predecessor context from terminal evidence."""
+        if effect.state is not SinkEffectState.FINALIZED or not durable_members:
+            raise LandscapeRecordError("sink routing context requires a finalized nonempty predecessor")
+        token_ids = {member.token_id for member in durable_members}
+        if len(token_ids) != len(durable_members) or [member.ordinal for member in durable_members] != list(range(len(durable_members))):
+            raise LandscapeRecordError("sink routing context predecessor membership is not dense and unique")
+        completed: dict[str, TokenOutcome] = {}
+        for outcome in self._factory.query.get_token_outcomes_for_tokens(effect.run_id, tuple(token_ids)):
+            if outcome.run_id != effect.run_id or outcome.token_id not in token_ids:
+                raise LandscapeRecordError("sink routing context outcome has foreign ownership")
+            if outcome.completed:
+                if outcome.token_id in completed:
+                    raise LandscapeRecordError("sink routing context has ambiguous completed outcomes")
+                completed[outcome.token_id] = outcome
+        restored: list[SinkEffectMember] = []
+        for durable in durable_members:
+            if (
+                durable.effect_id != effect.effect_id
+                or durable.run_id != effect.run_id
+                or durable.sink_node_id != effect.sink_node_id
+                or durable.role is not effect.role
+                or durable.member_state is not SinkEffectState.FINALIZED
+                or durable.prepared_disposition != "accepted"
+            ):
+                raise LandscapeRecordError("sink routing context requires exact all-accepted predecessor membership")
+            if durable.token_id not in completed:
+                raise LandscapeRecordError("sink routing context is missing its completed outcome")
+            terminal = completed[durable.token_id]
+            if terminal.outcome is None:
+                raise LandscapeRecordError("sink routing context is missing its completed outcome")
+            if effect.role is SinkEffectRole.FAILSINK:
+                if (terminal.outcome, terminal.path) != (TerminalOutcome.TRANSIENT, TerminalPath.SINK_FALLBACK_TO_FAILSINK):
+                    raise LandscapeRecordError("sink routing context failsink disposition is divergent")
+                if durable.primary_effect_id is None:
+                    raise LandscapeRecordError("sink routing context is missing its primary linkage")
+                primary = self._effects.get_effect(durable.primary_effect_id)
+                if (
+                    primary is None
+                    or primary.run_id != effect.run_id
+                    or primary.role is not SinkEffectRole.PRIMARY
+                    or primary.state is not SinkEffectState.FINALIZED
+                ):
+                    raise LandscapeRecordError("sink routing context primary effect is divergent")
+                linked = [member for member in self._effects.get_members(primary.effect_id) if member.token_id == durable.token_id]
+                if (
+                    len(linked) != 1
+                    or linked[0].row_id != durable.row_id
+                    or linked[0].prepared_disposition != "diverted"
+                    or linked[0].member_state is not SinkEffectState.FINALIZED
+                ):
+                    raise LandscapeRecordError("sink routing context lacks its exact diverted primary member")
+            error_reason = None
+            if include_error_reason:
+                from elspeth.engine.executors.sink_error_reason import resolve_sink_error_reason
+
+                error_reason = resolve_sink_error_reason(
+                    self._factory,
+                    run_id=effect.run_id,
+                    token_id=durable.token_id,
+                    row_id=durable.row_id,
+                    sink_node_id=effect.sink_node_id,
+                    sink_name=None,
+                    outcome=terminal.outcome,
+                    path=terminal.path,
+                    error_hash=terminal.error_hash,
+                )
+            disposition_reason = None
+            if include_disposition_reason:
+                from elspeth.engine.executors.sink_disposition_reason import resolve_sink_disposition_reason
+
+                hydrated = self._hydrate_member(durable)
+                disposition_reason = resolve_sink_disposition_reason(
+                    self._factory,
+                    run_id=effect.run_id,
+                    token_id=durable.token_id,
+                    row_id=durable.row_id,
+                    sink_node_id=effect.sink_node_id,
+                    sink_name=None,
+                    outcome=terminal.outcome,
+                    path=terminal.path,
+                    error_hash=terminal.error_hash,
+                    row=hydrated.row,
+                )
+            try:
+                routing = SinkEffectRoutingContext(
+                    outcome=terminal.outcome,
+                    path=terminal.path,
+                    error_hash=terminal.error_hash,
+                    primary_effect_id=durable.primary_effect_id,
+                    error_reason=error_reason,
+                    disposition_reason=disposition_reason,
+                )
+            except (TypeError, ValueError) as exc:
+                raise LandscapeRecordError("sink routing context completed evidence is invalid") from exc
+            restored.append(self._hydrate_member(durable, routing_context=routing))
+        members = tuple(restored)
+        if compute_pipeline_membership_hash(members) != effect.membership_or_manifest_hash:
+            raise LandscapeRecordError("sink routing context does not bind the original effect membership")
+        return members
 
     def _persist_pipeline_member_payloads(self, effect_input: object) -> None:
         if type(effect_input) is not SinkEffectPipelineMembersInput:
@@ -1199,7 +1363,9 @@ class SinkEffectCoordinator:
             if content_hash != member.payload_hash:
                 raise LandscapeRecordError("sink effect payload store returned a divergent member content hash")
 
-    def _hydrate_member(self, durable: SinkEffectMemberRecord) -> SinkEffectMember:
+    def _hydrate_member(
+        self, durable: SinkEffectMemberRecord, *, routing_context: SinkEffectRoutingContext | None = None
+    ) -> SinkEffectMember:
         store = self._factory.payload_store
         if store is None:
             raise LandscapeRecordError("replacing sink effect recovery requires the configured payload store")
@@ -1222,6 +1388,8 @@ class SinkEffectCoordinator:
             row=row,
             member_effect_id=durable.member_effect_id,
             primary_effect_id=durable.primary_effect_id,
+            pending_identity_hash=routing_context.identity_hash if routing_context is not None else stable_hash({}),
+            routing_context=routing_context,
         )
 
     def _prepare(

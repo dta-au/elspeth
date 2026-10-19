@@ -13,12 +13,22 @@ from uuid import uuid4
 from sqlalchemy import Connection, Engine, delete, func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.models import rate_limit_buckets_table, rate_limit_events_table
 from elspeth.web.sessions.time_normalization import restore_utc
 
 RateLimitScope = Literal["composer", "write", "auth", "audit_readiness"]
+
+
+class RateLimitPolicyMismatchError(SQLAlchemyError):
+    """A replica disagrees with the policy of an unexpired shared bucket.
+
+    Refuse through the existing database-unavailable paths. Replacing the
+    bucket or incorporating policy into its digest would give mixed replicas
+    separate capacity and silently weaken the shared quota.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +125,7 @@ class RepositoryRateLimitAuthority:
             bucket_insert.values(
                 subject_digest=digest,
                 window_seconds=window_seconds,
+                request_limit=limit,
                 updated_at=created_at,
                 expires_at=created_at + timedelta(seconds=window_seconds),
             )
@@ -122,12 +133,14 @@ class RepositoryRateLimitAuthority:
             # cannot delete the bucket between this upsert and the read.
             .on_conflict_do_update(index_elements=[rate_limit_buckets_table.c.subject_digest], set_={"subject_digest": digest})
         )
-        bucket_query = select(rate_limit_buckets_table.c.window_seconds).where(rate_limit_buckets_table.c.subject_digest == digest)
+        bucket_query = select(rate_limit_buckets_table.c.window_seconds, rate_limit_buckets_table.c.request_limit).where(
+            rate_limit_buckets_table.c.subject_digest == digest
+        )
         if conn.dialect.name == "postgresql":
             bucket_query = bucket_query.with_for_update()
         bucket = conn.execute(bucket_query).one()
-        if bucket.window_seconds != window_seconds:
-            raise ValueError("Rate limit window disagrees with active bucket")
+        if bucket.window_seconds != window_seconds or bucket.request_limit != limit:
+            raise RateLimitPolicyMismatchError("Rate limit policy disagrees with active bucket")
         now = _database_now(conn)
         conn.execute(
             delete(rate_limit_events_table).where(

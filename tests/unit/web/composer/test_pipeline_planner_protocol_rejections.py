@@ -205,10 +205,12 @@ async def test_terminal_batched_with_discovery_goes_to_hatch_when_budget_spent(
     first_attempt = recorder.planner_attempts[0]
     assert first_attempt.planner_code is ComposerPlannerCode.REPAIR_EXHAUSTED
     assert first_attempt.led_to is ComposerPlannerAttemptLedTo.HATCH
-    # The rejected turn is protocol-complete in the hatch transcript.
+    # The hatch receives only retained protocol-complete turns. The rejected
+    # mixed proposal/discovery turn executed neither call and is omitted.
     hatch_messages = completion.requests[1]["messages"]
     tool_replies = [message for message in hatch_messages if message["role"] == "tool"]
-    assert [message["tool_call_id"] for message in tool_replies] == ["call-1", "call-2"]
+    assert tool_replies == []
+    assert not any(message["role"] == "assistant" and message.get("tool_calls") for message in hatch_messages)
 
 
 @pytest.mark.asyncio

@@ -11,24 +11,29 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import UUID
 
+import httpx
 import litellm
 import pytest
 from httpx import ASGITransport, AsyncClient
 from litellm.types.utils import Choices, Message, ModelResponse, Usage
+from pydantic import SecretStr
 from sqlalchemy import select
 from starlette.types import Message as ASGIMessage
 
 from elspeth.web.app import create_app
 from elspeth.web.async_workers import run_stream_read_in_worker
 from elspeth.web.auth.local import LocalAuthProvider
+from elspeth.web.composer import prompt_guard_clients
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.sessions.models import session_operation_fences_table
 from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 from tests.helpers.composer_operations import message_body, settle_composer_operation
 
 
 def pg_http_settings(session_url: str, landscape_url: str, data_dir: Path) -> WebSettings:
+    guard_settings = PromptGuardSettings(endpoint="https://guard.example.test", subscription_key=SecretStr("synthetic-pg-guard-key"))
     return WebSettings(
         data_dir=data_dir,
         session_db_url=session_url,
@@ -40,6 +45,9 @@ def pg_http_settings(session_url: str, landscape_url: str, data_dir: Path) -> We
         payload_store_path=data_dir / "payloads",
         composer_model="gpt-5.5",
         composer_advisor_model="openai/gpt-4.1",
+        composer_prompt_guard=guard_settings,
+        composer_advisor_prompt_guard=guard_settings,
+        composer_prompt_guard_mode="required",
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
         composer_boot_probe_enabled=False,
@@ -129,8 +137,32 @@ def mounted_pg_http_process(
 async def _serve(
     session_url: str, landscape_url: str, data_dir: Path, session_id: str, user_id: str, username: str, pipe: Connection
 ) -> None:
+    guard_requests: list[httpx.Request] = []
+
+    def guard_response(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://guard.example.test/contentsafety/text:shieldPrompt?api-version=2024-09-01"
+        assert request.headers["Ocp-Apim-Subscription-Key"] == "synthetic-pg-guard-key"
+        payload = json.loads(request.content)
+        assert set(payload) == {"userPrompt", "documents"}
+        assert payload["userPrompt"] == "Explain this request without changing the pipeline."
+        assert type(payload["documents"]) is list
+        assert all(type(document) is str for document in payload["documents"])
+        guard_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in payload["documents"]],
+            },
+        )
+
+    def guard_client(settings: PromptGuardSettings) -> prompt_guard_clients.AzurePromptGuardClient:
+        return prompt_guard_clients.AzurePromptGuardClient(settings, http_transport=httpx.MockTransport(guard_response))
+
     with pytest.MonkeyPatch.context() as credential_patch:
         credential_patch.setenv("OPENAI_API_KEY", "offline-pg-http-test-only-not-a-provider-credential")
+        credential_patch.setattr(prompt_guard_clients, "build_prompt_guard_client", guard_client)
         app = create_app(settings=pg_http_settings(session_url, landscape_url, data_dir), process_watchdog_factory=OwnedTestProcessWatchdog)
         provider = app.state.auth_provider
         assert isinstance(provider, LocalAuthProvider)
@@ -149,6 +181,7 @@ async def _serve(
             assert kwargs["model"] == "gpt-5.5"
             assert os.environ["OPENAI_API_KEY"] == "offline-pg-http-test-only-not-a-provider-credential"
             assert kwargs["messages"]
+            assert guard_requests, "SDK dispatch requires an actual Azure guard HTTP response"
             sdk_calls += 1
             sdk_entered.set()
             try:

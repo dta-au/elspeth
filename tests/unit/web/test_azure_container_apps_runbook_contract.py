@@ -31,11 +31,13 @@ ACCEPTANCE_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-deployment.md"
 COLD_INSTALL_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-cold-install.md"
 REDEPLOY_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-existing-service-redeploy.md"
 RUNBOOKS = (ACCEPTANCE_RUNBOOK, COLD_INSTALL_RUNBOOK, REDEPLOY_RUNBOOK)
-PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
-FACTS_LINK = "../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+FACTS_LINK = (
+    "https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/"
+    "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+)
 CURRENT_VERSION = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 RECEIPT_PATH = f"docs/operator/evidence/azure-container-apps/{CURRENT_VERSION}.json"
 HISTORICAL_REDEPLOY_SCHEMA_STATEMENT = "**Historical 0.8.6:** The 0.8.6 candidate expects session epoch 76 and Landscape epoch 49."
@@ -101,6 +103,16 @@ def _assert_example_pricing(resolved: dict[str, Any]) -> None:
         for entry in resolved["extraEnvironment"]["value"]:
             if "value" in entry:
                 patch.setenv(entry["name"], entry["value"])
+            elif entry["name"] in {"ELSPETH_WEB__COMPOSER_PROMPT_GUARD", "ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD"}:
+                patch.setenv(
+                    entry["name"],
+                    json.dumps(
+                        {
+                            "endpoint": "https://guard.example.test",
+                            "subscription_key": "synthetic-guard-value-for-offline-test",
+                        }
+                    ),
+                )
             else:
                 patch.setenv(entry["name"], "synthetic-secret-value-for-offline-test")
         settings = settings_from_env()
@@ -369,7 +381,6 @@ def test_cold_install_describes_independent_durable_job_budget_and_sync_headroom
 
 
 def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_status() -> None:
-    assert PLATFORM_FACTS.is_file()
     for runbook in RUNBOOKS:
         text = _text(runbook)
         assert FACTS_LINK in text, runbook.name
@@ -386,6 +397,11 @@ def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_statu
         assert "reconnect" in normalized, runbook.name
         assert "not a support claim" not in normalized, runbook.name
         assert "**LIVE" in text, runbook.name
+    for surface in (
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "SKILL.md",
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "references" / "command-cheatsheet.md",
+    ):
+        assert FACTS_LINK in _text(surface), surface
 
 
 def test_prospective_receipt_paths_match_the_current_release() -> None:

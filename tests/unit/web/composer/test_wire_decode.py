@@ -8,7 +8,7 @@ dialect's wire schema W back into the flat semantic arguments S admits:
 * the set_pipeline ``{"pipeline": ...}`` envelope is unwrapped, and a
   malformed envelope is the one rejection (``ToolArgumentError``,
   category ``wire_envelope``);
-* on ``openai_strict`` only, a ``null`` at one of the 15 promoted positions
+* on ``openai_strict`` only, a ``null`` at one of the 17 promoted positions
   becomes the omission S expects. Nothing else is touched.
 
 ``encode_semantic_arguments`` is the inverse of the envelope only in S1; the
@@ -126,7 +126,7 @@ def test_decode_rejects_malformed_framing_and_preserves_null_semantics(
     assert _semantic(decode_wire_arguments("list_models", STRICT, {"provider": None, "x": None})) == {"x": None}
 
 
-# One minimal S-valid call for each of the 32 strict-capable tools: the
+# One minimal S-valid call for each of the 33 strict-capable tools: the
 # flat-required keys only. The promoted positions are filled from
 # ``_PROMOTED_VALUES`` below.
 _SEEDS: dict[str, dict[str, Any]] = {
@@ -134,6 +134,7 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "list_composer_blobs": {},
     "get_blob_metadata": {"blob_id": "blob-1"},
     "get_blob_content": {"blob_id": "blob-1"},
+    "read_attachment": {"blob_id": "blob-1"},
     "create_blob": {"filename": "rows.csv", "mime_type": "text/csv", "content": "a,b\n1,2\n"},
     "update_blob": {"blob_id": "blob-1", "content": "a,b\n3,4\n"},
     "delete_blob": {"blob_id": "blob-1"},
@@ -169,16 +170,18 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "wire_secret_ref": {"name": "OPENROUTER_API_KEY", "target": "node", "option_key": "api_key"},
 }
 
-# A valid (non-null) value for each of the 15 promoted positions, valid under
+# A valid (non-null) value for each of the 17 promoted positions, valid under
 # both S and the strict W.
 _PROMOTED_VALUES: dict[tuple[str, tuple[str, ...]], Any] = {
     # Offset zero keeps every independent presence combination valid; actual
     # positive-offset continuation still requires the identity below.
     ("get_blob_content", ("offset_chars",)): 0,
     ("get_blob_content", ("expected_content_hash",)): "a" * 64,
+    ("read_attachment", ("expected_content_hash",)): "a" * 64,
     ("create_blob", ("description",)): "sample rows",
     ("wire_blob_inline_ref", ("encoding",)): "utf-16",
     ("clear_source", ("source_name",)): "source",
+    ("inspect_source", ("encoding",)): "utf-8-sig",
     ("get_pipeline_state", ("component",)): "nodes",
     ("get_plugin_assistance", ("issue_code",)): "no_help",
     ("list_models", ("provider",)): "openrouter/",
@@ -236,12 +239,12 @@ def _semantic(decoded: DecodedArguments) -> dict[str, Any]:
 # ---------------------------------------------------------------- the seeds
 
 
-def test_the_seeds_cover_exactly_the_32_strict_capable_tools_and_15_promoted_positions() -> None:
+def test_the_seeds_cover_exactly_the_33_strict_capable_tools_and_17_promoted_positions() -> None:
     assert set(_SEEDS) == _strict_capable_names()
-    assert len(_SEEDS) == 32
+    assert len(_SEEDS) == 33
     promoted = {(name, path) for name in _SEEDS for path in _WIRE_TOOL_DEFS[STRICT][name].promoted_paths}
     assert set(_PROMOTED_VALUES) == promoted
-    assert len(promoted) == 15
+    assert len(promoted) == 17
 
 
 @pytest.mark.parametrize("tool", sorted(_SEEDS))
@@ -277,6 +280,8 @@ def test_a_null_at_a_promoted_position_becomes_absent(tool: str, path: tuple[str
         ("create_blob", ("content",)),
         ("request_interpretation_review", ("user_term",)),
         ("get_blob_content", ("blob_id",)),
+        ("read_attachment", ("blob_id",)),
+        ("inspect_source", ("blob_id",)),
     ],
 )
 def test_a_null_at_a_non_promoted_position_is_left_for_s(tool: str, path: tuple[str, ...]) -> None:
@@ -369,6 +374,28 @@ def test_decode_never_rejects_on_a_w_failure() -> None:
 
     assert decoded.wire_conformant is False
     assert _semantic(decoded) == raw
+
+
+@pytest.mark.parametrize("dialect", [NONE, STRICT])
+@pytest.mark.parametrize(
+    ("encoding", "admitted"),
+    [(None, True), ("u", True), ("x" * 128, True), ("", False), ("x" * 129, False)],
+    ids=["null", "minimum-length", "maximum-length", "too-short", "too-long"],
+)
+def test_inspection_encoding_length_limits_remain_semantic_after_decode(
+    dialect: ToolContractDialect, encoding: str | None, admitted: bool
+) -> None:
+    raw = {"blob_id": "blob-1", "encoding": encoding}
+    decoded = decode_wire_arguments("inspect_source", dialect, raw)
+    # Strict W carries length guidance in its ledger descriptions; S remains
+    # the enforcement boundary. This checks schema admission, not codec lookup.
+    assert decoded.wire_conformant is (dialect is STRICT or admitted)
+    assert _s_valid("inspect_source", _semantic(decoded)) is admitted
+    if admitted:
+        require_schema_valid_arguments("inspect_source", _semantic(decoded))
+    else:
+        with pytest.raises(ToolArgumentError):
+            require_schema_valid_arguments("inspect_source", _semantic(decoded))
 
 
 @pytest.mark.parametrize("tool", sorted(_SEEDS))

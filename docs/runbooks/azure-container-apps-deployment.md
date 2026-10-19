@@ -12,7 +12,7 @@ fact, the receipt records a sanitized projection of it.
 > **Status.** The implemented ACA slice received desktop acceptance:
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This executable procedure can produce a future receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.7.json` for the unreleased candidate. Steps marked
+> at `docs/operator/evidence/azure-container-apps/0.8.9.json` for the unreleased candidate. Steps marked
 > **LIVE** require measurements from that operator run. Neither a live run nor
 > a receipt is an outstanding closure condition. See
 > [Deployment Platforms](../reference/deployment-platforms.md) for support scope.
@@ -38,7 +38,7 @@ eligible checkpoint resume, using fresh web and Landscape authority. Unsafe
 effects, incomplete sources and identity/compatibility failures remain
 `recovery_required`; see the [handoff contract](../reference/deployment-platforms.md#durable-run-handoff).
 Integrated verification is recorded in the
-[ACA plan](../plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
+[ACA plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification).
 Evidence remains limited to
 local PostgreSQL mechanism and integration evidence, with no cloud receipt or
 no-affinity deployment qualification.
@@ -48,7 +48,7 @@ no-affinity deployment qualification.
 > (environment, workload, jobs, parameter examples, KQL evidence queries and
 > the thin `scripts/acceptance.sh` driver). Every platform literal below is
 > measured in the
-> [platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
+> [platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
 > cite that file by section, never restate a fact from memory. For an ordinary
 > image rollout to an existing app use
 > [Azure Container Apps existing-service redeploy](azure-container-apps-existing-service-redeploy.md);
@@ -116,7 +116,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The exact published candidate image digest (session epoch 77, Landscape epoch 49), once available, in the registry.
+- The exact published candidate image digest (session epoch 78, Landscape epoch 50), once available, in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -332,7 +332,7 @@ Keep the configured SSO provider throughout these stages. Neither local
 registration credentials nor an anonymous readiness response establishes an
 admitted acceptance user.
 
-### 0.8.7 fix-on-fail cycle
+### 0.8.9 fix-on-fail cycle
 
 Run each acceptance attempt against an exact candidate commit and published
 image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
@@ -481,8 +481,8 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both fresh schemas at session epoch 77
-  and Landscape epoch 49. Existing stores must be preserved and refused.
+  with the schema-owner URLs and initializes both fresh schemas at session epoch 78
+  and Landscape epoch 50. Existing stores must be preserved and refused.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
   `session_tls`, `landscape_tls`, `payload_store_writable` and
@@ -493,9 +493,9 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   cases inside the environment, the one auth mode whose truth depends on
   where the process runs.
 
-> **LIVE:** for 0.8.7 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initial creation at session epoch 77
-> and Landscape epoch 49. Record the execution names. Any no-schema dry run
+> **LIVE:** for 0.8.9 acceptance, run the Jobs with the candidate digest and
+> require both schema checks to pass after initial creation at session epoch 78
+> and Landscape epoch 50. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
 
@@ -561,14 +561,14 @@ parity test feeds one corpus through both).
   "candidate_image_digest": "sha256:64-lowercase-hex",
   "candidate_revision_sha256": "64-lowercase-hex",
   "candidate_doctor_job_sha256": "64-lowercase-hex",
-  "candidate_package_version": "0.8.7",
+  "candidate_package_version": "0.8.9",
   "previous_source_sha": "",
   "previous_image_digest": "",
   "previous_revision_sha256": "",
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 77, "landscape_epoch": 49, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 78, "landscape_epoch": 50, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -620,7 +620,7 @@ cross-checks every replica name against `az containerapp replica list`.
 Both runtime roles need write access to `web_instances`. Each replica registers
 itself in that table at boot, so a role holding only `SELECT` fails startup with
 `permission denied for table web_instances` and P3 never gets a row to expire.
-From 0.8.7, startup also needs `UPDATE` on `quota_policies` to authorize its
+In 0.8.9, startup also needs `UPDATE` on `quota_policies` to authorize its
 population lock, even when no container ceiling is configured. For a startup
 proof with no configured quota, the session-database minimum is:
 
@@ -632,7 +632,7 @@ GRANT UPDATE ON quota_policies TO elspeth_runtime_a;
 ```
 
 Repeat for `elspeth_runtime_b`. Existing restricted roles following the older
-minimum need the quota-table grant before upgrading to 0.8.7. These grants do
+minimum need the quota-table grant before upgrading to 0.8.9. These grants do
 not grant DDL or the full DML needed for normal application use. In particular,
 creating a configured policy additionally needs `INSERT` on `quota_policies`
 and the normal Landscape audit-write permissions. Use the maintained bootstrap
@@ -960,7 +960,7 @@ run). The driver captures the `bundle-validate` verdict in private
 `$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
 not create a public receipt. Review the protected receipts and publish a
 sanitized account of measured facts at
-`docs/operator/evidence/azure-container-apps/0.8.7.json` only after the live
+`docs/operator/evidence/azure-container-apps/0.8.9.json` only after the live
 procedure completes and the bundle passes. Never create a receipt from desktop
 analysis or treat skipped or failed probes as passes. If a run fails, retain
 its diagnostics, fix the defect and rerun before claiming live acceptance.

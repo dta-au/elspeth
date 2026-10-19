@@ -61,12 +61,13 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"Session epoch advances from 76 to {SESSION_SCHEMA_EPOCH}" in current_release
-    assert f"Landscape remains at epoch {SQLITE_SCHEMA_EPOCH}" in current_release
+    assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in current_release
+    assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in current_release
     assert "immutable graph snapshots" in current_release
     assert "both distinct epoch-76" in current_release
     assert "cannot share session stores or replicas" in current_release
     assert "Preserve epoch-75 stores" in current_release
+    assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(current_release.split())
     assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in current_release
     assert "Drain and isolate old/new deployments" in current_release
     assert "no migration,\nreset, restamping or downgrade" in current_release
@@ -82,7 +83,7 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     assert "LLM compatibility and Composer recovery" in release_085
     assert "Omitted LLM temperature uses the provider default" in release_085
     assert "Session epoch 72 adds durable Composer jobs" in release_084
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in release_084
+    assert "Landscape epoch 49 remains unchanged" in release_084
     assert "A Landscape database already at epoch 49 remains usable" in " ".join(release_084.split())
 
     assert "Session epoch 71 and Landscape epoch 49" in release_082
@@ -198,7 +199,8 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
     assert "Qualification uses explicitly new compatible stores" in current_text
-    assert f"Keep a Landscape database already at epoch {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert f"explicitly new epoch-{SQLITE_SCHEMA_EPOCH} Landscape target" in current_text
+    assert "epoch-49 Landscape stores with compatible prior application access" in current_text
     assert "preserved and refused before incompatible writes" in current_text
     assert "Do not recreate, delete, restamp or migrate them" in current_text
     assert "ordinary freeform composition" in current_text
@@ -206,6 +208,8 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "Preserve epoch-75 stores" in current_text
     assert f"explicitly new epoch-{SESSION_SCHEMA_EPOCH} target" in current_text
     assert "both distinct epoch-76 contracts" in current_text
+    assert "Quota API quantities are exact signed-64-bit decimal strings" in current_text
+    assert "Proxy deployments must explicitly configure their trusted forwarding peers" in current_text
     release_086 = soup.select('[data-release="0.8.6"]')
     assert len(release_086) == 1
     assert "Sessions epoch 76" in release_086[0].get_text(" ", strip=True)

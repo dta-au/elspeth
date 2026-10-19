@@ -353,6 +353,33 @@ class TestAllocateCallIndex:
             second.execution.allocate_operation_call_index(operation_id, coordination_token=leader_coordination_token(second, "run-1")) == 2
         )
 
+    def test_governed_call_identity_survives_operation_index_remapping(self):
+        """A concurrent recorder must not sever the durable quota binding."""
+        db, first, _state_id, operation_id = _setup_with_operation()
+        second = make_factory(db)
+        first_index = first.execution.allocate_operation_call_index(
+            operation_id, coordination_token=leader_coordination_token(first, "run-1")
+        )
+        second_index = second.execution.allocate_operation_call_index(
+            operation_id, coordination_token=leader_coordination_token(second, "run-1")
+        )
+        assert first_index == second_index == 0
+        for factory, index, attempt_id in ((first, first_index, "attempt-first"), (second, second_index, "attempt-second")):
+            call = factory.execution.record_operation_call(
+                operation_id,
+                CallType.LLM,
+                CallStatus.SUCCESS,
+                request_data=RawCallPayload({"worker": attempt_id}),
+                call_index=index,
+                call_id=attempt_id,
+                coordination_token=leader_coordination_token(factory, "run-1"),
+            )
+            assert call.call_id == attempt_id
+        assert [(call.call_index, call.call_id) for call in second.execution.get_operation_calls(operation_id)] == [
+            (0, "attempt-first"),
+            (1, "attempt-second"),
+        ]
+
     def test_fresh_state_id_starts_at_zero_with_db_seeding(self):
         """A state_id with no DB entries still starts at 0."""
         _db, factory, state_id = _setup()

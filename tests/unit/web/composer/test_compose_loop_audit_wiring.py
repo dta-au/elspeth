@@ -143,6 +143,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     defaults.update(overrides)
@@ -933,14 +934,22 @@ async def test_compose_loop_records_arg_error_for_non_finite_object_arguments() 
     from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
 
     raw = "Recovered."
+    header = "The pipeline is still empty — the composer did not complete a valid build this turn."
+    blocker = "set_metadata failed before mutation (ValueError: ValueError)."
+    footer = (
+        "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
+    )
     notice = (
         "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
         "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
     )
     assert result.raw_assistant_content == raw
-    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert result.message == (raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + header + "\n\nCause: " + blocker + "\n\n" + footer + "\n\n" + notice)
     assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
         AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(header),
+        AssistantTextSegment("Cause: " + blocker),
+        TrustedSystemNoticeSegment(footer),
         TrustedSystemNoticeSegment(notice),
     )
     mock_execute_tool.assert_not_called()
@@ -989,14 +998,22 @@ async def test_compose_loop_records_arg_error_for_non_finite_non_object_argument
     from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
 
     raw = "Recovered."
+    header = "The pipeline is still empty — the composer did not complete a valid build this turn."
+    blocker = "set_metadata failed before mutation (ValueError: ValueError)."
+    footer = (
+        "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
+    )
     notice = (
         "Checkpoint save status: Verified checkpoint evidence covers 0 saved draft revisions. "
         "There is no net authored change from the starting draft. Checkpoint evidence does not establish task completion."
     )
     assert result.raw_assistant_content == raw
-    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+    assert result.message == (raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + header + "\n\nCause: " + blocker + "\n\n" + footer + "\n\n" + notice)
     assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
         AssistantTextSegment(raw),
+        TrustedSystemNoticeSegment(header),
+        AssistantTextSegment("Cause: " + blocker),
+        TrustedSystemNoticeSegment(footer),
         TrustedSystemNoticeSegment(notice),
     )
     mock_execute_tool.assert_not_called()

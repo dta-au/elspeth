@@ -166,7 +166,7 @@ class TestDerivation:
 
         assert record.tool_contract_dialect is ToolContractDialect.OPENAI_STRICT
         assert record.strict_tool_count == expected
-        assert expected == 32
+        assert expected == 33
 
     def test_unstamped_loop_list_is_none_with_zero(self) -> None:
         record = _record(wire_tool_definitions(ToolContractDialect.NONE))
@@ -210,7 +210,7 @@ class TestSurvivesToThePersistedProjection:
         call_payload = _envelope_call(_record(wire_tool_definitions(ToolContractDialect.OPENAI_STRICT)))
 
         assert call_payload["tool_contract_dialect"] == "openai_strict"
-        assert call_payload["strict_tool_count"] == 32
+        assert call_payload["strict_tool_count"] == 33
 
     def test_to_dict_writes_the_dialect_as_its_string_value(self) -> None:
         raw = _llm_call(tool_contract_dialect=ToolContractDialect.NONE, strict_tool_count=0).to_dict()

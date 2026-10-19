@@ -71,6 +71,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import SchemaViolation, ToolArgumentError
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 if TYPE_CHECKING:
@@ -289,6 +290,7 @@ class BufferingRecorder(
         self._llm_calls: list[ComposerLLMCall] = []
         self._planner_attempts: list[ComposerPlannerAttempt] = []
         self._withheld_replies: list[WithheldReply] = []
+        self._visible_tool_events: list[tuple[ComposerToolInvocation, VisibleToolEvent]] = []
         self._private_candidates: list[PrivatePlannerCandidate] = []
         self._private_authorings: dict[str, PrivateToolAuthoring] = {}
         self._lock = threading.Lock()
@@ -343,6 +345,22 @@ class BufferingRecorder(
         """Append one semantic planner response disposition."""
         with self._lock:
             self._planner_attempts.append(attempt)
+
+    def record_visible_tool_event(self, invocation: ComposerToolInvocation, event: VisibleToolEvent) -> None:
+        """Link ordinary visible evidence to the actual recorded invocation."""
+        if type(invocation) is not ComposerToolInvocation or type(event) is not VisibleToolEvent:
+            raise AuditIntegrityError("Visible tool event lacks nominal invocation custody")
+        with self._lock:
+            if not any(item is invocation for item in self._invocations) or any(
+                item is invocation for item, _event in self._visible_tool_events
+            ):
+                raise AuditIntegrityError("Visible tool event lacks a unique recorded invocation")
+            self._visible_tool_events.append((invocation, event))
+
+    @property
+    def visible_tool_events(self) -> tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...]:
+        with self._lock:
+            return tuple(self._visible_tool_events)
 
     def record_withheld_reply(self, origin: WithheldReplyOrigin, content: str) -> None:
         """Stage a model reply its producer will not publish.

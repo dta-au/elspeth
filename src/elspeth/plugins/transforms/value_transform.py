@@ -363,16 +363,16 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:60e856c2e2543429"
+    source_file_hash: str | None = "sha256:7d4ce6833cb24ca0"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
-        "Use for ordered expression-based field calculation when every input row follows pass-through semantics "
+        "Use for ordered expression-based field calculation that preserves arriving fields on successful rows "
         "and each operation may read fields computed by an earlier operation."
     )
     usage_when_not_to_use = (
-        "Row filtering or routing — value_transform never drops rows; every row passes "
-        "through with its computed fields. Use a gate node for conditional row filtering "
+        "Intentional row filtering or routing — successful rows pass through with computed fields; "
+        "expression or type failures follow on_error. Use a gate node for conditional row filtering "
         "(or keyword_filter for regex pattern blocking)."
     )
     example_use: str = """transform:
@@ -685,24 +685,29 @@ class ValueTransform(BaseTransform):
                 issue_code=None,
                 summary=(
                     "Compute new or overwritten field values with per-row expressions using a "
-                    "restricted expression grammar. Assignment-only: every row passes through — "
-                    "it cannot drop, keep, or route rows. Stateless and pure."
+                    "restricted expression grammar. Assignment-only: successful rows pass through; "
+                    "expression or type failures follow on_error. It is not a conditional filtering or routing tool. Stateless and pure."
                 ),
                 composer_hints=(
                     "Call get_expression_grammar to see the allowed operations — only stdlib-safe expressions are permitted.",
                     "Achievable here: arithmetic (row['a'] + row['b'], abs(row['n'])), field copies and overwrites, string "
-                    "concatenation, case folding/trimming via lower(row['x']), upper(row['x']), strip(row['x']), "
-                    "casefold(row['x']), membership tests, conditionals. For type changes use type_coerce.",
+                    "concatenation, membership tests and conditionals.",
+                    "For case folding/trimming use lower(row['x']), upper(row['x']), strip(row['x']) and casefold(row['x']).",
+                    "Use starts_with(text, prefix) for strict leading-prefix predicates and word_count(text) for whitespace-delimited counts.",
+                    "Use decimal_within(left, right, tolerance) for inclusive decimal-spelling tolerance. It accepts finite int/float "
+                    "values, excluding bool, and a nonnegative tolerance; it does not repair earlier binary-float arithmetic.",
+                    "For type changes use type_coerce.",
                     "NOT achievable here: regex (pattern extraction, splitting), title-casing, and method-call syntax "
-                    "(row['x'].lower() is rejected; use lower(row['x'])). Only len, abs, lower, upper, strip, casefold "
+                    "(row['x'].lower() is rejected; use lower(row['x'])).",
+                    "Only len, abs, lower, upper, strip, casefold, starts_with, word_count, decimal_within "
                     "are callable. Route text rewriting beyond case folding through an llm transform.",
                     "Declare arriving types for consumed fields and output types for new targets. A provably incompatible authored target is refused at build; a value-dependent mismatch routes to on_error.",
                     "Treat any as its own type at typed consumers and union branches, never as a wildcard.",
                     "A target the schema does not type uses the expression's provable output type over declared inputs; "
                     "an unknown expression stays 'any'. Add a declaration or type_coerce before a typed consumer when needed.",
                     "When reading or overwriting an existing field, use its carried name (normally normalized header or source mapping target), not another spelling. A genuinely new target may use any valid new name.",
-                    "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
-                    "error-route the row. Conditional row filtering is a gate node, not this transform.",
+                    "A successful expression that evaluates to False stores False rather than filtering the row. "
+                    "Evaluation or type failures follow on_error. Conditional row filtering belongs to a gate node.",
                     "A result may be nested (row['meta'], or a list, tuple or dict literal); its field is typed 'any'. A set "
                     "cannot be stored (no canonical order): use a list; keep set literals to membership tests or len().",
                     "Expressions are sandboxed — file I/O, imports, and external calls are rejected at parse time.",

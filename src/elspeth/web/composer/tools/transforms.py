@@ -243,7 +243,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "plugin": {
             "type": ["string", "null"],
-            "description": "Plugin name. Required for transform/aggregation/collector. Null for gate/coalesce/row_union/queue.",
+            "description": (
+                "Plugin name. Required for transform/aggregation/collector. Explicitly supply it when replacing an existing "
+                "configured plugin node, including routing-only edits. Null for gate/coalesce/row_union/queue."
+            ),
         },
         "input": {
             "type": "string",
@@ -279,7 +282,9 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "options": {
             "type": "object",
             "description": (
-                "Plugin-specific config for transform, aggregation, and collector nodes; a queue permits only its optional "
+                "Complete author-owned plugin config for transform, aggregation, and collector nodes. Explicitly supply it "
+                "when replacing an existing configured plugin node, even for routing-only edits; omitted options are not merged. "
+                "A queue permits only its optional "
                 "description. Other structural kinds do not take plugin configuration. The schema: block declares what "
                 "ARRIVES for consumed fields and the OUTPUT type for fields the node creates. "
                 "Convert arriving values at the source or with an upstream type_coerce; an output declaration checks values but does not convert them. "
@@ -422,6 +427,9 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Add or update a pipeline node. "
+        "upsert_node replaces the node: when updating an existing configured transform/aggregation/collector, "
+        "explicitly supply plugin and complete author-owned options even for routing-only edits. "
+        "Read get_pipeline_state(component='set_pipeline_arguments') for the authoring payload. "
         "Fields are node_type-dependent: "
         "transform/aggregation use plugin+options; "
         "gate uses condition+routes (or fork_to) and optional node-level on_error; "
@@ -659,6 +667,22 @@ def _execute_upsert_node(
     plugin = validated.plugin
     node_options: Mapping[str, Any] = validated.options
     existing_node = next((node for node in state.nodes if node.id == node_id), None)
+    if (
+        existing_node is not None
+        and existing_node.plugin is not None
+        and existing_node.node_type in ("transform", "aggregation", "collector")
+        and node_type in ("transform", "aggregation", "collector")
+        and not {"plugin", "options"} <= validated.model_fields_set
+    ):
+        return _saved_graph_rejection_result(
+            state,
+            "upsert_node replaces the node, including its plugin configuration. For an existing configured "
+            "transform, aggregation, or collector, explicitly supply plugin and complete author-owned options, "
+            "even for routing-only edits. Read get_pipeline_state(component='set_pipeline_arguments') for the "
+            "authoring payload, then resubmit the complete node.",
+            error_code="argument_error",
+            rejected_component=node_ref,
+        )
     prior_node = existing_node if existing_node is not None and existing_node.node_type == node_type else None
     on_error = validated.on_error
     if node_type in ("transform", "aggregation"):

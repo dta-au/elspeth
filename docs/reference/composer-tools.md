@@ -478,16 +478,16 @@ Read a ready blob's decoded text for inspection, with bounded continuation.
 **Returns:** `content`, verified original-byte `content_hash`, full `size_bytes`
 and `total_chars`, half-open `[start_char, end_char)` range, `truncated`, and
 `next_offset_chars`, plus blob identity and recorded origin metadata. Each page
-contains at most 50,000 original Unicode code points; the complete serialized
-JSON tool response is bounded to 65,536 bytes, so escaping and metadata can
-reduce the returned text.
+preserves original Unicode code points. The complete serialized JSON tool
+response, including metadata and escaping, is bounded to 4,096 UTF-8 bytes.
 
 Continue with `offset_chars` set to the returned `next_offset_chars` and
 `expected_content_hash` set to the returned `content_hash`. A changed content
 identity is refused. `truncated`
 means `end_char < total_chars`; `next_offset_chars` is null at the end. A prefix
 does not establish whole-file inspection, and `size_bytes` describes the full
-blob rather than this page.
+blob rather than this page. Whole-file inspection needs enough configured
+discovery turns to read every page.
 
 ---
 

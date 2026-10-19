@@ -353,7 +353,7 @@ Discover-don't-remember still applies, but these are the traps that cost time.
 - `Dockerfile` — image build, extras, frontend bundling, runtime user/entrypoint.
 - `.dockerignore` — build-context and secret exclusions.
 - `pyproject.toml` / `uv.lock` — locked Python/test dependencies.
-- `docs/operator/aws-ecs-health-and-readiness.md` — probe semantics.
+- [Historical AWS ECS health and readiness](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/operator/aws-ecs-health-and-readiness.md) — probe semantics; use the maintained deployment runbook for current procedures.
 - `src/elspeth/web/aws_ecs_startup.py` — startup and schema gate.
 - `src/elspeth/web/aws_ecs_acceptance.py` — deployed acceptance checks.
 - `docs/runbooks/aws-ecs-deployment.md` — exhaustive disposable-environment

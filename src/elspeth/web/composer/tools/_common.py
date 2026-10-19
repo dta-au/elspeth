@@ -175,8 +175,9 @@ _AUTHOR_OWNED_INTERPRETATION_REQUIREMENT_FIELDS_TEXT: Final[str] = (
     + ", with optional display_title (a non-empty string of at most 200 characters)"
 )
 _INTERPRETATION_REVIEW_FOLLOWUP: Final[str] = (
-    "Then call request_interpretation_review for an authorable staged site; "
-    "backend-owned review kinds are surfaced automatically. The user resolves "
+    "When request_interpretation_review is offered, call it for an authorable staged site. "
+    "On a proposal-only surface, include pending requirements in the complete proposal instead. "
+    "Backend-owned review kinds are surfaced automatically. The user resolves "
     "the card and ELSPETH writes resolved review metadata."
 )
 _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
@@ -185,8 +186,9 @@ _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     + " are authorable. display_title is a concise human-readable approval name. "
     "Resolver-owned fields are not settable: "
     + ", ".join(sorted(_RESOLVER_OWNED_INTERPRETATION_REQUIREMENT_FIELDS))
-    + ". Omit those fields. Persist an authorable pending review with the current mutation tool, then call "
-    "request_interpretation_review for that staged site; backend-owned review kinds are surfaced automatically. "
+    + ". Omit those fields. On incremental surfaces, persist an authorable pending review with the offered mutation tool "
+    "and call request_interpretation_review when offered. On a proposal-only surface, include the pending requirements "
+    "in the appropriate source/node options of the complete proposal instead. Backend-owned review kinds are surfaced automatically. "
     "The user resolves the card and ELSPETH writes resolved review metadata."
 )
 _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
@@ -2156,17 +2158,18 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
         "node with node_type='coalesce', plugin=null, branches mapping each branch name to its "
         "incoming connection, policy (e.g. 'require_all') and merge (e.g. 'union'); downstream nodes "
-        "read the coalesce node id as their input. SHAPE SELECTION: several assessments of the SAME "
-        "input field belong on a SINGLE llm node's `queries` map (multi_query) instead of "
-        "fork/coalesce; use fork/coalesce only when the branches take genuinely INDEPENDENT inputs "
-        "or independent per-branch processing chains."
+        "read the coalesce node id as their input. SHAPE SELECTION: for same-input assessments "
+        "with compatible node-wide model, system prompt and sampling settings, prefer one llm node's queries map (multi_query) "
+        "when separate nodes or calls were not requested. Preserve requested branches even with "
+        "the same input; use fork/coalesce for different branch settings, independent inputs or processing chains."
     ),
     "gate": (
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
         "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches. "
-        "Its optional node-level `on_error` handles expression-evaluation errors: set it to 'discard' or a declared sink; "
-        "omit it for fail-fast behavior. Do not represent gate on_error as an edge."
+        "Its optional node-level `on_error` handles expression-evaluation errors: ordinarily name 'discard' "
+        "or a declared sink; inside a valid bound region an eligible enclosing closer may receive loss diversion. "
+        "Required-control coverage still applies. Omit it for fail-fast behavior; never author it as an edge."
     ),
     "row_union": (
         "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import planner_probe as pp  # evals/composer-battery/planner_probe.py via conftest sys.path
+import pytest
 from evals.lib import battery_planner as bp
 
 from elspeth.web.composer.protocol import PIPELINE_STAGED_AUTO_COMMIT_MESSAGE
@@ -38,7 +39,7 @@ def _planner_thread() -> list[dict]:
     ]
 
 
-def test_run_tripwire_and_probe_use_the_battery_with_proposal_capture(tmp_path: Path) -> None:
+def test_tripwire_captures_proposals_and_unpaired_probe_refuses_before_firing(tmp_path: Path) -> None:
     class StubBattery:
         round = "r1"
         round_dir = tmp_path / "runs" / "r1"
@@ -64,13 +65,10 @@ def test_run_tripwire_and_probe_use_the_battery_with_proposal_capture(tmp_path: 
     assert all(c["capture_proposals"] for c in b.calls) and all(c["case"] == "_tripwire" for c in b.calls)
     assert (tmp_path / "runs/r1/_tripwire/tripwire.json").exists()
     b.calls.clear()
-    pp.run_probe(b)  # type: ignore[arg-type]
-    assert (
-        len(b.calls) == 20
-        and b.calls[0]["prompt"] == bp.load_fixture(bp.PROBE_FIXTURES[0])["intent"]
-        and b.calls[1]["prompt"].startswith("Hi. ")
-    )
-    assert (tmp_path / "runs/r1/_probe/probe.json").exists()
+    with pytest.raises(bp.ProbeUnpaired, match="wording no longer selects"):
+        pp.run_probe(b)  # type: ignore[arg-type]
+    assert b.calls == []
+    assert not (tmp_path / "runs/r1/_probe").exists()
 
 
 def test_resume_never_refires_a_complete_tripwire_capture(tmp_path: Path) -> None:
@@ -138,9 +136,7 @@ def test_a_crashing_arm_never_stops_the_remaining_fixtures(tmp_path: Path) -> No
     assert table[bp.TRIPWIRE_FIXTURES[1]]["pass"] is True
 
 
-def test_preflight_asserts_pair_routing_for_every_tripwire_fixture() -> None:
-    """The routing assertion used to run inside the firing loop — i.e. after the canary was already spent."""
-    pp.tripwire_preflight()  # the real fixtures route correctly today
+def test_tripwire_preflight_does_not_classify_request_wording() -> None:
     calls: list[str] = []
     original = pp.assert_pair_routes
     try:
@@ -148,4 +144,4 @@ def test_preflight_asserts_pair_routing_for_every_tripwire_fixture() -> None:
         pp.tripwire_preflight()
     finally:
         pp.assert_pair_routes = original  # type: ignore[assignment]
-    assert calls == [bp.load_fixture(f)["intent"] for f in bp.TRIPWIRE_FIXTURES]
+    assert calls == []

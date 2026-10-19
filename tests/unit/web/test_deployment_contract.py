@@ -42,6 +42,8 @@ def _settings(**overrides: Any) -> WebSettings:
 
 def _external_settings(tmp_path: Path, *, target: str = "docker-compose", **overrides: Any) -> WebSettings:
     tls_query = _AWS_TLS_QUERY if target == "aws-ecs" else ""
+    if target == "azure-container-apps":
+        tls_query = "?sslmode=verify-full&sslrootcert=system"
     values: dict[str, Any] = {
         "deployment_target": target,
         "deployment_state_mode": "external-postgresql",
@@ -390,6 +392,110 @@ def test_external_postgresql_accepts_only_supported_sync_driver_forms(tmp_path: 
     assert checks["session_db_url"].ok
     assert checks["landscape_url"].ok
     assert checks["separate_db_targets"].ok
+
+
+@pytest.mark.parametrize("field", ["session_db_url", "landscape_url"])
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "sslmode=verify-full",
+        "sslrootcert=system",
+        "sslmode=verify-full&sslrootcert=",
+        "sslmode=verify-full&sslrootcert=relative.pem",
+        "sslmode=verify-ca&sslrootcert=/private/ca.pem",
+        "sslmode=require&sslrootcert=/private/ca.pem",
+        "sslmode=prefer&sslrootcert=system",
+        "sslmode=disable&sslrootcert=system",
+        "sslmode=allow&sslrootcert=system",
+        "sslmode=verify-full&sslmode=verify-full&sslrootcert=system",
+        "sslmode=&sslmode=verify-full&sslrootcert=system",
+        "sslmode=verify-full&sslmode=&sslrootcert=system",
+        "sslmode&sslmode=verify-full&sslrootcert=system",
+        "sslmode=verify-full&sslrootcert=&sslrootcert=system",
+        "sslmode=verify-full&sslrootcert=system&sslrootcert=",
+        "sslmode=verify-full&sslrootcert=system&sslrootcert=system",
+        "sslmode=verify-full&%73slmode=verify-full&sslrootcert=system",
+        "sslmode=verify-full&sslrootcert=system&requiressl=1",
+        "requiressl=0&sslmode=verify-full&sslrootcert=/private/ca.pem",
+        "sslmode=verify-full&sslrootcert=system&%72equiressl=",
+        "sslmode=verify-full&sslrootcert=system&application_name=example#&requiressl=1",
+        "sslmode=verify-full&sslrootcert=system&gssencmode=require",
+        "sslmode=verify-full&sslrootcert=system&gssencmode=prefer",
+        "sslmode=verify-full&sslrootcert=system&gssencmode=disable&gssencmode=disable",
+        "sslmode=verify-full&sslrootcert=system&application_name=example#&gssencmode=require",
+    ],
+)
+def test_aca_rejects_unverified_or_ambiguous_tls_and_redacts(tmp_path: Path, field: str, driver: str, query: str) -> None:
+    url = f"{driver}://tls_user:tls_password@private-db/private_database?{query}"
+    settings = _external_settings(tmp_path, target="azure-container-apps").model_copy(update={field: url})
+
+    checks = {item.name: item for item in validate_external_postgresql_settings(settings)}
+
+    assert checks[field].ok is False
+    for fragment in ("tls_user", "tls_password", "private-db", "private_database", "/private/ca.pem"):
+        assert fragment not in checks[field].detail
+
+
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+@pytest.mark.parametrize("root", ["system", "/operator/trust.pem"])
+@pytest.mark.parametrize("extra", ["", "&gssencmode=disable"])
+def test_aca_accepts_explicit_authenticated_tls(tmp_path: Path, driver: str, root: str, extra: str) -> None:
+    query = f"?sslmode=verify-full&sslrootcert={root}{extra}"
+    settings = _external_settings(
+        tmp_path,
+        target="azure-container-apps",
+        session_db_url=f"{driver}://user:password@db/session{query}",
+        landscape_url=f"{driver}://user:password@db/landscape{query}",
+    )
+
+    checks = validate_external_postgresql_settings(settings)
+
+    assert all(check.ok for check in checks)
+
+
+def test_aca_retains_connection_target_override_refusal(tmp_path: Path) -> None:
+    settings = _external_settings(
+        tmp_path,
+        target="azure-container-apps",
+        session_db_url="postgresql+psycopg://user:password@db/session?sslmode=verify-full&sslrootcert=system&host=other-db",
+    )
+
+    checks = {item.name: item for item in validate_external_postgresql_settings(settings)}
+
+    assert checks["session_db_url"].ok is True
+    assert checks["separate_db_targets"].ok is False
+
+
+@pytest.mark.parametrize("option", ["gssencmode=require", "requiressl=1", "sslmode=", "sslrootcert="])
+def test_aca_rejects_transport_overrides_hidden_from_standard_url_parser(tmp_path: Path, option: str) -> None:
+    settings = _external_settings(
+        tmp_path,
+        target="azure-container-apps",
+        session_db_url=f"postgresql+psycopg://user:pw?marker@db/session?{option}&sslmode=verify-full&sslrootcert=/tmp/ca.pem",
+    )
+
+    check = {item.name: item for item in validate_external_postgresql_settings(settings)}["session_db_url"]
+
+    assert check.ok is False
+
+
+@pytest.mark.parametrize("field", ["session_db_url", "landscape_url"])
+@pytest.mark.parametrize("driver", ["postgresql", "postgresql+psycopg2", "postgresql+psycopg"])
+@pytest.mark.parametrize("extra", ["", "&gssencmode=disable"])
+@pytest.mark.parametrize(
+    "userinfo",
+    ["user:pw%3Fmarker", "user:pw%23marker", "u%3Fser:password", "user:pw%2540marker", "u%40%3A%23%25%2B:pw%3F%40%3A%23%25%2B"],
+)
+def test_aca_accepts_canonical_percent_escaped_credentials(tmp_path: Path, userinfo: str, field: str, driver: str, extra: str) -> None:
+    settings = _external_settings(tmp_path, target="azure-container-apps").model_copy(
+        update={field: f"{driver}://{userinfo}@db/escaped_credentials?sslmode=verify-full&sslrootcert=system{extra}"}
+    )
+
+    check = {item.name: item for item in validate_external_postgresql_settings(settings)}[field]
+
+    assert check.ok is True
 
 
 @pytest.mark.parametrize("sslmode", ["disable", "allow", "prefer", "require", "verify-ca"])

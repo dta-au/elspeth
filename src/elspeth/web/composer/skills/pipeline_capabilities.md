@@ -41,14 +41,15 @@ authoring:
 5. Author through your surface's terminal authoring tool with the complete
    canonical document. Preserve the requested topology during every repair.
 
-These steps order the facts you need, not the turns you spend. When several of
-them are still unresolved, issue those discovery calls together in a single
-turn rather than one per turn: every call in a turn is executed and its result
-returned before your next turn begins, bounded by the per-turn tool budget.
+Batch independent missing facts. Pages of one blob depend on its
+returned continuation offset and content hash; read them sequentially, without
+guessing later offsets. On a
+proposal-only surface, finish discovery in earlier turns: the terminal proposal
+must be the only call in its turn, and a mixed terminal batch executes no calls.
 Batch only calls whose fact is still missing: never issue the same call twice
 in one turn, and never ask for a fact the request already supplies or one an
-earlier call already answered — such a read is refused rather than answered,
-and two refusals can end the request's discovery. A rejection clears the
+earlier call already answered — such a read is refused rather than answered.
+A rejection clears the
 repetition window but does not un-supply anything already read: a fact stays
 supplied for the whole request, so repair through step 3's structured-repair
 reads, which carry what a re-read cannot. Where your palette also carries
@@ -61,16 +62,19 @@ question, or a successful mutation that omits the echo.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
-discovery proves it — cite the `prohibited` array on `list_sources` /
-`list_transforms` / `list_sinks`, or an attempt failure (e.g. a rejected
-`set_source`), never a bare assertion. Do not turn a stage timing question, a
+discovery proves it — use the supplied discovery digest's `prohibited` entries
+first, an offered `list_sources` / `list_transforms` / `list_sinks` tool when
+that fact is missing, or an attempt failure (e.g. a rejected `set_source`),
+never a bare assertion. Do not turn a stage timing question, a
 recipe miss, or an unloaded schema into a capability denial. Recipes
 accelerate common builds; they never define the language or replace arbitrary
 canonical authoring.
 
 <!-- taught:begin tool-data list_sources data.available; tool-data list_sources data.prohibited; tool-data list_transforms data.available; tool-data list_transforms data.prohibited; tool-data list_sinks data.available; tool-data list_sinks data.prohibited -->
 When a user names a specific plugin and asks why it cannot be used, check the
-relevant discovery tool's `prohibited` array before answering. A plugin listed
+supplied discovery digest's `plugins.prohibited` entries first, or the relevant
+discovery tool's `prohibited` array if that tool is offered and the fact is
+missing. A plugin listed
 there is closed by standing security policy, not by anything an operator can
 configure — state its `reason` and `explanation` verbatim rather than
 guessing, retrying, or silently dropping the question. A plugin absent from
@@ -105,8 +109,22 @@ clear it to fail-fast with null. Structural nodes retain their
 own contracts. Public YAML import uses this explicit-choice rule even for
 internal placeholder plugin names; it grants no resume authority.
 
-Error policies are narrower: transform/aggregation/gate `on_error` may be
-`discard` or an output `sink_name`, never a downstream processing input. Node
+For a CSV retention sink, `require_all_rows=true` makes a refused row stop
+preparation before ordinary row diversion, including `on_write_failure=discard`.
+It does not roll back earlier publications. `include_audit_context=true`
+requires that option, observed schema, normalized headers and write mode.
+Its two optional reason modes are mutually exclusive: `include_error_reason`
+requires a readable durable source/transform failure; `include_disposition_reason`
+also accepts a unique completed Boolean gate route to that sink without
+reclassifying a successful gate decision as an error. Missing, ambiguous or
+redacted disposition evidence and linked sink diversions stop preparation.
+Inspect current CSV assistance for the full supported contract; a fallback
+route alone does not disprove required-row retention.
+
+Error policies are narrower: transform/aggregation/gate `on_error` ordinarily
+names `discard` or an output `sink_name`, never an arbitrary processing input.
+A transform or gate inside a valid bound region may instead divert loss to
+that enclosing region's closer. Aggregations cannot use this exception. Node
 ids ordinarily identify components rather than connections. The only implicit
 self-publishing node kinds are `aggregation`, `queue`, and `coalesce`: when
 `on_success` is omitted, each publishes under its own node id, and a downstream
@@ -123,7 +141,8 @@ component; `row_union` requires an explicit `on_success` connection.
   not in scope and is rejected. `get_expression_grammar` is the full grammar
   authority.
   Gate expression-evaluation failures use the optional node-level `on_error`
-  policy: set it to `discard` or a declared sink name. Omit it to preserve
+  policy: set it to `discard`, a declared sink name, or an eligible enclosing
+  bound-region closer as described above. Omit it to preserve
   fail-fast behavior. Gate `on_error` is authored on the gate node, never as an
   `on_error` edge.
   Gate semantics are the user's, never invented: use the user's stated
@@ -289,16 +308,16 @@ cleanup node and then from the cleanup node to the sink.
 
 ### Declared Types And Row Templates
 
-A type you declare is checked on every row and never converted to fit: a row
-whose value has another type goes to `on_error` when the mismatch depends on
-the value; a provable contradiction can be refused at build (an `int`
-satisfies `float`; nothing else is widened). Declare the type the value actually has, and `any`
-for a created field whose type varies. A model node's structured output fields
-bind their row types — `integer` is `int`, `number` is `float`, `boolean` is
-`bool`, `string` and `enum` are `str` — so a node schema type on a field the
-model writes must admit that bound type (validation refuses `int` over `number`), the
-`<response>_usage` field is `any`, and a downstream consumer of a `number`
-field declares `float`.
+Source plugins may coerce declared fields only where their live contract permits it.
+CSV fixed/flexible schemas coerce declared fields at ingestion; observed CSV cells remain strings.
+Source validation failures use `on_validation_failure`.
+A downstream input type declaration validates arriving values without converting them:
+value-dependent mismatches use `on_error`; provable contradictions may be refused
+at build. Only `int` widens to `float`. Declare actual types; use `any` for created
+fields with varying types. Model structured outputs bind row types: `integer` →
+`int`, `number` → `float`, `boolean` → `bool`, `string`/`enum` → `str`. Node schemas
+must admit these types (`int` over `number` is refused); `<response>_usage` is
+`any`. Downstream consumers declare `float` for `number` fields.
 
 A row template — an LLM prompt or query template, or a retrieval
 `query_template` — sees only the fields its node declares in
@@ -331,8 +350,16 @@ is fine. With `required_input_fields` omitted, a model prompt may not use
 For a multi-query template, `row.source_row` contains only original upstream
 columns the node declares in `required_input_fields`. The explicit `[]` opt-out
 keeps its existing whole-original-row visibility.
+Declared LLM inputs reject blank strings before provider dispatch by default.
+For a prompt that handles unavailable text, `allow_blank_input_fields` may name
+only the relevant `required_input_fields`. It passes the original empty or
+whitespace string unchanged; field presence, types, template visibility and
+input/result checks still apply. Null requires the arriving field's nullable
+contract independently. This option does not produce an unavailable assessment.
 `query_input_mode: upstream` is the default: every query reads the original row.
-`query_input_mode: ordered` requires list-form named queries and `pool_size: 1`.
+`query_input_mode: ordered` runs list-form named queries in their authored order,
+with effective `pool_size: 1`. A profile-bound Composer node omits `pool_size`;
+profile lowering and the runtime default supply sequential execution.
 Its `input_fields` may bind an exact generated name from an earlier successful,
 validated query. Before authoring each binding, obtain the selected plugin's
 exact configuration and generated structured/raw/usage/model output names from
@@ -341,9 +368,33 @@ or prompt prose. Self/forward bindings and
 collisions are refused. Those internal dependencies are not upstream requirements.
 `source_row` and images always remain original-only. A constant first ordered
 query may use `input_fields: {}`; do not invent an external input for it.
+For example, query 1 can consume `animal_type` and publish typed `teeth_count`.
+Query 2 binds `input_fields: {teeth_count: teeth_count}` and reads
+`{{ row.teeth_count }}`. To publish that bare structured name, query 1 uses
+`structured_output_prefix: ""`; the default would publish `<query_name>_teeth_count`.
+Only `animal_type` belongs in the node's upstream `required_input_fields` for
+this chain. Each query still has its own effective user prompt and validated
+outputs under the node's shared system/model configuration.
+Per-query structured extraction checks types before a dependent query runs;
+node-level `result_checks` run after all queries. Keep a separate node boundary
+when a required check must run before another model call.
+Preserve each field's requested meaning when writing postconditions. Validate
+independent outputs independently; never copy a score-to-verdict relationship
+from one question/query group into another unless the request specifies it for
+that group.
 No query publishes a partial output row. Failure discards local results and
 routes the original entry row, while completed provider calls and charges remain.
 Recovery restarts at the node boundary and may repeat calls.
+
+For a selected `reference_join`, named `tables` and a `lookups` list support
+the same within-node dependency pattern. Lookups run in list order; a later
+`key_field` may name an earlier lookup's exact output. `reference_key_name`
+names the match column in its table, and `output` expressions read the matched
+entry through `ref`. This plugin uses `tables`/`lookups`, not LLM `queries` or
+`query_input_mode`. Follow its live schema and assistance for configuration.
+Self/forward references, duplicate outputs and overwriting arriving fields are
+refused. A failed lookup releases no partially enriched row; the node's error
+route receives the original entry row.
 
 ### Optional operator-led chain compaction
 
@@ -445,7 +496,7 @@ the schema does not contain; use those when correcting a prior conclusion.
 Validation failures are structured repair input. Preserve the complete
 requested shape, apply required fields/enums/options from the returned schema or
 assistance, correct routing and field guarantees, then resubmit the complete
-proposal within the repair budget. Never delete a requested source, node,
+proposal. Never delete a requested source, node,
 branch, output, cleanup, LLM, or failure path merely to make validation pass.
 
 ## Capability and trust boundary

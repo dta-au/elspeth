@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -54,12 +54,14 @@ from elspeth.contracts.sink_effect_http import HTTPSinkEffectCapability, SinkEff
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
+    SinkEffectAuditContextCapability,
     SinkEffectFinalizationMember,
     SinkEffectInputKind,
     SinkEffectMemberCandidate,
     SinkEffectPipelineMembersInput,
     SinkEffectReservationRequest,
     SinkEffectRole,
+    SinkEffectRoutingContext,
     SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
@@ -798,16 +800,68 @@ class SinkExecutor:
             "outcome": pending_outcome.outcome.value,
             "path": pending_outcome.path.value,
         }
+        routing_context = (
+            SinkEffectRoutingContext(outcome=pending_outcome.outcome, path=pending_outcome.path, error_hash=pending_outcome.error_hash)
+            if isinstance(sink, SinkEffectAuditContextCapability) and sink.requires_audit_context
+            else None
+        )
         canonical_rows: list[dict[str, object]] = []
         for row in rows:
             normalized = canonical_json_loads(pipeline_canonical_json(row))
             if type(normalized) is not dict:  # pragma: no cover - rows are dictionaries by construction
                 raise OrchestrationInvariantError("sink-effect row canonicalization did not produce a mapping")
             canonical_rows.append(normalized)
-        candidates = tuple(
-            SinkEffectMemberCandidate(token_id=token.token_id, row=row, pending_identity=pending_identity)
-            for token, row in zip(tokens, canonical_rows, strict=True)
-        )
+        candidates_list = []
+        for token, row in zip(tokens, canonical_rows, strict=True):
+            member_context = routing_context
+            if isinstance(sink, SinkEffectAuditContextCapability) and sink.requires_error_reason:
+                from elspeth.engine.executors.sink_error_reason import resolve_sink_error_reason
+
+                if member_context is None:
+                    raise OrchestrationInvariantError("readable sink error reasons require audit routing context")
+                member_context = replace(
+                    member_context,
+                    error_reason=resolve_sink_error_reason(
+                        self._factory,
+                        run_id=self._run_id,
+                        token_id=token.token_id,
+                        row_id=token.row_id,
+                        sink_node_id=sink_node_id,
+                        sink_name=sink_name,
+                        outcome=pending_outcome.outcome,
+                        path=pending_outcome.path,
+                        error_hash=pending_outcome.error_hash,
+                    ),
+                )
+            if isinstance(sink, SinkEffectAuditContextCapability) and sink.requires_disposition_reason:
+                from elspeth.engine.executors.sink_disposition_reason import resolve_sink_disposition_reason
+
+                if member_context is None:
+                    raise OrchestrationInvariantError("readable sink disposition reasons require audit routing context")
+                member_context = replace(
+                    member_context,
+                    disposition_reason=resolve_sink_disposition_reason(
+                        self._factory,
+                        run_id=self._run_id,
+                        token_id=token.token_id,
+                        row_id=token.row_id,
+                        sink_node_id=sink_node_id,
+                        sink_name=sink_name,
+                        outcome=pending_outcome.outcome,
+                        path=pending_outcome.path,
+                        error_hash=pending_outcome.error_hash,
+                        row=row,
+                    ),
+                )
+            candidates_list.append(
+                SinkEffectMemberCandidate(
+                    token_id=token.token_id,
+                    row=row,
+                    pending_identity=member_context.pending_identity() if member_context is not None else pending_identity,
+                    routing_context=member_context,
+                )
+            )
+        candidates = tuple(candidates_list)
         members = resolve_sink_effect_members(self._factory, candidates)  # type: ignore[arg-type]
         target_config = dict(sink.config)
         identity = compute_pipeline_effect_identity(
@@ -1158,6 +1212,12 @@ class SinkExecutor:
                 violation=violation,
             )
             raise
+        if isinstance(failsink, SinkEffectAuditContextCapability) and (
+            failsink.requires_error_reason or failsink.requires_disposition_reason
+        ):
+            from elspeth.contracts.errors import SinkEffectCapabilityError
+
+            raise SinkEffectCapabilityError("Readable CSV error retention lacks a durable linked-diversion cause")
         candidates = tuple(
             SinkEffectMemberCandidate(
                 token_id=token.token_id,
@@ -1169,6 +1229,16 @@ class SinkExecutor:
                     "primary_effect_id": primary_effect_id_by_token[token.token_id],
                 },
                 primary_effect_id=primary_effect_id_by_token[token.token_id],
+                routing_context=(
+                    SinkEffectRoutingContext(
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
+                        error_hash=diversion_error_hashes[index],
+                        primary_effect_id=primary_effect_id_by_token[token.token_id],
+                    )
+                    if isinstance(failsink, SinkEffectAuditContextCapability) and failsink.requires_audit_context
+                    else None
+                ),
             )
             for token, index, _state in primary_divert_states
         )

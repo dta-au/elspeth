@@ -11,12 +11,14 @@ would never see it).
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -24,6 +26,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
 from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
@@ -80,18 +83,51 @@ class _ScriptedCompletion:
         return self.turns[len(self.messages) - 1]
 
 
-_ROOTLESS_RECOVERY_PREFIX = "[composer-system] No composition-state mutation completed successfully this turn"
+@contextmanager
+def _review_terminal_reply(service: ComposerServiceImpl, expected_reply: str):
+    """Keep real END ownership; supply one SDK verdict for this exact diagnostic reply."""
+    assert service._advisor_checkpoint._run_advisor_checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
+    reviews = []
 
+    async def complete(**kwargs):
+        assert kwargs["model"] == service._settings.composer_advisor_model
+        assert kwargs.get("tools") is None
+        assert "response_format" in kwargs
+        assert not reviews, "Only one terminal END response is supplied"
+        from tests.helpers.advisor_review import parse_advisor_publication_review
 
-def _assert_neutral_rootless_recovery(
-    before: list[dict[str, Any]],
-    after: list[dict[str, Any]],
-) -> None:
-    assert not any(_ROOTLESS_RECOVERY_PREFIX in str(message.get("content", "")) for message in before)
-    recovery = [message for message in after if _ROOTLESS_RECOVERY_PREFIX in str(message.get("content", ""))]
-    assert len(recovery) == 1
-    assert recovery[0]["role"] == "user"
-    assert "Re-check the user's request against that state." in recovery[0]["content"]
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+        assert review["current_request"] == "Build something"
+        assert review["candidate_reply"] == expected_reply
+        reviews.append(review)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            id="anti-anchor-terminal-review",
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "verdict": "CLEAN",
+                                "category": "other",
+                                "steps": [],
+                                "findings": "",
+                                "note": None,
+                                "publication_verdict": "ADMIT",
+                            }
+                        ),
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+        )
+
+    with patch("litellm.acompletion", side_effect=complete):
+        yield reviews
+    assert len(reviews) == 1
 
 
 def _empty_state() -> CompositionState:
@@ -134,6 +170,7 @@ def _make_settings() -> WebSettings:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         shareable_link_signing_key=b"\x00" * 32,
     )
 
@@ -177,10 +214,9 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
 
     Drive 3 turns where the LLM issues the same set_metadata call with the
     same arguments and execute_tool raises ToolArgumentError each time. On
-    turn 4 the LLM produces a text-only response. Because no mutation
-    succeeded, turn 5 answers the neutral rootless recovery. Inspect the
+    turn 4 the LLM produces a text-only response, reviewed by real END. Inspect the
     dispatch snapshot on turn 4: the hint must appear after the third tool
-    result, before that later recovery.
+    result, before termination.
     """
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
@@ -196,7 +232,6 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
         turn_with_failure("call_2"),
         turn_with_failure("call_3"),
         _make_text_only_response("I give up."),
-        _make_text_only_response("No pipeline was created; the metadata changes failed."),
     ]
     scripted = _ScriptedCompletion(turns)
 
@@ -216,6 +251,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
         events.append(event)
 
     with (
+        _review_terminal_reply(service, "I give up."),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -227,10 +263,9 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
 
     # The fourth LLM call is the post-hint LLM call. Inspect its messages
     # argument and find the system-injected hint.
-    assert mock_llm.call_count == 5, f"expected 5 LLM calls (3 mutating + prose + recovery), got {mock_llm.call_count}"
-    assert result.repair_turns_used == 1
+    assert mock_llm.call_count == 4, f"expected 4 PRIMARY calls (3 mutating + prose), got {mock_llm.call_count}"
+    assert result.repair_turns_used == 0
     fourth_call_messages = scripted.messages[3]
-    _assert_neutral_rootless_recovery(fourth_call_messages, scripted.messages[4])
 
     hint_messages = [
         m
@@ -246,7 +281,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
     assert "byte-identical" in hint_text or "identical" in hint_text
     assert "same error" not in hint_text
     assert "will keep failing" not in hint_text
-    retry_event = next(event for event in events if event.headline == "ELSPETH detected a no-progress retry pattern.")
+    retry_event = next(event for event in events if event.headline == "ELSPETH observed three failed calls to the same tool.")
     assert retry_event.evidence[0] == "The last 3 tool calls used identical arguments and failed."
     reported = [json.loads(invocation.result_canonical)["validation_errors"][0]["type"] for invocation in result.tool_invocations]
     assert reported == [code.value for code in (categories if different_errors else (categories[0],) * 3)]
@@ -276,7 +311,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         nonlocal call_count
         call_count += 1
         dispatched_messages.append(deepcopy(messages))
-        assert call_count <= 5, "the provider exceeded the three failures, prose, and recovery script"
+        assert call_count <= 4, "the provider exceeded the three failures and prose script"
         if call_count <= 3:
             return _make_response_with_tool(f"call_{call_count}", "set_metadata", identical_args)
 
@@ -314,6 +349,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         return _make_text_only_response("The durable hint changed my next action.")
 
     with (
+        _review_terminal_reply(service, "The durable hint changed my next action."),
         patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -322,9 +358,8 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
     ):
         result = await service.compose("Build something", [], state, session_id=str(session.id))
 
-    assert call_count == 5
-    assert result.repair_turns_used == 1
-    _assert_neutral_rootless_recovery(dispatched_messages[3], dispatched_messages[4])
+    assert call_count == 4
+    assert result.repair_turns_used == 0
 
 
 @pytest.mark.asyncio
@@ -397,7 +432,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
         nonlocal call_count
         call_count += 1
         dispatched_messages.append(deepcopy(messages))
-        assert call_count <= 5, "the provider exceeded the three failures, prose, and recovery script"
+        assert call_count <= 4, "the provider exceeded the three failures and prose script"
         if call_count <= 3:
             return _make_response_with_tool(f"call_{call_count}", "set_metadata", identical_args)
         hint = next(
@@ -412,6 +447,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
     mock_llm = AsyncMock(spec=service._provider_gateway._call_llm, side_effect=respond)
     arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
     with (
+        _review_terminal_reply(service, "The validator named patch.name; the structural mismatch is its expected shape."),
         patch.object(service._provider_gateway, "_call_llm", mock_llm),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -420,10 +456,9 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
     ):
         result = await service.compose("Build something", [], state, session_id=session_id)
 
-    assert mock_llm.call_count == 5
-    assert result.repair_turns_used == 1
+    assert mock_llm.call_count == 4
+    assert result.repair_turns_used == 0
     fourth_call_messages = dispatched_messages[3]
-    _assert_neutral_rootless_recovery(fourth_call_messages, dispatched_messages[4])
     hint_text = next(
         str(message["content"])
         for message in fourth_call_messages
@@ -446,13 +481,13 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
         _make_response_with_tool("call_2", "set_metadata", {"patch": {"name": "Draft B"}}),
         _make_response_with_tool("call_3", "set_metadata", {"patch": {"name": "Draft C"}}),
         _make_text_only_response("I am stuck."),
-        _make_text_only_response("No pipeline was created; the metadata changes failed."),
     ]
     scripted = _ScriptedCompletion(turns)
 
     arg_error = ToolArgumentError(argument="patch", expected="valid metadata patch", actual_type="dict")
 
     with (
+        _review_terminal_reply(service, "I am stuck."),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -462,10 +497,9 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
         mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
-    assert mock_llm.call_count == 5
-    assert result.repair_turns_used == 1
+    assert mock_llm.call_count == 4
+    assert result.repair_turns_used == 0
     fourth_call_messages = scripted.messages[3]
-    _assert_neutral_rootless_recovery(fourth_call_messages, scripted.messages[4])
     hint_messages = [
         m
         for m in fourth_call_messages
@@ -474,7 +508,7 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
     assert len(hint_messages) == 1
     hint_text = hint_messages[0]["content"]
     assert "set_metadata" in hint_text
-    assert "drift" in hint_text.lower()
+    assert "error details and validation changes were not compared" in hint_text
     assert "different arguments" in hint_text
 
 
@@ -495,8 +529,7 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
       turn 3: set_pipeline #2   (fails, identical args)
       turn 4: get_plugin_schema (succeeds — discovery, must not clear)
       turn 5: set_pipeline #3   (fails, identical args)
-      turn 6: text-only         (rootless recovery is requested)
-      turn 7: text-only         (answers the neutral recovery, compose returns)
+      turn 6: text-only         (real END reviews this terminal diagnostic)
 
     Asserts that turn 6's LLM call sees the [ELSPETH-SYSTEM-HINT].
     """
@@ -513,7 +546,6 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
         _make_response_with_tool("d2", "get_plugin_schema", discovery_args),
         _make_response_with_tool("c3", "set_metadata", identical_args),
         _make_text_only_response("Either the hint will help me or I give up."),
-        _make_text_only_response("The metadata changes failed; no pipeline was created."),
     ]
     scripted = _ScriptedCompletion(turns)
 
@@ -537,6 +569,7 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
     # path was already gated above; this test verifies the dispatch path
     # gate too.)
     with (
+        _review_terminal_reply(service, "Either the hint will help me or I give up."),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=dispatch_with_mutation_failures) as mock_execute,
     ):
@@ -544,8 +577,8 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
         result = await service.compose("Build something", [], state, session_id=session_id)
 
     # 6th LLM call should see the hint after the 3rd identical mutation failure.
-    assert mock_llm.call_count == 7, f"expected 7 LLM calls including neutral recovery, got {mock_llm.call_count}"
-    assert result.repair_turns_used == 1
+    assert mock_llm.call_count == 6, f"expected 6 PRIMARY calls through the post-hint diagnostic, got {mock_llm.call_count}"
+    assert result.repair_turns_used == 0
     assert [call.args[0] for call in mock_execute.call_args_list] == [
         "set_metadata",
         "get_plugin_schema",
@@ -553,7 +586,6 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
         "set_metadata",
     ]
     sixth_call_messages = scripted.messages[5]
-    _assert_neutral_rootless_recovery(sixth_call_messages, scripted.messages[6])
     discoveries = [message for message in sixth_call_messages if message.get("tool_call_id") in {"d1", "d2"}]
     assert [message["tool_call_id"] for message in discoveries] == ["d1", "d2"]
     assert all(json.loads(message["content"])["success"] for message in discoveries)
@@ -609,6 +641,7 @@ async def test_mutation_success_breaks_anchor() -> None:
     )
 
     with (
+        _review_terminal_reply(service, "Below threshold post-reset."),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -639,12 +672,12 @@ async def test_two_identical_failures_do_not_inject_hint() -> None:
         _make_response_with_tool("c1", "set_metadata", args),
         _make_response_with_tool("c2", "set_metadata", args),
         _make_text_only_response("not stuck yet"),
-        _make_text_only_response("No pipeline was created; the metadata changes failed."),
     ]
     scripted = _ScriptedCompletion(turns)
     arg_error = ToolArgumentError(argument="patch", expected="x", actual_type="dict")
 
     with (
+        _review_terminal_reply(service, "not stuck yet"),
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
@@ -654,10 +687,9 @@ async def test_two_identical_failures_do_not_inject_hint() -> None:
         mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
-    assert mock_llm.call_count == 4
-    assert result.repair_turns_used == 1
-    # Inspect the THIRD LLM call, before neutral recovery — no hint.
+    assert mock_llm.call_count == 3
+    assert result.repair_turns_used == 0
+    # Inspect the THIRD and terminal PRIMARY call — no hint.
     third_call_messages = scripted.messages[2]
-    _assert_neutral_rootless_recovery(third_call_messages, scripted.messages[3])
     hint_messages = [m for m in third_call_messages if isinstance(m, dict) and "[ELSPETH-SYSTEM-HINT]" in str(m.get("content", ""))]
     assert hint_messages == [], "hint must not fire below the 3-failure threshold"

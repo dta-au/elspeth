@@ -4,8 +4,184 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.7 - Unreleased (Composer refusal and quota fixes)
+## 0.8.9 - Unreleased (Engine and miscellaneous improvements)
 
+The combined merge groups Composer changes under 0.8.7, Azure Container Apps
+changes under 0.8.8, and engine and miscellaneous changes under 0.8.9.
+
+- **CSV sinks can require retention and include verified audit context.** The
+  opt-in `require_all_rows` stops a rejected member before publishing that
+  effect. With `include_audit_context`, a retention envelope carries owned row
+  and token identity, recorded outcomes, audit reason references and the complete
+  canonical carried row. Unprovable predecessor context refuses publication.
+  Defaults remain ordinary CSV, and earlier published effects are not rolled
+  back. These options require a supporting runtime beginning with 0.8.9; see
+  [CSV required-row retention](docs/runbooks/csv-required-row-retention.md) for
+  configuration constraints and recovery limits.
+- **Required CSV retention can include a readable recorded cause.** Opt-in
+  `include_error_reason` appends a bounded cause to the audit envelope, backed by
+  the exact durable source or transform failure handoff and verified on recovery.
+  Missing, ambiguous or redacted evidence and unsupported linked sink diversions
+  stop explicitly. Existing envelope defaults and earlier publications are
+  preserved; this option requires a supporting 0.8.9 runtime.
+- **CSV audit envelopes can retain a verified disposition reason.** Opt-in
+  `include_disposition_reason` records a source or transform failure, or one
+  direct completed Boolean gate-to-sink decision. Gate decisions remain
+  successful outcomes. This option requires `include_audit_context` and is
+  mutually exclusive with `include_error_reason`; missing or ambiguous evidence
+  refuses publication rather than inventing a cause.
+- **LLM output fields can explicitly admit null.** The opt-in `nullable: true`
+  descriptor supports unavailable values in single-query and multi-query
+  transforms and LLM sources while retaining required keys and typed nullable
+  row contracts. Defaults preserve non-null extraction. The new option requires
+  a supporting 0.8.9 runtime; existing plugin implementation compatibility checks
+  still govern resume and replay.
+- **LLM transforms can check inputs and completed results.** Named `input_checks`
+  run before per-row model requests; `result_checks` run before releasing
+  completed output. Failed, non-Boolean or invalid row-data evaluations follow
+  `on_error` without retry. `allow_blank_input_fields` permits empty strings only
+  for explicitly named required inputs; presence and type checks still apply.
+- **Multi-query structured outputs can use explicit field prefixes.** Per-query
+  `structured_output_prefix` can retain the query-name default, choose another
+  identifier, or use an empty prefix for bare suffixes. Explicit prefix overrides
+  require unique generated names and refuse arriving-field collisions. Response
+  JSON keys and raw response, usage and model fields retain their existing names.
+- **Complete-source batches can annotate exact duplicate cells.** The new
+  `batch_duplicate_annotator` compares selected string cells within and across
+  rows, retains every member in order, and emits validity and static cause
+  fields for downstream admission. It requires a finite, bounded, EOF-only
+  source window. Incomplete windows, capacity failures and output collisions
+  refuse the batch; it does not select survivors or compare across runs.
+- **Expressions support typed text and decimal comparisons.** `starts_with`
+  checks a string prefix, `word_count` counts whitespace-separated tokens, and
+  `decimal_within` compares finite numeric decimal spellings with an inclusive,
+  nonnegative tolerance. The helpers reject invalid types without coercion;
+  decimal comparison does not undo earlier floating-point arithmetic.
+- **Landscape retains provider-attempt and returned-model evidence.** Durable
+  attempt bindings support Web quota recovery without an in-memory association.
+  Returned model identity survives response-payload retention choices. Exported
+  row-call and operation-call records add nullable `returned_model`; consumers
+  enforcing a closed export shape must admit this field.
+- **Container builds and CLI dependencies avoid known installation failures.**
+  The Docker builder supplies the compiler, headers and `make` required by the
+  SQL parser extension. Dependency resolution constrains `typer-slim` to prevent
+  older wheels overwriting the full Typer package used by the CLI.
+- **Compose keeps the backend behind its host proxy.** The host-nginx bundle
+  binds port 8451 to loopback and explicitly trusts its configured bridge
+  gateway. Existing networks need recreation to change their IPAM settings;
+  named data volumes must be preserved.
+- **CI preserves failed proof evidence and rejects broken mutation runs.**
+  Collection failures retain diagnostic evidence even when coverage never starts.
+  Mutation tooling errors and missing, empty or malformed result inventories
+  fail the job; mutation-score thresholds remain advisory.
+
+Session epoch advances from 77 to 78; Landscape advances from epoch 49 to 50.
+The combined package retains committed graph-review authority over immutable graph snapshots
+and adds durable quota custody, aggregate container storage, rate-limit policy
+binding and run provider-attempt evidence. Preserve epoch-75 stores, both distinct epoch-76
+predecessors, epoch-77 session stores and epoch-49 Landscape stores with compatible
+prior application access; configure an explicitly new epoch-78 target and an
+explicitly new epoch-50 Landscape target. Older readers ignore those completion
+blockers or cannot admit the new quota shape. This authorizes no migration,
+reset, restamping or downgrade. Drain and isolate old/new deployments; they
+cannot share session stores or replicas.
+
+These unreleased notes describe implemented source changes across 0.8.7–0.8.9,
+not completed integrated qualification. Automatic image publication from main remains held.
+The 0.8.9 tag and container publication follow successful required checks and
+the protected merge; operator signing and deployment remain separate.
+
+## 0.8.8 - Unreleased (Azure Container Apps readiness)
+
+- **First-install instructions can be rehearsed offline.** The instructions
+  select an explicit GHCR account, export the transport ceiling required by
+  configuration resolution and distinguish model routing aliases from pricing
+  identities. The application example supplies primary and advisor pricing
+  settings and versioned secret references for both required authoring guards.
+- **ACA enforces authenticated PostgreSQL TLS settings.** Startup and deployment
+  doctor require one explicit `sslmode=verify-full` and one `sslrootcert`, either
+  `system` or an absolute CA-file path. Duplicate TLS parameters, legacy
+  `requiressl` and GSS settings other than a single optional `gssencmode=disable`
+  are refused. Correctly URL-escaped credentials remain supported. Existing
+  insecure ACA configurations must be corrected before using this version.
+- **ACA doctor reports TLS before schema initialization.** Sessions and Landscape
+  checks measure each initial preflight connection used for schema inspection.
+  Failed prerequisites or TLS checks prevent schema initialization. Separate
+  initialization/final-verification connections and later web connections remain
+  outside this measurement.
+
+Offline rehearsal does not establish cloud deployment, guard health or provider
+access. First installation requires explicitly new compatible stores;
+existing-service redeploy, transition and rollback holds remain in place.
+
+## 0.8.7 - Unreleased (Composer correctness and recovery)
+
+- **Empty-session conversations reach the planner without wording heuristics.**
+  Graph and session prerequisites select the authoring surface. The model can
+  build, explain, clarify or decline using ordinary bounded prose; it no longer
+  needs a special decline marker or completed discovery before replying.
+  Prior assistant messages retain clarification context separately from
+  authenticated user requirements.
+- **Cleanup review follows structured decisions and actual source fields.**
+  Registered decision identity and declared web-scrape fields determine cleanup
+  obligations. Draft wording, node names and HTML-like field names no longer
+  decide admission; review provenance and artifact binding remain required.
+- **Advisor input reviews assess the requested task.** Constant prompts,
+  URL-only inputs and absent named field references alone no longer establish
+  a defect. Review guidance requires a concrete mismatch between the task and
+  available inputs, including whole-row and dynamic references.
+- **Public tool evidence excludes private inline custody data.** New pipeline
+  evidence removes private inline values before public retention. Unsafe or
+  unparseable historical inline custody evidence refuses public replay while
+  preserving the original audit record.
+- **Composer and advisor protection uses Azure Prompt Shields.** Each role has
+  an independent Azure AI Content Safety configuration. Required guard checks
+  precede protected model dispatch and record sanitized decisions; missing
+  configuration, blocked input or unavailable inspection refuses dispatch.
+  Historical advisor prescan audits remain readable. Runtime graph transforms
+  remain separately configured.
+- **Composer repair guidance distinguishes replies from graph changes.** A
+  publication-only review can request a prose correction without demanding graph
+  mutations; graph-blocking reviews retain their tool-call requirement. Plugin
+  option repair guidance tells the planner to preserve explicit user requirements
+  and report unsupported capabilities. Discovery follows actual continuation
+  offsets, and blocked or time-limited work can return truthful saved progress
+  for continuation. Advisor repairs use current schema evidence and distinguish
+  strict CSV retention from audit references and readable failure reasons.
+- **Native thinking survives tool continuations intact.** Complete signed and
+  redacted thinking blocks retain their native fields after shape admission and
+  credential checks. Guard inspection does not truncate or rewrite replay data.
+  Invalid blocks refuse replay; native thinking remains separate from visible
+  replies and Advisor evidence.
+- **Advisor reviews receive complete available visible conversation evidence.**
+  Historical authenticated turns, visible tool requests and results, and current
+  discovery retain their chronology and request binding. Missing original tool
+  results are explicit gaps. Reviews retain configured prompts, query bindings,
+  schemas and output values with secret redaction. Native thinking, private
+  diagnostics and static authoring prompts remain excluded.
+- **Planner context preserves prior requirements and discovery access.** Prior
+  authenticated user requests, including amendments, remain chronological;
+  oversized request packets refuse dispatch instead of dropping middle requests.
+  Read-only discovery remains available within existing budgets, and schema
+  evidence is marked delivered only after successful delivery.
+- **The planner can read a complete authorized attachment.** `read_attachment`
+  returns guarded UTF-8 content with its hash and origin, or explicitly refuses
+  when the complete serialized response cannot fit. Identity-bound paged reads
+  remain available through `get_blob_content`.
+- **Advisor limitations survive continued useful work.**
+  `CONTINUE_WITH_LIMITATION` retains the unresolved requirement through later
+  publication review while allowing independent authorized work to proceed.
+  Failed batch prerequisites block dependent mutations without blocking unrelated
+  calls. Reviewed prompt parts and authored score scales remain reviewable through
+  planner edits; old reduced draft echoes require reinspection.
+- **Settled replies report committed checkpoints.** Saved-change receipts remain
+  available when ordinary prose is withheld. They describe committed effects
+  separately from delivered inspection evidence and do not imply that every
+  requested edit was completed.
+- **Source inspection accepts an explicit CSV encoding.** A bounded read can
+  resolve BOM-bearing CSV/TSV headers using the runtime name resolver and report
+  the selected interpretation. This read-only option does not configure a source
+  or claim full-file coverage; omitted encoding retains the previous behavior.
 - **Refusals retain the correct graph context.** Full-replacement candidate
   refusals exclude errors from the old saved graph; incremental output refusals
   retain standing validation and the original version. Producer-owned codes,
@@ -17,31 +193,78 @@ All notable changes to ELSPETH are documented here.
 - **Shared-link failures preserve the requested link.** Malformed fragments and
   unavailable private sender links remain link failures rather than falling
   through to the recipient's workspace. Ordinary root-URL SSO resume is retained.
-- **Configured container token policy is provisioned before serving.** Startup
-  creates or verifies the token ceiling without activating container storage.
-  Identity storage allowances remain mandatory; explicit numeric container
-  storage and policy precedence are preserved. A cross-actor singleton prevents
-  duplicate active container policies. Startup joins provisioning through
-  cancellation before finalizing its database owners. Daily accounting,
-  overshoot and token reservation semantics are unchanged.
+- **The private blob-helper import boundary is narrower.** `_sync_list_blobs`
+  is no longer re-exported by `elspeth.web.composer.tools`. Its implementation
+  and internal callers remain in `elspeth.web.composer.tools.blobs`; code using
+  the private facade path must update its import.
+- **Configured container quotas are provisioned before serving.** Token and
+  storage ceilings are independent. Container storage admission measures aggregate
+  retained and reserved bytes across identities, including run-output reservations.
+  Identity allowances remain mandatory. A cross-actor singleton prevents duplicate
+  active container policies, and startup joins provisioning through cancellation
+  before finalizing database owners.
+- **Quota accounting survives durable run-call recovery.** Landscape calls retain
+  their provider-attempt binding so recovery can settle completed calls without
+  an in-memory association. Quota chronology uses database time, and returned
+  model identity is retained independently of response payload retention. Closed
+  receipt failures preserve storage accounting outages as 503 responses on both
+  first response and replay.
+- **Web storage admission covers retained run artifacts and stage reservations.**
+  Archiving a session preserves those artifacts and does not reclaim quota.
+  The file manager can delete uploads; generic run artifacts have no user-facing
+  purge action. Web execution refuses local SQLite database sinks and persistent
+  Chroma sinks, retrieval and collection probes because their library-owned files
+  cannot obey byte reservations. Existing graphs using those modes must change;
+  standalone CLI plugin behavior is unchanged. Remote service modes remain subject
+  to the existing plugin policy and security restrictions.
+- **Quota administration shows enforced policy state and exact quantities.**
+  Revoked allowances show suspension, durable policies remain editable after
+  defaults are removed, and shared ceilings include shared usage. Quota API
+  quantities are decimal strings over the positive signed-64-bit range; request
+  bodies still accept exact JSON integers through `2**53-1`, while larger values
+  require strings. API consumers must adapt response parsing. Application-owned
+  Composer 429 refusals surface immediately with retry guidance instead of silently
+  resubmitting the action; uncertain gateway responses retain reconciliation.
+- **Shared request limits bind their durable policy.** A replica with a different
+  configured cap refuses admission while the shared bucket remains active;
+  configuration changes take effect after its expiry. Forwarded client addresses
+  are trusted only from explicit numeric `trusted_proxy_hosts`; the default trusts
+  no forwarding headers. Proxy deployments must configure their actual connecting
+  peers. The Compose host-nginx bundle supplies its bridge gateway explicitly.
 - **Automatic titles disable adapter and SDK retries.** Both existing title
   custody modes supply zero retry settings. This does not claim universal
   physical-dispatch accounting under arbitrary dependency fallback settings.
+- **Composer prompt inspection accommodates its supported content limits.**
+  The aggregate byte limit now derives from the existing user-text,
+  document-size and document-count limits, so supported whole content is no
+  longer refused by a smaller aggregate allowance. Azure per-call limits and
+  required fail-closed inspection remain enforced. Policy fingerprints include
+  the numeric limits even when no guard is configured.
+- **Advisor checkpoint budgeting preserves complete review evidence.** The
+  configured checkpoint input allowance now limits the optional summary,
+  retaining the full request, candidate, guidance and available visible transcript
+  with their review binding. Both default and explicit settings relax the previous
+  input cost bound; calls may cost more or take longer. The summary allowance does
+  not cap required review evidence or reserve model context tokens or account
+  credit. Guard and provider constraints still apply. Inspection retains separate
+  option, query and field units without changing the published summary or guard limits.
+  Unicode prompt text is inspected decoded while provider text remains unchanged.
+  Reviews receive bounded source-inspection facts only after successful delivery;
+  these facts do not imply complete file-content coverage.
+- **Prompt guard input refusals report their local cause.** Unsupported
+  authoring input returns `prompt_guard_unsupported_input` with status 422;
+  guard service failures retain status 503. Audit decisions and previously
+  stored operation replies remain unchanged.
+- **Planner routing semantics stay with the model.** Quoted comparisons no
+  longer trigger the prose-based threshold rejection. Removing that heuristic
+  also removes its automatic second authoring opportunity for an incorrect
+  constant gate, including under auto-commit; no replacement semantic review
+  is added. Structural checks and artifact-bound approval retain their
+  existing behavior.
 
-Session epoch advances from 76 to 77; Landscape remains at epoch 49. The combined
-contract retains committed graph-review authority over immutable graph snapshots
-and adds optional container storage with mandatory identity storage and the
-active-container singleton. Preserve epoch-75 stores and both distinct epoch-76
-predecessors with compatible prior application access; configure an explicitly
-new epoch-77 target. Older readers ignore those completion blockers or cannot
-admit the new quota shape. This authorizes no migration,
-reset, restamping or downgrade. Drain and isolate old/new deployments; they
-cannot share session stores or replicas.
-
-These unreleased notes describe implemented source changes, not completed
-integrated qualification. Automatic image publication from main remains held.
-The 0.8.7 tag and container publication follow successful required checks and
-the protected merge; operator signing and deployment remain separate.
+The combined candidate's schema cutover and qualification limits are recorded
+under 0.8.9 above. Graph visibility toggles now redraw filtered routes correctly
+without changing the authored graph or execution behavior.
 
 ## 0.8.6 - Candidate (Composer correctness and recovery)
 

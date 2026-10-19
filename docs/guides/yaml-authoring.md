@@ -5,7 +5,7 @@ text. YAML and the Web Composer feed the same plugin contracts, graph validator,
 runtime, and Landscape audit trail. You do not need Composer or an LLM provider
 to run a pipeline made entirely from local data plugins.
 
-This guide describes the 0.8.6 YAML interface. It assumes ELSPETH is already
+This guide describes the 0.8.9 YAML interface. It assumes ELSPETH is already
 installed in an activated environment; check with `elspeth --version`. For
 source installation, see [Your First Pipeline](your-first-pipeline.md#step-1-install-elspeth).
 Use an approved checkout or installed version that supports the features you
@@ -643,7 +643,9 @@ queries:
 in `input_fields`. Do not add generated fields to `required_input_fields` or
 the node's input schema. Self/forward references and generated-name collisions
 are rejected. Structured outputs support `string`, `integer`, `number`,
-`boolean`, and `enum` (with `values`); nullable structured outputs are unsupported.
+`boolean`, and `enum` (with `values`). Add `nullable: true` to an output-field
+descriptor to admit JSON null while still requiring the key. Consumers must
+handle null explicitly; omitting the option retains non-null extraction.
 
 Every query still calls the provider. The node publishes one complete row only
 after all queries succeed; a terminal failure routes the original entry row

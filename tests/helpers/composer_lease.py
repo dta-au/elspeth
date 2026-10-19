@@ -18,21 +18,60 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
     session-operation context acquire an exact, short-lived COMPOSE lease on
     the composer's sessions service for the duration of the call (mirrors
     FencedSessionServiceHarness for the session writers)."""
-    from uuid import UUID
+    from uuid import UUID, uuid4
 
     from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.coordination.contracts import SessionOperationFenceLost
     from elspeth.web.coordination.lifecycle import SessionOperationLease
+    from elspeth.web.required_work import (
+        RequiredAuthorityKind,
+        RequiredWorkAuthority,
+        RequiredWorkBinding,
+        RequiredWorkCoordinator,
+        RequiredWorkRole,
+    )
 
-    async def _with_lease(self, session_id, kwargs, call):
+    async def _with_provider_owner(self, kwargs, call, lease=None):
+        sessions = self._sessions_service
+        context = kwargs.get("session_operation_context")
+        if sessions is None or context is None or kwargs.get("required_work") is not None or kwargs.get("provider_owner") is not None:
+            return await call(**kwargs)
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+        )
+        if lease is not None:
+            lease.bind_required_work(coordinator)
+        binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+        forwarded = {**kwargs, "required_work": binding, "provider_owner": ProviderInvocationOwner(service=sessions, required_work=binding)}
+        body = None
+        try:
+            return await call(**forwarded)
+        except BaseException as failure:
+            body = failure
+            raise
+        finally:
+            try:
+                if lease is None:
+                    coordinator.assert_completed()
+                else:
+                    # The lifecycle owns and joins a possibly active renewal;
+                    # every body producer/physical write must already be done.
+                    coordinator.settlement_failure_receipts()
+            except BaseException as settlement:
+                if body is not None and settlement is not body:
+                    raise BaseExceptionGroup("Composer test body and required settlement outcomes", [body, settlement]) from None
+                raise
+
+    async def _with_lease(self, session_id, kwargs, call, *, bind_provider_owner=False):
         # ``self`` is always a ComposerServiceImpl (the adapter is installed on
         # that class) and its sessions service is a SessionServiceImpl, so the
         # authority and engine are read directly: a double lacking them fails
         # the calling test loudly instead of silently running unfenced.
         sessions = self._sessions_service
         if session_id is None or kwargs.get("session_operation_context") is not None or sessions is None:
-            return await call(**kwargs)
+            return await _with_provider_owner(self, kwargs, call) if bind_provider_owner else await call(**kwargs)
         authority = sessions.session_operation_authority
         session_uuid = session_id if not isinstance(session_id, str) else UUID(session_id)
         try:
@@ -62,11 +101,21 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
                 owner_instance_id=sessions.session_operation_owner_instance_id,
                 lease_seconds=sessions.session_operation_lease_seconds,
             )
+        body = None
         try:
             forwarded = {name: value for name, value in kwargs.items() if name != "session_operation_context"}
-            return await call(session_operation_context=lease.context, **forwarded)
+            forwarded["session_operation_context"] = lease.context
+            return await _with_provider_owner(self, forwarded, call, lease) if bind_provider_owner else await call(**forwarded)
+        except BaseException as failure:
+            body = failure
+            raise
         finally:
-            await lease.close()
+            try:
+                await lease.close()
+            except BaseException as closing:
+                if body is not None and closing is not body:
+                    raise BaseExceptionGroup("Composer test body and lease close outcomes", [body, closing]) from None
+                raise
 
     real_compose = ComposerServiceImpl.compose
     real_turn = ComposerServiceImpl._run_one_turn_for_test
@@ -89,6 +138,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         provider_owner=None,
         recovery_context=None,
         retained_operation_context=None,
+        advisor_history=None,
     ):
         kwargs = {
             "message": message,
@@ -106,12 +156,13 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
             "provider_owner": provider_owner,
             "recovery_context": recovery_context,
             "retained_operation_context": retained_operation_context,
+            "advisor_history": advisor_history,
         }
 
         async def call(**kw):
             return await real_compose(self, **kw)
 
-        return await _with_lease(self, session_id, kwargs, call)
+        return await _with_lease(self, session_id, kwargs, call, bind_provider_owner=True)
 
     async def run_one_turn(self, **kwargs):
         scripted_llm = kwargs.pop("llm", None)

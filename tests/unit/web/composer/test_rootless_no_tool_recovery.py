@@ -1,6 +1,10 @@
-"""One neutral recovery call for a rootless build request that ran no tools."""
+"""Rootless reply orchestration without a lexical pre-END recovery call.
 
-from copy import deepcopy
+The existing CLEAN fixture isolates these mechanical controls. Real END
+WITHHOLD/repair/ADMIT and guarded physical transitions are covered separately
+by the real-worker semantic-publication tests, without this fixture.
+"""
+
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -26,7 +30,7 @@ _CLARIFICATION = "Which urgency categories should the pipeline use?"
 
 
 @pytest.mark.asyncio
-async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution() -> None:
+async def test_rootless_tool_execution_is_preserved_without_lexical_retry() -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     tool_reply = _make_llm_response(
         content="CLARIFY: Which categories should the pipeline use?",
@@ -48,54 +52,55 @@ async def test_rootless_build_prose_gets_one_neutral_retry_then_tool_execution()
         patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
     ):
         completion.side_effect = [
-            _make_llm_response(content=_FALSE_COMPLETION),
             tool_reply,
             _make_llm_response(content="The source is now configured."),
         ]
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
-    assert completion.call_count == 3
-    assert result.repair_turns_used == 1
+    assert completion.call_count == 2
+    assert result.repair_turns_used == 0
     assert result.state.sources["source"].plugin == "csv"
     assert any(call.tool_name == "set_source" and call.status.value == "success" for call in result.tool_invocations)
 
 
 @pytest.mark.asyncio
-async def test_repeated_rootless_prose_ends_after_one_neutral_retry() -> None:
+async def test_truthful_rootless_reply_does_not_spend_a_generic_primary_repair() -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
-    observed = []
-
-    async def respond(*args: Any, **kwargs: Any) -> Any:
-        observed.append(deepcopy(args[0]))
-        return _make_llm_response(content=_FALSE_COMPLETION)
-
-    with patch.object(service._provider_gateway, "_call_llm", side_effect=respond) as completion:
+    truthful = "No source has been configured. Please supply the CSV file."
+    with patch.object(service._provider_gateway, "_call_llm", return_value=_make_llm_response(content=truthful)) as completion:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
-    assert completion.call_count == 2
-    assert result.repair_turns_used == 1
+    assert completion.call_count == 1
+    assert result.repair_turns_used == 0
     assert not result.tool_invocations
     assert not result.state.sources
-    assert "pipeline is still empty" in result.message
-    repair = observed[1][-1]["content"]
-    assert "No tool has run this turn" in repair
-    assert "authorized work" in repair
-    assert "revoked construction" in repair
-    assert any(message["role"] == "assistant" and message["content"] == _FALSE_COMPLETION for message in observed[1])
+    assert result.message.startswith(truthful)
+    assert "pipeline is still empty" not in result.message
+    assert result.runtime_preflight is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "user_message", ["Do not build anything; explain how CSV parsing works.", "Are you able to run pipelines yourself?"]
+    "user_message",
+    [
+        "Do not build anything; explain how CSV parsing works.",
+        "Are you able to run pipelines yourself?",
+        "How do I route rows to two different files?",
+        "I make heavy use of CSV files.",
+        'What does "build a pipeline" mean?',
+    ],
 )
-async def test_neutral_retry_keeps_explanation_and_revocation_without_mutation(user_message: str) -> None:
+async def test_zero_attempt_explanation_and_revocation_do_not_spend_lexical_repair(user_message: str) -> None:
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     with patch.object(
         service._provider_gateway, "_call_llm", return_value=_make_llm_response(content="I can explain that without changing anything.")
     ) as completion:
         result = await service.compose(user_message, [], _empty_state(), session_id=sid)
-    assert completion.call_count == 2
-    assert result.repair_turns_used == 1
+    assert completion.call_count == 1
+    assert result.repair_turns_used == 0
     assert not result.tool_invocations
     assert not result.state.sources
+    assert result.runtime_preflight is None
+    assert "did not complete a valid build" not in result.message
+    assert "pipeline is still empty" not in result.message
 
 
 @pytest.mark.asyncio
@@ -135,15 +140,11 @@ async def test_expired_deadline_does_not_start_rootless_retry() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("preceding_reply,repair_budget", [(None, 0), (None, 2), (_FALSE_COMPLETION, 2)])
-async def test_marked_clarification_preserves_question_without_build_failure(
-    preceding_reply: str | None, repair_budget: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.parametrize("repair_budget", [0, 2])
+async def test_marked_clarification_preserves_question_without_build_failure(repair_budget: int, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(completion_module, "_MAX_REPAIR_TURNS", repair_budget)
     service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
     replies = [_make_llm_response(content="CLARIFY: " + _CLARIFICATION)]
-    if preceding_reply is not None:
-        replies.insert(0, _make_llm_response(content=preceding_reply))
     with patch.object(service._provider_gateway, "_call_llm", side_effect=replies) as completion:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
     assert completion.call_count == len(replies)
@@ -153,7 +154,7 @@ async def test_marked_clarification_preserves_question_without_build_failure(
     assert "did not complete a valid build" not in result.message
     assert "CLARIFY:" not in result.message
     assert result.runtime_preflight is None
-    assert result.repair_turns_used == int(preceding_reply is not None)
+    assert result.repair_turns_used == 0
 
 
 @pytest.mark.asyncio
@@ -203,7 +204,6 @@ async def test_marked_clarification_after_tool_preserves_receipt_policy(tool_nam
     replies = [
         _make_llm_response(tool_calls=[{"id": "before-question", "name": tool_name, "arguments": {}}]),
         _make_llm_response(content="CLARIFY: " + _CLARIFICATION),
-        _make_llm_response(content="CLARIFY: " + _CLARIFICATION),
     ]
     with patch.object(service._provider_gateway, "_call_llm", side_effect=replies) as completion:
         result = await service.compose(_REQUEST, [], _empty_state(), session_id=sid)
@@ -213,7 +213,7 @@ async def test_marked_clarification_after_tool_preserves_receipt_policy(tool_nam
         assert "No pipeline has been built yet" in result.message
         assert result.runtime_preflight is None
     else:
-        assert completion.call_count == 3
+        assert completion.call_count == 2
         assert "set_pipeline failed before mutation" in result.message
         assert result.runtime_preflight is not None and not result.runtime_preflight.is_valid
         assert "No pipeline has been built yet" not in result.message

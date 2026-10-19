@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -34,15 +34,17 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema
 
-from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType
+from elspeth.contracts.blobs import BLOB_CREATORS, AllowedMimeType, BlobCreator
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
 from elspeth.web.composer.state import EdgeType
@@ -633,9 +635,16 @@ def _unwrap_annotated(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, 
 
 
 def _normalise(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:
-    """Repeatedly unwrap Annotated layers until a non-Annotated type remains."""
-    while get_origin(field_type) is Annotated:
-        field_type, metadata = _unwrap_annotated(field_type, metadata)
+    """Expose owned aliases and Annotated metadata without granting scalar trust."""
+    aliases: set[TypeAliasType] = set()
+    while isinstance(field_type, TypeAliasType) or get_origin(field_type) is Annotated:
+        if isinstance(field_type, TypeAliasType):
+            if field_type in aliases:
+                raise ValueError("Recursive redaction type alias cannot be inspected")
+            aliases.add(field_type)
+            field_type = field_type.__value__
+        else:
+            field_type, metadata = _unwrap_annotated(field_type, metadata)
     return field_type, metadata
 
 
@@ -3353,6 +3362,12 @@ class GetBlobContentArgumentsModel(BaseModel):
         return self
 
 
+type BlobReadSuggestion = Literal[
+    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit.",
+]
+
+
 class GetBlobContentDataModel(BaseModel):
     """Redaction-bearing success payload for ``get_blob_content``."""
 
@@ -3376,6 +3391,8 @@ class GetBlobContentDataModel(BaseModel):
     created_by: str
     creation_modality: str
 
+    read_attachment_suggestion: BlobReadSuggestion | None = Field(default=None, exclude_if=lambda value: value is None)
+
     model_config = ConfigDict(strict=True, extra="forbid")
 
     @model_validator(mode="after")
@@ -3388,6 +3405,56 @@ class GetBlobContentDataModel(BaseModel):
             raise ValueError("Blob truncation must describe the returned range")
         if self.next_offset_chars != (self.end_char if self.truncated else None):
             raise ValueError("Blob continuation offset must match the returned range")
+        return self
+
+
+READ_ATTACHMENT_MAX_UTF8_BYTES = min(JSON_MAX_TOTAL_UTF8_BYTES, DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_string_bytes)
+
+
+class ReadAttachmentArgumentsModel(BaseModel):
+    """Selectors for one complete authorized session attachment."""
+
+    blob_id: str
+    expected_content_hash: Annotated[str | None, Sensitive()] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+
+class ReadAttachmentDataModel(BaseModel):
+    """Complete text; never reinterpret a prefix as a full attachment."""
+
+    blob_id: str
+    filename: str
+    mime_type: str
+    content: Annotated[str, Sensitive(summarizer=_summarize_blob_content)]
+    truncated: bool
+    size_bytes: int = Field(ge=0, le=READ_ATTACHMENT_MAX_UTF8_BYTES)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    total_chars: int = Field(ge=0)
+    start_char: int = Field(ge=0)
+    end_char: int = Field(ge=0)
+    next_offset_chars: int | None = Field(ge=0)
+    created_by: BlobCreator
+    creation_modality: str
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, revalidate_instances="always")
+
+
+class ReadAttachmentResponseModel(BaseModel):
+    """Sensitive full-file text and recoverable failures share a closed envelope."""
+
+    success: bool
+    validation: GetBlobContentValidationModel
+    affected_nodes: list[str]
+    version: int
+    data: ReadAttachmentDataModel | None = Field(default=None, exclude_if=lambda data: data is None)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def require_success_data(self) -> ReadAttachmentResponseModel:
+        if self.success and self.data is None:
+            raise ValueError("Successful read_attachment response requires complete data")
         return self
 
 
@@ -3443,8 +3510,9 @@ class _ToolResultResponseModel(BaseModel):
 _INSPECT_SOURCE_REASON = HandlesNoSensitiveDataReason(
     sensitive_data_locations=("source inspection facts — headers / types / URL candidates, never raw row content",),
     why_arguments_safe=(
-        "inspect_source accepts a single blob_id scalar string selecting one inventory "
-        "row; the handler reads at most 8 KiB and parses at most 100 rows, returning only "
+        "inspect_source accepts a blob_id scalar string selecting one inventory row "
+        "and an optional bounded encoding scalar selecting CSV/TSV decoding. "
+        "The handler reads at most 8 KiB and parses at most 100 rows, returning only "
         "structural facts; the schema and redaction allowlist reject or strip any other keys."
     ),
     why_responses_safe=(
@@ -3940,9 +4008,13 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
             argument_model=GetBlobContentArgumentsModel,
             response_model=GetBlobContentResponseModel,
         ),
+        "read_attachment": ToolRedaction(
+            argument_model=ReadAttachmentArgumentsModel,
+            response_model=ReadAttachmentResponseModel,
+        ),
         "inspect_source": ToolRedaction(
             policy=ToolRedactionPolicy(
-                known_argument_keys=("blob_id",),
+                known_argument_keys=("blob_id", "encoding"),
                 redact_unknown_argument_keys=True,
                 handles_no_sensitive_data=True,
                 handles_no_sensitive_data_reason_struct=_INSPECT_SOURCE_REASON,
@@ -4052,6 +4124,8 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "cached_prompt_tokens",
                     "advisor_latency_ms",
                     "note",
+                    "abandonment_decision",
+                    "review_binding",
                 ),
             )
         ),
@@ -4224,6 +4298,11 @@ def redact_tool_call_response(
                 # Only this closed model's canonical SHA256 is public identity
                 # metadata. Preserve it without admitting arbitrary strings or
                 # hashes from any other tool's response projection.
+                schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
+        elif tool_name == "read_attachment":
+            if not isinstance(validated, ReadAttachmentResponseModel):
+                raise AuditIntegrityError("Attachment redaction requires its declared response model")
+            if validated.data is not None and "data" not in over_budget:
                 schema_redacted["data"]["content_hash"] = _TrustedRedactionSummary(validated.data.content_hash)
         projected = _project_validated_response_scalars(schema_redacted)
         assert type(projected) is dict

@@ -200,7 +200,7 @@ class TestSchemaShapeBoundSplit:
 class TestClosedRootLookup:
     def test_every_advertised_tool_resolves_to_a_closed_root(self) -> None:
         names = [definition["name"] for definition in get_tool_definitions()]
-        assert len(names) == 42
+        assert len(names) == 43
         for name in names:
             schema = _closed_root_schema(name)
             assert schema["type"] == "object"
@@ -416,11 +416,17 @@ _FLAT_PIPELINE = {"source": {"plugin": "csv", "on_success": "rows"}, "nodes": []
 async def test_compose_loop_site_records_honest_class_and_category(
     fake_composer_service: ComposerServiceImpl,
     result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
     tool_name: str,
     raw_arguments: str,
     error_class: str,
     category: ToolArgumentErrorCategory,
 ) -> None:
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This control owns P3/P4 classification, not physical END policy. The
+    # existing isolation helper still requires the actual publication binding.
+    monkeypatch.setattr(fake_composer_service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
     llm = _raw_tool_call_llm(name=tool_name, raw_arguments=raw_arguments)
 
     result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)

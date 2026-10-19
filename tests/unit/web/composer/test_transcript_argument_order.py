@@ -34,12 +34,14 @@ import pytest
 
 import elspeth.web.composer.tool_batch as tool_batch
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _PROPOSAL_SESSION_ID,
     _harness,
+    _incremental_base_state,
     _inline_pipeline_args,
     _ScriptedLLM,
     _tool_turn,
@@ -49,7 +51,6 @@ from tests.integration.web.composer.test_freeform_required_controls import (
     _textract_llm_mapper_args,
 )
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
-from tests.unit.web.composer.test_planner_authoring_aids import _empty_state
 
 _MODEL_ORDER = ["zeta", "alpha"]
 _SOURCE_ORDER = ["zeta_src", "alpha_src"]
@@ -175,10 +176,26 @@ class _RecordingLLM(_FakeComposeLLM):
         self.seen: list[list[dict[str, Any]]] = []
 
     async def __call__(
-        self, messages: Any, tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        self,
+        messages: Any,
+        tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         self.seen.append(copy.deepcopy(list(messages)))
-        return await super().__call__(messages, tools)
+        return await super().__call__(
+            messages,
+            tools,
+            provider_custody=provider_custody,
+            credential_state=credential_state,
+            prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
+            prompt_guard_content_parts=prompt_guard_content_parts,
+            prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
+        )
 
 
 def _record_replay_callers(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -206,6 +223,15 @@ async def test_success_path_replay_keeps_model_order_on_next_provider_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Every set_pipeline is re-serialised through the custody projection before dispatch."""
+    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint
+
+    # This replay unit does not qualify physical END review. The existing
+    # isolation helper still requires the actual publication binding.
+    monkeypatch.setattr(
+        fake_composer_service._advisor_checkpoint,
+        "_run_advisor_checkpoint",
+        _clean_advisor_checkpoint,
+    )
     pipeline = _reversed_order_pipeline()
     caller_lines = _record_replay_callers(monkeypatch)
     llm = _RecordingLLM(
@@ -292,7 +318,7 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
         result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -366,7 +392,7 @@ async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Pat
         await harness.service.compose(
             "Build and apply a Textract to LLM pipeline over two manifests.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -398,7 +424,7 @@ async def test_explicit_finalization_and_custody_replay_keeps_coalesce_order(tmp
         await harness.service.compose(
             "Build a Textract to LLM pipeline and prepare it for review.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -443,7 +469,7 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
         result = await harness.service.compose(
             "Prepare this pipeline for review.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,

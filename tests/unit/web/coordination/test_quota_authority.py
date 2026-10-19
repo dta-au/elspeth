@@ -668,6 +668,39 @@ def test_attempt_terminal_replay_cannot_change_recorded_usage(fenced_session_wit
         )
 
 
+@pytest.mark.parametrize("changed", ["source", "run_id"])
+def test_attempt_terminal_replay_rejects_corrupt_provenance(fenced_session: FencedSession, changed: str) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.models import quota_provider_attempts_table
+
+    conn = _resolve_mutation_connection(fenced_session.connection_token)
+    conn.execute(
+        insert(quota_provider_attempts_table).values(
+            attempt_id="provenance-attempt",
+            identity_id=fenced_session.identity_id,
+            session_id=fenced_session.session_id,
+            source="run",
+            run_id="run-1",
+            started_at=DAY,
+            operation_id="operation",
+            operation_epoch=1,
+            lease_token="lease",
+        )
+    )
+    entry = _entry(10, 5, call_id="actual-call")
+    settle_provider_attempt_on_connection(conn, session_id=fenced_session.session_id, attempt_id="provenance-attempt", entry=entry)
+    # The normal replay is the positive control. Deferring FK enforcement
+    # simulates pre-existing corruption while leaving application checks live.
+    settle_provider_attempt_on_connection(conn, session_id=fenced_session.session_id, attempt_id="provenance-attempt", entry=entry)
+    conn.exec_driver_sql("PRAGMA defer_foreign_keys=ON")
+    with conn.begin_nested() as mutation:
+        changes = {"source": "auto_title", "run_id": None} if changed == "source" else {"run_id": "run-2"}
+        conn.execute(update(token_usage_ledger_table).values(**changes))
+        with pytest.raises(AuditIntegrityError, match="contradicts recorded usage"):
+            settle_provider_attempt_on_connection(conn, session_id=fenced_session.session_id, attempt_id="provenance-attempt", entry=entry)
+        mutation.rollback()
+
+
 def test_abandoned_attempt_day_rolls_over_at_utc_midnight(fenced_session_with_policy: FencedSessionWithPolicy) -> None:
     fenced = fenced_session_with_policy
     conn = _resolve_mutation_connection(fenced.connection_token)

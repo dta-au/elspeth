@@ -9,16 +9,13 @@ identity. Semantic publication review belongs to the upstream END gate.
 
 from __future__ import annotations
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.composer_preflight import ComposerPreflight
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
-)
-from elspeth.web.composer.no_tool_policy import (
-    carries_build_action as _carries_build_action,
 )
 from elspeth.web.composer.no_tool_policy import compose_clarification_message
 from elspeth.web.composer.no_tool_policy import (
@@ -45,6 +42,7 @@ from elspeth.web.composer.no_tool_policy import (
 from elspeth.web.composer.no_tool_response import NoToolResponse, is_unstarted_clarification, parse_no_tool_response
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools import is_blob_store_only_mutation_tool, is_mutation_tool
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -74,10 +72,11 @@ async def finalize_no_tool_response(
     ``routes._composer_history_content`` discriminator depends on the
     ``content`` / ``raw_assistant_content`` relationship below):
 
-    1. **No-mutation empty-state augmentation** — the user's message
-       carried a build action (``carries_build_action``), no successful
-       mutation has been seen this
-       turn, and the state is structurally empty. The model's prose
+    1. **No-mutation empty-state augmentation** — an actual registered
+       composition mutation was attempted, no successful mutation has been
+       seen this turn, and the state is structurally empty. Blob-only work,
+       cancellation and pending approval proposals are not build failures.
+       The model's prose
        is passed through verbatim with an operator-facing suffix
        appended (concrete blocker if a tool failed). ``content``
        starts with ``raw_assistant_content`` so the LLM keeps seeing
@@ -128,16 +127,15 @@ async def finalize_no_tool_response(
         runtime_preflight_cache: Per-turn cache to avoid redundant
             preflight invocations on identical state.
         session_scope: Scope identifier for cache + telemetry.
-        user_message: The user's message that triggered this turn.
-            Used to detect "build-style" requests for the
-            no-mutation empty-state augmentation path; a purely
-            conversational message suppresses that path.
+        user_message: The user's message that triggered this turn. Retained
+            for caller compatibility; receipt eligibility does not inspect it.
         mutation_success_seen: Whether any mutating tool call
             succeeded this turn. Suppresses the no-mutation
             augmentation path.
-        tool_invocations: Tool calls made this turn; the most
-            recent failed build/edit (non-discovery) call feeds the
-            operator-facing blocker suffix.
+        tool_invocations: Full tool audit for this turn. Registered composition
+            mutation attempts supply the blocker; discovery, advisor and
+            blob-only receipts remain in the result without manufacturing a
+            graph-build failure.
         llm_calls: LLM call audit rows for this turn.
 
     Unexpected preflight exceptions (anything other than a
@@ -156,11 +154,18 @@ async def finalize_no_tool_response(
         mutation_success_seen=mutation_success_seen,
         tool_invocations=tool_invocations,
     )
+    composition_attempts = tuple(
+        invocation
+        for invocation in tool_invocations
+        if is_mutation_tool(invocation.tool_name)
+        and not is_blob_store_only_mutation_tool(invocation.tool_name)
+        and invocation.status is not ComposerToolStatus.CANCELLED
+    )
     if (
-        _carries_build_action(user_message)
+        composition_attempts
         and not mutation_success_seen
         and _state_is_structurally_empty(state)
-        and not _last_mutation_was_pending_proposal(tool_invocations)
+        and not _last_mutation_was_pending_proposal(composition_attempts)
         and not unstarted_clarification
     ):
         # No-mutation empty-state augmentation. The model produced
@@ -173,27 +178,11 @@ async def finalize_no_tool_response(
         # from the model itself on subsequent turns
         # (cf. elspeth-861b0c58f5).
         #
-        # Disclosure is gated on _carries_build_action, NOT on the
-        # mutation-intent enum (issue elspeth-a6a2ed6b1d). This branch
-        # previously required EXPLICIT_MUTATION, which is a packaging
-        # verdict — the grammar fullmatches the whole normalised message
-        # from character 0 and treats a single "?" anywhere as a hard
-        # disqualifier. Over the acceptance corpus that split
-        # otherwise-identical requests: 14 of 18 phrasings classified
-        # AMBIGUOUS and silently lost the explanation of why nothing got
-        # built. Whether a user is owed that explanation cannot turn on
-        # the article after the verb.
-        #
-        # Gating on "is not CONVERSATIONAL" instead was tried and
-        # rejected on review: AMBIGUOUS is also reached by two early
-        # returns that never test content (the input-size ceiling and
-        # the unbalanced-quote guard), so an oversize or
-        # unbalanced-quote greeting failed OPEN into a build-failure
-        # notice. The named predicate always runs the content test, so
-        # neither short-circuit decides disclosure. Routing is
-        # unaffected: the surface-selection call sites read
-        # classify_pipeline_mutation_intent, which this path no longer
-        # consults.
+        # An actual composition attempt supplies this fact, independently of
+        # how the user phrased the request. This also discloses an unwanted
+        # mutation attempted during an explanation. Filtering the same tuple
+        # for proposal detection and blocker selection prevents later discovery,
+        # advisor or blob-only receipts from masking the actual outcome.
         #
         # Exception: APPROVAL_REQUIRED proposals are not failures. Under
         # explicit_approve trust mode the build SUCCEEDED — the work is
@@ -203,7 +192,7 @@ async def finalize_no_tool_response(
         # empty" over it corrupts both operator framing and (via the
         # synthesized suffix being re-read on subsequent turns) the
         # model's state model.
-        blocker = _blocking_result_from_tool_invocations(tool_invocations)
+        blocker = _blocking_result_from_tool_invocations(composition_attempts)
         empty_state_runtime_result = _no_mutation_empty_state_validation(blocker)
         augmented_message = _compose_empty_state_message(content, blocker=blocker)
         _enforce_augmentation_prefix_invariant(

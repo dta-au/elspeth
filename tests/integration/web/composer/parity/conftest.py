@@ -306,6 +306,7 @@ def _build_settings(data_dir: Path) -> WebSettings:
         data_dir=data_dir,
         composer_model="test/planner",
         composer_boot_probe_enabled=False,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_max_composition_turns=4,
         composer_max_discovery_turns=3,
         composer_timeout_seconds=30.0,

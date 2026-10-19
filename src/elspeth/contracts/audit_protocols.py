@@ -10,6 +10,7 @@ Method-count budget: Do not exceed 20 methods.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from elspeth.contracts import (
@@ -63,6 +64,8 @@ class CallRecorder(Protocol):
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -83,6 +86,8 @@ class CallRecorder(Protocol):
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 
@@ -120,6 +125,8 @@ class PluginAuditWriter(Protocol):
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
         member_token: WorkerMembershipToken,
         work_item: TokenWorkItem,
     ) -> Call: ...
@@ -140,6 +147,8 @@ class PluginAuditWriter(Protocol):
         approved_prompt_artifact_hash: str | None = None,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
         coordination_token: CoordinationToken,
     ) -> Call: ...
 

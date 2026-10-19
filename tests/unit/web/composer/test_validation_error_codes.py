@@ -926,20 +926,8 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         feedback = _allowlisted_candidate_feedback(result)
         assert feedback["validation"]["errors"][0]["error_code"] == "validation_error"
 
-    def test_review_contract_guidance_quotes_the_recognition_constants_verbatim(self) -> None:
-        """The repair guidance must BE the literal minimal delta.
-
-        Tutorial op 18b4cee7 (session c98e8561, 2026-07-22, post-356d839a8):
-        four generations including the opus hatch each drew the single code
-        ``interpretation_review_contract_unsatisfied`` WITH guidance live.
-        The contract recognizes the cleanup row only when user_term equals
-        RAW_HTML_CLEANUP_USER_TERM AND the draft's lowercase contains every
-        _RAW_HTML_CLEANUP_DRAFT_MARKERS substring — guidance inviting a
-        free-text draft steers the planner into an unrecognized-row loop
-        where the identical code fires forever. The suggested_fix must quote
-        the registered user_term and the canonical draft constant verbatim
-        so a copy-paste repair is guaranteed to be recognized.
-        """
+    def test_review_contract_guidance_supplies_registered_term_and_example_draft(self) -> None:
+        """Repair guidance includes a complete example of the required review row."""
         from elspeth.web.composer.tools.generation import explain_validation_code
         from elspeth.web.interpretation_state import (
             RAW_HTML_CLEANUP_REVIEW_DRAFT,

@@ -1938,6 +1938,22 @@ class SessionServiceImpl:
         # turn: an id naming no persisted tool row would orphan the reason.
         # Same pre-transaction posture as the transcript validation above.
         tool_row_ids = {row.tool_call_id for row in redacted_tool_rows}
+        from elspeth.web.composer.visible_tool_event import VisibleToolEvent
+
+        assistant_calls_by_id = {call["id"]: call for call in redacted_assistant_tool_calls}
+        for tool_row in redacted_tool_rows:
+            if tool_row.visible_event is not None:
+                if type(tool_row.visible_event) is not VisibleToolEvent or writer_principal != "compose_loop":
+                    raise AuditIntegrityError("Visible tool evidence lacks its exact producer")
+                call = assistant_calls_by_id[tool_row.tool_call_id]
+                tool_row.visible_event.validate(
+                    context=session_operation_context,
+                    session_id=session_id,
+                    tool_call_id=tool_row.tool_call_id,
+                    tool_name=call["function"]["name"],
+                    display_arguments=call["function"]["arguments"],
+                    display_result=tool_row.content,
+                )
         if (tool_row_ids or private_tool_evidence) and writer_principal != "compose_loop":
             raise AuditIntegrityError("private tool evidence requires compose_loop writer custody")
         from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
@@ -2092,7 +2108,9 @@ class SessionServiceImpl:
                             role="tool",
                             content=tool_row.content,
                             raw_content=None,
-                            tool_calls=None,
+                            tool_calls=[tool_row.visible_event.with_parent(assistant_id).to_envelope()]
+                            if tool_row.visible_event is not None
+                            else None,
                             sequence_no=base_seq + 2 * offset - 1,
                             writer_principal=writer_principal,
                             composition_state_id=state_id,
@@ -5777,6 +5795,16 @@ class SessionServiceImpl:
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
         pid = str(parent_assistant_id) if parent_assistant_id else None
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+
+        validate_visible_audit_row(
+            envelopes=tuple(tool_calls or ()),
+            content=content,
+            role=role,
+            writer_principal=writer_principal,
+            session_id=sid,
+            context=session_operation_context,
+        )
         msg_id_holder: dict[str, str] = {}
         sequence_holder: dict[str, int] = {}
 
@@ -6103,6 +6131,13 @@ class SessionServiceImpl:
 
         rows = await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_sync(_sync)
 
+        if not include_private_evidence:
+            from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+            for row in rows:
+                for envelope in row.tool_calls or ():
+                    if "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+                        VisibleToolEvent.from_envelope(envelope)
         return [self._row_to_chat_message_record(row, operation_id=row.operation_id) for row in rows]
 
     def count_tool_responses_for_assistant(
@@ -7433,6 +7468,7 @@ class SessionServiceImpl:
     ) -> None:
         """Persist actual terminal call evidence and settle its ledger atomically."""
         from elspeth.web.composer.audit import llm_call_audit_envelope
+        from elspeth.web.composer.visible_tool_event import visible_response_gap
 
         if type(session_operation_context) is not SessionOperationContext:
             _refuse_required_sql(required_work, TypeError("provider settlement requires an owned operation context"))
@@ -7447,8 +7483,13 @@ class SessionServiceImpl:
         with _required_sql_preflight(required_work):
             if type(call) is not ComposerLLMCall or call.call_id is None:
                 raise AuditIntegrityError("A provider checkpoint requires its pending attempt identity")
+            public_call = llm_call_audit_envelope(call)
             drafts: tuple[AuditMessageDraft, ...] = (
-                AuditMessageDraft(role="audit", content="Provider call result recorded.", tool_calls=(llm_call_audit_envelope(call),)),
+                AuditMessageDraft(
+                    role="audit",
+                    content="Provider call result recorded.",
+                    tool_calls=(public_call, visible_response_gap(call, session_operation_context, public_call)),
+                ),
             )
             from elspeth.web.composer.audit_storage import private_diagnostic_drafts
 
@@ -9673,6 +9714,17 @@ class SessionServiceImpl:
         effective_state_ids = tuple(d.effective_composition_state_id(csid) for d in drafts)
         if not drafts:
             return ()
+        from elspeth.web.composer.visible_tool_event import validate_visible_audit_row
+
+        for draft in drafts:
+            validate_visible_audit_row(
+                envelopes=tuple(draft.tool_calls or ()),
+                content=draft.content,
+                role=draft.role,
+                writer_principal=writer_principal,
+                session_id=sid,
+                context=session_operation_context,
+            )
         self._assert_session_write_lock_held(
             conn,
             sid,

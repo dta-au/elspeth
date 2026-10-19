@@ -59,6 +59,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import install_composer_async_worker, settle_sync
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -123,17 +124,17 @@ class _Response:
 
 
 def _malformed_completion() -> Any:
-    """A prose overrun whose escape-hatch turn is also unusable.
+    """An empty-reply overrun whose escape-hatch turn is also unusable.
 
-    Three no-tool-call replies exhaust the nudge budget and engage the escape
+    Three empty no-tool-call replies exhaust the nudge budget and engage the escape
     hatch; the advisor then answers with malformed tool-call arguments, so the
     hatch is spent and the overrun's terminal MALFORMED_RESPONSE disposition
-    stands. Every reply carries the leak sentinel.
+    stands. The malformed arguments carry the leak sentinel.
     """
 
-    def _prose() -> _Response:
+    def _empty_reply() -> _Response:
         return _Response(
-            choices=[_Choice(message=_Message(content=_WITHHELD_PROSE, tool_calls=[]))],
+            choices=[_Choice(message=_Message(content="", tool_calls=[]))],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
 
@@ -158,7 +159,7 @@ def _malformed_completion() -> Any:
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
 
-    responses = [_prose(), _prose(), _prose(), _malformed_arguments()]
+    responses = [*(_empty_reply() for _ in range(_PROSE_NUDGE_BUDGET + 1)), _malformed_arguments()]
 
     async def completion(**_kwargs: Any) -> _Response:
         return responses.pop(0)
@@ -241,6 +242,7 @@ def _build_app(
         data_dir=tmp_path,
         composer_model="test/planner",
         composer_boot_probe_enabled=False,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         llm_profiles={
             "offline-review": {
                 "provider": "bedrock",
@@ -678,24 +680,17 @@ def _registered_recipe_request(*, envelope_insertion: str) -> str:
         'Can you "not" build the pipeline?',
     ],
 )
-def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
+def test_provider_can_answer_without_graph_mutation_for_any_request_wording(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     message: str,
 ) -> None:
-    """The HTTP route must keep non-authorizing requests conversational."""
-    # Fixed expectations for the five measured information-only controls.
-    # This table selects test expectations; the offline SDK never routes content.
-    single_transition_requests = {
-        "Read the CSV documentation and explain how transforms work.",
-        "Read customers.csv and explain how transforms work.",
-        "Read customers.csv and explain the password policy.",
-        "Read customers.csv and explain: write is a pipeline operation.",
-        "Read customers.csv and summarize the data, then write a summary in this chat.",
-    }
-    expected_primary_calls = 1 if message in single_transition_requests else 2
+    """The planner chooses conversation; request wording never bypasses it."""
+
+    # Every request gets one planner call and its real END review when the
+    # provider chooses a conversational answer without authoring a graph.
+    expected_primary_calls = 1
     completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
-    reconciliation_completion = AsyncMock(spec=litellm.acompletion, side_effect=_conversational_completion())
     requests = []
     primary_requests = []
     advisor_requests = []
@@ -707,6 +702,11 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             assert kwargs["model"] == composer._settings.composer_advisor_model
             advisor_requests.append(request)
             assert len(advisor_requests) == 1, "An unbudgeted additional END transition must not occur"
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+            assert review["current_request"] == message
+            assert review["candidate_reply"] == "No pipeline changes were requested."
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
             return _Response(
                 choices=[
                     _Choice(
@@ -728,11 +728,7 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
             )
         primary_requests.append(request)
         assert len(primary_requests) <= expected_primary_calls, "An unbudgeted primary transition must not occur"
-        if len(primary_requests) == 1:
-            return await completion(**kwargs)
-        if len(primary_requests) == 2:
-            return await reconciliation_completion(**kwargs)
-        raise AssertionError("An unbudgeted third provider transition must not occur")
+        return await completion(**kwargs)
 
     physical_sdk = AsyncMock(spec=litellm.acompletion, side_effect=physical_completion)
     client, engine, sessions = _build_app(tmp_path, monkeypatch, physical_sdk)
@@ -752,68 +748,37 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
     )
 
     assert settled.final.status_code == 200, settled.final.text
-    settled.result()
-    ordinary_loop.assert_awaited_once()
+    result = settled.result()
+    assert result["message"]["content"] == "No pipeline changes were requested."
+    assert result["state"] is None and result["proposals"] == []
+    ordinary_loop.assert_not_awaited()
     completion.assert_awaited_once()
     assert len(primary_requests) == expected_primary_calls
     assert len(advisor_requests) == 1
     assert physical_sdk.await_count == len(requests) == expected_primary_calls + 1
     assert requests == [*primary_requests, *advisor_requests]
     assert advisor_requests[0]["tools"] is None
-    assert requests[0]["messages"][-3:-1] == [
-        {"role": "user", "content": message},
-        {
-            "role": "system",
-            "content": json.dumps(
-                {
-                    "turn_start_state_id": None,
-                    "turn_start_version": 0,
-                    "current_state_id": None,
-                    "current_version": 0,
-                    "malformed_head": False,
-                    "parked_graphs": [],
-                },
-                sort_keys=True,
-            ),
-        },
-    ]
-    assert requests[0]["messages"][-1]["role"] == "system"
-    assert json.loads(requests[0]["messages"][-1]["content"]) == {
-        "retained_operation_history": {
-            "availability": "available",
-            "has_more": False,
-            "outcomes": [],
-            "scope": "Bounded retained failures for this authenticated session and actor; not complete lifetime history.",
-            "interpretation": (
-                "Saved revision counts describe operation-local persistence, not requested edits or request satisfaction. "
-                "Unknown attribution is not zero progress. No retained failure does not establish prior success. "
-                "These outcomes do not describe the current session head or this request's effects."
-            ),
-        }
+    assert requests[0]["messages"][-1]["role"] == "user"
+    planner_request = json.loads(requests[0]["messages"][-1]["content"])
+    assert planner_request["intent"] == message
+    assert planner_request["current_state"]["sources"] == {}
+    assert planner_request["current_state"]["nodes"] == []
+    assert planner_request["current_state"]["edges"] == []
+    assert planner_request["current_state"]["outputs"] == []
+    tool_names = {tool["function"]["name"] for tool in primary_requests[0]["tools"]}
+    assert "emit_pipeline_proposal" in tool_names
+    assert "set_pipeline" not in tool_names
+    assert planner_request["retained_operation_history"] == {
+        "availability": "available",
+        "has_more": False,
+        "outcomes": [],
+        "scope": "Bounded retained failures for this authenticated session and actor; not complete lifetime history.",
+        "interpretation": (
+            "Saved revision counts describe operation-local persistence, not requested edits or request satisfaction. "
+            "Unknown attribution is not zero progress. No retained failure does not establish prior success. "
+            "These outcomes do not describe the current session head or this request's effects."
+        ),
     }
-    if expected_primary_calls == 2:
-        reconciliation_completion.assert_awaited_once()
-        assert requests[1]["model"] == requests[0]["model"]
-        assert requests[1]["tools"] == requests[0]["tools"]
-        assert requests[1]["messages"][:-2] == requests[0]["messages"]
-        assert requests[1]["messages"][-2] == {
-            "role": "assistant",
-            "content": "No pipeline changes were requested.",
-        }
-        assert requests[1]["messages"][-1] == {
-            "role": "user",
-            "content": (
-                "[composer-system] No tool has run this turn, and the pipeline has no source or nodes. "
-                "Re-check the user's request against that state. If the user requested construction or generated "
-                "source data, carry out that authorized work using the declared tools before claiming it is complete. "
-                "If a required product fact is missing, start your no-tool reply with CLARIFY: and ask the concrete question. "
-                "If the user asked only for "
-                "explanation or revoked construction, answer that request without building. Do not describe data "
-                "as saved, bound, or reviewed until tool results establish it."
-            ),
-        }
-    else:
-        reconciliation_completion.assert_not_awaited()
     audit_rows = _llm_audit_rows(engine)
     assert len(audit_rows) == expected_primary_calls + 1
     actual_calls = [row.tool_calls[0]["call"] for row in audit_rows]
@@ -831,7 +796,19 @@ def test_non_authorizing_request_cannot_enter_planner_or_auto_commit(
         assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
 
 
-@pytest.mark.parametrize("message", _COMPLETE_MULTI_CLAUSE_REQUESTS)
+@pytest.mark.parametrize(
+    "message",
+    [
+        *_COMPLETE_MULTI_CLAUSE_REQUESTS,
+        pytest.param('Build a pipeline that reads "input.csv" and writes rows to "output.csv".', id="quoted-paths"),
+        pytest.param("Construct a workflow that reads input.csv and writes rows to output.csv.", id="paraphrase"),
+        pytest.param("Please turn the uploaded CSV into a JSON file.", id="conversion"),
+        pytest.param("Build a pipeline that reads input.csv and writes output.csv. Can you do that?", id="question"),
+        pytest.param("Explain the pipeline.", id="explanation"),
+        pytest.param('Explain why the string "source:csv" appears in the docs.', id="quoted-plugin"),
+        pytest.param("Do not build a pipeline.", id="negation"),
+    ],
+)
 def test_complete_multi_clause_request_enters_empty_pipeline_planner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -872,12 +849,12 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
         "expected_withheld_replies",
     ),
     [
-        # The prose (no-tool-call) reply is nudge-retried on its own bounded
+        # An empty (no-tool-call) reply is nudge-retried on its own bounded
         # budget, the overrun engages the escape hatch, and the advisor's
         # malformed reply spends it — so every nudged attempt AND the hatch
         # call land as durable audit evidence alongside the terminal
         # MALFORMED_RESPONSE.
-        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2, 3),
+        (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 2, 0),
         (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1, 0),
         # LiteLLM API errors are the declared retryable provider failure, so
         # every configured physical attempt must be present in the audit.
@@ -1078,7 +1055,7 @@ def test_recompose_freeform_planner_failure_is_translated(
     assert len(disposition_rows) == 1
     assert disposition_rows[0].tool_calls[0]["failure_code"] == "invalid_provider_response"
 
-    _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=3)
+    _assert_no_sentinel_leak(engine, settled.final.text, expected_withheld_replies=0)
     _assert_withheld_prose_is_not_visible_or_replayed(client, sessions, session_id)
     captured = capsys.readouterr()
     assert _PROVIDER_LEAK_SENTINEL not in captured.out + captured.err + caplog.text
@@ -1253,7 +1230,6 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     provider failure: 200 with the advisor's own words, no failure disposition,
     no 'unusable pipeline plan' misattribution."""
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
 
     request = "Build a pipeline that joins two unbounded streams by matching keys."
     planner_completion = _decline_after_exhaustion_completion()
@@ -1266,9 +1242,8 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
             assert model == composer._settings.composer_advisor_model
             end_requests.append(deepcopy(kwargs))
             assert len(end_requests) == 1, "Only one END SDK response is supplied"
-            assert [item["model"] for item in planner_requests] == ["test/planner", "test/planner", model]
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            assert [item["model"] for item in planner_requests] == ["test/planner", "test/planner", "test/planner", model]
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             assert review["current_request"] == request
             assert review["candidate_reply"] == _DECLINE_TEXT
             assert review["saved_effects"]["saved_revision_count"] == 0
@@ -1295,8 +1270,8 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
                 id="decline-end-review",
             )
         planner_requests.append(deepcopy(kwargs))
-        assert len(planner_requests) <= 3, "Only the original two discovery turns and hatch are supplied"
-        assert model == ("test/planner" if len(planner_requests) <= 2 else composer._settings.composer_advisor_model)
+        assert len(planner_requests) <= 4, "Only three discovery attempts and the hatch are supplied"
+        assert model == ("test/planner" if len(planner_requests) <= 3 else composer._settings.composer_advisor_model)
         return await planner_completion(**kwargs)
 
     client, engine, _sessions = _build_app(tmp_path, monkeypatch, completion)
@@ -1312,7 +1287,7 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
 
     assert settled.final.status_code == 200, settled.final.text
     body = settled.result()
-    assert len(planner_requests) == 3 and len(end_requests) == 1
+    assert len(planner_requests) == 4 and len(end_requests) == 1
     assert body["message"]["content"] == _DECLINE_TEXT
     assert _DECLINE_TEXT in settled.final.text
     assert "unusable pipeline plan" not in settled.final.text
@@ -1324,7 +1299,7 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
 
     # Original discovery retry/hatch semantics remain; publication adds one
     # separately accounted physical END call with an actual accepted audit.
-    assert len(_llm_audit_rows(engine)) == 4
+    assert len(_llm_audit_rows(engine)) == 5
 
     # The decline lands in the visible conversation as an assistant message.
     with engine.connect() as conn:
@@ -1343,12 +1318,12 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
 
 
-def _marker_decline_completion() -> Any:
-    """The planner declines on its first, decline-eligible ordinary turn."""
+def _natural_decline_completion() -> Any:
+    """The planner answers naturally on its first ordinary turn."""
 
     async def completion(**_kwargs: Any) -> _Response:
         return _Response(
-            choices=[_Choice(message=_Message(content=f"DECLINE: {_DECLINE_TEXT}", tool_calls=[]))],
+            choices=[_Choice(message=_Message(content=_DECLINE_TEXT, tool_calls=[]))],
             usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
         )
 
@@ -1372,18 +1347,17 @@ def _observe_publication_reviews(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize("publication_verdict", ["ADMIT", "WITHHOLD"])
-def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message(
+def test_send_message_ordinary_turn_natural_decline_is_a_normal_assistant_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     publication_verdict: str,
 ) -> None:
     """One planner decision publishes only after exact-candidate END admission."""
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.sessions.routes._helpers import _composer_chat_history
 
     reviews = _observe_publication_reviews(monkeypatch)
-    planner_completion = _marker_decline_completion()
+    planner_completion = _natural_decline_completion()
     primary_requests: list[dict[str, Any]] = []
     end_requests: list[dict[str, Any]] = []
     reviewed_payloads = []
@@ -1394,12 +1368,13 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
             assert len(primary_requests) == len(end_requests) == 1, "No additional SDK dispatch is supplied"
             assert kwargs["model"] == client.app.state.composer_service._settings.composer_advisor_model
             assert kwargs.get("tools") is None
-            summary = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(summary.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             assert review["current_request"] == _EMPTY_INTENT and review["candidate_reply"] == _DECLINE_TEXT
             assert review["saved_effects"]["saved_revision_count"] == 0
             assert review["saved_effects"]["net_changed"] is False
-            reviewed_payloads.append(review)
+            reviewed_payloads.append(
+                {key: value for key, value in review.items() if key not in {"current_request_ref", "candidate_reply_ref"}}
+            )
             return _Response(
                 choices=[
                     _Choice(
@@ -1421,7 +1396,7 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
                 ],
                 usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
                 model=kwargs["model"],
-                id="marker-decline-end",
+                id="natural-decline-end",
             )
         primary_requests.append(deepcopy(kwargs))
         assert len(primary_requests) == 1 and not end_requests, "Only the original planner decision is supplied"
@@ -1447,7 +1422,6 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
         assert body["message"]["content"] == _DECLINE_TEXT
     else:
         assert _DECLINE_TEXT not in settled.final.text
-    assert "DECLINE:" not in body["message"]["content"]
     assert body["state"] is None
 
     # Not a failure: no disposition row, and progress is not "failed".
@@ -1458,8 +1432,7 @@ def test_send_message_ordinary_turn_marker_decline_is_a_normal_assistant_message
     # The planner decision remains one call; publication has its own END audit.
     assert len(_llm_audit_rows(engine)) == 2
 
-    # The decline lands in the visible conversation as an assistant message,
-    # marker stripped, body verbatim.
+    # Only an admitted decline lands in the visible conversation, verbatim.
     with engine.connect() as conn:
         rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.content, chat_messages_table.c.tool_calls)).all()
     assistant_rows = [row for row in rows if row.role == "assistant" and (row.content or "") == _DECLINE_TEXT]
@@ -1590,9 +1563,10 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     Historical intent: the first planner-authored LLM pipeline in session
     ff368dcb committed pending requirements without resolvable events. Keep
     this registration as the regression. Current admission deliberately stages
-    pending-review candidates. This normal Web request uses the registered
-    compose-loop set_pipeline dialect: an actual explicit-approval preference
-    change and subsequent HTTP acceptance exercise atomic publication/evidence.
+    pending-review candidates. Empty sessions use the planner proposal dialect;
+    existing graphs use the compose-loop set_pipeline dialect. An actual
+    explicit-approval preference change and subsequent HTTP acceptance exercise
+    atomic publication/evidence through both paths.
     The separate later-imperative test retains the green auto-commit witness.
     """
     import socket
@@ -1602,8 +1576,8 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
         AdvisorGraphReviewFact,
     )
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.pipeline_proposal import composition_content_hash
+    from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE
     from elspeth.web.interpretation_state import approved_prompt_artifact_hash_from_options, interpretation_sites
     from elspeth.web.sessions.models import (
         composer_async_operations_table,
@@ -1634,12 +1608,11 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     physical_requests: list[dict[str, Any]] = []
     reviews = _observe_publication_reviews(monkeypatch)
     end_payloads = []
-    primary_count = 3 if base_kind == "absent" else 2
-    candidate_reply = (
-        "The pipeline proposal awaits your approval; no pipeline state has been committed."
-        if base_kind == "absent"
-        else "The proposed pipeline is waiting for your approval."
-    )
+    planner_path = base_kind == "absent"
+    primary_count = 1 if planner_path else 2
+    end_count = 0 if planner_path else 1
+    physical_count = primary_count + end_count
+    candidate_reply = "The proposed pipeline is waiting for your approval."
 
     async def pending_completion(**kwargs: Any) -> _Response:
         physical_requests.append(deepcopy(kwargs))
@@ -1648,12 +1621,11 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
             assert ordinal == primary_count + 1 and not end_payloads, "Exactly one END follows the original primary calls"
             assert kwargs.get("tools") is None
             assert kwargs["model"] == client.app.state.composer_service._settings.composer_advisor_model
-            summary = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(summary.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             assert review["current_request"] == "Build a CSV to JSONL pipeline with an LLM description of each name."
             assert review["candidate_reply"] == candidate_reply
             assert review["saved_effects"]["saved_revision_count"] == 0 and review["saved_effects"]["net_changed"] is False
-            end_payloads.append(review)
+            end_payloads.append({key: value for key, value in review.items() if key not in {"current_request_ref", "candidate_reply_ref"}})
             return _Response(
                 choices=[
                     _Choice(
@@ -1675,47 +1647,18 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
                 model=kwargs["model"],
                 id="pending-proposal-end-review",
             )
-        assert ordinal <= primary_count, "only the authored mutation, post-tool reply, and applicable empty-graph canary are allowed"
+        assert ordinal <= primary_count, "Only the authored mutation and any loop post-tool reply are supplied"
         names = [tool["function"]["name"] for tool in kwargs["tools"]]
-        assert "set_pipeline" in names
-        assert "emit_pipeline_proposal" not in names
-        (declaration,) = [tool["function"] for tool in kwargs["tools"] if tool["function"]["name"] == "set_pipeline"]
+        mutation_name = "emit_pipeline_proposal" if planner_path else "set_pipeline"
+        assert mutation_name in names
+        assert ("set_pipeline" if planner_path else "emit_pipeline_proposal") not in names
+        (declaration,) = [tool["function"] for tool in kwargs["tools"] if tool["function"]["name"] == mutation_name]
         parameters = declaration["parameters"]
         assert parameters["type"] == "object"
         assert set(parameters["properties"]) == {"pipeline"}
         assert parameters["required"] == ["pipeline"]
         assert parameters["additionalProperties"] is False
         assert parameters["properties"]["pipeline"]["type"] == "object"
-        if ordinal == 3:
-            assert base_kind == "absent", "A populated base does not take the empty-graph canary"
-            assert kwargs["model"] == physical_requests[1]["model"]
-            assert kwargs["tools"] == physical_requests[1]["tools"]
-            assert kwargs["messages"][:-2] == physical_requests[1]["messages"]
-            assert kwargs["messages"][-2] == {
-                "role": "assistant",
-                "content": "The proposed pipeline is waiting for your approval.",
-            }
-            assert kwargs["messages"][-1] == {
-                "role": "user",
-                "content": (
-                    "[composer-system] No composition-state mutation completed successfully this turn, "
-                    "and the pipeline has no source or nodes. Re-check the user's request against that state. "
-                    "If the user requested construction or generated source data, carry out that authorized work "
-                    "using the declared tools before claiming it is complete. If a required product fact is missing, "
-                    "start your no-tool reply with CLARIFY: and ask the concrete question. "
-                    "If the user asked only for explanation or revoked construction, "
-                    "answer that request without building. Do not describe data as saved, bound, or reviewed "
-                    "until tool results establish it."
-                ),
-            }
-            return _Response(
-                choices=[
-                    _Choice(message=_Message(content="The pipeline proposal awaits your approval; no pipeline state has been committed."))
-                ],
-                usage={"prompt_tokens": 14, "completion_tokens": 7, "total_tokens": 21, "cost": 0.03},
-                model="provider/canary-reply-v1",
-                id="canary-request-3",
-            )
         if ordinal == 2:
             assert kwargs["model"] == physical_requests[0]["model"]
             assert kwargs["tools"] == physical_requests[0]["tools"]
@@ -1776,7 +1719,7 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         # The physical Web dialect wraps the canonical object in the
         # declared pipeline field; the wire decoder unwraps it before dispatch.
         # The provider authors the object; backend validation remains unchanged.
-        function.name = "set_pipeline"
+        function.name = mutation_name
         function.arguments = json.dumps({"pipeline": pipeline})
         return response
 
@@ -1864,9 +1807,12 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     )
     assert settled.final.status_code == 200, settled.final.text
     result = settled.result()
-    assert result["message"]["content"].startswith(candidate_reply)
-    assert "Composer completion is withheld." in result["message"]["content"], "Prose admission must not clear the pending graph"
-    assert len(end_payloads) == 1
+    if planner_path:
+        assert result["message"]["content"] == PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE
+    else:
+        assert result["message"]["content"].startswith(candidate_reply)
+        assert "Composer completion is withheld." in result["message"]["content"], "Prose admission must not clear the pending graph"
+    assert len(end_payloads) == end_count
     # A committed private review fact blocks completion without manufacturing
     # a graph checkpoint that immediately invalidates the proposal's AbsentBase.
     if base_record is None:
@@ -1878,17 +1824,20 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     with engine.connect() as conn:
         assert conn.execute(select(composition_states_table)).mappings().all() == immutable_before
         rows = conn.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).all()
-        (envelope,) = [
-            row.tool_calls[0] for row in rows if row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_GRAPH_REVIEW_AUDIT_KIND
-        ]
-        review_fact = AdvisorGraphReviewFact.from_envelope(envelope)
-        assert review_fact.state_id == (base_record.id if base_record is not None else None)
-        assert review_fact.session_id == UUID(session_id)
-        assert review_fact.terminal_operation_id == settled.accepted.json()["operation_id"]
-        assert review_fact.action == "blocked" and review_fact.identity.source == "model"
-        assert review_fact.gates.advisor_signoff is not None
-        assert review_fact.gates.advisor_signoff.cause.value == "graph_rejected"
-        assert _sessions._graph_review_on_connection(conn, session_id=UUID(session_id), stored=base_record) == review_fact
+        envelopes = [row.tool_calls[0] for row in rows if row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_GRAPH_REVIEW_AUDIT_KIND]
+        if planner_path:
+            assert envelopes == []
+            assert _sessions._graph_review_on_connection(conn, session_id=UUID(session_id), stored=None) is None
+        else:
+            (envelope,) = envelopes
+            review_fact = AdvisorGraphReviewFact.from_envelope(envelope)
+            assert review_fact.state_id == base_record.id
+            assert review_fact.session_id == UUID(session_id)
+            assert review_fact.terminal_operation_id == settled.accepted.json()["operation_id"]
+            assert review_fact.action == "blocked" and review_fact.identity.source == "model"
+            assert review_fact.gates.advisor_signoff is not None
+            assert review_fact.gates.advisor_signoff.cause.value == "graph_rejected"
+            assert _sessions._graph_review_on_connection(conn, session_id=UUID(session_id), stored=base_record) == review_fact
     before_acceptance = client.get(f"/api/sessions/{session_id}/state")
     assert before_acceptance.status_code == 200, before_acceptance.text
     if base_record is None:
@@ -1927,15 +1876,20 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
     assert current.status_code == 200, current.text
     state = current.json()
     assert accepted.json()["committed_state_id"] == state["id"]
-    assert state["composer_meta"]["completion_gates"]["advisor_signoff"]["status"] == "blocked"
-    assert state["composer_meta"]["completion_gates"]["advisor_signoff"]["for_graph"] == review_fact.identity.for_graph
+    if not planner_path:
+        assert state["composer_meta"]["completion_gates"]["advisor_signoff"]["status"] == "blocked"
+        assert state["composer_meta"]["completion_gates"]["advisor_signoff"]["for_graph"] == review_fact.identity.for_graph
     composition = CompositionState.from_dict({key: state[key] for key in ("sources", "nodes", "edges", "outputs", "metadata", "version")})
     from elspeth.web.execution.completion_gates import ADVISOR_SIGNOFF_PENDING_DETAIL, merge_completion_gates, parse_completion_gates
     from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
 
-    readiness = merge_completion_gates(_green_result(), parse_completion_gates(state["composer_meta"]), composition).readiness
-    assert not readiness.completion_ready
-    assert any(blocker.detail == ADVISOR_SIGNOFF_PENDING_DETAIL for blocker in readiness.blockers)
+    if planner_path:
+        gates = parse_completion_gates(state["composer_meta"])
+        assert gates is None or gates.advisor_signoff is None
+    else:
+        readiness = merge_completion_gates(_green_result(), parse_completion_gates(state["composer_meta"]), composition).readiness
+        assert not readiness.completion_ready
+        assert any(blocker.detail == ADVISOR_SIGNOFF_PENDING_DETAIL for blocker in readiness.blockers)
     assert composition_content_hash(composition) == composition_content_hash(prepared_state)
     pending = client.get(f"/api/sessions/{session_id}/interpretations?status=pending")
     assert pending.status_code == 200, pending.text
@@ -2054,22 +2008,19 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         )
     assert resolved_row["arguments_hash"] == event["arguments_hash"]
     assert resolved_row["approved_prompt_artifact_hash"] == expected_artifact_hash
-    assert physical_sdk.await_count == len(physical_requests) == primary_count + 1
+    assert physical_sdk.await_count == len(physical_requests) == physical_count
     audits = _llm_audit_rows(engine)
-    assert len(audits) == primary_count + 1
+    assert len(audits) == physical_count
     calls = [audit.tool_calls[0]["call"] for audit in audits]
-    assert len({call["call_id"] for call in calls}) == primary_count + 1
+    assert len({call["call_id"] for call in calls}) == physical_count
     assert {call["messages_hash"] for call in calls} == {stable_hash(request["messages"]) for request in physical_requests}
-    assert {call["provider_request_id"] for call in calls} == {
-        "planner-request-1",
-        "post-tool-request-2",
-        "pending-proposal-end-review",
-    } | ({"canary-request-3"} if base_kind == "absent" else set())
-    assert {call["model_returned"] for call in calls} == {
-        "provider/planner-v1",
-        "provider/post-tool-v1",
-        client.app.state.composer_service._settings.composer_advisor_model,
-    } | ({"provider/canary-reply-v1"} if base_kind == "absent" else set())
+    expected_request_ids = {"planner-request-1"}
+    expected_models = {"provider/planner-v1"}
+    if not planner_path:
+        expected_request_ids.update({"post-tool-request-2", "pending-proposal-end-review"})
+        expected_models.update({"provider/post-tool-v1", client.app.state.composer_service._settings.composer_advisor_model})
+    assert {call["provider_request_id"] for call in calls} == expected_request_ids
+    assert {call["model_returned"] for call in calls} == expected_models
     for physical in physical_requests:
         (call,) = [call for call in calls if call["messages_hash"] == stable_hash(physical["messages"])]
         assert call["status"] == "success"
@@ -2082,13 +2033,14 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
         for row in audit_rows
         if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
     ]
-    assert len(passes) == 1
-    assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
-    assert passes[0]["verdict"] == "flagged" and passes[0]["publication_verdict"] == "ADMIT"
-    assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
-    assert passes[0]["publication_binding"] in {
-        review.binding for review in reviews if json.loads(review.provider_payload_json) == end_payloads[0]
-    }
+    assert len(passes) == end_count
+    if not planner_path:
+        assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
+        assert passes[0]["verdict"] == "flagged" and passes[0]["publication_verdict"] == "ADMIT"
+        assert passes[0]["provider_attempts"] == 1 and passes[0]["first_attempt_accepted"] is True
+        assert passes[0]["publication_binding"] in {
+            review.binding for review in reviews if json.loads(review.provider_payload_json) == end_payloads[0]
+        }
     with engine.connect() as conn:
         operation = (
             conn.execute(
@@ -2119,9 +2071,9 @@ def test_freeform_auto_commit_surfaces_interpretation_reviews(
             .all()
         )
     assert operation["status"] == "completed"
-    assert len(attempts) == len(ledger) == primary_count + 1
+    assert len(attempts) == len(ledger) == physical_count
     assert {attempt["attempt_id"] for attempt in attempts} == {call["call_id"] for call in calls}
-    assert len({attempt["ledger_entry_id"] for attempt in attempts}) == primary_count + 1
+    assert len({attempt["ledger_entry_id"] for attempt in attempts}) == physical_count
     assert {attempt["ledger_entry_id"] for attempt in attempts} == {entry["entry_id"] for entry in ledger}
     for attempt in attempts:
         assert attempt["settled_at"] is not None

@@ -25,10 +25,11 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 def tripwire_preflight() -> None:
-    """Classifier-drift check for every tripwire fixture. Raises ``ProbeUnpaired``; the driver runs it BEFORE
-    the canary, so a grammar edit fails the round immediately instead of after ten canary runs are spent."""
-    for fixture in TRIPWIRE_FIXTURES:
-        assert_pair_routes(load_fixture(fixture)["intent"])
+    """Tripwires use fresh persisted sessions and structural planner routing.
+
+    No wording assertion is needed. The paired P/L probe separately refuses
+    to run because its greeting prefix can no longer select the loop.
+    """
 
 
 def run_tripwire(battery: Battery) -> Path:

@@ -147,6 +147,8 @@ class TestCallRecordingRoutesToExecution:
             approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
             source_call_id=None,
+            call_id=None,
+            created_at=None,
         )
 
 
@@ -245,6 +247,8 @@ class TestOperationCallRoutesToExecution:
             approved_prompt_artifact_hash=None,
             token_usage=UNKNOWN_TOKEN_USAGE,
             source_call_id=None,
+            call_id=None,
+            created_at=None,
         )
 
 

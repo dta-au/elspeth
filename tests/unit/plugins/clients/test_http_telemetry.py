@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
@@ -23,6 +23,8 @@ from tests.fixtures.mock_audit import mock_audit_authority
 
 @dataclass(frozen=True)
 class _RecordedCall:
+    call_id: str
+    created_at: datetime
     request_hash: str = "req_hash_123"
     response_hash: str = "resp_hash_456"
 
@@ -58,6 +60,8 @@ class _RecordingExecution:
         work_item: TokenWorkItem,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> _RecordedCall:
         assert source_call_id is None
         kwargs = {
@@ -72,6 +76,8 @@ class _RecordingExecution:
             "request_ref": request_ref,
             "response_ref": response_ref,
             "approved_prompt_artifact_hash": approved_prompt_artifact_hash,
+            "call_id": call_id,
+            "created_at": created_at,
         }
         if source_call_id is not None:
             kwargs["source_call_id"] = source_call_id
@@ -80,7 +86,10 @@ class _RecordingExecution:
             raise self.record_call_effect
         if self.record_call_effect is not None:
             return self.record_call_effect(**kwargs)
-        return _RecordedCall()
+        return _RecordedCall(
+            call_id=call_id if call_id is not None else f"call-{len(self.record_call_calls)}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
+        )
 
     def record_operation_call(
         self,
@@ -99,9 +108,14 @@ class _RecordingExecution:
         coordination_token: CoordinationToken,
         token_usage: TokenUsage = UNKNOWN_TOKEN_USAGE,
         source_call_id: str | None = None,
+        call_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> _RecordedCall:
         assert source_call_id is None
-        return _RecordedCall()
+        return _RecordedCall(
+            call_id=call_id if call_id is not None else f"operation-call-{call_index}",
+            created_at=created_at if created_at is not None else datetime.now(UTC),
+        )
 
 
 def _json_response(body: Mapping[str, Any], *, status_code: int = 200) -> httpx.Response:
@@ -253,7 +267,12 @@ class TestHTTPClientTelemetry:
 
         def record_call_with_order(**kwargs: Any) -> _RecordedCall:
             call_order.append("landscape")
-            return _RecordedCall(request_hash="req_hash", response_hash="resp_hash")
+            return _RecordedCall(
+                call_id=kwargs["call_id"] if kwargs["call_id"] is not None else "ordered-call",
+                created_at=kwargs["created_at"] if kwargs["created_at"] is not None else datetime.now(UTC),
+                request_hash="req_hash",
+                response_hash="resp_hash",
+            )
 
         execution.record_call_effect = record_call_with_order
 

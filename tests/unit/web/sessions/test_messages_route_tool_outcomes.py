@@ -12,17 +12,23 @@ envelopes — server-authenticated, never name-derived.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import insert
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.tools.generation import explain_validation_code
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table
+from elspeth.web.sessions.protocol import ChatMessageRecord
+from elspeth.web.sessions.routes._helpers import _tool_call_outcomes_by_call_id
+from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.conftest import _make_session
 
 
@@ -141,6 +147,93 @@ def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
             ],
         )
     return {"session_id": session_id, "assistant_id": assistant_id}
+
+
+async def _with_visible_companions(test_client: TestClient, session_id: str) -> list[ChatMessageRecord]:
+    """Attach actual producer envelopes to the fixture's durable read image."""
+    rows = await test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)
+    assistant = next(row for row in rows if row.role == "assistant")
+    assert assistant.tool_calls is not None
+    calls = {call["id"]: call for call in assistant.tool_calls}
+    context = make_compose_context(session_id)
+    result = []
+    for row in rows:
+        if row.role != "tool":
+            result.append(row)
+            continue
+        assert row.tool_call_id is not None
+        call = calls[row.tool_call_id]
+        event = VisibleToolEvent.capture(
+            context=context,
+            request_id=None,
+            tool_call_id=row.tool_call_id,
+            tool_name=call["function"]["name"],
+            received_arguments=call["function"]["arguments"],
+            effective_arguments=call["function"]["arguments"],
+            # This is evidence, never an authority to classify a lookup as
+            # applied or grant a state version absent from the durable row.
+            selected_result='{"success": true, "version_after": 999}',
+            display_arguments=call["function"]["arguments"],
+            display_result=row.content,
+        ).with_parent(str(row.parent_assistant_id))
+        result.append(replace(row, tool_calls=[event.to_envelope()]))
+    return result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_tool_rows", [False, True], ids=["conversation", "tool-opt-in"])
+async def test_visible_companions_preserve_api_outcomes_and_do_not_become_calls(
+    test_client: TestClient, monkeypatch: pytest.MonkeyPatch, include_tool_rows: bool
+) -> None:
+    seeded = _seed_compose_turn_with_outcomes(test_client)
+    session_id = seeded["session_id"]
+    records = await _with_visible_companions(test_client, session_id)
+
+    async def companion_read(sid: UUID, *, limit: int | None, include_private_evidence: bool) -> list[ChatMessageRecord]:
+        assert str(sid) == session_id and limit is None and include_private_evidence is False
+        return records
+
+    monkeypatch.setattr(test_client.app.state.session_service, "get_messages", companion_read)
+    response = await _get(test_client, f"/api/sessions/{session_id}/messages?include_tool_rows={str(include_tool_rows).lower()}")
+    assert response.status_code == 200
+    rows = response.json()
+    assistant = next(row for row in rows if row["role"] == "assistant")
+    assert [call["id"] for call in assistant["tool_calls"]] == ["call_mutate", "call_read", "call_reject"]
+    assert [call["outcome"] for call in assistant["tool_calls"]] == ["applied", "completed", "rejected"]
+    assert [call["applied_state_version"] for call in assistant["tool_calls"]] == [2, None, None]
+    tools = [row for row in rows if row["role"] == "tool"]
+    if include_tool_rows:
+        assert [row["tool_call_id"] for row in tools] == ["call_mutate", "call_read", "call_reject"]
+        for row in tools:
+            (envelope,) = row["tool_calls"]
+            event = VisibleToolEvent.from_envelope(envelope)
+            assert event.tool_call_id == row["tool_call_id"]
+            assert event.parent_assistant_id == row["parent_assistant_id"]
+    else:
+        assert tools == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["payload_hash", "schema"])
+async def test_visible_companion_corruption_is_not_silently_treated_as_a_primary_row(test_client: TestClient, damage: str) -> None:
+    seeded = _seed_compose_turn_with_outcomes(test_client)
+    rows = await _with_visible_companions(test_client, seeded["session_id"])
+    row = next(row for row in rows if row.tool_call_id == "call_read")
+    assert row.tool_calls is not None
+    (event,) = row.tool_calls
+    damaged = replace(row, tool_calls=[dict(event) | {damage: "invalid"}])
+    with pytest.raises(AuditIntegrityError):
+        _tool_call_outcomes_by_call_id([damaged], state_versions_by_id={})
+
+
+@pytest.mark.asyncio
+async def test_malformed_legacy_invocation_still_fails_closed_with_a_state_id(test_client: TestClient) -> None:
+    seeded = _seed_compose_turn_with_outcomes(test_client)
+    rows = await test_client.app.state.session_service.get_messages(UUID(seeded["session_id"]), limit=None)
+    row = next(row for row in rows if row.tool_call_id == "call_mutate")
+    malformed = replace(row, tool_calls=[{"_kind": "audit"}])
+    with pytest.raises(KeyError, match="invocation"):
+        _tool_call_outcomes_by_call_id([malformed], state_versions_by_id={str(row.composition_state_id): 2})
 
 
 @pytest.mark.asyncio

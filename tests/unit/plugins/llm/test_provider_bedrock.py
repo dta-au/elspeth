@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -137,7 +138,7 @@ class FakeAuditRecorder:
     def record_operation_call(self, **call: Any) -> SimpleNamespace:
         self.operation_calls.append(call)
         return SimpleNamespace(
-            call_id=f"operation-call-{len(self.operation_calls)}",
+            call_id=call.get("call_id") or f"operation-call-{len(self.operation_calls)}",
             request_ref=f"operation-request-{len(self.operation_calls)}",
             response_ref=f"operation-response-{len(self.operation_calls)}",
         )
@@ -157,7 +158,7 @@ def test_governance_guards_bedrock_and_settles_once(preflight: bool, refused: bo
 
     def after(attempt_id: str, call_id: str) -> None:
         assert attempt_id == "attempt-bedrock"
-        assert call_id == "operation-call-1"
+        assert call_id == attempt_id
         assert len(recorder.operation_calls) == 1
         events.append("after")
 
@@ -365,6 +366,37 @@ class TestBedrockConfig:
 
 
 class TestBedrockAdapter:
+    def test_nullable_number_and_enum_schema_reach_the_litellm_sdk(self) -> None:
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "NullableAnswer",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "score": {"type": ["number", "null"]},
+                        "label": {"type": ["string", "null"], "enum": ["green", "blue", None]},
+                    },
+                    "required": ["score", "label"],
+                },
+            },
+        }
+        expected = json.dumps(response_format, sort_keys=True)
+        provider = _provider()
+
+        with patch("litellm.completion", return_value=_response()) as completion:
+            provider.execute_query(
+                messages=[ChatMessage(role="user", content="Assess the colour.")],
+                model=MODEL,
+                temperature=0.25,
+                max_tokens=64,
+                audit_parent=LLMAuditParent.for_operation(coordination_token=_LEADER_TOKEN, operation_id="operation-1"),
+                response_format=response_format,
+            )
+
+        completion.assert_called_once()
+        assert json.dumps(completion.call_args.kwargs["response_format"], sort_keys=True) == expected
+
     @pytest.mark.parametrize("ambient_token", [None, "ambient-session-sentinel"])
     @pytest.mark.parametrize("credential_mode", ["long-lived", "temporary", "default-chain"])
     def test_litellm_resolves_and_signs_with_one_credential_identity(

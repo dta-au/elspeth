@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow, QuotaPolicyRow
+import pytest
+
+from elspeth.web.coordination.quota_authority import ContainerQuotaPolicyRow, QuotaExceeded, QuotaPolicyRow
 from elspeth.web.coordination.quota_policy_authority import QuotaPolicyChange
 from tests.unit.web.auth.test_audit import _durable_recorder, _durable_rows, _metadata, _request
 
@@ -74,3 +76,37 @@ def test_configured_container_ceiling_has_no_fictional_identity_or_storage_cap(t
     data = _metadata(row)
     assert (data["actor"], data["source"], data["scope"], data["dimension"]) == ("config", "config", "container", "tokens")
     assert (data["policy_id"], data["tokens_per_day"], data["storage_bytes"]) == ("configured", 9000, None)
+
+
+@pytest.mark.parametrize("tokens", [None, 9000])
+def test_container_storage_provisioning_audits_only_configured_dimensions(tmp_path: Any, tokens: int | None) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_container_quota_set(
+        provider="local", policy=ContainerQuotaPolicyRow(policy_id="storage-configured", tokens_per_day=tokens, storage_bytes=8192)
+    )
+    metadata = {_metadata(row)["dimension"]: _metadata(row) for row in _durable_rows(url)}
+    assert set(metadata) == ({"storage"} if tokens is None else {"tokens", "storage"})
+    assert metadata["storage"]["cap"] == 8192
+    assert metadata["storage"]["tokens_per_day"] == tokens
+
+
+def test_shared_storage_refusal_audits_the_measured_scope(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_quota_exceeded(
+        QuotaExceeded(
+            identity_id="alice",
+            provider="local",
+            operation="blob_create",
+            dimension="storage",
+            cap=100,
+            ceiling=1000,
+            usage=995,
+            identity_policy_id="person",
+            container_policy_id="shared",
+            scope="container",
+            limit=1000,
+        )
+    )
+    (row,) = _durable_rows(url)
+    metadata = _metadata(row)
+    assert (metadata["scope"], metadata["limit"], metadata["usage"]) == ("container", 1000, 995)

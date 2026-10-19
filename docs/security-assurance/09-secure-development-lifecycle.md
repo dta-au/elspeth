@@ -421,18 +421,18 @@ invariants that no latency or cost argument overrides
 
 ### 4.2 Review records
 
-Review records are kept under [docs/reviews/](../reviews/): 39 top-level review
+Historical review records are preserved in git history under [docs/reviews/](https://github.com/dta-au/elspeth/tree/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews): 39 top-level review
 records dated 2026-09-20 to 2026-09-30 at `487ac85a3`, with 80 nested
 supporting records [EV-623]. Those most relevant to security:
 
 | Date | Review | Method |
 |---|---|---|
-| 2026-09-23 | [Pre-publication security plan review](../reviews/2026-09-23-pre-publication-security-review.md) | Four independent readers (source reality, architecture, test quality, downstream effects); read-only GitHub secret and ruleset inventory |
-| 2026-09-23 | [Web tier review, 48-hour window](../reviews/2026-09-23-release-0.8.1-web-review/README.md) | Diff review of 133 commits in 39 bundles and 9 seams; every finding sent to an independent refuter, high findings to a second |
-| 2026-09-23 | [Identity / SSO programme completion adjudication](../reviews/2026-09-23-identity-sso-completion.md) | Completion check of the identity programme |
+| 2026-09-23 | [Pre-publication security plan review](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-23-pre-publication-security-review.md) | Four independent readers (source reality, architecture, test quality, downstream effects); read-only GitHub secret and ruleset inventory |
+| 2026-09-23 | [Web tier review, 48-hour window](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-23-release-0.8.1-web-review/README.md) | Diff review of 133 commits in 39 bundles and 9 seams; every finding sent to an independent refuter, high findings to a second |
+| 2026-09-23 | [Identity / SSO programme completion adjudication](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-23-identity-sso-completion.md) | Completion check of the identity programme |
 | 2026-09-23 | [Single-developer assumptions audit](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-23-single-developer-assumptions.md) and [in agent tooling](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-23-single-developer-tooling-assumptions.md) | Historical reports preserved in `docs-archive/`; open findings retain their own disposition |
-| 2026-09-27 | [Composer provider failure boundary gap analysis](../reviews/2026-09-27-composer-provider-boundary-gap.md) | Boundary analysis |
-| 2026-09-28 | [Gateway boundary implementation review](../reviews/2026-09-28-gateway-boundaries-implementation-review.md) | Implementation review |
+| 2026-09-27 | [Composer provider failure boundary gap analysis](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-27-composer-provider-boundary-gap.md) | Boundary analysis |
+| 2026-09-28 | [Gateway boundary implementation review](https://github.com/dta-au/elspeth/blob/487ac85a377f135e012bb206e3769cd65f6fadb8/docs/reviews/2026-09-28-gateway-boundaries-implementation-review.md) | Implementation review |
 
 Open or accepted findings from these reviews belong in the controlled
 [risk register](15-risk-register.md), not in this public process document.

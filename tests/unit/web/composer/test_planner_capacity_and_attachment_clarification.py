@@ -227,7 +227,7 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
     tool_context: ToolContext,
 ) -> None:
     question = "I cannot preserve the missing workbook. Please upload it or confirm separate detail and summary CSVs; should I assess every row or a selected batch?"
-    completion = _ScriptedCompletion(_text_response(f"DECLINE: {question}"))
+    completion = _ScriptedCompletion(_text_response(question))
     recorder = BufferingRecorder()
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
@@ -240,8 +240,7 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
         policies.append(policy)
         return policy
 
-    # Use the real information-aware policy: an empty injected manifest does
-    # not supply catalog.selection and cannot authorize a first-turn decline.
+    # Inspect the real information-aware policy while the model asks its question.
     with (
         patch.object(pipeline_planner.PlannerDiscoveryPolicy, "initial", side_effect=capture_initial),
         pytest.raises(PlannerDeclined) as caught,
@@ -267,12 +266,17 @@ async def test_planner_missing_artifact_reply_can_ask_the_model_authored_focused
     assert isinstance(policy.manifest, pipeline_planner.PlannerInformationManifest)
     assert policy.manifest.supplies("catalog.selection")
     assert not policy.manifest.unresolved
-    payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    messages = completion.requests[0]["messages"]
+    # Catalog/schema reference and mixed request remain distinct owned messages.
+    assert [message["role"] for message in messages] == ["system", "user", "user"]
+    reference = json.loads(messages[1]["content"])
+    assert set(reference) == {"authoring_aids", "schema_contract_evidence"}
+    payload = json.loads(messages[2]["content"])
     assert payload["information_manifest"]["supplied"]["plugin_selection"] == "policy_snapshot"
     assert payload["information_manifest"]["unresolved"] == []
-    assert 'starting with "DECLINE: "' in completion.requests[0]["messages"][-1]["content"]
+    assert "reply in plain text" in payload["instruction"]
     rendered = completion.requests[0]["messages"][0]["content"]
     assert "In the freeform Composer" in rendered
-    assert "proposal planner, explicit `handoff_to_user` is available without the conditions" in rendered
-    assert "on the planner's `DECLINE:` prose protocol; never emit" in rendered
-    assert "`CLARIFY:` from the proposal planner." in rendered
+    assert "proposal planner, reply in ordinary text or use explicit `handoff_to_user`" in rendered
+    assert "without discovery prerequisites" in rendered
+    assert "No prefix\nis required for the proposal planner's text replies." in rendered

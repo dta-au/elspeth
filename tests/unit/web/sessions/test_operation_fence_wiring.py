@@ -497,17 +497,39 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     helper = next(node for node in helper_tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
     assert isinstance(helper.body[-1], ast.Try)
     main_try = helper.body[-1]
-    assert isinstance(main_try.body[3], ast.If)
-    title_branch = main_try.body[3]
+    title_guards = [
+        node
+        for node in main_try.body
+        if isinstance(node, ast.Assign) and [ast.unparse(target) for target in node.targets] == ["should_auto_title"]
+    ]
+    assert len(title_guards) == 1
     expected_title_guard = ast.parse(
         "not recovery_context.malformed_head and isinstance(request, SendMessageRequest) "
         "and len(records) == 1 and is_default_session_title(session.title)",
         mode="eval",
     ).body
-    assert _stable_ast_bytes(title_branch.test) == _stable_ast_bytes(expected_title_guard)
-    assert len(title_branch.body) == 4
-    title_child = title_branch.body[2]
-    assert isinstance(title_child, ast.AsyncFunctionDef) and title_child.name == "run_owned_title"
+    assert _stable_ast_bytes(title_guards[0].value) == _stable_ast_bytes(expected_title_guard)
+    invocation_tries = [
+        node
+        for node in main_try.body
+        if isinstance(node, ast.Try)
+        and any(isinstance(child, ast.If) and ast.unparse(child.test) == "should_auto_title" for child in node.body)
+    ]
+    assert len(invocation_tries) == 1
+    invocation_try = invocation_tries[0]
+    assert main_try.body.index(title_guards[0]) < main_try.body.index(invocation_try)
+    title_branches = [node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "should_auto_title"]
+    primary_branches = [
+        node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "recovery_context.malformed_head"
+    ]
+    assert len(title_branches) == len(primary_branches) == 1
+    title_branch = title_branches[0]
+    primary_branch = primary_branches[0]
+    assert invocation_try.body.index(title_branch) < invocation_try.body.index(primary_branch)
+    assert len(title_branch.body) == 7
+    title_children = [node for node in title_branch.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title"]
+    assert len(title_children) == 1
+    title_child = title_children[0]
     assert len(title_child.body) == 2 and isinstance(title_child.body[0], ast.Try)
     child_try = title_child.body[0]
     assert len(child_try.body) == 1 and isinstance(child_try.body[0], ast.Expr)
@@ -518,21 +540,59 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "session_operation_context"] == [
         ("session_operation_context", "lease.context")
     ]
-    assert isinstance(title_branch.body[3], ast.Try)
-    owned_try = title_branch.body[3]
+    assert [
+        (item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg in {"prompt_guard_mount", "prompt_guard_mode"}
+    ] == [
+        ("prompt_guard_mount", "services.composer_service.composer_prompt_guard_mount"),
+        ("prompt_guard_mode", "settings.composer_prompt_guard_mode"),
+    ]
+    assert [(item.arg, ast.unparse(item.value)) for item in title_call.keywords if item.arg == "provider_custody"] == [
+        ("provider_custody", "title_custody")
+    ]
+    owned_tries = [node for node in title_branch.body if isinstance(node, ast.Try)]
+    assert len(owned_tries) == 1
+    owned_try = owned_tries[0]
     assert len(owned_try.body) == 1 and isinstance(owned_try.body[0], ast.Assign)
     assert [ast.unparse(target) for target in owned_try.body[0].targets] == ["auto_title_task"]
     assert ast.unparse(owned_try.body[0].value) == "lease.create_task(run_owned_title())"
+    title_joins = [
+        node
+        for node in title_branch.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and ast.unparse(node.value.value.func) == "_join_auto_title"
+    ]
+    assert len(title_joins) == 1
+    title_join = title_joins[0]
+    assert title_branch.body.index(owned_try) < title_branch.body.index(title_join)
+    assert [ast.unparse(arg) for arg in title_join.value.value.args] == ["auto_title_task"]
+    assert [(item.arg, ast.unparse(item.value)) for item in title_join.value.value.keywords] == [
+        ("session_id", "turn.session_id"),
+        ("operation_id", "turn.operation_id"),
+        ("cancellation_observations", "auto_title_cancellations"),
+        ("wait_until_complete", "True"),
+    ]
 
     # Direct edges alone admit earlier returns and nested unreachable guards.
-    # Bind only the reviewed public wrapper and the executed prefix through
-    # the first-message title branch, retaining all AST fields and strings.
+    # Bind the reviewed wrapper, helper preamble, outer prefix before provider
+    # invocation, and invocation prefix through the joined title suspension.
+    # Semantic locators close earlier-return gaps without pinning list offsets.
     assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
-        "02f2e650fc7028278be731ffefe2f2f3013d7fe08c5e04ebba2c6bcb80484350"
+        "6a2ffff4fd20ec97d98e2d0bb0dc81c457af97405daf4734eea8e37ffc3cadc1"
     )
-    assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=main_try.body[:4], type_ignores=[]))).hexdigest() == (
-        "2f65c341a560baf72b0f8ba1c12a939c8724a2d7691d83690529e79413b31929"
+    assert (
+        hashlib.sha256(
+            _stable_ast_bytes(ast.Module(body=main_try.body[: main_try.body.index(invocation_try)], type_ignores=[]))
+        ).hexdigest()
+        == "e00d6b374471ab72519e2d17e8af9b0f7df4384e2d4d6473c35d6e3cd53ffe1b"
+    )
+    assert (
+        hashlib.sha256(
+            _stable_ast_bytes(ast.Module(body=invocation_try.body[: invocation_try.body.index(primary_branch)], type_ignores=[]))
+        ).hexdigest()
+        == "bfe52a9bd67375dc641dd59d0fb413b7c8c7db0602d953fe3c3d754ef1e8ab70"
     )
 
 
@@ -549,6 +609,12 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
         ("helper", "session_operation_context=lease.context", "session_operation_context=other_context"),
         ("helper", "auto_title_task = lease.create_task(run_owned_title())", "auto_title_task = asyncio.create_task(run_owned_title())"),
         ("helper", "not recovery_context.malformed_head", "True"),
+        (
+            "helper",
+            "prompt_guard_mount=services.composer_service.composer_prompt_guard_mount",
+            "prompt_guard_mount=services.composer_service.composer_advisor_prompt_guard_mount",
+        ),
+        ("helper", "prompt_guard_mode=settings.composer_prompt_guard_mode", "prompt_guard_mode='debug-when-unconfigured'"),
     ],
 )
 def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str, before: str, after: str) -> None:
@@ -560,7 +626,21 @@ def test_auto_title_ownership_rejects_foreign_lease_or_unowned_child(owner: str,
         _assert_auto_title_ownership(sources["public"], sources["helper"])
 
 
-@pytest.mark.parametrize("mutation", ["detached_inner", "unawaited_inner", "unreachable_owned", "early_return", "arbitrary_guard"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "detached_inner",
+        "unawaited_inner",
+        "unreachable_owned",
+        "early_return",
+        "arbitrary_guard",
+        "detached_join",
+        "unawaited_join",
+        "foreign_join",
+        "bounded_join",
+        "title_after_primary",
+    ],
+)
 def test_auto_title_ownership_rejects_unreached_or_unjoined_work(mutation: str) -> None:
     public_source = inspect.getsource(run_composer_turn)
     helper_source = inspect.getsource(_run_composer_turn)
@@ -569,10 +649,14 @@ def test_auto_title_ownership_rejects_unreached_or_unjoined_work(mutation: str) 
     helper = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_composer_turn")
     assert isinstance(helper.body[-1], ast.Try)
     main_try = helper.body[-1]
-    assert isinstance(main_try.body[3], ast.If)
-    branch = main_try.body[3]
-    assert isinstance(branch.body[2], ast.AsyncFunctionDef)
-    child = branch.body[2]
+    invocation_try = next(
+        node
+        for node in main_try.body
+        if isinstance(node, ast.Try)
+        and any(isinstance(statement, ast.If) and ast.unparse(statement.test) == "should_auto_title" for statement in node.body)
+    )
+    branch = next(node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "should_auto_title")
+    child = next(node for node in branch.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title")
     assert isinstance(child.body[0], ast.Try)
     title_expr = child.body[0].body[0]
     assert isinstance(title_expr, ast.Expr) and isinstance(title_expr.value, ast.Await)
@@ -588,16 +672,46 @@ def test_auto_title_ownership_rejects_unreached_or_unjoined_work(mutation: str) 
             else title_call
         )
     elif mutation in {"unreachable_owned", "arbitrary_guard"}:
-        assert isinstance(branch.body[3], ast.Try)
-        owned_try = branch.body[3]
+        owned_try = next(node for node in branch.body if isinstance(node, ast.Try))
         original = owned_try.body[0]
         owned_try.body[0] = ast.If(
             test=ast.Constant(False) if mutation == "unreachable_owned" else ast.Name(id="unreviewed_gate", ctx=ast.Load()),
             body=[original],
             orelse=[],
         )
+    elif mutation == "early_return":
+        invocation_try.body.insert(invocation_try.body.index(branch), ast.Return(value=ast.Constant(None)))
+    elif mutation == "title_after_primary":
+        primary = next(
+            node for node in invocation_try.body if isinstance(node, ast.If) and ast.unparse(node.test) == "recovery_context.malformed_head"
+        )
+        invocation_try.body.remove(branch)
+        invocation_try.body.insert(invocation_try.body.index(primary) + 1, branch)
     else:
-        main_try.body.insert(3, ast.Return(value=ast.Constant(None)))
+        join = next(
+            node
+            for node in branch.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Await)
+            and isinstance(node.value.value, ast.Call)
+            and ast.unparse(node.value.value.func) == "_join_auto_title"
+        )
+        call = join.value.value
+        if mutation == "detached_join":
+            join.value = ast.Call(
+                func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="create_task", ctx=ast.Load()),
+                args=[call],
+                keywords=[],
+            )
+        elif mutation == "unawaited_join":
+            join.value = call
+        elif mutation == "foreign_join":
+            call.args[0] = ast.Name(id="foreign_title_task", ctx=ast.Load())
+        elif mutation == "bounded_join":
+            keyword = next(item for item in call.keywords if item.arg == "wait_until_complete")
+            keyword.value = ast.Constant(False)
+        else:
+            raise AssertionError("Unknown auto-title ownership mutation")
     ast.fix_missing_locations(tree)
     with pytest.raises(AssertionError):
         _assert_auto_title_ownership(public_source, ast.unparse(tree))
@@ -619,21 +733,36 @@ def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._Paramete
     parameters = tuple(parameter for parameter in signature.parameters.values() if parameter.name != "self")
     for parameter in parameters:
         if (
-            parameter.name == "execution_input"
-            and member
-            in {
-                sessions_protocol.SessionOperationRunMutations.create_pending_run,
-                coordination_repository._RepositoryRunMutations.create_pending_run,
-            }
-        ) or (
-            parameter.name == "approval"
-            and member
-            in {
-                sessions_protocol.SessionOperationRunMutations.assess_start_admission,
-                sessions_protocol.SessionOperationRunMutations.issue_start_permit,
-                coordination_repository._RepositoryRunMutations.assess_start_admission,
-                coordination_repository._RepositoryRunMutations.issue_start_permit,
-            }
+            (
+                parameter.name == "execution_input"
+                and member
+                in {
+                    sessions_protocol.SessionOperationRunMutations.create_pending_run,
+                    coordination_repository._RepositoryRunMutations.create_pending_run,
+                }
+            )
+            or (
+                parameter.name == "remaining_output_storage_bytes"
+                and member
+                in {
+                    sessions_protocol.SessionOperationBlobMutations.retire_blob_replacement,
+                    sessions_protocol.SessionOperationBlobMutations.retire_blob_deletion,
+                    sessions_protocol.SessionOperationBlobMutations.retire_atomic_blob_deletion,
+                    coordination_repository._RepositoryBlobMutations.retire_blob_replacement,
+                    coordination_repository._RepositoryBlobMutations.retire_blob_deletion,
+                    coordination_repository._RepositoryBlobMutations.retire_atomic_blob_deletion,
+                }
+            )
+            or (
+                parameter.name == "approval"
+                and member
+                in {
+                    sessions_protocol.SessionOperationRunMutations.assess_start_admission,
+                    sessions_protocol.SessionOperationRunMutations.issue_start_permit,
+                    coordination_repository._RepositoryRunMutations.assess_start_admission,
+                    coordination_repository._RepositoryRunMutations.issue_start_permit,
+                }
+            )
         ):
             assert parameter.default is None
         else:
@@ -945,6 +1074,28 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     tuple[BlobRecord, ...],
                 ),
+                "list_run_output_storage_paths": (
+                    (("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    tuple[str, ...],
+                ),
+                "reserve_run_output_storage": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("target_path", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("size_bytes", inspect.Parameter.KEYWORD_ONLY, int),
+                        ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
+                    ),
+                    type(None),
+                ),
+                "reconcile_run_output_storage": (
+                    (
+                        ("run_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("target_path", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("size_bytes", inspect.Parameter.KEYWORD_ONLY, int),
+                        ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
+                    ),
+                    type(None),
+                ),
                 "mark_blob_deletion_staged": (
                     (("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),),
                     BlobDeletionPlan,
@@ -1031,15 +1182,24 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     bool,
                 ),
                 "retire_atomic_blob_deletion": (
-                    (("obligation", inspect.Parameter.KEYWORD_ONLY, BlobAtomicDeletionObligation),),
+                    (
+                        ("obligation", inspect.Parameter.KEYWORD_ONLY, BlobAtomicDeletionObligation),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "retire_blob_deletion": (
-                    (("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),),
+                    (
+                        ("plan", inspect.Parameter.KEYWORD_ONLY, BlobDeletionPlan),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "retire_blob_replacement": (
-                    (("plan", inspect.Parameter.KEYWORD_ONLY, BlobReplacementPlan),),
+                    (
+                        ("plan", inspect.Parameter.KEYWORD_ONLY, BlobReplacementPlan),
+                        ("remaining_output_storage_bytes", inspect.Parameter.KEYWORD_ONLY, int | None),
+                    ),
                     bool,
                 ),
                 "insert_blob_inline_resolutions": (

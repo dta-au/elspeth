@@ -76,6 +76,76 @@ service = _service_tests.service
 
 class TestAuthoritativeProofDiagnostics:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "configuration_only",
+            "availability_only",
+            "configuration_first",
+            "configuration_last",
+            "configuration_after_cap",
+        ],
+    )
+    async def test_unavailable_source_cannot_improve_independent_authoring_readiness(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        mode: str,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        path = tmp_path / "amounts.csv"
+        path.write_text("amount\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(service, session_id=session_id, blob_id=blob_id, source_path=path)
+        ready_record = blob_service.get_blob.return_value
+
+        def lookup(requested_id: UUID, *, session_operation_context: Any) -> Any:
+            assert session_operation_context.fence.session_id == str(session_id)
+            if requested_id == blob_id:
+                return ready_record
+            raise BlobNotFoundError(str(requested_id))
+
+        blob_service.get_blob.side_effect = lookup
+        unavailable_count = 0 if mode == "configuration_only" else 17 if mode == "configuration_after_cap" else 1
+        missing = {
+            f"missing_{index}": replace(
+                state.sources["source"],
+                on_success=f"unavailable_rows_{index}",
+                options={
+                    **state.sources["source"].options,
+                    "blob_ref": str(uuid4()),
+                },
+            )
+            for index in range(unavailable_count)
+        }
+        if mode == "availability_only":
+            state = replace(state, sources=missing, nodes=())
+        elif mode == "configuration_first":
+            state = replace(state, sources={**state.sources, **missing})
+        else:
+            state = replace(state, sources={**missing, **state.sources})
+        with patch("elspeth.web.execution.validation.validate_pipeline", return_value=_successful_core_validation_result()):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+        assert result.is_valid is False
+        assert result.readiness.execution_ready is False
+        assert result.readiness.completion_ready is False
+        assert result.readiness.authoring_valid is (mode == "availability_only")
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
+        if mode == "configuration_after_cap":
+            assert len(result.errors) == 16
+            assert all(error.error_code == "source_blob_unavailable" for error in result.errors)
+            assert any(blocker.code == "proof_diagnostics" for blocker in result.readiness.blockers)
+        else:
+            codes = {error.error_code for error in result.errors}
+            assert ("source_blob_unavailable" in codes) is (mode != "configuration_only")
+            assert ("gate_expression_type_mismatch_against_source_schema" in codes) is (mode != "availability_only")
+        assert blob_service.get_blob.await_count == unavailable_count + int(mode != "availability_only")
+        assert blob_service.read_blob_content_prefix_verified.await_count == int(mode != "availability_only")
+
+    @pytest.mark.asyncio
     async def test_freeform_claimed_blob_with_wrong_session_fails_closed_without_reading(
         self,
         service: ExecutionServiceImpl,
@@ -109,7 +179,8 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in result.errors] == ["source_blob_unavailable"]
+        assert result.readiness.authoring_valid is True
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
@@ -191,7 +262,8 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in result.errors] == ["source_blob_unavailable"]
+        assert result.readiness.authoring_valid is True
         blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
@@ -658,7 +730,8 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in result.errors] == ["source_blob_unavailable"]
+        assert result.readiness.authoring_valid is True
 
     @pytest.mark.asyncio
     async def test_ambiguous_blob_path_binding_fails_without_reading_bytes(
@@ -703,7 +776,8 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in result.errors] == ["source_blob_unavailable"]
+        assert result.readiness.authoring_valid is True
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 

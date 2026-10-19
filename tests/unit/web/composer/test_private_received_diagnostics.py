@@ -113,12 +113,16 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
     import httpx
     import litellm
     from openai import APIConnectionError
+    from pydantic import SecretStr
 
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.contracts.freeze import deep_thaw
     from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
+    from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
     from elspeth.web.composer.provider_gateway import ProviderGateway
     from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
     from elspeth.web.required_work import (
         RequiredAuthorityKind,
         RequiredWorkAuthority,
@@ -126,6 +130,7 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
         RequiredWorkCoordinator,
         RequiredWorkRole,
     )
+    from tests.helpers.quota_guard import assert_provider_audit_companion
     from tests.unit.web.composer.test_llm_sampling_config import _settings
     from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
 
@@ -140,7 +145,28 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
         RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
     )
     owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
-    gateway = ProviderGateway(model="test/model", settings=_settings(tmp_path), endpoint_base_url=None, endpoint_api_key=None)
+    guard_requests = []
+
+    def inspect(request):
+        body = json.loads(request.content)
+        guard_requests.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in body["documents"]],
+            },
+        )
+
+    guard_settings = PromptGuardSettings(endpoint="https://guard.example.test", subscription_key=SecretStr("synthetic-test-key"))
+    client = AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(inspect))
+    gateway = ProviderGateway(
+        model="test/model",
+        settings=_settings(tmp_path, composer_prompt_guard=guard_settings),
+        endpoint_base_url=None,
+        endpoint_api_key=None,
+    )
+    monkeypatch.setattr(gateway, "_prompt_guard_mount", PromptGuardMount(client))
     original_insert = service._insert_chat_message
     original_failure = APIConnectionError(
         message="ordinary endpoint temporarily unavailable", request=httpx.Request("POST", "https://provider.invalid")
@@ -165,13 +191,14 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
     try:
 
         async def invoke():
-            await gateway._call_llm_with_audit(
-                [{"role": "user", "content": "ordinary request"}],
-                [],
-                timeout=5,
-                recorder=None,
-                provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
-            )
+            with prompt_guard_user_scope("ordinary request"):
+                await gateway._call_llm_with_audit(
+                    [{"role": "user", "content": "ordinary request"}],
+                    [],
+                    timeout=5,
+                    recorder=None,
+                    provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY),
+                )
 
         if mode == "success_in_except":
             try:
@@ -188,15 +215,34 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
                 await invoke()
             assert caught.value is original_failure
         rows = await service.get_messages(session.id, limit=None)
+        assert len(guard_requests) == 1 and guard_requests[0]["userPrompt"] == "ordinary request"
+        assert all(row.role == "audit" for row in rows)
+        for row in rows:
+            assert_provider_audit_companion(row.tool_calls, context)
+        assert [row.tool_calls[0]["_kind"] for row in rows] == {
+            "rollback": ["prompt_guard_audit"],
+            "success_in_except": ["prompt_guard_audit", "llm_call_audit", "composer_diagnostic_evidence"],
+            "failure": ["prompt_guard_audit", "llm_call_audit", "composer_diagnostic_evidence", "composer_diagnostic_evidence"],
+        }[mode]
+        check = rows[0].tool_calls[0]["check"]
+        assert check["operation_id"] == context.fence.operation_id and check["operation_epoch"] == context.fence.operation_epoch
+        assert (check["role"], check["mode"], check["adapter"], check["disposition"], check["reason"]) == (
+            "composer",
+            "required",
+            "azure_prompt_shields",
+            "allow",
+            "clean",
+        )
+        assert check["policy_fingerprint"] == client.policy_fingerprint
         if mode == "rollback":
-            assert rows == []
+            assert len(rows) == 1
             assert _ledger(engine) == []
         elif mode == "success_in_except":
-            assert len(rows) == 2
+            assert len(rows) == 3
             assert "caller-private-canary" not in json.dumps(deep_thaw([row.tool_calls for row in rows]))
             assert len(_ledger(engine)) == 1
         else:
-            assert len(rows) == 3
+            assert len(rows) == 4
             assert "ordinary endpoint temporarily unavailable" in json.dumps(deep_thaw([row.tool_calls for row in rows]))
             public = next(row for row in rows if row.tool_calls[0].get("_kind") == "llm_call_audit")
             assert "ordinary endpoint temporarily unavailable" not in json.dumps(deep_thaw(public.tool_calls))
@@ -210,6 +256,7 @@ async def test_no_recorder_owned_provider_failure_private_checkpoint_is_atomic(t
             ]
             assert len(requests) == 1
             assert json.loads(requests[0]["arguments"]["content"])["messages"] == [{"role": "user", "content": "ordinary request"}]
+        coordinator.assert_completed()
     finally:
         authority.release(context)
         engine.dispose()

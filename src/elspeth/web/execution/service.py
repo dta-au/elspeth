@@ -23,6 +23,7 @@ import traceback
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import partial
@@ -96,6 +97,7 @@ from elspeth.web.async_workers import (
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     AllowedMimeType,
+    BlobContentMissingError,
     BlobIntegrityError,
     BlobNotFoundError,
     BlobQuotaExceededError,
@@ -165,6 +167,7 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
+from elspeth.web.execution.provider_clock import RunProviderAttemptClock
 from elspeth.web.execution.retained_inputs import read_retained_input, retain_execution_inputs, retain_source_bytes
 from elspeth.web.execution.schemas import (
     CHECK_PROOF_DIAGNOSTICS,
@@ -211,7 +214,14 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
+    from elspeth.web.composer.tools.generation import (
+        ProofEvaluated,
+        ProofNotApplicable,
+        ProofUnavailable,
+        ResolvedProofBlob,
+        UnresolvedClaimedProofBlob,
+        _AuthoritativeProofContext,
+    )
 
 slog = structlog.get_logger()
 _meter = metrics.get_meter(__name__)
@@ -363,11 +373,18 @@ def _insert_proof_check(
 
 def _merge_authoritative_proof_diagnostics(
     result: ValidationResult,
-    diagnostics: Sequence[Mapping[str, Any]],
+    proof: ProofNotApplicable | ProofEvaluated | ProofUnavailable,
 ) -> ValidationResult:
     """Append the real proof check and fail readiness on sampled blockers."""
+    from elspeth.web.composer.tools.generation import ProofEvaluated, ProofNotApplicable, ProofUnavailable
+
     if not result.is_valid:
         return result
+    if type(proof) is ProofNotApplicable:
+        return result
+    if type(proof) not in (ProofEvaluated, ProofUnavailable):
+        raise TypeError("Authoritative proof requires an owned proof outcome")
+    diagnostics = proof.diagnostics
 
     blocking = [diagnostic for diagnostic in diagnostics if diagnostic["severity"] == "blocking"]
     bounded_blocking = blocking[:_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS]
@@ -442,7 +459,9 @@ def _merge_authoritative_proof_diagnostics(
             "checks": checks,
             "errors": [*result.errors, *errors],
             "readiness": ValidationReadiness(
-                authoring_valid=False,
+                authoring_valid=result.readiness.authoring_valid
+                and type(proof) is ProofUnavailable
+                and all(diagnostic["code"] == "source_blob_unavailable" for diagnostic in blocking),
                 execution_ready=False,
                 completion_ready=False,
                 blockers=[*result.readiness.blockers, *blockers],
@@ -839,9 +858,9 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
 
     Reads the Landscape ``calls`` token columns (epoch 40): ``call_type='llm'``
     rows are the logical LLM calls, parented by a node state or by an operation;
-    transport rows never carry the charge (sso-design.md:855). The model is the
-    calling node's configured ``model`` (Azure configures ``deployment_name``),
-    and the plugin name when the node configures neither. Missing usage stays
+    transport rows never carry the charge (sso-design.md:855). Prefer the
+    provider-returned model persisted with the outcome. Calls without a
+    returned model use node configuration, then plugin name. Missing usage stays
     unknown even for errors: a dispatched timeout may already have been billed.
     Call identity and creation time preserve replay and UTC-day attribution.
     """
@@ -853,6 +872,7 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
         calls_table.c.completion_tokens,
         calls_table.c.cached_prompt_tokens,
         calls_table.c.reasoning_tokens,
+        calls_table.c.returned_model,
         nodes_table.c.plugin_name,
         nodes_table.c.config_json,
     )
@@ -880,11 +900,13 @@ def _run_token_usage_entries(landscape_db: LandscapeDB, *, landscape_run_id: str
     entries: list[TokenUsageEntry] = []
     for row in sorted([*state_calls, *operation_calls], key=lambda call: (call.created_at, call.call_id)):
         config = json.loads(row.config_json)
-        model = row.plugin_name
-        for key in ("model", "deployment_name"):
-            if key in config and config[key] is not None:
-                model = config[key]
-                break
+        model = row.returned_model
+        if model is None:
+            model = row.plugin_name
+            for key in ("model", "deployment_name"):
+                if key in config and config[key] is not None:
+                    model = config[key]
+                    break
         entries.append(
             TokenUsageEntry(
                 model=model,
@@ -1391,28 +1413,31 @@ class ExecutionServiceImpl:
         *,
         session_id: UUID | None,
         session_operation_context: SessionOperationContext,
-    ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
+    ) -> _AuthoritativeProofContext:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
         from elspeth.web.composer.tools.blobs import BlobToolRecord
-        from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
+        from elspeth.web.composer.tools.generation import (
+            MalformedSourceProofClaim,
+            ResolvedProofBlob,
+            UnresolvedClaimedProofBlob,
+            _admit_source_proof_claims,
+            _AuthoritativeProofContext,
+        )
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
         # Every authored source blob_ref is a custody claim. If its live
         # binding cannot be resolved, the bounded proof must fail closed.
         claimed_blob_ids: set[str] = set()
         expected_paths_by_blob_id: dict[str, set[str]] = {}
-        for source_name, source in state.sources.items():
-            if "blob_ref" not in source.options:
-                continue
-            raw_blob_id = source.options["blob_ref"]
-            if type(raw_blob_id) is not str:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
-            try:
-                parsed_blob_id = UUID(raw_blob_id)
-            except ValueError as exc:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a UUID") from exc
-            if str(parsed_blob_id) != raw_blob_id:
-                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Authoritative source proof requires the actual session operation context")
+        if session_id is not None and session_operation_context.fence.session_id != str(session_id):
+            raise AuditIntegrityError("Authoritative source proof context belongs to another session")
+        try:
+            claims = _admit_source_proof_claims(state)
+        except MalformedSourceProofClaim as exc:
+            raise MalformedBlobRefError(f"sources.{exc.source_name}.blob_ref must be a canonical UUID string") from exc
+        for _source_name, source, raw_blob_id in claims:
             claimed_blob_ids.add(raw_blob_id)
             paths = {
                 value
@@ -1476,13 +1501,17 @@ class ExecutionServiceImpl:
                     "creating_arguments_hash": record.creating_arguments_hash,
                 },
             )
-            verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
-                self._blob_service.read_blob_content_prefix_verified(
-                    parsed_blob_id,
-                    prefix_bytes=8 * 1024,
-                    session_operation_context=session_operation_context,
+            try:
+                verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
+                    self._blob_service.read_blob_content_prefix_verified(
+                        parsed_blob_id,
+                        prefix_bytes=8 * 1024,
+                        session_operation_context=session_operation_context,
+                    )
                 )
-            )
+            except (BlobNotFoundError, BlobContentMissingError, BlobStateError):
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             resolved = ResolvedProofBlob(
                 metadata=metadata,
                 verified_prefix=verified_prefix,
@@ -1492,7 +1521,7 @@ class ExecutionServiceImpl:
             resolved_by_blob_id[blob_id] = resolved
             return resolved
 
-        return _resolve
+        return _AuthoritativeProofContext(resolve=_resolve)
 
     def _authoritative_state_preflight_sync(
         self,
@@ -1548,8 +1577,7 @@ class ExecutionServiceImpl:
 
         diagnostics = compute_proof_diagnostics(
             state,
-            session_id=str(session_id) if session_id is not None else None,
-            blob_resolver=self._authoritative_proof_blob_resolver(
+            context=self._authoritative_proof_blob_resolver(
                 state,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
@@ -3951,6 +3979,11 @@ class ExecutionServiceImpl:
             session_operation_lease.guard_external_effect()
             if landscape_db is None:
                 landscape_db = open_landscape_db(self._settings)
+            if resume_existing:
+                # Replay committed outcomes before the resumed executor can
+                # request another admission. This is independent of whether
+                # the previous worker received its settlement receipt.
+                self._record_run_token_usage(run_uuid, session_operation_lease, landscape_db=landscape_db, landscape_run_id=run_id)
 
             # Fold aggregations into transforms, assemble PipelineConfig, and
             # run the four orchestrator route-target validators. The
@@ -4075,6 +4108,7 @@ class ExecutionServiceImpl:
                 telemetry_manager = create_telemetry_manager(telemetry_config)
             checkpoint_manager = CheckpointManager(landscape_db) if checkpoint_config.enabled or resume_existing else None
 
+            provider_clock = RunProviderAttemptClock()
             orchestrator = Orchestrator(
                 db=landscape_db,
                 event_bus=event_bus,
@@ -4084,7 +4118,7 @@ class ExecutionServiceImpl:
                 checkpoint_config=checkpoint_config,
                 telemetry_manager=telemetry_manager,
                 llm_call_governance=LLMCallGovernance(
-                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease),
+                    before_call=partial(self._admit_run_llm_call, run_uuid, session_operation_lease, clock=provider_clock),
                     after_call=partial(
                         self._settle_run_llm_call,
                         run_uuid,
@@ -4092,6 +4126,7 @@ class ExecutionServiceImpl:
                         landscape_db=landscape_db,
                         landscape_run_id=run_id,
                     ),
+                    outcome_timestamp=provider_clock.timestamp_for_outcome,
                 ),
             )
 
@@ -4122,56 +4157,62 @@ class ExecutionServiceImpl:
                 )
 
             session_operation_lease.guard_external_effect()
-            if resume_existing:
-                assert checkpoint_manager is not None
-                if checkpoint_manager.get_latest_checkpoint(run_id) is None:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
-                lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
-                if not lifecycle.check.can_resume:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
-                recovery = RecoveryManager(landscape_db, checkpoint_manager)
-                resume_point = recovery.get_resume_point(run_id, graph)
-                if resume_point is None:
-                    raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
-                result = orchestrator.resume(
-                    resume_point,
-                    pipeline_config,
-                    graph,
-                    payload_store=payload_store,
-                    settings=settings,
-                    shutdown_event=shutdown_event,
-                    pre_effect_guard=session_operation_lease.guard_external_effect,
-                    check_coordination_latch=session_operation_lease.guard_external_effect,
-                )
-            else:
-                result = orchestrator.run(
-                    pipeline_config,
-                    graph=graph,
-                    settings=settings,
-                    payload_store=payload_store,
-                    audit_export_content_store=audit_export_content_store,
-                    audit_export_content_store_resolver=audit_export_content_store_resolver,
-                    secret_resolutions=secret_resolution_inputs or None,
-                    shutdown_event=shutdown_event,  # B2: NEVER omit this
-                    sink_factory=make_policy_bound_sink_factory(
-                        settings,
-                        plugin_snapshot=plugin_snapshot,
-                    ),
-                    run_id=run_id,
-                    initiated_by_user_id=user_id,
-                    auth_provider_type=auth_provider_type,
-                    openrouter_catalog_sha256=catalog_sha,
-                    openrouter_catalog_source=catalog_source,
-                    web_plugin_policy_evidence=replace(
-                        restored_envelope.web_plugin_policy_evidence
-                        if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
-                        else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
-                        admission_decision=admission_decision,
-                    ),
-                    check_coordination_latch=session_operation_lease.guard_external_effect,
-                    pre_effect_guard=session_operation_lease.guard_external_effect,
-                    run_start_permit=run_start_permit,
-                )
+            output_admission = (
+                self._blob_service.run_output_write_admission(run_uuid, session_operation_context=session_operation_context)
+                if self._blob_service is not None
+                else nullcontext()
+            )
+            with output_admission:
+                if resume_existing:
+                    assert checkpoint_manager is not None
+                    if checkpoint_manager.get_latest_checkpoint(run_id) is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.MISSING_BASELINE)
+                    lifecycle = check_source_lifecycle_resumable(landscape_db, run_id)
+                    if not lifecycle.check.can_resume:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.INCOMPLETE_SOURCE)
+                    recovery = RecoveryManager(landscape_db, checkpoint_manager)
+                    resume_point = recovery.get_resume_point(run_id, graph)
+                    if resume_point is None:
+                        raise _RunRecoveryRequired(RecoveryRequiredReason.COMPATIBILITY_MISMATCH)
+                    result = orchestrator.resume(
+                        resume_point,
+                        pipeline_config,
+                        graph,
+                        payload_store=payload_store,
+                        settings=settings,
+                        shutdown_event=shutdown_event,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                    )
+                else:
+                    result = orchestrator.run(
+                        pipeline_config,
+                        graph=graph,
+                        settings=settings,
+                        payload_store=payload_store,
+                        audit_export_content_store=audit_export_content_store,
+                        audit_export_content_store_resolver=audit_export_content_store_resolver,
+                        secret_resolutions=secret_resolution_inputs or None,
+                        shutdown_event=shutdown_event,  # B2: NEVER omit this
+                        sink_factory=make_policy_bound_sink_factory(
+                            settings,
+                            plugin_snapshot=plugin_snapshot,
+                        ),
+                        run_id=run_id,
+                        initiated_by_user_id=user_id,
+                        auth_provider_type=auth_provider_type,
+                        openrouter_catalog_sha256=catalog_sha,
+                        openrouter_catalog_source=catalog_source,
+                        web_plugin_policy_evidence=replace(
+                            restored_envelope.web_plugin_policy_evidence
+                            if restored_envelope is not None and restored_envelope.web_plugin_policy_evidence is not None
+                            else _build_web_plugin_policy_evidence(snapshot=plugin_snapshot, policy=self._web_plugin_policy),
+                            admission_decision=admission_decision,
+                        ),
+                        check_coordination_latch=session_operation_lease.guard_external_effect,
+                        pre_effect_guard=session_operation_lease.guard_external_effect,
+                        run_start_permit=run_start_permit,
+                    )
 
             # Orchestrator.run() returns normally ONLY on completion.
             # If shutdown was requested, it raises GracefulShutdownError
@@ -4787,13 +4828,21 @@ class ExecutionServiceImpl:
                 )
         return None
 
-    def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
+    def _admit_run_llm_call(
+        self,
+        run_uuid: UUID,
+        session_operation_lease: SessionOperationLease,
+        *,
+        clock: RunProviderAttemptClock | None = None,
+    ) -> str:
         """Persist an admitted pending attempt before the provider can spend."""
         session_operation_lease.guard_external_effect()
         attempt = self._session_service.begin_run_provider_attempt_sync(
             session_operation_context=session_operation_lease.context,
             run_id=run_uuid,
         )
+        if clock is not None:
+            clock.bind(attempt)
         return attempt.attempt_id
 
     def _settle_run_llm_call(

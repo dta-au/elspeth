@@ -35,6 +35,8 @@ from elspeth.web.composer.redaction import (
     _STABLE_RESPONSE_SENTINELS,
     MANIFEST,
     CreateBlobArgumentsModel,
+    ReadAttachmentArgumentsModel,
+    ReadAttachmentResponseModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
     _SensitiveMarker,
@@ -45,6 +47,22 @@ from elspeth.web.composer.redaction import (
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 _CONTAINER_PATH_MARKERS = ("[*]", "{*}")
+
+
+def test_read_attachment_strategies_cover_optional_hash_and_both_response_outcomes():
+    arguments = st.from_type(ReadAttachmentArgumentsModel)
+    omitted = find(arguments, lambda value: "expected_content_hash" not in value.model_fields_set)
+    supplied = find(arguments, lambda value: value.expected_content_hash is not None)
+    null = find(arguments, lambda value: "expected_content_hash" in value.model_fields_set and value.expected_content_hash is None)
+    assert "expected_content_hash" not in omitted.model_dump(exclude_unset=True)
+    assert supplied.expected_content_hash is not None and len(supplied.expected_content_hash) == 64
+    assert null.expected_content_hash is None
+    responses = st.from_type(ReadAttachmentResponseModel)
+    success = find(responses, lambda value: value.success)
+    failure = find(responses, lambda value: not value.success and value.data is None)
+    assert success.data is not None and success.data.end_char == success.data.total_chars
+    assert success.data.start_char == 0 and success.data.next_offset_chars is None and not success.data.truncated
+    assert failure.data is None
 
 
 @pytest.mark.parametrize(

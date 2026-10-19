@@ -409,6 +409,7 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # True when the plugin reads ``ctx.aggregation_batch``, which only an
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
+    requires_complete_source_batch: bool
 
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape
@@ -707,6 +708,7 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # True when the plugin reads ``ctx.aggregation_batch``, which only an
     # aggregation flush supplies; runtime_factory refuses it as a collector.
     requires_aggregation_batch_context: bool
+    requires_complete_source_batch: bool
 
     # True when every successful flush emits exactly one row per buffered row
     # (success_multi, buffered order, no quarantined_indices): the only shape

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -74,13 +75,18 @@ def _planner_thread(
     return rows
 
 
-def test_pair_routing_precondition_and_fingerprint() -> None:
+def test_wording_can_no_longer_establish_a_paired_surface_probe() -> None:
     for name in pp.PROBE_FIXTURES:
-        pp.assert_pair_routes(pp.load_fixture(name)["intent"])  # both arms dry-run to their surface offline
-    with pytest.raises(pp.ProbeUnpaired):
-        pp.assert_pair_routes("I have some products and want to score them")  # never routes to the planner
-    assert len(pp.classifier_fingerprint()) == 64
+        with pytest.raises(pp.ProbeUnpaired, match="wording no longer selects"):
+            pp.assert_pair_routes(pp.load_fixture(name)["intent"])
+    with pytest.raises(pp.ProbeUnpaired, match="wording no longer selects"):
+        pp.assert_pair_routes("I have some products and want to score them")
     assert set(pp.TRIPWIRE_FIXTURES) <= set(pp.PROBE_FIXTURES) and len(pp.PROBE_FIXTURES) == 10
+
+
+def test_historical_fingerprint_key_binds_current_structural_router() -> None:
+    router = pp.REPO / "src/elspeth/web/composer/service.py"
+    assert pp.classifier_fingerprint() == hashlib.sha256(router.read_bytes()).hexdigest()
 
 
 def test_required_information_floor() -> None:

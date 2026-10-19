@@ -30,6 +30,18 @@ def _make_observed_schema() -> dict[str, str]:
 
 _TRANSFORM_REJECTION_CASES = [
     pytest.param(
+        "batch_duplicate_annotator",
+        {
+            "schema": _make_observed_schema(),
+            "rules": [
+                {"name": "same_rule", "cells": [{"field": "first_text"}]},
+                {"name": "same_rule", "cells": [{"field": "second_text"}]},
+            ],
+        },
+        "Duplicate rule names must be distinct",
+        id="batch_duplicate_annotator-duplicate-rule-names",
+    ),
+    pytest.param(
         "llm",
         {
             "provider": "azure",

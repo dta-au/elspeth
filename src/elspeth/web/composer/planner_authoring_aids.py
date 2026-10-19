@@ -44,19 +44,15 @@ from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
 from elspeth.plugins.infrastructure.manager import untrusted_content_transform_names
 
-# The model-catalog aid restates what ``list_models`` serves, so it reads the
-# SAME accessors that tool reads (``tools/generation.py`` imports this exact
-# module) rather than re-deriving OpenRouter's slug normalisation. The
-# authorable-provider vocabulary comes from the two live ``provider``
-# discriminators themselves, so a new provider variant cannot leave the aid
-# behind.
+# The explicit model-catalog projection uses the same accessors as
+# ``list_models``. It remains available to callers, but is not injected into
+# every authoring request: profile-bound authors need only the live aliases.
 from elspeth.plugins.sources.llm.config import LLMSourceConfig
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.model_catalog import (
     MODEL_CATALOG_OPENROUTER,
     OPENROUTER_LITELLM_PREFIX,
     read_litellm_model_list,
-    read_openrouter_catalog_snapshot_id,
 )
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
@@ -407,7 +403,7 @@ _SOURCE_CUSTODY_RULES: Final[tuple[str, ...]] = (
     "it via inline_blob, stage the invented_source interpretation review, "
     "and narrate it in FIRST PERSON — 'I generated this content as you "
     "asked' — never as something 'the system' produced or you found. "
-    "Reading a blob you authored this turn back through get_blob_content "
+    "Reading a blob you authored this turn back through get_blob_content or read_attachment "
     "does not make its content external.",
 )
 
@@ -419,16 +415,16 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     # run-3 E1: the old unconditional fork-over-queries preference produced a
     # wrong-topology V-pass and 0/3 multi_query adoption where it fit. Shape
     # SELECTION is decided by what varies per assessment, not by preference.
-    "SHAPE SELECTION: several assessments of the SAME input field (aspects, "
-    "angles, questions about one piece of content) belong on a SINGLE llm "
-    "node's queries map (multi_query) — one node, one pass, prefixed output "
-    "fields. Use THIS fork/coalesce shape only when the branches take "
-    "genuinely INDEPENDENT inputs or independent per-branch processing "
-    "chains (different fields, different upstream transforms, different "
-    "plugins per branch).",
-    "When the user explicitly asks for separate nodes or one model call per "
-    "branch over independent inputs, fork with a gate fanning out to one "
-    "branch transform per branch, rejoined by a coalesce.",
+    "SHAPE SELECTION: for several assessments of the SAME row using "
+    "compatible node-wide model, system prompt and sampling settings, prefer "
+    "a SINGLE llm node with named queries when separate nodes were not requested. "
+    "For a sequence, use a queries list and query_input_mode: ordered; later queries may explicitly bind earlier validated outputs. "
+    "Each query remains a separate model call. Preserve "
+    "requested separate branches even when their input is the same. Use "
+    "fork/coalesce when branch settings, inputs or processing chains differ.",
+    "When the user explicitly asks for separate branches or one model call per "
+    "branch, fork with a gate fanning out to one branch transform per branch, "
+    "rejoined by a coalesce; do not compact away the requested topology.",
     "Key the coalesce branches map by FORK BRANCH NAME; each value names the "
     "connection arriving at the coalesce after that branch's transforms.",
     "When branches rejoin at a coalesce, each branch transform MUST publish "
@@ -443,10 +439,14 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
     # only, and a planner asked for an A/B of two prompts cloned it key for
     # key — both arms shipped with no system prompt.
-    "Every llm node carries BOTH prompt roles: options.system_prompt (the "
-    "model's role and task constraints) and options.prompt_template (the row "
-    "data and the requested reply). Validation rejects an llm node missing "
-    "either. When the user supplies only one role, keep theirs verbatim and "
+    "Every llm node needs BOTH prompt roles: options.system_prompt (the "
+    "model's role and task constraints) and an effective user template for "
+    "the row data and requested reply. In single-prompt mode use "
+    "options.prompt_template. In multi_query, each query's template may "
+    "supply the user role, with options.prompt_template as the fallback; a "
+    "node-level template is unnecessary when every query supplies its own. "
+    "Validation rejects missing effective roles. When the user supplies only "
+    "one role, keep theirs verbatim and "
     "author the other from the task, or ask. Arms that differ only in role or "
     "persona keep the SAME prompt_template and vary system_prompt — which is "
     "itself a reason to fork: system_prompt is shared by every query on a "
@@ -465,11 +465,11 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "via prompt_template_parts, registered pipeline_decision, "
     "invented_source), each in the short form {kind, user_term, draft} with "
     "user_term mandatory.",
-    "Coalesce policy and merge are the engine's closed vocabularies: policy "
-    "is one of require_all, quorum, best_effort, first; merge is one of "
-    "union, nested, select. Use best_effort when some branches may "
-    "legitimately produce no row for an id — it merges whichever branches "
-    "arrive, where require_all would drop the whole row.",
+    "Composer-authored coalesces support policy require_all, best_effort "
+    "(requires timeout_seconds), or first, and merge union or nested. Engine "
+    "quorum/select require fields this surface cannot author. Use best_effort "
+    "with an explicit timeout when partial branch arrival is intended; it "
+    "merges arriving branches where require_all would drop an incomplete row.",
     "A coalesce consumes ONLY the connections named in its branches values. "
     "Its input field is required by the schema but is not a consuming "
     "binding — set it to the first branch's arriving connection by "
@@ -599,17 +599,10 @@ def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> lis
     can sit on an error branch, so a quarantine sink stays an operator
     decision. A selection whose required bindings only exist as placeholder
     exemplars cannot be auto-wired, so that posture keeps the manual-wiring
-    mandate.
+    mandate. The common controlled-error rules retain the eligible enclosing
+    closer exception and the operator tradeoff without suggesting policy evasion.
     """
-    on_error_rule = (
-        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
-        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
-        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
-        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
-        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
-        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
-        "CLI/batch runtime), never something to author around.",
-    )
+    on_error_rule = _llm_on_error_rules(output_control=safety_plugin)
     if auto_wired:
         return [
             f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
@@ -632,44 +625,18 @@ def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> lis
 
 
 def _raw_html_cleanup_rules(*, untrusted_producers: tuple[str, ...]) -> list[str]:
-    """Raw-HTML cleanup review rules quoting the registered constants verbatim.
-
-    run-2 G6: the shield draft shipped verbatim (reproduced 3/3) while the
-    cleanup draft did not — sims paraphrased and the contract's marker
-    recognition ("raw html" + "fingerprint" substrings) treated the row as
-    absent, re-firing interpretation_review_contract_unsatisfied. Same
-    imported-constants discipline as the shield rules.
-    """
+    """Teach the structured review identity and a descriptive draft example."""
     producers = " or ".join(sorted(untrusted_producers))
     return [
         f"When a field_mapper with select_only=true drops {producers} raw fields "
         "(raw content / fingerprint) before the sink, stage the cleanup review ON "
         "THAT field_mapper node: one pending pipeline_decision entry in its "
         "options.interpretation_requirements (a SIBLING of mapping, never inside it).",
-        f'Use exactly: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}} '
-        "— copy the user_term and draft strings verbatim.",
-        "The row is RECOGNIZED only when the draft text names both the raw HTML "
-        "and the fingerprint fields — a paraphrased draft is treated as absent "
-        "and the same rejection fires again.",
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. "
+        f'Example review row: {{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}.',
         "An explicit user instruction to drop the fields does NOT waive the row — it records that decision for the audit trail.",
     ]
-
-
-_WEB_SCRAPE_HTTP_IDENTITY_RULES: Final[tuple[str, ...]] = (
-    # run-3 E3 (mechanical half; hard-fail-vs-review doctrine is an operator
-    # item — enforcement is NOT changed here).
-    "http.abuse_contact and http.scraping_reason are IDENTITY CLAIMS made to "
-    "remote site operators. Bind them ONLY from identities discoverable in "
-    "this session — operator-provided discovery facts, session context, or "
-    "the user's own words — copied verbatim.",
-    "If no discoverable identity exists, OMIT the http block entirely and "
-    "name the gap in metadata.description; the coded rejection for a missing "
-    "required block is the correct outcome. NEVER invent a plausible "
-    "identity: validation enforcement is reserved-list-only (known-reserved "
-    "domains hard-fail), so a fabricated contact can pass validation and "
-    "SHIP a false claim — passing the validator does not make it yours to "
-    "assert.",
-)
 
 
 _USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
@@ -689,9 +656,16 @@ _USER_DISCLOSURE_RULES: Final[tuple[str, ...]] = (
     "model behind a profile only when the current session's served evidence supplies that binding; otherwise "
     "say the profile is operator-managed and the concrete model is not exposed here. Never infer a model or "
     "version from an alias. Operator custody exempts a profile from model-choice approval, not disclosure.",
-    "Explain the saved failure policies before asking the user to proceed. For on_error='discard', "
-    "on_validation_failure='discard', or on_write_failure='discard', identify which rows can be absent from "
-    "the output while their failure remains recorded in the audit trail. A require_all merge needs every "
+    "Explain effective saved failure policies before asking the user to proceed. Discard routing can omit rows; "
+    "inspect the selected plugin's schema and assistance before declaring a requested retention policy unsupported. "
+    "CSV require_all_rows=true makes row refusal fail preparation; on_write_failure is still required, and discard does not override it. "
+    "A route named fail is not a stop enum. "
+    "include_audit_context=true requires require_all_rows=true, observed schema, normalized/default headers and mode=write. "
+    "It retains actual run/row/token identity, outcome/path, an audit error reference and the complete carried row_json; "
+    "It synthesizes no readable business reason. Author required readable reasons only from evidence available "
+    "through a supported producer and processing path. If a failure path exposes only an audit reference, "
+    "disclose that gap; do not invent a reason or claim full retention/report compliance. "
+    "Neither option rolls back prior publications. A require_all merge needs every "
     "branch: if one branch is lost, that input has a recorded failed merge and no combined output row. "
     "Do not promise all input rows reach the CSV when those policies permit missing rows. Describe a named "
     "failure sink instead when that is the configured policy; do not claim quarantine exists when it does not.",
@@ -728,14 +702,12 @@ def _model_custody_rules(profile_alias: str | None) -> list[str]:
     else:
         rules.append(
             "No llm operator profile is currently usable in this deployment: "
-            "bind a model only through a literal slug a served catalog carries "
-            "— the authoring_aids model_catalog section for this request, or a "
-            "list_models result in THIS session."
+            "bind a model only through a literal slug from a fresh list_models "
+            "result in THIS session."
         )
     rules.append(
-        "Author options.model ONLY with a slug a served catalog carries — the "
-        "authoring_aids model_catalog section, or a list_models result — "
-        "never invented, never recalled from training. A literal slug "
+        "Author options.model ONLY with a slug from a fresh list_models result, "
+        "never invented or recalled from training. A literal slug "
         "auto-stages the llm_model_choice review, which must be surfaced and "
         "resolved before the pipeline can run."
     )
@@ -774,33 +746,30 @@ _LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
     "quarantine sink instead of discard."
 )
 
-# Rendered with the deployment's selected output control. A quarantine sink is
-# genuinely unavailable to an llm node here: on_error may only name a sink or
-# 'discard' (core/dag/builder.py:1108), so no control transform can be
-# interposed on an error branch, and any sink it names is an uncontrolled write.
+# Direct error-to-sink routes before the selected output control bypass it.
+# The enclosing-closer exception does not waive topology or control coverage.
 _LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE: Final[str] = (
     "This deployment REQUIRES the {control} control on every path carrying llm "
-    "output, so an llm node's on_error MUST be 'discard'. An on_error edge "
-    "names a SINK (or 'discard') and nothing else — no control transform can "
-    "sit on an error branch — so a quarantine sink for an llm node is an "
-    "uncontrolled write path and the pipeline is rejected. Do NOT try to wire "
-    "{control} onto the error branch; that connection has no producer and fails "
-    "graph construction. The same applies to any transform between the llm node "
-    "and the {control} transform; downstream OF that control, on_error may name "
-    "a quarantine sink normally, as may transforms that never carry llm output."
+    "output. Before that control, use on_error='discard' rather than a direct "
+    "quarantine sink: that sink would be an uncontrolled write path and is rejected. "
+    "An arbitrary processing transform cannot consume an on_error route, so do not "
+    "try to insert {control} directly on that route. A transform or gate inside a "
+    "valid bound region may divert loss to its enclosing closer; this exception "
+    "still must satisfy topology and required-control coverage and does not "
+    "authorize an uncontrolled sink. The same coverage rule applies to transforms "
+    "between the llm node and {control}. Downstream OF that control, or for "
+    "transforms that never carry llm output, a quarantine sink may be eligible."
 )
 
-# The author cannot satisfy "retain the failed rows" here, so the rule names who
-# can. Without this the planner reads the requirement as a bug and burns its
-# repair budget re-attempting quarantine shapes.
+# Name the tradeoff when the supported controlled topology requires discard.
 _LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE: Final[str] = (
     "'discard' costs the failed row's CONTENT, not the record of it: nothing "
     "reaches a sink to inspect later, while the audit trail still records the "
-    "row's terminal outcome and content hash. If the user needs failed llm rows "
-    "preserved in a quarantine sink, say plainly that this is an operator "
-    "decision, not something to author around — the operator relaxes the "
-    "{control} control mode to 'recommend', or the pipeline runs under the "
-    "CLI/batch runtime. Do not keep re-attempting quarantine shapes."
+    "row's terminal outcome and content hash. If failed llm rows must be "
+    "preserved and no supported topology satisfies the required {control} "
+    "coverage, disclose that limitation and ask the operator for a supported "
+    "workflow or an explicit policy decision. Never relax the control or switch "
+    "execution surfaces to evade it. Do not keep re-attempting rejected quarantine shapes."
 )
 
 
@@ -819,7 +788,7 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "(default llm_response). Asking for JSON or named keys in free text alone does NOT "
     "create row fields. Configured output_fields extracts and types the named fields.",
     "options.required_input_fields names upstream columns and bounds the row visible to templates. "
-    "Never require this node's generated outputs as upstream inputs. The plugin derives generated "
+    "Node-level required_input_fields names only upstream inputs; ordered query input_fields may bind earlier generated outputs internally. The plugin derives generated "
     "field names and types from response_field and output_fields. options.schema.fields can declare "
     "output types (ADR-050); schema alone does not extract fields from a reply. Upstream pass-through "
     "guarantees come from the upstream producer.",
@@ -834,16 +803,21 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # prompt fed reference_join key_field with on_miss:fail + on_error:
     # discard — one 'Billing.' or lowercase reply silently drops the row.
     # The API-native constraint exists and was untaught.
-    "When an llm node's output field feeds a downstream EXACT-MATCH "
-    "consumer — a reference_join key_field, a gate condition comparing "
-    "against literals, or any lookup key — declare that field via "
+    "When an llm node's output field must match a known CLOSED STRING "
+    "VOCABULARY — for example a reference_join label key or an exact-label "
+    "gate condition — declare that field via "
     "output_fields with type: 'enum' and the closed values list, and set "
-    "response_format: 'structured' so the constraint is API-enforced "
-    "(off-vocabulary replies become structurally impossible). Never rely "
-    "on a free-text prompt instruction for a value another node matches "
+    "response_format: 'structured' to request a native schema where the "
+    "provider supports it. ELSPETH validates the reply and rejects invalid "
+    "values; do not assume off-vocabulary replies are impossible. Numeric "
+    "threshold fields retain their numeric type; open-domain identifiers "
+    "retain their actual schema type rather than an invented enum. Validate "
+    "them and choose a suitable miss policy. Never rely only "
+    "on a free-text prompt instruction for a closed label another node matches "
     "exactly: reference_join has no normalization option, so one "
-    "mis-spelled, punctuated, or re-cased reply errors the join and, "
-    "under on_error: 'discard', silently drops the row.",
+    "mis-spelled, punctuated, or re-cased reply can miss the lookup. The "
+    "reference_join on_miss policy chooses fail, null or default; with fail, "
+    "the row follows on_error, and discard is audited row loss.",
     # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
     # widened field_mapper AND the sink's fixed schema to 'any' instead of
     # narrowing once at a type_coerce.
@@ -868,20 +842,23 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # fields, so downstream nodes can require them by exact name.
     "Each query key names its output row fields by PREFIX: the raw reply "
     "lands in <query_key>_<response_field>, and each typed output_fields "
-    "entry lands in <query_key>_<suffix>. Downstream mappers and sinks "
-    "reference those exact prefixed names.",
+    "entry defaults to <query_key>_<suffix>. Per-query structured_output_prefix null/omitted keeps that default; "
+    "empty string publishes the bare suffix; a nonempty ASCII identifier stem (at most 64 characters) publishes <stem>_<suffix>. "
+    "This changes only structured row-field names, never response JSON keys or raw/usage/model names. "
+    "Any non-null override requires unique final generated names across ALL queries, including raw/usage/model fields. "
+    "Downstream mappers and sinks reference the exact published names.",
     # run-4 E1: the CLOSED per-query key set + namespace arbitration.
     # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,
     # and list-form name — all valid QueryDefinition keys — so the rule
     # forbade supported configuration by omission and steered planners to
     # drop it or produce a nameless list entry validation rejects.
     "The per-query keys you author are input_fields (REQUIRED), template, "
-    "output_fields, response_format ('standard' or 'structured'; default "
+    "output_fields, structured_output_prefix, response_format ('standard' or 'structured'; default "
     "standard), and max_tokens (a per-query override of the node-level "
     "max_tokens). In mapping form the mapping key supplies the query name; "
     "in LIST form each entry additionally REQUIRES its own name key. There "
     "is NO per-query response_field or schema — output naming comes "
-    "from the query-key prefix and output_fields suffix. Node-level schema output declarations use "
+    "from the query-key prefix (or explicit structured_output_prefix for structured outputs) and output_fields suffix. Node-level schema output declarations use "
     "the exact generated names and must admit the configured output_fields types.",
     "For example, two queries good_colour_pair and approximate_hex can each map input_fields "
     "{shade: colour} and declare output_fields [{suffix: answer, type: string}]. The LLM input "
@@ -1952,11 +1929,10 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "Entries carry no worked example; the worked shapes validated for this "
     "deployment are the other authoring_aids sections. "
     "You rarely need list_sources/list_transforms/"
-    "list_sinks calls. Model identifiers still come only from a served "
-    "catalog — the model_catalog section beside this one, or a list_models "
-    "result — never from training. A model catalog is a session snapshot and "
-    "can become stale, so refresh it through list_models before binding a "
-    "literal model the served catalog does not carry; blob/secret "
+    "list_sinks calls. Literal model identifiers come only from a fresh "
+    "list_models result, never from training. Usable operator-profile aliases "
+    "are already listed for each plugin; profile-bound authoring needs no "
+    "model-catalog lookup. Blob/secret "
     "discovery is unchanged. Use "
     "get_plugin_assistance and explain_validation_error for structured "
     "repair when a proposal is rejected."
@@ -1994,16 +1970,13 @@ def _model_catalog_size(catalog: _ModelCatalog) -> int:
 
 
 def planner_model_catalog() -> _ModelCatalog:
-    """Project the model catalog the models listing serves for this process.
+    """Explicit compatibility projection of the process model catalog.
 
-    Targets the discovery turn every llm-node intent paid for a catalog that is
-    deployment-static and already policy-visible to this same provider through
-    the models listing. The listing is two-mode: without a provider argument it
-    returns provider names and counts plus a hint to call again, so an author
-    that does not already know the provider paid TWO turns. Both modes are
-    restated here — ``provider_model_counts``/``total_models`` are the
-    unfiltered mode verbatim, ``models_by_provider`` the filtered mode's
-    identifier lists — so neither turn is needed to bind a slug.
+    This helper is retained for callers that explicitly request the projection;
+    it no longer rides in every authoring request. Literal-model authoring uses
+    ``list_models``; profile-bound authoring uses policy-visible aliases.
+    ``provider_model_counts``/``total_models`` retain the unfiltered listing's
+    counts, and ``models_by_provider`` retains its filtered identifier lists.
 
     Identifiers are grouped on the same ``provider/`` segment the unfiltered
     mode groups on, which is what keeps each carried list exactly as long as
@@ -2079,20 +2052,6 @@ def planner_model_catalog() -> _ModelCatalog:
     return catalog
 
 
-_MODEL_CATALOG_GUIDANCE: Final[str] = (
-    "Current at prompt build, this is the catalog list_models serves. Bind a "
-    "served models_by_provider slug directly, with no discovery call. "
-    "provider_model_counts and total_models include every known provider; "
-    "absence from models_by_provider means identifiers were not carried. "
-    "authorable_providers is the closed llm provider-option set; only its "
-    "identifiers are carried or authorable. An authorable provider absent from "
-    "provider_model_counts has no catalogued identifiers: its endpoints are "
-    "operator-configured. Each models_omitted entry names an over-budget "
-    "provider with model_count and details_via; follow that marker before "
-    "binding its slug. Never invent a slug or recall one from training: "
-    "preflight rejects an unserved slug."
-)
-
 _EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (
     "This is the expression syntax reference for gate conditions and "
     "value_transform expressions, verbatim from the same reference the "
@@ -2142,43 +2101,13 @@ def planner_expression_grammar() -> _ExpressionGrammarAid:
     return aid
 
 
-def _llm_source_generation_rules(*, profile_alias: str | None, output_control: str | None) -> list[str]:
-    """Source-native LLM guidance for pipelines that begin with generation."""
-    rules = [
-        "For a generation-first pipeline with no input rows, use source:llm. "
-        "Do not fabricate a seed/null row or add an upstream source plus a transform merely to trigger one model call.",
-        "One successful authored prompt emits exactly one source row. The text lands in options.response_field "
-        "(default llm_response), with <response_field>_usage and <response_field>_model appended automatically.",
-        "The prompt is static with respect to pipeline rows: no incoming row exists and {{ row... }} is invalid. "
-        "Use options.lookup for explicit authored values and reference them through {{ lookup... }}; Jinja globals are also available.",
-        "Prompt Shield is not applicable to this static author-authored source prompt. Content Safety still applies downstream "
-        "to the generated row when deployment policy requires it.",
-        "A model catalog — the authoring_aids model_catalog section or a list_models result — is a session snapshot and can "
-        "become stale; refresh through list_models before binding a literal model the served catalog does not carry on a "
-        "trained-operator/provider-form surface. Never invent or recall a model identifier from training.",
+def _llm_source_generation_rules(*, output_control: str) -> list[str]:
+    """Retain the deployment-specific source failure rule beside JIT schemas."""
+    return [
+        f"This deployment REQUIRES the {output_control} Content Safety control for generated output. Set "
+        "options.on_validation_failure to 'discard': a non-discard source validation exit cannot be placed downstream "
+        "of the control and is rejected as an uncontrolled output path.",
     ]
-    if profile_alias is not None:
-        rules.append(
-            f"This deployment serves source:llm through the operator profile alias '{profile_alias}'. Set options.profile to "
-            "that alias and omit provider/model/credential fields; operator policy owns those private bindings."
-        )
-    else:
-        rules.append(
-            "No source:llm operator profile is currently usable. On a trained-operator surface, bind a literal model only "
-            "from a fresh list_models result; on the web surface, ask the operator to provide a usable profile."
-        )
-    if output_control is not None:
-        rules.append(
-            f"This deployment REQUIRES the {output_control} Content Safety control for generated output. Set "
-            "options.on_validation_failure to 'discard': a non-discard source validation exit cannot be placed downstream "
-            "of the control and is rejected as an uncontrolled output path."
-        )
-    else:
-        rules.append(
-            "Set options.on_validation_failure explicitly. Use 'discard' for intentional dropping; a named sink retains "
-            "invalid generated rows only when deployment control policy permits that path."
-        )
-    return rules
 
 
 def source_custody_exemplar_args(
@@ -2720,19 +2649,10 @@ def fork_row_union_exemplar_args(
     }
 
 
-# Payload memo keyed by plugin-policy snapshot hash AND model-catalog
-# identity. Most of the aids depend only on the policy-visible catalog
-# projection (plugin classes are static per process; visibility and profile
-# aliases are exactly what the snapshot hash covers), and a cold build costs a
-# full catalog sweep (~50ms) — too much to repeat inside every planner call's
-# wall-clock budget. The carried model catalog is the exception: it is read
-# from the OpenRouter catalog accessor, which the boot lifespan primes and
-# which no policy snapshot covers, so the snapshot hash alone would serve a
-# pre-prime catalog for the process lifetime. The catalog's own canonical
-# snapshot id — the identity the Landscape run record persists — joins the
-# key, which also distinguishes a live snapshot from the bundled fallback of
-# equal content. Bounded so snapshot rotation cannot grow it without limit;
-# callers receive a deep copy so no caller can poison the cached payload.
+# Payload memo keyed by plugin-policy snapshot hash. Plugin classes are static
+# per process; visibility, profile aliases and control bindings are covered by
+# the snapshot. Model catalogs are discovered on demand and are not memoized
+# here. Callers receive a deep copy so they cannot poison the cached payload.
 _AIDS_MEMO: dict[str, _PlannerAuthoringAids] = {}
 _AIDS_MEMO_MAX: Final[int] = 8
 _AIDS_MEMO_LOCK = Lock()
@@ -2741,13 +2661,11 @@ _AIDS_MEMO_LOCK = Lock()
 def build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthoringAids:
     """Assemble the live authoring-aids payload for one planner call.
 
-    Rendered from the policy-visible catalog (memoized per snapshot hash and
-    model-catalog identity), so it can never drift from the deployment.
+    Rendered from the policy-visible catalog and memoized per snapshot hash.
     Sections whose plugins are policy-hidden are omitted rather than rendered
     with invented names.
     """
-    catalog_sha256, catalog_source = read_openrouter_catalog_snapshot_id()
-    key = f"{catalog.snapshot.snapshot_hash}:{catalog_source}:{catalog_sha256}"
+    key = catalog.snapshot.snapshot_hash
     with _AIDS_MEMO_LOCK:
         cached = _AIDS_MEMO.get(key)
     if cached is None:
@@ -2822,13 +2740,8 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
             "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
         }
         aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
-    if "llm" in visible["source"]:
-        aids["llm_source_generation"] = {
-            "rules": _llm_source_generation_rules(
-                profile_alias=_usable_llm_profile_alias(catalog, kind="source"),
-                output_control=required_output_control,
-            )
-        }
+    if "llm" in visible["source"] and required_output_control is not None:
+        aids["llm_source_generation"] = {"rules": _llm_source_generation_rules(output_control=required_output_control)}
     aids["review_registry"] = {
         # Imported from interpretation_state so the taught vocabulary can
         # never drift from the resolve-time registry (52322ebe1 discipline).
@@ -2864,21 +2777,13 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control, auto_wired=safety_auto_wired)}
     if visible_raw_html_producers and "field_mapper" in visible["transform"]:
         aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_raw_html_producers)}
-    if "web_scrape" in visible["transform"]:
-        aids["web_scrape_http_identity"] = {"rules": list(_WEB_SCRAPE_HTTP_IDENTITY_RULES)}
     aids["discovery_digest"] = {
         "guidance": _DISCOVERY_DIGEST_GUIDANCE,
         "plugins": discovery_digest(catalog, summaries=summaries),
     }
-    # Carried only where an llm node can be authored at all: on a deployment
-    # whose policy hides both llm surfaces the catalog is unspendable, and the
-    # planner request is append-only and uncached, so every carried byte is
-    # re-sent on every turn of the plan.
-    if "llm" in visible["transform"] or "llm" in visible["source"]:
-        aids["model_catalog"] = {
-            "guidance": _MODEL_CATALOG_GUIDANCE,
-            "catalog": planner_model_catalog(),
-        }
+    # Profile aliases remain in the complete discovery digest. Literal model
+    # identifiers and optional plugin guides are discovered through existing
+    # list_models, get_plugin_schema and get_plugin_assistance tools.
     # Gate conditions are structural, so the expression reference is
     # authorable on every deployment regardless of which plugins are visible.
     aids["expression_grammar"] = planner_expression_grammar()

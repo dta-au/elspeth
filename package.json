@@ -9,11 +9,11 @@
   "devDependencies": {
     "acorn": "^8.18.0",
     "azurite": "^3.36.0",
-    "sprintf-js": "file:tooling/tedious-formatter"
+    "sprintf-js": "file:tools/tedious-formatter"
   },
   "scripts": {
     "azurite": "azurite --silent",
-    "test:formatter": "node --test tooling/tedious-formatter/index.test.cjs"
+    "test:formatter": "node --test tools/tedious-formatter/index.test.cjs"
   },
   "dependencies": {
     "playwright": "^1.63.0"

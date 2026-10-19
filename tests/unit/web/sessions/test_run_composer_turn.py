@@ -64,7 +64,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerTurnDeadlineExpired,
     composer_operation_request_hash,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.routes import _helpers
 from elspeth.web.sessions.routes._helpers import ComposerRequestLifecycle, composer_request_lifecycle
 from elspeth.web.sessions.routes.composer import pipeline_settlement
@@ -104,6 +104,57 @@ class _TestSnapshotFactory:
 
     def for_user_id(self, user_id: str) -> PluginAvailabilitySnapshot:
         return self._factory(user_id)
+
+
+async def _seed_output_only_draft(app: FastAPI, service: SessionServiceImpl, session_id: uuid.UUID) -> CompositionStateRecord:
+    """Create an actual prior draft for scenarios that require the ordinary loop.
+
+    A ready output makes the topology nonempty while leaving the source absent;
+    it cannot make a later configured-source or completed-pipeline claim true.
+    """
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.composer.tools import execute_tool
+    from tests.helpers.session_fences import fenced_operation_context
+
+    catalog = app.state.catalog_service
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    with fenced_operation_context(app.state.session_engine, str(session_id)) as context:
+        outcome = execute_tool(
+            "set_output",
+            {
+                "sink_name": "existing_output",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/existing.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            },
+            CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            session_operation_context=context,
+        )
+        assert outcome.success and outcome.updated_state is not None
+        state = outcome.updated_state.to_dict()
+        baseline = await service.save_composition_state(
+            session_id,
+            CompositionStateData(
+                sources=state["sources"],
+                nodes=state["nodes"],
+                edges=state["edges"],
+                outputs=state["outputs"],
+                metadata_=state["metadata"],
+                is_valid=False,
+            ),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    assert not baseline.sources and not baseline.nodes and len(baseline.outputs) == 1
+    return baseline
 
 
 @contextlib.asynccontextmanager
@@ -229,6 +280,280 @@ async def _row(job: _Job) -> ComposerOperationRecord:
 
 def _user_and_assistant_roles(messages: Any) -> list[str]:
     return [message.role for message in messages if message.role in {"user", "assistant"}]
+
+
+async def _guarded_title_turn_app(tmp_path, monkeypatch, *, title_decision, primary_decision, planner_handoff=False):
+    import litellm
+    from pydantic import SecretStr
+
+    from elspeth.contracts.prompt_guard import PromptGuardDecision
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
+
+    app, service = _make_app(tmp_path, quota_enabled=True)
+    guard_settings = PromptGuardSettings(endpoint="https://shield.example.test", subscription_key="offline-test-key")
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "composer_model": "openai/gpt-4.1-mini",
+            "composer_endpoint_base_url": "https://model.example.test/v1",
+            "composer_endpoint_api_key": SecretStr("offline-model-key"),  # secret-scan: allow-this-line
+            "composer_prompt_guard_mode": "required",
+            "composer_prompt_guard": guard_settings,
+            "composer_advisor_prompt_guard": guard_settings,
+        }
+    )
+    guard_requests = []
+    sdk_requests = []
+    events = []
+
+    async def inspect(_self, request):
+        title = request.user_prompt.startswith("Conversation excerpt (") or any(
+            "Conversation excerpt (UNTRUSTED USER DATA" in document for document in request.documents
+        )
+        disposition = title_decision if title else primary_decision
+        reason = {"allow": "clean", "blocked": "policy_blocked", "unavailable": "service_error"}[disposition]
+        guard_requests.append((title, request))
+        events.append(("guard", "title" if title else "primary", disposition))
+        return PromptGuardDecision(disposition, reason)
+
+    async def completion(**kwargs):
+        title = kwargs.get("max_tokens") == 40 and "tools" not in kwargs
+        phase = "title" if title else "advisor" if "response_format" in kwargs else "primary"
+        sdk_requests.append(kwargs)
+        events.append(("sdk", phase))
+        if planner_handoff and not title:
+            assert "handoff_to_user" in {tool["function"]["name"] for tool in kwargs["tools"]}
+            return litellm.ModelResponse(
+                model=kwargs["model"],
+                choices=[
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "title-order-handoff",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "handoff_to_user",
+                                        "arguments": json.dumps(
+                                            {"action": "reset_to_safe_checkpoint", "message": "Let's discuss the pipeline."}
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7, "cost": 0.001},
+            )
+        content = (
+            "Useful Pipeline"
+            if title
+            else json.dumps(
+                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+            )
+            if phase == "advisor"
+            else "I can help build a pipeline."
+        )
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[{"message": {"role": "assistant", "content": content, "tool_calls": None}, "finish_reason": "stop"}],
+            usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7, "cost": 0.001},
+        )
+
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", inspect)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, provider="test", model=kwargs["model"]),
+    )
+    app.state.composer_service = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(), app.state.settings, sessions_service=service, session_engine=app.state.session_engine
+    )
+    app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
+    return app, service, guard_requests, sdk_requests, events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("title_decision", "primary_decision", "expected_http", "expected_sdk"),
+    [("blocked", "blocked", 422, 0), ("unavailable", "allow", 503, 0), ("allow", "blocked", 422, 1), ("allow", "unavailable", 503, 1)],
+)
+async def test_real_worker_title_guard_is_terminal_before_primary(
+    tmp_path, monkeypatch, title_decision, primary_decision, expected_http, expected_sdk
+):
+    import httpx
+    from sqlalchemy import select
+
+    from elspeth.web.sessions.models import quota_provider_attempts_table, session_operation_fences_table
+    from tests.helpers.composer_operations import message_body, submit_and_settle
+
+    app, service, guards, sdk, events = await _guarded_title_turn_app(
+        tmp_path, monkeypatch, title_decision=title_decision, primary_decision=primary_decision
+    )
+    session = await service.create_session("alice", "New session", "local")
+    message = "What can you help me build?"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body(message))
+    status, body = settled.error()
+    assert status == expected_http, body
+    payload = body["detail"]
+    refused = title_decision if title_decision != "allow" else primary_decision
+    assert payload["error_type"] == f"prompt_guard_{refused}"
+    assert len(sdk) == expected_sdk
+    assert guards[0][0] is True and guards[0][1].user_prompt == message
+    assert all(request.user_prompt == message for _title, request in guards)
+    assert len(guards) == (1 if title_decision != "allow" else 2)
+    if title_decision == "allow":
+        assert events[:3] == [("guard", "title", "allow"), ("sdk", "title"), ("guard", "primary", primary_decision)]
+    rows = await service.get_messages(session.id, limit=None)
+    checks = [envelope["check"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"]
+    assert payload["audit_id"] == checks[-1]["audit_id"]
+    assert [check["disposition"] for check in checks] == ([title_decision] if title_decision != "allow" else ["allow", primary_decision])
+    assert _user_and_assistant_roles(rows) == ["user"]
+    assert await service.get_current_state(session.id) is None
+    assert await service.list_composition_proposals(session.id) == []
+    with service._engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        fence = connection.execute(
+            select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+        ).one()
+    assert len(attempts) == expected_sdk
+    assert all(attempt.ledger_entry_id is not None and attempt.settled_at is not None for attempt in attempts)
+    assert fence.released_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("title_decision", ["allow", "unavailable"])
+async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp_path, monkeypatch, title_decision):
+    import httpx
+    from sqlalchemy import select
+
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.sessions import composer_async_worker
+    from elspeth.web.sessions.models import chat_messages_table
+    from tests.helpers.composer_operations import message_body, submit_and_settle
+
+    app, service, guards, sdk, events = await _guarded_title_turn_app(
+        tmp_path, monkeypatch, title_decision=title_decision, primary_decision="allow", planner_handoff=True
+    )
+    results = []
+    failures = []
+    real_compose = app.state.composer_service.compose
+    real_turn = composer_async_worker.run_composer_turn
+
+    async def record_actual_failure(*args, **kwargs):
+        try:
+            return await real_turn(*args, **kwargs)
+        except BaseException as failure:
+            failures.append(failure)
+            raise
+
+    async def record_actual_result(*args, **kwargs):
+        result = await real_compose(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(app.state.composer_service, "compose", record_actual_result)
+    monkeypatch.setattr(composer_async_worker, "run_composer_turn", record_actual_failure)
+    session = await service.create_session("alice", "New session", "local")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        settled = await submit_and_settle(
+            client, app, path=f"/api/sessions/{session.id}/messages", body=message_body("Build the requested pipeline.")
+        )
+    rows = await service.get_messages(session.id, limit=None, include_private_evidence=True)
+    with service._engine.connect() as connection:
+        durable_rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).all()
+    if title_decision == "unavailable":
+        status, body = settled.error()
+        assert status == 503 and body["detail"]["error_type"] == "prompt_guard_unavailable"
+        assert results == sdk == []
+        assert len(guards) == 1 and guards[0][0] is True
+        assert await service.get_current_state(session.id) is None
+        assert _user_and_assistant_roles(rows) == ["user"]
+    else:
+        assert settled.final.json()["status"] == "completed", failures
+        assert settled.result()["message"]["content"] == "Let's discuss the pipeline."
+        assert len(results) == 1 and results[0].graph_recovery_intent is not None
+        assert results[0].graph_recovery_intent.action == "reset_to_safe_checkpoint"
+        drafts = results[0].recovery_audit_drafts
+        assert drafts, "the actual planner handoff must carry its recovery audit cohort"
+        for draft in drafts:
+            if draft.tool_calls and draft.tool_calls[0]["_kind"] == "llm_call_audit":
+                # Physical settlement already checkpointed this exact complete
+                # call. Cohort replay keeps that row, including its original
+                # content, rather than duplicating it with a summary string.
+                matches = [row for row in durable_rows if deep_thaw(row.tool_calls) == deep_thaw(draft.tool_calls)]
+                assert len(matches) == 1 and matches[0].content == "Provider call result recorded."
+                continue
+            matches = [
+                row for row in durable_rows if row.content == draft.content and deep_thaw(row.tool_calls) == deep_thaw(draft.tool_calls)
+            ]
+            assert len(matches) == 1, (
+                "each actual recovery draft must become durable exactly once",
+                draft.content[:100],
+                [row.content[:100] for row in durable_rows],
+            )
+        assert len(sdk) == 2 and len(_llm_call_audit_rows(rows)) == 2
+        assert events[0:3] == [("guard", "title", "allow"), ("sdk", "title"), ("guard", "primary", "allow")]
+        assert _user_and_assistant_roles(rows) == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_title_completion_spends_the_original_primary_budget(tmp_path, monkeypatch):
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock("Ready.")
+    composer.composer_prompt_guard_mount = None
+    app.state.composer_service = composer
+    session = await service.create_session("alice", "New session", "local")
+    title_finished = []
+
+    async def title(**kwargs):
+        await asyncio.sleep(0.05)
+        title_finished.append(time.monotonic())
+
+    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", title)
+    async with _running_job(app, service, session.id, kind="compose_message", content="Title me.") as job:
+        result = await _run(app, job)
+        budget = composer.compose.await_args.kwargs["budget_seconds"]
+        assert result.status == "completed"
+        assert len(title_finished) == 1
+        assert 0 < budget <= job.budget_anchor.remaining_seconds(monotonic_now=title_finished[0])
+
+
+@pytest.mark.asyncio
+async def test_real_worker_title_guard_uses_the_admitted_operation_deadline(tmp_path, monkeypatch):
+    import httpx
+
+    from tests.helpers.composer_operations import message_body, submit_and_settle
+
+    app, service, _guards, sdk, _events = await _guarded_title_turn_app(
+        tmp_path, monkeypatch, title_decision="allow", primary_decision="allow"
+    )
+    app.state.settings = app.state.settings.model_copy(update={"composer_timeout_seconds": 8.0})
+    entered, joined = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_operation_deadline(_self, request):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            joined.set()
+
+    monkeypatch.setattr("elspeth.web.composer.prompt_guard_clients.AzurePromptGuardClient.inspect", wait_for_operation_deadline)
+    session = await service.create_session("alice", "New session", "local")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        settled = await submit_and_settle(client, app, path=f"/api/sessions/{session.id}/messages", body=message_body("Build it."))
+    status, body = settled.error()
+    assert status == 504 and body["error_type"] == "composer_operation_deadline_expired"
+    assert entered.is_set() and joined.is_set() and sdk == []
+    rows = await service.get_messages(session.id, limit=None)
+    checks = [envelope["check"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"]
+    assert len(checks) == 1 and checks[0]["disposition"] == "cancelled"
+    assert _user_and_assistant_roles(rows) == ["user"]
+    assert await service.get_current_state(session.id) is None
 
 
 @pytest.mark.asyncio
@@ -759,7 +1084,11 @@ async def test_actual_planner_decline_review_shares_call_budget_and_saved_termin
 
     app, sessions = _make_app(tmp_path)
     app.state.settings = app.state.settings.model_copy(
-        update={"composer_planner_max_provider_calls": call_limit, "composer_planner_max_cumulative_provider_cost": Decimal(cost_cap)}
+        update={
+            "composer_prompt_guard_mode": "debug-when-unconfigured",
+            "composer_planner_max_provider_calls": call_limit,
+            "composer_planner_max_cumulative_provider_cost": Decimal(cost_cap),
+        }
     )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
@@ -863,6 +1192,8 @@ async def test_actual_planner_decline_review_shares_call_budget_and_saved_termin
 async def test_actual_inspection_review_controls_public_and_saved_equivalence_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, admit: bool, read_all: bool
 ) -> None:
+    from itertools import pairwise
+
     import litellm
 
     from elspeth.web.blobs.service import BlobServiceImpl
@@ -871,6 +1202,11 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     from tests.unit.web.composer._helpers import _mock_catalog
 
     app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
+    if read_all:
+        # Complete inspection of this unchanged long fixture requires more
+        # truthful 4K pages; keep time, provider-call and cost budgets intact.
+        app.state.settings = app.state.settings.model_copy(update={"composer_max_discovery_turns": 40})
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
@@ -883,6 +1219,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     app.state.composer_service = composer
     session = await sessions.create_session("alice", "Existing title", "local")
     content = "name,score\n" + "ada,42\n" * 8_000
+    baseline = await _seed_output_only_draft(app, sessions, session.id) if route == "primary" else None
     with fenced_operation_context(app.state.session_engine, str(session.id)) as context:
         blob = await BlobServiceImpl(app.state.session_engine, app.state.settings.data_dir).create_blob(
             session.id, "coverage.csv", content.encode(), "text/csv", session_operation_context=context
@@ -939,7 +1276,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
                     body = None
                     tool_calls = [
                         SimpleNamespace(
-                            id="inspect-page-2",
+                            id=f"inspect-page-{len(pages) + 1}",
                             function=SimpleNamespace(
                                 name="get_blob_content",
                                 arguments=json.dumps(
@@ -977,7 +1314,12 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     assert (candidate in response.message.content) is admit
     assert any(candidate in row.content for row in rows if row.role == "assistant") is admit
     # Checkpoints and gate facts can save revisions without an authored edit.
-    assert all(not row.sources and not row.nodes and not row.outputs for row in await sessions.get_state_versions(session.id))
+    versions = await sessions.get_state_versions(session.id)
+    assert all(not row.sources and not row.nodes for row in versions)
+    if baseline is not None:
+        assert all(row.outputs == baseline.outputs for row in versions)
+    else:
+        assert all(not row.outputs for row in versions)
     assert selected_pages and reviews
     prefix = selected_pages[0]
     assert 0 < prefix["end_char"] < prefix["total_chars"] == len(content)
@@ -994,9 +1336,15 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         assert review["saved_effects"]["initial_authored_state_hash"] == review["saved_effects"]["latest_verified_authored_state_hash"]
         assert review["saved_effects"]["changed_fields"] == []
     assert len([call for call in calls if "response_format" in call]) == (1 if admit or route == "planner" else 2)
-    assert len([call for call in calls if "response_format" not in call]) == (3 if read_all or (not admit and route == "primary") else 2)
+    inspected_page_count = len({page["start_char"] for page in selected_pages})
+    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(
+        not admit and route == "primary"
+    )
     if read_all:
-        assert selected_pages[-1]["start_char"] == prefix["end_char"]
+        assert len(selected_pages) > 1
+        for earlier, later in pairwise(selected_pages):
+            assert later["start_char"] == earlier["end_char"]
+        assert "".join(page["content"] for page in selected_pages) == content
         assert selected_pages[-1]["end_char"] == len(content)
     if route == "primary":
         canonical_results = [row.content for row in rows if row.role == "tool" and row.tool_call_id == "inspect-page-1"]
@@ -1007,7 +1355,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
             for envelope in row.tool_calls or ()
             if envelope.get("_kind") == "audit" and envelope["invocation"]["tool_name"] == "get_blob_content"
         ]
-    assert len(canonical_results) == (2 if read_all else 1)
+    assert len(canonical_results) == inspected_page_count
     assert all("name,score" not in result for result in canonical_results)
     retained_calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
     for _, review in reviews:
@@ -1022,7 +1370,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("review_mode", ("clean_admit", "flagged_admit", "unavailable", "input_budget"))
+@pytest.mark.parametrize("review_mode", ("clean_admit", "flagged_admit", "unavailable", "minimal_optional_context"))
 async def test_actual_proof_exhaustion_reviews_or_withholds_public_and_saved_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, review_mode: str
 ) -> None:
@@ -1033,11 +1381,13 @@ async def test_actual_proof_exhaustion_reviews_or_withholds_public_and_saved_can
     from elspeth.web.composer.advisor_decision import AdvisorGatePassed
     from elspeth.web.composer.tools import execute_tool
     from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+    from tests.helpers.advisor_review import parse_advisor_publication_review
     from tests.helpers.session_fences import fenced_operation_context
     from tests.unit.web.composer._helpers import _mock_catalog
 
     app, sessions = _make_app(tmp_path)
-    if review_mode == "input_budget":
+    app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
+    if review_mode == "minimal_optional_context":
         app.state.settings = app.state.settings.model_copy(update={"composer_advisor_max_prompt_tokens": 1})
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
@@ -1110,7 +1460,7 @@ async def test_actual_proof_exhaustion_reviews_or_withholds_public_and_saved_can
         catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
     )
     app.state.composer_service = composer
-    admitted = review_mode in ("clean_admit", "flagged_admit")
+    admitted = review_mode in ("clean_admit", "flagged_admit", "minimal_optional_context")
     candidate = (
         "PROOF_EXHAUSTED_EXPLANATION_CANARY: The name is saved, but the fixed schema still omits observed columns and execution remains blocked."
         if admitted
@@ -1124,9 +1474,15 @@ async def test_actual_proof_exhaustion_reviews_or_withholds_public_and_saved_can
             end_calls.append(kwargs)
             assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
             assert candidate in json.dumps(kwargs["messages"])
+            if review_mode == "minimal_optional_context":
+                supplied = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+                assert supplied["current_request"] == "Change the pipeline name and explain remaining blockers."
+                assert supplied["candidate_reply"] == candidate
+                assert supplied["saved_effects"]["saved_revision_count"] == 1
             if review_mode == "unavailable":
                 raise ConnectionError("Synthetic unavailable proof END review")
-            assert review_mode != "input_budget", "No physical review fits the original configured input budget"
+            # This allowance limits optional context; the complete required
+            # request, graph and candidate still reach physical END review.
             content = json.dumps(
                 {
                     "verdict": "FLAGGED" if review_mode == "flagged_admit" else "CLEAN",
@@ -1205,7 +1561,9 @@ async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publ
     from tests.unit.web.composer._helpers import _mock_catalog
 
     app, sessions = _make_app(tmp_path)
-    app.state.settings = app.state.settings.model_copy(update={"composer_planner_max_provider_calls": 3})
+    app.state.settings = app.state.settings.model_copy(
+        update={"composer_prompt_guard_mode": "debug-when-unconfigured", "composer_planner_max_provider_calls": 3}
+    )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
@@ -1310,6 +1668,7 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
 
     app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
     if stale_evidence:
         app.state.settings = app.state.settings.model_copy(update={"composer_advisor_checkpoint_max_passes": 1})
     monkeypatch.setattr(
@@ -1392,18 +1751,25 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     ]
     assert passes
     assert all(item["publication_verdict"] == publication_verdict and len(item["publication_binding"]) == 64 for item in passes)
-    expected_review_calls = 1 if admitted or stale_evidence else 2
+    # A structurally empty persisted request uses the planner's terminal prose
+    # review. WITHHOLD ends that request instead of starting a primary repair.
+    expected_review_calls = 1
     assert len([call for call in calls if "response_format" in call]) == expected_review_calls
     primary_calls = [call for call in calls if "response_format" not in call]
-    assert len(primary_calls) == expected_review_calls + int(revoke_build)
-    primary_audits = [call for call in result.llm_calls if call.model_requested == app.state.settings.composer_model]
-    assert all(call.call_id is not None for call in primary_audits)
-    assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == primary_audits[-1].call_id
-    if revoke_build:
-        assert any(
-            message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
-            for message in primary_calls[1]["messages"]
-        )
+    assert len(primary_calls) == expected_review_calls
+    planner_audits = [
+        envelope["call"]
+        for _, envelope in _llm_call_audit_rows(messages)
+        if envelope["call"]["model_requested"] == app.state.settings.composer_model
+    ]
+    assert len(planner_audits) == 1 and planner_audits[0]["call_id"] is not None
+    assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == planner_audits[0]["call_id"]
+    assert not any(
+        message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
+        for call in primary_calls
+        for message in call["messages"]
+        if isinstance(message["content"], str)
+    )
     withheld = [
         entry
         for row in messages
@@ -1429,7 +1795,9 @@ async def test_actual_repeated_reply_review_stops_stalled_repair_without_reusing
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     app, sessions = _make_app(tmp_path)
-    app.state.settings = app.state.settings.model_copy(update={"composer_advisor_checkpoint_max_passes": 3})
+    app.state.settings = app.state.settings.model_copy(
+        update={"composer_prompt_guard_mode": "debug-when-unconfigured", "composer_advisor_checkpoint_max_passes": 3}
+    )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
@@ -1478,6 +1846,7 @@ async def test_actual_repeated_reply_review_stops_stalled_repair_without_reusing
     monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
     monkeypatch.setattr(litellm, "acompletion", complete)
     session = await sessions.create_session("alice", "Existing title", "local")
+    baseline = await _seed_output_only_draft(app, sessions, session.id)
     async with _running_job(app, sessions, session.id, kind="compose_message", content="Explain ELSPETH.") as job:
         record = await _run(app, job)
     assert record.status == "completed"
@@ -1493,6 +1862,8 @@ async def test_actual_repeated_reply_review_stops_stalled_repair_without_reusing
     assert (candidate in record.result_json) is self_corrects
     visible = [row.content for row in await sessions.get_messages(session.id, limit=None) if row.role != "audit"]
     assert (candidate in json.dumps(visible)) is self_corrects
+    current = await sessions.get_current_state(session.id)
+    assert current is not None and current.outputs == baseline.outputs and not current.sources
 
 
 @pytest.mark.asyncio
@@ -1510,6 +1881,7 @@ async def test_actual_early_failure_preserves_committed_checkpoint_and_owned_pro
     from elspeth.web.required_work import RequiredWorkSource, reduce_composer_failures
 
     app, sessions = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
@@ -1576,6 +1948,7 @@ async def test_actual_early_failure_preserves_committed_checkpoint_and_owned_pro
     monkeypatch.setattr(composer._advisor_checkpoint, "_maybe_run_early_checkpoint", early)
     monkeypatch.setattr(litellm, "acompletion", complete)
     session = await sessions.create_session("alice", "Existing title", "local")
+    baseline = await _seed_output_only_draft(app, sessions, session.id)
     async with _running_job(app, sessions, session.id, kind="compose_message", content="Change the pipeline name.") as job:
         with pytest.raises(BaseExceptionGroup if mixed_group else ValueError) as caught:
             await _run(app, job)
@@ -1608,8 +1981,9 @@ async def test_actual_early_failure_preserves_committed_checkpoint_and_owned_pro
         assert len([row for row in rows if row.role == "tool"]) == 1
         assert len([row for row in rows if row.role == "assistant" and row.tool_calls]) == 1
         versions = await sessions.get_state_versions(session.id)
-        assert len(versions) == 1
-        assert str(versions[0].id) == persisted[0].current_state_id
+        assert len(versions) == 2 and versions[0].id == baseline.id
+        assert str(versions[1].id) == persisted[0].current_state_id
+        assert versions[1].outputs == baseline.outputs and not versions[1].sources
 
 
 @pytest.mark.asyncio
@@ -1658,12 +2032,14 @@ async def test_send_turn_joins_auto_title_under_the_adopted_lease_before_the_ter
     """E12: the title child finishes before the terminal composite. Known-negative: joined after, it reads ``completed``."""
     app, service = _make_app(tmp_path)
     app.state.composer_service = _make_composer_mock("Titled.")
+    app.state.composer_service.composer_prompt_guard_mount = None
     session = await service.create_session("alice", "New session", "local")
     job_holder: list[_Job] = []
     observed: list[tuple[object, str]] = []
 
     async def _fake_auto_title(**kwargs: Any) -> None:
         await asyncio.sleep(0.2)
+        app.state.composer_service.compose.assert_not_awaited()
         observed.append((kwargs["session_operation_context"], (await _row(job_holder[0])).status))
 
     monkeypatch.setattr(composer_turn, "maybe_auto_title_session", _fake_auto_title)
@@ -2084,33 +2460,43 @@ def _parked_auto_title_factory(started: asyncio.Event, cancelled: asyncio.Event)
 
 
 @pytest.mark.asyncio
-async def test_auto_title_join_timeout_is_logged_and_never_relabels_the_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """E12 / review m3: a join timeout cancels and settles the child, is logged, and the turn still settles."""
+async def test_title_completion_precedes_primary_without_a_local_join_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured title decision cannot be skipped by the former best-effort join timer."""
     app, service = _make_app(tmp_path)
     app.state.composer_service = _make_composer_mock("Titled later.")
+    app.state.composer_service.composer_prompt_guard_mount = None
     session = await service.create_session("alice", "New session", "local")
-    title_started, title_cancelled = asyncio.Event(), asyncio.Event()
-    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", _parked_auto_title_factory(title_started, title_cancelled))
-    monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 0.05)
+    title_started, title_finished, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def title(**kwargs):
+        title_started.set()
+        await release.wait()
+        title_finished.set()
+
+    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", title)
+    monkeypatch.setattr(composer_turn, "_AUTO_TITLE_JOIN_SECONDS", 0.01)
     async with _running_job(app, service, session.id, kind="compose_message", content="Title me.") as job:
         with capture_logs() as logs:
-            record = await _run(app, job)
+            task = asyncio.create_task(_run(app, job))
+            try:
+                await asyncio.wait_for(title_started.wait(), timeout=5)
+                await asyncio.sleep(0.05)
+                assert not task.done() and not title_finished.is_set()
+                app.state.composer_service.compose.assert_not_awaited()
+            finally:
+                release.set()
+            record = await task
 
     assert record.status == "completed"
     assert title_started.is_set()
-    assert title_cancelled.is_set()
+    assert title_finished.is_set()
     timed_out = [entry for entry in logs if entry["event"] == "composer_operation.auto_title_join_timed_out"]
-    assert len(timed_out) == 1
-    assert timed_out[0]["session_id"] == str(session.id)
-    assert timed_out[0]["operation_id"] == job.turn.operation_id
-    assert timed_out[0]["child_settled"] is True
+    assert timed_out == []
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_the_auto_title_join_settles_the_child_and_keeps_the_compose_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Review m3 + F-B2/C2: a marker delivered in the pre-terminal title join orphans nothing and loses no evidence.
+async def test_cancel_during_title_stops_before_primary_and_settles_the_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A marker delivered in the title join settles it before any primary provider work.
 
     Known-negative: dropping the child reference before the join leaves the
     child running past the turn (no ``auto_title_join_cancelled`` event,
@@ -2118,6 +2504,7 @@ async def test_cancel_during_the_auto_title_join_settles_the_child_and_keeps_the
     """
     app, service = _make_app(tmp_path)
     composer = _make_composer_mock("Never published.")
+    composer.composer_prompt_guard_mount = None
     composer.compose.return_value = ComposerResult(message="Never published.", state=_EMPTY_STATE, llm_calls=(_llm_call(),))
     app.state.composer_service = composer
     session = await service.create_session("alice", "New session", "local")
@@ -2128,11 +2515,8 @@ async def test_cancel_during_the_auto_title_join_settles_the_child_and_keeps_the
         with capture_logs() as logs:
             task = asyncio.create_task(_run(app, job))
             await asyncio.wait_for(title_started.wait(), timeout=5.0)
-            for _ in range(500):
-                if job.observation.compose_result is not None:
-                    break
-                await asyncio.sleep(0.01)
-            assert job.observation.compose_result is composer.compose.return_value
+            assert job.observation.compose_result is None
+            composer.compose.assert_not_awaited()
             await asyncio.sleep(0.05)
             assert not task.done()
             marker = composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED
@@ -2152,7 +2536,7 @@ async def test_cancel_during_the_auto_title_join_settles_the_child_and_keeps_the
     assert cancelled_joins[0]["child_settled"] is True
     messages = await service.get_messages(session.id, limit=None)
     assert _user_and_assistant_roles(messages) == ["user"]
-    assert len(_llm_call_audit_rows(messages)) == 1
+    assert len(_llm_call_audit_rows(messages)) == 0
 
 
 @pytest.mark.parametrize(
@@ -2624,11 +3008,12 @@ async def test_initial_auto_title_join_caller_cancellation_keeps_exact_original_
 
 
 @pytest.mark.asyncio
-async def test_auto_title_timeout_retains_repeated_late_caller_cancellations_after_physical_child_settlement(
+async def test_auto_title_retains_repeated_caller_cancellations_after_physical_child_settlement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app, service = _make_app(tmp_path)
     composer = _make_composer_mock("Never published after cancellation.")
+    composer.composer_prompt_guard_mount = None
     app.state.composer_service = composer
     session = await service.create_session("alice", "New session", "local")
     entered, child_cancelled, release, child_finished = (asyncio.Event() for _ in range(4))
@@ -2658,12 +3043,13 @@ async def test_auto_title_timeout_retains_repeated_late_caller_cancellations_aft
         task = asyncio.create_task(_run(app, job))
         try:
             await asyncio.wait_for(entered.wait(), timeout=5)
-            await asyncio.wait_for(child_cancelled.wait(), timeout=5)
-            assert job.observation.compose_result is composer.compose.return_value
+            assert job.observation.compose_result is None
+            composer.compose.assert_not_awaited()
             assert not task.done() and not child_finished.is_set()
             first_marker = composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED
             second_marker = object()
             task.cancel(first_marker)
+            await asyncio.wait_for(child_cancelled.wait(), timeout=5)
             for _ in range(100):
                 if observations is not None and len(observations) == 1:
                     break

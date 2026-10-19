@@ -60,11 +60,15 @@ Classify from the `--json` report: `session_schema`/`landscape_schema`
 decision), `payload_store_writable`/
 `blob_writable` (NFS ownership; the `provision-storage` Job runs as root
 with `NoRootSquash`), or a Key Vault reference version that does not exist.
-The ACA doctor emits no `session_tls`/`landscape_tls` checks. For TLS errors,
+Require the ACA doctor's `session_tls`/`landscape_tls` checks on its initial
+preflight schema-inspection connections. Failed TLS preflight blocks schema
+initialization. Separate initialization/final-verification connections are not
+independently measured by these checks. For TLS errors,
 retain `sslmode=verify-full&sslrootcert=system`; fix the server FQDN, private
 DNS and CA trust. Weaker modes with system roots are rejected by libpq.
-The cold-install runbook gives a separate `pg_stat_ssl` query for an operator
-connection; it must not be presented as a measurement of the runtime's socket.
+The cold-install runbook distinguishes the doctor's runtime-credential
+connections from an operator's separate connection. Neither observes every
+subsequent web socket or establishes live Azure acceptance.
 
 ### 5. Readiness
 

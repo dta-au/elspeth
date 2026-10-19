@@ -83,9 +83,7 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
         "gate_condition_authored",
     }
 )
-# Sink-neutral wording (pack pressure-suite run 2, G6): the old "JSON output"
-# clause forced a false audit statement onto CSV/text sinks. The recognition
-# markers ("raw html", "fingerprint") are unchanged.
+# Sink-neutral example wording for the structured cleanup review decision.
 RAW_HTML_CLEANUP_REVIEW_DRAFT: Final[str] = "Drop the scraped raw HTML and fingerprint fields before saving the output."
 WEB_SCRAPE_HTTP_IDENTITY_USER_TERM: Final[str] = "web_scrape_http_identity"
 PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
@@ -166,29 +164,25 @@ PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
 # ContentTrust declaration: untrusted producers present -> the constants
 # above; none -> these.
 PROMPT_SHIELD_LOCAL_CONTENT_WARNING_DRAFT: Final[str] = (
-    "Recommend inserting a prompt-injection shield transform "
-    "in front of this LLM if its input data may carry adversarial text. This pipeline has no "
-    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
-    "exposure is limited to adversarial text already present in that data, and continuing "
-    "without a shield is allowed. "
+    "This pipeline has no declared untrusted-content producer upstream. "
+    "Operator-supplied or uploaded data is not necessarily trusted. "
+    "If this LLM consumes untrusted or externally controlled text, stage the required "
+    "prompt-injection-shield recommendation decision card. "
+    "Shield installation is optional and may be declined by the user. "
+    "Trusted internal-only values do not require this recommendation. "
+    "Continue authoring while review is pending; pending review does not approve or execute the pipeline. "
 )
 PROMPT_SHIELD_LOCAL_CONTENT_AVAILABLE_DRAFT: Final[str] = (
-    "An authorized prompt-injection shield IS available in this deployment. This pipeline has no "
-    "external-content fetch step: the LLM consumes operator-supplied source content, so the "
-    "exposure is limited to adversarial text already present in that data. Wiring the shield in "
-    "front of this LLM is recommended if that data may carry adversarial text, and you may "
-    "proceed without it. "
+    "An authorized prompt-injection shield IS available in this deployment and is strongly recommended "
+    "for untrusted or externally controlled text. "
+    "No upstream producer is declared untrusted in this pipeline. "
+    "Operator-supplied or uploaded data is not necessarily trusted. "
+    "If this LLM consumes untrusted or externally controlled text, stage the required "
+    "prompt-injection-shield recommendation decision card. "
+    "Shield installation is optional and may be declined by the user. "
+    "Trusted internal-only values do not require this recommendation. "
+    "Continue authoring while review is pending; pending review does not approve or execute the pipeline. "
 )
-
-_RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerprint")
-
-# Stable prefix consumed by the set_pipeline boundary to select the closed
-# error code for a term-matched cleanup row whose draft fails marker
-# recognition. A term-matched row must never be silently treated as absent:
-# that re-fires the missing-row contract error against a planner that DID
-# author the row, which is unrepairable from the feedback alone (tutorial op
-# 18b4cee7, 2026-07-22).
-RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review draft is malformed"
 
 # A pending vague_term requirement with no resolvable prompt wiring stages a
 # review the operator can approve but never resolve: the resolver dead-ends
@@ -511,7 +505,7 @@ def validate_pipeline_decision_semantics(
                 raise ValueError(f"{context}: web-scrape HTTP identity decision requires non-empty http.{field_name} on node {node_id!r}")
         return
 
-    if not _is_raw_html_cleanup_decision(user_term=user_term, draft=draft):
+    if not _is_raw_html_cleanup_decision(user_term=user_term):
         return
     if plugin != "field_mapper":
         raise ValueError(
@@ -527,7 +521,7 @@ def validate_pipeline_decision_semantics(
             field_name
             for source_field, target_field in mapping.items()
             for field_name in _validated_mapping_pair(source_field, target_field, context=context, node_id=node_id)
-            if _looks_like_raw_html_field(field_name) or field_name in web_scrape_raw_fields
+            if field_name in web_scrape_raw_fields
         }
     )
     if preserved_raw_fields:
@@ -596,11 +590,6 @@ def raw_html_cleanup_review_contract_error(state: CompositionState) -> str | Non
             continue
         preserved_fields = _preserved_mapping_fields(mapping)
         preserved_raw_fields = sorted(field for field in web_scrape_raw_fields if field in preserved_fields)
-        if preserved_raw_fields and _looks_like_cleanup_node_id(node.id):
-            return (
-                f"Node {node.id!r} is named like raw HTML cleanup but preserves web-scrape raw field(s) "
-                f"{preserved_raw_fields}. Remove those fields from field_mapper.mapping when select_only=true."
-            )
         if preserved_raw_fields:
             continue
         requirements = _requirements(node.options)
@@ -958,14 +947,7 @@ def _raw_html_cleanup_requirement_contract_error(
     for requirement in requirements:
         if InterpretationKind(requirement["kind"]) is not InterpretationKind.PIPELINE_DECISION:
             continue
-        if not _is_raw_html_cleanup_decision(user_term=requirement["user_term"], draft=requirement["draft"]):
-            if requirement["user_term"].strip() == RAW_HTML_CLEANUP_USER_TERM:
-                return (
-                    f"{RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX} on node {node.id!r}: the row's "
-                    f"user_term matches {RAW_HTML_CLEANUP_USER_TERM!r} but its draft text is not "
-                    "recognized. The draft must contain both 'raw html' and 'fingerprint'. "
-                    f"Copy the canonical draft verbatim, do not rephrase: {RAW_HTML_CLEANUP_REVIEW_DRAFT!r}"
-                )
+        if not _is_raw_html_cleanup_decision(user_term=requirement["user_term"]):
             continue
         try:
             validate_pipeline_decision_semantics(
@@ -985,14 +967,8 @@ def _raw_html_cleanup_requirement_contract_error(
     return None
 
 
-def _is_raw_html_cleanup_decision(*, user_term: str, draft: str | None) -> bool:
-    normalized_term = user_term.strip()
-    if normalized_term != RAW_HTML_CLEANUP_USER_TERM:
-        return False
-    if draft is None:
-        return False
-    normalized_draft = draft.lower()
-    return all(marker in normalized_draft for marker in _RAW_HTML_CLEANUP_DRAFT_MARKERS)
+def _is_raw_html_cleanup_decision(*, user_term: str) -> bool:
+    return user_term.strip() == RAW_HTML_CLEANUP_USER_TERM
 
 
 def _is_web_scrape_http_identity_decision(*, user_term: str) -> bool:
@@ -1026,16 +1002,6 @@ def _validated_mapping_pair(source_field: object, target_field: object, *, conte
         _validated_mapping_field(source_field, context=context, node_id=node_id),
         _validated_mapping_field(target_field, context=context, node_id=node_id),
     )
-
-
-def _looks_like_raw_html_field(field_name: str) -> bool:
-    normalized = field_name.strip().lower().replace("-", "_")
-    return normalized == "content" or "html" in normalized or "fingerprint" in normalized
-
-
-def _looks_like_cleanup_node_id(node_id: str) -> bool:
-    normalized = node_id.strip().lower().replace("-", "_")
-    return "drop" in normalized or "cleanup" in normalized or "clean" in normalized or "raw" in normalized or "html" in normalized
 
 
 @trust_boundary(
@@ -1138,7 +1104,7 @@ def _raw_html_cleanup_requirement(requirements: Sequence[InterpretationRequireme
     for requirement in requirements:
         if InterpretationKind(requirement["kind"]) is not InterpretationKind.PIPELINE_DECISION:
             continue
-        if _is_raw_html_cleanup_decision(user_term=requirement["user_term"], draft=requirement["draft"]):
+        if _is_raw_html_cleanup_decision(user_term=requirement["user_term"]):
             return requirement
     return None
 

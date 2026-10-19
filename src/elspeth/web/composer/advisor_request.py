@@ -1,12 +1,18 @@
-"""Shared runtime and boot-probe options for the advisor provider request."""
+"""Advisor provider options and model-facing feedback projection."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
-from elspeth.web.composer.advisor_output import advisor_response_format
+from elspeth.web.composer.advisor_output import advisor_abandonment_response_format, advisor_response_format
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+
+
+def advisor_feedback_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Keep accounting in the audit/API result without coaching model scarcity."""
+    return {key: value for key, value in payload.items() if key not in {"budget_used", "budget_remaining"}}
 
 
 def build_advisor_request_options(
@@ -20,6 +26,7 @@ def build_advisor_request_options(
     api_key: str | None,
     structured_output: bool,
     checkpoint_phase: AdvisorCheckpointPhase | None,
+    abandonment_review: bool = False,
 ) -> dict[str, object]:
     """Keep checkpoint capabilities identical at boot and during a turn.
 
@@ -41,13 +48,18 @@ def build_advisor_request_options(
     if api_key is not None:
         kwargs["api_key"] = api_key
     if structured_output:
-        if checkpoint_phase is None:
+        if abandonment_review:
+            if checkpoint_phase is not None:
+                raise ValueError("Abandonment review is independent of graph checkpoint phases")
+            kwargs["response_format"] = advisor_abandonment_response_format()
+        elif checkpoint_phase is None:
             raise ValueError("Structured advisor requests require their owned checkpoint phase")
-        kwargs["response_format"] = advisor_response_format(phase=checkpoint_phase)
+        else:
+            kwargs["response_format"] = advisor_response_format(phase=checkpoint_phase)
         if model.startswith("openrouter/") or (api_base is not None and urlsplit(api_base).hostname == "openrouter.ai"):
             # Top-level provider survives LiteLLM's OpenRouter transformation;
             # caller-supplied extra_body is rebuilt by that adapter.
             kwargs["provider"] = {"require_parameters": True}
-    elif checkpoint_phase is not None:
+    elif checkpoint_phase is not None or abandonment_review:
         raise ValueError("Manual prose hints have no checkpoint phase")
     return kwargs

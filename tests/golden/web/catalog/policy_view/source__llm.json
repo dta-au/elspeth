@@ -46,8 +46,14 @@
       },
       "OutputFieldConfig": {
         "additionalProperties": false,
-        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement, and the output column's row type\n        (integer -> int, number -> float, boolean -> bool, string/enum -> str)\n    values: Required for enum type - list of allowed values",
+        "description": "Configuration for a single output field in the LLM response.\n\nAttributes:\n    suffix: Column suffix in output row (e.g., \"score\" -> \"{prefix}_score\")\n    type: Data type for schema enforcement, and the output column's row type\n        (integer -> int, number -> float, boolean -> bool, string/enum -> str)\n    values: Required for enum type - list of allowed values\n    nullable: Whether this required field also admits JSON null",
         "properties": {
+          "nullable": {
+            "default": false,
+            "description": "Allow JSON null in this required field; the key must still be present. Defaults to false.",
+            "title": "Nullable",
+            "type": "boolean"
+          },
           "schema": {
             "anyOf": [
               {

@@ -589,6 +589,7 @@ class TestCallLoader:
             "completion_tokens": None,
             "cached_prompt_tokens": None,
             "reasoning_tokens": None,
+            "returned_model": None,
         }
         defaults.update(overrides)
         return _make_sa_row(**defaults)
@@ -603,6 +604,11 @@ class TestCallLoader:
         assert result.status == CallStatus.SUCCESS
         assert result.state_id == "state-1"
         assert result.operation_id is None
+
+    @pytest.mark.parametrize("value", ["", 3, True])
+    def test_rejects_corrupt_returned_model(self, value: object) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            CallLoader().load(self._make_call_row(returned_model=value))
 
     def test_maps_approved_prompt_artifact_hash(self) -> None:
         """CallLoader must carry the cross-DB prompt-hash anchor (elspeth-543ee35ed3)."""

@@ -46,6 +46,8 @@ from elspeth.web.coordination.quota_authority import (
     admit_storage_bytes_on_connection,
     begin_provider_attempt_on_connection,
     cancel_undispatched_provider_attempt_on_connection,
+    session_storage_bytes_on_connection,
+    storage_bytes_used_on_connection,
 )
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
@@ -54,8 +56,11 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
+    composition_states_table,
+    output_storage_reservations_table,
     quota_policies_table,
     quota_provider_attempts_table,
+    runs_table,
     sessions_table,
     token_usage_ledger_table,
 )
@@ -435,7 +440,7 @@ def test_storage_admission_joins_archived_session_blobs_on_postgres(pg_fenced: F
     assert [(row.dimension, row.usage, row.cap) for row in recorded] == [("storage", 90, 100)]
 
 
-def test_storage_admission_does_not_wait_on_container_policy_row_lock(pg_fenced: FencedSession) -> None:
+def test_storage_admission_waits_on_container_policy_row_lock(pg_fenced: FencedSession) -> None:
     with pg_fenced.engine.begin() as setup:
         setup.execute(
             insert(quota_policies_table).values(
@@ -449,8 +454,13 @@ def test_storage_admission_does_not_wait_on_container_policy_row_lock(pg_fenced:
             )
         )
 
+    started = Event()
+    pid: list[int] = []
+
     def admit() -> int | None:
         with pg_fenced.engine.begin() as other:
+            pid.append(other.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            started.set()
             return admit_storage_bytes_on_connection(
                 other,
                 session_id=pg_fenced.session_id,
@@ -464,4 +474,129 @@ def test_storage_admission_does_not_wait_on_container_policy_row_lock(pg_fenced:
             select(quota_policies_table.c.policy_id).where(quota_policies_table.c.policy_id == "storage-container").with_for_update()
         )
         future = workers.submit(admit)
+        assert started.wait(5)
+        _wait_for_database_lock(pg_fenced, pid[0])
+        locked.commit()
         assert future.result(timeout=5) == 0
+
+
+def _wait_for_database_lock(fenced: FencedSession, pid: int) -> None:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with fenced.engine.connect() as observer:
+            blocked = observer.execute(
+                text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"), {"pid": pid}
+            ).scalar_one()
+        if blocked:
+            return
+        time.sleep(0.01)
+    pytest.fail("storage admission did not wait on the shared policy lock")
+
+
+def test_container_storage_serializes_cross_identity_output_reservations(pg_fenced: FencedSession) -> None:
+    """A different identity must observe the first writer's committed bytes."""
+    conn = _resolve_mutation_connection(pg_fenced.connection_token)
+    other_session = str(uuid.uuid4())
+    ensure_test_identity(conn, identity_id="bob")
+    conn.execute(
+        insert(sessions_table).values(
+            id=other_session, user_id="bob", auth_provider_type="local", title="other owner", created_at=DAY, updated_at=DAY
+        )
+    )
+    for policy_id, identity, tokens, storage in [
+        ("container-storage", None, None, 10),
+        ("alice-storage", "alice", 1000, 100),
+        ("bob-storage", "bob", 1000, 100),
+    ]:
+        conn.execute(
+            insert(quota_policies_table).values(
+                policy_id=policy_id,
+                identity_id=identity,
+                tokens_per_day=tokens,
+                storage_bytes=storage,
+                set_by_actor="operator",
+                set_at=DAY,
+            )
+        )
+    run_ids = {}
+    for session_id in [pg_fenced.session_id, other_session]:
+        state_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
+        conn.execute(
+            insert(composition_states_table).values(
+                id=state_id,
+                session_id=session_id,
+                version=1,
+                is_valid=True,
+                provenance="session_seed",
+                created_at=DAY,
+            )
+        )
+        conn.execute(insert(runs_table).values(id=run_id, session_id=session_id, state_id=state_id, status="running", started_at=DAY))
+        run_ids[session_id] = run_id
+    conn.commit()
+    first_reserved, release_first, second_started = Event(), Event(), Event()
+    second_pid: list[int] = []
+
+    def reserve(connection, session_id: str, size: int) -> None:
+        admit_storage_bytes_on_connection(
+            connection,
+            session_id=session_id,
+            additional_bytes=size,
+            operation="run_output_finalize",
+            record=lambda _event: None,
+        )
+        connection.execute(
+            insert(output_storage_reservations_table).values(
+                target_path=f"/outputs/{session_id}/result.csv",
+                session_id=session_id,
+                run_id=run_ids[session_id],
+                size_bytes=size,
+                custody_operation_id="execute",
+                custody_operation_epoch=1,
+            )
+        )
+
+    def first() -> None:
+        with pg_fenced.engine.begin() as owned:
+            reserve(owned, pg_fenced.session_id, 6)
+            first_reserved.set()
+            assert release_first.wait(10)
+
+    def second() -> list[QuotaExceeded]:
+        recorded: list[QuotaExceeded] = []
+        with pg_fenced.engine.begin() as owned:
+            second_pid.append(owned.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            second_started.set()
+            with pytest.raises(IdentityStorageQuotaExceededError):
+                admit_storage_bytes_on_connection(
+                    owned,
+                    session_id=other_session,
+                    additional_bytes=6,
+                    operation="run_output_finalize",
+                    record=recorded.append,
+                )
+        return recorded
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        first_result = workers.submit(first)
+        try:
+            if not first_reserved.wait(5):
+                first_result.result(timeout=1)
+                pytest.fail("first writer did not reserve output bytes")
+            second_result = workers.submit(second)
+            assert second_started.wait(5)
+            _wait_for_database_lock(pg_fenced, second_pid[0])
+        finally:
+            release_first.set()
+        first_result.result(timeout=5)
+        refused = second_result.result(timeout=5)
+    assert [(row.identity_id, row.usage, row.cap, row.ceiling) for row in refused] == [("bob", 6, 100, 10)]
+    with pg_fenced.engine.begin() as final:
+        assert storage_bytes_used_on_connection(final, identity_id="alice") == 6
+        assert storage_bytes_used_on_connection(final, identity_id="bob") == 0
+        assert storage_bytes_used_on_connection(final, identity_id=None) == 6
+        reserve(final, other_session, 4)
+    with pg_fenced.engine.connect() as observer:
+        assert storage_bytes_used_on_connection(observer, identity_id=None) == 10
+        assert session_storage_bytes_on_connection(observer, session_id=pg_fenced.session_id) == 6
+        assert session_storage_bytes_on_connection(observer, session_id=other_session) == 4

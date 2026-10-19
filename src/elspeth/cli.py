@@ -5268,6 +5268,17 @@ def web(
     if selected_auth is not None:
         os.environ["ELSPETH_WEB__AUTH_PROVIDER"] = selected_auth
 
+    from elspeth.web.config import trusted_proxy_hosts_from_env
+
+    try:
+        trusted_proxy_hosts = trusted_proxy_hosts_from_env()
+    except ValueError:
+        typer.echo(
+            "Error: ELSPETH_WEB__TRUSTED_PROXY_HOSTS must be a JSON array of explicit numeric IP addresses or CIDR networks.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
+
     uvicorn.run(
         "elspeth.web.app:create_app",
         host=host,
@@ -5275,6 +5286,8 @@ def web(
         reload=reload,
         factory=True,
         access_log=False,
+        proxy_headers=bool(trusted_proxy_hosts),
+        forwarded_allow_ips=list(trusted_proxy_hosts),
     )
 
 

@@ -88,12 +88,16 @@ export type QuotaDimension = "tokens" | "storage";
 
 export interface IdentityQuota {
   identity_id: string;
-  tokens_per_day: number | null;
-  storage_bytes: number | null;
-  container_tokens_per_day: number | null;
-  container_storage_bytes: number | null;
-  tokens_used_today: number | null;
-  storage_bytes_used: number;
+  tokens_per_day: string | null;
+  storage_bytes: string | null;
+  container_tokens_per_day: string | null;
+  container_storage_bytes: string | null;
+  tokens_used_today: string | null;
+  storage_bytes_used: string;
+  policy_state: "active" | "never_issued" | "suspended";
+  can_edit: boolean;
+  container_tokens_used_today: string | null;
+  container_storage_bytes_used: string;
 }
 
 /** The approver audit view. The server decides scope; an identity absent from

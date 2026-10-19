@@ -1019,7 +1019,9 @@ _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
 # Export retry repair: 154 edges remain; _reserve_export -> _lock_stream moves
 # 30cdda6842ae896d -> 79fef0a1995bd81d because create excludes existing winners.
 # Measured by the gate's scanner against 49c184508: one moved, no arrivals/departures.
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "7ee575f619b21c40b64fbb73541cb1be5508dc32a1bf1dcae95c1b6b72081f92"
+# Durable quota accounting forwards preserve_call_id=explicit_call_id through
+# the existing record_call/record_operation_call -> _insert_allocated_call edges.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "99e14aae3b82aca256018fc9c4c58da2db08a76ccc8724e47d7291d19d16e94b"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
@@ -5818,7 +5820,7 @@ _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operation
 _reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "fbd8951bb2cccff4d982072302e8484efd6446a1a7ebe1f5d4b5e0b5fd5389a2",
+    "src/elspeth/web/sessions/composer_turn.py": "ba2337366bfdc9f6c4181a85e8dcf0dc1d3048b405de3855c882d178e96dda52",
     "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
 }
 
@@ -9501,7 +9503,8 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     turn_path = "src/elspeth/web/sessions/composer_turn.py"
     dto_path = "src/elspeth/web/sessions/composer_app_services.py"
     title_path = "src/elspeth/web/sessions/_auto_title.py"
-    if any(path not in paths for path in (helper_path, turn_path, dto_path, title_path)):
+    service_path = "src/elspeth/web/composer/service.py"
+    if any(path not in paths for path in (helper_path, turn_path, dto_path, title_path, service_path)):
         return ["captured composer receiver source is missing"], None
     helper = _reserve_node_at(paths[helper_path], "composer_session_lock_registry")
     registry = _reserve_node_at(paths[helper_path], "_SessionComposeLockRegistry")
@@ -9582,7 +9585,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     titles = [node for node in ast.walk(turn) if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_owned_title"]
     auto_title = _reserve_node_at(paths[title_path], "maybe_auto_title_session")
     if len(title_tasks) != 1 or len(titles) != 1 or auto_title is None:
-        return ["parallel title task producer is missing or duplicated"], None
+        return ["guarded title task producer is missing or duplicated"], None
     if not any(
         isinstance(statement, ast.ImportFrom)
         and statement.level == 0
@@ -9595,14 +9598,6 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     prefix = outer.body[4:index] + outer.body[index + 1 : 21]
     if index != 15 or not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["captured composer receiver interval has an unreviewed effect"], None
-    # These are the exact deferred definitions admitted by the closed prefix
-    # and title checks. Their bodies do not execute at definition; defaults,
-    # decorators and postponed-annotation premises remain checked separately.
-    settlement_definition = prefix[1]
-    deferred_bodies = {
-        node for definition in (title, settlement_definition) for statement in definition.body for node in ast.walk(statement)
-    }
-    history_join = outer.body[8].value
     session_service_stores = [
         node
         for node in ast.walk(turn)
@@ -9612,45 +9607,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         isinstance(node, ast.Assign) and node.targets == session_service_stores and ast.unparse(node.value) == "services.session_service"
         for node in ast.walk(turn)
     ):
-        return ["parallel title service is not the separate DTO session service"], None
-    title_calls = [node for node in ast.walk(title) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"]
-    if (
-        title_task.lineno >= capture.lineno
-        or title.decorator_list
-        or title.args.posonlyargs
-        or title.args.args
-        or title.args.kwonlyargs
-        or title.args.defaults
-        or title.args.kw_defaults
-        or title.args.vararg is not None
-        or title.args.kwarg is not None
-        or title.type_params
-        or len(title_calls) != 1
-        or len(title_calls[0].args) != 0
-        or [keyword.arg for keyword in title_calls[0].keywords]
-        != [
-            "service",
-            "session_id",
-            "user_message",
-            "model",
-            "temperature",
-            "seed",
-            "session_operation_context",
-            "api_base",
-            "api_key",
-            "provider_custody",
-        ]
-        or ast.unparse(title_calls[0].keywords[0].value) != "service"
-        or any(isinstance(node, ast.Name) and node.id in {"composer", "services", "app", "_app"} for node in ast.walk(title))
-        or any(isinstance(node, ast.Name) and node.id in {"composer", "app", "_app"} for node in ast.walk(auto_title))
-        or any(isinstance(node, ast.Attribute) and node.attr in {"composer_service", "state", "_state"} for node in ast.walk(auto_title))
-        or any(
-            isinstance(node, ast.Await) and title_task.lineno <= node.lineno < capture.lineno
-            for node in ast.walk(turn)
-            if node not in deferred_bodies and node is not history_join
-        )
-    ):
-        return ["parallel title task can reach or preempt the captured composer receiver"], None
+        return ["guarded title service is not the separate DTO session service"], None
     prelude = outer.body[4:6]
     suffix = outer.body[index + 1 : index + 7]
     dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[5]) if len(suffix) == 6 else None
@@ -9687,8 +9644,36 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
         or (turn_path, id(dispatch[0])) != compose_call
     ):
         return ["captured composer receiver interval has an unreviewed effect"], None
-    # An await in the timeout arm cannot reach the following compose: that arm
-    # raises. Any other await or receiver reference before the call is unsafe.
+    # The exact title prelude is the one admitted suspended interval after
+    # capture. It carries session/custody/guard authority and is deliberately
+    # effectful; common supplier/receiver premises still exclude foreign
+    # instance/class mutation. The complete finite grammar independently binds
+    # its mounted guard read, physical join, deadline and typed refusal audit.
+    title_prelude = _reserve_composer_receiver.composer_title_prelude(suffix[5])
+    if (
+        title_prelude is None
+        or title is not title_prelude.body[2]
+        or title_task is not title_prelude.body[3].body[0].value
+        or any(isinstance(node, ast.Name) and node.id in {"composer", "app", "_app"} for node in ast.walk(title))
+        or any(isinstance(node, ast.Name) and node.id in {"composer", "services", "app", "_app"} for node in ast.walk(auto_title))
+        or any(isinstance(node, ast.Attribute) and node.attr in {"composer_service", "state", "_state"} for node in ast.walk(auto_title))
+    ):
+        return ["guarded title interval has an unreviewed supplier or receiver effect"], None
+    mount_property = _reserve_node_at(paths[service_path], "ComposerServiceImpl.composer_prompt_guard_mount")
+    expected_property = ast.parse(
+        "@property\n"
+        "def composer_prompt_guard_mount(self) -> PromptGuardMount | None:\n"
+        "    return self._provider_gateway.prompt_guard_mount\n"
+    ).body[0]
+    if not isinstance(mount_property, ast.FunctionDef):
+        return ["guarded title mount property is missing"], None
+    property_body = _reserve_composer_receiver.body(mount_property)
+    normalized_property = ast.parse(ast.unparse(mount_property)).body[0]
+    normalized_property.body = property_body
+    if stable_ast_dump(normalized_property) != stable_ast_dump(expected_property):
+        return ["guarded title mount property has an unreviewed receiver effect"], None
+    # An await in the earlier timeout arm cannot reach the following compose:
+    # that arm raises. Other prefix suspensions and receiver escapes stay banned.
     for statement in suffix[:5]:
         for node in ast.walk(statement):
             if isinstance(node, ast.Await) and statement is not suffix[4]:
@@ -9840,7 +9825,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/core/landscape/execution_repository.py",
             "ExecutionRepository",
-            "1c1c40559024a572d359287fe8afc0d9c4dad76207d2594b6478b37b3e7f214f",
+            "3f7b7a2963e058d5fa2af9a9b400a180ff21028aab537af5b0e7dbb512d0ed34",
         ),
         (
             "src/elspeth/core/landscape/execution/sink_effects.py",
@@ -9855,7 +9840,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/engine/executors/sink_effects.py",
             "SinkEffectCoordinator",
-            "7f49b2153337c1b3e991bff69f279b9eaeb081a530137b77b68c25856be855e8",
+            "e02b95605111afa607819b7a84b05bbe3481df8586d0a5577e8081e63fcda8c3",
         ),
     )
     indexed = {unit.path: unit for unit in units}
@@ -9905,6 +9890,18 @@ def _reserve_sink_effect_disjoint_receipts(units):
         ):
             return ["sink-effect owner source shape changed " + name], frozenset()
         owners[name] = (path, owner)
+    # Disposition restoration reaches an additional read-only evidence resolver.
+    # Bind its imports and complete body; the common origin proof below must
+    # still refuse replacement callables and outside receiver effects.
+    read_dependency_path = "src/elspeth/engine/executors/sink_disposition_reason.py"
+    read_dependency = indexed.get(read_dependency_path)
+    if read_dependency is None:
+        return ["sink-effect read dependency source missing " + read_dependency_path], frozenset()
+    if (
+        hashlib.sha256(stable_ast_dump(read_dependency.tree).encode("utf-8")).hexdigest()
+        != "f30f7b887cdb4e5283d7da738e08228246d85c1e41c4955d2d2db63dfe909af7"
+    ):
+        return ["sink-effect read dependency source changed " + read_dependency_path], frozenset()
     protected_sink_fields = {
         "_execution",
         "_payload_store",
@@ -10592,6 +10589,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         "normal_no_fault_hook_callers": frozenset(no_fault_hook_callers),
         "request_constructors": frozenset(inline_requests),
         "normal_callback_sources": frozenset(callback_nodes),
+        "read_dependency_origins": frozenset({"elspeth.engine.executors.sink_disposition_reason.resolve_sink_disposition_reason"}),
     }
 
 
@@ -10760,7 +10758,7 @@ def _reserve_retained_failure_transfer_receipts(units):
     failure = _reserve_node_at(index[service_path], "SessionServiceImpl.fail_composer_async_operation")
     # Keep the independently checked history/cancellation structure even when a
     # caller grammar is deliberately rebound by an adversarial control.
-    prefix = turn.body[37].body[4:15] + turn.body[37].body[16:21]
+    prefix = turn.body[36].body[4:15] + turn.body[36].body[16:21]
     if not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["retained/private transfer history ownership or cancellation changed"], frozenset()
     expected = {
@@ -11317,8 +11315,9 @@ def _reserve_supported_boundary(units):
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(sink_receipt["read_dependency_origins"])
     guarded_classes = set()
-    guarded_functions = set()
+    guarded_functions = set(sink_receipt["read_dependency_origins"])
     for path, guard in _reserve_full_source_guards().items():
         if not guard["protected_exports"]:
             continue
@@ -14364,7 +14363,7 @@ def _raw_attribute_collector(unit: SourceUnit, units: tuple[SourceUnit, ...]) ->
 # These are source bindings, not permissions granted by a filename alone.
 _NEW_LANDSCAPE_STAMP_SOURCES = {
     "src/elspeth/web/schema_probe.py": "c0f27e271e6128ea96a4cb345f32ef4c61bbcdd338aba0a9eaaf1db34447851d",
-    "src/elspeth/core/landscape/database.py": "dee9cbab892223687e425cbc3222b9ede3235f95cbdec1316e3f17e991e35135",
+    "src/elspeth/core/landscape/database.py": "b8da4ed519bbe887140a0a72f040ce264fc4910724c56ca0f55065c2a89653cf",
     "src/elspeth/core/schema_shape.py": "5b32f7faf09a03a7c482b48a092eb0f7cf5811eb927302ad72820fde81ceccb0",
 }
 
@@ -16002,7 +16001,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # guard, journal installation, and database clock path remain unchanged.
     # #298 admits existing SQLite stores read-only before writer bootstrap and
     # changes refusal guidance. Deadline/journal installation order is retained.
-    "src/elspeth/core/landscape/database.py": "93732e93b20b0a30e76f29d259d9ea24b706de7c9cc61173f9b87bbc38ad1438",
+    # Durable quota recovery adds calls.returned_model to required columns;
+    # engine construction and deadline/journal guard ordering are unchanged.
+    "src/elspeth/core/landscape/database.py": "f95f6b921824bb82b58cc754fa86f6c3a46687d892ff810879b5abbb864ce246",
 }
 
 

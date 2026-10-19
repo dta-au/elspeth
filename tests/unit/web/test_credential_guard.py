@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections.abc import Iterator
+from typing import Any, cast
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.provider_gateway import ProviderGateway
+from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
@@ -18,10 +22,48 @@ from elspeth.web.credential_guard import (
     require_no_credential_material_in_state,
     require_no_credential_material_in_tool_wire,
 )
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
 from elspeth.web.sessions.routes.workflow.approvals import ApprovalDecisionBody, ApprovalRequestBody
 from elspeth.web.sessions.routes.workflow.library import CurateLibraryEntryRequest, PublishLibraryEntryRequest
 from elspeth.web.sessions.routes.workflow.reviews import AttestBody, RequestReviewBody
-from tests.unit.web.composer._helpers import _make_llm_response, _make_settings
+from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.session_fences import ensure_session_fence
+from tests.unit.web.composer._helpers import _composer_service_with_session, _make_llm_response, _make_settings, _mock_catalog
+
+
+@pytest.fixture
+def provider_custody() -> Iterator[ProviderCallCustody]:
+    """Reach credential admission with real fenced custody and no SDK dispatch."""
+    composer, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+    assert composer._sessions_service is not None
+    sessions = cast(SessionServiceImpl, composer._sessions_service)
+    assert ensure_session_fence(sessions._engine, session_id, owner_instance_id="credential-guard-test")
+    authority = sessions.session_operation_authority
+    context = authority.acquire(
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="credential-guard-test",
+        lease_seconds=60,
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+    custody = ProviderInvocationOwner(service=sessions, required_work=binding).mint(ProviderInvocationFamily.PRIMARY)
+    try:
+        yield custody
+        assert custody.attempt is None
+        assert custody.call is None
+        coordinator.assert_completed()
+    finally:
+        authority.release(context)
+        sessions._engine.dispose()
 
 
 def _field_mapper_node(mapping: dict[str, str]) -> dict[str, Any]:
@@ -403,7 +445,7 @@ def test_tool_wire_rejects_credential_or_oversized_reference_contents(arguments:
 
 
 @pytest.mark.asyncio
-async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody) -> None:
     transport_calls: list[dict[str, Any]] = []
 
     async def transport(**kwargs: Any) -> object:
@@ -415,7 +457,11 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
     monkeypatch.setattr(litellm, "acompletion", transport)
     with pytest.raises(CredentialMaterialRefused) as caught:
         await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
             model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
             messages=[{"role": "user", "content": "sk-" + "a" * 24}],
         )
 
@@ -424,7 +470,9 @@ async def test_provider_request_is_refused_before_transport(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_serialized_state_credential_is_refused_before_provider_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_serialized_state_credential_is_refused_before_provider_transport(
+    monkeypatch: pytest.MonkeyPatch, provider_custody: ProviderCallCustody
+) -> None:
     transport_calls: list[dict[str, Any]] = []
 
     async def transport(**kwargs: Any) -> object:
@@ -436,7 +484,11 @@ async def test_serialized_state_credential_is_refused_before_provider_transport(
     monkeypatch.setattr(litellm, "acompletion", transport)
     with pytest.raises(CredentialMaterialRefused):
         await provider_gateway._litellm_acompletion(
+            provider_custody=provider_custody,
             model="openai/test-model",
+            prompt_guard_mount=None,
+            prompt_guard_mode="required",
+            prompt_guard_role="composer",
             messages=[{"role": "user", "content": '{"password":"low-entropy-secret"}'}],
         )
 

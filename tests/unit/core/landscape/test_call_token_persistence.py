@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts import CallStatus, CallType
-from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.call_data import LLMCallResponse, RawCallPayload
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.core.landscape.export_read_model import open_export_read_transaction
@@ -79,6 +79,58 @@ def test_call_usage_round_trip(operation: bool, usage: TokenUsage) -> None:
     assert exported[0]["completion_tokens"] == usage.completion_tokens
     assert exported[0]["cached_prompt_tokens"] == usage.cached_prompt_tokens
     assert exported[0]["reasoning_tokens"] == usage.reasoning_tokens
+
+
+@pytest.mark.parametrize("operation", [False, True])
+def test_returned_model_survives_payload_purge_and_reaches_signed_export(operation: bool) -> None:
+    db, factory, state_id, operation_id = _setup_with_operation()
+    token = leader_coordination_token(factory, "run-1")
+    response = LLMCallResponse(content="answer", model="routed/actual-model", usage=TokenUsage.known(3, 2), raw_response={})
+    if operation:
+        call = factory.execution.record_operation_call(
+            operation_id,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload({"model": "configured/model"}),
+            response_data=response,
+            coordination_token=token,
+        )
+    else:
+        call = factory.execution.record_call(
+            state_id,
+            0,
+            CallType.LLM,
+            CallStatus.SUCCESS,
+            RawCallPayload({"model": "configured/model"}),
+            response_data=response,
+            member_token=token.membership,
+            work_item=_claim_state(factory, state_id, member_token=token.membership),
+        )
+    with db.write_connection() as connection:
+        connection.execute(calls_table.update().where(calls_table.c.call_id == call.call_id).values(response_ref=None))
+    loaded = factory.execution.get_operation_calls(operation_id)[0] if operation else factory.query.get_calls(state_id)[0]
+    assert loaded.returned_model == "routed/actual-model"
+    with open_export_read_transaction(db.engine) as read_model:
+        records = list(LandscapeExporter(db, read_model=read_model, compartment_id="test-compartment").iter_unsigned_run_records("run-1"))
+    exported = [record for record in records if record["record_type"] == "call"]
+    assert len(exported) == 1
+    assert exported[0]["returned_model"] == "routed/actual-model"
+
+
+def test_signed_call_record_binds_returned_model() -> None:
+    signatures: list[str] = []
+    for model in (None, "routed/model-a", "routed/model-b"):
+        exporter = _make_exporter(
+            signing_key=b"call-model-test-key",
+            rows=[_ROW],
+            tokens=[_TOKEN],
+            node_states=[_NODE_STATE_COMPLETED],
+            state_calls=[replace(_STATE_CALL, returned_model=model)],
+        )
+        calls = [record for record in exporter.export_run("run-1", sign=True) if record["record_type"] == "call"]
+        assert calls[0]["returned_model"] == model
+        signatures.append(calls[0]["signature"])
+    assert len(set(signatures)) == 3
 
 
 @pytest.mark.parametrize("field", ["prompt_tokens", "completion_tokens", "cached_prompt_tokens", "reasoning_tokens"])

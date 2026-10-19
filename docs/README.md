@@ -2,7 +2,7 @@
 
 Index of the documentation shipped in this repository.
 
-**Framework status:** `0.8.7`
+**Framework status:** `0.8.9`
 **Archive note:** current release, architecture, contract, guide, reference, and
 runbook docs remain visible here. Implemented plans, superseded specs, generated
 review sidecars, and other internal work product are removed from active public
@@ -19,11 +19,12 @@ history.
 | New to ELSPETH | [Your First Pipeline](guides/your-first-pipeline.md) then [User Manual](guides/user-manual.md) |
 | Writing pipelines as version-controlled text | [Authoring pipelines in YAML](guides/yaml-authoring.md) |
 | Deploying a new AWS stack | [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md), then the [Terraform package reference](../deploy/aws-ecs/terraform/README.md) |
+| Deploying a new Azure Container Apps stack | [Azure Container Apps Cold Install](runbooks/azure-container-apps-cold-install.md) |
 | Building or operating pipelines | [Configuration Reference](reference/configuration.md), [Runbooks](runbooks/index.md), and [Troubleshooting](guides/troubleshooting.md) |
 | Investigating audit data | [Landscape MCP Analysis](guides/landscape-mcp-analysis.md) and [Architecture Overview](../ARCHITECTURE.md) |
 | Developing plugins | [Data Trust and Error Handling](guides/data-trust-and-error-handling.md), [Plugin Development Guide](../PLUGIN.md), then [Plugin Protocol](contracts/plugin-protocol.md) |
 | Contributing to the codebase | [Contributing](../CONTRIBUTING.md) |
-| Developing a web or agent head | [Application API design](specs/application-api-design.md) — authoritative future seam and required reference-client conformance — then [Local web development](guides/web-local-development.md) |
+| Developing a web or agent head | [Architecture Overview](../ARCHITECTURE.md), then [Local web development](guides/web-local-development.md) |
 | Evaluating ELSPETH | [Composer Guide](release/composer-guide.md), [Platform Architecture](release/platform-architecture.md), and [Audit and Lineage Guarantees](release/guarantees.md) |
 | Reviewing delivery confidence and decisions | [Project Control](project-control/README.md) — the control registers are maintained by the project but not published in the repository |
 
@@ -44,7 +45,6 @@ explains the arrangement and how to request them.
 Current architecture and design references.
 
 - [Repository Directory Strategy](repository-structure.md) — purpose of every top-level folder and where new files belong
-- [Application API Design](specs/application-api-design.md) — single future-facing spec for API hardening, retained reference UI conformance, ARGO, agentic chassis, web ownership and the internal compiler seam
 - [Maintainer Toolchain](maintainer/toolchain.md) — how the maintainer's own agents work (tracker, code map, delegation); not a requirement for contributors
 - [Architecture Overview](../ARCHITECTURE.md) — C4 model, data flows, and system-level orientation
 - [System Overview](architecture/overview.md) — compatibility pointer to the maintained root architecture overview
@@ -97,6 +97,7 @@ Lookup material for configuration, tools, and plugin-specific behavior.
 - [Configuration Reference](reference/configuration.md)
 - [Environment Variables](reference/environment-variables.md)
 - [Composer Tools](reference/composer-tools.md)
+- [Composer Prompt Guard](reference/composer-prompt-guard.md)
 - [ChaosLLM](reference/chaosllm.md)
 - [ChaosLLM MCP Server](reference/chaosllm-mcp.md)
 - [Web Scrape Transform](reference/web-scrape-transform.md)
@@ -117,6 +118,7 @@ Runbooks and production procedures.
 - [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md)
 - [AWS ECS Existing-Service Redeploy](runbooks/aws-ecs-existing-service-redeploy.md)
 - [AWS ECS Full Disposable Acceptance](runbooks/aws-ecs-deployment.md)
+- [Azure Container Apps Cold Install](runbooks/azure-container-apps-cold-install.md)
 
 ## Release History
 

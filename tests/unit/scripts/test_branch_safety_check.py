@@ -117,6 +117,53 @@ def test_ordinary_commit_remains_allowed(merging_repo: Path) -> None:
     assert "[PASS] in-progress" in result.stdout
 
 
+def test_rotation_manifest_is_allowed(merging_repo: Path) -> None:
+    _git(merging_repo, "merge", "--abort")
+    manifest = merging_repo / ".elspeth/rotations.log"
+    manifest.parent.mkdir()
+    manifest.write_text('{"kind":"tier_model_rotation"}\n', encoding="utf-8")
+    _git(merging_repo, "add", ".elspeth/rotations.log")
+
+    result = _preflight(merging_repo, "commit")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[PASS] staged-paths" in result.stdout
+
+
+@pytest.mark.parametrize("path", [".elspeth/scratch.log", ".elspeth/cache.json", "scratch.log", "nested/.elspeth/rotations.log"])
+def test_rotation_manifest_exception_keeps_artefacts_refused(merging_repo: Path, path: str) -> None:
+    _git(merging_repo, "merge", "--abort")
+    artifact = merging_repo / path
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("scratch\n", encoding="utf-8")
+    _git(merging_repo, "add", path)
+
+    result = _preflight(merging_repo, "commit")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] staged-paths" in result.stdout
+    assert path in result.stdout
+
+
+def test_rotation_manifest_still_checks_blob_and_secrets(merging_repo: Path) -> None:
+    _git(merging_repo, "merge", "--abort")
+    manifest = merging_repo / ".elspeth/rotations.log"
+    manifest.parent.mkdir()
+    manifest.write_text(str(Path.home()) + "\n", encoding="utf-8")
+    _git(merging_repo, "add", ".elspeth/rotations.log")
+    scanner = merging_repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
+    scanner.parent.mkdir(parents=True)
+    scanner.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    scanner.chmod(0o755)
+
+    result = _preflight(merging_repo, "commit")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[PASS] staged-paths" in result.stdout
+    assert "[FAIL] home-paths" in result.stdout
+    assert "[FAIL] secrets" in result.stdout
+
+
 @pytest.fixture
 def fetch_repo(tmp_path: Path) -> tuple[Path, Path, str, str]:
     """A main-only clone with a stale release ref and an advanced remote tip."""

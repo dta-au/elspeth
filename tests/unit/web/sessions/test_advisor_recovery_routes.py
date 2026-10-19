@@ -7,6 +7,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorGatePassed, AdvisorSignoffGateFact
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.completion_gates import (
@@ -20,9 +21,15 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.composer_operations import submit_and_settle
 from tests.unit.web.sessions.test_completion_gate_roundtrip import _green_result
-from tests.unit.web.sessions.test_routes import _make_app, _make_authoring_valid_partial
+from tests.unit.web.sessions.test_routes import (
+    _assert_required_route_guard_checks,
+    _install_required_route_prompt_shields,
+    _make_app,
+    _make_authoring_valid_partial,
+)
 
 
 @pytest.mark.asyncio
@@ -114,12 +121,12 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
         ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
         AdvisorGraphReviewIdentity,
     )
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     app, service = _make_app(tmp_path)
+    guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
     session = await service.create_session("alice", "Advisor recovery", "local")
     state = _make_authoring_valid_partial("advisor-recovery")
     fingerprint = completion_gate_fingerprint(state)
@@ -164,8 +171,7 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
         assert kwargs["model"] == app.state.settings.composer_advisor_model
         assert "tools" not in kwargs and kwargs["num_retries"] == kwargs["max_retries"] == 0
         assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
-        payload = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-        review = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
         assert review["current_request"] == "Please retry the review"
         assert review["candidate_reply"] == "Review complete"
         assert review["saved_effects"]["saved_revision_count"] == 0 and review["saved_effects"]["net_changed"] is False
@@ -216,16 +222,19 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
                     initial_state=state,
                 )
                 review = evidence.review_candidate(candidate="Review complete", request=message, current_state=state)
-                verdict = await checkpoint_service._advisor_checkpoint._run_advisor_checkpoint(
-                    phase="end",
-                    state=state,
-                    session_id=str(session.id),
-                    recorder=recorder,
-                    user_message=message,
-                    session_operation_context=kwargs["session_operation_context"],
-                    provider_owner=kwargs["provider_owner"],
-                    publication_review=review,
-                )
+                # The route double enters the actual checkpoint directly;
+                # supply the genuine scope normally owned by compose().
+                with prompt_guard_user_scope(message):
+                    verdict = await checkpoint_service._advisor_checkpoint._run_advisor_checkpoint(
+                        phase="end",
+                        state=state,
+                        session_id=str(session.id),
+                        recorder=recorder,
+                        user_message=message,
+                        session_operation_context=kwargs["session_operation_context"],
+                        provider_owner=kwargs["provider_owner"],
+                        publication_review=review,
+                    )
                 assert verdict.ok and not verdict.blocking and verdict.publication_verdict == "ADMIT"
                 assert verdict.publication_binding == review.binding
                 identity = AdvisorGraphReviewIdentity(binding=verdict.publication_binding, for_graph=fingerprint, source="model")
@@ -268,6 +277,19 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
     assert merge_completion_gates(_green_result(), reloaded_facts, rebuilt).readiness.completion_ready is adjudicates
     assert len(reviews) == len(identities) == int(adjudicates)
     stored = await service.get_messages(session.id, limit=None)
+    guard_envelopes = [
+        envelope
+        for row in stored
+        if row.role == "audit" and row.tool_calls
+        for envelope in row.tool_calls
+        if envelope["_kind"] == "prompt_guard_audit"
+    ]
+    if adjudicates:
+        _assert_required_route_guard_checks(guard_envelopes, guard_mount, roles=["advisor"])
+    else:
+        assert guard_envelopes == []
+    assert bool(guard_requests) is adjudicates
+    assert all(request["userPrompt"] == "Please retry the review" for request in guard_requests)
     pass_records = [
         row.tool_calls[0]["pass"]
         for row in stored
@@ -289,7 +311,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["messages", "recompose"])
 async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(tmp_path, route, monkeypatch):
-    import json
 
     import litellm
 
@@ -298,12 +319,12 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
         ADVISOR_GRAPH_REVIEW_AUDIT_KIND,
         AdvisorGraphReviewIdentity,
     )
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.turn_effects import TurnEvidence
 
     app, service = _make_app(tmp_path)
+    guard_mount, guard_requests = _install_required_route_prompt_shields(app, monkeypatch)
     session = await service.create_session("alice", "Advisor failures", "local")
     state = _make_authoring_valid_partial("advisor-failures")
     state_d = state.to_dict()
@@ -349,8 +370,7 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
                 assert "tools" not in request and request["num_retries"] == request["max_retries"] == 0
                 assert request["response_format"]["json_schema"]["name"] == "advisor_end_response"
                 assert len(attempts) < (1 if expected_cause is AdvisorBlockCause.UNAVAILABLE else 2), "No extra END response is supplied"
-                payload = request["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-                supplied = json.loads(payload.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+                supplied = parse_advisor_publication_review(request["messages"][1]["content"])
                 assert supplied["current_request"] == "Retry review" and supplied["candidate_reply"] == "Review failed"
                 assert supplied["saved_effects"]["saved_revision_count"] == 0 and supplied["saved_effects"]["net_changed"] is False
                 attempts.append(supplied)
@@ -366,16 +386,17 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
 
             monkeypatch.setattr(litellm, "acompletion", failing_sdk)
             recorder = BufferingRecorder()
-            verdict = await checkpoint_service._advisor_checkpoint._run_advisor_checkpoint(
-                phase="end",
-                state=state,
-                session_id=str(session.id),
-                recorder=recorder,
-                user_message=message,
-                session_operation_context=kwargs["session_operation_context"],
-                provider_owner=kwargs["provider_owner"],
-                publication_review=review,
-            )
+            with prompt_guard_user_scope(message):
+                verdict = await checkpoint_service._advisor_checkpoint._run_advisor_checkpoint(
+                    phase="end",
+                    state=state,
+                    session_id=str(session.id),
+                    recorder=recorder,
+                    user_message=message,
+                    session_operation_context=kwargs["session_operation_context"],
+                    provider_owner=kwargs["provider_owner"],
+                    publication_review=review,
+                )
             assert verdict.ok is False and verdict.publication_verdict is None and verdict.publication_binding is None
             source = "unavailable" if verdict.failure_class == "unavailable" else "malformed"
             actual_cause = AdvisorBlockCause.UNAVAILABLE if source == "unavailable" else AdvisorBlockCause.MALFORMED
@@ -404,6 +425,7 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
     previous = await service.get_current_state(session.id)
     assert previous is not None
     original = previous
+    guard_count = 0
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         for cause, should_save in (
             (AdvisorBlockCause.UNAVAILABLE, True),
@@ -439,6 +461,19 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
                 is False
             )
             rows = await service.get_messages(session.id, limit=None)
+            expected_attempts = 1 if cause is AdvisorBlockCause.UNAVAILABLE else 2
+            guard_envelopes = [
+                envelope
+                for row in rows
+                if row.role == "audit" and row.tool_calls
+                for envelope in row.tool_calls
+                if envelope["_kind"] == "prompt_guard_audit"
+            ]
+            _assert_required_route_guard_checks(guard_envelopes[guard_count:], guard_mount, roles=["advisor"] * expected_attempts)
+            guard_count += expected_attempts
+            assert len(guard_envelopes) == guard_count
+            assert len(guard_requests) >= guard_count
+            assert all(request["userPrompt"] == "Retry review" for request in guard_requests)
             reviews = [
                 row.tool_calls[0]["review"]
                 for row in rows

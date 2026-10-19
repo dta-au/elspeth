@@ -72,6 +72,7 @@ F6 follow-up: drift guard added per ``docs/composer/evidence/composer-phase-2-fo
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -90,6 +91,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BLOB_CREATORS
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.config import validate_runtime_node_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
@@ -104,6 +106,9 @@ from elspeth.web.composer.redaction import (
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
     GetBlobContentResponseModel,
+    ReadAttachmentArgumentsModel,
+    ReadAttachmentDataModel,
+    ReadAttachmentResponseModel,
     SetPipelineArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
@@ -265,6 +270,43 @@ def _get_blob_content_data_strategy(draw: st.DrawFn) -> GetBlobContentDataModel:
     )
 
 
+@st.composite
+def _read_attachment_arguments_strategy(draw: st.DrawFn) -> ReadAttachmentArgumentsModel:
+    arguments = {"blob_id": draw(st.text())}
+    if draw(st.booleans()):
+        arguments["expected_content_hash"] = draw(st.one_of(st.none(), _BLOB_HASH_STRATEGY))
+    return ReadAttachmentArgumentsModel.model_validate(arguments)
+
+
+@st.composite
+def _read_attachment_data_strategy(draw: st.DrawFn) -> ReadAttachmentDataModel:
+    content = draw(st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=64))
+    raw = content.encode("utf-8")
+    return ReadAttachmentDataModel(
+        blob_id=draw(st.text()),
+        filename=draw(st.text()),
+        mime_type=draw(st.text()),
+        content=content,
+        truncated=False,
+        size_bytes=len(raw),
+        content_hash=hashlib.sha256(raw).hexdigest(),
+        total_chars=len(content),
+        start_char=0,
+        end_char=len(content),
+        next_offset_chars=None,
+        created_by=draw(st.sampled_from(sorted(BLOB_CREATORS))),
+        creation_modality=draw(st.sampled_from(tuple(modality.value for modality in CreationModality))),
+    )
+
+
+def _read_attachment_response_strategy() -> st.SearchStrategy[ReadAttachmentResponseModel]:
+    data = st.from_type(ReadAttachmentDataModel)
+    return st.one_of(
+        st.builds(ReadAttachmentResponseModel, success=st.just(True), data=data),
+        st.builds(ReadAttachmentResponseModel, success=st.just(False), data=st.one_of(st.none(), data)),
+    )
+
+
 def _set_pipeline_source_strategy() -> st.SearchStrategy[_SetPipelineSourceModel]:
     return st.builds(
         _SetPipelineSourceModel,
@@ -404,6 +446,9 @@ st.register_type_strategy(CreateBlobArgumentsModel, _create_blob_strategy())
 st.register_type_strategy(GetBlobContentArgumentsModel, _get_blob_content_arguments_strategy())
 st.register_type_strategy(GetBlobContentDataModel, _get_blob_content_data_strategy())
 st.register_type_strategy(GetBlobContentResponseModel, _get_blob_content_response_strategy())
+st.register_type_strategy(ReadAttachmentArgumentsModel, _read_attachment_arguments_strategy())
+st.register_type_strategy(ReadAttachmentDataModel, _read_attachment_data_strategy())
+st.register_type_strategy(ReadAttachmentResponseModel, _read_attachment_response_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
@@ -614,8 +659,12 @@ class _FakeComposeLLM:
         *,
         provider_custody: object | None = None,
         credential_state: CompositionState | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
-        del provider_custody, credential_state
+        del provider_custody, credential_state, prompt_guard_trusted_message_indexes
+        del prompt_guard_content_parts, prompt_guard_tool_argument_parts
         if not self._responses:
             return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
         return _admit_composer_llm_completion(self._responses.pop(0))
@@ -706,12 +755,18 @@ def make_tool_context() -> Any:
 
 
 def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
+    """Use explicit development guard mode for this fake-provider harness.
+
+    Actual physical calls still require fenced custody and durable guard audit.
+    Guard-policy tests can override the mode to exercise required admission.
+    """
     values: dict[str, Any] = {
         "data_dir": data_dir,
         "composer_max_composition_turns": 15,
         "composer_max_discovery_turns": 10,
         "composer_timeout_seconds": 85.0,
         "composer_rate_limit_per_minute": 10,
+        "composer_prompt_guard_mode": "debug-when-unconfigured",
         "shareable_link_signing_key": b"\x00" * 32,
     }
     values.update(overrides)

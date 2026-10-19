@@ -379,7 +379,7 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     llm = _ScriptedLLM(
         _tool_turn("call_required_controls_explicit", "set_pipeline", original),
     )
-    initial_state = _empty_state()
+    initial_state = _incremental_base_state(tmp_path)
 
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
@@ -466,7 +466,7 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
         result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -538,7 +538,7 @@ async def test_auto_commit_does_not_wire_an_incomplete_set_pipeline_candidate(tm
         result = await harness.service.compose(
             "Build this pipeline incrementally; the sink will follow.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,
@@ -581,7 +581,7 @@ async def test_auto_commit_does_not_duplicate_already_covered_controls(tmp_path:
         result = await harness.service.compose(
             "Apply this already-covered pipeline.",
             [],
-            _empty_state(),
+            _incremental_base_state(tmp_path),
             session_id=harness.session_id,
             user_id="proposal-prevalidation-user",
             user_message_id=harness.user_message_id,

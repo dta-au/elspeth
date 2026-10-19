@@ -10,7 +10,6 @@ import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Literal, TypedDict, final
 from uuid import UUID
@@ -20,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from sqlalchemy import Engine
 
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
-from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -102,7 +101,6 @@ from elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _locked_read_ready_blob,
-    _verify_blob_content_integrity,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -218,13 +216,13 @@ def _csv_source_field_mapping(options: Mapping[str, Any]) -> dict[str, str] | No
 _EXPRESSION_GRAMMAR = """\
 Expression Syntax Reference
 ===========================
-Applies to gate conditions and value_transform expressions.
+Applies to gate conditions, value_transform expressions and LLM result_checks.
 
 Variables:
   row      - The current row as a dict. Access fields via row['field_name'].
 
 Field access:
-  row['field_name']       Direct access (raises KeyError if missing)
+  row['field_name']       Direct access (expression evaluation fails if missing)
   row.get('field_name')   Returns None if missing (NO default argument allowed)
 
 Operators:
@@ -237,7 +235,7 @@ Operators:
 
 Literals:
   Strings, numbers, and the constants True, False, None
-  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — sets only for in-place membership tests
+  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — consume sets inside expressions (e.g. membership or len); never store a set in a row value
 
 Built-in functions (only these are allowed):
   len()       Length of a sequence or string
@@ -246,8 +244,15 @@ Built-in functions (only these are allowed):
   upper()     Uppercase a string
   strip()     Trim whitespace (or given characters: strip(row['x'], 'z'))
   casefold()  Aggressive lowercase for caseless matching
+  starts_with(value, prefix)  Exact case-sensitive leading prefix; exactly two strings, no offsets or tuple prefixes
+  word_count(value)  Whitespace-delimited token count of a string; punctuation within a token does not split it
+  decimal_within(left, right, tolerance)  Inclusive absolute difference of numeric decimal spellings, no epsilon
 
-Case folding is function-call form only — row['x'].lower() is rejected.
+decimal_within requires finite int/float values (not bool or strings) and a nonnegative tolerance.
+It compares the values received; it does not recover source text or undo earlier binary-float arithmetic.
+word_count scans the full string and temporarily splits on Python whitespace; empty/all-whitespace text gives zero.
+
+Helpers are function-call form only — row['x'].lower(), .startswith(), .split() and slices are rejected.
 Type coercion functions (int, str, float, bool) are NOT available.
 Types come from upstream declarations (source, conversions, and authored outputs); expressions never coerce.
 A stored value_transform result cannot be a set: use a list. Its target type is
@@ -1090,7 +1095,15 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"plugin_options_invalid",
         "One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement — read it before hypothesising a cause.",
-        "Apply exactly what 'detail' names (it usually includes a ready repair, e.g. a patch_node_options call). Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) for exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps: an llm node must declare the row fields its template reads; [] is for intentional whole-row or computed-key reads and a field-scoped shield cannot credit it. Observed source schemas report lexical types; created fields use output declarations or derived types. Declarations use carried field names; template filters and tests must exist; the llm profile must be one of the enum aliases from get_plugin_schema.",
+        "Preserve the user's explicit names, values, types and interface requirements when applying the validator's repair. "
+        "A schema-valid spelling does not authorize changing those requirements. If the plugin cannot express them, report "
+        "the concrete capability gap and supported alternatives instead of silently changing the request. Use 'detail' "
+        "to identify the offending options. Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) "
+        "for exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps: an llm node "
+        "must declare the row fields its template reads; [] is for intentional whole-row or computed-key reads and a "
+        "field-scoped shield cannot credit it. Observed source schemas report lexical types; created fields use output "
+        "declarations or derived types. Declarations use carried field names; template filters and tests must exist; "
+        "the llm profile must be one of the enum aliases from get_plugin_schema.",
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
@@ -1104,17 +1117,24 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"gate_on_error_unknown_sink",
-        "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
+        "A gate's node-level on_error policy may name 'discard', an existing sink, or an eligible enclosing "
+        "bound-region closer. Arbitrary processing destinations are forbidden. The rejection's "
         "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
         "'declared_sinks'.",
         "Use upsert_node to set the gate's on_error='discard', or copy one of the connectivity facts' declared_sinks "
-        "exactly. Gate evaluation-error routing is configured on the gate node; do not add an on_error edge.",
+        "exactly. If the intended destination is an eligible enclosing closer, correct that binding instead. "
+        "Preserve the user's retention choices and required-control coverage. Gate evaluation-error routing "
+        "is configured on the gate node; do not add an on_error edge.",
     ),
     (
         r"transform_on_error_unknown_sink|references unknown sink",
-        "An on_error destination may only be 'discard' or an existing sink name. The rejection's 'connectivity' facts, when present, "
+        "An on_error destination ordinarily names 'discard' or an existing sink. A transform or gate inside a valid "
+        "bound region may instead name its enclosing closer; aggregations cannot. Required-control coverage still applies. "
+        "The rejection's 'connectivity' facts, when present, "
         "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
-        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly.",
+        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly. "
+        "For a transform or gate whose intended destination is an eligible enclosing closer, correct that binding instead. "
+        "Preserve the user's retention choices and required-control coverage.",
     ),
     (
         r"gate_route_labels_mismatch|route labels don't match",
@@ -1123,15 +1143,12 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"gate_condition_ignores_stated_threshold",
-        "The instruction states a comparison (a threshold on a field), but every gate in the candidate has a constant "
-        "condition. A constant condition makes no per-row decision, so the stated rule is expressed nowhere in the "
-        "pipeline and every row takes the same path — with a fan-out gate that means every row is written to every "
-        "destination. The rejection's 'detail' quotes the comparison from the instruction verbatim.",
-        "Author the comparison as the gate's condition — e.g. condition=\"row['amount'] > 500\" — and point "
-        'routes={"true": <one destination>, "false": <the other destination>} at the two DIFFERENT destinations '
-        "(drop fork_to; a fork delivers to every branch). "
-        "If the constant fan-out was genuinely intended — every row to every destination — re-emit the same pipeline "
-        "unchanged and it will be accepted.",
+        "Historical planner heuristic: request prose appeared to state a routing comparison while every authored gate "
+        "had a constant condition. That one-nudge check is retired; this stored code does not establish the request's "
+        "meaning or prove that the graph is wrong.",
+        "Compare the actual request with the authored condition and route destinations. If conditional routing was "
+        "intended, ask the planner to author that rule; if fan-out was intended, retain it. A constant fan-out sends "
+        "every row to every branch. This historical diagnostic no longer triggers an automatic second authoring attempt.",
     ),
     (
         r"review_reconciliation_failed|Authoritative interpretation-review reconciliation failed",
@@ -1164,22 +1181,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
-        "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
-        "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
-        f'"{RAW_HTML_CLEANUP_REVIEW_DRAFT}". '
-        "Keep the row's user_term and every other pipeline detail unchanged, and re-emit the FULL set_pipeline call.",
+        "Historical cleanup-draft diagnostic: an earlier implementation rejected review drafts that did not contain specific phrases. "
+        "That prose predicate is retired; this stored code does not establish a defect in the current review or mapping.",
+        "Keep the registered pipeline_decision user_term and describe the intended cleanup in the draft. "
+        "Check the actual field_mapper mapping against the declared web_scrape raw fields. Preserve review provenance "
+        "and artifact binding when repairing a candidate.",
     ),
     (
         r"interpretation_review_contract_unsatisfied|drops web-scrape raw field",
         "A cleanup node that drops web-scrape raw fields (field_mapper with select_only=true) must stage an interpretation review recording that decision before the pipeline is accepted. "
-        "The row is recognized ONLY when user_term is the registered decision kind and the draft text names both the raw HTML and the fingerprint fields — a paraphrased draft is NOT recognized and this same code fires again.",
-        # The literal minimal delta (tutorial op 18b4cee7: four generations
-        # looped on this code because free-text drafts fail the contract's
-        # marker recognition). Quote the registered user_term and the
-        # canonical draft VERBATIM so a copy-paste repair always lands.
-        "On the cleanup field_mapper node, add options.interpretation_requirements — a SIBLING of mapping, never inside it — containing exactly this entry: "
+        "The structured pipeline_decision kind and registered user_term identify the review; the actual mapping and declared producer fields determine its effects.",
+        "On the cleanup field_mapper node, add options.interpretation_requirements — a SIBLING of mapping, never inside it. "
+        f"Use kind 'pipeline_decision' and user_term {RAW_HTML_CLEANUP_USER_TERM!r} exactly. "
+        "Write the draft in your own words to describe the fields being dropped. Example review row: "
         f'{{"kind": "pipeline_decision", "user_term": "{RAW_HTML_CLEANUP_USER_TERM}", "draft": "{RAW_HTML_CLEANUP_REVIEW_DRAFT}"}}. '
-        "Copy the user_term and draft strings verbatim — do not rephrase the draft. "
         "Then re-emit the FULL set_pipeline call with that requirement in place; rejected set_pipeline calls do not persist partial nodes.",
     ),
     (
@@ -1520,9 +1535,9 @@ _LEGACY_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # ── Nodeless-revision guard (same closure; proposal 3cb6532e) ──────────
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
-    # ── Stated-threshold fidelity guard (R2-F17, 2026-08-01) ───────────────
-    # Planner-loop only: the instruction is the evidence, so no structural
-    # validator can raise this. The shape it rejects is legal everywhere else.
+    # ── Historical stated-threshold heuristic (R2-F17, retired) ──────────
+    # Retain the stored code and legacy match order. The prose-derived
+    # planner rejection is retired; constant fan-out remains structurally legal.
     "gate_condition_ignores_stated_threshold",
     # ── Plugin-unavailability family (same sweep) ──────────────────────────
     # Historical expansion only. New policy members get direct records from
@@ -1875,6 +1890,47 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The selected source artifact is not valid UTF-8 text for this binding.",
         "Use an artifact with the source plugin's supported encoding and format, preserving the intended data. Do not "
         "silently coerce bytes or discard undecodable content.",
+    ),
+    DirectValidationGuidance(
+        "secret_context_unavailable",
+        "Required authenticated secret-service context is unavailable for this request. The saved graph was retained.",
+        "Retain the intended graph and reference. Report the missing secret-service or user context and retry only "
+        "through a surface that supplies it. Rewriting the graph or inventing a secret cannot supply this context.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_required",
+        "The secret wiring operation did not select one existing destination.",
+        "Inspect the saved graph and supply its intended exact target_id: the node ID or output name, or the source "
+        "name when multiple sources are configured. Preserve unrelated components and the intended reference.",
+    ),
+    DirectValidationGuidance(
+        "secret_target_unsupported",
+        "The selected node cannot receive plugin credential options.",
+        "Select the intended existing source, transform/aggregation/collector plugin node, or output. Do not change "
+        "a structural node's kind or replace unrelated components merely to make a credential destination.",
+    ),
+    DirectValidationGuidance(
+        "missing_secret_ref",
+        "The intended secret reference does not currently resolve for this authenticated request. This does not "
+        "establish that the reference is absent.",
+        "Use list_secret_refs and validate_secret_ref to inspect the intended reference's current availability and "
+        "reported reason where present. Use the existing secret-management workflow for user-owned references when "
+        "appropriate, or ask the operator to resolve deployment prerequisites when needed. Do not invent names, literal "
+        "credentials or environment interpolation, or assume availability grants destination authorization.",
+    ),
+    DirectValidationGuidance(
+        "unauthorized_secret_ref",
+        "The deployment has not authorized this exact secret/component/plugin/option destination.",
+        "Preserve the intended graph and explain the destination refusal. An operator must authorize the exact "
+        "destination through the server-authored secret wiring policy if it is required. Availability checks and "
+        "repeated wiring attempts cannot grant that authority; do not silently remove or substitute the reference.",
+    ),
+    DirectValidationGuidance(
+        "disallowed_secret_ref",
+        "An option does not permit secret_ref markers under the credential-placement policy.",
+        "Use the intended credential-bearing option allowed by the existing placement policy, still subject to exact "
+        "destination authorization. Do not paste a literal credential into a noncredential field or rewrite unrelated "
+        "components to silence the refusal.",
     ),
     *_direct_plugin_policy_guidance(),
 )
@@ -2627,6 +2683,7 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
         "gate_expression_unbounded_string_amplification",
         "text_source_url_without_web_scrape",
         "source_inspection_failed",
+        "source_blob_unavailable",
     }
 )
 _MAX_PROOF_BLOB_SOURCES: Final[int] = 256
@@ -2636,23 +2693,14 @@ _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS: Final[int] = 16
 
 @dataclass(frozen=True, slots=True)
 class ResolvedProofBlob:
-    """One custody-resolved blob and optional verified bounded content."""
+    """One custody-resolved blob with verified bounded content."""
 
     metadata: BlobToolRecord
-    verified_prefix: bytes | None = None
-    verified_content_hash: str | None = None
-    total_size_bytes: int | None = None
+    verified_prefix: bytes
+    verified_content_hash: str
+    total_size_bytes: int
 
     def __post_init__(self) -> None:
-        supplied = (
-            self.verified_prefix is not None,
-            self.verified_content_hash is not None,
-            self.total_size_bytes is not None,
-        )
-        if any(supplied) and not all(supplied):
-            raise TypeError("verified proof bytes, content hash, and total size must be supplied together")
-        if not any(supplied):
-            return
         if type(self.verified_prefix) is not bytes or len(self.verified_prefix) > 8 * 1024:
             raise TypeError("verified proof prefix must be exact bytes bounded to 8192 bytes")
         if type(self.verified_content_hash) is not str:
@@ -2682,6 +2730,98 @@ class UnresolvedClaimedProofBlob:
     resolver union with the house ``type(x) is C`` idiom, which only narrows the
     negative branch to ``ResolvedProofBlob`` because this marker cannot be subclassed.
     """
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ComposerProofContext:
+    """Complete dependencies for proof through the existing fenced blob reader.
+
+    This carrier grants no authority; the reader still verifies the operation
+    against the store under its normal custody lock.
+    """
+
+    session_engine: Engine
+    session_id: str
+    data_dir: str
+    operation: SessionOperationContext
+    authority: SessionOperationAuthority
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not SessionOperationContext or self.authority is None:
+            raise AuditIntegrityError("Source proof requires the actual session operation context and authority")
+        if self.operation.fence.session_id != self.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+        if not isinstance(self.session_engine, Engine):
+            raise TypeError("Source proof requires a session Engine")
+        if type(self.data_dir) is not str or not self.data_dir:
+            raise TypeError("Source proof requires a storage root")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _AuthoritativeProofContext:
+    """Resolver captured by the execution owner's exact custody factory."""
+
+    resolve: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofNotApplicable:
+    """No source claims scalar blob content; no proof was performed."""
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofEvaluated:
+    """Bounded proof diagnostics were evaluated, including configuration faults."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "diagnostics")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ProofUnavailable:
+    """At least one claimed source could not supply verified ready evidence."""
+
+    diagnostics: tuple[Mapping[str, Any], ...]
+
+    def __post_init__(self) -> None:
+        if not any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in self.diagnostics):
+            raise AuditIntegrityError("Unavailable source proof requires a blocking availability diagnostic")
+        freeze_fields(self, "diagnostics")
+
+
+class MalformedSourceProofClaim(ValueError):
+    """A present scalar claim is invalid; raw authored values are never retained."""
+
+    def __init__(self, source_name: str, reason: str) -> None:
+        self.source_name = source_name
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _admit_source_proof_claims(state: CompositionState) -> tuple[tuple[str, SourceSpec, str], ...]:
+    """Admit every present scalar identity before any metadata or byte read."""
+    claims: list[tuple[str, SourceSpec, str]] = []
+    for name, source in state.sources.items():
+        if "blob_ref" not in source.options:
+            continue
+        raw = source.options["blob_ref"]
+        if type(raw) is not str:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be an exact canonical UUID string.")
+        try:
+            parsed = UUID(raw)
+        except ValueError:
+            raise MalformedSourceProofClaim(name, "The source blob claim must be a canonical UUID string.") from None
+        if str(parsed) != raw:
+            raise MalformedSourceProofClaim(name, "The source blob claim must use canonical UUID spelling.")
+        claims.append((name, source, raw))
+    return tuple(claims)
 
 
 class _BlockingDiagnosticPayload(TypedDict):
@@ -3582,7 +3722,7 @@ def _compute_proof_diagnostics_for_source(
     *,
     source_name: str,
     source: SourceSpec,
-    blob_id: object,
+    blob_id: str,
     blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None],
     declared_input_type_budget: _DeclaredInputTypeProofBudget,
 ) -> list[Mapping[str, Any]]:
@@ -3637,49 +3777,30 @@ def _compute_proof_diagnostics_for_source(
     """
     diagnostics: list[Mapping[str, Any]] = []
 
-    resolved_blob = blob_resolver(str(blob_id))
-    if type(resolved_blob) is UnresolvedClaimedProofBlob:
+    resolved_blob = blob_resolver(blob_id)
+    if resolved_blob is None or type(resolved_blob) is UnresolvedClaimedProofBlob:
         return [
             _blocking_diagnostic(
-                code="source_inspection_failed",
-                message=("This source claims blob custody, but the live blob is not an exact ready, session-owned path match."),
-                suggested_repair="Re-select or re-upload the source blob, then validate the pipeline again.",
-                evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+                code="source_blob_unavailable",
+                message="The claimed source content could not be verified as ready for this request.",
+                suggested_repair=(
+                    "Inspect the intended artifact through authenticated blob discovery and resolve its availability before retrying. "
+                    "Retain the intended binding; do not fabricate or assume empty source content."
+                ),
+                evidence_locator={"source": "blob", "blob_id": blob_id},
             )
         ]
-    blob = None if resolved_blob is None else resolved_blob.metadata
+    if type(resolved_blob) is not ResolvedProofBlob:
+        raise TypeError("Source proof resolver returned an unowned evidence type")
+    blob = resolved_blob.metadata
     # ``blob`` is a BlobToolRecord (TypedDict produced by
     # ``_blob_row_to_tool_dict`` from a validated blobs row). Direct
     # subscript access is mandatory — a missing key is a Tier-1
     # contract violation in our own dict shape, not external data.
-    if blob is None or blob["status"] != "ready":
-        return diagnostics
-    assert resolved_blob is not None
-
-    if resolved_blob.verified_prefix is None:
-        storage_path = Path(blob["storage_path"])
-        if not storage_path.exists():
-            diagnostics.append(
-                _blocking_diagnostic(
-                    code="source_inspection_failed",
-                    message=(f"Source blob '{blob_id}' storage file is missing — pipeline cannot run until the blob is re-uploaded."),
-                    suggested_repair="create_blob with the original content and re-wire via set_source_from_blob",
-                    evidence_locator={"source": "blob", "blob_id": str(blob_id)},
-                )
-            )
-            return diagnostics
-
-        # Existing Composer-engine behavior: read and verify the complete local
-        # file. Authoritative validate/execute callers instead supply the
-        # BlobService's already-verified 8 KiB prefix to avoid full-file memory
-        # use and a metadata/path TOCTOU seam.
-        content = storage_path.read_bytes()
-        _verify_blob_content_integrity(blob, content)
-        total_size_bytes = len(content)
-    else:
-        content = resolved_blob.verified_prefix
-        assert resolved_blob.total_size_bytes is not None
-        total_size_bytes = resolved_blob.total_size_bytes
+    if blob["status"] != "ready":
+        raise AuditIntegrityError("Resolved source proof evidence is not ready")
+    content = resolved_blob.verified_prefix
+    total_size_bytes = resolved_blob.total_size_bytes
 
     facts = inspect_blob_content(
         content=content,
@@ -4112,27 +4233,63 @@ def _attribute_proof_diagnostic_to_source(
 def compute_proof_diagnostics(
     state: CompositionState,
     *,
-    session_engine: Engine | None = None,
-    session_id: str | None = None,
-    data_dir: str | None = None,
-    session_operation_context: SessionOperationContext | None = None,
-    session_operation_authority: SessionOperationAuthority | None = None,
-    blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] | None = None,
-) -> list[Mapping[str, Any]]:
+    context: ComposerProofContext | _AuthoritativeProofContext | None,
+) -> ProofNotApplicable | ProofEvaluated | ProofUnavailable:
     """Inspect every blob-backed source within the authored-source proof cap.
 
     Each source gets an independent custody resolution and bounded 8 KiB
     inspection. Pipelines above the explicit cap block deterministically rather
     than silently marking a partially inspected topology as proof-passed.
-    Composer callers supply ``session_engine``/``session_id``; authoritative
-    execution supplies the BlobService-backed ``blob_resolver``.
+    Composer supplies its complete fenced reader context; execution supplies
+    the nominal context captured by its authoritative BlobService factory.
     """
-    if session_id is None:
-        return []
-    effective_resolver = blob_resolver
-    if effective_resolver is None:
-        if session_engine is None:
-            return []
+    if context is not None and type(context) not in (ComposerProofContext, _AuthoritativeProofContext):
+        raise TypeError("Source proof requires an owned proof context or explicit absence")
+    blob_sources = _admit_source_proof_claims(state)
+    if not blob_sources:
+        return ProofNotApplicable()
+
+    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
+        return ProofEvaluated(
+            (
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=(
+                        f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
+                        f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
+                    ),
+                    suggested_repair=(
+                        f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
+                        "it into separately validated pipelines, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "pipeline",
+                        "blob_source_count": len(blob_sources),
+                        "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
+                    },
+                ),
+            )
+        )
+    if context is None:
+        return ProofUnavailable(
+            tuple(
+                _attribute_proof_diagnostic_to_source(
+                    _blocking_diagnostic(
+                        code="source_blob_unavailable",
+                        message="Authenticated source-proof context is unavailable for this request; source content was not verified.",
+                        suggested_repair=(
+                            "Restore the authenticated session and storage context before retrying. "
+                            "Retain the intended source binding; do not rewrite the graph to supply missing infrastructure."
+                        ),
+                        evidence_locator={"source": "blob", "blob_id": blob_id},
+                    ),
+                    source_name=source_name,
+                )
+                for source_name, _source, blob_id in blob_sources
+            )
+        )
+    effective_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]
+    if type(context) is ComposerProofContext:
 
         def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
             # Row + bytes observed as ONE version under the session custody
@@ -4140,19 +4297,15 @@ def compute_proof_diagnostics(
             # file swap would escalate a false BlobIntegrityError
             # (elspeth-3d1d1fcb6c).
             metadata, content = _locked_read_ready_blob(
-                session_engine,
-                session_id,
+                context.session_engine,
+                context.session_id,
                 resolved_blob_id,
-                data_dir=data_dir,
-                session_operation_context=session_operation_context,
-                session_operation_authority=session_operation_authority,
+                data_dir=context.data_dir,
+                session_operation_context=context.operation,
+                session_operation_authority=context.authority,
             )
-            if metadata is None:
+            if metadata is None or content is None:
                 return None
-            if content is None:
-                # Not ready, or storage file missing — metadata-only
-                # resolution; downstream emits the matching diagnostic.
-                return ResolvedProofBlob(metadata=metadata)
             stored_hash = metadata["content_hash"]
             if stored_hash is None:
                 raise AuditIntegrityError("ready proof blob has null content_hash")
@@ -4164,50 +4317,16 @@ def compute_proof_diagnostics(
             )
 
         effective_resolver = _resolve_from_composer_store
+    else:
+        effective_resolver = context.resolve
 
     uncached_resolver = effective_resolver
-    resolved_by_blob_id: dict[tuple[str, str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
+    resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
 
     def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
-        try:
-            parsed_blob_id = UUID(resolved_blob_id)
-        except ValueError:
-            cache_key = ("raw", resolved_blob_id)
-        else:
-            canonical_blob_id = str(parsed_blob_id)
-            cache_key = (
-                "uuid" if canonical_blob_id == resolved_blob_id else "noncanonical",
-                canonical_blob_id if canonical_blob_id == resolved_blob_id else resolved_blob_id,
-            )
-        if cache_key not in resolved_by_blob_id:
-            resolved_by_blob_id[cache_key] = uncached_resolver(resolved_blob_id)
-        return resolved_by_blob_id[cache_key]
-
-    blob_sources: list[tuple[str, SourceSpec, object]] = []
-    for source_name, source in state.sources.items():
-        blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
-        if blob_id is not None:
-            blob_sources.append((source_name, source, blob_id))
-
-    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
-        return [
-            _blocking_diagnostic(
-                code="source_inspection_failed",
-                message=(
-                    f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
-                    f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
-                ),
-                suggested_repair=(
-                    f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
-                    "it into separately validated pipelines, then re-run preview_pipeline."
-                ),
-                evidence_locator={
-                    "source": "pipeline",
-                    "blob_source_count": len(blob_sources),
-                    "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
-                },
-            )
-        ]
+        if resolved_blob_id not in resolved_by_blob_id:
+            resolved_by_blob_id[resolved_blob_id] = uncached_resolver(resolved_blob_id)
+        return resolved_by_blob_id[resolved_blob_id]
 
     diagnostics: list[Mapping[str, Any]] = []
     declared_input_type_budget = _DeclaredInputTypeProofBudget()
@@ -4238,7 +4357,9 @@ def compute_proof_diagnostics(
                 )
             )
             break
-    return diagnostics
+    if any(d["code"] == "source_blob_unavailable" and d["severity"] == "blocking" for d in diagnostics):
+        return ProofUnavailable(tuple(diagnostics))
+    return ProofEvaluated(tuple(diagnostics))
 
 
 def _runtime_preflight_not_run_error() -> ValidationEntryDict:
@@ -4380,6 +4501,36 @@ def _execute_preview_pipeline(
     explicit ``runtime_preflight_not_run`` entry naming the stage that did
     not run.
     """
+    operation = context.session_operation_context
+    if operation is not None:
+        if type(operation) is not SessionOperationContext:
+            raise AuditIntegrityError("Source proof requires the actual session operation context")
+        if context.session_id is not None and operation.fence.session_id != context.session_id:
+            raise AuditIntegrityError("Source proof context does not match the requested store")
+    proof_context = (
+        ComposerProofContext(
+            context.session_engine,
+            context.session_id,
+            context.data_dir,
+            operation,
+            context.session_operation_authority,
+        )
+        if context.session_engine is not None
+        and context.session_id is not None
+        and context.data_dir is not None
+        and operation is not None
+        and context.session_operation_authority is not None
+        else None
+    )
+    try:
+        _admit_source_proof_claims(state)
+    except MalformedSourceProofClaim as exc:
+        return _saved_graph_rejection_result(
+            state,
+            exc.reason,
+            error_code="source_blob_identity_invalid",
+            rejected_component=source_producer_id(exc.source_name),
+        )
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
         1,
@@ -4395,14 +4546,8 @@ def _execute_preview_pipeline(
         _structural_preview_block(state, context.structural_preflight(state)) if context.structural_preflight is not None else None
     )
 
-    proof_diagnostics = compute_proof_diagnostics(
-        state,
-        session_engine=context.session_engine,
-        session_id=context.session_id,
-        data_dir=context.data_dir,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
-    )
+    proof = compute_proof_diagnostics(state, context=proof_context)
+    proof_diagnostics = () if type(proof) is ProofNotApplicable else proof.diagnostics
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
     preview_is_valid = validation.is_valid
@@ -4539,13 +4684,13 @@ _DIFF_PIPELINE_DECLARATION = ToolDeclaration(
     response_contract=DIFF_PIPELINE_RESPONSE_CONTRACT,
     handler=_execute_diff_pipeline,
     kind=ToolKind.DISCOVERY,
-    description="Show what changed since the session was loaded or created. "
+    description="Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
     "On success `data` carries `from_version` (the baseline; the version it "
     "changed TO is the envelope's own `version`), `sources_changed`, "
     "`metadata_changed`, `total_changes`, `warnings_introduced`, "
     "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
     "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
-    "baseline (no session loaded or created yet) it fails with `error` and "
+    "baseline it fails with `error` and "
     "`error_code` only.",
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=False,

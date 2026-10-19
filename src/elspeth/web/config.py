@@ -9,16 +9,28 @@ import types
 import typing
 from collections.abc import Mapping
 from decimal import Decimal
-from ipaddress import ip_address
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.prompt_guard import PromptGuardMode
 from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
@@ -42,6 +54,7 @@ from elspeth.web.plugin_policy.profiles import (
     AWSTextractProfileSettings,
     AzureSearchProfileSettings,
 )
+from elspeth.web.prompt_guard_config import PromptGuardSettings
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -98,6 +111,33 @@ DeploymentTarget = Literal[
     "kubernetes",
 ]
 DeploymentStateMode = Literal["auto", "sqlite-single", "external-postgresql"]
+
+
+def validate_trusted_proxy_hosts(hosts: tuple[str, ...]) -> tuple[str, ...]:
+    """Admit explicit numeric forwarding peers without Uvicorn's wildcard form."""
+    normalized: list[str] = []
+    for host in hosts:
+        if host != host.strip() or "%" in host:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks")
+        try:
+            network = ip_network(host, strict=True)
+        except ValueError:
+            raise ValueError("trusted_proxy_hosts entries must be numeric IP addresses or strict CIDR networks") from None
+        if network.prefixlen == 0 or network.network_address.is_multicast or network.network_address.is_unspecified:
+            raise ValueError("trusted_proxy_hosts must not include wildcard, unspecified, or multicast peers")
+        normalized.append(str(network) if "/" in host else str(network.network_address))
+    return tuple(normalized)
+
+
+def trusted_proxy_hosts_from_env() -> tuple[str, ...]:
+    """Read the server transport setting before the application factory runs.
+
+    The CLI must configure Uvicorn itself; loading all application settings here
+    would duplicate the factory's startup validation and secret loading.
+    """
+    raw = os.environ.get("ELSPETH_WEB__TRUSTED_PROXY_HOSTS", "[]")
+    hosts = TypeAdapter(tuple[str, ...]).validate_json(raw)
+    return validate_trusted_proxy_hosts(hosts)
 
 
 def _allow_insecure_test_keys(host: str) -> bool:
@@ -192,6 +232,9 @@ class WebSettings(BaseModel):
 
     host: str = "127.0.0.1"
     port: int = Field(default=8451, ge=1, le=65535)
+    # No forwarding headers are trusted until the operator names the actual
+    # connecting proxy peers. This also overrides Uvicorn's ambient defaults.
+    trusted_proxy_hosts: tuple[str, ...] = ()
     auth_provider: AuthProviderType = "local"
     # ``default`` preserves current behavior; deployment-specific state rules
     # are resolved by web/deployment_contract.py.
@@ -256,6 +299,8 @@ class WebSettings(BaseModel):
         default=None
     )
     composer_model: str = "gpt-5.5"
+    composer_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
+    composer_prompt_guard_mode: PromptGuardMode = "required"
     composer_pricing_model: str | None = Field(
         default=None, min_length=1, description="LiteLLM catalog identity for missing-cost calculation; defaults to the routing model."
     )
@@ -395,6 +440,7 @@ class WebSettings(BaseModel):
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"
+    composer_advisor_prompt_guard: PromptGuardSettings | None = Field(default=None, repr=False)
     composer_advisor_pricing_model: str | None = Field(
         default=None,
         min_length=1,
@@ -446,7 +492,17 @@ class WebSettings(BaseModel):
             "separately. Operator decision pending.)"
         ),
     )
-    composer_advisor_max_prompt_tokens: int = Field(default=4000, ge=1)
+    composer_advisor_max_prompt_tokens: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Rough input-cost allowance converted to characters at four characters per configured unit. "
+            "Public hints count the complete variable message; backend EARLY/END checkpoints count only "
+            "optional prose added above the complete required graph. Mandatory graph and checkpoint evidence "
+            "is always retained and is not capped by this allowance. "
+            "This is not a measured provider-token or context-window limit."
+        ),
+    )
     # 8192 (was 1500): with advisor reasoning enabled the thinking budget
     # shares max_tokens, and Anthropic thinking has a 1024-token floor that
     # must fit inside it — 1500 left medium effort illegal or starved.
@@ -750,6 +806,11 @@ class WebSettings(BaseModel):
         if not v.strip():
             raise ValueError("must not be blank (omit the field or set to a non-empty value)")
         return v
+
+    @field_validator("trusted_proxy_hosts")
+    @classmethod
+    def _validate_trusted_proxy_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_trusted_proxy_hosts(value)
 
     @field_validator("compartment_id")
     @classmethod
@@ -1464,6 +1525,7 @@ def resolve_session_db_url(*, data_dir: Path, session_db_url: str | None) -> str
 _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     {
         "cors_origins",
+        "trusted_proxy_hosts",
         "server_secret_allowlist",
         # Both arrive from the ECS task definition as JSON, so they decode the
         # same way every other collection setting does.
@@ -1481,6 +1543,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
     {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
 )
+_OPTIONAL_JSON_OBJECT_FIELDS: frozenset[str] = frozenset({"composer_prompt_guard", "composer_advisor_prompt_guard"})
 
 
 def _text_configured(value: str | None) -> bool:
@@ -1580,7 +1643,7 @@ def settings_from_env() -> WebSettings:
             raise RuntimeError("ELSPETH_WEB__DEPLOYMENT_AWS_REGION is reserved; deployment region comes from ambient AWS_REGION")
         if field_name not in WebSettings.model_fields:
             raise RuntimeError(f"Unknown ELSPETH_WEB__ setting: {key}")
-        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS:
+        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS | _OPTIONAL_JSON_OBJECT_FIELDS:
             try:
                 parsed = json.loads(value)
             except (json.JSONDecodeError, ValueError):
@@ -1591,6 +1654,9 @@ def settings_from_env() -> WebSettings:
                     raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON array.")
                 kwargs[field_name] = tuple(parsed)
             else:
+                if parsed is None and field_name in _OPTIONAL_JSON_OBJECT_FIELDS:
+                    kwargs[field_name] = None
+                    continue
                 if not isinstance(parsed, dict):
                     raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON object.")
                 kwargs[field_name] = parsed
@@ -1624,10 +1690,17 @@ def settings_from_env() -> WebSettings:
             "aws_s3_source_profiles",
             "aws_textract_profiles",
             "azure_search_profiles",
+            "composer_prompt_guard",
+            "composer_advisor_prompt_guard",
+            "composer_prompt_guard_mode",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))
         }
+        guard_paths = (_OPTIONAL_JSON_OBJECT_FIELDS | {"composer_prompt_guard_mode"}) & safe_paths
+        if guard_paths:
+            rendered_paths = ", ".join(sorted(guard_paths))
+            raise RuntimeError(f"Invalid ELSPETH_WEB__ prompt guard setting at: {rendered_paths}") from None
         if policy_fields & safe_paths:
             rendered_paths = ", ".join(sorted(safe_paths))
             raise RuntimeError(f"Invalid ELSPETH_WEB__ plugin policy setting at: {rendered_paths}") from None

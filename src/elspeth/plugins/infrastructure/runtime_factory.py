@@ -204,6 +204,12 @@ def instantiate_plugins_from_config(
                     f"its flush emits become new downstream tokens. A custom batch plugin whose flush does emit one "
                     f"row per buffered row declares flush_emits_one_row_per_buffered_row = True on its class."
                 )
+            if transform_cls.requires_complete_source_batch and (
+                agg_config.trigger.has_count or agg_config.trigger.has_timeout or agg_config.trigger.has_condition
+            ):
+                raise ValueError(
+                    f"Aggregation '{agg_config.name}' uses '{agg_config.plugin}', which requires an EOF-only trigger; omit trigger or use {{}}"
+                )
             transform = transform_cls(dict(agg_config.options))
             transform.on_success = agg_config.on_success
             transform.on_error = agg_config.on_error

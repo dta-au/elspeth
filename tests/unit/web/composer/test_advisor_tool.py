@@ -21,14 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import (
@@ -38,9 +41,11 @@ from elspeth.web.composer._compose_loop_carriers import (
 from elspeth.web.composer.advisor_context import build_advisor_user_message
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, composer_loop_tool_definitions
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
@@ -49,7 +54,16 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.required_work import (
+    RequiredAuthorityKind,
+    RequiredWorkAuthority,
+    RequiredWorkBinding,
+    RequiredWorkCoordinator,
+    RequiredWorkRole,
+)
+from tests.helpers.session_fences import ensure_session_fence
 from tests.unit.web.composer._helpers import (
     _composer_service_with_session,
     _persisted_tool_responses,
@@ -148,6 +162,7 @@ def _make_settings(
         composer_max_discovery_turns=discovery_turns,
         composer_timeout_seconds=composer_timeout_seconds,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=budget,
         composer_advisor_timeout_seconds=advisor_timeout_seconds,
         shareable_link_signing_key=b"\x00" * 32,
@@ -220,6 +235,40 @@ def _make_advisor_response(text: str = "Try setting `provider: azure` and supply
     )
 
 
+@asynccontextmanager
+async def _owned_direct_advisor(service: ComposerServiceImpl, session_id: str, *, genuine_user_message: str):
+    """Own one direct SDK test invocation, without a default user or fake fence."""
+    sessions = service._require_sessions_service()
+    ensure_session_fence(sessions._engine, session_id, owner_instance_id=sessions.session_operation_owner_instance_id)
+    lease = await SessionOperationLease.acquire(
+        sessions.session_operation_authority,
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=sessions.session_operation_lease_seconds,
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, lease.context, invocation_id=str(uuid4()))
+    )
+    lease.bind_required_work(coordinator)
+    binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
+    owner = ProviderInvocationOwner(service=sessions, required_work=binding)
+    original = None
+    try:
+        with prompt_guard_user_scope(genuine_user_message):
+            yield owner
+    except BaseException as failure:
+        original = failure
+        raise
+    finally:
+        try:
+            await lease.close()
+        except BaseException as closing:
+            if original is not None and closing is not original:
+                raise BaseExceptionGroup("Direct advisor body and owned lease close outcomes", [original, closing]) from None
+            raise
+
+
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
@@ -240,7 +289,7 @@ def test_advisor_tool_exposed() -> None:
     assert "request_advisor_hint" in names
     advisor = next(t for t in tools if t["function"]["name"] == "request_advisor_hint")
     assert advisor["function"]["description"], "advisor tool needs a description"
-    assert "ADVICE" in advisor["function"]["description"], "description must steer the LLM that the reply is advice not config"
+    assert "advice" in advisor["function"]["description"].lower(), "description must steer the LLM that the reply is advice not config"
 
 
 def test_advisor_tool_schema_requires_trigger_and_mentions_proactive_criteria() -> None:
@@ -260,12 +309,14 @@ def test_advisor_tool_schema_requires_trigger_and_mentions_proactive_criteria() 
     assert trigger_schema["enum"] == [
         "proactive_security_safety",
         "proactive_red_listed_plugin",
+        "cannot_complete",
     ]
 
     description = advisor["description"]
     assert "security" in description
     assert "red-listed" in description
-    assert "before `set_pipeline`" in description
+    assert "before set_pipeline" in description
+    assert "CONTINUE_WITH_LIMITATION" in description
 
 
 def test_advisor_argument_validation_rejects_unknown_keys() -> None:
@@ -353,6 +404,44 @@ def test_advisor_tool_excluded_from_cli_mcp_allowlist() -> None:
 
 
 # --- 3. Compose-loop happy path (advisor returns guidance) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision_kind", ["CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"])
+async def test_scoped_advisor_limitation_keeps_the_tool_result_actionable(decision_kind):
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(budget=3))
+    decision = {
+        "decision": decision_kind,
+        "reason": (
+            "The requested external operation is unavailable, but source inspection is supported."
+            if decision_kind == "CONTINUE_WITH_LIMITATION"
+            else "All remaining work requires the unavailable external operation."
+        ),
+        "next_action": "Inspect the source schema." if decision_kind == "CONTINUE_WITH_LIMITATION" else None,
+        "question": None,
+    }
+    with (
+        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as primary,
+        patch("litellm.acompletion", new_callable=AsyncMock) as advisor,
+    ):
+        primary.side_effect = [
+            _make_advisor_tool_call("scoped-review", trigger="cannot_complete"),
+            _make_text_only_response("The external operation is unavailable; source inspection remains supported."),
+        ]
+        advisor.return_value = _make_advisor_response(json.dumps(decision))
+        result = await service.compose(
+            "Inspect the source and explain the unavailable operation.", [], _empty_state(), session_id=session_id
+        )
+    invocation = next(item for item in result.tool_invocations if item.tool_name == "request_advisor_hint")
+    payload = json.loads(_result_canonical(invocation))
+    assert payload["status"] == "SUCCESS"
+    assert payload["abandonment_decision"] == decision_kind
+    if decision_kind == "CONTINUE_WITH_LIMITATION":
+        assert decision["next_action"] in payload["guidance"]
+        assert "Stop authoring this request" not in payload["note"]
+        assert "limitation" in payload["note"]
+    else:
+        assert "Stop authoring this request" in payload["note"]
 
 
 @pytest.mark.asyncio
@@ -493,7 +582,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     }
     if excerpt is not None:
         arguments["schema_excerpt"] = excerpt
-    expected = build_advisor_user_message(arguments)
+    expected = build_advisor_user_message({key: value for key, value in arguments.items() if key != "schema_excerpt"})
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
@@ -507,16 +596,18 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
 
     assert mock_provider.await_count == 1
     actual = mock_provider.call_args.kwargs["messages"][1]["content"]
-    assert actual == expected
+    assert actual.startswith(expected)
+    assert "Complete available same-session visible transcript" in actual
+    assert "Pipeline: Untitled Pipeline" in actual
     for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
         assert marker in actual
     assert sample_value in actual
     if excerpt:
         assert "SCHEMA_MARKER" in actual
-        assert "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in actual
-        assert actual.count("END_UNTRUSTED_PIPELINE_SUMMARY") == 1
-    else:
-        assert "UNTRUSTED_PIPELINE_SUMMARY" not in actual
+        # The submitted excerpt remains verbatim inside the attributed
+        # original tool arguments; the server-owned graph is separate.
+        assert "schema_excerpt" in actual
+    assert actual.count("Complete original user request") == 1
 
 
 @pytest.mark.asyncio
@@ -534,6 +625,7 @@ async def test_advisor_only_turn_does_not_consume_discovery_budget() -> None:
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
@@ -586,10 +678,7 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
         encoding="utf-8",
     )
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(
-        catalog=catalog,
-        settings=_make_settings(data_dir=tmp_path),
-    )
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(data_dir=tmp_path))
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -603,7 +692,8 @@ async def test_advisor_call_includes_core_and_deployment_skill_context(tmp_path:
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     messages = mock_acompletion.call_args.kwargs["messages"]
     system_content = messages[0]["content"]
@@ -630,7 +720,7 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
         lambda model: ["temperature", "max_tokens"],
     )
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings())
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -644,7 +734,8 @@ async def test_advisor_omits_seed_when_advisor_model_does_not_support_it(monkeyp
         new_callable=AsyncMock,
         return_value=_make_advisor_response(),
     ) as mock_acompletion:
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     kwargs = mock_acompletion.call_args.kwargs
     assert "seed" not in kwargs
@@ -706,13 +797,11 @@ async def test_budget_exhaustion_returns_structured_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
-    """BUDGET_EXHAUSTED advisor turns must still be bounded by loop budget.
+async def test_exhausted_advisor_turn_preserves_discovery_accounting_and_deadline() -> None:
+    """A refused hint is accounted without reinstating the removed turn cap.
 
-    Successful advisor guidance is budgeted separately so the primary model
-    can read it. A policy refusal is different: no guidance was produced, and
-    repeated calls must converge via the generic discovery-turn guard rather
-    than spinning until the wall-clock compose timeout.
+    The primary model can continue after the refusal. A subsequent provider
+    timeout still terminates the request and retains the durable refusal.
     """
     catalog = _mock_catalog()
     settings = WebSettings(
@@ -721,6 +810,7 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
         composer_max_discovery_turns=1,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=0,
         composer_advisor_timeout_seconds=60.0,
         shareable_link_signing_key=b"\x00" * 32,
@@ -738,14 +828,15 @@ async def test_exhausted_advisor_turn_charges_discovery_budget() -> None:
     ):
         mock_llm.side_effect = [
             _make_advisor_tool_call("call_budget_exhausted"),
-            _make_text_only_response("would incorrectly continue"),
+            TimeoutError(),
         ]
         await service.compose("help me", [], state, session_id=session_id)
 
-    assert exc_info.value.tool_invocations == ()
+    assert tuple(inv.tool_call_id for inv in exc_info.value.tool_invocations) == ("call_budget_exhausted",)
     durable_responses = _persisted_tool_responses(service, session_id)
-    assert exc_info.value.budget_exhausted == "discovery"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 1
+    assert mock_llm.call_count == 2
     assert mock_acompletion.call_count == 0
     invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
     assert len(invocations) == 1
@@ -1028,7 +1119,7 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
 
 
 @pytest.mark.asyncio
-async def test_advisor_just_below_floor_is_truthful_discovery_without_state_changes() -> None:
+async def test_advisor_just_below_floor_preserves_accounting_and_allows_primary_continuation() -> None:
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(
         catalog=catalog,
@@ -1053,14 +1144,15 @@ async def test_advisor_just_below_floor_is_truthful_discovery_without_state_chan
     ):
         mock_llm.side_effect = [
             _make_advisor_tool_call("call_too_close"),
-            _make_text_only_response("must not reach a second model turn"),
+            TimeoutError(),
         ]
         await service.compose("help me", [], _empty_state(), session_id=session_id)
 
-    assert exc_info.value.tool_invocations == ()
+    assert tuple(inv.tool_call_id for inv in exc_info.value.tool_invocations) == ("call_too_close",)
     durable_responses = _persisted_tool_responses(service, session_id)
-    assert exc_info.value.budget_exhausted == "discovery"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 1
+    assert mock_llm.call_count == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
     invocations = [inv for inv in durable_responses if inv["tool_name"] == "request_advisor_hint"]
@@ -1523,6 +1615,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_max_prompt_tokens=1000,  # → ~4000 char cap
         shareable_link_signing_key=b"\x00" * 32,
@@ -1593,6 +1686,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=10,
+        composer_prompt_guard_mode="debug-when-unconfigured",
         composer_advisor_max_calls_per_compose=3,
         composer_advisor_max_prompt_tokens=prompt_tokens,
         shareable_link_signing_key=b"\x00" * 32,
@@ -1651,7 +1745,10 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     else:
         assert mock_acompletion.await_count == 1
         assert invs[0].status.name == "SUCCESS"
-        assert len(mock_acompletion.call_args.kwargs["messages"][1]["content"]) == 308
+        assert len(build_advisor_user_message(overhead_args)) == 308
+        prepared = mock_acompletion.call_args.kwargs["messages"][1]["content"]
+        assert len(prepared) > 308
+        assert "Complete available same-session visible transcript" in prepared
 
 
 @pytest.mark.asyncio
@@ -1680,7 +1777,7 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
     session route's cancellation handler can persist the audit row.
     """
     catalog = _mock_catalog()
-    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
     recorder = BufferingRecorder()
     args = {
         "trigger": "proactive_security_safety",
@@ -1697,7 +1794,8 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
         ),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder)
+        async with _owned_direct_advisor(service, session_id, genuine_user_message="") as owner:
+            await service._advisor_checkpoint._call_advisor_with_audit(args, recorder=recorder, provider_owner=owner)
 
     assert len(recorder.llm_calls) == 1
     assert recorder.llm_calls[0].status.name == "CANCELLED"

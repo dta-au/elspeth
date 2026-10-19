@@ -155,22 +155,27 @@ def _shutdown_requested_result(
     return TransformResult.error(cast(TransformErrorReason, reason), retryable=False)
 
 
-def _blank_required_input_result(row: PipelineRow, required_fields: frozenset[str]) -> TransformResult | None:
-    """Return a row error when declared LLM input content is blank at runtime."""
+def _blank_required_input_result(
+    row: PipelineRow, required_fields: frozenset[str], allow_blank_fields: frozenset[str] = frozenset()
+) -> TransformResult | None:
+    """Refuse blanks except explicitly permitted strings and nullable nulls."""
     for field_name in sorted(required_fields):
         if field_name not in row:
             continue
         value = row[field_name]
+        if field_name in allow_blank_fields and type(value) is str:
+            continue
+        if value is None:
+            canonical_name = row.contract.find_name(field_name)
+            if canonical_name is not None and row.contract.get_field(canonical_name).nullable:
+                continue
         if value is None or (type(value) is str and not value.strip()):
             return TransformResult.error(
-                cast(
-                    TransformErrorReason,
-                    {
-                        "reason": "required_input_field_blank",
-                        "field": field_name,
-                        "message": "Declared required_input_fields must contain non-blank row content before LLM dispatch.",
-                    },
-                ),
+                {
+                    "reason": "required_input_field_blank",
+                    "field": field_name,
+                    "message": "Declared required_input_fields must contain non-blank row content before LLM dispatch.",
+                },
                 retryable=False,
             )
     return None
@@ -817,9 +822,9 @@ class MultiQueryStrategy:
                 extraction_error["query_name"] = spec.name
                 extraction_error["query_index"] = query_idx
                 return TransformResult.error(extraction_error, retryable=False)
-            # Typed fields land in prefixed output columns.
+            # Publish typed fields under the spec's resolved row names.
             for suffix, value in extracted.items():
-                partial[f"{spec.name}_{suffix}"] = value
+                partial[spec.structured_field_name(suffix)] = value
             # Also store raw content for audit traceability
             partial[f"{spec.name}_{self.response_field}"] = content
         else:
@@ -1237,7 +1242,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:705f5c0d4bb975a2"
+    source_file_hash: str | None = "sha256:498b84f2c8939775"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1485,6 +1490,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             config_cls.from_dict(provider_config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
+        self._result_checks = tuple(self._config.result_checks or ())
+        self._input_checks = tuple(self._config.input_checks or ())
         self.header_spelled_lookups = MappingProxyType(self._config.header_spelled_row_lookups())
 
         # Store common LLM settings.
@@ -1494,6 +1501,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # What a template may see of each row: exactly the declared fields
         # (the whole row under the ``[]`` opt-out; nothing when omitted). ADR-051.
         self._row_projection: RowProjection = declared_row_projection(self._config.required_input_fields)
+        self._allow_blank_input_fields = frozenset(self._config.allow_blank_input_fields)
         self._template = PromptTemplate(
             self._config.effective_template(
                 self._config.resolved_queries()[0].template
@@ -1563,6 +1571,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         max_images_per_call = self._config.max_images_per_call
 
         # Strategy dispatch: queries is not None → multi-query
+        self._strict_generated_fields: frozenset[str] = frozenset()
         if self._config.queries is not None:
             query_specs = self._config.resolved_queries()
             self._strategy: SingleQueryStrategy | MultiQueryStrategy = MultiQueryStrategy(
@@ -1596,8 +1605,12 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 prefixed_guaranteed.update(get_llm_guaranteed_fields(prefix))
                 if spec.output_fields:
                     for field in spec.output_fields:
-                        prefixed_guaranteed.add(f"{spec.name}_{field.suffix}")
+                        prefixed_guaranteed.add(spec.structured_field_name(field.suffix))
             self.declared_output_fields = frozenset(prefixed_guaranteed)
+            if self._config.query_input_mode == QueryInputMode.ORDERED or any(
+                spec.structured_output_prefix is not None for spec in query_specs
+            ):
+                self._strict_generated_fields = self.declared_output_fields
 
             # Output schema config with prefixed fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
@@ -1606,23 +1619,28 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 definition
                 for spec in query_specs
                 for definition in _llm_created_output_fields(
-                    f"{spec.name}_{self._response_field}", f"{spec.name}_", spec.output_fields or ()
+                    f"{spec.name}_{self._response_field}", spec.structured_field_prefix, spec.output_fields or ()
                 )
             )
 
             # Pydantic output schema with prefixed LLM fields
             # Build extracted_fields mapping: query_name → (field_name, schema_type) tuples
             extracted: dict[str, tuple[tuple[str, _FieldType], ...]] = {}
+            nullable_fields = frozenset(
+                spec.structured_field_name(field.suffix) for spec in query_specs for field in spec.output_fields or () if field.nullable
+            )
             for spec in query_specs:
                 if spec.output_fields:
                     extracted[spec.name] = tuple(
-                        (f"{spec.name}_{f.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
+                        (spec.structured_field_name(f.suffix), _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
                     )
             generated_fields = tuple(
                 field
                 for spec in query_specs
                 for field in _llm_generated_output_fields(
-                    f"{spec.name}_{self._response_field}", extracted[spec.name] if spec.name in extracted else ()
+                    f"{spec.name}_{self._response_field}",
+                    extracted[spec.name] if spec.name in extracted else (),
+                    nullable_fields=nullable_fields,
                 )
             )
             self._output_schema_config = _build_llm_output_schema_config(
@@ -1634,6 +1652,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 query_names=tuple(spec.name for spec in query_specs),
                 schema_name=f"{self.name}OutputSchema",
                 extracted_fields=extracted if extracted else None,
+                nullable_fields=nullable_fields,
             )
         else:
             single_output_fields = tuple(self._config.output_fields or ())
@@ -1669,7 +1688,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
             extracted_single = tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
-            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single)
+            nullable_fields = frozenset(field.suffix for field in single_output_fields if field.nullable)
+            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single, nullable_fields=nullable_fields)
             self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed, generated_fields=generated_fields)
             self._created_output_fields = _llm_created_output_fields(self._response_field, "", single_output_fields)
 
@@ -1680,6 +1700,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
                 extracted_fields=extracted_single or None,
+                nullable_fields=nullable_fields,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available
@@ -1806,9 +1827,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         entry is BOUND to the row type of its ``OutputFieldConfig.type`` through
         ``_OUTPUT_FIELD_TYPE_TO_SCHEMA``, and the Tier-3 parse
         (``validation.parse_field_value``, reached through
-        ``extract_structured_fields``) returns every value it admits in exactly
-        that type (``integer`` admits an integral float as an int, ``number``
-        an int as a float), so a value the parse admits always satisfies the
+        ``extract_structured_fields``) returns every nonnull value it admits in
+        exactly that type (``integer`` admits an integral float as an int,
+        ``number`` an int as a float), and admits None only when that field's
+        explicit nullable flag declares it. A value the parse admits satisfies the
         declaration the engine enforces. The binding and the parse landed
         together and a test pins that they agree for every ``OutputFieldType``
         (operator ruling 2026-09-25: never one without the other).
@@ -1975,23 +1997,35 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise RuntimeError("Provider not initialized — _process_row called before on_start()")
         self._shutdown_event = ctx.shutdown_event
 
-        blank_required_input = _blank_required_input_result(row, self.declared_input_fields)
+        blank_required_input = _blank_required_input_result(row, self.declared_input_fields, self._allow_blank_input_fields)
         if blank_required_input is not None:
             return blank_required_input
 
-        if isinstance(self._strategy, MultiQueryStrategy) and self._strategy.ordered_plan is not None:
-            generated = self._strategy.ordered_plan.generated_fields
-            for field in row.contract.fields:
-                if field.normalized_name in generated or field.original_name in generated:
-                    return TransformResult.error({"reason": "field_collision", "field": field.normalized_name}, retryable=False)
+        for row_field in row.contract.fields:
+            if row_field.normalized_name in self._strict_generated_fields or row_field.original_name in self._strict_generated_fields:
+                return TransformResult.error({"reason": "field_collision", "field": row_field.normalized_name}, retryable=False)
 
-        return self._strategy.execute(
+        for check in self._input_checks:
+            failure = check.failure_for(row, phase="input")
+            if failure is not None:
+                return TransformResult.error(failure, retryable=False)
+
+        result = self._strategy.execute(
             row,
             ctx,
             provider=self._provider,
             tracer=self._tracer,
             payload_store=self._payload_store,
         )
+        if result.status == "error" or not self._result_checks:
+            return result
+        if result.row is None or result.rows is not None:
+            raise FrameworkBugError("LLM result checks require a single successful output row")
+        for check in self._result_checks:
+            failure = check.failure_for(result.row)
+            if failure is not None:
+                return TransformResult.error(failure, retryable=False, context_after=result.context_after)
+        return result
 
     def _verify_intermediate_output(self, prior: PipelineRow, candidate: PipelineRow) -> None:
         """Reuse ADR-050 value semantics before any dependent query is rendered."""
@@ -2132,8 +2166,17 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
+                    "Declared inputs reject empty/whitespace strings before provider dispatch by default. For a prompt that must classify unavailable text, set allow_blank_input_fields to only the relevant required_input_fields.",
+                    "allow_blank_input_fields preserves the original string, declared visibility, field presence and types; non-nullable nulls and other blank fields still fail. It does not generate an unavailable result or waive input/result checks.",
                     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
-                    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries, pool_size=1; allows exact bindings to earlier validated generated fields, never self/forward. Per-query output_fields: <queryname>_<suffix>.",
+                    "Optional input_checks are named strict-Boolean expressions on the entry row, before any per-row model request. False/non-Boolean/evaluation errors route a nonretryable failure via on_error without widening prompt visibility.",
+                    "input_checks do not replace operation startup preflight. Keep detailed admission causes in the incoming row for error-sink row_json retention.",
+                    "Multi-query input_fields maps variables to upstream columns by default. Explicit query_input_mode=ordered needs list-form named queries and pool_size=1; exact bindings may name earlier validated generated fields, never self/forward.",
+                    "Per-query output_fields default to <queryname>_<suffix>.",
+                    "Per-query structured_output_prefix: null/omitted retains the query-name stem; empty string emits bare suffixes; a nonempty ASCII identifier (at most 64 characters) emits <stem>_<suffix>.",
+                    "structured_output_prefix leaves JSON response keys and raw/usage/model names unchanged. Any non-null override requires unique final generated names across every query; ordered mode always rejects collisions.",
+                    "A separate semantic reviewer query must bind the actual earlier generated fields and relevant original evidence explicitly. A Boolean verdict plus result_checks can reject before downstream release.",
+                    "Separate model calls are not a certification of semantic correctness; both prompts and authored judgment semantics still need ordinary review.",
                     "Ordered mode preserves original-only source_row/images and atomic final output. Later failure routes the original entry row; prior calls/charges remain. Node-level restart may repeat calls; no durable mid-node resume or exactly-once guarantee.",
                     "Optional chain compaction is an operator choice. Inspect all consumers, exact output names/types, rendered prompts, effective provider/profile/settings, intermediate shields/gates/mappers/branches and failure policies.",
                     "For optional chain compaction, independent entry-row queries can qualify; dependent queries require ordered mode. Never promise fewer calls/tokens. Disclose changed quarantine/audit/checkpoint boundaries.",

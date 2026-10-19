@@ -1875,6 +1875,36 @@ def test_public_llm_schema_exposes_alias_not_private_provider_binding() -> None:
         assert private_name not in rendered
 
 
+def test_llm_result_checks_project_as_closed_public_postconditions_and_lower_unchanged() -> None:
+    registry = _profile_registry()
+    plugin_id = PluginId("transform", "llm")
+    public = registry.public_schema(plugin_id, create_catalog_service().get_schema("transform", "llm"), available_aliases=("tutorial",))
+    checks = [{"name": "answer_allowed", "expression": "row['answer'] == 'accepted'"}]
+    options = {
+        "profile": "tutorial",
+        "schema": {"mode": "observed"},
+        "required_input_fields": ["text"],
+        "prompt_template": "{{ row.text }}",
+        "output_fields": [{"suffix": "answer", "type": "string"}],
+        "result_checks": checks,
+    }
+    validator = Draft202012Validator(public.json_schema)
+    validator.validate(options)
+    assert public.json_schema["$defs"]["ResultCheck"]["additionalProperties"] is False
+    assert set(public.json_schema["$defs"]["ResultCheck"]["properties"]) == {"name", "expression"}
+    knobs = {knob["name"]: knob for knob in public.knob_schema["fields"]}
+    assert knobs["result_checks"]["tier"] == "advanced"
+    malformed = {**options, "result_checks": [{**checks[0], "unknown": True}]}
+    assert list(validator.iter_errors(malformed))
+    lowered = registry.lower_options(
+        plugin_id, alias="tutorial", safe_options={key: value for key, value in options.items() if key != "profile"}
+    )
+    assert deep_thaw(lowered.executable_options)["result_checks"] == checks
+    assert deep_thaw(lowered.audit_safe_options) == options
+    rendered = public.model_dump_json()
+    assert "_parser" not in rendered and "api_key" not in rendered
+
+
 def test_public_llm_source_schema_is_component_specific() -> None:
     """The llm SOURCE's public schema carries its own options, not the transform's.
 

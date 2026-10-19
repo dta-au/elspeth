@@ -21,6 +21,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.canonical import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
@@ -36,6 +37,7 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_to
 from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions.models import (
@@ -740,7 +742,14 @@ async def test_mixed_internal_tool_batch_refuses_atomically_before_any_handler_o
     )
 
     async def _internal_completion(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         return completion
 
@@ -844,14 +853,21 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
         if credential_field == "reasoning_details":
             metadata_value = {"detail": candidate}
         elif credential_field == "thinking_blocks":
-            metadata_value = [{"thinking": candidate}]
+            metadata_value = [{"type": "thinking", "thinking": candidate, "signature": "synthetic-native-signature"}]
         completion = replace(
             completion,
             provider_metadata=replace(completion.provider_metadata, **{credential_field: metadata_value}),
         )
 
     async def _internal_completion(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         return completion
 
@@ -868,7 +884,8 @@ async def test_internal_completion_control_metadata_refuses_atomically_before_an
             session_id=result_session_id,
         )
 
-    assert caught.value.surface == "composer_provider_response"
+    expected_surface = "composer_provider_thinking" if credential_field == "thinking_blocks" else "composer_provider_response"
+    assert caught.value.surface == expected_surface
     assert candidate not in repr(caught.value.to_payload())
     llm_calls = caught.value.__dict__["llm_calls"]
     assert len(llm_calls) == 1
@@ -913,7 +930,14 @@ async def test_internal_no_tool_completion_is_refused_before_audit_or_history(
     completion = replace(completion, message=replace(completion.message, content=candidate))
 
     async def _internal_completion(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         return completion
 
@@ -1545,7 +1569,14 @@ async def test_tool_batch_snapshots_calls_before_first_await(
     responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -1616,7 +1647,14 @@ async def test_tool_batch_snapshots_calls_before_preference_await(
     responses = [_admit_composer_llm_completion(response), _text_response("Done.")]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -1700,7 +1738,14 @@ async def test_tool_batch_rejects_session_reused_id_before_current_turn_proposal
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2097,7 +2142,16 @@ async def test_current_loop_schema_valid_semantic_arg_error_persists_only_closed
         _text_response("Recovered after the semantic argument error."),
     ]
 
-    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
+    async def _llm(
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    ) -> Any:
         return responses.pop(0)
 
     result = await _run_one_turn(
@@ -2158,7 +2212,16 @@ async def test_current_loop_non_object_arg_error_matches_durable_projection_and_
         _text_response("Recovered after the non-object argument error."),
     ]
 
-    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
+    async def _llm(
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    ) -> Any:
         return responses.pop(0)
 
     result = await _run_one_turn(
@@ -2288,7 +2351,16 @@ async def test_current_loop_plugin_crash_with_invalid_arguments_uses_closed_clas
         )
     ]
 
-    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
+    async def _llm(
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    ) -> Any:
         return responses.pop(0)
 
     with pytest.raises(ComposerPluginCrashError):
@@ -2413,7 +2485,14 @@ async def test_step2_persists_intercepted_advisor_tool_call_rows(
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2492,7 +2571,14 @@ async def test_step2_advisor_compose_timeout_persists_recovery_envelope(
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2575,7 +2661,14 @@ async def test_step2_advisor_compose_timeout_preserves_audit_failure_primacy(
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2638,7 +2731,14 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2677,7 +2777,7 @@ async def test_step2_redacts_intercepted_advisor_unknown_arguments_before_persis
 
 
 @pytest.mark.asyncio
-async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
+async def test_step2_unknown_tool_display_is_redacted_and_visible_evidence_retains_arguments(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
@@ -2689,7 +2789,14 @@ async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
     ]
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return responses.pop(0)
 
@@ -2724,7 +2831,21 @@ async def test_step2_unknown_tool_canary_is_absent_from_actual_persistence(
             ).mappings()
         )
 
-    durable_blob = json.dumps([dict(row) for row in rows], sort_keys=True)
+    # Tool rows carry the complete, credential-filtered visible evidence for
+    # Advisor review beside their separately redacted display content.
+    tool_rows = [row for row in rows if row["role"] == "tool"]
+    assert len(tool_rows) == 1
+    assert len(tool_rows[0]["tool_calls"]) == 1
+    event = VisibleToolEvent.from_envelope(tool_rows[0]["tool_calls"][0])
+    assert event.tool_call_id == "call_unknown_canary"
+    evidence = json.loads(event.payload_json)
+    assert json.loads(evidence["received_arguments"]) == {canary_key: canary_value}
+    assert json.loads(evidence["effective_arguments"]) == {"_redaction_status": "unknown_tool"}
+    display_rows = [
+        {"role": row["role"], "content": row["content"], "tool_calls": row["tool_calls"] if row["role"] == "assistant" else None}
+        for row in rows
+    ]
+    durable_blob = json.dumps(display_rows, sort_keys=True)
     result_blob = json.dumps([invocation.to_dict() for invocation in result.tool_invocations], sort_keys=True)
     assert canary_key not in durable_blob
     assert canary_value not in durable_blob
@@ -2748,7 +2869,14 @@ async def test_step2_registered_tool_missing_manifest_fails_before_persistence(
     response = _metadata_tool_response("call_manifest_drift", "must-not-persist")
 
     async def _fake_llm(
-        _messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> Any:
         return response
 
@@ -2862,7 +2990,14 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
     turns = {"alpha": 0, "beta": 0}
 
     async def _llm(
-        messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None
+        messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     ) -> _AdmittedLLMCompletion:
         prompt = json.dumps(messages)
         label = "alpha" if "overlap alpha 8472" in prompt else "beta"
@@ -3060,7 +3195,16 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
 
     llm_calls = 0
 
-    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
+    async def _llm(
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    ) -> Any:
         nonlocal llm_calls
         llm_calls += 1
         if llm_calls == 1:
@@ -3451,7 +3595,16 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
         _metadata_tool_response("call_unpersisted_crash", "crash"),
     ]
 
-    async def _llm(_messages: Any, _tools: Any, *, provider_custody: object | None = None, credential_state: object | None = None) -> Any:
+    async def _llm(
+        _messages: Any,
+        _tools: Any,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
+        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+    ) -> Any:
         return responses.pop(0)
 
     with pytest.raises(ComposerPluginCrashError) as excinfo:

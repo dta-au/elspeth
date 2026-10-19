@@ -42,6 +42,7 @@ const READ_ONLY_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
     "Looks up a plain-language explanation for a validation error code.",
   generate_yaml: "Renders the current pipeline as a YAML document.",
   get_blob_content: "Reads the text content of a session file for inspection.",
+  read_attachment: "Reads a session attachment's complete text for inspection.",
   get_blob_metadata: "Looks up a session file's name, size, and status.",
   inspect_source:
     "Reads a session file's headers, inferred types, and sample-row count to plan the source.",

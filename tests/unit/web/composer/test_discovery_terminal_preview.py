@@ -1,4 +1,4 @@
-"""A final verified preview may spend the discovery budget before replying."""
+"""Preview evidence retains normal authoring until the real request deadline."""
 
 import asyncio
 import json
@@ -8,18 +8,14 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
-from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+from elspeth.web.composer.no_tool_policy import AssistantTextSegment, visible_message_segments
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError
 from elspeth.web.composer.service import (
     _reply_only_messages,
     _reply_only_protocol_echo,
-    _tool_batch_ends_with_valid_current_preview,
 )
-from elspeth.web.composer.state import OutputSpec, SourceSpec, ValidationSummary
-from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.state import OutputSpec, SourceSpec
 from elspeth.web.composer.turn_effects import AdvisorPublicationReview
 from elspeth.web.execution.schemas import ValidationResult
 from tests.unit.web.composer._helpers import (
@@ -85,10 +81,24 @@ def test_reply_only_history_preserves_attribution_and_echo_check_needs_internal_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "final_kind",
-    ["text", "tools", "timeout", "expired", "advisor_block", "protocol_echo", "protocol_echo_advisor_block", "quoted_json", "quoted_log"],
+    [
+        "text",
+        "tools",
+        "timeout",
+        "expired",
+        "advisor_block",
+        "protocol_echo",
+        "protocol_echo_advisor_block",
+        "quoted_json",
+        "quoted_log",
+        "inspected_text",
+    ],
 )
-async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytest.MonkeyPatch, final_kind: str) -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings(composer_max_discovery_turns=1))
+async def test_preview_keeps_authoring_available_until_the_real_deadline(monkeypatch: pytest.MonkeyPatch, final_kind: str) -> None:
+    settings = _make_settings(composer_max_discovery_turns=1)
+    if final_kind == "inspected_text":
+        settings = _make_settings(composer_max_discovery_turns=1, composer_model="anthropic/claude-sonnet-5-5")
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=settings)
     state = (
         _empty_state()
         .with_source(
@@ -108,9 +118,24 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             )
         )
     )
+    first_calls = [{"id": "preview", "name": "preview_pipeline", "arguments": {}}]
+    if final_kind == "inspected_text":
+        from elspeth.web.composer import tool_batch
+        from tests.unit.web.composer.test_turn_effects import _page
+
+        admitted, _content = _page(0, 6)
+        execute = tool_batch.execute_tool
+
+        def execute_with_page(tool_name, arguments, current_state, catalog, *args, **kwargs):
+            if tool_name == "get_blob_content":
+                return replace(admitted.result, updated_state=current_state)
+            return execute(tool_name, arguments, current_state, catalog, *args, **kwargs)
+
+        monkeypatch.setattr(tool_batch, "execute_tool", execute_with_page)
+        first_calls.insert(0, {"id": "page", "name": "get_blob_content", "arguments": {"blob_id": "blob"}})
     replies = iter(
         [
-            _make_llm_response(tool_calls=[{"id": "preview", "name": "preview_pipeline", "arguments": {}}]),
+            _make_llm_response(tool_calls=first_calls),
             _make_llm_response(content="The pipeline preview passed."),
         ]
     )
@@ -133,12 +158,14 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
                 raise TimeoutError
             if final_kind == "tools":
                 return _make_llm_response(
-                    tool_calls=[{"id": "forbidden", "name": "set_metadata", "arguments": {"patch": {"name": "must not apply"}}}]
+                    tool_calls=[{"id": "after-preview", "name": "set_metadata", "arguments": {"patch": {"name": "updated_after_preview"}}}]
                 )
             if final_kind in {"protocol_echo", "protocol_echo_advisor_block", "quoted_log"}:
                 return _make_llm_response(content=_PROTOCOL_ECHO)
             if final_kind == "quoted_json":
                 return _make_llm_response(content=_USER_QUOTED_JSON)
+        if len(advertised_tools) > 2 and final_kind == "advisor_block":
+            return _make_llm_response(content="The requested output needs review.")
         return next(replies)
 
     def preflight(*_args: Any, **_kwargs: Any) -> ValidationResult:
@@ -150,6 +177,14 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
 
     async def advisor(*args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
         advisor_phases.append(kwargs["phase"])
+        if final_kind == "inspected_text":
+            from elspeth.contracts.hashing import stable_hash
+
+            review = kwargs["publication_review"]
+            assert type(review) is AdvisorPublicationReview
+            inspection = json.loads(review.payload_json)["inspection"]
+            assert inspection["currently_available"][0]["ranges"] == [[0, 6]]
+            assert inspection["current_candidate_call"][1] == stable_hash(provider_messages[1])
         if final_kind in {"advisor_block", "protocol_echo_advisor_block"}:
             review = kwargs["publication_review"]
             assert type(review) is AdvisorPublicationReview
@@ -174,46 +209,40 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
         monkeypatch.setattr(service, "_call_llm_before_deadline", expire_final_reply)
 
     user_message = "Preview the current pipeline and explain the result."
+    if final_kind == "tools":
+        user_message = "Preview the pipeline, then rename it to updated_after_preview and explain the result."
     if final_kind == "quoted_log":
         user_message += " Please quote this log exactly:\n" + _PROTOCOL_ECHO
-    if final_kind == "tools":
-        with pytest.raises(_MalformedLLMResponseError, match="Reply stage requires text or a terminal recovery control"):
-            await service.compose(user_message, [], state, session_id=session_id)
-        assert state.metadata.name != "must not apply"
-    elif final_kind in {"timeout", "expired"}:
+    if final_kind in {"timeout", "expired"}:
         with pytest.raises(ComposerConvergenceError) as raised:
             await service.compose(user_message, [], state, session_id=session_id)
         assert raised.value.budget_exhausted == "timeout"
         assert raised.value.max_turns == 1
-        assert state.metadata.name != "must not apply"
+        assert state.metadata.name != "updated_after_preview"
     else:
         result = await service.compose(user_message, [], state, session_id=session_id)
-        assert result.state == state
-        assert advisor_phases == ["end"]
-        if final_kind == "advisor_block":
+        assert advisor_phases[-1] == "end"
+        if final_kind == "tools":
+            assert result.state.metadata.name == "updated_after_preview"
+            assert state.metadata.name != "updated_after_preview"
+            _assert_checkpoint_reply(result, "The pipeline preview passed.", count=1, changed=True)
+        elif final_kind == "advisor_block":
+            assert result.state == state
             assert result.message != "The pipeline preview passed."
             assert result.advisor_gate_decision is not None
         elif final_kind in {"protocol_echo", "protocol_echo_advisor_block"}:
-            assert result.message.count("final reply is unavailable") == 1
-            assert _PROTOCOL_ECHO not in result.message
+            # This remains an ordinary authoring response. Quoted protocol
+            # prose does not execute the tool it describes; the separate
+            # reply-only projector still rejects unattributed protocol echo.
+            assert result.state == state
             if final_kind == "protocol_echo_advisor_block":
-                # The rejected echo is absent; the retained prefix explains
-                # the verified absence of saved mutations in this request.
-                assert result.raw_assistant_content == (
-                    "Verified checkpoint evidence covers 0 saved draft revisions. There is no net authored change from the starting draft."
-                )
-                assert result.message.startswith(result.raw_assistant_content)
-            else:
-                assert result.raw_assistant_content == ""
-            assert len(result.llm_calls) == 2
-            assert tuple(call.status for call in result.llm_calls) == (
-                ComposerLLMCallStatus.SUCCESS,
-                ComposerLLMCallStatus.SUCCESS,
-            )
-            if final_kind == "protocol_echo_advisor_block":
+                assert _PROTOCOL_ECHO not in result.message
                 assert result.advisor_gate_decision is not None
-            segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
-            assert isinstance(segments[-1], TrustedSystemNoticeSegment)
+            else:
+                assert _PROTOCOL_ECHO in result.message
+                assert "final reply is unavailable" not in result.message
+                assert len(result.llm_calls) == 2
+            assert all(call.status is ComposerLLMCallStatus.SUCCESS for call in result.llm_calls)
         elif final_kind == "quoted_json":
             _assert_checkpoint_reply(result, _USER_QUOTED_JSON, count=0)
             segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
@@ -226,73 +255,20 @@ async def test_last_discovery_preview_gets_one_provider_reply(monkeypatch: pytes
             assert type(segments[0]) is AssistantTextSegment
             assert _PROTOCOL_ECHO in segments[0].content
         else:
+            assert result.state == state
             _assert_checkpoint_reply(result, "The pipeline preview passed.", count=0)
-    assert len(advertised_tools) == (1 if final_kind == "expired" else 2)
-    assert dispatched_batches == [("preview_pipeline",)]
+    if final_kind in {"advisor_block", "protocol_echo_advisor_block"}:
+        assert len(advertised_tools) >= 2
+    else:
+        assert len(advertised_tools) == (1 if final_kind == "expired" else 3 if final_kind == "tools" else 2)
+    expected_batches = [("get_blob_content", "preview_pipeline")] if final_kind == "inspected_text" else [("preview_pipeline",)]
+    if final_kind == "tools":
+        expected_batches.append(("set_metadata",))
+    assert dispatched_batches == expected_batches
     assert advertised_tools[0]
-    if len(advertised_tools) == 2:
-        assert {tool["function"]["name"] for tool in advertised_tools[1]} == {"handoff_to_user", "restore_parked_graph"}
-        assert all(message["role"] != "tool" and "tool_calls" not in message for message in provider_messages[1])
-        assert any("Historical tool protocol record" in message["content"] for message in provider_messages[1])
-
-
-@pytest.mark.parametrize(
-    "defect",
-    [
-        "none",
-        "empty_batch",
-        "tool_error",
-        "failed_result",
-        "invalid_stage1",
-        "missing_preflight",
-        "invalid_preflight",
-        "stale",
-        "later_read",
-        "prior_error",
-    ],
-)
-def test_terminal_preview_requires_current_successful_evidence(defect: str) -> None:
-    state = _empty_state()
-    call = _admit_composer_llm_completion(
-        _make_llm_response(tool_calls=[{"id": "preview", "name": "preview_pipeline", "arguments": {}}])
-    ).tool_batch.calls[0]
-    preflight = ValidationResult(is_valid=True, checks=[], errors=[], readiness=_execution_ready())
-    result = ToolResult(
-        success=True,
-        updated_state=state,
-        validation=ValidationSummary(is_valid=True, errors=()),
-        affected_nodes=(),
-        runtime_preflight=preflight,
-    )
-    outcome = _ToolOutcome(
-        call=call,
-        response=result,
-        error_class=None,
-        error_category=None,
-        error_message=None,
-        pre_version=state.version,
-        post_version=state.version,
-    )
-    if defect == "tool_error":
-        outcome = replace(outcome, error_class="ToolArgumentError", response=None)
-    elif defect == "failed_result":
-        outcome = replace(outcome, response=replace(result, success=False))
-    elif defect == "invalid_stage1":
-        outcome = replace(outcome, response=replace(result, validation=ValidationSummary(is_valid=False, errors=())))
-    elif defect == "missing_preflight":
-        outcome = replace(outcome, response=replace(result, runtime_preflight=None))
-    elif defect == "invalid_preflight":
-        outcome = replace(outcome, response=replace(result, runtime_preflight=preflight.model_copy(update={"is_valid": False})))
-    elif defect == "stale":
-        outcome = replace(outcome, response=replace(result, updated_state=replace(state, version=state.version + 1)))
-    outcomes = (outcome,)
-    if defect == "empty_batch":
-        outcomes = ()
-    elif defect == "later_read":
-        read = _admit_composer_llm_completion(
-            _make_llm_response(tool_calls=[{"id": "read", "name": "get_pipeline_state", "arguments": {}}])
-        ).tool_batch.calls[0]
-        outcomes = (outcome, replace(outcome, call=read))
-    elif defect == "prior_error":
-        outcomes = (replace(outcome, response=None, error_class="ToolArgumentError"), outcome)
-    assert _tool_batch_ends_with_valid_current_preview(outcomes, state) is (defect == "none")
+    if len(advertised_tools) >= 2:
+        assert {"set_metadata", "get_pipeline_state", "handoff_to_user", "restore_parked_graph"} <= {
+            tool["function"]["name"] for tool in advertised_tools[1]
+        }
+        assert any(message["role"] == "tool" for message in provider_messages[1])
+        assert any("tool_calls" in message for message in provider_messages[1])

@@ -235,11 +235,22 @@ unknown fields and hides input values in validation errors [EV-010].
 | HTTP `allowed_origins`, `allowed_hosts`, headers and fetch limits | No exact-origin list; `public_only`; response 10 MiB; POST request 1 MiB; 30 s | Origin/address/DNS/redirect policy constrains public fetches; web-authored values cannot exceed 10 MiB request/response and 30 s [EV-011], [EV-020] | DEPLOYMENT-TODO: |
 | Planner/advisor models, endpoints and same-model override | `gpt-5.5`; `anthropic/claude-sonnet-4-6`; endpoints unset; same model refused | Operator controls both destinations; endpoint and credential fields are paired; independent models are required unless explicitly overridden [EV-504] | DEPLOYMENT-TODO: |
 | Composer turn/time/rate settings | Composition turns, discovery turns, timeout and per-user rate are required; no implicit values | Bounds must fit the declared transport idle ceiling; provider errors are hidden by default [EV-504] | DEPLOYMENT-TODO: |
-| Planner/advisor resource budgets | Planner: 75 provider calls, 2 MiB request, 16,384 completion tokens, USD 5 cumulative cost, 2 repairs; advisor: 4 calls, 2 checkpoint passes, 4,000 prompt / 8,192 completion tokens, 60 s | Limits resource consumption and review loops; checkpoint and ordinary advisor budgets are separate [EV-504] | DEPLOYMENT-TODO: |
+| Planner/advisor resource budgets | Planner: 75 provider calls, 2 MiB request, 16,384 completion tokens, USD 5 cumulative cost, 2 repairs; advisor: 4 calls, 2 checkpoint passes, 4,000-unit input proxy / 8,192 completion tokens, 60 s | Limits resource consumption and review loops; checkpoint and ordinary advisor budgets are separate; see the 0.8.9 input-scope change below [EV-504] | DEPLOYMENT-TODO: |
 | `execution_rate_limit` | 60 calls/minute per unconfigured service | Operator-owned limit for external calls made by web-executed runs | DEPLOYMENT-TODO: |
 | Pipeline and operator telemetry | Pipeline telemetry disabled, `lifecycle`, blocking backpressure; web operator mode `prometheus`, pipeline granularity `lifecycle` | `full` pipeline telemetry can export prompts, completions and HTTP bodies; AWS web mode permits only `lifecycle` or `rows` [EV-322], [EV-324] | DEPLOYMENT-TODO: |
 | `classification_banner` | None | No banner is shown until the operator declares a supported ceiling; the banner does not classify content [EV-016] | DEPLOYMENT-TODO: |
 | `payload_store_retention_days` | 90 | Informational retention period; the product does not schedule purge automatically [EV-325], [EV-326] | DEPLOYMENT-TODO: record purge schedule and legal hold |
+
+**0.8.9 Advisor input-scope change.** The existing input setting multiplies its
+value by four to obtain a character allowance. Public hints count their full
+variable message; EARLY/END checkpoints count only optional rendered pipeline
+evidence, preserving mandatory request/candidate and review context. This
+relaxes the inherited complete checkpoint input-cost proxy for both default
+and explicitly configured values; cost and latency can increase. It is not a
+tokenizer, provider-context guarantee or reservation of the next call's cost.
+Required guards, actual quota admission and bound publication review remain
+in force. See [Advisor input allowance](../reference/environment-variables.md#advisor-input-allowance).
+This scoped change does not requalify the historical assessment pin above.
 
 ## 8. Maturity and assessment constraints
 

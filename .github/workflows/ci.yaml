@@ -792,7 +792,8 @@ jobs:
           # tree-wide, and the live_provider ids are operator-gated
           # (`--run-live-provider`) and by design run in no CI job at all.
           status=0
-          uv run pytest tests/integration/ -v || status=$?
+          # Reserve two workers within the shared Nyx test budget.
+          uv run pytest tests/integration/ -n 2 -v || status=$?
           if [ "$status" -eq 5 ]; then
             echo "No integration tests collected (exit 5) — treating as a skip."
             exit 0
@@ -1056,7 +1057,8 @@ jobs:
         run: uv sync --frozen --all-extras
 
       - name: Run the compiled-ARM bundle contract test
-        run: uv run pytest tests/unit/deployment/test_azure_container_apps_bundle.py -v
+        # Run this single contract test serially within the shared Nyx budget.
+        run: uv run pytest tests/unit/deployment/test_azure_container_apps_bundle.py -n 0 -v
 
   supply-chain-audit:
     name: Dependency and License Audit

@@ -505,6 +505,7 @@ class ErrorDetail(TypedDict):
 
 # Literal type for compile-time validation of error categories
 TransformErrorCategory = Literal[
+    "required_input_field_blank",  # A present required LLM input lacks permitted content
     # API/Network errors
     "api_error",
     "api_call_failed",

@@ -7,7 +7,7 @@ import functools
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import structlog
@@ -57,7 +57,6 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
 from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
-    is_referential_pipeline_mutation_intent,
     state_is_structurally_empty,
 )
 from elspeth.web.composer.pipeline_planner import (
@@ -69,6 +68,7 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerHandoff,
     PlannerModelConfig,
     PlannerOriginatingMessage,
+    PlannerPriorAssistantMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
     plan_pipeline,
@@ -78,6 +78,7 @@ from elspeth.web.composer.pipeline_proposal import (
     PresentBase,
     composition_content_hash,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.prompts import project_server_owned_option_metadata
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
@@ -102,6 +103,7 @@ from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.schema_disclosure import SchemaDisclosureTracker
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import RuntimePreflight
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent, visible_response_gap
 from elspeth.web.composer.withheld_replies import WithheldReply, withheld_reply_envelope
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -117,7 +119,6 @@ from elspeth.web.sessions.pipeline_rejection_custody import (
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, RedactedPipelineArguments, SessionServiceProtocol
 
 slog = structlog.get_logger()
-_FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
 
 
 async def _await_pipeline_staging_write_with_deferred_cancellation[T](
@@ -193,20 +194,20 @@ def _freeform_planner_conversation_context(
     message: str,
     messages: list[ComposerHistoryMessage],
 ) -> PlannerConversationContext | None:
-    """Project bounded, authoritative earlier user requests for the planner.
+    """Preserve earlier user requests and assistant conversation separately.
 
     Empty-state planning receives the current message separately as its
     custody-bearing ``PlannerOriginatingMessage``. This projection carries
-    only preceding user-authored requests needed to resolve a referential turn;
-    assistant prose is model synthesis, not intent authority, and is excluded.
-    The first request plus the seven most recent requests survive long
-    histories, with an explicit omission count. The planner's existing exact
-    request-byte budget remains the final provider-call bound.
+    preceding user-authored requests, including earlier amendments. Assistant
+    prose is retained separately so answers to clarifying questions have their
+    context; it is model synthesis and never user-request authority.
+    A fresh-looking build instruction can still depend on an earlier
+    restriction. Preserve every authenticated request in chronological order;
+    the planner's exact request-byte bound refuses an oversized packet before
+    any provider call instead of silently losing requirements.
     """
-    if not is_referential_pipeline_mutation_intent(message):
-        return None
-
     prior_requests: list[PlannerPriorUserRequest] = []
+    prior_assistant_messages: list[PlannerPriorAssistantMessage] = []
     for history_index, history_message in enumerate(messages):
         if type(history_message) is not dict:
             raise InvariantError("composer chat history entries must be exact dictionaries")
@@ -216,6 +217,12 @@ def _freeform_planner_conversation_context(
         # must crash, so membership and value are checked separately rather
         # than letting a `.get()` default fold present-but-invalid into absent.
         if COMPOSER_HISTORY_USER_AUTHORED_KEY not in history_message:
+            if history_message["role"] == "assistant":
+                content = history_message["content"]
+                if type(content) is not str:
+                    raise InvariantError("composer assistant chat history content must be an exact string")
+                if content.strip():
+                    prior_assistant_messages.append(PlannerPriorAssistantMessage(history_index=history_index, content=content))
             continue
         authorship = history_message[COMPOSER_HISTORY_USER_AUTHORED_KEY]
         if authorship is not True or "role" not in history_message or history_message["role"] != "user":
@@ -225,18 +232,11 @@ def _freeform_planner_conversation_context(
             raise InvariantError("composer user chat history content must be a non-empty exact string")
         prior_requests.append(PlannerPriorUserRequest(history_index=history_index, content=content))
 
-    if not prior_requests:
+    if not prior_requests and not prior_assistant_messages:
         return None
-    if len(prior_requests) <= _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS:
-        retained = tuple(prior_requests)
-        omitted = 0
-    else:
-        tail_count = _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS - 1
-        retained = (prior_requests[0], *prior_requests[-tail_count:])
-        omitted = len(prior_requests) - len(retained)
     return PlannerConversationContext(
-        prior_user_requests=retained,
-        additional_prior_user_requests_omitted=omitted,
+        prior_user_requests=tuple(prior_requests),
+        prior_assistant_messages=tuple(prior_assistant_messages),
     )
 
 
@@ -266,6 +266,8 @@ class PlanningApplication:
         advisor_endpoint_api_key: str | None,
         advisor_checkpoint: AdvisorCheckpointOwner,
         completion: CompositionCompletion,
+        composer_prompt_guard_mount: PromptGuardMount | None = None,
+        advisor_prompt_guard_mount: PromptGuardMount | None = None,
     ) -> None:
         self._sessions_service_optional = sessions_service
         self._policy_context = policy_context
@@ -287,6 +289,16 @@ class PlanningApplication:
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
         self._advisor_checkpoint = advisor_checkpoint
         self._completion = completion
+        self._composer_prompt_guard_mount = (
+            composer_prompt_guard_mount
+            if composer_prompt_guard_mount is not None
+            else build_prompt_guard_mount(settings.composer_prompt_guard)
+        )
+        self._advisor_prompt_guard_mount = (
+            advisor_prompt_guard_mount
+            if advisor_prompt_guard_mount is not None
+            else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
+        )
         self._model = settings.composer_model
         self._max_composition_turns = settings.composer_max_composition_turns
         self._max_discovery_turns = settings.composer_max_discovery_turns
@@ -341,6 +353,7 @@ class PlanningApplication:
         withheld_replies: tuple[WithheldReply, ...],
         private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> tuple[AuditMessageDraft, ...]:
         """Build required planner evidence without writing or touching graph state.
 
@@ -363,11 +376,12 @@ class PlanningApplication:
                 if session_operation_context is None:
                     raise AuditIntegrityError("planner diagnostics require operation authority")
                 drafts.extend(private_diagnostic_drafts(record, context=session_operation_context))
+                public_call = llm_call_audit_envelope(record)
                 drafts.append(
                     AuditMessageDraft(
                         role="audit",
                         content=llm_call_audit_summary(record),
-                        tool_calls=(llm_call_audit_envelope(record),),
+                        tool_calls=(public_call, visible_response_gap(record, session_operation_context, public_call)),
                     )
                 )
             else:
@@ -387,11 +401,25 @@ class PlanningApplication:
                 private_tool_invocation_draft(invocation, session_id=str(session_id), session_operation_context=session_operation_context)
             )
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            companions = [event for recorded, event in visible_tool_events if recorded is invocation]
+            if len(companions) > 1:
+                raise AuditIntegrityError("Planner tool event repeats its ordinary visible companion")
+            if companions:
+                visible = companions[0]
+                display_invocation = cast(dict[str, Any], envelope["invocation"])
+                visible.validate(
+                    context=session_operation_context,
+                    session_id=str(session_id),
+                    tool_call_id=invocation.tool_call_id,
+                    tool_name=invocation.tool_name,
+                    display_arguments=display_invocation["arguments_canonical"],
+                    display_result=content,
+                )
             drafts.append(
                 AuditMessageDraft(
                     role="audit",
                     content=content,
-                    tool_calls=(envelope,),
+                    tool_calls=(envelope, companions[0].to_envelope()) if companions else (envelope,),
                 )
             )
         for withheld in withheld_replies:
@@ -441,6 +469,7 @@ class PlanningApplication:
         private_candidates: tuple[PrivatePlannerCandidate, ...],
         session_operation_context: SessionOperationContext | None,
         required_work: RequiredWorkBinding | None = None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> None:
         """Settle the planner evidence cohort before creating proposal authority."""
         if session_operation_context is None:
@@ -453,6 +482,7 @@ class PlanningApplication:
             withheld_replies=withheld_replies,
             private_candidates=private_candidates,
             session_operation_context=session_operation_context,
+            visible_tool_events=visible_tool_events,
         )
         sessions = self._sessions_service
         audit_sql = audit_projection = None
@@ -594,6 +624,7 @@ class PlanningApplication:
         planner_private_candidates: tuple[PrivatePlannerCandidate, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         required_work: RequiredWorkBinding | None = None,
+        visible_tool_events: tuple[tuple[ComposerToolInvocation, VisibleToolEvent], ...] = (),
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
 
@@ -625,6 +656,7 @@ class PlanningApplication:
             private_candidates=planner_private_candidates,
             session_operation_context=session_operation_context,
             required_work=required_work,
+            visible_tool_events=visible_tool_events,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -974,6 +1006,8 @@ class PlanningApplication:
                 blocked, session_id=session_id, session_operation_context=session_operation_context
             )
             return blocked
+        except PromptGuardRefused as error:
+            raise error.with_evidence(state=state, initial_version=state.version, llm_calls=recorder.llm_calls[end_call_start:]) from error
         except BaseException as error:
             attach_llm_calls(error, recorder, start_index=end_call_start)
             raise
@@ -1092,7 +1126,12 @@ class PlanningApplication:
                 originating_message=origin,
                 base=base,
                 model_config=PlannerModelConfig(
-                    completion=provider_gateway._litellm_acompletion,
+                    completion=functools.partial(
+                        provider_gateway._litellm_acompletion,
+                        prompt_guard_mount=self._composer_prompt_guard_mount,
+                        prompt_guard_mode=self._settings.composer_prompt_guard_mode,
+                        prompt_guard_role="composer",
+                    ),
                     model_identifier=self._model,
                     provider=self._availability.provider or "unknown",
                     temperature=self._settings.composer_temperature,
@@ -1115,6 +1154,9 @@ class PlanningApplication:
                     api_key=self._endpoint_api_key,
                     escape_hatch_api_base=self._advisor_endpoint_base_url,
                     escape_hatch_api_key=self._advisor_endpoint_api_key,
+                    prompt_guard_mount=self._composer_prompt_guard_mount,
+                    escape_hatch_prompt_guard_mount=self._advisor_prompt_guard_mount,
+                    prompt_guard_mode=self._settings.composer_prompt_guard_mode,
                 ),
                 rendered_skill=rendered_skill,
                 repair_budget=self._settings.composer_planner_repair_budget,
@@ -1146,6 +1188,7 @@ class PlanningApplication:
                 withheld_replies=recorder.withheld_replies[planner_withheld_start:],
                 private_candidates=(),
                 session_operation_context=session_operation_context,
+                visible_tool_events=recorder.visible_tool_events,
             )
             return ComposerResult(
                 message=handoff.intent.message,
@@ -1154,10 +1197,7 @@ class PlanningApplication:
                 recovery_audit_drafts=drafts,
             )
         except PlannerDeclined as declined:
-            # Honest decline — from an ordinary manifest-satisfied turn
-            # led by the taught DECLINE: marker, or from the escape-hatch
-            # advisor turn, which accepts any text: a successful
-            # conversational outcome, not a provider failure. Mirror the
+            # The provider chose a conversational outcome. Mirror the
             # success path's audit persistence, then surface the model's own
             # words as the assistant message.
             await self._persist_pipeline_planner_audit(
@@ -1170,6 +1210,7 @@ class PlanningApplication:
                 private_candidates=recorder.private_candidates[planner_private_start:],
                 session_operation_context=session_operation_context,
                 required_work=required_work,
+                visible_tool_events=recorder.visible_tool_events,
             )
             decline_message = declined.decline_text.strip() or (
                 "I could not find a way to build this pipeline with the available components."
@@ -1188,6 +1229,29 @@ class PlanningApplication:
                 turn_evidence=turn_evidence,
                 deadline=deadline,
             )
+        except PromptGuardRefused as exc:
+            calls = recorder.llm_calls[planner_llm_start:]
+            if exc.llm_calls != calls:
+                raise AuditIntegrityError("pipeline guard refusal carried unrelated LLM audit evidence") from exc
+            _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+                self._persist_pipeline_planner_audit(
+                    session_id=session_uuid,
+                    current_state_id=state_uuid,
+                    llm_calls=calls,
+                    planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+                    invocations=recorder.invocations[planner_invocation_start:],
+                    withheld_replies=recorder.withheld_replies[planner_withheld_start:],
+                    private_candidates=recorder.private_candidates[planner_private_start:],
+                    session_operation_context=session_operation_context,
+                    required_work=required_work,
+                    visible_tool_events=recorder.visible_tool_events,
+                )
+            )
+            if deferred is not None:
+                raise deferred from exc
+            # All prior planner work is durable. Preserve the terminal guard
+            # identity without replaying that cohort in the route unwind.
+            raise exc.with_evidence(state=state, initial_version=state.version) from exc
         except BaseException as exc:
             exc_dict = exc.__dict__
             attached_calls = exc_dict["llm_calls"] if "llm_calls" in exc_dict else ()
@@ -1211,6 +1275,7 @@ class PlanningApplication:
                     private_candidates=recorder.private_candidates[planner_private_start:],
                     session_operation_context=session_operation_context,
                     required_work=required_work,
+                    visible_tool_events=recorder.visible_tool_events,
                 ),
                 deferred=exc if type(exc) is asyncio.CancelledError else None,
             )
@@ -1237,4 +1302,5 @@ class PlanningApplication:
             planner_private_candidates=recorder.private_candidates[planner_private_start:],
             plugin_snapshot=plugin_snapshot,
             required_work=required_work,
+            visible_tool_events=recorder.visible_tool_events,
         )

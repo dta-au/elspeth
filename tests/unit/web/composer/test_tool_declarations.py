@@ -584,13 +584,13 @@ class TestStep3DiscoveryTierMigration:
     def test_diff_pipeline(self) -> None:
         assert self._get("diff_pipeline") == {
             "name": "diff_pipeline",
-            "description": "Show what changed since the session was loaded or created. "
+            "description": "Compare the current pipeline with the baseline supplied by this surface, which may be the request-start state. "
             "On success `data` carries `from_version` (the baseline; the version it "
             "changed TO is the envelope's own `version`), `sources_changed`, "
             "`metadata_changed`, `total_changes`, `warnings_introduced`, "
             "`warnings_resolved`, and per-collection `added` / `removed` / `modified` "
             "lists under `nodes`, `edges`, `outputs`, and — only when `sources_changed` — `sources`. Without a "
-            "baseline (no session loaded or created yet) it fails with `error` and "
+            "baseline it fails with `error` and "
             "`error_code` only.",
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
@@ -839,25 +839,24 @@ class TestStep3MutationTierMigration:
         assert "rows missing a promised column quarantine; the run continues" not in skill
 
     def test_core_skill_keeps_the_full_rebuild_steer_scoped_to_new_builds(self) -> None:
-        """The new edit row must not read as licence for tool-by-tool NEW builds.
-
-        The 2026-07-22 stress test (planner_authoring_aids:13-14) found 0 of 6
-        cold planners converged constructing a new pipeline tool-by-tool, which
-        is why the batching section exists. Widening the edit table must leave
-        that steer intact and explicitly bounded to new builds.
-        """
+        """Staged new builds do not turn focused existing-pipeline edits into rebuilds."""
         # Prose is hard-wrapped, so match on whitespace-normalized text: a
         # reflow must not read as a doctrine change.
         skill = " ".join(
             (Path(__file__).parents[4] / "src/elspeth/web/composer/skills/pipeline_composer.md").read_text(encoding="utf-8").split()
         )
 
-        assert "governs NEW builds only" in skill
-        assert "Do not build a complex new pipeline tool-by-tool" in skill
-        assert "not by switching into a one-component-at-a-time construction loop" in skill
-        # The carve-out is what keeps the prohibition from reading as general.
-        assert "Editing a pipeline that already exists is not a new build" in skill
-        assert "A new build never walks this table row by row" in skill
+        assert "Create a new pipeline or perform an intentional full rebuild | `set_pipeline`, or bounded construction batches" in skill
+        assert "The narrower tools also support staged construction of a new pipeline" in skill
+        assert "Preserve existing components when extending a saved draft" in skill
+        assert "use a full replacement only when you can supply the exact current bindings and the requested complete state" in skill
+        assert "Make an option-only edit to an existing node | `patch_node_options`" in skill
+        assert "Add or rewire a node in an existing pipeline, when neither narrower row above fits | `upsert_node` / `upsert_edge`" in skill
+        assert (
+            "Follow focused repair diagnostics without discarding already verified components or narrowing the requested final topology"
+            in skill
+        )
+        assert "For edits to an existing pipeline, continue to choose the narrowest supported tool" in skill
 
     def test_upsert_node_required(self) -> None:
         defn = self._get("upsert_node")
@@ -947,8 +946,9 @@ class TestStep3BlobDiscoveryTierMigration:
             "name": "get_blob_content",
             "description": (
                 "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-                "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+                "Each complete JSON tool response, including metadata, is bounded to 4,096 UTF-8 bytes and preserves original Unicode code points. "
                 "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+                "page sizes vary, so never guess later offsets or parallelize dependent pages of one blob. "
                 "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
                 "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
                 "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
@@ -988,14 +988,17 @@ class TestStep3BlobDiscoveryTierMigration:
                 "Return bounded structural facts about a blob-backed source: `source_kind`, "
                 "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
                 "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
-                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
-                "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
-                "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+                "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window "
+                "inspected) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+                "`content_hash_prefix` — nothing secret). Inspects at most an 8 KiB prefix and parses at most 100 rows; "
+                "streams the full file to verify its integrity hash. Use this "
                 "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
                 "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
                 "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
                 "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
                 "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+                "For CSV/TSV, pass encoding when the intended source encoding is known (for example utf-8-sig for a UTF-8 BOM). "
+                "This selects only the inspection's decoding; configure the same encoding on the source separately. "
                 "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
                 "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
                 "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
@@ -1009,6 +1012,12 @@ class TestStep3BlobDiscoveryTierMigration:
                         "type": "string",
                         "description": "ID of the blob to inspect.",
                     },
+                    "encoding": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "description": "Explicit CSV/TSV text encoding for this bounded inspection only. Use null for default blob inspection.",
+                    },
                 },
                 "required": ["blob_id"],
                 "additionalProperties": False,
@@ -1019,7 +1028,7 @@ class TestStep3BlobDiscoveryTierMigration:
         from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
 
         names = {d.name for d in _REGISTERED_TOOLS if d.kind is ToolKind.BLOB_DISCOVERY}
-        assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "inspect_source"}
+        assert names == {"list_blobs", "list_composer_blobs", "get_blob_metadata", "get_blob_content", "read_attachment", "inspect_source"}
 
     def test_wire_blob_inline_ref(self) -> None:
         from elspeth.web.composer.tools._common import _BLOB_INLINE_REF_OWNERSHIP_SCHEMA_NOTE

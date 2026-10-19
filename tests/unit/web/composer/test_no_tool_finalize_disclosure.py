@@ -1,58 +1,29 @@
-"""Empty-state blocker disclosure must not depend on sentence packaging.
+"""Empty-state failure disclosure follows actual composition attempts.
 
-Issue elspeth-a6a2ed6b1d. The no-mutation empty-state finalize branch
-(``no_tool_finalize.finalize_no_tool_response``) appends a
-system-attributed suffix naming the concrete blocker that stopped the
-build. That disclosure was gated on
-``classify_pipeline_mutation_intent(...) is EXPLICIT_MUTATION``.
-
-EXPLICIT_MUTATION is a *packaging* verdict: the closed grammar
-fullmatches the whole normalised message from character 0 and treats a
-single ``?`` anywhere as a hard disqualifier. So "Build a pipeline
-that ... to JSON." discloses while "Build me a pipeline that ... to
-JSON." does not, though the two requests are the same request. Measured
-over the acceptance corpus (``ops-local/acceptance/intents/*.json``):
-14 AMBIGUOUS, 3 CONVERSATIONAL, 1 EXPLICIT_MUTATION — so 17 of 18 real
-phrasings silently lost the explanation of why nothing got built.
-
-Disclosure now keys on a dedicated predicate, ``carries_build_action``,
-rather than on the intent enum. Gating on ``is not CONVERSATIONAL`` was
-tried first and rejected on review: two *packaging* short-circuits reach
-AMBIGUOUS before the enum's only content test runs (the 4096-char
-ceiling and the unbalanced-quote guard), so an oversize or
-unbalanced-quote greeting failed open into disclosure. The named
-predicate runs the content test unconditionally, so neither
-short-circuit decides disclosure any more.
-
-Turns that carry no build action are still excluded: appending "the
-composer did not complete a valid build this turn" to a greeting or a
-catalog question would be a misattributed system notice in the other
-direction.
-
-Routing is untouched: both routing call sites (``service.py`` surface
-selection and the freeform planner gate) test ``is EXPLICIT_MUTATION``
-against the same unmodified classifier, which this change does not call
-on the disclosure path at all.
+Request wording does not manufacture a failed build or erase an unwanted
+mutation that the provider really tried.
+Semantic completion claims are reviewed by the upstream END gate; this file
+tests the finalizer's factual receipt notice and public/history provenance.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, ToolArgumentErrorCategory
-from elspeth.web.composer.no_tool_policy import (
-    PipelineMutationIntentDecision,
-    classify_pipeline_mutation_intent,
-)
+from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.tools import is_blob_store_only_mutation_tool, is_mutation_tool
 
 from ._helpers import _empty_state, _make_settings, _mock_catalog
 
-# One request, six surface phrasings. The classifier splits these across
-# EXPLICIT_MUTATION and AMBIGUOUS on packaging alone (leading context,
-# the article after the verb, the adjective vocabulary, a trailing "?").
+# One request, six surface phrasings. Disclosure follows tool receipts across
+# leading context, articles, adjective vocabulary, and trailing punctuation.
 _SAME_REQUEST_PHRASINGS: tuple[str, ...] = (
     "Build a pipeline that reads manifest.csv and writes results to JSON.",
     "Build me a pipeline that reads manifest.csv and writes results to JSON.",
@@ -70,8 +41,8 @@ def _failed_set_pipeline_invocation() -> ComposerToolInvocation:
     return ComposerToolInvocation(
         tool_call_id="call_failed",
         tool_name="set_pipeline",
-        arguments_canonical=b"{}",
-        arguments_hash="0" * 64,
+        arguments_canonical="{}",
+        arguments_hash=hashlib.sha256(b"{}").hexdigest(),
         result_canonical=None,
         result_hash=None,
         status=ComposerToolStatus.ARG_ERROR,
@@ -87,8 +58,13 @@ def _failed_set_pipeline_invocation() -> ComposerToolInvocation:
     )
 
 
-async def _finalize(user_message: str) -> str:
-    """Run the no-tool finalizer on an empty state with a failed build tool."""
+async def _finalize_result(
+    user_message: str,
+    *,
+    tool_invocations: tuple[ComposerToolInvocation, ...] = (),
+    mutation_success_seen: bool = False,
+) -> ComposerResult:
+    """Run the real finalizer with exactly the supplied current-turn receipts."""
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
     result = await service._completion._finalize_no_tool_response(
@@ -101,16 +77,39 @@ async def _finalize(user_message: str) -> str:
         runtime_preflight_cache=service._preflight.new_cache(),
         session_scope="session:test",
         user_message=user_message,
-        tool_invocations=(_failed_set_pipeline_invocation(),),
+        tool_invocations=tool_invocations,
+        mutation_success_seen=mutation_success_seen,
     )
+    assert result.tool_invocations == tool_invocations
+    return result
+
+
+async def _finalize(user_message: str) -> str:
+    """Preserve the failed-build controls' actual argument-rejection receipt."""
+    result = await _finalize_result(user_message, tool_invocations=(_failed_set_pipeline_invocation(),))
     return result.message
 
 
+def _successful_receipt(tool_name: str, result: dict[str, object]) -> ComposerToolInvocation:
+    canonical = json.dumps(result, sort_keys=True, separators=(",", ":"))
+    return replace(
+        _failed_set_pipeline_invocation(),
+        tool_call_id=f"call_{tool_name}",
+        tool_name=tool_name,
+        status=ComposerToolStatus.SUCCESS,
+        result_canonical=canonical,
+        result_hash=hashlib.sha256(canonical.encode()).hexdigest(),
+        error_class=None,
+        error_message=None,
+        error_category=None,
+        version_after=1,
+    )
+
+
 @pytest.mark.asyncio
-async def test_ambiguous_empty_state_request_receives_blocker_explanation() -> None:
-    """An AMBIGUOUS build request must be told why its pipeline is empty."""
+async def test_personalized_empty_state_request_receives_blocker_explanation() -> None:
+    """A failed attempt must explain why the pipeline is empty."""
     message = "Build me a pipeline that reads manifest.csv and writes results to JSON."
-    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
 
     finalized = await _finalize(message)
 
@@ -122,9 +121,8 @@ async def test_ambiguous_empty_state_request_receives_blocker_explanation() -> N
 
 @pytest.mark.asyncio
 async def test_explicit_empty_state_request_still_receives_blocker_explanation() -> None:
-    """Regression guard: the pre-existing EXPLICIT_MUTATION disclosure is unchanged."""
+    """A direct request receives the same factual disclosure."""
     message = "Build a pipeline that reads manifest.csv and writes results to JSON."
-    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
 
     finalized = await _finalize(message)
 
@@ -162,49 +160,35 @@ async def test_conversational_turn_receives_no_build_failure_notice(message: str
     not complete a valid build this turn" to greetings and catalog
     questions on any fresh session — a misattributed system notice.
     """
-    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.CONVERSATIONAL
-
-    finalized = await _finalize(message)
+    result = await _finalize_result(message)
+    finalized = result.message
 
     assert finalized == _MODEL_PROSE
     assert "[ELSPETH-SYSTEM]" not in finalized
+    assert result.runtime_preflight is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("label", "message"),
     [
-        # Unbalanced quote: classify_pipeline_mutation_intent returns
-        # AMBIGUOUS at no_tool_policy.py:589 before reaching any content
-        # test, so an enum-based gate failed open here.
         ("unbalanced_quote", 'Hi, what is a "sink?'),
-        # Oversize: same story at no_tool_policy.py:585, the 4096 ceiling.
         ("oversize", "hello " + "x" * 4092),
     ],
 )
-async def test_packaging_short_circuits_do_not_manufacture_disclosure(label: str, message: str) -> None:
-    """Neither packaging early-return in the intent grammar grants disclosure.
-
-    Both of these reach AMBIGUOUS without the classifier ever testing
-    for a build action. Disclosure must consult content directly.
-    """
-    finalized = await _finalize(message)
+async def test_unusual_request_packaging_does_not_manufacture_disclosure(label: str, message: str) -> None:
+    """Quotes and message length cannot supply composition-attempt receipts."""
+    result = await _finalize_result(message)
+    finalized = result.message
 
     assert finalized == _MODEL_PROSE
     assert "[ELSPETH-SYSTEM]" not in finalized
+    assert result.runtime_preflight is None
 
 
 @pytest.mark.asyncio
 async def test_oversize_build_request_still_receives_blocker_explanation() -> None:
-    """A long build request discloses — the ceiling bounds authority, not disclosure.
-
-    Deliberate call: ``classify_pipeline_mutation_intent`` caps input at
-    4096 chars because granting *mutation authority* on unbounded text
-    is unsafe. Disclosure grants nothing, and failing closed on length
-    would re-create the very withholding defect this issue is about for
-    the realistic "here is my 6KB CSV, build me a pipeline that ..."
-    shape.
-    """
+    """An actual failed attempt discloses independently of message length."""
     message = "Here is my data. " + "col_a,col_b\n" * 400 + " Build a pipeline that reads it and writes JSON."
     assert len(message) > 4096
 
@@ -218,12 +202,8 @@ async def test_oversize_build_request_still_receives_blocker_explanation() -> No
 async def test_build_request_mentioning_run_failure_still_discloses() -> None:
     """A build request that also discusses failure handling still discloses.
 
-    Regression pin from acceptance intents g07/g07r. Suppressing
-    disclosure via ``_REQUEST_REVOCATION_PATTERN`` was tried and
-    reverted: that pattern is a bare search, and these intents pair
-    "Build me a pipeline that runs Amazon Textract ..." with "... rather
-    than have the whole run stop.", which it matches. Suppressing here
-    re-creates the withholding defect for a real build request.
+    Failure-handling requirements in a request cannot suppress factual
+    disclosure of an actual failed composition attempt.
     """
     message = (
         "Build me a pipeline that runs Amazon Textract over the documents. "
@@ -244,51 +224,138 @@ async def test_build_request_mentioning_run_failure_still_discloses() -> None:
         "How do I route rows to two different files?",
         "I make heavy use of CSV files.",
         "Are you able to run pipelines yourself?",
+        'What does "build a pipeline" mean?',
     ],
 )
-async def test_known_limitation_bare_verb_draws_notice_on_conversation(message: str) -> None:
-    """CHARACTERIZATION OF A DEFECT, NOT DESIRED BEHAVIOUR.
+async def test_zero_attempt_conversation_does_not_manufacture_build_failure(message: str) -> None:
+    result = await _finalize_result(message)
 
-    The verb alternation behind ``carries_build_action`` has no object
-    requirement, so these conversational turns draw an empty-state
-    notice they have not earned. This is asserted so the cost is
-    visible and reviewable rather than buried, and so that whoever
-    narrows the predicate sees these flip.
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+    assert "[ELSPETH-SYSTEM]" not in result.message
 
-    If you are here because this test failed: that is probably GOOD.
-    Confirm the message now correctly gets no notice, then delete the
-    case — do not restore the assertion.
-    """
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", ["hello", "Do not build anything.", "How do I route rows to two different files?"])
+async def test_unwanted_real_mutation_failure_is_disclosed_even_on_conversation(message: str) -> None:
     finalized = await _finalize(message)
 
     assert "The pipeline is still empty" in finalized
+    assert "Cause: set_pipeline failed before mutation (ToolArgumentError: source.blob_id is required)." in finalized
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message", _SAME_REQUEST_PHRASINGS)
+async def test_zero_attempt_build_request_has_no_fabricated_failure_receipt(message: str) -> None:
+    """END owns false-completion review; the finalizer must not invent a tool failure."""
+    result = await _finalize_result(message)
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_pipeline_state", "request_advisor_hint", "request_interpretation_review", "unknown_tool"])
+async def test_non_mutation_receipt_does_not_become_a_graph_failure(tool_name: str) -> None:
+    assert not is_mutation_tool(tool_name)
+    failed = replace(_failed_set_pipeline_invocation(), tool_name=tool_name)
+    result = await _finalize_result("Build me a pipeline.", tool_invocations=(failed,))
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+async def test_successful_blob_only_work_does_not_become_a_failed_graph_mutation() -> None:
+    assert is_mutation_tool("create_blob") and is_blob_store_only_mutation_tool("create_blob")
+    receipt = _successful_receipt("create_blob", {"success": True, "data": {"blob_id": "example-blob"}})
+    result = await _finalize_result("Make example CSV data.", tool_invocations=(receipt,))
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+async def test_cancellation_receipt_is_not_relabelled_as_a_recoverable_build_failure() -> None:
+    receipt = replace(
+        _failed_set_pipeline_invocation(),
+        status=ComposerToolStatus.CANCELLED,
+        error_class="CancelledError",
+        error_message="coordinator_cancelled",
+        error_category=None,
+    )
+    result = await _finalize_result("Build me a pipeline.", tool_invocations=(receipt,))
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_tool", [None, "get_pipeline_state", "request_advisor_hint", "create_blob"])
+async def test_pending_proposal_is_not_a_failed_build_even_with_non_composition_receipts(trailing_tool: str | None) -> None:
+    proposal = _successful_receipt("set_pipeline", {"success": True, "data": {"status": "APPROVAL_REQUIRED"}})
+    receipts = (proposal,)
+    if trailing_tool is not None:
+        receipts += (_successful_receipt(trailing_tool, {"success": True, "data": {}}),)
+    result = await _finalize_result("Build me a pipeline.", tool_invocations=receipts)
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None
+
+
+@pytest.mark.asyncio
+async def test_later_actual_composition_failure_supersedes_a_pending_proposal() -> None:
+    proposal = _successful_receipt("set_pipeline", {"success": True, "data": {"status": "APPROVAL_REQUIRED"}})
+    failed = _failed_set_pipeline_invocation()
+    result = await _finalize_result("Build me a pipeline.", tool_invocations=(proposal, failed))
+
+    assert "Cause: set_pipeline failed before mutation (ToolArgumentError: source.blob_id is required)." in result.message
+    assert result.runtime_preflight is not None and not result.runtime_preflight.is_valid
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("message", "expected"),
+    ("status", "payload", "detail"),
     [
-        (_SAME_REQUEST_PHRASINGS[0], PipelineMutationIntentDecision.EXPLICIT_MUTATION),
-        (_SAME_REQUEST_PHRASINGS[1], PipelineMutationIntentDecision.AMBIGUOUS),
-        (_SAME_REQUEST_PHRASINGS[2], PipelineMutationIntentDecision.AMBIGUOUS),
-        (_SAME_REQUEST_PHRASINGS[3], PipelineMutationIntentDecision.AMBIGUOUS),
-        (_SAME_REQUEST_PHRASINGS[4], PipelineMutationIntentDecision.EXPLICIT_MUTATION),
-        (_SAME_REQUEST_PHRASINGS[5], PipelineMutationIntentDecision.AMBIGUOUS),
+        (ComposerToolStatus.ARG_ERROR, None, "set_pipeline failed before mutation"),
+        (ComposerToolStatus.PLUGIN_CRASH, None, "set_pipeline crashed before a safe mutation completed"),
+        (ComposerToolStatus.SUCCESS, {"success": False, "error": "source is missing"}, "set_pipeline returned success=false"),
+        (ComposerToolStatus.SUCCESS, {"success": True, "data": {}}, "set_pipeline succeeded without mutating CompositionState"),
     ],
 )
-def test_routing_classification_is_unchanged(message: str, expected: PipelineMutationIntentDecision) -> None:
-    """Characterization pin on the intent grammar the routing call sites read.
+async def test_actual_failure_or_noop_survives_later_non_composition_receipts(
+    status: ComposerToolStatus, payload: dict[str, object] | None, detail: str
+) -> None:
+    if status is ComposerToolStatus.SUCCESS:
+        assert payload is not None
+        attempt = _successful_receipt("set_pipeline", payload)
+    else:
+        attempt = replace(
+            _failed_set_pipeline_invocation(),
+            status=status,
+            error_class="RuntimeError" if status is ComposerToolStatus.PLUGIN_CRASH else "ToolArgumentError",
+            error_category=ToolArgumentErrorCategory.MODEL_VALIDATION if status is ComposerToolStatus.ARG_ERROR else None,
+        )
+    trailing = (
+        replace(_failed_set_pipeline_invocation(), tool_call_id="discovery", tool_name="get_pipeline_state"),
+        replace(_failed_set_pipeline_invocation(), tool_call_id="advisor", tool_name="request_advisor_hint"),
+        _successful_receipt("create_blob", {"success": True, "data": {}}),
+    )
+    result = await _finalize_result("Explain CSV parsing without building.", tool_invocations=(attempt, *trailing))
 
-    This does NOT prove the disclosure change left routing alone — it
-    imports the classifier directly and never exercises the finalize
-    branch, so it passes under any edit confined to
-    ``no_tool_finalize``. That proof is structural: disclosure no longer
-    calls this function at all.
+    assert result.message.startswith(_MODEL_PROSE)
+    assert detail in result.message
+    assert result.raw_assistant_content == _MODEL_PROSE
+    assert result.runtime_preflight is not None and not result.runtime_preflight.is_valid
+    assert all(detail in check.detail for check in result.runtime_preflight.checks)
+    assert all(detail in blocker.detail for blocker in result.runtime_preflight.readiness.blockers)
 
-    Its value is forward-looking. Both routing consumers
-    (``service.py`` empty-state surface selection and the freeform
-    planner gate) decide on ``classify_pipeline_mutation_intent(message)
-    is EXPLICIT_MUTATION``. A future fixer loosening this grammar to
-    make AMBIGUOUS phrasings route to the planner will trip these
-    verdicts and be told, deliberately, that they are changing routing.
-    """
-    assert classify_pipeline_mutation_intent(message) is expected
+
+@pytest.mark.asyncio
+async def test_mutation_success_guard_still_suppresses_failure_augmentation() -> None:
+    result = await _finalize_result(
+        "Build me a pipeline.", tool_invocations=(_failed_set_pipeline_invocation(),), mutation_success_seen=True
+    )
+
+    assert result.message == _MODEL_PROSE
+    assert result.runtime_preflight is None

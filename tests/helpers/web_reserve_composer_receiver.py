@@ -588,11 +588,102 @@ def origin_inventory(units):
     return records, class_origin
 
 
-def composer_dispatch_calls(invoke):
-    """Select only the closed malformed-head/ordinary dispatch on one receiver."""
-    if not isinstance(invoke, ast.Try) or len(invoke.body) < 2:
+def composer_title_prelude(invoke):
+    """Bind the complete guarded title child, join and original-deadline check.
+
+    This finite source contract permits this one awaited interval before the
+    primary call. It does not qualify foreign mutation by a provider or guard
+    implementation; those remain common supplier/effect obligations.
+    """
+    if not isinstance(invoke, ast.Try) or not invoke.body:
         return None
-    annotation, branch = invoke.body[:2]
+    expected = ast.parse(
+        "if should_auto_title:\n"
+        "    title_custody = provider_owner.mint(ProviderInvocationFamily.TITLE)\n"
+        "    title_producer = required_work.reserve(\n"
+        "        RequiredWorkSource.TITLE_CONTINUATION_PRODUCER,\n"
+        "        transition_ordinal=title_custody.required_work.transition_ordinal,\n"
+        "        semantic_ordinal=title_custody.required_work.semantic_ordinal)\n"
+        "    async def run_owned_title() -> None:\n"
+        "        try:\n"
+        "            await maybe_auto_title_session(\n"
+        "                service=service, session_id=session.id, user_message=message_text,\n"
+        "                model=settings.composer_model, temperature=settings.composer_temperature,\n"
+        "                seed=settings.composer_seed, session_operation_context=lease.context,\n"
+        "                prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,\n"
+        "                prompt_guard_mode=settings.composer_prompt_guard_mode,\n"
+        "                api_base=settings.composer_endpoint_base_url,\n"
+        "                api_key=(settings.composer_endpoint_api_key.get_secret_value()\n"
+        "                    if settings.composer_endpoint_api_key is not None else None),\n"
+        "                provider_custody=title_custody)\n"
+        "        except BaseException as failure:\n"
+        "            title_producer.complete_owned(failure)\n"
+        "            raise\n"
+        "        title_producer.complete_owned()\n"
+        "    try:\n"
+        "        auto_title_task = lease.create_task(run_owned_title())\n"
+        "    except BaseException as failure:\n"
+        "        title_producer.complete_owned(failure)\n"
+        "        raise\n"
+        "    await _join_auto_title(auto_title_task, session_id=turn.session_id,\n"
+        "        operation_id=turn.operation_id, cancellation_observations=auto_title_cancellations,\n"
+        "        wait_until_complete=True)\n"
+        "    compose_budget_seconds = budget_anchor.remaining_seconds(monotonic_now=time.monotonic())\n"
+        "    if compose_budget_seconds <= 0:\n"
+        "        terminal_status = 'timed_out'\n"
+        "        raise ComposerTurnDeadlineExpired(session_id=turn.session_id,\n"
+        "            operation_id=turn.operation_id, remaining_seconds=compose_budget_seconds,\n"
+        "            budget_seconds_at_running=budget_anchor.remaining_at_running_seconds)\n"
+    ).body[0]
+    if ast.dump(invoke.body[0], include_attributes=False) != ast.dump(expected, include_attributes=False):
+        return None
+    if [ast.unparse(handler.type) if handler.type is not None else None for handler in invoke.handlers] != [
+        "asyncio.CancelledError",
+        "ComposerToolFailure",
+        "ComposerConvergenceError",
+        "OpenAIError",
+        "_BadRequestLLMError",
+        "ComposerPluginCrashError",
+        "ComposerRuntimePreflightError",
+        "PipelinePlannerError",
+        "ChargeableAdmissionRefused",
+        "PromptGuardRefused",
+        "ComposerAdmissionRefused",
+        "ComposerServiceError",
+    ]:
+        return None
+    expected_refusal = (
+        ast.parse(
+            "try:\n"
+            "    pass\n"
+            "except PromptGuardRefused as exc:\n"
+            "    llm_calls = exc.llm_calls\n"
+            "    observation.pending_exception_llm_calls = llm_calls\n"
+            "    observation.pending_exception_tool_invocations = exc.tool_invocations\n"
+            "    if llm_calls or exc.tool_invocations:\n"
+            "        await _required_audit(observation, _persist_turn_audit_cohort(\n"
+            "            service, session.id, exc.tool_invocations, llm_calls,\n"
+            "            tool_composition_state_id=compose_base_state_id,\n"
+            "            llm_composition_state_id=compose_base_state_id, plugin_crash_pending=True,\n"
+            "            session_operation_context=lease.context, required_audit=True,\n"
+            "            required_work=observation.required_work))\n"
+            "        observation.audit_cohort_durable = True\n"
+            "    raise HTTPException(status_code=exc.http_status,\n"
+            "        detail=exc.to_payload()) from exc\n"
+        )
+        .body[0]
+        .handlers[0]
+    )
+    if ast.dump(invoke.handlers[9], include_attributes=False) != ast.dump(expected_refusal, include_attributes=False):
+        return None
+    return invoke.body[0]
+
+
+def composer_dispatch_calls(invoke):
+    """Select closed primary branches after the exact guarded title interval."""
+    if composer_title_prelude(invoke) is None or len(invoke.body) < 3:
+        return None
+    annotation, branch = invoke.body[1:3]
     if (
         not isinstance(annotation, ast.AnnAssign)
         or ast.unparse(annotation) != "result: ComposerResult | GraphRecoveryResponse"
@@ -958,8 +1049,8 @@ def composer_receiver_local_contracts(units):
                 active_path = bi == 15 and ci == 21 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
                 # The exact import/deferred/history operations precede capture;
                 # only the five scalar/deadline statements follow it. Preserve
-                # all sixteen operation checks without admitting a suspended
-                # receiver interval.
+                # all sixteen operation checks; the separately closed title
+                # prelude is the only admitted suspended interval afterwards.
                 prefix = owner.body[4:bi] + owner.body[bi + 1 : ci]
                 active_path = active_path and receiver_transfer_prefix(prefix)
                 deferred = [n for n in prefix if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
@@ -977,7 +1068,7 @@ def composer_receiver_local_contracts(units):
                     "outer_try": (TURN, id(owner)),
                     "receiver_statement": (TURN, id(bindings[0])),
                     "inner_try": (TURN, id(invoke)),
-                    "await_statement": (TURN, id(invoke.body[1].orelse[1])),
+                    "await_statement": (TURN, id(invoke.body[2].orelse[1])),
                     "call": (TURN, id(calls[0])),
                     "recovery_call": (TURN, id(recovery_calls[0])),
                     "qualification": "ACTUAL_CLOSED_BRANCH_AWAIT_PATHS_SAME_RETAINED_BINDING",
@@ -1078,6 +1169,14 @@ def composer_receiver_local_contracts(units):
         (
             "elspeth.web.sessions.composer_turn._capture_retained_operation_read",
             "exact owned outcome wrapper, registered lease child and join/cancellation effects before provider dispatch",
+        ),
+        (
+            "elspeth.web.sessions.composer_turn._run_composer_turn.<locals>.run_owned_title",
+            "exact title custody, mounted guard, original deadline and completed join; guard/provider effects cannot mutate the retained receiver",
+        ),
+        (
+            "elspeth.web.composer.service.ComposerServiceImpl.composer_prompt_guard_mount",
+            "normal property lookup returns the deployment-owned guard mount; no receiver mutation or replacement through the title supplier",
         ),
         (
             "elspeth.web.sessions.routes._helpers._publish_progress",

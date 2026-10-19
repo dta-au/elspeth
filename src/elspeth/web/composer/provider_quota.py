@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from enum import IntEnum
 from functools import wraps
 from typing import TYPE_CHECKING, Any
@@ -25,6 +27,26 @@ from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkRole, Req
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+
+def _bind_attempt_call(call: ComposerLLMCall, attempt: ProviderAttempt, admitted_ns: int) -> ComposerLLMCall:
+    """Anchor monotonic call duration to the authoritative database admission.
+
+    The request's local wall clock is useful only before quota binding. Both
+    persisted endpoints must share the database clock domain, including when
+    a replica's wall clock is ahead of or behind UTC midnight.
+    """
+    if call.call_id == attempt.attempt_id and call.started_at == attempt.started_at:
+        # Caller-side classification can refine a complete audit. Preserve its
+        # original clock binding, including when required settlement is replayed.
+        return call
+    elapsed_ns = time.monotonic_ns() - admitted_ns
+    return replace(
+        call,
+        call_id=attempt.attempt_id,
+        started_at=attempt.started_at,
+        finished_at=attempt.started_at + timedelta(microseconds=elapsed_ns // 1_000),
+    )
 
 
 class ProviderInvocationFamily(IntEnum):
@@ -74,6 +96,7 @@ class ProviderCallCustody:
 
     __slots__ = (
         "__weakref__",
+        "_admitted_ns",
         "_admitting",
         "_context",
         "_required_work",
@@ -98,6 +121,7 @@ class ProviderCallCustody:
         self.call: ComposerLLMCall | None = None
         self._sdk_entered = False
         self._admitting = False
+        self._admitted_ns = 0
         self._undispatched_recurrence = 0
         self._settlements = 0
 
@@ -223,6 +247,7 @@ class ProviderCallCustody:
                 if type(attempt) is not ProviderAttempt:
                     raise AuditIntegrityError("Provider admission returned a foreign attempt")
                 self.attempt = attempt
+                self._admitted_ns = time.monotonic_ns()
                 self.call = None
                 self._sdk_entered = False
             except BaseException as failure:
@@ -248,7 +273,7 @@ class ProviderCallCustody:
             raise AuditIntegrityError("Provider audit is not an owned complete call")
         if self.attempt is None or not self._sdk_entered:
             raise AuditIntegrityError("Provider audit lacks actual dispatched admission")
-        bound = replace(call, call_id=self.attempt.attempt_id, started_at=self.attempt.started_at)
+        bound = _bind_attempt_call(call, self.attempt, self._admitted_ns)
         self.call = bound
         return bound
 
@@ -344,6 +369,7 @@ class _ProviderSpan:
     scope: _QuotaScope
     attempt: ProviderAttempt | None = None
     call: ComposerLLMCall | None = None
+    admitted_ns: int = 0
 
 
 _SCOPE: ContextVar[_QuotaScope | None] = ContextVar("composer_quota_scope", default=None)
@@ -464,6 +490,7 @@ async def admit_provider_attempt(*, model: str) -> None:
     )
     try:
         span.attempt = await asyncio.shield(admission)
+        span.admitted_ns = time.monotonic_ns()
     except asyncio.CancelledError as cancellation:
         attempt = await _join_after_cancellation(admission, cancellation)
         # The SDK has not been entered: only this narrow path can assert zero
@@ -517,7 +544,7 @@ def bind_provider_attempt(call: ComposerLLMCall) -> ComposerLLMCall:
     span = _CONTEXTVAR_GET(_SPAN)
     if span is None or span.attempt is None:
         return call
-    bound = replace(call, call_id=span.attempt.attempt_id, started_at=span.attempt.started_at)
+    bound = _bind_attempt_call(call, span.attempt, span.admitted_ns)
     span.call = bound
     return bound
 

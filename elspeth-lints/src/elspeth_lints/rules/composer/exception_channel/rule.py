@@ -25,6 +25,11 @@ module-local call graph and reports it only when some path lets it ESCAPE:
   ``TypeError`` is ADR-032 Tier-1 nominal typing of an owned type, never the
   LLM-argument channel, and per the ``ToolArgumentError`` contract a bug of
   that kind MUST crash.
+
+A direct negative nominal guard may also protect an internal contract in a
+normal function. Only the proven raise site is excluded: its subject must be
+a closed owned-carrier parameter or a direct result of a typed callable
+parameter. Ambiguous bindings and unsupported syntax retain the finding.
 """
 
 from __future__ import annotations
@@ -84,7 +89,8 @@ def find_exception_channel_findings(tree: ast.AST, file_path: str) -> list[Findi
     """Return CEC1 findings for one parsed module: bare raises that can escape it."""
     aliases = _exception_aliases(tree)
     functions = _module_functions(tree)
-    facts = {name: _collect_facts(node, aliases, functions) for name, node in functions.items()}
+    nominal_invariants = _nominal_invariant_raises(tree)
+    facts = {name: _collect_facts(node, aliases, functions, nominal_invariants) for name, node in functions.items()}
     callers: dict[str, list[tuple[str, frozenset[str]]]] = {}
     for caller, caller_facts in facts.items():
         for callee, guards in caller_facts.calls:
@@ -120,16 +126,261 @@ def _collect_facts(
     function: ast.FunctionDef | ast.AsyncFunctionDef,
     aliases: dict[str, str],
     functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    nominal_invariants: frozenset[ast.Raise],
 ) -> _FunctionFacts:
     facts = _FunctionFacts()
     for node, guards in _walk_own_scope(function, frozenset()):
         if isinstance(node, ast.Raise) and node.exc is not None:
             name = _raise_exception_name(node.exc, aliases)
-            if name in _BANNED:
+            if name in _BANNED and node not in nominal_invariants:
                 facts.raises.append(_RaiseSite(line=node.lineno, name=name, guards=guards))
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in functions:
             facts.calls.append((node.func.id, guards))
     return facts
+
+
+def _scope_bindings(scope: ast.AST) -> dict[str, list[ast.AST]]:
+    """Collect syntactic writes in one namespace, without entering child scopes."""
+    bindings: dict[str, list[ast.AST]] = {}
+
+    def bind(name: str, node: ast.AST) -> None:
+        bindings.setdefault(name, []).append(node)
+
+    def visit(node: ast.AST) -> None:
+        if node is not scope and isinstance(node, _SCOPE_BOUNDARIES):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bind(node.name, node)
+                for decorator in node.decorator_list:
+                    visit(decorator)
+            # Definition headers can write into the enclosing namespace. Child
+            # parameters and bodies still belong to their separate namespaces.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for argument in ast.iter_child_nodes(node.args):
+                    if isinstance(argument, ast.arg):
+                        if argument.annotation is not None:
+                            visit(argument.annotation)
+                    else:
+                        visit(argument)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+                    visit(node.returns)
+            elif isinstance(node, ast.ClassDef):
+                for expression in (*node.bases, *node.keywords):
+                    visit(expression)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bind(node.id, node)
+        elif isinstance(node, ast.arg):
+            bind(node.arg, node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bind(alias.asname or alias.name.split(".")[0], node)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                bind(name, node)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+            bind(node.name, node)
+        elif isinstance(node, ast.MatchMapping) and node.rest is not None:
+            bind(node.rest, node)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(scope)
+    return bindings
+
+
+def _exact_import(bindings: dict[str, list[ast.AST]], name: str, modules: frozenset[str], module: ast.Module) -> bool:
+    sites = bindings.get(name, [])
+    return (
+        len(sites) == 1
+        and isinstance(sites[0], ast.ImportFrom)
+        and sites[0] in module.body
+        and sites[0].level == 0
+        and sites[0].module in modules
+        and any(alias.name == name and alias.asname is None for alias in sites[0].names)
+    )
+
+
+def _owned_dataclasses(module: ast.Module, bindings: dict[str, list[ast.AST]]) -> frozenset[str]:
+    """Prove unique concrete frozen dataclasses, not arbitrary local class names."""
+    if not _exact_import(bindings, "dataclass", frozenset({"dataclasses"}), module):
+        return frozenset()
+    owned: set[str] = set()
+    for node in module.body:
+        if not isinstance(node, ast.ClassDef) or bindings[node.name] != [node] or node.bases or node.keywords or node.type_params:
+            continue
+        frozen = False
+        dataclass_seen = False
+        supported = True
+        for decorator in node.decorator_list:
+            if isinstance(decorator, ast.Name) and decorator.id == "final":
+                supported &= _exact_import(bindings, "final", frozenset({"typing"}), module)
+            elif (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "dataclass"
+                and not decorator.args
+                and not dataclass_seen
+            ):
+                dataclass_seen = True
+                keywords = {keyword.arg: keyword.value for keyword in decorator.keywords}
+                supported &= len(keywords) == len(decorator.keywords) and set(keywords) <= {"frozen", "slots"}
+                supported &= all(isinstance(value, ast.Constant) and type(value.value) is bool for value in keywords.values())
+                frozen_value = keywords.get("frozen")
+                frozen = isinstance(frozen_value, ast.Constant) and frozen_value.value is True
+            else:
+                supported = False
+        if supported and frozen:
+            owned.add(node.name)
+    return frozenset(owned)
+
+
+def _closed_owned_annotation(annotation: ast.expr | None, owned: frozenset[str]) -> frozenset[str]:
+    if isinstance(annotation, ast.Name) and annotation.id in owned:
+        return frozenset({annotation.id})
+    if isinstance(annotation, ast.Constant) and annotation.value is None:
+        return frozenset({"None"})
+    if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+        left = _closed_owned_annotation(annotation.left, owned)
+        right = _closed_owned_annotation(annotation.right, owned)
+        if left and right:
+            return left | right
+    return frozenset()
+
+
+def _negative_nominal_subject(test: ast.expr, owned: frozenset[str]) -> tuple[str, frozenset[str], bool] | None:
+    """Recognize only exact rejection forms, with an optional same-name None guard."""
+    optional_subject: str | None = None
+    if isinstance(test, ast.BoolOp):
+        if not isinstance(test.op, ast.And) or len(test.values) != 2:
+            return None
+        first, test = test.values
+        if not (
+            isinstance(first, ast.Compare)
+            and isinstance(first.left, ast.Name)
+            and len(first.ops) == len(first.comparators) == 1
+            and isinstance(first.ops[0], ast.IsNot)
+            and isinstance(first.comparators[0], ast.Constant)
+            and first.comparators[0].value is None
+        ):
+            return None
+        optional_subject = first.left.id
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == len(test.comparators) == 1
+        and isinstance(test.left, ast.Call)
+        and isinstance(test.left.func, ast.Name)
+        and test.left.func.id == "type"
+        and len(test.left.args) == 1
+        and not test.left.keywords
+        and isinstance(test.left.args[0], ast.Name)
+    ):
+        return None
+    subject = test.left.args[0].id
+    if optional_subject is not None and optional_subject != subject:
+        return None
+    comparator = test.comparators[0]
+    if isinstance(test.ops[0], ast.IsNot) and isinstance(comparator, ast.Name):
+        classes = frozenset({comparator.id})
+    elif isinstance(test.ops[0], ast.NotIn) and isinstance(comparator, ast.Tuple) and comparator.elts:
+        if not all(isinstance(element, ast.Name) for element in comparator.elts):
+            return None
+        classes = frozenset(element.id for element in comparator.elts if isinstance(element, ast.Name))
+        if len(classes) != len(comparator.elts):
+            return None
+    else:
+        return None
+    if not classes <= owned:
+        return None
+    return subject, classes, optional_subject is not None
+
+
+def _internal_subject_contract(
+    subject: str,
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    guard: ast.If,
+    bindings: dict[str, list[ast.AST]],
+    module_bindings: dict[str, list[ast.AST]],
+    owned: frozenset[str],
+    module: ast.Module,
+) -> frozenset[str]:
+    """A bounded declaration check, not arbitrary alias/taint or control-flow inference."""
+    if len(bindings.get(subject, [])) != 1:
+        return frozenset()
+    parameters = {arg.arg: arg for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)}
+    if subject in parameters:
+        return _closed_owned_annotation(parameters[subject].annotation, owned)
+    for statement in function.body[: function.body.index(guard)]:
+        if not (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == subject
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+        ):
+            continue
+        resolver = statement.value.func.id
+        if resolver not in parameters or len(bindings.get(resolver, [])) != 1:
+            return frozenset()
+        annotation = parameters[resolver].annotation
+        if not (
+            isinstance(annotation, ast.Subscript)
+            and isinstance(annotation.value, ast.Name)
+            and annotation.value.id == "Callable"
+            and _exact_import(module_bindings, "Callable", frozenset({"collections.abc", "typing"}), module)
+            and isinstance(annotation.slice, ast.Tuple)
+            and len(annotation.slice.elts) == 2
+            and (
+                isinstance(annotation.slice.elts[0], ast.List)
+                or (isinstance(annotation.slice.elts[0], ast.Constant) and annotation.slice.elts[0].value is Ellipsis)
+            )
+        ):
+            return frozenset()
+        return _closed_owned_annotation(annotation.slice.elts[1], owned)
+    return frozenset()
+
+
+def _nominal_invariant_raises(tree: ast.AST) -> frozenset[ast.Raise]:
+    """Exclude only proven direct internal TypeError sites; all uncertainty stays red."""
+    if not isinstance(tree, ast.Module):
+        return frozenset()
+    module_bindings = _scope_bindings(tree)
+    globals_written = {name for node in ast.walk(tree) if isinstance(node, ast.Global) for name in node.names}
+    protected = {"type", "TypeError", "dataclass", "final", "Callable"}
+    if "*" in module_bindings or {"type", "TypeError"} & module_bindings.keys() or protected & globals_written:
+        return frozenset()
+    owned = _owned_dataclasses(tree, module_bindings) - globals_written
+    proven: set[ast.Raise] = set()
+    for function in tree.body:
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if module_bindings[function.name] != [function] or function.decorator_list or function.type_params:
+            continue
+        bindings = _scope_bindings(function)
+        if (protected | owned) & bindings.keys():
+            continue
+        for statement in function.body:
+            if not isinstance(statement, ast.If) or len(statement.body) != 1 or statement.orelse:
+                continue
+            raised = statement.body[0]
+            if not (
+                isinstance(raised, ast.Raise)
+                and raised.cause is None
+                and isinstance(raised.exc, ast.Call)
+                and isinstance(raised.exc.func, ast.Name)
+                and raised.exc.func.id == "TypeError"
+            ):
+                continue
+            guard = _negative_nominal_subject(statement.test, owned)
+            if guard is None:
+                continue
+            subject, classes, optional = guard
+            contract = _internal_subject_contract(subject, function, statement, bindings, module_bindings, owned, tree)
+            if classes <= contract and (not optional or "None" in contract):
+                proven.add(raised)
+    return frozenset(proven)
 
 
 def _walk_own_scope(node: ast.AST, guards: frozenset[str]) -> Iterator[tuple[ast.AST, frozenset[str]]]:

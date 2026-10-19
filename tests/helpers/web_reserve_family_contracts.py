@@ -487,6 +487,7 @@ def _provider_contracts():
                 annotate(s("call"), ast.BinOp(left=n("ComposerLLMCall"), op=ast.BitOr(), right=c(None)), c(None)),
                 assign(s("_sdk_entered"), c(False)),
                 assign(s("_admitting"), c(False)),
+                assign(s("_admitted_ns"), c(0)),
                 assign(s("_undispatched_recurrence"), c(0)),
                 assign(s("_settlements"), c(0)),
             ],
@@ -1861,6 +1862,7 @@ def family_local_contracts(units):
                 "ProviderCallCustody",
                 (
                     "__weakref__",
+                    "_admitted_ns",
                     "_admitting",
                     "_context",
                     "_required_work",

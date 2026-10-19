@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
@@ -227,7 +227,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
     """
 
     @pytest.mark.asyncio
-    async def test_unknown_tool_name_audit_shape(self) -> None:
+    async def test_unknown_tool_name_audit_shape(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Drive the compose loop with a hallucinated tool name; pin the audit shape.
 
         Asserts:
@@ -244,47 +244,94 @@ class TestUnknownToolNameComposeLoopAuditShape:
            ``"Unknown tool: this_tool_does_not_exist"`` — the error message
            produced by ``_failure_result`` at ``tools.py:5731``.
         5. The compose loop continues after the unknown-tool-call turn,
-           then reconciles the still-empty build request through the provider
-           before returning its concrete clarification question.
+            then its concrete clarification question passes the real independent
+            END review without inventing a composition-mutation retry.
 
         Spec refs: §4.2.6 disposition table (added row: unknown tool name →
         SUCCESS-with-semantic-failure); §5.7.5 (audit status clarified).
         Pin: ``tests/unit/web/composer/test_compose_loop_unknown_tool_name.py``
         (this file). Closes plan-review M7 / W3.
         """
+        import httpx
         import litellm
 
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-        from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+        from elspeth.web.composer.prompt_guard import PromptGuardMount
+        from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+        from elspeth.web.prompt_guard_config import PromptGuardSettings
+        from tests.helpers.advisor_review import parse_advisor_publication_review
 
         catalog = _mock_catalog()
-        settings = _make_settings()
+        primary_guard = PromptGuardSettings(endpoint="https://primary-shield.example.test", subscription_key="offline-primary-shield")
+        advisor_guard = PromptGuardSettings(endpoint="https://advisor-shield.example.test", subscription_key="offline-advisor-shield")
+        settings = _make_settings(composer_prompt_guard=primary_guard, composer_advisor_prompt_guard=advisor_guard)
+        assert settings.composer_prompt_guard_mode == "required"
+        shield_requests = []
+
+        def shield_response(request):
+            assert request.url.host in {"primary-shield.example.test", "advisor-shield.example.test"}
+            payload = json.loads(request.content)
+            assert payload["userPrompt"] == "Build a pipeline"
+            shield_requests.append((request.url.host, payload))
+            return httpx.Response(
+                200,
+                json={
+                    "userPromptAnalysis": {"attackDetected": False},
+                    "documentsAnalysis": [{"attackDetected": False} for _document in payload["documents"]],
+                },
+            )
+
+        def mount(guard_settings):
+            return PromptGuardMount(AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(shield_response)))
+
+        monkeypatch.setattr("elspeth.web.composer.provider_gateway.build_prompt_guard_mount", mount)
+        monkeypatch.setattr("elspeth.web.composer.service.build_prompt_guard_mount", mount)
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
         # Turn 1: LLM emits a hallucinated (unknown) tool name.
-        unknown_tool_call = _make_llm_response(
-            tool_calls=[
+        unknown_tool_call = litellm.ModelResponse(
+            model=settings.composer_model,
+            choices=[
                 {
-                    "id": "call_unknown",
-                    "name": "this_tool_does_not_exist",
-                    "arguments": {},
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_unknown",
+                                "type": "function",
+                                "function": {"name": "this_tool_does_not_exist", "arguments": "{}"},
+                            }
+                        ],
+                    },
                 }
             ],
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
         )
-        # Turn 2: LLM self-corrects with a text response after receiving the
-        # failure payload as a role=tool message.
-        self_correction = _make_llm_response(content="I apologise — that tool does not exist. Let me try again.")
-        clarification = _make_llm_response(content="Which data source should the pipeline use?")
-        responses = iter((unknown_tool_call, self_correction, clarification))
+        # Turn 2: the LLM asks its concrete clarification after receiving the
+        # unknown-tool failure payload. Independent END reviews that exact reply.
+        clarification = litellm.ModelResponse(
+            model=settings.composer_model,
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "Which data source should the pipeline use?"},
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+        )
+        responses = iter((unknown_tool_call, clarification))
         provider_messages: list[list[dict[str, Any]]] = []
         reviews: list[dict[str, Any]] = []
 
         async def review_clarification(**kwargs: Any) -> Any:
             assert kwargs["model"] == settings.composer_advisor_model
             assert not reviews, "Only one independent END SDK response is supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["candidate_reply"] == "Which data source should the pipeline use?"
             assert review["current_request"] == "Build a pipeline"
@@ -314,38 +361,27 @@ class TestUnknownToolNameComposeLoopAuditShape:
                 usage={"prompt_tokens": 10, "completion_tokens": 20},
             )
 
-        async def scripted_provider(
-            messages: list[dict[str, Any]],
-            _tools: list[dict[str, Any]],
-            *,
-            provider_custody: object | None = None,
-            credential_state: object | None = None,
-        ) -> _AdmittedLLMCompletion:
+        async def scripted_provider(**kwargs):
+            if kwargs["model"] == settings.composer_advisor_model:
+                return await review_clarification(**kwargs)
+            assert kwargs["model"] == settings.composer_model
             # The service extends one shared message list between calls.
             # Snapshot each provider boundary before those later mutations.
-            provider_messages.append(deepcopy(messages))
-            assert len(provider_messages) <= 3, "Only the original three primary responses are supplied"
+            provider_messages.append(deepcopy(kwargs["messages"]))
+            assert len(provider_messages) <= 2, "Only the unknown tool and its concrete clarification are supplied"
             return next(responses)
 
-        with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch("litellm.acompletion", side_effect=review_clarification),
-        ):
-            mock_llm.side_effect = scripted_provider
+        with patch("litellm.acompletion", side_effect=scripted_provider) as sdk:
             result = await service.compose("Build a pipeline", [], state, session_id=session_id)
 
-        # Assert 5: one neutral reconciliation turn follows the failed
-        # dispatch; the provider supplies the final clarification.
-        assert mock_llm.await_count == 3
+        # Assert 5: the failed dispatch reaches the next provider call, whose
+        # concrete clarification is admitted by the real independent END review.
+        assert len(provider_messages) == 2
+        assert sdk.await_count == 3
+        assert {host for host, _payload in shield_requests} == {"primary-shield.example.test", "advisor-shield.example.test"}
+        assert result.repair_turns_used == 0
         assert len(reviews) == 1
         assert "Which data source should the pipeline use?" in result.message
-        reconciliation_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
-        assert not any(
-            message["content"].startswith(reconciliation_prefix) for message in provider_messages[1] if message["role"] == "user"
-        )
-        assert (
-            sum(message["content"].startswith(reconciliation_prefix) for message in provider_messages[2] if message["role"] == "user") == 1
-        )
         assert any(message["role"] == "tool" and message["tool_call_id"] == "call_unknown" for message in provider_messages[1])
 
         # Find the invocation for the hallucinated tool name.

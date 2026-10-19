@@ -217,6 +217,7 @@ async def test_mcp_input_budget_refuses_before_spawn(audit_target: tuple[str, st
 async def test_deadline_reaps_query_and_allows_next_query(
     audit_target: tuple[str, str | None], monkeypatch: pytest.MonkeyPatch, process_pids: list[int]
 ) -> None:
+    normal_query_seconds = query_worker.QUERY_SECONDS
     monkeypatch.setattr(query_worker, "QUERY_SECONDS", 2.5)
     monkeypatch.setattr(query_worker, "CLEANUP_SECONDS", 0.1)
     worker = RawQueryWorker(*audit_target)
@@ -225,6 +226,10 @@ async def test_deadline_reaps_query_and_allows_next_query(
         await worker.execute(HUNG_SQL, None, 1)
     assert time.monotonic() - started < 5
     _assert_reaped(process_pids)
+    # The shortened deadline controls the hung request. A fresh encrypted
+    # worker also pays process/import/key setup, so use its normal allowance
+    # when checking that reaping released admission for the healthy follow-up.
+    monkeypatch.setattr(query_worker, "QUERY_SECONDS", normal_query_seconds)
     assert await worker.execute("SELECT 1 AS value", None, 1)
 
 

@@ -262,9 +262,11 @@ def create_blobs_router() -> APIRouter:
                         "error_type": "storage_quota_exceeded",
                         "detail": str(exc),
                         "dimension": "storage",
-                        "cap": exc.cap,
-                        "ceiling": exc.ceiling,
-                        "usage": exc.usage,
+                        "scope": exc.scope,
+                        "limit": str(exc.limit_bytes),
+                        "cap": None if exc.cap is None else str(exc.cap),
+                        "ceiling": None if exc.ceiling is None else str(exc.ceiling),
+                        "usage": str(exc.usage),
                     },
                 ) from None
             except StorageAccountingUnavailableError as exc:
@@ -340,9 +342,11 @@ def create_blobs_router() -> APIRouter:
                         "error_type": "storage_quota_exceeded",
                         "detail": str(exc),
                         "dimension": "storage",
-                        "cap": exc.cap,
-                        "ceiling": exc.ceiling,
-                        "usage": exc.usage,
+                        "scope": exc.scope,
+                        "limit": str(exc.limit_bytes),
+                        "cap": None if exc.cap is None else str(exc.cap),
+                        "ceiling": None if exc.ceiling is None else str(exc.ceiling),
+                        "usage": str(exc.usage),
                     },
                 ) from None
             except StorageAccountingUnavailableError as exc:

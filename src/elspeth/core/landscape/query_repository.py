@@ -31,6 +31,7 @@ from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.landscape._database_ops import ReadOnlyDatabaseOps
 from elspeth.core.landscape.model_loaders import (
     CallLoader,
@@ -43,6 +44,7 @@ from elspeth.core.landscape.model_loaders import (
     TokenParentLoader,
 )
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping
 from elspeth.core.landscape.schema import (
     artifacts_table,
     calls_table,
@@ -54,6 +56,7 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     token_outcomes_table,
     token_parents_table,
+    token_work_items_table,
     tokens_table,
 )
 
@@ -64,6 +67,22 @@ class QueryRepository:
     """Read-only query repository for audit trail entities."""
 
     _QUERY_CHUNK_SIZE = 500
+
+    def get_sink_error_handoffs(self, *, run_id: str, token_id: str, row_id: str) -> tuple[TokenWorkItem, ...]:
+        """Read exact durable handoffs, including terminalized predecessor work.
+
+        The caller must verify sink/disposition/hash and unique ownership before
+        exposing a cause. A hash alone is never a lookup authority.
+        """
+        query = (
+            select(token_work_items_table)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.token_id == token_id)
+            .where(token_work_items_table.c.row_id == row_id)
+            .where(token_work_items_table.c.pending_sink_name.is_not(None))
+            .order_by(token_work_items_table.c.work_item_id)
+        )
+        return tuple(item_from_mapping(row._mapping) for row in self._ops.execute_fetchall(query))
 
     def __init__(
         self,

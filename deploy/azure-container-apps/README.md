@@ -5,7 +5,7 @@ in **evidence**, not in code: a Bicep bundle composed from Azure Verified
 Modules, the parameter sets for a production stack and for the disposable
 replica > 1 acceptance, the KQL evidence queries and the thin acceptance
 driver. Every platform literal here is measured in
-[the platform facts](../../docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
+[the platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md);
 the operator procedures are the three runbooks
 ([cold install](../../docs/runbooks/azure-container-apps-cold-install.md),
 [existing-service redeploy](../../docs/runbooks/azure-container-apps-existing-service-redeploy.md),
@@ -14,7 +14,7 @@ the operator procedures are the three runbooks
 > **Status.** Implemented; desktop acceptance closed `elspeth-5ec3befc1a` on
 > 2026-09-10 under the operator's desktop-analysis ruling. No live cloud
 > acceptance is claimed. A future operator run may produce the sanitized receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.7.json`; that receipt is
+> at `docs/operator/evidence/azure-container-apps/0.8.9.json`; that receipt is
 > no longer a tracker closure or documentation-promotion condition.
 
 The supported operating configuration is `Single` revision mode, `sticky`
@@ -27,7 +27,7 @@ resumed. Automatic run handoff is implemented for durable admission,
 permit-bound PREPARED initialization and eligible checkpoint resume, with
 fresh web and Landscape authority and explicit `recovery_required` exclusions.
 Integrated verification is recorded in the
-[ACA plan](../../docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification); see the
+[ACA plan](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-10-aca-pivot-and-replica-residuals.md#final-verification); see the
 [handoff contract](../../docs/reference/deployment-platforms.md#durable-run-handoff).
 
 Verification is limited to local PostgreSQL mechanism and integration evidence;

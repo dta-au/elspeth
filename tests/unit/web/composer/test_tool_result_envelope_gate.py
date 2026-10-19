@@ -3207,6 +3207,7 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     "pre_call_timeout_payload": ("status", "error", "budget_used", "budget_remaining"),
     "timeout_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
     "advisor_error_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
+    "refusal_payload": ("success", "outbound_call_made", "error_type", "detail", "audit_id"),
     "success_payload": (
         "status",
         "guidance",
@@ -3218,8 +3219,143 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
         "budget_used",
         "budget_remaining",
         "note",
+        "abandonment_decision",
+        "review_binding",
     ),
 }
+
+
+def _advisor_bindings(tree: ast.AST, name: str) -> list[ast.AST]:
+    """Fail closed on every supported lexical binding, including nested scopes.
+
+    This deliberately does not try to prove that an unrelated nested binding is
+    harmless. A star import or namespace declaration also requires review.
+    """
+    bindings: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if (
+            (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, ast.arg) and node.arg == name)
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name)
+        ):
+            bindings.append(node)
+        elif isinstance(node, ast.Import):
+            bindings.extend(node for alias in node.names if (alias.asname or alias.name.split(".")[0]) == name)
+        elif isinstance(node, ast.ImportFrom):
+            bindings.extend(node for alias in node.names if alias.name == "*" or (alias.asname or alias.name) == name)
+        elif (
+            (isinstance(node, ast.ExceptHandler) and node.name == name)
+            or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name)
+            or (isinstance(node, ast.MatchMapping) and node.rest == name)
+            or (isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names)
+            or (isinstance(node, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) and node.name == name)
+        ):
+            bindings.append(node)
+    return bindings
+
+
+def _advisor_no_dynamic_payload_replacement(tree: ast.AST) -> None:
+    """Bound this source reader to ordinary nominal method dispatch.
+
+    It is not a proof against arbitrary external monkeypatching. These source
+    inputs must not replace the method/namespace by an unowned dynamic route.
+    Attribute writes are refused even through an alias or an unrelated receiver.
+    Already-forbidden primitives remain forbidden when imported under an alias.
+    """
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "to_payload" and isinstance(node.ctx, (ast.Store, ast.Del))
+        for node in ast.walk(tree)
+    ), "guard refusal payload method was replaced through an attribute"
+    dynamic_names = frozenset({"setattr", "delattr", "exec", "eval", "globals", "locals", "vars"})
+    namespace_attributes = frozenset({"__dict__", "__class__", "__bases__", "__getattribute__", "__setattr__", "__delattr__"})
+    forbidden_members = dynamic_names | namespace_attributes
+    assert not any(
+        (isinstance(node, ast.Name) and node.id in dynamic_names)
+        or (isinstance(node, ast.Attribute) and node.attr in forbidden_members)
+        or (isinstance(node, ast.ImportFrom) and any(alias.name in forbidden_members for alias in node.names))
+        for node in ast.walk(tree)
+    ), "guard refusal payload uses an unsupported dynamic namespace route"
+
+
+def _advisor_guard_refusal_keys(expression: ast.AST, *, literal: ast.Dict, fn: ast.AST, tree: ast.Module) -> tuple[str, ...]:
+    """Follow only the absolute owned class and its unreplaced closed producer.
+
+    Closed lexical bindings and ordinary method dispatch are source premises,
+    not runtime authority or a claim that foreign payloads are interchangeable.
+    """
+    expected = ast.parse("first_party_exc.to_payload()", mode="eval").body
+    assert ast.dump(expression) == ast.dump(expected), "advisor unpack is not the owned guard refusal call"
+    imports = _advisor_bindings(tree, "PromptGuardRefused")
+    assert len(imports) == 1 and isinstance(imports[0], ast.ImportFrom), "guard refusal binding was replaced"
+    imported = imports[0]
+    assert imported in tree.body and imported.level == 0 and imported.module == "elspeth.web.composer.prompt_guard", (
+        "guard refusal import changed"
+    )
+    assert any(alias.name == "PromptGuardRefused" and alias.asname is None for alias in imported.names), "guard refusal alias changed"
+    assert not _advisor_bindings(tree, "isinstance"), "nominal guard builtin was replaced"
+    receiver_bindings = list(_assignments_to(fn, "first_party_exc"))
+    origin = ast.parse("advisor_outcome.original_exc", mode="eval").body
+    assert len(receiver_bindings) == 1 and ast.dump(receiver_bindings[0][0]) == ast.dump(origin), "guard refusal receiver origin changed"
+    bindings = _advisor_bindings(tree, "first_party_exc")
+    assert len(bindings) == 1 and isinstance(bindings[0], ast.Name) and isinstance(bindings[0].ctx, ast.Store), (
+        "guard refusal receiver was rebound"
+    )
+    guard = ast.dump(ast.parse("isinstance(first_party_exc, PromptGuardRefused)", mode="eval").body)
+    assert any(
+        isinstance(node, ast.If)
+        and ast.dump(node.test) == guard
+        and any(child is literal for statement in node.body for child in ast.walk(statement))
+        for node in ast.walk(fn)
+    ), "advisor unpack lacks the actual nominal guard refusal branch"
+    _advisor_no_dynamic_payload_replacement(tree)
+    owner_tree = _parse(COMPOSER / "prompt_guard.py")
+    owners = _advisor_bindings(owner_tree, "PromptGuardRefused")
+    assert len(owners) == 1 and isinstance(owners[0], ast.ClassDef) and owners[0] in owner_tree.body, (
+        "guard refusal producer class binding changed"
+    )
+    owner = owners[0]
+    assert not owner.decorator_list and not owner.keywords and not owner.type_params, "guard refusal producer class dispatch changed"
+    assert len(owner.bases) == 1 and ast.dump(owner.bases[0]) == ast.dump(ast.Name(id="Exception", ctx=ast.Load())), (
+        "guard refusal producer base changed"
+    )
+    assert not _advisor_bindings(owner_tree, "Exception"), "guard refusal producer base builtin was replaced"
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {"__getattribute__", "__getattr__"}
+        for node in ast.walk(owner)
+    ), "guard refusal producer customizes payload attribute dispatch"
+    producers = _advisor_bindings(owner_tree, "to_payload")
+    assert len(producers) == 1 and isinstance(producers[0], ast.FunctionDef) and producers[0] in owner.body, (
+        "guard refusal producer method binding changed"
+    )
+    producer = producers[0]
+    expected_args = ast.parse("def to_payload(self): pass").body[0]
+    assert isinstance(expected_args, ast.FunctionDef)
+    assert not producer.decorator_list and not producer.type_params and ast.dump(producer.args) == ast.dump(expected_args.args), (
+        "guard refusal producer method dispatch changed"
+    )
+    _advisor_no_dynamic_payload_replacement(owner_tree)
+    returns = [node for node in ast.walk(producer) if isinstance(node, ast.Return)]
+    assert returns, "guard refusal producer has no return"
+    shapes: list[tuple[str, ...]] = []
+    for returned in returns:
+        assert isinstance(returned.value, ast.Dict), "guard refusal producer return is not a closed literal"
+        shape: list[str] = []
+        for key in returned.value.keys:
+            assert key is not None, "guard refusal producer return contains an unknown unpack"
+            shape.append(_key_of(key, {}, "guard refusal producer"))
+        shapes.append(tuple(shape))
+    assert all(shape == shapes[0] for shape in shapes), "guard refusal producer return shapes differ"
+    return shapes[0]
+
+
+def _advisor_mapping_literal_keys(literal: ast.Dict, *, fn: ast.AST, tree: ast.Module, name: str) -> tuple[str, ...]:
+    keys: list[str] = []
+    for key, value in zip(literal.keys, literal.values, strict=True):
+        if key is None:
+            keys.extend(_advisor_guard_refusal_keys(value, literal=literal, fn=fn, tree=tree))
+        else:
+            keys.append(_key_of(key, {}, f"{_display(TOOL_BATCH)}:{name}"))
+    return tuple(keys)
 
 
 def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused() -> None:
@@ -3233,7 +3369,8 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
     compared to the recorded shapes, so a new advisor payload or a new key on
     one refuses here until it is adjudicated.
     """
-    fn = _function(_parse(TOOL_BATCH), "run_tool_batch")
+    tree = _parse(TOOL_BATCH)
+    fn = _function(tree, "run_tool_batch")
     responses = {
         kw.value.id
         for node in ast.walk(fn)
@@ -3246,7 +3383,7 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
         for rhs, _index, _annotation in _assignments_to(fn, name):
             if not isinstance(rhs, ast.Dict):
                 continue  # a ToolResult-carrying local; its envelope is censused
-            keys = tuple(_key_of(key, {}, f"{_display(TOOL_BATCH)}:{name}") for key in rhs.keys if key is not None)
+            keys = _advisor_mapping_literal_keys(rhs, fn=fn, tree=tree, name=name)
             assert mappings.setdefault(name, keys) == keys, f"{name}: two dict literals with different keys"
     assert mappings == _ADVISOR_ENVELOPE_PAYLOADS
     # The recorded keys are the literal's, so they are the whole payload only
@@ -3255,6 +3392,213 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
     # same escape would silently widen an envelope no census reaches at all.
     reshaped = {name: _dict_mutations(fn, _aliases_of(fn, name), frozenset()) for name in sorted(mappings)}
     assert not any(reshaped.values()), f"an advisor payload is re-shaped after its literal: {reshaped}"
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "foreign-receiver",
+        "foreign-method",
+        "foreign-import",
+        "rebound-class",
+        "rebound-receiver",
+        "missing-nominal-branch",
+        "unknown-unpack",
+        "nonliteral-return",
+        "extra-return-key",
+        "all-returns-extra-key",
+        "producer-unpack",
+        "alias-mutation",
+    ],
+)
+def test_advisor_mapping_guard_unpack_rejects_changed_producer_and_authority(monkeypatch: pytest.MonkeyPatch, defect: str) -> None:
+    test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+    original = _parse
+
+    def changed_source(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == TOOL_BATCH:
+            fn = _function(tree, "run_tool_batch")
+            payload = _initial_dict_assign(fn, "refusal_payload", "guard refusal probe")
+            expansion = next(value for key, value in zip(payload.keys, payload.values, strict=True) if key is None)
+            assert isinstance(expansion, ast.Call) and isinstance(expansion.func, ast.Attribute)
+            if defect == "foreign-receiver":
+                expansion.func.value = ast.Name(id="foreign", ctx=ast.Load())
+            elif defect == "foreign-method":
+                expansion.func.attr = "other_payload"
+            elif defect == "foreign-import":
+                imported = next(
+                    node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.composer.prompt_guard"
+                )
+                imported.module = "elspeth.web.composer.protocol"
+            elif defect == "rebound-class":
+                tree.body.extend(ast.parse("PromptGuardRefused = ForeignRefusal").body)
+            elif defect == "rebound-receiver":
+                fn.body.extend(ast.parse("first_party_exc = foreign").body)
+            elif defect == "missing-nominal-branch":
+                guarded = next(
+                    node
+                    for node in ast.walk(fn)
+                    if isinstance(node, ast.If) and ast.unparse(node.test) == "isinstance(first_party_exc, PromptGuardRefused)"
+                )
+                guarded.test = ast.Constant(value=True)
+            elif defect == "unknown-unpack":
+                payload.values[payload.keys.index(None)] = ast.Name(id="unowned_payload", ctx=ast.Load())
+            elif defect == "alias-mutation":
+                fn.body.extend(ast.parse("alias = refusal_payload\nalias['unexpected_refusal_key'] = True").body)
+        elif path == COMPOSER / "prompt_guard.py":
+            producer = _function(tree, "to_payload", in_class="PromptGuardRefused")
+            returns = [node for node in ast.walk(producer) if isinstance(node, ast.Return)]
+            assert returns and all(isinstance(node.value, ast.Dict) for node in returns)
+            if defect == "nonliteral-return":
+                returns[0].value = ast.Name(id="unowned_payload", ctx=ast.Load())
+            elif defect in ("extra-return-key", "all-returns-extra-key", "producer-unpack"):
+                selected = returns if defect == "all-returns-extra-key" else returns[:1]
+                for returned in selected:
+                    assert isinstance(returned.value, ast.Dict)
+                    returned.value.keys.append(None if defect == "producer-unpack" else ast.Constant(value="unexpected_refusal_key"))
+                    returned.value.values.append(
+                        ast.Name(id="unowned_payload", ctx=ast.Load()) if defect == "producer-unpack" else ast.Constant(value=True)
+                    )
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", changed_source)
+    with pytest.raises(AssertionError):
+        test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+
+
+@pytest.mark.parametrize(
+    ("location", "replacement"),
+    [
+        ("tool-module", "import json as PromptGuardRefused"),
+        ("relative-import", ""),
+        ("tool-module", "from foreign_refusals import *"),
+        ("tool-module", "match Exception:\n    case PromptGuardRefused: pass"),
+        ("tool-module", "match []:\n    case [*PromptGuardRefused]: pass"),
+        ("tool-module", "match {}:\n    case {**PromptGuardRefused}: pass"),
+        ("tool-module", "try: pass\nexcept Exception as PromptGuardRefused: pass"),
+        ("tool-module", "def closure(PromptGuardRefused): pass"),
+        ("tool-module", "isinstance = foreign"),
+        ("branch", "import json as first_party_exc"),
+        ("branch", "from foreign_refusals import refusal as first_party_exc"),
+        ("branch", "match Exception:\n    case first_party_exc: pass"),
+        ("branch", "match []:\n    case [*first_party_exc]: pass"),
+        ("branch", "match {}:\n    case {**first_party_exc}: pass"),
+        ("branch", "try: pass\nexcept Exception as first_party_exc: pass"),
+        ("branch", "def closure(first_party_exc): pass"),
+        ("branch", "def first_party_exc(): pass"),
+        ("branch", "del first_party_exc"),
+        ("branch", "(first_party_exc := foreign)"),
+        ("branch", "first_party_exc.to_payload = foreign"),
+        ("branch", "first_party_exc.__class__ = ForeignRefusal"),
+        ("branch", "setattr(first_party_exc, 'to_payload', foreign)"),
+        ("caller-global", "global first_party_exc"),
+        ("caller-type-parameter", ""),
+        ("producer-module", "PromptGuardRefused = ForeignRefusal"),
+        ("producer-module", "import json as PromptGuardRefused"),
+        ("producer-module", "match Exception:\n    case PromptGuardRefused: pass"),
+        ("producer-module", "try: pass\nexcept Exception as PromptGuardRefused: pass"),
+        ("producer-class", "to_payload = foreign"),
+        ("producer-class", "import json as to_payload"),
+        ("producer-class", "match Exception:\n    case to_payload: pass"),
+        ("producer-class", "try: pass\nexcept Exception as to_payload: pass"),
+        ("producer-module", "PromptGuardRefused.to_payload = foreign"),
+        ("producer-module", "PromptGuardRefused.__bases__ = (ForeignBase,)"),
+        ("producer-module", "alias = PromptGuardRefused\nalias.to_payload = foreign"),
+        ("producer-module", "setattr(PromptGuardRefused, 'to_payload', foreign)"),
+        ("producer-module", "setter = setattr\nsetter(PromptGuardRefused, 'to_payload', foreign)"),
+        ("producer-module", "import builtins\nsetter = builtins.setattr\nsetter(PromptGuardRefused, 'to_payload', foreign)"),
+        ("producer-module", "PromptGuardRefused.__dict__['to_payload'] = foreign"),
+        ("producer-module", "Exception = ForeignBase"),
+        ("producer-class", "def __getattribute__(self, name): return foreign"),
+        ("producer-decorator", ""),
+        ("producer-metaclass", ""),
+        ("producer-method-arguments", ""),
+        ("producer-type-parameter", ""),
+    ],
+)
+def test_advisor_mapping_guard_unpack_rejects_shadow_bindings(monkeypatch: pytest.MonkeyPatch, location: str, replacement: str) -> None:
+    """The real positive must pass before a source binding mutation refuses."""
+    test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+    original = _parse
+
+    def changed_source(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == TOOL_BATCH:
+            fn = _function(tree, "run_tool_batch")
+            if location == "tool-module":
+                tree.body.extend(ast.parse(replacement).body)
+            elif location == "relative-import":
+                imported = next(
+                    node for node in tree.body if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.composer.prompt_guard"
+                )
+                imported.level = 1
+            elif location == "branch":
+                guarded = next(
+                    node
+                    for node in ast.walk(fn)
+                    if isinstance(node, ast.If) and ast.unparse(node.test) == "isinstance(first_party_exc, PromptGuardRefused)"
+                )
+                guarded.body[0:0] = ast.parse(replacement).body
+            elif location == "caller-global":
+                fn.body[0:0] = ast.parse(replacement).body
+            elif location == "caller-type-parameter":
+                fn.type_params.append(ast.TypeVar(name="first_party_exc", bound=None))
+        elif path == COMPOSER / "prompt_guard.py":
+            owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "PromptGuardRefused")
+            producer = _function(tree, "to_payload", in_class="PromptGuardRefused")
+            if location == "producer-module":
+                tree.body.extend(ast.parse(replacement).body)
+            elif location == "producer-class":
+                owner.body.extend(ast.parse(replacement).body)
+            elif location == "producer-decorator":
+                producer.decorator_list.append(ast.Name(id="property", ctx=ast.Load()))
+            elif location == "producer-metaclass":
+                owner.keywords.append(ast.keyword(arg="metaclass", value=ast.Name(id="type", ctx=ast.Load())))
+            elif location == "producer-method-arguments":
+                producer.args.args.append(ast.arg(arg="foreign"))
+            elif location == "producer-type-parameter":
+                producer.type_params.append(ast.TypeVar(name="Foreign", bound=None))
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", changed_source)
+    with pytest.raises(AssertionError):
+        test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "from builtins import setattr as setter\nsetter(PromptGuardRefused, 'to_payload', foreign)",
+        "from builtins import setattr as setter\nmutate = setter\nmutate(PromptGuardRefused, 'to_payload', foreign)",
+        "setter = setattr\nsetter(PromptGuardRefused, 'to_payload', foreign)",
+        "import builtins\nsetter = builtins.setattr\nsetter(PromptGuardRefused, 'to_payload', foreign)",
+        "from builtins import vars as namespace\nnamespace()['PromptGuardRefused'] = ForeignRefusal",
+        "from builtins import vars as namespace\nlookup = namespace\nlookup()['PromptGuardRefused'] = ForeignRefusal",
+        "namespace = vars\nnamespace()['PromptGuardRefused'] = ForeignRefusal",
+        "import builtins\nnamespace = builtins.vars\nnamespace()['PromptGuardRefused'] = ForeignRefusal",
+        "from builtins import __dict__ as namespace\nnamespace['setattr'](PromptGuardRefused, 'to_payload', foreign)",
+        "from builtins import globals as namespace\nnamespace()['PromptGuardRefused'] = ForeignRefusal",
+        "from builtins import locals as namespace\nnamespace()['PromptGuardRefused'] = ForeignRefusal",
+        "from builtins import delattr as erase\nerase(PromptGuardRefused, 'to_payload')",
+        'from builtins import exec as execute\nexecute("PromptGuardRefused.to_payload = foreign")',
+        "from builtins import eval as evaluate\nevaluate(\"setattr(PromptGuardRefused, 'to_payload', foreign)\")",
+    ],
+)
+def test_advisor_mapping_guard_unpack_rejects_aliased_namespace_primitives(monkeypatch: pytest.MonkeyPatch, replacement: str) -> None:
+    """Imported and assignment aliases cannot conceal a forbidden primitive."""
+    test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+    original = _parse
+
+    def changed_source(path: Path) -> ast.Module:
+        tree = original(path)
+        if path == COMPOSER / "prompt_guard.py":
+            tree.body.extend(ast.parse(replacement).body)
+        return tree
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", changed_source)
+    with pytest.raises(AssertionError):
+        test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
 
 
 # The APPROVAL_REQUIRED proposal payload, in the order run_tool_batch authors it. ``success`` is

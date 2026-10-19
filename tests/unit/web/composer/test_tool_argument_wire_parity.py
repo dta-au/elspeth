@@ -56,6 +56,7 @@ _TYPE_DRIVEN_INPUTS: dict[str, dict[str, Any]] = {
     "patch_node_options": {"node_id": "node", "patch": {"nested": [None, False, 1]}},
     "patch_output_options": {"sink_name": "output", "patch": {"nested": [None, False, 1]}},
     "get_blob_content": {"blob_id": "blob"},
+    "read_attachment": {"blob_id": "blob", "expected_content_hash": "a" * 64},
     "request_interpretation_review": {"affected_node_id": "node", "kind": "vague_term", "user_term": "draft term"},
     "splice_transform": {
         "predecessor_id": "source",

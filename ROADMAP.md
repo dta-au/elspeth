@@ -11,7 +11,7 @@ is required before any onboarding commitment.
 **Planning basis:** a maintainer work-package assessment dated 3 September
 2026. The source assessment is not published in a repository clone; see
 [project control](docs/project-control/README.md) for access information.
-The [application API design](docs/specs/application-api-design.md) consolidates
+The archived [application API design](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/specs/application-api-design.md) consolidates
 the web split, API seam and compiler direction and supplements that assessment.
 Multi-replica implementation remediation also draws on the
 [0.8.0 changelog](CHANGELOG.md#080---2026-09-07-unified-lineage-and-production-hardening)
@@ -102,8 +102,8 @@ acceptance.
 | **C.3 Application API seam** | Harden one versioned contract for the retained reference UI, ARGO and an agentic chassis. Publish HTTP/stream schemas, errors, negotiation and semantic fixtures; make the producer and reference UI conform. Retain server validation, policy, custody, execution and audit authority. | Can proceed independently of C.2. Reference conformance is mandatory, not inferred from current behavior. Machine identity/delegation and harness effect controls precede relevant alternate-head admission. Independent releases/origins need additional evidence. |
 | **C.4 Composer wires remediation** | Connect each advertised tool setting to its validation model, handler behaviour, redaction rules, planner guidance and user-facing proposal. Repair settings that are dropped or hidden, misleading change summaries and inconsistent response fields. | Derive checks from source, prove they detect deliberate faults, and verify results with live Composer trials. Coordinate with A.2 and A.3. This package gives the Composer wires campaign its own scope within the broader C.1 hardening work; count that work here only. |
 
-The [application API design](docs/specs/application-api-design.md) is the single
-future-facing specification for C.2/C.3 and web ownership. The API defines the
+The archived [application API design](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/specs/application-api-design.md) records the proposed
+direction for C.2/C.3 and web ownership. The API defines the
 boundary; the current UI remains the reference implementation and must be
 migrated to it, rather than define it through incidental internal assumptions.
 Contract fixtures support offline clients; producer/consumer and lifecycle
@@ -128,10 +128,10 @@ plugin escape path. Neither requires portable compiled artifacts for first use.
 | **E.1 Plugin work** | Prioritise row-failure routing and plugin contracts, then join typing, document reassembly and provider behaviour. Consider knowledge-management and monitoring capabilities after scope review. Keep plugin documentation aligned with the registry. | Row-failure routing and reassembly share engine dependencies owned by B.1. Reassess search designs against existing retrieval support. Decide which plugins users may author through the web before committing to larger extensions. |
 | **E.2 Composer skillpacks** | Allow a plugin to ship long-form guidance describing the considerations that govern its correct use, and let the Composer planner retrieve that guidance when it judges it relevant. Advanced statistical and industrial plugins carry assumptions, sequencing requirements and failure semantics that a short hint cannot convey. Record which guidance was available and which was used. | Follows E.1's decision on which plugins users may author through the web. Guidance is explanatory only: it carries no pipeline structure, and the planner continues to author every pipeline. Decide the size limits and the first plugin to document before writing further guidance to fit them. |
 
-The [Composer skillpacks design](docs/specs/2026-09-10-plugin-skillpacks-design.md)
+The [Composer skillpacks design](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/specs/2026-09-10-plugin-skillpacks-design.md)
 describes guidance that ships with the plugin it documents and reaches the
 planner only when the planner asks for it, so its cost falls on the sessions
-that need it. The [user customisation design](docs/specs/2026-09-10-user-standing-preferences-design.md)
+that need it. The [user customisation design](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/specs/2026-09-10-user-standing-preferences-design.md)
 describes the standing-preferences part of A.5. Both record in the audit trail
 what was in force for a composition, and neither authors pipeline structure.
 Both apply uniformly to the first-run tutorial, which continues to use the

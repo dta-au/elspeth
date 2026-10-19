@@ -11,11 +11,13 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.protocol import CompositionStateRecord
 
@@ -37,8 +39,8 @@ def test_publication_provider_projection_preserves_digest_and_scrubs_text(monkey
     message = build_advisor_user_message(
         {"trigger": "test", "problem_summary": "test", "recent_errors": [], "attempted_actions": [], "publication_review": review}
     )
-    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 1
-    wire = message.split(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
+    assert message.count(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN) == message.count(_ADVISOR_UNTRUSTED_SUMMARY_END) == 3
+    wire = message.rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1].split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0]
     payload = json.loads(wire)
     assert payload["current_graph_hash"] == digest
     assert payload["saved_effects"]["initial_authored_state_hash"] == digest
@@ -261,6 +263,164 @@ def _evidence():
     )
 
 
+def _abandonment_snapshot(seed="policy"):
+    return PluginAvailabilitySnapshot.create(
+        policy_hash=stable_hash(seed),
+        principal_scope="user:test",
+        available=frozenset(),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint=stable_hash("generation"),
+    )
+
+
+def test_scoped_limitation_survives_supported_work_without_authorizing_a_request_stop():
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    decision = AdvisorAbandonmentResponse(
+        decision="CONTINUE_WITH_LIMITATION",
+        reason="Operation B is unavailable; contact private@example.test.",
+        next_action="Complete supported operation A.",
+        question=None,
+    )
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=snapshot)
+    evidence.invalidate_abandonment()
+    changed = _state("Supported A completed", version=2)
+    evidence.accept_checkpoint(
+        _witness(changed), expected_state=changed, tool_call_ids=("supported-action",), assistant_message_id=str(uuid4())
+    )
+    publication = evidence.review_candidate(candidate="A is saved; B remains unavailable.", request="Inspect", current_state=changed)
+    payload = json.loads(publication.payload_json)
+    provider = json.loads(publication.provider_payload_json)
+    limitations = payload["historical_authoring_limitations"]
+    assert len(limitations) == 1
+    assert limitations[0]["binding"] == review.binding
+    assert limitations[0]["reviewed_graph_hash"] == review.graph_hash
+    assert limitations[0]["reason"] == decision.reason
+    assert "private@example.test" not in provider["historical_authoring_limitations"][0]["reason"]
+    assert "authoring_stop_review" not in payload
+    assert not evidence.confirmed_abandonment(current_state=changed, plugin_snapshot=snapshot)
+    other = _evidence().review_candidate(candidate="A is saved; B remains unavailable.", request="Inspect", current_state=changed)
+    assert "historical_authoring_limitations" not in json.loads(other.payload_json)
+
+
+@pytest.mark.parametrize("decision_kind", ["CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"])
+def test_advisor_decision_changes_bind_publication_and_semantic_repair(decision_kind):
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    publications = []
+    for reason in ("Capability B is unavailable.", "Prerequisite C is unavailable."):
+        decision = AdvisorAbandonmentResponse(
+            decision=decision_kind,
+            reason=reason,
+            next_action="Complete supported A." if decision_kind == "CONTINUE_WITH_LIMITATION" else None,
+            question=None,
+        )
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+        publications.append(evidence.review_candidate(candidate="Here is the current result.", request="Inspect", current_state=_state()))
+    assert publications[0].binding != publications[1].binding
+    assert publications[0].semantic_repair_key != publications[1].semantic_repair_key
+    payload = json.loads(publications[1].payload_json)
+    if decision_kind == "CONTINUE_WITH_LIMITATION":
+        assert len(payload["historical_authoring_limitations"]) == 1
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=snapshot) is (decision_kind == "STOP_CONFIRMED")
+
+
+def test_repeated_limitation_review_is_not_semantic_repair_progress():
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    decision = AdvisorAbandonmentResponse(
+        decision="CONTINUE_WITH_LIMITATION", reason="B is unavailable.", next_action="Complete A.", question=None
+    )
+    publications = []
+    for messages in ((), ({"role": "user", "content": "The same capability evidence was reviewed again."},)):
+        review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=messages)
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=snapshot)
+        publications.append(
+            evidence.review_candidate(candidate="A remains to do; B is unavailable.", request="Inspect", current_state=_state())
+        )
+    assert publications[0].binding != publications[1].binding
+    assert publications[0].semantic_repair_key == publications[1].semantic_repair_key
+    assert len(json.loads(publications[1].payload_json)["historical_authoring_limitations"]) == 2
+
+
+@pytest.mark.parametrize("stale_part", ["graph", "policy", "request", "revision"])
+def test_abandonment_scopes_refuse_stale_or_different_request_evidence(stale_part):
+    evidence = _evidence()
+    snapshot = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=snapshot, messages=())
+    if stale_part == "request":
+        review = replace(review, request_scope=(SID, CONTEXT.fence.operation_id, "another-request"))
+    elif stale_part == "revision":
+        review = replace(review, registration_revision=review.registration_revision + 1)
+    decision = AdvisorAbandonmentResponse(
+        decision="STOP_CONFIRMED", reason="All remaining work requires the missing input.", next_action=None, question="Which input?"
+    )
+    with pytest.raises(AuditIntegrityError, match="stale evidence"):
+        evidence.accept_abandonment(
+            review,
+            decision,
+            current_state=_state("Different") if stale_part == "graph" else _state(),
+            plugin_snapshot=_abandonment_snapshot("other") if stale_part == "policy" else snapshot,
+        )
+
+
+@pytest.mark.parametrize("change", ["schema", "control"])
+def test_abandonment_refuses_transcript_only_changes_at_acceptance_and_current_use(change):
+    evidence = _evidence()
+    policy = _abandonment_snapshot()
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=policy, messages=())
+    decision = AdvisorAbandonmentResponse(decision="STOP_CONFIRMED", reason="A required input is absent.", next_action=None, question=None)
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    message = (
+        {"role": "tool", "tool_call_id": "new-schema", "content": json.dumps({"success": True, "data": {"field": "new_fact"}})}
+        if change == "schema"
+        else {"role": "user", "content": "A newly supplied backend fact"}
+    )
+    evidence.transcript.observe_messages((message,))
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    with pytest.raises(AuditIntegrityError, match="stale evidence"):
+        evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    publication = evidence.review_candidate(candidate="A truthful status", request="Inspect", current_state=_state())
+    assert "authoring_stop_review" not in json.loads(publication.payload_json)
+
+
+def test_only_exact_reviewed_advisor_feedback_can_extend_the_stop_boundary():
+    evidence = _evidence()
+    policy = _abandonment_snapshot()
+    request = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "reviewed-advisor", "type": "function", "function": {"name": "request_advisor_hint", "arguments": "{}"}}],
+    }
+    review = evidence.abandonment_context(request="Inspect", current_state=_state(), plugin_snapshot=policy, messages=(request,))
+    decision = AdvisorAbandonmentResponse(decision="STOP_CONFIRMED", reason="A required input is absent.", next_action=None, question=None)
+    evidence.accept_abandonment(review, decision, current_state=_state(), plugin_snapshot=policy)
+    feedback = {
+        "role": "tool",
+        "tool_call_id": "reviewed-advisor",
+        "content": json.dumps(
+            {
+                "status": "SUCCESS",
+                "review_binding": review.binding,
+                "abandonment_decision": "STOP_CONFIRMED",
+            }
+        ),
+    }
+    with pytest.raises(AuditIntegrityError):
+        evidence.seal_abandonment_feedback(review, feedback | {"tool_call_id": "another-call"})
+    evidence.seal_abandonment_feedback(review, feedback)
+    assert evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+    evidence.transcript.observe_messages(({"role": "user", "content": "Subsequent visible evidence"},))
+    assert not evidence.confirmed_abandonment(current_state=_state(), plugin_snapshot=policy)
+
+
 def _page(start, end, *, total=6, content_hash="a" * 64):
     result = ToolResult(
         success=True,
@@ -303,8 +463,8 @@ def _delivery_call(messages, *, call_id="physical", status=ComposerLLMCallStatus
         declared_tool_names=(),
         started_at=now,
         finished_at=now,
-        error_class=None,
-        error_message=None,
+        error_class=None if status is ComposerLLMCallStatus.SUCCESS else "ProviderError",
+        error_message=None if status is ComposerLLMCallStatus.SUCCESS else "Provider delivery failed",
         temperature=None,
         seed=None,
         call_id=call_id,
@@ -391,6 +551,102 @@ def test_blob_delivery_requires_matching_tools_and_actual_selected_envelope():
     messages = [{"role": "tool", "tool_call_id": "page", "content": content}]
     attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=[{"type": "function"}], scope="primary")
     assert not evidence.confirm_delivery(attempt, (_delivery_call(messages),))
+    assert evidence.inspection_coverage("primary") == ()
+
+
+@pytest.mark.parametrize("kind", ["blob", "source"])
+def test_reply_only_conversion_keeps_current_inspection_on_its_actual_physical_call(kind):
+    from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
+    from elspeth.web.composer.service import _reply_only_messages
+
+    evidence = _evidence()
+    admitted, content = _page(0, 6) if kind == "blob" else _source_inspection_receipt()
+    assert evidence.register_blob_page(tool_call_id="page", admitted=admitted, selected_content=content, producer_call_id="producer")
+    original = [{"role": "tool", "tool_call_id": "page", "content": content}]
+    quoted = _reply_only_messages(original, turn_evidence=evidence)
+    assert quoted == _reply_only_messages(original)
+    messages = detach_prompt_guard_evidence(quoted).messages
+    assert messages[0]["role"] == "user"
+    attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=None, scope="primary")
+    assert evidence.inspection_coverage("primary") == ()
+    assert not evidence.confirm_delivery(attempt, (_delivery_call(original),))
+    assert evidence.confirm_delivery(attempt, (_delivery_call(messages),))
+    payload = json.loads(evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state()).payload_json)
+    assert payload["inspection"]["current_candidate_call"] == ["physical", stable_hash(messages)]
+    if kind == "blob":
+        assert evidence.inspection_coverage("primary")[0].complete
+        assert payload["inspection"]["currently_available"][0]["ranges"] == [[0, 6]]
+    else:
+        assert evidence.inspection_coverage("primary") == ()
+        assert payload["inspection"]["source_metadata_currently_available"][0]["byte_range_inspected"] == [0, 8192]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "unminted-prefix",
+        "unregistered",
+        "wrong-original",
+        "changed",
+        "truncated",
+        "role",
+        "omitted",
+        "duplicate-quote",
+        "duplicate-direct",
+        "other-owner",
+        "conflict",
+        "stale",
+        "failed",
+        "cancelled",
+        "wrong-call",
+        "wrong-tools",
+        "old-call",
+    ],
+)
+def test_quoted_inspection_never_borrows_authorship_registration_or_delivery(change):
+    from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
+    from elspeth.web.composer.service import _reply_only_messages
+
+    evidence = _evidence()
+    admitted, content = _page(0, 6)
+    if change != "unregistered":
+        assert evidence.register_blob_page(tool_call_id="page", admitted=admitted, selected_content=content, producer_call_id="producer")
+    original = [{"role": "tool", "tool_call_id": "page", "content": content + " " if change == "wrong-original" else content}]
+    quoted = _reply_only_messages(original, turn_evidence=None if change == "unminted-prefix" else evidence)
+    messages = detach_prompt_guard_evidence(quoted).messages
+    if change == "changed":
+        messages[0]["content"] += " "
+    elif change == "truncated":
+        messages[0]["content"] = messages[0]["content"][:-1]
+    elif change == "role":
+        messages[0]["role"] = "assistant"
+    elif change == "omitted":
+        messages.clear()
+    elif change == "duplicate-quote":
+        messages.append(dict(messages[0]))
+    elif change == "duplicate-direct":
+        messages.extend(original)
+    elif change == "other-owner":
+        evidence = _evidence()
+        assert evidence.register_blob_page(tool_call_id="page", admitted=admitted, selected_content=content, producer_call_id="producer")
+    elif change == "conflict":
+        other, other_content = _page(0, 6, content_hash="b" * 64)
+        assert not evidence.register_blob_page(
+            tool_call_id="page", admitted=other, selected_content=other_content, producer_call_id="producer"
+        )
+    call = _delivery_call(messages)
+    attempt = evidence.prepare_delivery(messages, previous_calls=(call,) if change == "old-call" else (), tools=None, scope="primary")
+    if change == "stale":
+        evidence.prepare_delivery([], previous_calls=(), tools=None, scope="primary")
+    elif change == "failed":
+        call = replace(call, status=ComposerLLMCallStatus.API_ERROR, error_class="Synthetic", error_message="Synthetic")
+    elif change == "cancelled":
+        call = replace(call, status=ComposerLLMCallStatus.CANCELLED, error_class="Synthetic", error_message="Synthetic")
+    elif change == "wrong-call":
+        call = replace(call, messages_hash="wrong")
+    elif change == "wrong-tools":
+        call = replace(call, tools_spec_hash="wrong")
+    evidence.confirm_delivery(attempt, (call,))
     assert evidence.inspection_coverage("primary") == ()
 
 
@@ -496,3 +752,131 @@ def test_semantic_repair_key_retains_saved_revision_scope_and_current_content_id
         before.semantic_repair_key
         != other.review_candidate(candidate="Explanation", request="Inspect", current_state=_state()).semantic_repair_key
     )
+
+
+def _source_inspection_receipt(*, byte_size=234567):
+    from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_to_dict
+
+    facts = SourceInspectionFacts(
+        source_kind="csv",
+        redacted_identity={
+            "filename": "records.csv",
+            "mime_type": "text/csv",
+            "byte_size": str(byte_size),
+            "blob_id": "22222222-2222-4222-8222-222222222222",
+            "content_hash_prefix": "abcdef01",
+        },
+        byte_range_inspected=(0, 8192),
+        sample_row_count=15,
+        observed_headers=("record",),
+        inferred_types={"record": "str"},
+        url_candidates=(),
+        warnings=(),
+    )
+    result = ToolResult(
+        success=True,
+        updated_state=_state(),
+        validation=ValidationSummary(is_valid=True, errors=()),
+        affected_nodes=[],
+        data=facts_to_dict(facts),
+    )
+    admitted = admit_discovery_result("inspect_source", result)
+    return admitted, serialize_admitted_discovery_result(admitted)
+
+
+def test_source_metadata_requires_exact_successfully_delivered_receipt_without_content_coverage():
+    evidence = _evidence()
+    admitted, content = _source_inspection_receipt()
+    assert evidence.register_blob_page(
+        tool_call_id="source-facts", admitted=admitted, selected_content=content, producer_call_id="producer"
+    )
+    before = json.loads(evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state()).provider_payload_json)
+    assert "source_metadata_currently_available" not in before["inspection"]
+    messages = [{"role": "tool", "tool_call_id": "source-facts", "content": content}]
+    attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=None, scope="primary")
+    assert evidence.confirm_delivery(attempt, (_delivery_call(messages),))
+    review = evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state())
+    payload = json.loads(review.provider_payload_json)
+    expected = {
+        "blob_id": "22222222-2222-4222-8222-222222222222",
+        "total_size_bytes": 234567,
+        "byte_range_inspected": [0, 8192],
+        "source_kind": "csv",
+        "receipt_envelope_hash": stable_hash(content),
+    }
+    assert payload["inspection"]["source_metadata_currently_available"] == [expected]
+    assert payload["inspection"]["source_metadata_historically_delivered"] == [expected]
+    assert payload["inspection"]["currently_available"] == []
+    assert evidence.inspection_coverage("primary") == ()
+    assert "records.csv" not in review.provider_payload_json
+    assert "observed_headers" not in review.provider_payload_json
+    assert "sample_row_count" not in review.provider_payload_json
+    assert "content_hash_prefix" not in review.provider_payload_json
+    binding = review.binding
+    later = evidence.prepare_delivery([], previous_calls=(), tools=None, scope="primary")
+    assert evidence.confirm_delivery(later, (_delivery_call([], call_id="without-metadata"),))
+    later_review = evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state())
+    later_payload = json.loads(later_review.provider_payload_json)
+    assert later_payload["inspection"]["source_metadata_currently_available"] == []
+    assert later_payload["inspection"]["source_metadata_historically_delivered"] == [expected]
+    assert later_review.binding != binding
+    assert later_review.semantic_repair_key != review.semantic_repair_key
+
+
+@pytest.mark.parametrize("failure", ["changed-envelope", "failed-provider", "duplicate-selected-id", "conflicting-registration"])
+def test_source_metadata_cannot_be_claimed_without_confirmed_current_delivery(failure):
+    evidence = _evidence()
+    admitted, content = _source_inspection_receipt()
+    assert evidence.register_blob_page(
+        tool_call_id="source-facts", admitted=admitted, selected_content=content, producer_call_id="producer"
+    )
+    messages = [{"role": "tool", "tool_call_id": "source-facts", "content": content}]
+    if failure == "changed-envelope":
+        messages[0]["content"] += " "
+    elif failure == "duplicate-selected-id":
+        messages.append(dict(messages[0]))
+    attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=None, scope="primary")
+    if failure == "conflicting-registration":
+        changed, changed_content = _source_inspection_receipt(byte_size=234568)
+        assert not evidence.register_blob_page(
+            tool_call_id="source-facts", admitted=changed, selected_content=changed_content, producer_call_id="producer"
+        )
+    status = ComposerLLMCallStatus.API_ERROR if failure == "failed-provider" else ComposerLLMCallStatus.SUCCESS
+    evidence.confirm_delivery(attempt, (_delivery_call(messages, status=status),))
+    payload = json.loads(evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state()).provider_payload_json)
+    assert "source_metadata_currently_available" not in payload["inspection"]
+    assert "source_metadata_historically_delivered" not in payload["inspection"]
+
+
+def test_source_metadata_planner_scope_cannot_substitute_for_primary_current_evidence():
+    evidence = _evidence()
+    admitted, content = _source_inspection_receipt()
+    evidence.register_blob_page(tool_call_id="source-facts", admitted=admitted, selected_content=content, producer_call_id="producer")
+    messages = [{"role": "tool", "tool_call_id": "source-facts", "content": content}]
+    attempt = evidence.prepare_delivery(messages, previous_calls=(), tools=None, scope="planner")
+    assert evidence.confirm_delivery(attempt, (_delivery_call(messages),))
+    primary = json.loads(evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state()).provider_payload_json)
+    planner = json.loads(
+        evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state(), scope="planner").provider_payload_json
+    )
+    assert primary["inspection"]["source_metadata_currently_available"] == []
+    assert len(primary["inspection"]["source_metadata_historically_delivered"]) == 1
+    assert len(planner["inspection"]["source_metadata_currently_available"]) == 1
+    assert planner["inspection"]["currently_available"] == []
+
+
+def test_rereading_same_source_metadata_does_not_manufacture_semantic_repair_progress():
+    evidence = _evidence()
+    admitted, content = _source_inspection_receipt()
+    reviews = []
+    calls = []
+    for index in range(2):
+        tool_id = f"source-facts-{index}"
+        evidence.register_blob_page(tool_call_id=tool_id, admitted=admitted, selected_content=content, producer_call_id="producer")
+        messages = [{"role": "tool", "tool_call_id": tool_id, "content": content}]
+        attempt = evidence.prepare_delivery(messages, previous_calls=tuple(calls), tools=None, scope="primary")
+        calls.append(_delivery_call(messages, call_id=f"consumer-{index}"))
+        assert evidence.confirm_delivery(attempt, tuple(calls))
+        reviews.append(evidence.review_candidate(candidate="Inspect", request="Inspect", current_state=_state()))
+    assert reviews[0].binding != reviews[1].binding
+    assert reviews[0].semantic_repair_key == reviews[1].semantic_repair_key

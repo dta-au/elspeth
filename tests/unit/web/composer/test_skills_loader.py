@@ -42,9 +42,10 @@ class TestLoadSkill:
         assert "except backend-owned `llm_prompt_template` rows" in normalized
 
     def test_pipeline_composer_preflight_uses_authored_requirement_shape(self) -> None:
-        content = load_skill("pipeline_composer")
+        content = " ".join(load_skill("pipeline_composer").split())
 
-        assert "Every requirement object has `kind`, `user_term`, and `draft`, plus optional `display_title`." in content
+        assert "The AUTHORED shape contains `kind`, `user_term`, and `draft`, plus optional `display_title`." in content
+        assert "Never add `id`, `status`, or the server-bookkeeping fields" in content
         assert "Every requirement object has `id`, `kind`, `user_term`, `status`, and `draft`." not in content
 
     def test_missing_skill_raises_file_not_found(self) -> None:

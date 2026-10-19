@@ -551,6 +551,7 @@ def _collect_deployment_checks(
     include_aws_checks: bool,
 ) -> list[ContractCheck]:
     """Collect one external-PostgreSQL report with optional AWS-only checks."""
+    require_authenticated_tls = include_aws_checks or settings.deployment_target == "azure-container-apps"
     if include_aws_checks:
         checks = list(validate_aws_ecs_settings(settings))
     else:
@@ -581,7 +582,7 @@ def _collect_deployment_checks(
     )
     if not database_prerequisites_pass:
         blocked_detail = "schema inspection was not attempted because the deployment database prerequisites failed"
-        if include_aws_checks:
+        if require_authenticated_tls:
             blocked_tls_detail = "TLS was not verified because the deployment database prerequisites failed"
             checks.extend(
                 [
@@ -603,15 +604,15 @@ def _collect_deployment_checks(
         "session_schema",
         session_url,
         probe_session_schema,
-        require_authenticated_tls=include_aws_checks,
+        require_authenticated_tls=require_authenticated_tls,
     )
     landscape_state, landscape_result, landscape_tls_result = _inspect_database(
         "landscape_schema",
         landscape_url,
         probe_landscape_schema,
-        require_authenticated_tls=include_aws_checks,
+        require_authenticated_tls=require_authenticated_tls,
     )
-    if include_aws_checks:
+    if require_authenticated_tls:
         checks.extend([cast(ContractCheck, session_tls_result), cast(ContractCheck, landscape_tls_result)])
 
     if not init_schema:

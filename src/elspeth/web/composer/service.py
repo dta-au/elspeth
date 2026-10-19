@@ -21,7 +21,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
@@ -47,6 +47,14 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+    PromptGuardTrust,
+    detach_prompt_guard_evidence,
+    detach_prompt_guard_messages,
+)
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
@@ -73,6 +81,7 @@ from elspeth.web.composer.advisor_checkpoint import (
 from elspeth.web.composer.advisor_decision import (
     AdvisorGateDecision,
 )
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder, ComposerToolCancellation, ComposerToolFailure
@@ -92,6 +101,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     RuntimePreflightCache as _RuntimePreflightCache,
 )
+from elspeth.web.composer.discovery_response import admit_discovery_result, preview_source_proof_stop
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.interpretation_surfacing import InterpretationSurfacing
 from elspeth.web.composer.invariants import InvariantError
@@ -104,6 +114,8 @@ from elspeth.web.composer.progress import (
     emit_progress,
     model_call_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard_rendering import JsonPath, json_content_parts
 from elspeth.web.composer.prompts import (
     build_messages,
     build_run_diagnostics_messages,
@@ -153,6 +165,7 @@ from elspeth.web.composer.strict_transport import (
     resolve_composer_tool_contract,
 )
 from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, ProofUnavailable
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
@@ -248,8 +261,6 @@ async def _await_tool_turn_with_deferred_cancellation[T](
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _is_pending_interpretation_handoff = _no_tool_policy.is_pending_interpretation_handoff
 _state_is_structurally_empty = _no_tool_policy.state_is_structurally_empty
-_classify_pipeline_mutation_intent = _no_tool_policy.classify_pipeline_mutation_intent
-_PipelineMutationIntentDecision = _no_tool_policy.PipelineMutationIntentDecision
 
 
 _ADVISOR_ATTEMPTED_ACTIONS_MAX_ITEMS: Final[int] = 8
@@ -296,43 +307,56 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
     return handoff_seen
 
 
-def _tool_batch_ends_with_valid_current_preview(tool_outcomes: tuple[_ToolOutcome, ...], state: CompositionState) -> bool:
-    """Admit terminal verification from this batch's actual current-state result."""
-    if not tool_outcomes:
-        return False
-    for outcome in tool_outcomes:
-        if outcome.error_class is not None or not isinstance(outcome.response, ToolResult) or not outcome.response.success:
-            return False
-    terminal = tool_outcomes[-1]
-    response = terminal.response
-    return (
-        terminal.call.function.name == "preview_pipeline"
-        and isinstance(response, ToolResult)
-        and response.updated_state == state
-        and response.validation.is_valid
-        and response.runtime_preflight is not None
-        and response.runtime_preflight.is_valid
-    )
-
-
 _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
 
 
-def _reply_only_messages(llm_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: TurnEvidence | None = None) -> list[dict[str, Any]]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
-    return [
-        (
-            {
-                "role": "user" if historical_message["role"] == "tool" else historical_message["role"],
-                "content": _REPLY_ONLY_HISTORY_PREFIX
-                + json.dumps(historical_message, ensure_ascii=False, sort_keys=True)
-                + "\n[End historical tool evidence; this was not a current assistant reply.]",
-            }
-            if historical_message["role"] == "tool" or "tool_calls" in historical_message
-            else historical_message
+    # Native thinking belongs to the original complete assistant/tool exchange.
+    # The caller's explicit recovery-only palette still controls new actions.
+    native_evidence = detach_prompt_guard_evidence(llm_messages)
+    if any(entry is not None for entry in native_evidence.thinking_parts):
+        return list(llm_messages)
+    messages: list[dict[str, Any]] = []
+    for historical_message in llm_messages:
+        if historical_message["role"] != "tool" and "tool_calls" not in historical_message:
+            messages.append(historical_message)
+            continue
+        evidence = detach_prompt_guard_evidence([historical_message])
+        wire = evidence.messages[0]
+        string_parts: dict[JsonPath, tuple[PromptGuardContentPart, ...]] = {}
+        content_parts = evidence.content_parts[0]
+        if content_parts is not None:
+            string_parts[("content",)] = content_parts
+        elif evidence.trusted_message_indexes and "content" in wire and type(wire["content"]) is str:
+            string_parts[("content",)] = (PromptGuardContentPart(wire["content"], historical_message[PROMPT_GUARD_TRUST_KEY]),)
+        arguments = evidence.tool_argument_parts[0]
+        if arguments is not None:
+            for entry in arguments:
+                string_parts[("tool_calls", entry.tool_call_index, "function", "arguments")] = entry.parts
+        serialized = json.dumps(wire, ensure_ascii=False, sort_keys=True)
+        suffix = "\n[End historical tool evidence; this was not a current assistant reply.]"
+        quoted_parts = (
+            PromptGuardContentPart(_REPLY_ONLY_HISTORY_PREFIX),
+            *json_content_parts(serialized, ensure_ascii=False, sort_keys=True, string_parts=string_parts),
+            PromptGuardContentPart(suffix),
         )
-        for historical_message in llm_messages
-    ]
+        quoted_role = "user" if historical_message["role"] == "tool" else historical_message["role"]
+        quoted_content = _REPLY_ONLY_HISTORY_PREFIX + serialized + suffix
+        if (
+            turn_evidence is not None
+            and wire["role"] == "tool"
+            and type(wire.get("tool_call_id")) is str
+            and type(wire.get("content")) is str
+        ):
+            turn_evidence.register_quoted_inspection(
+                tool_call_id=wire["tool_call_id"],
+                original_content=wire["content"],
+                quoted_role=quoted_role,
+                quoted_content=quoted_content,
+            )
+        messages.append({"role": quoted_role, "content": quoted_content, PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts})
+    return messages
 
 
 def _reply_only_protocol_records(content: str) -> tuple[object, ...]:
@@ -522,22 +546,23 @@ _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE: Final[bool] = True
 
 
 class ComposerServiceImpl:
-    """LLM-driven pipeline composer with dual-counter budget and discovery caching.
+    """LLM-driven pipeline composer with bounded composition and discovery caching.
 
-    Runs a bounded tool-use loop with separate budgets for discovery
-    and composition turns. Cacheable discovery tool results are cached
+    The request deadline bounds the tool-use loop; composition turns have
+    an additional mutation limit. Discovery turns are counted for diagnostics
+    without an aggregate termination cap. Cacheable discovery results are cached
     per-compose-call in a local dict (not an instance field) to avoid
     concurrent-request races.
 
     Budget classification: a turn containing at least one mutation tool
     call charges the composition budget. A turn containing only discovery
-    tool calls charges the discovery budget. Cache hits do not charge
-    any budget.
+    tool calls increments the diagnostic discovery counter. Cache hits do not
+    increment either counter.
 
     Args:
         catalog: CatalogService for discovery tool delegation.
         settings: ComposerSettings with composer_max_composition_turns,
-            composer_max_discovery_turns, composer_timeout_seconds,
+            composer_timeout_seconds,
             composer_model, data_dir.
     """
 
@@ -635,8 +660,8 @@ class ComposerServiceImpl:
             endpoint_base_url=self._endpoint_base_url,
             endpoint_api_key=self._endpoint_api_key,
         )
+        self._advisor_prompt_guard_mount = build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         self._max_composition_turns = settings.composer_max_composition_turns
-        self._max_discovery_turns = settings.composer_max_discovery_turns
         self._timeout_seconds = settings.composer_timeout_seconds
         self._data_dir: str = str(settings.data_dir)
         self._session_engine = session_engine
@@ -673,6 +698,26 @@ class ComposerServiceImpl:
             advisor_endpoint_base_url=self._advisor_endpoint_base_url,
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
         )
+        missing_guard_roles = tuple(
+            role
+            for role, mount in (
+                ("composer", self._provider_gateway.prompt_guard_mount),
+                ("advisor", self._advisor_prompt_guard_mount),
+            )
+            if mount is None
+        )
+        if settings.composer_prompt_guard_mode == "required" and missing_guard_roles:
+            self._availability = replace(
+                self._availability,
+                available=False,
+                reason="Composer is unavailable: required prompt guard configuration is missing for "
+                + ", ".join(missing_guard_roles)
+                + ".",
+            )
+        elif settings.composer_prompt_guard_mode == "debug-when-unconfigured":
+            slog.warning(
+                "composer_prompt_guard_debug_mode", unconfigured_roles=missing_guard_roles, mode=settings.composer_prompt_guard_mode
+            )
         from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
@@ -721,6 +766,7 @@ class ComposerServiceImpl:
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
             sessions_service=sessions_service,
             chargeable_admission=self._chargeable_admission,
+            prompt_guard_mount=self._advisor_prompt_guard_mount,
         )
         self._composer_skill_name: str = PIPELINE_COMPOSER_SKILL_NAME
         self._interpretation_surfacing = InterpretationSurfacing(
@@ -762,12 +808,19 @@ class ComposerServiceImpl:
             advisor_endpoint_api_key=self._advisor_endpoint_api_key,
             advisor_checkpoint=self._advisor_checkpoint,
             completion=self._completion,
+            composer_prompt_guard_mount=self._provider_gateway.prompt_guard_mount,
+            advisor_prompt_guard_mount=self._advisor_prompt_guard_mount,
         )
         # F-5c gate: ensures the first ``compose()`` call upserts
         # the skill markdown into ``skill_markdown_history`` exactly once
         # per service instance. Subsequent compose() calls observe the
         # flag set and skip the upsert.
         self._skill_markdown_history_upserted: bool = False
+
+    @property
+    def composer_prompt_guard_mount(self) -> PromptGuardMount | None:
+        """Deployment-owned primary mount shared with the title producer."""
+        return self._provider_gateway.prompt_guard_mount
 
     @property
     def tool_contract_summary(self) -> ComposerToolContractSummary:
@@ -922,6 +975,7 @@ class ComposerServiceImpl:
         *,
         recorder: BufferingRecorder | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Return a plain-language explanation of a bounded run snapshot.
 
@@ -934,7 +988,7 @@ class ComposerServiceImpl:
             raise ComposerServiceError(self._availability.reason or "Composer is unavailable.")
 
         await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(""):
             try:
                 messages = build_run_diagnostics_messages(snapshot, data_dir=self._data_dir)
             except OSError as exc:
@@ -952,6 +1006,7 @@ class ComposerServiceImpl:
                     messages,
                     timeout=self._settings.composer_sync_timeout_seconds,
                     recorder=recorder,
+                    provider_custody=provider_custody,
                 )
             except TimeoutError:
                 raise ComposerServiceError("Run diagnostics explanation timed out") from None
@@ -998,20 +1053,21 @@ class ComposerServiceImpl:
         if remaining <= 0:
             raise ComposerServiceError("Recovery provider deadline expired; no graph was restored.")
         recorder = BufferingRecorder()
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
             completion = await self._provider_gateway._call_llm_with_audit(
                 [
                     {
                         "role": "system",
+                        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
                         "content": (
                             "The saved graph could not be decoded. Its payload is unavailable and must not be inferred. "
                             "Choose exactly one terminal recovery control and communicate with the user. "
                             "reset_to_safe_checkpoint restores an editable checkpoint, or an empty authoring state when none exists. "
                             "Saving or capturing the broken graph is not required. Do not claim recovery succeeded before the "
-                            "server receipt. Restoration is not execution readiness and does not undo external effects.\n"
-                            + recovery_context_message(recovery_context)
+                            "server receipt. Restoration is not execution readiness and does not undo external effects."
                         ),
                     },
+                    {"role": "user", "content": recovery_context_message(recovery_context)},
                     {"role": "user", "content": message},
                 ],
                 recovery_tool_definitions(self._planner_dialect),
@@ -1070,6 +1126,7 @@ class ComposerServiceImpl:
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop with dual-counter budget.
 
@@ -1125,7 +1182,7 @@ class ComposerServiceImpl:
         )
 
         await self._chargeable_admission.require(session_operation_context)
-        with composer_quota_scope(self._require_sessions_service(), session_operation_context):
+        with composer_quota_scope(self._require_sessions_service(), session_operation_context), prompt_guard_user_scope(message):
             turn_budget = self._timeout_seconds if budget_seconds is None else budget_seconds
             if turn_budget <= 0:
                 raise ComposerConvergenceError.capture(
@@ -1149,53 +1206,42 @@ class ComposerServiceImpl:
                 initial_state=state,
                 retained_operation_context=retained_operation_context,
                 actor_user_id=user_id,
+                advisor_history=advisor_history,
             )
+            if self._session_engine is not None and session_id is not None and session_operation_context is not None:
+                from elspeth.web.composer.tools.blobs import _locked_read_ready_blob
+
+                history_engine = self._session_engine
+
+                def read_advisor_history_blob(blob_id: str) -> tuple[Mapping[str, Any], bytes] | None:
+                    record, raw = _locked_read_ready_blob(
+                        history_engine,
+                        session_id,
+                        blob_id,
+                        data_dir=self._data_dir,
+                        session_operation_context=session_operation_context,
+                        session_operation_authority=self._require_sessions_service().session_operation_authority,
+                    )
+                    return (record, raw) if record is not None and raw is not None else None
+
+                turn_evidence.transcript.use_blob_reader(read_advisor_history_blob)
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
             try:
-                # Which authoring surface a request gets is decided here, and the
-                # two are not equivalent: the planner is one bounded call, the
-                # compose loop is an iterative turn/wall-clock budget. Nothing else
-                # records the choice — the `surface` dimension on Composer
-                # telemetry records the authoring choice, not a session mode —
-                # so without this line a session's posture cannot be reconstructed
-                # after the fact (elspeth-7da4e52344). Booleans and closed vocab
-                # only: the message itself is Tier-3 authored text and must not be
-                # logged.
+                # Route by graph/session prerequisites. The provider decides
+                # whether the request calls for authoring, explanation, or a
+                # question; user wording does not select its tool surface.
                 state_is_empty = _state_is_structurally_empty(state)
-                # Short-circuit on state_is_empty exactly as the original inline
-                # condition did, so the classifier stays a first-turn-only cost
-                # rather than running on every compose request. None in the log
-                # means "not evaluated" — a non-empty state already decided this.
-                intent_is_explicit_mutation = (
-                    _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
-                    if state_is_empty
-                    else None
-                )
                 planner_eligible = (
-                    state_is_empty
-                    and intent_is_explicit_mutation is True
-                    and self._sessions_service is not None
-                    and session_id is not None
-                    and user_message_id is not None
+                    state_is_empty and self._sessions_service is not None and session_id is not None and user_message_id is not None
                 )
                 slog.info(
                     "composer_authoring_surface_selected",
                     authoring_surface="planner" if planner_eligible else "compose_loop",
                     state_is_structurally_empty=state_is_empty,
-                    intent_is_explicit_mutation=intent_is_explicit_mutation,
                     session_id=session_id,
                 )
-                # Repeated rather than branching on ``planner_eligible`` so the
-                # ``is not None`` conjuncts narrow ``session_id`` /
-                # ``user_message_id`` for the call below. Every conjunct here is a
-                # cached boolean or a None check — the classifier does not re-run.
-                if (
-                    state_is_empty
-                    and intent_is_explicit_mutation is True
-                    and self._sessions_service is not None
-                    and session_id is not None
-                    and user_message_id is not None
-                ):
+                # Repeat prerequisites to narrow the optional IDs for the call.
+                if state_is_empty and self._sessions_service is not None and session_id is not None and user_message_id is not None:
                     planner_budget_seconds = deadline - asyncio.get_event_loop().time()
                     if planner_budget_seconds <= 0:
                         raise ComposerConvergenceError.capture(
@@ -1320,6 +1366,10 @@ class ComposerServiceImpl:
                     ),
                 )
                 raise
+            except PromptGuardRefused:
+                # Each invocation owner captured its exact undrained evidence.
+                # A completed planner drain must remain empty here.
+                raise
             except ComposerServiceError:
                 # Generic service-level failure (prompt prep, availability check,
                 # or a LiteLLMAPIError surfacing through the inner loop). The
@@ -1384,6 +1434,7 @@ class ComposerServiceImpl:
         selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
         delivery = None
         if turn_evidence is not None:
+            turn_evidence.transcript.observe_messages(messages)
             marked_messages, marked_tools = selected_messages, selected_tools
             if supports_anthropic_prompt_cache_markers(self._model):
                 marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
@@ -1391,7 +1442,10 @@ class ComposerServiceImpl:
                 )
                 marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
             delivery = turn_evidence.prepare_delivery(
-                marked_messages, previous_calls=recorder.llm_calls, tools=marked_tools or None, scope="primary"
+                detach_prompt_guard_messages(marked_messages)[0],
+                previous_calls=recorder.llm_calls,
+                tools=marked_tools or None,
+                scope="primary",
             )
         return selected_messages, selected_tools, delivery
 
@@ -1671,7 +1725,7 @@ class ComposerServiceImpl:
         completion_gates: CompletionGateFacts | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
     ) -> _ClassifyOutcome:
-        """Phase P5 of the compose loop — anti-anchor + budget classify.
+        """Phase P5 of the compose loop — anti-anchor + turn accounting.
 
         Three concerns share this phase because their decision flow is
         sequential:
@@ -1681,20 +1735,19 @@ class ComposerServiceImpl:
            role="user" hint into ``llm_messages`` so the model breaks
            the anchored retry. The hint is persisted via the normal
            ``chat_messages`` path.
-        2. **Cache-hit short-circuit.** When every tool call this turn
-           was a discovery cache hit, no budget charge: continue.
-        3. **Budget classify.** Charge the composition or discovery counter.
-           Composition exhaustion gets the B-4D-3 last-chance call; discovery
-           exhaustion gets a reply-only call only after a valid current preview.
+        2. **Cache-hit short-circuit.** A batch of discovery cache hits
+           does not increment either turn counter: continue.
+        3. **Turn accounting.** Charge composition or count discovery.
+           Composition exhaustion gets the B-4D-3 last-chance call. Discovery
+           continues within the request deadline without an aggregate turn cap.
            Advisor-only turns return to the driver without charging.
 
         Returns:
             ``_ClassifyOutcome(action="continue", composition_turns_delta=...,
             discovery_turns_delta=...)`` on the normal path, or
             ``_ClassifyOutcome(action="return", result=...)`` when the
-            B-4D-3 bonus call terminated the loop. Convergence raises
-            (composition / discovery budget exhausted without bonus
-            success) leave through the exception channel.
+            B-4D-3 bonus call terminated the loop. Composition exhaustion
+            without bonus success leaves through the exception channel.
         """
         state = dispatch.state
         last_runtime_preflight = dispatch.last_runtime_preflight
@@ -1706,10 +1759,71 @@ class ComposerServiceImpl:
         persisted_assistant_content = persist.persisted_assistant_content
         failed_turn = persist.failed_turn
 
+        # P4 and original failure/cancellation primacy have completed. Reuse
+        # the current preview's observation without resolving the blob again:
+        # newly ready bytes cannot reopen this request's primary dialogue.
+        source_stop: ProofUnavailable | MalformedSourceProofClaim | None = None
+        if dispatch.tool_outcomes:
+            terminal = dispatch.tool_outcomes[-1]
+            if (
+                terminal.call.function.name == "preview_pipeline"
+                and terminal.error_class is None
+                and isinstance(terminal.response, ToolResult)
+            ):
+                source_stop = preview_source_proof_stop(admit_discovery_result("preview_pipeline", terminal.response), state)
+        terminal_without_preview = _tool_batch_staged_terminal_interpretation_review_handoff(dispatch.tool_outcomes) or (
+            turn_has_mutation and composition_turns_used + 1 >= self._max_composition_turns
+        )
+        if source_stop is None and terminal_without_preview:
+            assessment = self._completion._assess_source_proof(
+                state, session_id=session_id, session_operation_context=session_operation_context
+            )
+            if type(assessment) in (ProofUnavailable, MalformedSourceProofClaim):
+                source_stop = cast(ProofUnavailable | MalformedSourceProofClaim, assessment)
+        if source_stop is not None:
+            stopped = await self._completion._terminate_source_proof(
+                proof=source_stop,
+                state=state,
+                assistant_message=dispatch.assistant_message,
+                turn_evidence=turn_evidence,
+                message=message,
+                session_id=session_id,
+                current_state_id=persist.current_state_id,
+                session_operation_context=session_operation_context,
+                user_id=user_id,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                runtime_preflight_cache=runtime_preflight_cache,
+                last_runtime_preflight=last_runtime_preflight,
+                recorder=recorder,
+                progress=progress,
+                repair_turns_used=repair_turns_used,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                plugin_snapshot=plugin_snapshot,
+                deadline=deadline,
+                composition_turns_used=composition_turns_used + int(turn_has_mutation),
+                discovery_turns_used=discovery_turns_used + int(turn_has_discovery and not turn_has_mutation),
+                failed_turn=failed_turn,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+            return _ClassifyOutcome(
+                action="return",
+                result=stopped.result,
+                composition_turns_delta=int(turn_has_mutation),
+                discovery_turns_delta=int(turn_has_discovery and not turn_has_mutation),
+                advisor_passes_delta=stopped.advisor_passes_delta,
+                publication_binding=stopped.publication_binding,
+            )
+
         # §7.7 anti-anchor hint: if the last 3 failed tool calls share the
-        # same (tool_name, arguments_hash), the model has stopped reading
-        # validator feedback. Inject a synthetic role="user" hint before
-        # the next LLM turn so the model breaks the anchor. consume_fire()
+        # same tool (with identical or different argument hashes), report
+        # those observations without inferring whether repairs progressed.
+        # Inject a synthetic role="user" hint before the next LLM turn. consume_fire()
         # clears the deque so the hint cannot re-fire on the same anchor.
         # Persisted first as a system-origin audit row whose closed envelope
         # records the provider role. Replay restores that exact role/content.
@@ -1733,21 +1847,21 @@ class ComposerServiceImpl:
                 )
             anti_anchor.consume_fire()
             llm_messages.append({"role": "user", "content": hint_text})
-            is_drift_hint = "drift without convergence" in hint_text
+            is_drift_hint = "with different arguments" in hint_text or "sending different arguments" in hint_text
             await emit_progress(
                 progress,
                 ComposerProgressEvent(
                     phase="using_tools",
-                    headline="ELSPETH detected a no-progress retry pattern.",
+                    headline="ELSPETH observed three failed calls to the same tool.",
                     evidence=(
                         (
-                            "The last 3 tool calls used different arguments but failed the same repair loop."
+                            "The last 3 tool calls used different arguments and failed; their error details and progress were not compared."
                             if is_drift_hint
                             else "The last 3 tool calls used identical arguments and failed."
                         ),
                         "A structural hint was injected to help the model converge.",
                     ),
-                    likely_next="The model will see the hint and try a different argument shape.",
+                    likely_next="The model will review the actual tool results before choosing its next step.",
                 ),
             )
 
@@ -1855,10 +1969,11 @@ class ComposerServiceImpl:
                 # blocks on providers such as Bedrock Converse. Preserve each
                 # complete historical record as attributed text instead; the
                 # planning/audit history stays unchanged and no tool is enabled.
-                reply_messages = _reply_only_messages(llm_messages)
+                reply_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
                 reply_messages.append(
                     {
                         "role": "system",
+                        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
                         "content": (
                             "Review cards have been staged. This is a reply stage: ordinary authoring tools are unavailable. "
                             "Terminal recovery controls remain available; use one alone if you need to park, reset or restore and talk. "
@@ -2055,46 +2170,20 @@ class ComposerServiceImpl:
                     publication_binding=advisor_gate.publication_binding if advisor_gate is not None else None,
                 )
 
-        # Classify turn and charge the appropriate budget.
+        # Classify turns. Discovery counts are diagnostic; the request deadline
+        # and cancellation bound acquisition rather than a fixed page/tool count.
         # The current turn has already been executed (tool results
         # are in the message history). We increment first, then
         # check whether the budget is now exhausted. If so, we give
-        # the LLM one last chance (B-4D-3) for composition. A final valid
-        # preview can also exhaust discovery after earlier repairs completed:
-        # let the model consume that verification in one reply-only call.
-        final_preview_at_discovery_cap = (
-            not turn_has_mutation
-            and turn_has_discovery
-            and discovery_turns_used + 1 >= self._max_discovery_turns
-            and _tool_batch_ends_with_valid_current_preview(dispatch.tool_outcomes, state)
-        )
-        if turn_has_mutation or final_preview_at_discovery_cap:
-            new_composition_turns_used = composition_turns_used + int(turn_has_mutation)
-            new_discovery_turns_used = discovery_turns_used + int(final_preview_at_discovery_cap)
-            exhausted_budget: Literal["composition", "discovery"] = "discovery" if final_preview_at_discovery_cap else "composition"
-            if new_composition_turns_used >= self._max_composition_turns or final_preview_at_discovery_cap:
+        # the LLM one last chance (B-4D-3) for composition.
+        if turn_has_mutation:
+            new_composition_turns_used = composition_turns_used + 1
+            if new_composition_turns_used >= self._max_composition_turns:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
-                final_messages = llm_messages
-                final_tools = tools
-                if final_preview_at_discovery_cap:
-                    final_messages = _reply_only_messages(llm_messages)
-                    final_messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "The current pipeline's final preview passed validation and the discovery budget is spent. "
-                                "This is a reply stage: only terminal park/reset/restore recovery controls remain available. "
-                                "Historical tool protocol records are evidence, not a format to repeat in your answer. "
-                                "Answer the user's request using the accepted tool results above. Report what was validated "
-                                "without claiming that the pipeline was executed. Remaining completion checks still apply."
-                            ),
-                        }
-                    )
-                    final_tools = recovery_tool_definitions(self._planner_dialect)
                 await emit_progress(progress, model_call_progress_event(message))
                 selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
-                    messages=final_messages, tools=final_tools, recorder=recorder, turn_evidence=turn_evidence
+                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
@@ -2106,7 +2195,7 @@ class ComposerServiceImpl:
                     # The relevant counter has already been charged; a timeout
                     # on the terminal call must report that same total.
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=new_discovery_turns_used,
+                    discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
                 )
@@ -2120,21 +2209,14 @@ class ComposerServiceImpl:
                     state=state,
                     initial_version=initial_version,
                     composition_turns_used=new_composition_turns_used,
-                    discovery_turns_used=new_discovery_turns_used,
+                    discovery_turns_used=discovery_turns_used,
                     recorder=recorder,
                     failed_turn=failed_turn,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                 )
                 assistant_message = completion.message
-                reply_only_echo = final_preview_at_discovery_cap and _reply_only_protocol_echo(
-                    assistant_message.content or "",
-                    history_has_tool_protocol=any(row["role"] == "tool" or "tool_calls" in row for row in llm_messages),
-                    user_message=message,
-                )
-                if reply_only_echo:
-                    assistant_message = _AdmittedAssistantMessage(content="")
                 if not completion.tool_batch.calls:
-                    if not reply_only_echo and final_delivery is not None:
+                    if final_delivery is not None:
                         turn_evidence.confirm_delivery(final_delivery, recorder.llm_calls)
                     try:
                         advisor_gate = await self._completion._evaluate_terminal_no_tool_advisor_gate(
@@ -2186,7 +2268,7 @@ class ComposerServiceImpl:
                             session_operation_context=session_operation_context,
                         )
                         raise ComposerConvergenceError.capture(
-                            max_turns=new_composition_turns_used + new_discovery_turns_used,
+                            max_turns=new_composition_turns_used + discovery_turns_used,
                             budget_exhausted="timeout",
                             state=state,
                             initial_version=initial_version,
@@ -2196,21 +2278,10 @@ class ComposerServiceImpl:
                         ) from None
                     if advisor_gate.action == "return":
                         advisor_result = advisor_gate.result
-                        if reply_only_echo:
-                            if advisor_result is None:
-                                raise AuditIntegrityError("Reply-only advisor return omitted its result")
-                            advisor_result = replace(
-                                advisor_result,
-                                message=_no_tool_policy.compose_review_reply_unavailable_message(advisor_result.message),
-                                raw_assistant_content=(
-                                    "" if advisor_result.raw_assistant_content is None else advisor_result.raw_assistant_content
-                                ),
-                            )
                         return _ClassifyOutcome(
                             action="return",
                             result=advisor_result,
-                            composition_turns_delta=int(turn_has_mutation),
-                            discovery_turns_delta=int(final_preview_at_discovery_cap),
+                            composition_turns_delta=1,
                             advisor_passes_delta=advisor_gate.advisor_passes_delta,
                         )
                     # B-4D-3 budget-exhaustion last-chance finalize is a SECOND
@@ -2244,12 +2315,6 @@ class ComposerServiceImpl:
                         plugin_snapshot=plugin_snapshot,
                         deadline=deadline,
                     )
-                    if reply_only_echo:
-                        result = replace(
-                            result,
-                            message=_no_tool_policy.compose_review_reply_unavailable_message(result.message),
-                            raw_assistant_content="" if result.raw_assistant_content is None else result.raw_assistant_content,
-                        )
                     result = _with_advisor_gate_decision(
                         result, completion_gates, advisor_gate.advisor_gate_decision, advisor_gate.graph_review_identity
                     )
@@ -2263,13 +2328,12 @@ class ComposerServiceImpl:
                     return _ClassifyOutcome(
                         action="return",
                         result=threaded,
-                        composition_turns_delta=int(turn_has_mutation),
-                        discovery_turns_delta=int(final_preview_at_discovery_cap),
+                        composition_turns_delta=1,
                         publication_binding=advisor_gate.publication_binding,
                     )
                 raise ComposerConvergenceError.capture(
-                    max_turns=new_composition_turns_used + new_discovery_turns_used,
-                    budget_exhausted=exhausted_budget,
+                    max_turns=new_composition_turns_used + discovery_turns_used,
+                    budget_exhausted="composition",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
@@ -2278,17 +2342,6 @@ class ComposerServiceImpl:
                 )
             return _ClassifyOutcome(action="continue", composition_turns_delta=1)
         if turn_has_discovery:
-            new_discovery_turns_used = discovery_turns_used + 1
-            if new_discovery_turns_used >= self._max_discovery_turns:
-                raise ComposerConvergenceError.capture(
-                    max_turns=composition_turns_used + new_discovery_turns_used,
-                    budget_exhausted="discovery",
-                    state=state,
-                    initial_version=initial_version,
-                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
-                    llm_calls=recorder.llm_calls,
-                    failed_turn=failed_turn,
-                )
             return _ClassifyOutcome(action="continue", discovery_turns_delta=1)
         # The only non-cache tool currently handled outside the
         # discovery/mutation registries is request_advisor_hint. It
@@ -2406,6 +2459,7 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
         )
+        turn_evidence.transcript.begin_messages(llm_messages)
         tools = composer_loop_tool_definitions(self._planner_dialect)
         if recovery_context is not None:
             llm_messages.append({"role": "system", "content": recovery_context_message(recovery_context)})
@@ -2751,6 +2805,7 @@ class ComposerServiceImpl:
                                 deadline=deadline,
                                 session_operation_context=session_operation_context,
                                 provider_owner=provider_owner,
+                                turn_evidence=turn_evidence,
                             )
                         except _AdvisorCheckpointComposeDeadlineExpired:
                             # The driver converts this signal after persistence
@@ -2767,6 +2822,7 @@ class ComposerServiceImpl:
                     # A successful tool remains successful; the separate
                     # checkpoint failure propagates after this mandatory work.
                     early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
+                    turn_evidence.transcript.observe_messages(llm_messages)
                     persist_result = await self._persist_turn_audit(
                         tool_outcomes=dispatch_result.tool_outcomes,
                         decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
@@ -2952,6 +3008,21 @@ class ComposerServiceImpl:
                         "Advisor failure audit row could not be persisted",
                         failed_turn=failed_turn,
                     ) from dispatch.advisor_failure
+                if isinstance(dispatch.advisor_failure, PromptGuardRefused):
+                    advisor_refusal = dispatch.advisor_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        advisor_refusal.__cause__ = dispatch.advisor_failure
+                        raise BaseExceptionGroup(
+                            "Manual advisor guard refusal and committed effect verification failure",
+                            (advisor_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise advisor_refusal from dispatch.advisor_failure
                 if persist.effect_verification_failure is not None:
                     prior_cause = dispatch.advisor_failure.__cause__
                     raise dispatch.advisor_failure from BaseExceptionGroup(
@@ -2977,6 +3048,24 @@ class ComposerServiceImpl:
                 raise deferred_cancel
 
             if early_checkpoint_failure is not None:
+                if isinstance(early_checkpoint_failure, PromptGuardRefused):
+                    early_refusal = early_checkpoint_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        # P4 already committed. Keep both originals visible to
+                        # the operation reducer so a policy refusal cannot mask
+                        # failure to verify the saved effect or replay its rows.
+                        early_refusal.__cause__ = early_checkpoint_failure
+                        raise BaseExceptionGroup(
+                            "EARLY guard refusal and committed effect verification failure",
+                            (early_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise early_refusal from early_checkpoint_failure
                 attach_llm_calls(early_checkpoint_failure, recorder)
                 if persist.effect_verification_failure is not None:
                     prior_cause = early_checkpoint_failure.__cause__
@@ -3231,6 +3320,13 @@ class ComposerServiceImpl:
                     provider_custody=provider_custody,
                     credential_state=state,
                 )
+            except PromptGuardRefused as exc:
+                raise exc.with_evidence(
+                    state=state,
+                    initial_version=state.version,
+                    llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
+                ) from exc
             except TimeoutError:
                 raise ComposerConvergenceError.capture(
                     max_turns=composition_turns_used + discovery_turns_used,

@@ -452,6 +452,7 @@ def _mock_pipeline_settings() -> _ModelCopyNamespace:
         transforms=[],
         aggregations=[],
         collectors=[],
+        collection_probes=[],
         sinks={"primary": SimpleNamespace(plugin="json", options={})},
         gates=[],
         coalesce=[],
@@ -4019,11 +4020,12 @@ class TestBlobRefPreValidation:
         state = _proof_gate_state(source_path=Path("/tmp/source.csv"), blob_id=None)
         source = state.sources["source"]
         state = replace(state, sources={"source": replace(source, options={**source.options, "blob_ref": blob_ref})})
+        lease = _execute_lease()
         with pytest.raises(MalformedBlobRefError, match=r"sources\.source\.blob_ref"):
             service._authoritative_proof_blob_resolver(
                 state,
-                session_id=uuid4(),
-                session_operation_context=_execute_lease().context,
+                session_id=UUID(lease.context.fence.session_id),
+                session_operation_context=lease.context,
             )
 
     @pytest.mark.asyncio
@@ -4193,13 +4195,14 @@ class TestBlobOwnership:
         executing_session_id = uuid4()
         other_session_id = uuid4()
         blob_ref = str(uuid4())
+        canonical_path = f"/tmp/data/blobs/{executing_session_id}/{blob_ref}_input.csv"
 
         blob_service = _blob_service_stub()
         # Blob belongs to other_session_id, not executing_session_id
         blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
             blob_ref=blob_ref,
             session_id=other_session_id,
-            storage_path=f"/tmp/data/blobs/{other_session_id}/{blob_ref}_input.csv",
+            storage_path=canonical_path,
         )
         cast(Any, service)._blob_service = blob_service
 
@@ -4207,16 +4210,22 @@ class TestBlobOwnership:
         state.source = {
             "plugin": "csv",
             "on_success": "continue",
-            "options": {"blob_ref": blob_ref},
+            "options": {"blob_ref": blob_ref, "path": canonical_path},
             "on_validation_failure": "quarantine",
         }
 
+        authority = execution_fixture.observe_authority(executing_session_id)
         with pytest.raises(PipelineValidationError) as exc_info:
-            await _execute(service, session_id=executing_session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
-        assert "session-owned path match" in str(exc_info.value)
+            await _execute(service, session_id=executing_session_id, authority=authority, execution_fixture=execution_fixture)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
+        assert [error.message for error in exc_info.value.errors] == [
+            "The claimed source content could not be verified as ready for this request."
+        ]
         assert str(other_session_id) not in str(exc_info.value)
 
+        blob_service.get_blob.assert_awaited_once_with(UUID(blob_ref), session_operation_context=authority.calls[0][1])
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+        blob_service.link_blob_to_run.assert_not_called()
         # Critical: create_run was never called (rejected before run creation)
         mock_session_service.create_run.assert_not_called()
 
@@ -4260,7 +4269,7 @@ class TestBlobOwnership:
 
         with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=executing_session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
 
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -4334,8 +4343,10 @@ class TestBlobSourcePathReadGuard:
 
         with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
-        assert "session-owned path match" in str(exc_info.value)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
+        assert [error.message for error in exc_info.value.errors] == [
+            "The claimed source content could not be verified as ready for this request."
+        ]
 
         # Critical: create_run was never called — the session is not
         # poisoned with a pending run that the operator must clean up.
@@ -4373,7 +4384,7 @@ class TestBlobSourcePathReadGuard:
 
         with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
 
     @pytest.mark.asyncio
     async def test_named_blob_source_path_mismatch_raises_structured_error(
@@ -4407,7 +4418,7 @@ class TestBlobSourcePathReadGuard:
 
         with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 
@@ -4451,7 +4462,7 @@ class TestBlobSourcePathReadGuard:
 
         with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id, execution_fixture=execution_fixture)
-        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert [error.error_code for error in exc_info.value.errors] == ["source_blob_unavailable"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 

@@ -1,5 +1,6 @@
 """Independent recovery protocol checks using scripted, offline providers."""
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
@@ -192,7 +194,24 @@ async def test_malformed_head_entry_never_hydrates_or_enters_authoring(tmp_path:
         messages, advertised = gateway.call_args.args
         assert {tool["function"]["name"] for tool in advertised} == _CONTROL_NAMES
         assert "must not be inferred" in messages[0]["content"]
-        assert state_id in messages[0]["content"]
+        assert len(messages) == 3
+        assert messages[0]["role"] == "system"
+        assert messages[0][PROMPT_GUARD_TRUST_KEY] is PromptGuardTrust.INSTRUCTION
+        assert state_id not in messages[0]["content"]
+        assert messages[1]["role"] == "user"
+        assert PROMPT_GUARD_TRUST_KEY not in messages[1]
+        assert json.loads(messages[1]["content"]) == {
+            "turn_start_state_id": state_id,
+            "turn_start_version": 4,
+            "current_state_id": state_id,
+            "current_version": 4,
+            "malformed_head": True,
+            "parked_graphs": [],
+        }
+        assert messages[2] == {
+            "role": "user",
+            "content": "This graph is broken. Go back to an editable checkpoint and ask me what to do.",
+        }
         hydrate.assert_not_called()
         compose.assert_not_called()
     finally:
@@ -308,7 +327,8 @@ async def test_final_preview_reply_still_accepts_recovery_without_advisor_reentr
         result = await service.compose("Preview the current pipeline and explain the result.", [], state, session_id=session_id)
     assert completion.call_count == 2 + int(after_advisor_repair)
     assert {tool["function"]["name"] for tool in advertised[0]} >= _CONTROL_NAMES
-    assert {tool["function"]["name"] for tool in advertised[-1]} == _CONTROL_NAMES
+    assert advertised[-1] == advertised[0]
+    assert {tool["function"]["name"] for tool in advertised[-1]} >= _CONTROL_NAMES | {"preview_pipeline", "set_metadata"}
     assert advisor.call_count == int(after_advisor_repair)
     requalify.assert_not_called()
     assert result.graph_recovery_intent is not None

@@ -119,6 +119,14 @@ class TestFreeformRejectionCarriesCataloguedRepairText:
 
         assert "explain_tool" not in payload["validation_guidance"]
 
+    def test_plugin_repair_preserves_explicit_requirements_and_reports_capability_gaps(self) -> None:
+        payload = _invalid_source_options_set_pipeline(_mock_catalog())
+        suggested_fix = payload["validation_guidance"]["codes"]["plugin_options_invalid"]["suggested_fix"]
+
+        assert "Preserve the user's explicit names, values, types and interface requirements" in suggested_fix
+        assert "capability gap" in suggested_fix
+        assert "Apply exactly what 'detail' names" not in suggested_fix
+
     def test_a_successful_mutation_carries_no_guidance_key(self) -> None:
         catalog = _mock_catalog()
         result = execute_tool(

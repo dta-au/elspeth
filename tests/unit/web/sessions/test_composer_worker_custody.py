@@ -19,6 +19,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import outstanding_admissions, run_sync_in_worker
+from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
@@ -37,7 +38,7 @@ from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_async_worker import _owned
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import COMPOSER_SHUTDOWN
-from tests.unit.web.composer.test_llm_sampling_config import _settings
+from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.sessions.test_composer_async_worker import _admit, _file_app, _worker
 from tests.unit.web.sessions.test_run_composer_turn import _running_job
 from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
@@ -105,9 +106,11 @@ async def test_authoritative_failure_outranks_explicit_stop(tmp_path, failure: B
 
 
 @pytest.mark.asyncio
-async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path) -> None:
+async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path, monkeypatch) -> None:
     from litellm import ModelResponse
 
+    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
+    user_prompt = "Answer this ordinary quota-custody request."
     original = RuntimeError("accounting child failed")
     quota_engine, quota_authority, quota_service = _quota_service(tmp_path)
     quota_session = quota_authority.create_session_with_initial_fence(
@@ -125,6 +128,7 @@ async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path) -> No
     physical_attempts: list[str] = []
 
     async def provider(**_kwargs: object) -> ModelResponse:
+        _assert_required_guard_admitted(quota_engine, context, guard_requests, role="composer", user_prompt=user_prompt)
         assert custody.attempt is not None
         physical_attempts.append(custody.attempt.attempt_id)
         return ModelResponse(
@@ -146,14 +150,17 @@ async def test_real_quota_settlement_fault_outranks_durable_stop(tmp_path) -> No
         assert required_work.complete
         raise original
 
-    gateway = ProviderGateway(model="test/model", settings=_settings(tmp_path), endpoint_base_url=None, endpoint_api_key=None)
+    gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
     try:
         with (
+            prompt_guard_user_scope(user_prompt),
             patch("litellm.acompletion", new=provider),
             patch.object(type(quota_service), "finish_provider_attempt", new=failed_finish),
             pytest.raises(ComposerOwnedSettlementFailure) as caught,
         ):
-            await gateway._call_llm_with_audit([], [], timeout=5, recorder=None, provider_custody=custody)
+            await gateway._call_llm_with_audit(
+                [{"role": "user", "content": user_prompt}], [], timeout=5, recorder=None, provider_custody=custody
+            )
         assert len(physical_attempts) == 1
         assert len(_ledger(quota_engine)) == 1
         coordinator.assert_completed()

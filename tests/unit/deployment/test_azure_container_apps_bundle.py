@@ -7,9 +7,9 @@ object that references a parameter as an ARM expression string
 the ARM functions the compiled templates use; an unsupported function is an
 error, which keeps the templates inside the evaluated subset.
 
-The Bicep CLI is pinned by version and SHA-256 in ``.github/workflows/ci.yaml``
-(the same pin the platform facts record). Like the Terraform package tests, a
-missing binary skips locally and fails loudly in CI.
+The Bicep CLI is pinned by version and SHA-256 in ``.github/workflows/ci.yaml``.
+Like the Terraform package tests, a missing binary skips locally and fails
+loudly in CI.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BUNDLE = REPO_ROOT / "deploy" / "azure-container-apps"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yaml"
 BUILD_PUSH_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-push.yaml"
-PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
 
 BICEP_VERSION = "0.46.1"
 BICEP_SHA256 = "3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9"
@@ -493,6 +492,9 @@ def _settings_for_compiled_container(module: dict[str, Any]) -> WebSettings:
             assert entry["secretRef"] in declared_secrets
             if name in {"ELSPETH_WEB__SESSION_DB_URL", "ELSPETH_WEB__LANDSCAPE_URL"}:
                 value = "postgresql://synthetic@database.example.test/" + entry["secretRef"].replace("-", "_")
+            elif name in {"ELSPETH_WEB__COMPOSER_PROMPT_GUARD", "ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD"}:
+                # These Key Vault secrets contain a settings object, not an opaque key.
+                value = json.dumps({"endpoint": "https://guard.example.test", "subscription_key": secrets.token_hex(32)})
             else:
                 value = secrets.token_hex(32)
         else:
@@ -587,11 +589,26 @@ def test_native_azure_application_example_loads_from_compiled_environment() -> N
     assert settings.composer_advisor_model.startswith("azure/")
     assert settings.composer_endpoint_base_url is None
     assert settings.composer_advisor_endpoint_base_url is None
+    assert settings.composer_prompt_guard_mode == "required"
+    assert settings.composer_prompt_guard is not None
+    assert settings.composer_advisor_prompt_guard is not None
+    assert settings.composer_prompt_guard.endpoint == "https://guard.example.test"
+    assert settings.composer_advisor_prompt_guard.endpoint == "https://guard.example.test"
     assert settings.default_llm_profile == "standard"
     assert settings.llm_profiles["standard"].provider == "azure"
     assert settings.llm_profiles["standard"].credential_ref == "AZURE_API_KEY"
     environment = _env_map(app["containers"][0]["env"])
     assert environment["AZURE_API_KEY"]["secretRef"] == "azure-api-key"
+
+
+@pytest.mark.parametrize("secret_name", ["composer-prompt-guard", "composer-advisor-prompt-guard"])
+def test_native_azure_application_example_rejects_undeclared_guard_secret(secret_name: str) -> None:
+    parameters = _workload_regression_parameters()
+    parameters.update(json.loads((BUNDLE / "application.example.json").read_text()))
+    parameters["extraSecrets"] = [entry for entry in parameters["extraSecrets"] if entry["name"] != secret_name]
+    app = _module_parameters_with_values("workload", parameters, "elspeth-web-app")
+    with pytest.raises(AssertionError):
+        _settings_for_compiled_container(app)
 
 
 def test_required_startup_parameters_are_explicit_and_positive() -> None:
@@ -640,9 +657,6 @@ def test_package_contains_only_the_supported_source_and_operator_inputs() -> Non
 
 def test_ci_pins_the_measured_bicep_release_in_both_lanes() -> None:
     workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-    facts = PLATFORM_FACTS.read_text(encoding="utf-8")
-    assert BICEP_SHA256 in facts
-    assert f"`{BICEP_VERSION}`" in facts
 
     pins = 0
     for job_name in ("test", "azure-container-apps-bicep"):

@@ -22,6 +22,7 @@ from elspeth.contracts.credential_material import (
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.bounded_json import (
     JSON_MAX_TOTAL_UTF8_BYTES,
+    PROVIDER_ARTIFACT_UNAVAILABLE,
     JsonBoundaryError,
     _validate_json_structure,
     bounded_json_loads,
@@ -101,13 +102,21 @@ def require_no_credential_material_in_llm_metadata(
     surface: str,
 ) -> None:
     """Reject every provider-authored text field that can be audited or replayed."""
+    unavailable_native = type(thinking_blocks) is str and thinking_blocks == PROVIDER_ARTIFACT_UNAVAILABLE
+    if thinking_blocks is not None and not unavailable_native:
+        from elspeth.web.composer.provider_thinking import native_thinking_blocks
+
+        # Native fields are scanned whole under their closed grammar; the
+        # generic control-value traversal limit is not a provider field cap.
+        # The value-free unavailable diagnostic can be audited, but the native
+        # replay parser still refuses it as an incomplete block list.
+        native_thinking_blocks(thinking_blocks)
     require_no_credential_material(
         {
             "content": content,
             "tool_calls": [{"id": call_id, "name": name} for call_id, name in tool_calls],
             "reasoning_content": reasoning_content,
             "reasoning_details": reasoning_details,
-            "thinking_blocks": thinking_blocks,
             "model_returned": model_returned,
             "provider_request_id": provider_request_id,
             "finish_reason": finish_reason,

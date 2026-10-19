@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -604,6 +605,147 @@ class TestSingleQuerySuccess:
         assert result.reason["reason"] == "required_input_field_blank"
         assert result.reason["field"] == "text"
         mock_provider.execute_query.assert_not_called()
+
+    @pytest.mark.parametrize("query_mode", ["single", "multi", "ordered"])
+    @pytest.mark.parametrize("text", ["", " \t\n"])
+    def test_explicit_blank_input_permission_preserves_the_declared_value(self, query_mode: str, text: str) -> None:
+        config = _make_config(allow_blank_input_fields=("text",) if query_mode == "ordered" else ["text"])
+        if query_mode != "single":
+            query = {"name": "review", "input_fields": {"text": "text"}, "template": "Review {{ row.text }}"}
+            config["queries"] = [query]
+            if query_mode == "ordered":
+                config["query_input_mode"] = "ordered"
+        else:
+            config["prompt_template"] = "Review {{ row.text }}"
+        transform, provider = _make_transform_with_mock_provider(config)
+        provider.execute_query.return_value = LLMQueryResult(
+            content="unavailable", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+        )
+        result = transform._process_row(_make_row({"text": text}), _make_ctx())
+        assert result.status == "success", result.reason
+        assert result.row is not None and result.row["text"] == text
+        provider.execute_query.assert_called_once()
+        assert provider.execute_query.call_args.args[0] == [ChatMessage(role="user", content=f"Review {text}")]
+
+    @pytest.mark.parametrize("value", [None, "blank-other"])
+    def test_blank_permission_does_not_admit_null_or_another_blank_field(self, value: str | None) -> None:
+        config = _make_config(
+            prompt_template="Review {{ row.text }} {{ row.other }}",
+            required_input_fields=["text", "other"],
+            allow_blank_input_fields=["text"],
+        )
+        transform, provider = _make_transform_with_mock_provider(config)
+        row = _make_row({"text": value if value is None else "", "other": "present" if value is None else " "})
+        result = transform._process_row(row, _make_ctx())
+        assert result.status == "error" and result.retryable is False
+        assert result.reason is not None and result.reason["reason"] == "required_input_field_blank"
+        assert result.reason["field"] == ("text" if value is None else "other")
+        provider.execute_query.assert_not_called()
+
+    @pytest.mark.parametrize("required", [None, [], ["text"]])
+    def test_blank_permission_cannot_expand_template_visibility(self, required: list[str] | None) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        with pytest.raises(PluginConfigError, match=r"allow_blank_input_fields.*required_input_fields"):
+            LLMTransform(_make_config(required_input_fields=required, allow_blank_input_fields=["other"]))
+
+    def test_blank_permission_keeps_field_presence_types_and_input_checks(self) -> None:
+        transform, provider = _make_transform_with_mock_provider(
+            _make_config(
+                schema={"mode": "flexible", "fields": ["text: str"]},
+                allow_blank_input_fields=["text"],
+                input_checks=[{"name": "other_requirement", "expression": "False"}],
+            )
+        )
+        for invalid in ({}, {"text": None}, {"text": 7}):
+            with pytest.raises(ValidationError):
+                transform.input_schema.model_validate(invalid, strict=True)
+        transform.input_schema.model_validate({"text": " "}, strict=True)
+        result = transform._process_row(_make_row({"text": " "}), _make_ctx())
+        assert result.status == "error"
+        assert result.reason == {"reason": "validation_failed", "operation": "other_requirement", "error_type": "input_check_false"}
+        provider.execute_query.assert_not_called()
+
+    def test_blank_permissions_are_snapshotted_before_processing(self) -> None:
+        transform, provider = _make_transform_with_mock_provider()
+        transform._config.allow_blank_input_fields.append("text")
+        result = transform._process_row(_make_row({"text": " "}), _make_ctx())
+        assert result.status == "error" and result.reason["reason"] == "required_input_field_blank"
+        provider.execute_query.assert_not_called()
+
+    @pytest.mark.parametrize("permission", ["text", {"text": True}, {"text"}, True, None, [1], [" text"], ["text", "text"]])
+    def test_blank_permissions_reject_ambiguous_names_or_containers(self, permission: object) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError, match="allow_blank_input_fields"):
+            _make_transform_with_mock_provider(_make_config(allow_blank_input_fields=permission))
+
+    @pytest.mark.parametrize("image_field", ["image_ref", "image_format"])
+    def test_blank_permission_cannot_be_granted_by_an_image_only_declaration(self, image_field: str) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError, match=r"allow_blank_input_fields.*required_input_fields"):
+            _make_transform_with_mock_provider(
+                _make_config(
+                    image_inputs=[{"field": "image_ref", "format_field": "image_format"}],
+                    allow_blank_input_fields=[image_field],
+                )
+            )
+
+    @pytest.mark.parametrize(("multi_query", "template_name"), [(False, "score"), (True, "score"), (True, "RecordedScore")])
+    def test_required_nullable_input_reaches_provider_as_null(self, template_name: str, multi_query: bool) -> None:
+        # Declarations use canonical names; explicit query bindings may expose
+        # a different template variable without changing the source field.
+        config = _make_config(prompt_template=f"Review {{{{ row.{template_name} }}}}", required_input_fields=["score"])
+        if multi_query:
+            config["queries"] = {"review": {"input_fields": {template_name: "score"}, "template": f"Review {{{{ row.{template_name} }}}}"}}
+        transform, provider = _make_transform_with_mock_provider(config)
+        provider.execute_query.return_value = LLMQueryResult(
+            content="reviewed", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+        )
+        row = PipelineRow(
+            {"score": None},
+            SchemaContract(
+                mode="FLEXIBLE",
+                fields=(make_field("score", float, original_name="RecordedScore", required=True, source="declared", nullable=True),),
+                locked=True,
+            ),
+        )
+        result = transform._process_row(row, _make_ctx())
+        assert result.status == "success", result.reason
+        assert result.row is not None and result.row["score"] is None
+        provider.execute_query.assert_called_once()
+        assert provider.execute_query.call_args.args[0] == [ChatMessage(role="user", content="Review None")]
+
+    def test_required_null_guard_resolves_original_name_through_the_owned_contract(self) -> None:
+        from elspeth.plugins.transforms.llm.transform import _blank_required_input_result
+
+        contract = SchemaContract(
+            mode="FLEXIBLE",
+            fields=(make_field("score", float, original_name="RecordedScore", required=True, nullable=True),),
+            locked=True,
+        )
+        row = PipelineRow({"score": None}, contract)
+        assert _blank_required_input_result(row, frozenset({"RecordedScore"})) is None
+        nonnullable = PipelineRow({"score": None}, replace(contract, fields=(replace(contract.fields[0], nullable=False),)))
+        refused = _blank_required_input_result(nonnullable, frozenset({"RecordedScore"}))
+        assert refused is not None and refused.status == "error"
+
+    @pytest.mark.parametrize("case", ["nonnullable", "extra", "nullable-blank"])
+    def test_null_permission_requires_an_owned_nullable_field(self, case: str) -> None:
+        transform, provider = _make_transform_with_mock_provider(
+            _make_config(prompt_template="Review {{ row.score }}", required_input_fields=["score"])
+        )
+        provider.execute_query.return_value = LLMQueryResult(
+            content="reviewed", usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+        )
+        fields = () if case == "extra" else (make_field("score", str, required=True, nullable=case == "nullable-blank"),)
+        row = PipelineRow({"score": " " if case == "nullable-blank" else None}, SchemaContract(mode="FLEXIBLE", fields=fields, locked=True))
+        result = transform._process_row(row, _make_ctx())
+        assert result.status == "error" and result.retryable is False
+        assert result.reason is not None and result.reason["reason"] == "required_input_field_blank"
+        provider.execute_query.assert_not_called()
 
     def test_contract_propagation_single_query(self) -> None:
         """Single-query mode uses propagate_contract on input contract."""

@@ -1,5 +1,5 @@
-"""Corpus integrity: every case has a prompt, a scenario, a valid payload, a stored topology
-that round-trips, an extractor cross-check that holds, and a prompt that stays on the compose loop."""
+"""Corpus integrity: every case has a prompt, a scenario, a valid payload,
+a stored topology that round-trips, and an extractor cross-check that holds."""
 
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ from evals.lib.battery_scenario import (
     validate_canonical_arguments,
 )
 from evals.lib.battery_topology import observed_option_values, topologies_match, topology_from_pipeline
-
-from elspeth.web.composer.no_tool_policy import PipelineMutationIntentDecision, classify_pipeline_mutation_intent
 
 REPO = Path(__file__).resolve().parents[4]
 EXPECTED_CASES = {
@@ -101,16 +99,6 @@ def test_scenario_is_sound(case: str) -> None:
     assert sc.floor.tool_bearing_calls in {sc.floor.pre_calibration, sc.floor.post_calibration}
     if sc.corpus_version >= 1:
         assert sc.floor.post_calibration is not None, f"{case}: frozen scenario has no post_calibration floor"
-
-
-@pytest.mark.parametrize("case", _present_cases())
-def test_prompt_stays_on_the_compose_loop(case: str) -> None:
-    """Decision 7 surface gate, run in CI: a classifier-grammar edit must fail here, not silently re-route."""
-    _, cases = load_corpus()
-    sc = load_scenario(SCENARIOS_DIR / case / "scenario.json")
-    decision = classify_pipeline_mutation_intent(cases[case].prompt)
-    assert decision is not PipelineMutationIntentDecision.EXPLICIT_MUTATION, f"{case}: prompt would route to the planner"
-    assert decision.name == sc.classifier_decision, f"{case}: recorded classifier_decision {sc.classifier_decision} != {decision.name}"
 
 
 def test_corpus_version_matches_every_scenario() -> None:

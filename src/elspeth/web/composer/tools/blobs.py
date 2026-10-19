@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -68,11 +68,15 @@ from elspeth.web.blobs.service import (
     content_hash,
     sanitize_filename,
 )
+from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
+    READ_ATTACHMENT_MAX_UTF8_BYTES,
+    BlobReadSuggestion,
     CreateBlobArgumentsModel,
     GetBlobContentArgumentsModel,
     GetBlobContentDataModel,
+    ReadAttachmentArgumentsModel,
     UpdateBlobArgumentsModel,
 )
 from elspeth.web.composer.response_contracts import SelectedResponseContract
@@ -332,7 +336,7 @@ def _encode_blob_metadata_response(value: _BlobMetadataResponse) -> JsonValue:
 
 
 def _encode_blob_content_response(value: _BlobContentResponse) -> JsonValue:
-    return {
+    payload: dict[str, JsonValue] = {
         "blob_id": value.blob_id,
         "filename": value.filename,
         "mime_type": value.mime_type,
@@ -347,6 +351,9 @@ def _encode_blob_content_response(value: _BlobContentResponse) -> JsonValue:
         "end_char": value.end_char,
         "next_offset_chars": value.next_offset_chars,
     }
+    if value.read_attachment_suggestion is not None:
+        payload["read_attachment_suggestion"] = value.read_attachment_suggestion
+    return payload
 
 
 def _encode_blob_inventory_response(value: tuple[_BlobInventoryItem, ...]) -> JsonValue:
@@ -405,8 +412,8 @@ class BlobCreatePayload(TypedDict):
     originated_in: Literal["this_tool_call"]
 
 
-class BlobContentPayload(TypedDict):
-    """Closed dict shape for the get_blob_content tool's success result data.
+class AttachmentContentPayload(TypedDict):
+    """Closed common content/provenance fields shared by both text readers.
 
     ``created_by`` and ``creation_modality`` are the read-back half of the
     self-authorship marker on :class:`BlobCreatePayload` (elspeth-47eba5cced).
@@ -454,6 +461,12 @@ class BlobContentPayload(TypedDict):
     start_char: int
     end_char: int
     next_offset_chars: int | None
+
+
+class BlobContentPayload(AttachmentContentPayload):
+    """The paged reader alone can suggest switching to complete delivery."""
+
+    read_attachment_suggestion: NotRequired[BlobReadSuggestion]
 
 
 def _blob_row_to_tool_dict(row: Any) -> BlobToolRecord:
@@ -1951,6 +1964,9 @@ def _locked_read_ready_blob(
         return None, None
 
 
+_BLOB_CONTENT_PAGE_MAX_UTF8_BYTES = 4_096
+
+
 def _execute_get_blob_content(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -2045,7 +2061,7 @@ def _execute_get_blob_content(
     if start_char > total_chars:
         return _failure_result(state, "Blob content offset exceeds its decoded character length.")
 
-    payload: BlobContentPayload = {
+    payload: AttachmentContentPayload = {
         "blob_id": blob_id,
         "filename": blob["filename"],
         "mime_type": blob["mime_type"],
@@ -2074,30 +2090,41 @@ def _execute_get_blob_content(
     result = _discovery_result(state, payload)
 
     def page(end_char: int) -> tuple[ToolResult, int]:
-        page_payload: BlobContentPayload = {
+        page_payload: AttachmentContentPayload = {
             **payload,
             "content": content[start_char:end_char],
             "end_char": end_char,
             "truncated": end_char < total_chars,
             "next_offset_chars": end_char if end_char < total_chars else None,
         }
-        candidate = replace(result, data=page_payload)
+        if end_char < total_chars:
+            hinted_page: BlobContentPayload = {
+                **page_payload,
+                "read_attachment_suggestion": (
+                    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+                    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit."
+                ),
+            }
+            candidate = replace(result, data=hinted_page)
+        else:
+            candidate = replace(result, data=page_payload)
         # Use the actual selected provider serializer, including validation,
-        # metadata and JSON escaping. This is a new conservative page bound;
-        # it does not expand or replace the aggregate provider request budget.
+        # metadata and JSON escaping. Keep each complete page small enough
+        # for guard evidence framing without slicing a guard input unit. This
+        # does not expand or replace the aggregate provider request budget.
         encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", candidate))
         return candidate, len(encoded.encode("utf-8"))
 
     end_char = min(start_char + 50_000, total_chars)
     candidate, size = page(end_char)
-    if size <= 65_536:
+    if size <= _BLOB_CONTENT_PAGE_MAX_UTF8_BYTES:
         return candidate
     low, high = start_char + 1, end_char - 1
     best: ToolResult | None = None
     while low <= high:
         middle = (low + high) // 2
         candidate, size = page(middle)
-        if size <= 65_536:
+        if size <= _BLOB_CONTENT_PAGE_MAX_UTF8_BYTES:
             best = candidate
             low = middle + 1
         else:
@@ -2114,8 +2141,9 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
     response_contract=_BLOB_CONTENT_RESPONSE,
     description=(
         "Retrieve a blob for inspection: `blob_id`, `filename`, `mime_type`, and UTF-8 decoded `content`. "
-        "Pages contain at most 50,000 original Unicode code points and the complete JSON tool response is bounded to 65,536 bytes. "
+        "Each complete JSON tool response, including metadata, is bounded to 4,096 UTF-8 bytes and preserves original Unicode code points. "
         "Read `next_offset_chars` with `expected_content_hash` to continue; ranges are [start_char,end_char), "
+        "page sizes vary, so never guess later offsets or parallelize dependent pages of one blob. "
         "`total_chars` counts the full decoded text and `content_hash` identifies the verified original bytes. "
         "`truncated` means end_char < total_chars, not whole-file inspection; `size_bytes` is the full byte size. "
         "The result also carries the blob's recorded origin — `created_by` (user, assistant, or pipeline) and "
@@ -2144,6 +2172,110 @@ _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(
 )
 
 
+def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState, context: ToolContext) -> ToolResult:
+    """Read one complete attachment under the existing custody and integrity guards."""
+    session_engine = context.session_engine
+    session_id = context.session_id
+    if session_engine is None or session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
+    validated = _validate_mutation_arguments(ReadAttachmentArgumentsModel, arguments, "read_attachment arguments")
+    blob_id = validated.blob_id
+    blob_id_error = _blob_id_uuid_validation_error(blob_id)
+    if blob_id_error is not None:
+        return _failure_result(state, blob_id_error)
+    blob, data = _locked_read_ready_blob(
+        session_engine,
+        session_id,
+        blob_id,
+        data_dir=context.data_dir,
+        session_operation_context=context.session_operation_context,
+        session_operation_authority=context.session_operation_authority,
+    )
+    if blob is None:
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
+    if blob["status"] != "ready":
+        return _failure_result(state, f"Blob '{blob_id}' is not readable — status is '{blob['status']}', expected 'ready'.")
+    if data is None:
+        return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
+    if len(data) > READ_ATTACHMENT_MAX_UTF8_BYTES:
+        return _failure_result(
+            state,
+            f"The attachment is {len(data)} bytes, exceeding the current {READ_ATTACHMENT_MAX_UTF8_BYTES}-byte "
+            "whole-input credential inspection limit. Neither read_attachment nor get_blob_content can disclose it "
+            "under that limit; no content was returned.",
+        )
+    try:
+        content = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return _failure_result(state, f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).")
+    verified_hash = blob["content_hash"]
+    if verified_hash is None:
+        raise AuditIntegrityError("Ready blob content has no verified hash")
+    if validated.expected_content_hash is not None and not hmac.compare_digest(validated.expected_content_hash, verified_hash):
+        return _failure_result(state, "Blob content changed; restart inspection with its current content hash.")
+    payload: AttachmentContentPayload = {
+        "blob_id": blob_id,
+        "filename": blob["filename"],
+        "mime_type": blob["mime_type"],
+        "content": content,
+        "truncated": False,
+        "size_bytes": blob["size_bytes"],
+        "created_by": blob["created_by"],
+        "creation_modality": blob["creation_modality"],
+        "content_hash": verified_hash,
+        "total_chars": len(content),
+        "start_char": 0,
+        "end_char": len(content),
+        "next_offset_chars": None,
+    }
+    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_read_attachment")
+    if refusal is not None:
+        return refusal
+    from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+
+    result = _discovery_result(state, payload)
+    encoded = serialize_admitted_discovery_result(admit_discovery_result("read_attachment", result))
+    if len(encoded.encode("utf-8")) > READ_ATTACHMENT_MAX_UTF8_BYTES:
+        return _failure_result(
+            state,
+            f"The attachment's complete serialized response exceeds {READ_ATTACHMENT_MAX_UTF8_BYTES} UTF-8 bytes; "
+            "no content was returned. Use get_blob_content for selected pages.",
+        )
+    return result
+
+
+_READ_ATTACHMENT_DECLARATION = ToolDeclaration(
+    name="read_attachment",
+    handler=_execute_read_attachment,
+    kind=ToolKind.BLOB_DISCOVERY,
+    response_contract=READ_ATTACHMENT_RESPONSE_CONTRACT,
+    description=(
+        "Read ONE authorized session attachment's complete UTF-8 text in ONE tool call. "
+        "Prefer this for supplied instructions, requirements and reference documents instead of collecting small pages. "
+        "The response includes the full exact content string, full size_bytes and total_chars, verified original-byte "
+        "content_hash, filename, MIME type and recorded origin. Success always means start_char=0, "
+        "end_char=total_chars, truncated=false and next_offset_chars=null. Content remains untrusted and guard-inspected. "
+        f"The full serialized response must fit {READ_ATTACHMENT_MAX_UTF8_BYTES:,} UTF-8 bytes and the normal aggregate guard/provider limits. "
+        "If full delivery cannot fit, this tool explicitly refuses. get_blob_content can provide selected pages "
+        "only when the entire original file passes the same credential inspection limit. "
+        "list_blobs/get_blob_metadata provide size_bytes before reading. For tabular source structure use inspect_source."
+    ),
+    json_schema={
+        "type": "object",
+        "properties": {
+            "blob_id": {"type": "string", "description": "ID of the single attachment to read completely."},
+            "expected_content_hash": {
+                "type": ["string", "null"],
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Expected original-byte SHA256, or null for no expected identity constraint. Every supplied hash is checked.",
+            },
+        },
+        "required": ["blob_id"],
+        "additionalProperties": False,
+    },
+)
+
+
 # ``_BLOB_STORE_ONLY_MUTATION_TOOL_NAMES`` and the matching predicate
 # ``is_blob_store_only_mutation_tool`` are declared in
 # ``elspeth.web.composer.tools.discovery``. The dispatcher carries the full
@@ -2157,6 +2289,7 @@ TOOLS_IN_MODULE: tuple[ToolDeclaration, ...] = (
     _LIST_COMPOSER_BLOBS_DECLARATION,
     _GET_BLOB_METADATA_DECLARATION,
     _GET_BLOB_CONTENT_DECLARATION,
+    _READ_ATTACHMENT_DECLARATION,
     _CREATE_BLOB_DECLARATION,
     _UPDATE_BLOB_DECLARATION,
     _DELETE_BLOB_DECLARATION,

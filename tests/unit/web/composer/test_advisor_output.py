@@ -9,10 +9,45 @@ from elspeth.web.composer.advisor_output import (
     ADVISOR_FINDING_CATEGORIES,
     ADVISOR_NOTE_MAX_CHARS,
     AdvisorCheckpointResponse,
+    advisor_abandonment_response_format,
     advisor_response_format,
+    parse_advisor_abandonment_response,
     parse_advisor_checkpoint_response,
     sanitize_advisor_note,
 )
+
+
+@pytest.mark.parametrize("decision", ["CONTINUE", "CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"])
+def test_abandonment_scope_has_a_closed_actionable_provider_contract(decision):
+    payload = {
+        "decision": decision,
+        "reason": "One requested capability is unavailable.",
+        "next_action": None if decision == "STOP_CONFIRMED" else "Inspect the supported source schema.",
+        "question": None,
+    }
+    response = parse_advisor_abandonment_response(json.dumps(payload))
+    assert response is not None
+    assert response.decision == decision
+    schema = advisor_abandonment_response_format()["json_schema"]["schema"]
+    assert set(schema["properties"]["decision"]["enum"]) == {"CONTINUE", "CONTINUE_WITH_LIMITATION", "STOP_CONFIRMED"}
+
+
+@pytest.mark.parametrize(
+    ("decision", "next_action", "question"),
+    [
+        ("CONTINUE_WITH_LIMITATION", None, None),
+        ("CONTINUE_WITH_LIMITATION", "Inspect the source.", "Which file?"),
+        ("STOP_CONFIRMED", "Inspect the source.", None),
+        ("UNKNOWN", "Inspect the source.", None),
+    ],
+)
+def test_abandonment_scope_rejects_contradictory_or_unknown_decisions(decision, next_action, question):
+    assert (
+        parse_advisor_abandonment_response(
+            json.dumps({"decision": decision, "reason": "Observed evidence.", "next_action": next_action, "question": question})
+        )
+        is None
+    )
 
 
 def _clean_payload() -> dict[str, object]:

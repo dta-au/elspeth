@@ -124,11 +124,9 @@ ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 # whether prompt caching is wired.
 ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT = 300_000
 
-# The rootless recovery introduced on 2026-09-25 makes one additional provider
-# call when prose claims a build without any tool invocation. Keep the original
-# per-call allowance and allow exactly two such payloads cumulatively. The
-# measured two-call script emits about 434 KB; this does not raise the turn or
-# token caps, or permit an individual request to grow beyond the prior limit.
+# Keep the existing two-payload allowance for catalog discovery followed by a
+# concrete clarification. The scenario has two legitimate provider transitions;
+# no lexical retry or increase to the turn, token, or per-call bound is needed.
 ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY = 2 * ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT
 
 
@@ -226,10 +224,11 @@ async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "
 
 
 _ROOTLESS_TRIVIAL_SCRIPT: tuple[ScriptedTurn, ...] = (
-    # Turn 1: prose claims a build without any tool call. The empty state
-    # prompts one neutral retry; this is not a successful pipeline build.
+    # Actual catalog discovery earns a second provider turn. This envelope
+    # fixture makes no semantic-publication claim about a fabricated build.
     ScriptedTurn(
-        content="Done — a CSV pipeline is ready in your workspace.",
+        content=None,
+        tool_calls=({"id": "trivial_sources", "name": "list_sources", "arguments": {}},),
         prompt_tokens=8_000,
         completion_tokens=40,
     ),
@@ -295,9 +294,10 @@ class TestEnvelopeHarness:
     @pytest.mark.asyncio
     async def test_rootless_trivial_prompt_under_turn_ceiling(self) -> None:
         run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
-        assert run.result.repair_turns_used == 1
+        assert run.result.repair_turns_used == 0
         assert not run.result.state.sources
         assert "[ELSPETH-SYSTEM]" in run.result.message
+        assert "I still need your input file before I can build the pipeline." in run.result.message
         assert len(run.result.llm_calls) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
             f"Trivial first-turn creation exceeded the named turn ceiling "
             f"({ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT}); a regression has lifted the "
@@ -377,7 +377,8 @@ class TestEnvelopeHarness:
                 # Turn 1: cold cache. No cache_read_input_tokens.
             ),
             ScriptedTurn(
-                content="Done.",
+                content=None,
+                tool_calls=({"id": "c2", "name": "list_transforms", "arguments": {}},),
                 prompt_tokens=8_000,
                 # Turn 2: warm cache. Provider reports it served 7K tokens
                 # from cache and 1K of fresh prompt.
@@ -391,15 +392,12 @@ class TestEnvelopeHarness:
         )
         run = await _run_envelope(warm_script)
         assert len(run.result.llm_calls) == 3
-        assert run.result.repair_turns_used == 1
+        assert run.result.repair_turns_used == 0
         assert run.result.llm_calls[0].cache_read_input_tokens is None
         assert run.result.llm_calls[1].cache_read_input_tokens == 7_000
         assert run.result.llm_calls[2].cache_read_input_tokens == 7_000
-        recovery_prefix = "[composer-system] No composition-state mutation completed successfully this turn"
-        assert not any(recovery_prefix in str(message.get("content", "")) for message in run.per_turn_messages[1])
-        recovery = [message for message in run.per_turn_messages[2] if recovery_prefix in str(message.get("content", ""))]
-        assert len(recovery) == 1
-        assert recovery[0]["role"] == "user"
+        assert [invocation.tool_name for invocation in run.result.tool_invocations] == ["list_sources", "list_transforms"]
+        assert "I still need your input file before I can build the pipeline." in run.result.message
 
 
 class TestEnvelopeHarnessSelfTests:

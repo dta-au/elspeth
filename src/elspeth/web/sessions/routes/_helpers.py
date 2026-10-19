@@ -437,7 +437,8 @@ def _tool_call_outcomes_by_call_id(
 
     Two writers produce tool rows with different per-call semantics:
 
-    * ``persist_compose_turn`` (primary): ``tool_calls`` is NULL and
+    * ``persist_compose_turn`` (primary): ``tool_calls`` is NULL or carries
+      its ordinary visible-evidence companion, and
       ``composition_state_id`` is set exactly when THAT call inserted a
       composition state — per-call ground truth on the row itself.
     * ``_persist_tool_invocations`` (fallback drains): every row of the turn
@@ -449,12 +450,24 @@ def _tool_call_outcomes_by_call_id(
     and was refused must not render as applied, which is exactly the
     dishonesty class this projection exists to remove.
     """
+    from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
     outcomes: dict[str, _ToolCallOutcome] = {}
     for row in messages:
         if row.role != "tool" or row.tool_call_id is None:
             continue
         envelope = row.tool_calls[0] if row.tool_calls else None
-        if envelope is None and row.composition_state_id is not None:
+        primary_row = envelope is None
+        if envelope is not None and "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+            assert row.tool_calls is not None
+            if len(row.tool_calls) != 1:
+                raise AuditIntegrityError("Primary tool row must carry exactly one visible companion")
+            # Validate the closed stored shape, then classify from the real
+            # row's state/content. Companion payloads and copied operation IDs
+            # are historical evidence, never outcome or execution authority.
+            VisibleToolEvent.from_envelope(envelope)
+            primary_row = True
+        if primary_row and row.composition_state_id is not None:
             state_key = str(row.composition_state_id)
             outcomes[row.tool_call_id] = _ToolCallOutcome(
                 outcome=_ToolCallOutcomeKind.APPLIED,
@@ -464,13 +477,13 @@ def _tool_call_outcomes_by_call_id(
                 applied_state_version=state_versions_by_id[state_key] if state_key in state_versions_by_id else None,
             )
             continue
-        if envelope is not None:
+        if envelope is not None and not primary_row:
             # The per-call delta lives one level DOWN, under ``invocation``:
             # the fallback writer stores exactly
             # ``redacted_tool_invocation_content_and_envelope(...)[1]``, which
-            # is ``{"_kind": "audit", "invocation": {...}}`` — a first-party
-            # fixed contract, and the only writer that sets ``tool_calls`` on
-            # a tool row. Reading these keys off the top level found nothing
+            # is ``{"_kind": "audit", "invocation": {...}}`` — the fixed
+            # legacy contract. Primary companions were handled above.
+            # Reading these keys off the top level found nothing
             # on every real row, so an applied mutation fell through to
             # COMPLETED and rendered as a lookup (elspeth-f5e6723133's own
             # failure mode). The DB round-trip does not demote authorship
@@ -597,6 +610,11 @@ def _message_response(
 
     if msg.tool_calls is not None and any(is_diagnostic_evidence_envelope(envelope) for envelope in msg.tool_calls):
         raise AuditIntegrityError("Private Composer evidence cannot be projected into a public message")
+    from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND, VisibleToolEvent
+
+    for envelope in msg.tool_calls or ():
+        if "_kind" in envelope and envelope["_kind"] == VISIBLE_TOOL_EVENT_KIND:
+            VisibleToolEvent.from_envelope(envelope)
     tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
     if tool_calls is not None and tool_outcomes:
         stamped: list[Any] = []

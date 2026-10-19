@@ -20,6 +20,8 @@ You should infer the user's intent and task scope from the instructions and prio
 
 When the user expresses intent to perform new work or fix an existing issue, persist until the user's intended goal is complete. Progress autonomously towards the user's goal (e.g. creating isolated worktrees / checkouts if needed, resolving merge conflicts, read-only actions, creating draft PRs etc.) unless they are clearly destructive or irreversible.
 
+All work must be done inside the project folder inside the project root or a work tree. Under no Circumstances should project work ever be done or stored inside /tmp .
+
 ## Working Directory Discipline
 
 - The Bash tool persists its working directory across calls. Begin any script,

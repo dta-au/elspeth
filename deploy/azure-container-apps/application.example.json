@@ -11,6 +11,14 @@
   "composerAdvisorEndpointBaseUrl": "",
   "extraSecrets": [
     {
+      "name": "composer-prompt-guard",
+      "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-composer-prompt-guard/00000000000000000000000000000000"
+    },
+    {
+      "name": "composer-advisor-prompt-guard",
+      "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-composer-advisor-prompt-guard/00000000000000000000000000000000"
+    },
+    {
       "name": "azure-api-key",
       "keyVaultUrl": "https://replace-runtime-vault.vault.azure.net/secrets/elspeth-azure-api-key/00000000000000000000000000000000"
     },
@@ -24,6 +32,14 @@
     }
   ],
   "extraEnvironment": [
+    {
+      "name": "ELSPETH_WEB__COMPOSER_PROMPT_GUARD",
+      "secretRef": "composer-prompt-guard"
+    },
+    {
+      "name": "ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD",
+      "secretRef": "composer-advisor-prompt-guard"
+    },
     {
       "name": "ELSPETH_WEB__COMPOSER_PRICING_MODEL",
       "value": "REPLACE_PRIMARY_PRICING_MODEL"

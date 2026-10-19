@@ -57,12 +57,16 @@ vi.mock("@/api/client", async (importOriginal) => {
   return {
     ...actual,
     getBlobMetadata: vi.fn(),
-    previewBlobContent: vi.fn(),
+    downloadBlobContent: vi.fn(),
     // ModelChip's data source. Reset (undefined resolution) in most tests →
     // the chip renders nothing; the model-chip tests set a resolved value.
     fetchSystemStatus: vi.fn(),
   };
 });
+
+async function sourceDownload(content: string) {
+  return { data: await new Response(content).blob(), filename: "inline.csv" };
+}
 
 const mockedChatInputUpload = vi.hoisted(() => ({
   blob: null as BlobMetadata | null,
@@ -1233,8 +1237,8 @@ describe("ChatPanel inline-source projection", () => {
       makeBlobMetadata(),
     );
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue(twoRowInlineSourceText);
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload(twoRowInlineSourceText));
 
     const composition = makeComposition(1, {
       sources: {
@@ -1274,8 +1278,8 @@ describe("ChatPanel inline-source projection", () => {
       makeBlobMetadata(),
     );
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue(twoRowInlineSourceText);
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload(twoRowInlineSourceText));
 
     const composition = makeComposition(1, {
       sources: {
@@ -1347,7 +1351,7 @@ describe("ChatPanel inline-source projection", () => {
       );
     });
 
-    expect(apiClient.previewBlobContent).not.toHaveBeenCalled();
+    expect(apiClient.downloadBlobContent).not.toHaveBeenCalled();
     expect(
       screen.queryByRole("region", { name: /source created/i }),
     ).toBeNull();
@@ -1372,7 +1376,7 @@ describe("ChatPanel inline-source projection", () => {
     ).toBeNull();
     // No blob fetch attempted when no blob_ref is present.
     expect(apiClient.getBlobMetadata).not.toHaveBeenCalled();
-    expect(apiClient.previewBlobContent).not.toHaveBeenCalled();
+    expect(apiClient.downloadBlobContent).not.toHaveBeenCalled();
   });
 
   it("clears a stale inline-source summary when the active blob is not inline", async () => {
@@ -1413,7 +1417,7 @@ describe("ChatPanel inline-source projection", () => {
     await waitFor(() => {
       expect(useInlineSourceStore.getState().getSummaries("session-inline")[0]).toBeUndefined();
     });
-    expect(apiClient.previewBlobContent).not.toHaveBeenCalled();
+    expect(apiClient.downloadBlobContent).not.toHaveBeenCalled();
   });
 
   it("does NOT render the widget when compositionState has no sources", () => {
@@ -1446,8 +1450,8 @@ describe("ChatPanel inline-source projection", () => {
       content_hash: null,
     });
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue("url\nhttps://a.gov.au");
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload("url\nhttps://a.gov.au"));
 
     // Suppress the expected console.error from the projection's catch
     // arm so the test output is clean.  The assertion below confirms
@@ -1496,8 +1500,8 @@ describe("ChatPanel inline-source projection", () => {
       makeBlobMetadata({ mime_type: "text/csv; charset=" }),
     );
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue(twoRowInlineSourceText);
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload(twoRowInlineSourceText));
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => {});
@@ -1544,8 +1548,8 @@ describe("ChatPanel inline-source projection", () => {
       makeBlobMetadata({ content_hash: differentInlineSourceHash }),
     );
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue(oneRowInlineSourceText);
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload(oneRowInlineSourceText));
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => {});
@@ -1592,8 +1596,8 @@ describe("ChatPanel inline-source projection", () => {
       makeBlobMetadata(),
     );
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue(twoRowInlineSourceText);
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload(twoRowInlineSourceText));
     const projectionError = new TypeError("projection dependency failed");
     vi.spyOn(apiClient, "toInlineSourceProvenance").mockImplementation(() => {
       throw projectionError;
@@ -2111,8 +2115,8 @@ describe("ChatPanel interpretation-review inline-message dispatch", () => {
       creating_arguments_hash: "args-hash",
     });
     (
-      apiClient.previewBlobContent as ReturnType<typeof vi.fn>
-    ).mockResolvedValue("a\nb\nc\nd\ne\nf");
+      apiClient.downloadBlobContent as ReturnType<typeof vi.fn>
+    ).mockResolvedValue(await sourceDownload("a\nb\nc\nd\ne\nf"));
 
     const composition = makeComposition(1, {
       sources: {

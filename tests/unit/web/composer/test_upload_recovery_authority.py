@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -10,11 +11,13 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import litellm
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_decision import AdvisorGateBlocked
 from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
@@ -25,6 +28,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.sessions.protocol import CompositionStateData
+from tests.helpers.advisor_review import parse_advisor_publication_review
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_llm_response, _make_settings
 
@@ -48,44 +52,125 @@ def _advisor_reply():
     return _make_llm_response(content=json.dumps({"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}))
 
 
+def _sdk_reply(model, *, content=None, tool_calls=None):
+    """Keep the existing tool framing while supplying real SDK usage metadata."""
+    message = _make_llm_response(content=content, tool_calls=tool_calls).choices[0].message
+    wire_calls = [
+        {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
+        for call in (message.tool_calls or ())
+    ]
+    return litellm.ModelResponse(
+        model=model,
+        choices=[
+            {
+                "message": {"role": "assistant", "content": content, "tool_calls": wire_calls or None},
+                "finish_reason": "tool_calls" if wire_calls else "stop",
+            }
+        ],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+@contextmanager
+def _observe_real_end(service, reviews, outcomes):
+    """Observe and forward the real checkpoint, including its owned binding."""
+    actual = service._advisor_checkpoint._run_advisor_checkpoint
+    assert actual.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
+    assert actual.__module__ == "elspeth.web.composer.advisor_checkpoint"
+
+    async def observe(*args, **kwargs):
+        if kwargs["phase"] == "end":
+            reviews.append(kwargs["publication_review"])
+        verdict = await actual(*args, **kwargs)
+        if kwargs["phase"] == "end":
+            assert verdict.publication_binding == reviews[-1].binding
+            outcomes.append(verdict)
+        return verdict
+
+    with patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", new=observe):
+        yield
+
+
+def _assert_end_packet_sent(kwargs, review, message):
+    resolved = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+    assert {key: value for key, value in resolved.items() if key not in {"current_request_ref", "candidate_reply_ref"}} == json.loads(
+        review.provider_payload_json
+    )
+    payload = json.loads(review.payload_json)
+    assert payload["current_request"] == message
+    assert payload["saved_effects"]["saved_revision_count"] == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("uploaded", [False, True], ids=["without_upload", "with_upload"])
 @pytest.mark.parametrize(
-    ("message", "expected_calls"),
+    ("message", "publications"),
     [
-        ("Do not build anything. Just explain what a CSV source is.", 2),
-        ("Hello!", 1),
-        ("Build from my uploaded CSV", 2),
+        ("Do not build anything. Just explain what a CSV source is.", ("ADMIT",)),
+        ("Hello!", ("ADMIT",)),
+        ("Build from my uploaded CSV", ("WITHHOLD", "WITHHOLD")),
     ],
     ids=["no_build", "greeting", "build_stall"],
 )
-async def test_upload_availability_does_not_force_construction(tmp_path: Path, uploaded: bool, message: str, expected_calls: int) -> None:
+async def test_upload_availability_does_not_force_construction(
+    tmp_path: Path, uploaded: bool, message: str, publications: tuple[str, ...]
+) -> None:
     service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
     if uploaded:
         await _upload(service, session_id, tmp_path)
     observed = []
+    reviews = []
+    outcomes = []
+    phases = []
+    explanation = "I will only explain the options and leave the pipeline unchanged."
+    findings = "The authorized build remains unstarted; upload availability alone is not evidence of a configured pipeline."
 
     async def complete(**kwargs: Any):
         if kwargs["model"] == service._settings.composer_advisor_model:
-            return _advisor_reply()
+            assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+            assert len(reviews) <= len(publications)
+            phases.append("end")
+            _assert_end_packet_sent(kwargs, reviews[-1], message)
+            assert json.loads(reviews[-1].payload_json)["candidate_reply"] == explanation
+            publication = publications[len(reviews) - 1]
+            return _sdk_reply(
+                kwargs["model"],
+                content=json.dumps(
+                    {
+                        "verdict": "CLEAN",
+                        "category": "other",
+                        "steps": [],
+                        "findings": findings if publication == "WITHHOLD" else "",
+                        "note": None,
+                        "publication_verdict": publication,
+                    }
+                ),
+            )
+        assert kwargs["model"] == service._model
+        phases.append("primary")
         observed.append(deepcopy(kwargs["messages"]))
-        return _make_llm_response(content="I will only explain the options and leave the pipeline unchanged.")
+        assert len(observed) <= len(publications), "Unexpected lexical PRIMARY retry"
+        return _sdk_reply(kwargs["model"], content=explanation)
 
     initial = _empty_state()
-    with patch("litellm.acompletion", side_effect=complete):
+    with _observe_real_end(service, reviews, outcomes), patch("litellm.acompletion", side_effect=complete):
         result = await service.compose(message, [], initial, session_id=session_id)
 
-    assert len(observed) == expected_calls
-    assert result.repair_turns_used == expected_calls - 1
+    assert len(observed) == len(reviews) == len(outcomes) == len(publications)
+    assert phases == [phase for _publication in publications for phase in ("primary", "end")]
+    assert [outcome.publication_verdict for outcome in outcomes] == list(publications)
+    assert len({review.binding for review in reviews}) == len(reviews)
+    assert result.repair_turns_used == 0
     assert result.state == initial
     assert not result.tool_invocations
     assert all(
         "Continue by calling a build/edit tool" not in str(item["content"]) for turn in observed for item in turn if item["role"] == "user"
     )
-    if expected_calls == 2:
+    assert all(any(item["role"] == "user" and item["content"] == message for item in turn) for turn in observed)
+    if len(publications) == 2:
         repair = observed[1][-1]["content"]
-        assert "explanation or revoked construction" in repair
-        assert "authorized work" in repair
+        assert findings in repair
+        assert isinstance(result.advisor_gate_decision, AdvisorGateBlocked)
         assert any(item["role"] == "user" and item["content"] == message for item in observed[1])
 
 
@@ -94,7 +179,8 @@ async def test_upload_availability_does_not_force_construction(tmp_path: Path, u
 async def test_authorized_uploaded_build_recovers_through_provider_and_real_tools(tmp_path: Path, inspect_first: bool) -> None:
     service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
     blob = await _upload(service, session_id, tmp_path)
-    message = "Build from my uploaded CSV"
+    # The selected upload is named by the user, not supplied by a lexical retry.
+    message = f"Build a CSV report from my uploaded file {blob.id}."
     proposal = {
         "source": {
             "blob_id": str(blob.id),
@@ -123,38 +209,73 @@ async def test_authorized_uploaded_build_recovers_through_provider_and_real_tool
     calls = 0
     advisor_calls = 0
     observed = []
+    reviews = []
+    outcomes = []
+    phases = []
+    findings = "The current request authorizes the uploaded CSV report, but no pipeline has been saved."
 
     async def complete(**kwargs: Any):
         nonlocal calls, advisor_calls
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
-            return _advisor_reply()
+            schema_name = kwargs["response_format"]["json_schema"]["name"]
+            assert schema_name in {"advisor_checkpoint_response", "advisor_end_response"}
+            phase = "end" if schema_name == "advisor_end_response" else "early"
+            phases.append(phase)
+            payload = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
+            if phase == "end":
+                assert len(reviews) <= 2
+                first = len(reviews) == 1
+                if first:
+                    _assert_end_packet_sent(kwargs, reviews[-1], message)
+                    assert json.loads(reviews[-1].payload_json)["candidate_reply"] == "I can build a report from your uploaded CSV."
+                else:
+                    resolved = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+                    assert {
+                        key: value for key, value in resolved.items() if key not in {"current_request_ref", "candidate_reply_ref"}
+                    } == json.loads(reviews[-1].provider_payload_json)
+                    packet = json.loads(reviews[-1].payload_json)
+                    assert packet["current_request"] == message
+                    assert packet["candidate_reply"] == "The CSV report pipeline is configured."
+                    assert packet["saved_effects"]["saved_revision_count"] > 0
+                    assert packet["saved_effects"]["net_changed"] is True
+                payload["publication_verdict"] = "WITHHOLD" if first else "ADMIT"
+                payload["findings"] = findings if first else ""
+            return _sdk_reply(kwargs["model"], content=json.dumps(payload))
+        assert kwargs["model"] == service._model
+        phases.append("primary")
         observed.append(deepcopy(kwargs["messages"]))
         index = calls
         calls += 1
         if inspect_first and index == 0:
-            return _make_llm_response(tool_calls=[{"id": "inspect", "name": "inspect_source", "arguments": {"blob_id": str(blob.id)}}])
+            return _sdk_reply(
+                kwargs["model"], tool_calls=[{"id": "inspect", "name": "inspect_source", "arguments": {"blob_id": str(blob.id)}}]
+            )
         if index == int(inspect_first):
-            return _make_llm_response(content="I can build a report from your uploaded CSV.")
+            return _sdk_reply(kwargs["model"], content="I can build a report from your uploaded CSV.")
         if index == int(inspect_first) + 1:
             repair = kwargs["messages"][-1]["content"]
-            assert "authorized work" in repair
-            assert "explanation or revoked construction" in repair
-            assert str(blob.id) in repair
+            assert findings in repair
+            assert len(reviews) == 1
+            assert str(blob.id) in json.dumps(kwargs["messages"])
             assert any(item["role"] == "user" and item["content"] == message for item in kwargs["messages"])
             if inspect_first:
                 assert "No tool has run" not in repair
                 assert any(item["role"] == "tool" and item["tool_call_id"] == "inspect" for item in kwargs["messages"])
-            return _make_llm_response(tool_calls=[{"id": "build", "name": "set_pipeline", "arguments": proposal}])
+            return _sdk_reply(kwargs["model"], tool_calls=[{"id": "build", "name": "set_pipeline", "arguments": proposal}])
         assert index == int(inspect_first) + 2
-        return _make_llm_response(content="The CSV report pipeline is configured.")
+        return _sdk_reply(kwargs["model"], content="The CSV report pipeline is configured.")
 
-    with patch("litellm.acompletion", side_effect=complete):
+    with _observe_real_end(service, reviews, outcomes), patch("litellm.acompletion", side_effect=complete):
         result = await service.compose(message, [], _empty_state(), session_id=session_id)
 
     assert calls == 3 + int(inspect_first)
     assert advisor_calls > 0
-    assert result.repair_turns_used == 1
+    assert phases == (["primary"] if inspect_first else []) + ["primary", "end", "primary", "early", "primary", "end"]
+    assert advisor_calls == 3
+    assert [outcome.publication_verdict for outcome in outcomes] == ["WITHHOLD", "ADMIT"]
+    assert reviews[0].binding != reviews[1].binding
+    assert result.repair_turns_used == 0
     assert result.state.sources["source"].options["blob_ref"] == str(blob.id)
     assert [output.name for output in result.state.outputs] == ["report"]
     assert any(invocation.tool_name == "set_pipeline" and invocation.status.value == "success" for invocation in result.tool_invocations)
@@ -283,7 +404,7 @@ async def test_saved_validation_blocker_preserves_request_and_readiness(tmp_path
 @pytest.mark.parametrize("repair_authorized", [False, True], ids=["explain_without_changes", "repair_requested"])
 async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_path: Path, repair_authorized: bool) -> None:
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.advisor_context import _ADVISOR_UNTRUSTED_SUMMARY_BEGIN, _ADVISOR_UNTRUSTED_SUMMARY_END
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     service, session_id = _composer_service_with_session(catalog=create_catalog_service(), settings=_make_settings(data_dir=tmp_path))
     blob = await _upload(service, session_id, tmp_path)
@@ -341,8 +462,7 @@ async def test_saved_advisor_findings_preserve_request_and_completion_gate(tmp_p
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
             assert advisor_calls <= 2, "Only two END responses are supplied"
-            review_json = kwargs["messages"][1]["content"].rsplit(_ADVISOR_UNTRUSTED_SUMMARY_BEGIN + "\n", 1)[1]
-            review = json.loads(review_json.split("\n" + _ADVISOR_UNTRUSTED_SUMMARY_END, 1)[0])
+            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
             assert review["current_request"] == message
             repaired = repair_authorized and advisor_calls == 2

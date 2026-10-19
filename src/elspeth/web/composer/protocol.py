@@ -21,12 +21,16 @@ from pydantic import ValidationError as PydanticValidationError
 if TYPE_CHECKING:
     from pydantic import SecretStr
 
+    from elspeth.contracts.prompt_guard import PromptGuardMode
     from elspeth.contracts.session_operation import SessionOperationContext
+    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
-    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+    from elspeth.web.composer.prompt_guard import PromptGuardMount
+    from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
     from elspeth.web.composer.strict_transport import StrictToolsSetting
     from elspeth.web.execution.completion_gates import CompletionGateFacts
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
     from elspeth.web.required_work import RequiredWorkBinding
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
@@ -1061,7 +1065,8 @@ _SAFE_TOOL_ARGUMENT_EXPECTATIONS = (
             "a pending interpretation requirement or placeholder",
             "id of an existing LLM transform",
             "one of: the allowed values",
-            "prompt_template_parts interpretation_ref or placeholder wiring",
+            "one matching pending vague_term requirement with at least one matching interpretation_ref in prompt_template_parts; "
+            "legacy-only: exactly one placeholder with no matching pending vague_term",
             "the current non-empty options.model",
             "the current non-empty options.prompt_template",
             LLM_PROMPT_REVIEW_DRAFT_EXPECTATION,
@@ -1188,7 +1193,10 @@ def _canonical_tool_argument_expectation(value: object, argument: str) -> str:
     if "per term" in lowered and ("at most" in lowered or "limit" in lowered):
         return INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION
     if "prompt_template_parts" in lowered or "interpretation_ref" in lowered:
-        return "prompt_template_parts interpretation_ref or placeholder wiring"
+        return (
+            "one matching pending vague_term requirement with at least one matching interpretation_ref in prompt_template_parts; "
+            "legacy-only: exactly one placeholder with no matching pending vague_term"
+        )
     if "preserves raw html/fingerprint field" in lowered:
         return "a pipeline decision without preserved raw HTML/fingerprint fields"
     for kind in InterpretationKind:
@@ -1607,6 +1615,15 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_prompt_guard(self) -> PromptGuardSettings | None: ...
+
+    @property
+    def composer_advisor_prompt_guard(self) -> PromptGuardSettings | None: ...
+
+    @property
+    def composer_prompt_guard_mode(self) -> PromptGuardMode: ...
+
+    @property
     def composer_pricing_model(self) -> str | None: ...
 
     @property
@@ -1722,6 +1739,9 @@ class ComposerService(Protocol):
     no-tool assistant messages are still route-persisted (seam contract B).
     """
 
+    @property
+    def composer_prompt_guard_mount(self) -> PromptGuardMount | None: ...
+
     async def compose_recovery(
         self,
         *,
@@ -1753,6 +1773,7 @@ class ComposerService(Protocol):
         provider_owner: ProviderInvocationOwner | None = None,
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
+        advisor_history: AdvisorTranscriptHistory | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 
@@ -1795,6 +1816,7 @@ class ComposerService(Protocol):
         *,
         recorder: BufferingRecorder | None = None,
         session_operation_context: SessionOperationContext | None = None,
+        provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Explain a bounded run diagnostics snapshot without mutating state."""
         ...

@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Connection, select
+from sqlalchemy import Connection, select, update
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
@@ -71,6 +71,7 @@ from tests.e2e.recovery.test_sink_effect_process_death_matrix import (
     _install_short_sink_lease,
     _wait_until_run_is_resumable,
 )
+from tests.fixtures.landscape import make_recorder_with_run
 from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 from tests.helpers.web_cli_profile import create_profile_session
@@ -822,16 +823,93 @@ def _exercise_worker_profile(
 
 
 def _seat_liveness(database_url: str, run_id: str) -> tuple[bool, datetime | None, datetime]:
-    """The follower admission predicate itself: seat deadline against Landscape database time."""
+    """Observe the seat snapshot before sampling Landscape database time."""
     with LandscapeDB.from_url(database_url, create_tables=False) as db, db.engine.connect() as conn:
+        deadline = conn.execute(
+            select(run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id)
+        ).scalar_one()
+        # A later heartbeat must not pair its newer deadline with an older
+        # clock sample and appear to have exceeded the profile's real window.
         database_now = read_landscape_decision_time(conn)
-        seat = conn.execute(
-            select(
-                run_coordination_table.c.leader_heartbeat_expires_at,
-                (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
-            ).where(run_coordination_table.c.run_id == run_id)
-        ).one()
-    return bool(seat.seat_live), seat.leader_heartbeat_expires_at, database_now
+    if deadline is not None:
+        deadline = deadline.replace(tzinfo=UTC) if deadline.tzinfo is None else deadline.astimezone(UTC)
+    return deadline is not None and deadline >= database_now, deadline, database_now
+
+
+def test_seat_liveness_does_not_pair_a_renewed_deadline_with_an_earlier_clock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A heartbeat between observations must not invent an overlong window."""
+    database_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    with LandscapeDB(database_url) as db:
+        run_id = make_recorder_with_run(db=db).run_id
+        with db.engine.begin() as conn:
+            minted_deadline = read_landscape_decision_time(conn) + timedelta(seconds=_PROFILE_RUN_LIVENESS_SECONDS)
+            conn.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == run_id)
+                .values(leader_heartbeat_expires_at=minted_deadline)
+            )
+        real_clock = read_landscape_decision_time
+        renewed_deadlines: list[datetime] = []
+
+        def renew_after_clock_sample(conn: Connection) -> datetime:
+            sampled = real_clock(conn)
+            with db.engine.begin() as writer:
+                # Real SQLite milliseconds must advance before the heartbeat.
+                # Bound polling rather than sleeping or substituting process time.
+                for _ in range(10_000):
+                    writer_now = real_clock(writer)
+                    if writer_now > sampled:
+                        break
+                else:
+                    pytest.fail("SQLite decision clock did not advance during the interleaving control")
+                renewed_deadline = writer_now + timedelta(seconds=_PROFILE_RUN_LIVENESS_SECONDS)
+                writer.execute(
+                    update(run_coordination_table)
+                    .where(run_coordination_table.c.run_id == run_id)
+                    .values(leader_heartbeat_expires_at=renewed_deadline)
+                )
+            renewed_deadlines.append(renewed_deadline)
+            return sampled
+
+        monkeypatch.setattr(f"{__name__}.read_landscape_decision_time", renew_after_clock_sample)
+        live, observed_deadline, database_now = _seat_liveness(database_url, run_id)
+
+    assert live and observed_deadline is not None
+    assert (observed_deadline.replace(tzinfo=UTC) - database_now).total_seconds() <= _PROFILE_RUN_LIVENESS_SECONDS
+    assert renewed_deadlines and observed_deadline.replace(tzinfo=UTC) < renewed_deadlines[0]
+    assert observed_deadline.tzinfo is UTC
+
+
+@pytest.mark.parametrize(
+    ("window_seconds", "expected_live", "expected_overlong"),
+    [(5.0, True, False), (80.0, True, True), (-1.0, False, False), (None, False, False)],
+    ids=["profile-window", "overlong-window", "expired-seat", "vacant-seat"],
+)
+def test_seat_liveness_preserves_window_and_dead_seat_controls(
+    tmp_path: Path, window_seconds: float | None, expected_live: bool, expected_overlong: bool
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'audit.db'}"
+    with LandscapeDB(database_url) as db:
+        setup = make_recorder_with_run(db=db)
+        with db.engine.begin() as conn:
+            deadline = None if window_seconds is None else read_landscape_decision_time(conn) + timedelta(seconds=window_seconds)
+            conn.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == setup.run_id)
+                .values(
+                    leader_worker_id=None if deadline is None else setup.coordination_token.worker_id,
+                    leader_heartbeat_expires_at=deadline,
+                )
+            )
+        live, observed_deadline, database_now = _seat_liveness(database_url, setup.run_id)
+
+    assert live is expected_live
+    assert database_now.tzinfo is UTC
+    if window_seconds is None:
+        assert observed_deadline is None
+    else:
+        assert observed_deadline is not None
+        assert ((observed_deadline.replace(tzinfo=UTC) - database_now).total_seconds() > _PROFILE_RUN_LIVENESS_SECONDS) is expected_overlong
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")

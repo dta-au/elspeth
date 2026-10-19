@@ -368,9 +368,18 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
         const cap = firstDefined(ownField(nestedDetail, "cap"), ownField(body, "cap"));
         const ceiling = firstDefined(ownField(nestedDetail, "ceiling"), ownField(body, "ceiling"));
         const usage = firstDefined(ownField(nestedDetail, "usage"), ownField(body, "usage"));
-        const validLimit = (value: unknown): value is number | null => value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
-        if (dimension === "storage" && validLimit(cap) && validLimit(ceiling) && typeof usage === "number" && Number.isSafeInteger(usage) && usage >= 0) {
-          storageQuota = { cap, ceiling, usage };
+        const scope = firstDefined(ownField(nestedDetail, "scope"), ownField(body, "scope"));
+        const limit = firstDefined(ownField(nestedDetail, "limit"), ownField(body, "limit"));
+        const validQuantity = (value: unknown): value is string | number =>
+          (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value))
+          || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+        const validLimit = (value: unknown): value is string | number | null => value === null || validQuantity(value);
+        if (dimension === "storage" && validLimit(cap) && validLimit(ceiling) && validQuantity(usage)
+          && (scope === "identity" || scope === "container") && validQuantity(limit)) {
+          const bindingLimit = scope === "identity" ? cap : ceiling;
+          if (bindingLimit !== null && BigInt(bindingLimit) === BigInt(limit)) {
+            storageQuota = { cap, ceiling, usage, scope, limit };
+          }
         }
       }
       const rawSources = firstDefined(ownField(body, "sources"), ownField(nestedDetail, "sources"));
@@ -1002,7 +1011,13 @@ export function apiErrorFromBody(status: number, body: unknown): ApiError {
 
 export function isDefinitiveComposerRefusal(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("status" in error)) return false;
-  return typeof error.status === "number" && error.status >= 400 && error.status < 500 && error.status !== 408 && error.status !== 429;
+  if (error.status === 429) {
+    // These application refusals occur before admission commits. Surface the
+    // refusal (including retry_after) and leave a retry to the user. A generic
+    // gateway 429 can follow dispatch, so its custody remains uncertain.
+    return "error_type" in error && (error.error_type === "rate_limited" || error.error_type === "composer_queue_full");
+  }
+  return typeof error.status === "number" && error.status >= 400 && error.status < 500 && error.status !== 408;
 }
 export function composerActiveOperation(error: unknown): { operation_id: string; kind: import("@/types/composerOperations").OperationKind } | null {
   if (typeof error !== "object" || error === null || !("error_type" in error) || error.error_type !== "composer_operation_active" || !("operation_id" in error) || !("kind" in error)) return null;

@@ -1,7 +1,7 @@
 # ELSPETH Composer Guide
 
-**Document date:** 5 October 2026
-**Release covered:** 0.8.6 candidate
+**Document date:** 20 October 2026
+**Release covered:** 0.8.9 unreleased candidate
 **Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide
@@ -118,6 +118,14 @@ for review without running anything. A researcher may want to run immediately.
 An engineer may want YAML and the CLI.
 
 ## Recovery
+
+Storage allowances include uploads, retained run outputs, and reserved run-output
+space across your sessions. Archiving a session keeps its run artifacts and does
+not free that space. You can delete unneeded uploaded files in the file manager;
+this removes only those uploads, not generic run artifacts. If retained outputs
+exhaust your allowance, ask an administrator about raising it or the deployment's
+supported retention procedures. Composer currently has no purge control for those
+run artifacts.
 
 If a Composer session is interrupted, the recovery panel can show:
 

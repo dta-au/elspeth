@@ -19,6 +19,14 @@ from elspeth_lints.rules.audit_evidence.shared import load_class_allowlist
 from elspeth_lints.rules.audit_evidence.tier_1_decoration import RULE as TIER_1_DECORATION_RULE
 
 
+@pytest.fixture
+def _isolated_nominal_allowlist(tmp_path: Path) -> None:
+    """Keep synthetic source roots independent of checkout/ancestor allowlists."""
+    allowlist = tmp_path / "config" / "cicd" / "enforce_audit_evidence_nominal"
+    allowlist.mkdir(parents=True)
+    (allowlist / "rules.yaml").write_text("allow_classes: []\n", encoding="utf-8")
+
+
 def test_audit_evidence_nominal_reports_to_audit_dict_without_base() -> None:
     findings = list(
         AUDIT_EVIDENCE_NOMINAL_RULE.analyze(
@@ -92,6 +100,7 @@ def test_audit_evidence_nominal_distinguishes_same_named_classes_by_lexical_scop
     }
 
 
+@pytest.mark.usefixtures("_isolated_nominal_allowlist")
 def test_audit_evidence_nominal_prefers_lexical_class_over_same_named_import(tmp_path: Path) -> None:
     _write(
         tmp_path / "contracts" / "parent.py",
@@ -379,6 +388,7 @@ def test_audit_evidence_nominal_flags_intermediate_base_that_is_itself_spoofed()
     assert [finding.message.split(" ")[0] for finding in findings] == ["Child"]
 
 
+@pytest.mark.usefixtures("_isolated_nominal_allowlist")
 def test_audit_evidence_nominal_resolves_imported_intermediate_base(tmp_path: Path) -> None:
     # Cross-file one-hop chain, the PassThroughContractViolation shape:
     # contracts/errors.py subclasses a parent imported from
@@ -417,6 +427,7 @@ def test_audit_evidence_nominal_resolves_imported_intermediate_base(tmp_path: Pa
     assert _root_findings(AUDIT_EVIDENCE_NOMINAL_RULE, tmp_path) == []
 
 
+@pytest.mark.usefixtures("_isolated_nominal_allowlist")
 def test_audit_evidence_nominal_fails_closed_when_imported_base_is_unresolvable(tmp_path: Path) -> None:
     # The parent's module is not under the scan root, so its ancestry cannot be
     # proven from the tree. Absence of proof is a finding, not an exemption.
@@ -437,6 +448,7 @@ def test_audit_evidence_nominal_fails_closed_when_imported_base_is_unresolvable(
     assert "Child" in findings[0].message
 
 
+@pytest.mark.usefixtures("_isolated_nominal_allowlist")
 def test_audit_evidence_nominal_fails_closed_on_ambiguous_module_resolution(tmp_path: Path) -> None:
     # Two files under the root answer to the same module suffix; the rule must
     # not guess which one the import means.
@@ -465,6 +477,7 @@ def test_audit_evidence_nominal_fails_closed_on_ambiguous_module_resolution(tmp_
     assert [finding.message.split(" ")[0] for finding in findings] == ["Child"]
 
 
+@pytest.mark.usefixtures("_isolated_nominal_allowlist")
 def test_audit_evidence_nominal_imported_base_must_come_from_a_scanned_definition(tmp_path: Path) -> None:
     # The module resolves, but the named class there does NOT inherit the
     # canonical base — the child inherits nothing evidentiary.

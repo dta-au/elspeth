@@ -103,6 +103,35 @@ def test_upsert_node_admits_profiled_multi_query_llm(parity_env: Any) -> None:
     assert "max_capacity_retry_seconds" not in node.options
 
 
+@pytest.mark.parametrize("prefix", ["", "published"])
+def test_profiled_authoring_preserves_explicit_structured_publication_names(parity_env: Any, prefix: str) -> None:
+    options = _profiled_multi_query_options()
+    options.pop("prompt_template")
+    options.update(
+        query_input_mode="ordered",
+        queries=[
+            {
+                "name": "blue",
+                "structured_output_prefix": prefix,
+                "input_fields": {"color_name": "color_name"},
+                "template": "Assess {{ row.color_name }}",
+                "response_format": "structured",
+                "output_fields": [{"suffix": "amount", "type": "integer"}],
+            },
+            {
+                "name": "review",
+                "input_fields": {"candidate": f"{prefix}_amount" if prefix else "amount"},
+                "template": "Review {{ row.candidate }}",
+            },
+        ],
+    )
+    result = _run(parity_env, "upsert_node", _profiled_node(options), _empty_state())
+    assert result.success is True, result.data
+    node = next(n for n in result.updated_state.nodes if n.id == "assess_blue")
+    assert node.options["queries"][0]["structured_output_prefix"] == prefix
+    assert node.options["queries"][1]["input_fields"]["candidate"] == (f"{prefix}_amount" if prefix else "amount")
+
+
 def test_patch_node_options_rejects_authored_profile_temperature(parity_env: Any) -> None:
     created = _run(parity_env, "upsert_node", _profiled_node(_profiled_multi_query_options()), _empty_state())
     assert created.success is True, created.data

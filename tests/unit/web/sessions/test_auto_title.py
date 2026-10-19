@@ -1,118 +1,53 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
+import litellm
 import pytest
 from litellm import ModelResponse
 from litellm.exceptions import BadGatewayError, ServiceUnavailableError
 from litellm.exceptions import Timeout as LiteLLMTimeout
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
     AdmissionRefusalReason,
     ChargeableAdmissionDecision,
     ChargeableAdmissionRefused,
-    ChargeableOperation,
     QuotaDisposition,
 )
-from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
-from elspeth.web.composer import provider_gateway
+from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry
 from elspeth.web.sessions import _auto_title
+from elspeth.web.sessions.models import chat_messages_table, token_usage_ledger_table
 from elspeth.web.sessions.telemetry import _FakeCounter
+from tests.helpers.auto_title import RecordingTitleService as _TitleService
+from tests.helpers.auto_title import call_auto_title
 
-_DISPATCHED_AT = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
-
-
-class _TitleClock:
-    @staticmethod
-    def now(tz: object) -> datetime:
-        assert tz is UTC
-        return _DISPATCHED_AT
+_UNLINKED_LEDGER_AT = datetime(2026, 9, 15, 23, 59, 59, tzinfo=UTC)
 
 
-@pytest.fixture(autouse=True)
-def _freeze_dispatch_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_auto_title, "datetime", _TitleClock)
-
-
-class _TitleService:
-    def __init__(self) -> None:
-        self.updates: list[tuple[object, str]] = []
-        self.usage: list[tuple[str, object, tuple[TokenUsageEntry, ...]]] = []
-
-    async def begin_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
-    ) -> ProviderAttempt:
-        assert source == "auto_title"
-        assert run_id is None
-        decision = await self.assess_chargeable_operation(
-            session_operation_context=session_operation_context, operation=ChargeableOperation.AUTO_TITLE
-        )
-        if not decision.allowed:
-            raise ChargeableAdmissionRefused(decision)
-        return ProviderAttempt(attempt_id="title-attempt", started_at=datetime.now(UTC))
-
-    async def settle_provider_attempt(
-        self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-    ) -> None:
-        assert attempt_id == "title-attempt"
-        await self.record_token_usage(
-            session_operation_context=session_operation_context, source="auto_title", run_id=None, entries=(entry,)
-        )
-
-    async def record_token_usage(
-        self,
-        *,
-        session_operation_context: SessionOperationContext,
-        source: str,
-        run_id: object,
-        entries: tuple[TokenUsageEntry, ...],
-    ) -> tuple[str, ...]:
-        del session_operation_context
-        self.usage.append((source, run_id, entries))
-        return tuple(f"entry-{index}" for index in range(len(entries)))
-
-    async def assess_chargeable_operation(
-        self, *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
-    ) -> ChargeableAdmissionDecision:
-        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
-        assert operation is ChargeableOperation.AUTO_TITLE
-        return ChargeableAdmissionDecision(
-            refusal_reason=None,
-            evidence=AdmissionPolicyEvidence(quota_disposition=QuotaDisposition.NOT_CONFIGURED, secret_wiring_hash="a" * 64),
-        )
-
-    async def update_session_title(
-        self,
-        session_id: object,
-        title: str,
-        *,
-        session_operation_context: SessionOperationContext,
-    ) -> None:
-        del session_operation_context
-        self.updates.append((session_id, title))
-
-
-def _compose_context(session_id: object) -> SessionOperationContext:
-    return SessionOperationContext(
-        fence=SessionOperationFence(
-            session_id=str(session_id),
-            operation_id="auto-title-operation",
-            lease_token="auto-title-token",
-            operation_epoch=2,
-        ),
-        operation_kind=SessionOperationKind.COMPOSE,
-    )
-
-
-_TEST_SESSION_ID = uuid4()
-_TEST_CONTEXT = _compose_context(_TEST_SESSION_ID)
+def _actual_title_finished_at(service: _TitleService) -> datetime:
+    """Cross-check ledger time against the independently persisted provider audit."""
+    with service._engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(service.session_id))).all()
+    calls = [envelope["call"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "llm_call_audit"]
+    assert len(calls) == len(service.attempts) == 1
+    call = calls[0]
+    assert call["call_id"] == service.attempts[0].attempt_id
+    started_at = datetime.fromisoformat(call["started_at"])
+    finished_at = datetime.fromisoformat(call["finished_at"])
+    assert started_at == service.attempts[0].started_at
+    assert finished_at >= started_at
+    assert len(service.usage) == 1
+    assert service.usage[0][2][0].recorded_at == finished_at, "Actual title ledger completion must match persisted provider audit"
+    return finished_at
 
 
 def _completion(content: str | None) -> ModelResponse:
@@ -147,19 +82,69 @@ async def _run_auto_title(monkeypatch, response: object) -> tuple[_TitleService,
     async def _canned(**_kwargs: object) -> object:
         return response
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _canned)
+    monkeypatch.setattr(litellm, "acompletion", _canned)
     service = _TitleService()
-    session_id = uuid4()
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=session_id,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_compose_context(session_id),
     )
     return service, failed, rejected
+
+
+@pytest.mark.asyncio
+async def test_auto_title_required_guard_override_refuses_before_admission(monkeypatch) -> None:
+    calls = []
+
+    async def must_not_dispatch(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("Required guard refusal must precede physical SDK dispatch")
+
+    monkeypatch.setattr(litellm, "acompletion", must_not_dispatch)
+    service = _TitleService()
+    with pytest.raises(PromptGuardRefused) as caught:
+        await call_auto_title(
+            service=service,
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            prompt_guard_mode="required",
+        )
+    assert caught.value.disposition == "unavailable"
+    assert calls == service.attempts == service.updates == service.usage == []
+    with service._engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table)).all()
+    assert len(rows) == 1
+    check = rows[0].tool_calls[0]["check"]
+    assert (check["role"], check["mode"], check["disposition"]) == ("composer", "required", "unavailable")
+
+
+@pytest.mark.asyncio
+async def test_recording_title_usage_does_not_hide_unlinked_ledger_rows(monkeypatch) -> None:
+    service, _failed, _rejected = await _run_auto_title(monkeypatch, _completion("Useful Pipeline"))
+    assert len(service.usage) == 1
+    assert service.usage[0][2][0].call_id == service.attempts[0].attempt_id
+    with service._engine.begin() as connection:
+        connection.execute(
+            insert(token_usage_ledger_table).values(
+                entry_id=str(uuid4()),
+                identity_id="title-user",
+                source="auto_title",
+                session_id=str(service.session_id),
+                run_id=None,
+                model="controlled/title",
+                prompt_tokens=1,
+                completion_tokens=1,
+                cached_prompt_tokens=None,
+                reasoning_tokens=None,
+                recorded_at=_UNLINKED_LEDGER_AT,
+            )
+        )
+    with pytest.raises(AssertionError, match="Title ledger rows must retain their actual provider attempt"):
+        _ = service.usage
 
 
 # The exact completion shape from live acceptance 2026-08-04
@@ -351,28 +336,62 @@ async def test_auto_title_outbound_call_redacts_fences_and_truncates(monkeypatch
         captured.update(kwargs)
         return _completion("Useful Pipeline")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _capture)
+    monkeypatch.setattr(litellm, "acompletion", _capture)
     service = _TitleService()
     secret = "AKIA" + "A" * 16
-    session_id = uuid4()
-    await _auto_title.maybe_auto_title_session(
+    excerpt = _auto_title._build_auto_title_user_content(f"Use key {secret} to build a CSV pipeline. " + "x" * 5000)
+    assert secret not in excerpt
+    assert "<redacted-sensitive:aws_access_key>" in excerpt
+    await call_auto_title(
         service=service,
-        session_id=session_id,
-        user_message=f"Use key {secret} to build a CSV pipeline. " + "x" * 5000,
+        user_message="Build a CSV pipeline. " + "x" * 5000,
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_compose_context(session_id),
     )
     messages = captured["messages"]
     assert messages[0]["role"] == "system"
     user_content = messages[1]["content"]
     assert secret not in user_content
-    assert "<redacted-sensitive:aws_access_key>" in user_content
     assert user_content.count(_auto_title._AUTO_TITLE_EXCERPT_FENCE) == 2
     assert len(user_content) < _auto_title._AUTO_TITLE_EXCERPT_CHAR_LIMIT + 300
     assert captured["max_tokens"] == 40
     assert [title for _sid, title in service.updates] == ["Useful Pipeline"]
+
+
+@pytest.mark.asyncio
+async def test_auto_title_genuine_user_credentials_refuse_before_guard_and_sdk(monkeypatch) -> None:
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+
+    calls = []
+
+    async def provider(**kwargs):
+        calls.append(kwargs)
+        return _completion("Useful Pipeline")
+
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    service = _TitleService()
+    with pytest.raises(CredentialMaterialRefused):
+        await call_auto_title(
+            service=service,
+            user_message="Use key " + "AKIA" + "A" * 16 + " to build a CSV pipeline.",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+        )
+    assert calls == service.attempts == service.updates == service.usage == []
+    with service._engine.connect() as connection:
+        assert connection.execute(select(chat_messages_table)).all() == []
+
+
+@pytest.mark.asyncio
+async def test_title_clock_check_detects_ledger_timestamp_mutation(monkeypatch) -> None:
+    service, _failed, _rejected = await _run_auto_title(monkeypatch, _completion("Useful Pipeline"))
+    finished_at = _actual_title_finished_at(service)
+    with service._engine.begin() as connection:
+        connection.execute(update(token_usage_ledger_table).values(recorded_at=finished_at + timedelta(days=1)))
+    with pytest.raises(AssertionError, match="Actual title ledger completion must match persisted provider audit"):
+        _actual_title_finished_at(service)
 
 
 @pytest.mark.asyncio
@@ -385,36 +404,27 @@ async def test_auto_title_rejects_non_string_finish_reason_as_malformed(monkeypa
 
 @pytest.mark.asyncio
 async def test_auto_title_threads_exact_compose_context_to_title_write(monkeypatch) -> None:
-    session_id = uuid4()
-    context = _compose_context(session_id)
     observed: list[tuple[object, str, SessionOperationContext]] = []
 
     class _FencedTitleService(_TitleService):
-        async def update_session_title(
-            self,
-            session_id: object,
-            title: str,
-            *,
-            session_operation_context: SessionOperationContext,
-        ) -> None:
-            observed.append((session_id, title, session_operation_context))
+        async def before_title_write(self, session_id, title, context) -> None:
+            observed.append((session_id, title, context))
 
     async def _successful_completion(**_kwargs: object) -> object:
         return _completion("Fenced title")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _successful_completion)
+    monkeypatch.setattr(litellm, "acompletion", _successful_completion)
 
-    await _auto_title.maybe_auto_title_session(
-        service=_FencedTitleService(),  # type: ignore[arg-type]
-        session_id=session_id,
+    service = _FencedTitleService()
+    await call_auto_title(
+        service=service,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=context,
     )
 
-    assert observed == [(session_id, "Fenced title", context)]
+    assert observed == [(service.session_id, "Fenced title", service.last_context)]
 
 
 @pytest.mark.asyncio
@@ -425,17 +435,15 @@ async def test_auto_title_timeout_records_telemetry_and_returns(monkeypatch) -> 
     async def _raise_timeout(**_kwargs: object) -> object:
         raise TimeoutError("title generation timed out")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_timeout)
+    monkeypatch.setattr(litellm, "acompletion", _raise_timeout)
     service = _TitleService()
 
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
 
     assert service.updates == []
@@ -450,17 +458,15 @@ async def test_auto_title_malformed_provider_response_records_telemetry_and_retu
     async def _malformed_response(**_kwargs: object) -> object:
         return ModelResponse(choices=[])
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _malformed_response)
+    monkeypatch.setattr(litellm, "acompletion", _malformed_response)
     service = _TitleService()
 
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
 
     assert service.updates == []
@@ -475,17 +481,15 @@ async def test_auto_title_null_provider_content_is_an_explicit_no_title(monkeypa
     async def _null_content(**_kwargs: object) -> object:
         return _completion(None)
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _null_content)
+    monkeypatch.setattr(litellm, "acompletion", _null_content)
     service = _TitleService()
 
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
 
     assert service.updates == []
@@ -500,17 +504,15 @@ async def test_auto_title_rejects_non_string_provider_content(monkeypatch) -> No
     async def _wrong_content_type(**_kwargs: object) -> object:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=7))])
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _wrong_content_type)
+    monkeypatch.setattr(litellm, "acompletion", _wrong_content_type)
     service = _TitleService()
 
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
 
     assert service.updates == []
@@ -525,25 +527,23 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
     async def _raise_programmer_error(**_kwargs: object) -> object:
         raise TypeError("signature drift")
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_programmer_error)
+    monkeypatch.setattr(litellm, "acompletion", _raise_programmer_error)
 
     service = _TitleService()
     with pytest.raises(TypeError, match="signature drift"):
-        await _auto_title.maybe_auto_title_session(
+        await call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
 
     assert counter.calls == []
     assert service.updates == []
     assert len(service.usage) == 1
     entry = service.usage[0][2][0]
-    assert entry.call_id == "title-attempt"
+    assert entry.call_id == service.attempts[0].attempt_id
     assert entry.prompt_tokens is None
     assert entry.completion_tokens is None
 
@@ -556,23 +556,21 @@ async def test_auto_title_raw_transport_failure_settles_without_replacing_defaul
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(litellm, "acompletion", failing_provider)
     service = _TitleService()
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
 
     assert service.updates == []
     assert counter.calls == [(1, {"exception_class": "TransportError"}, None)]
     assert len(service.usage) == 1
     entry = service.usage[0][2][0]
-    assert entry.call_id == "title-attempt"
+    assert entry.call_id == service.attempts[0].attempt_id
     assert entry.prompt_tokens is None
     assert entry.completion_tokens is None
 
@@ -589,17 +587,15 @@ async def test_auto_title_first_party_http_error_after_response_is_not_provider_
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", response_from_provider)
+    monkeypatch.setattr(litellm, "acompletion", response_from_provider)
     service = _TitleService()
     with pytest.raises(httpx.ConnectError, match="local adapter bug"):
-        await _auto_title.maybe_auto_title_session(
+        await call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     assert counter.calls == []
     assert len(service.usage) == 1
@@ -607,27 +603,31 @@ async def test_auto_title_first_party_http_error_after_response_is_not_provider_
 
 @pytest.mark.asyncio
 async def test_auto_title_provider_failure_does_not_hide_failed_terminal_settlement(monkeypatch) -> None:
+    provider_failure = httpx.ConnectError("private upstream response")
+    settlement_failure = RuntimeError("ledger unavailable")
+
     async def failing_provider(**_kwargs: object) -> object:
-        raise httpx.ConnectError("private upstream response")
+        raise provider_failure
 
     class _FailingSettlementService(_TitleService):
-        async def settle_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-        ) -> None:
-            raise RuntimeError("ledger unavailable")
+        async def before_settlement(self) -> None:
+            raise settlement_failure
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(litellm, "acompletion", failing_provider)
     service = _FailingSettlementService()
-    with pytest.raises(AuditIntegrityError, match="could not be settled"):
-        await _auto_title.maybe_auto_title_session(
+    with pytest.raises(ExceptionGroup) as caught:
+        await call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
+    provider, settlement = caught.value.exceptions
+    assert type(provider) is _auto_title._AutoTitleProviderTransportError
+    assert provider.__cause__ is provider_failure
+    assert type(settlement) is ComposerOwnedSettlementFailure
+    assert settlement.__cause__ is settlement_failure
     assert service.usage == []
 
 
@@ -640,30 +640,27 @@ async def test_auto_title_title_write_failure_propagates(monkeypatch, error_type
     async def _completion_response(**_kwargs: object) -> object:
         return _completion("Useful Pipeline")
 
+    write_failure = error_type("database unavailable")
+
     class _FailingService(_TitleService):
-        async def update_session_title(
-            self,
-            session_id: object,
-            title: str,
-            *,
-            session_operation_context: SessionOperationContext,
-        ) -> None:
-            del session_id, title, session_operation_context
-            raise error_type("database unavailable")
+        async def before_title_write(self, session_id, title, context) -> None:
+            raise write_failure
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _completion_response)
+    monkeypatch.setattr(litellm, "acompletion", _completion_response)
 
-    with pytest.raises(error_type, match="database unavailable"):
-        await _auto_title.maybe_auto_title_session(
-            service=_FailingService(),
-            session_id=_TEST_SESSION_ID,
+    service = _FailingService()
+    with pytest.raises(ComposerOwnedSettlementFailure) as caught:
+        await call_auto_title(
+            service=service,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
 
+    assert caught.value.__cause__ is write_failure
+    assert service.updates == []
+    assert len(service.usage) == 1
     assert counter.calls == []
 
 
@@ -676,16 +673,14 @@ async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) 
     async def cancelled_provider(**kwargs: object) -> object:
         raise cancellation
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(litellm, "acompletion", cancelled_provider)
     with pytest.raises(asyncio.CancelledError) as caught:
-        await _auto_title.maybe_auto_title_session(
+        await call_auto_title(
             service=_TitleService(),
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     assert caught.value is cancellation
     assert counter.calls == [(1, {"exception_class": "CancelledError"}, None)]
@@ -701,35 +696,32 @@ async def test_auto_title_repeated_cancellation_finishes_settlement_and_preserve
         raise original
 
     class _BlockingSettlementService(_TitleService):
-        async def settle_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-        ) -> None:
+        async def before_settlement(self) -> None:
             settlement_started.set()
             await release_settlement.wait()
-            await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
 
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(litellm, "acompletion", cancelled_provider)
     service = _BlockingSettlementService()
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     )
     await asyncio.wait_for(settlement_started.wait(), timeout=1)
     task.cancel()
     release_settlement.set()
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(BaseExceptionGroup) as caught:
         await asyncio.wait_for(task, timeout=1)
-    assert caught.value is original
+    first, repeated = caught.value.exceptions
+    assert first is original
+    assert type(repeated) is asyncio.CancelledError and repeated.args == ()
     assert len(service.usage) == 1
-    assert service.usage[0][2][0].call_id == "title-attempt"
+    assert service.usage[0][2][0].call_id == service.attempts[0].attempt_id
 
 
 @pytest.mark.asyncio
@@ -745,36 +737,37 @@ async def test_auto_title_provider_cancellation_preserves_failure_priority_durin
         raise original
 
     class _FailingSettlementService(_TitleService):
-        async def settle_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-        ) -> None:
+        async def before_settlement(self) -> None:
             settlement_started.set()
             await release_settlement.wait()
             raise settlement_failure
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", cancelled_provider)
+    monkeypatch.setattr(litellm, "acompletion", cancelled_provider)
     service = _FailingSettlementService()
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     )
     await asyncio.wait_for(settlement_started.wait(), timeout=1)
     task.cancel("second cancellation")
     release_settlement.set()
-    with pytest.raises(AuditIntegrityError) as caught:
+    with pytest.raises(BaseExceptionGroup) as caught:
         await asyncio.wait_for(task, timeout=1)
+    first, settlement_outcomes = caught.value.exceptions
+    assert first is original
+    assert type(settlement_outcomes) is BaseExceptionGroup
+    retained_failure, repeated = settlement_outcomes.exceptions
     if isinstance(settlement_failure, AuditIntegrityError):
-        assert caught.value is settlement_failure
-        assert caught.value.__cause__ is original
+        assert retained_failure is settlement_failure
     else:
-        assert caught.value.__cause__ is original
+        assert type(retained_failure) is ComposerOwnedSettlementFailure
+        assert retained_failure.__cause__ is settlement_failure
+    assert type(repeated) is asyncio.CancelledError and repeated.args == ("second cancellation",)
     assert service.usage == []
 
 
@@ -782,6 +775,7 @@ async def test_auto_title_provider_cancellation_preserves_failure_priority_durin
 @pytest.mark.parametrize("provider_cancelled", [False, True])
 async def test_auto_title_child_settlement_self_cancellation_fails_closed(monkeypatch, provider_cancelled: bool) -> None:
     original = asyncio.CancelledError("provider cancellation")
+    child_cancellation = asyncio.CancelledError("settlement stopped itself")
 
     async def provider(**_kwargs: object) -> object:
         if provider_cancelled:
@@ -789,25 +783,31 @@ async def test_auto_title_child_settlement_self_cancellation_fails_closed(monkey
         return _completion("Useful Pipeline")
 
     class _SelfCancellingSettlementService(_TitleService):
-        async def settle_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-        ) -> None:
-            raise asyncio.CancelledError("settlement stopped itself")
+        async def before_settlement(self) -> None:
+            raise child_cancellation
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
+    monkeypatch.setattr(litellm, "acompletion", provider)
     service = _SelfCancellingSettlementService()
-    with pytest.raises(AuditIntegrityError, match="settlement was cancelled") as caught:
-        await _auto_title.maybe_auto_title_session(
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     if provider_cancelled:
-        assert caught.value.__cause__ is original
+        first, settlement_outcomes = caught.value.exceptions
+        assert first is original
+        assert type(settlement_outcomes) is BaseExceptionGroup
+    else:
+        settlement_outcomes = caught.value
+    integrity, retained_child, shield_cancellation = settlement_outcomes.exceptions
+    assert type(integrity) is AuditIntegrityError
+    assert str(integrity) == "Required provider child lacks an actual delivered outcome"
+    assert integrity.__cause__ is child_cancellation
+    assert retained_child is child_cancellation
+    assert type(shield_cancellation) is asyncio.CancelledError and shield_cancellation.args == ()
     assert service.usage == []
 
 
@@ -820,24 +820,19 @@ async def test_auto_title_cancellation_during_success_settlement_finishes_accoun
         return _completion("Useful Pipeline")
 
     class _BlockingSettlementService(_TitleService):
-        async def settle_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, entry: TokenUsageEntry
-        ) -> None:
+        async def before_settlement(self) -> None:
             settlement_started.set()
             await release_settlement.wait()
-            await super().settle_provider_attempt(session_operation_context=session_operation_context, attempt_id=attempt_id, entry=entry)
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", successful_provider)
+    monkeypatch.setattr(litellm, "acompletion", successful_provider)
     service = _BlockingSettlementService()
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     )
     await asyncio.wait_for(settlement_started.wait(), timeout=1)
@@ -846,7 +841,7 @@ async def test_auto_title_cancellation_during_success_settlement_finishes_accoun
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=1)
     assert len(service.usage) == 1
-    assert service.usage[0][2][0].call_id == "title-attempt"
+    assert service.usage[0][2][0].call_id == service.attempts[0].attempt_id
     assert service.updates == []
 
 
@@ -864,40 +859,24 @@ async def test_auto_title_cancellation_during_admission_closes_undispatched_atte
         return _completion("Useful Pipeline")
 
     class _BlockingAdmissionService(_TitleService):
-        def __init__(self) -> None:
-            super().__init__()
-            self.cancelled_attempts: list[str] = []
-
-        async def begin_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
-        ) -> ProviderAttempt:
-            attempt = await super().begin_provider_attempt(
-                session_operation_context=session_operation_context, source=source, run_id=run_id
-            )
+        async def after_admission(self, attempt: ProviderAttempt) -> None:
             admission_started.set()
             await release_admission.wait()
-            return attempt
 
-        async def cancel_undispatched_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, attempt_id: str, requested_model: str
-        ) -> None:
-            assert session_operation_context == _TEST_CONTEXT
-            assert requested_model == "openai/test"
+        async def before_undispatched_cancellation(self, attempt_id: str, context: SessionOperationContext) -> None:
+            assert context is self.last_context
             closure_started.set()
             await release_closure.wait()
-            self.cancelled_attempts.append(attempt_id)
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
+    monkeypatch.setattr(litellm, "acompletion", provider)
     service = _BlockingAdmissionService()
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=service,
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     )
     await asyncio.wait_for(admission_started.wait(), timeout=1)
@@ -906,12 +885,17 @@ async def test_auto_title_cancellation_during_admission_closes_undispatched_atte
     await asyncio.wait_for(closure_started.wait(), timeout=1)
     task.cancel("second cancellation")
     release_closure.set()
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(BaseExceptionGroup) as caught:
         await asyncio.wait_for(task, timeout=1)
-    assert caught.value.args == ("admission cancellation",)
-    assert service.cancelled_attempts == ["title-attempt"]
+    first, repeated = caught.value.exceptions
+    assert type(first) is asyncio.CancelledError and first.args == ("admission cancellation",)
+    assert type(repeated) is asyncio.CancelledError and repeated.args == ("second cancellation",)
+    assert service.cancelled_attempts == [service.attempts[0].attempt_id]
     assert provider_calls == 0
-    assert service.usage == []
+    assert len(service.usage) == 1
+    entry = service.usage[0][2][0]
+    assert entry.call_id == service.attempts[0].attempt_id
+    assert (entry.prompt_tokens, entry.completion_tokens) == (0, 0)
 
 
 @pytest.mark.asyncio
@@ -919,6 +903,14 @@ async def test_auto_title_cancellation_wins_over_concurrent_admission_refusal(mo
     admission_started = asyncio.Event()
     release_admission = asyncio.Event()
     provider_calls = 0
+    refusal = ChargeableAdmissionRefused(
+        ChargeableAdmissionDecision(
+            refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
+            evidence=AdmissionPolicyEvidence(
+                identity_policy_id="test-policy", quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE, secret_wiring_hash="a" * 64
+            ),
+        )
+    )
 
     async def provider(**_kwargs: object) -> object:
         nonlocal provider_calls
@@ -926,44 +918,30 @@ async def test_auto_title_cancellation_wins_over_concurrent_admission_refusal(mo
         return _completion("Useful Pipeline")
 
     class _BlockingRefusalService(_TitleService):
-        async def begin_provider_attempt(
-            self, *, session_operation_context: SessionOperationContext, source: str, run_id: object = None
-        ) -> ProviderAttempt:
-            assert session_operation_context == _TEST_CONTEXT
-            assert source == "auto_title"
-            assert run_id is None
+        async def before_admission(self) -> None:
             admission_started.set()
             await release_admission.wait()
-            raise ChargeableAdmissionRefused(
-                ChargeableAdmissionDecision(
-                    refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
-                    evidence=AdmissionPolicyEvidence(
-                        identity_policy_id="test-policy",
-                        quota_disposition=QuotaDisposition.ACCOUNTING_UNAVAILABLE,
-                        secret_wiring_hash="a" * 64,
-                    ),
-                )
-            )
+            raise refusal
 
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", provider)
+    monkeypatch.setattr(litellm, "acompletion", provider)
     task = asyncio.create_task(
-        _auto_title.maybe_auto_title_session(
+        call_auto_title(
             service=_BlockingRefusalService(),
-            session_id=_TEST_SESSION_ID,
             user_message="Build a CSV pipeline",
             model="openai/test",
             temperature=None,
             seed=None,
-            session_operation_context=_TEST_CONTEXT,
         )
     )
     await asyncio.wait_for(admission_started.wait(), timeout=1)
     task.cancel("caller cancellation")
     await asyncio.sleep(0)
     release_admission.set()
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(BaseExceptionGroup) as caught:
         await asyncio.wait_for(task, timeout=1)
-    assert caught.value.args == ("caller cancellation",)
+    retained_refusal, cancellation = caught.value.exceptions
+    assert retained_refusal is refusal
+    assert type(cancellation) is asyncio.CancelledError and cancellation.args == ("caller cancellation",)
     assert provider_calls == 0
 
 
@@ -991,8 +969,8 @@ async def test_auto_title_charges_a_returned_completion_even_when_the_title_is_r
                     completion_tokens=4,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
-                    call_id="title-attempt",
+                    recorded_at=_actual_title_finished_at(service),
+                    call_id=service.attempts[0].attempt_id,
                 ),
             ),
         )
@@ -1014,8 +992,8 @@ async def test_auto_title_charges_an_unreported_completion_as_unknown_never_zero
                     completion_tokens=None,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
-                    call_id="title-attempt",
+                    recorded_at=_actual_title_finished_at(service),
+                    call_id=service.attempts[0].attempt_id,
                 ),
             ),
         )
@@ -1028,16 +1006,14 @@ async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) ->
         raise TimeoutError("title generation timed out")
 
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", _FakeCounter())
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", _raise_timeout)
+    monkeypatch.setattr(litellm, "acompletion", _raise_timeout)
     service = _TitleService()
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
     assert service.usage == [
         (
@@ -1050,8 +1026,8 @@ async def test_auto_title_provider_timeout_charges_unknown_usage(monkeypatch) ->
                     completion_tokens=None,
                     cached_prompt_tokens=None,
                     reasoning_tokens=None,
-                    recorded_at=_DISPATCHED_AT,
-                    call_id="title-attempt",
+                    recorded_at=_actual_title_finished_at(service),
+                    call_id=service.attempts[0].attempt_id,
                 ),
             ),
         )
@@ -1068,22 +1044,20 @@ async def test_auto_title_gateway_failure_settles_unknown_usage_without_title(mo
 
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
-    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", failing_provider)
+    monkeypatch.setattr(litellm, "acompletion", failing_provider)
     service = _TitleService()
-    await _auto_title.maybe_auto_title_session(
+    await call_auto_title(
         service=service,
-        session_id=_TEST_SESSION_ID,
         user_message="Build a CSV pipeline",
         model="openai/test",
         temperature=None,
         seed=None,
-        session_operation_context=_TEST_CONTEXT,
     )
     assert service.updates == []
     assert counter.calls == [(1, {"exception_class": error_type.__name__}, None)]
     assert len(service.usage) == 1
     entry = service.usage[0][2][0]
-    assert entry.call_id == "title-attempt"
+    assert entry.call_id == service.attempts[0].attempt_id
     assert entry.prompt_tokens is None
     assert entry.completion_tokens is None
 
@@ -1105,7 +1079,7 @@ async def test_auto_title_malformed_response_preserves_reported_or_unknown_usage
         completion_tokens=0 if reported else None,
         cached_prompt_tokens=None,
         reasoning_tokens=None,
-        recorded_at=_DISPATCHED_AT,
-        call_id="title-attempt",
+        recorded_at=_actual_title_finished_at(service),
+        call_id=service.attempts[0].attempt_id,
     )
     assert service.usage == [("auto_title", None, (expected,))]

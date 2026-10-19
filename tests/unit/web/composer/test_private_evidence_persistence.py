@@ -63,32 +63,88 @@ def forbid_unmocked_sdk_transport(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_private_persistence_guard_refuses_unmocked_sdk_transport(forbid_unmocked_sdk_transport, composer_service_with_real_sessions):
-    import litellm
+async def test_private_persistence_guard_refuses_unmocked_sdk_transport(
+    forbid_unmocked_sdk_transport, composer_service_with_real_sessions, result_session_id, monkeypatch
+):
+    from uuid import uuid4
 
+    import httpx
+    import litellm
+    from pydantic import SecretStr
+
+    from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
+    from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.state import CompositionState, PipelineMetadata
     from elspeth.web.composer.turn_effects import TurnEvidence
-
-    state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    evidence = TurnEvidence(
-        session_id=None,
-        session_operation_context=None,
-        request_id="sdk-guard-negative-control",
-        request="Explain",
-        initial_state_id=None,
-        initial_state=state,
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
+    from elspeth.web.required_work import (
+        RequiredAuthorityKind,
+        RequiredWorkAuthority,
+        RequiredWorkBinding,
+        RequiredWorkCoordinator,
+        RequiredWorkRole,
     )
-    assert litellm.acompletion is forbid_unmocked_sdk_transport
-    with pytest.raises(AssertionError, match="must explicitly mock SDK transport"):
-        await composer_service_with_real_sessions._advisor_checkpoint._run_advisor_checkpoint(
-            phase="end",
-            state=state,
-            session_id=None,
-            session_operation_context=None,
-            recorder=BufferingRecorder(),
-            user_message="Explain",
-            publication_review=evidence.review_candidate(candidate="Explanation", request="Explain", current_state=state),
+
+    guard_requests = []
+
+    def inspect(request):
+        body = json.loads(request.content)
+        guard_requests.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in body["documents"]],
+            },
         )
+
+    guard_settings = PromptGuardSettings(endpoint="https://guard.example.test", subscription_key=SecretStr("synthetic-test-key"))
+    client = AzurePromptGuardClient(guard_settings, http_transport=httpx.MockTransport(inspect))
+    composer = composer_service_with_real_sessions
+    sessions = composer._require_sessions_service()
+    advisor = composer._advisor_checkpoint
+    monkeypatch.setattr(
+        advisor,
+        "_settings",
+        advisor._settings.model_copy(update={"composer_prompt_guard_mode": "required", "composer_advisor_prompt_guard": guard_settings}),
+    )
+    monkeypatch.setattr(advisor, "_prompt_guard_mount", PromptGuardMount(client))
+    state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    assert litellm.acompletion is forbid_unmocked_sdk_transport
+    async with acquire_compose_context(sessions, UUID(result_session_id)) as context:
+        user_message = await sessions.add_message(
+            UUID(result_session_id),
+            "user",
+            "Explain",
+            writer_principal="route_user_message",
+            session_operation_context=context,
+        )
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+        )
+        owner = ProviderInvocationOwner(service=sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+        evidence = TurnEvidence(
+            session_id=result_session_id,
+            session_operation_context=context,
+            request_id=str(user_message.id),
+            request=user_message.content,
+            initial_state_id=None,
+            initial_state=state,
+        )
+        with prompt_guard_user_scope(user_message.content), pytest.raises(AssertionError, match="must explicitly mock SDK transport"):
+            await advisor._run_advisor_checkpoint(
+                phase="end",
+                state=state,
+                session_id=result_session_id,
+                session_operation_context=context,
+                recorder=BufferingRecorder(),
+                user_message=user_message.content,
+                publication_review=evidence.review_candidate(candidate="Explanation", request="Explain", current_state=state),
+                provider_owner=owner,
+            )
+        coordinator.assert_completed()
+        assert len(guard_requests) == 1 and guard_requests[0]["userPrompt"] == user_message.content
     assert forbid_unmocked_sdk_transport.unexpected_calls == 1
     # The teardown gate rejects an attempted call even after a consumer catches
     # its exception. Only this deliberate negative control acknowledges it.

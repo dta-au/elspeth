@@ -10,16 +10,53 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SKILL = ROOT / ".agents/skills/operating-azure-container-apps"
 COLD = ROOT / "docs/runbooks/azure-container-apps-cold-install.md"
+ARCHIVED_FACTS_LINK = (
+    "https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/"
+    "docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md"
+)
 
 
 def _blocks(path: Path) -> list[str]:
     return re.findall(r"```bash\n(.*?)```", path.read_text(), re.DOTALL)
+
+
+def _assert_markdown_target(path: Path, target: str) -> None:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc:
+        # Pin the same immutable authority as the ACA runbook contract. CI's
+        # shallow checkout need not contain this historical blob locally.
+        assert target == ARCHIVED_FACTS_LINK, f"Unexpected archive link: {target}"
+    else:
+        assert (path.parent / target).resolve().is_file(), target
+
+
+@pytest.mark.parametrize("target", ["SKILL.md", ARCHIVED_FACTS_LINK], ids=["local", "immutable-archive"])
+def test_skill_markdown_target_accepts_existing_documents(target: str) -> None:
+    _assert_markdown_target(SKILL / "SKILL.md", target)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "references/missing-document-control.md",
+        ARCHIVED_FACTS_LINK.replace("github.com", "example.com"),
+        ARCHIVED_FACTS_LINK.replace("58b25d524d9c5a2550b0f895ea8f70e1dea9ea51", "main"),
+        ARCHIVED_FACTS_LINK.replace("platform-facts.md", "missing-document-control.md"),
+        ARCHIVED_FACTS_LINK.replace("https://", "http://"),
+        ARCHIVED_FACTS_LINK.replace("https:", ""),
+    ],
+    ids=["missing-local", "wrong-host", "mutable-ref", "wrong-path", "insecure-scheme", "scheme-relative"],
+)
+def test_skill_markdown_target_rejects_broken_or_unapproved_documents(target: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_markdown_target(SKILL / "SKILL.md", target)
 
 
 @pytest.mark.parametrize("account", ["enclave-builder", "second-builder"])
@@ -52,7 +89,7 @@ def test_skill_routes_first_install_and_preserves_existing_store_hold() -> None:
         assert "Current policy: new stores only." in text
         assert "rollback are held, even if an older compatibility record permits rollback" in " ".join(text.split())
         for target in re.findall(r"\]\(([^)]+\.md)\)", text):
-            assert (path.parent / target).resolve().is_file(), target
+            _assert_markdown_target(path, target)
     build = (SKILL / "references/build-and-push-ghcr.md").read_text()
     assert "continue at step 3" in build
     assert "johnm-dta" not in build
@@ -76,6 +113,8 @@ def test_cold_install_native_azure_instructions_end_to_end_offline(tmp_path: Pat
         "azure-api-key",
         "sso-client-secret",
         "sso-transaction-secret",
+        "composer-prompt-guard",
+        "composer-advisor-prompt-guard",
     )
     for name in secret_names:
         (secrets / f"elspeth-{name}").write_text("synthetic-private-value")
@@ -222,3 +261,101 @@ PY
     assert not (operator / "environment.parameters.json").exists()
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert events[-1] == ["curl", "--silent", "--fail-with-body", "https://elspeth-web.example.com/api/system/status"]
+
+
+@pytest.mark.parametrize("missing_role", (None, "composer", "advisor"), ids=("both-configured", "missing-composer", "missing-advisor"))
+def test_application_example_supplies_both_required_guard_mounts_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_role: str | None
+) -> None:
+    """Check real parsing/mounts/availability, without asking a provider to run."""
+    import base64
+    import os
+    from unittest.mock import MagicMock
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.config import settings_from_env
+
+    text = (ROOT / "deploy/azure-container-apps/application.example.json").read_text()
+    for placeholder, value in {
+        "REPLACE_PRIMARY_PRICING_MODEL": "azure/gpt-4o",
+        "REPLACE_ADVISOR_PRICING_MODEL": "azure/gpt-4o-mini",
+        "REPLACE_PRIMARY_DEPLOYMENT": "enclave-primary",
+        "REPLACE_ADVISOR_DEPLOYMENT": "enclave-advisor",
+        "REPLACE_AZURE_RESOURCE": "enclave-models",
+        "REPLACE_AZURE_API_VERSION": "2024-10-21",
+        "REPLACE_ENTRA_TENANT_ID": "12345678-1234-1234-1234-123456789abc",
+        "REPLACE_ENTRA_CLIENT_ID": "12345678-1234-1234-1234-123456789def",
+        "REPLACE_APP_FQDN": "elspeth-web.example.com",
+        "REPLACE_FIRST_ADMIN_SUBJECT": "enclave-admin",
+    }.items():
+        text = text.replace(placeholder, value)
+    application = json.loads(text)
+    # These stand for secret-store values. The example must supply the pointers;
+    # this probe never injects a guard variable the example failed to declare.
+    secret_values = {
+        "azure-api-key": "synthetic-provider-value",
+        "sso-client-secret": "synthetic-client-value",
+        "sso-transaction-secret": "synthetic-transaction-value",
+        "composer-prompt-guard": json.dumps(
+            {
+                "adapter": "azure_prompt_shields",
+                "endpoint": "https://composer-shields.example.test",
+                "subscription_key": "synthetic-composer-shield-value",
+                "timeout_seconds": 10.0,
+            }
+        ),
+        "composer-advisor-prompt-guard": json.dumps(
+            {
+                "adapter": "azure_prompt_shields",
+                "endpoint": "https://advisor-shields.example.test",
+                "subscription_key": "synthetic-advisor-shield-value",
+                "timeout_seconds": 10.0,
+            }
+        ),
+    }
+    for key in tuple(os.environ):
+        if key.startswith("ELSPETH_WEB__") or key in {"AWS_REGION", "AWS_DEFAULT_REGION"}:
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("ELSPETH_WEB__DATA_DIR", str(tmp_path / "web"))
+    monkeypatch.setenv("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", base64.b64encode(b"synthetic-test-value-32-bytes-long").decode())
+    for parameter, field in (
+        ("composerMaxCompositionTurns", "COMPOSER_MAX_COMPOSITION_TURNS"),
+        ("composerMaxDiscoveryTurns", "COMPOSER_MAX_DISCOVERY_TURNS"),
+        ("composerTimeoutSeconds", "COMPOSER_TIMEOUT_SECONDS"),
+        ("composerRateLimitPerMinute", "COMPOSER_RATE_LIMIT_PER_MINUTE"),
+        ("composerModel", "COMPOSER_MODEL"),
+        ("composerAdvisorModel", "COMPOSER_ADVISOR_MODEL"),
+        ("authProvider", "AUTH_PROVIDER"),
+        ("registrationMode", "REGISTRATION_MODE"),
+    ):
+        monkeypatch.setenv("ELSPETH_WEB__" + field, str(application[parameter]))
+    for entry in application["extraEnvironment"]:
+        value = entry["value"] if "value" in entry else secret_values[entry["secretRef"]]
+        monkeypatch.setenv(entry["name"], value)
+    if missing_role is not None:
+        missing_name = "COMPOSER_PROMPT_GUARD" if missing_role == "composer" else "COMPOSER_ADVISOR_PROMPT_GUARD"
+        monkeypatch.delenv("ELSPETH_WEB__" + missing_name, raising=False)
+    settings = settings_from_env()
+    service = ComposerServiceImpl.for_trained_operator(catalog=MagicMock(spec=CatalogService), settings=settings)
+    availability = service.get_availability()
+    assert settings.composer_prompt_guard_mode == "required"
+    assert availability.available == (missing_role is None), availability.reason
+    if missing_role is not None:
+        assert availability.reason == f"Composer is unavailable: required prompt guard configuration is missing for {missing_role}."
+        return
+    assert settings.composer_prompt_guard is not None
+    assert settings.composer_advisor_prompt_guard is not None
+    assert settings.composer_prompt_guard.endpoint == "https://composer-shields.example.test"
+    assert settings.composer_advisor_prompt_guard.endpoint == "https://advisor-shields.example.test"
+    assert settings.composer_prompt_guard.subscription_key.get_secret_value() == "synthetic-composer-shield-value"
+    assert settings.composer_advisor_prompt_guard.subscription_key.get_secret_value() == "synthetic-advisor-shield-value"
+    assert service.composer_prompt_guard_mount is not None
+    assert service._advisor_prompt_guard_mount is not None
+    assert type(service.composer_prompt_guard_mount.client) is AzurePromptGuardClient
+    assert type(service._advisor_prompt_guard_mount.client) is AzurePromptGuardClient
+    assert service.composer_prompt_guard_mount is not service._advisor_prompt_guard_mount
+    references = {entry["name"]: entry["secretRef"] for entry in application["extraEnvironment"] if "secretRef" in entry}
+    assert references["ELSPETH_WEB__COMPOSER_PROMPT_GUARD"] == "composer-prompt-guard"
+    assert references["ELSPETH_WEB__COMPOSER_ADVISOR_PROMPT_GUARD"] == "composer-advisor-prompt-guard"

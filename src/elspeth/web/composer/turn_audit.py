@@ -25,6 +25,7 @@ from elspeth.web.composer.tool_error_payloads import (
 )
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.interpretation_state import pending_execution_interpretation_sites
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
@@ -369,30 +370,55 @@ async def persist_turn_audit(
                 "wire_conformant": tool_outcome.wire_conformant,
             },
         )
-    redacted_tool_rows = tuple(
-        RedactedToolRow(
-            tool_call_id=tool_outcome.call.id,
-            content=_serialize_response_via_walker(
-                tool_outcome,
-                telemetry=redaction_telemetry,
-                failure_status=(
-                    None
-                    if tool_outcome.error_class is None
-                    else (
-                        ComposerToolStatus.PLUGIN_CRASH
-                        if crash_pending and index == len(tool_outcomes) - 1
-                        else ComposerToolStatus.ARG_ERROR
-                    )
-                ),
-            ),
-            composition_state_payload=(
-                _state_payload_for_compose_turn(tool_outcome.response, ingress=ingress, chat_ingress_inputs=chat_ingress_inputs)
-                if tool_outcome.post_version > tool_outcome.pre_version
-                else None
+
+    def visible_event_for(outcome: _ToolOutcome, display_result: str) -> VisibleToolEvent | None:
+        if session_operation_context is None:
+            return None
+        authoring = next((item for item in private_authorings if item.tool_call_id == outcome.call.id), None)
+        received, effective, selected = (
+            turn_evidence.transcript.current_tool_strings(outcome.call.id, outcome.call.function.name)
+            if turn_evidence is not None
+            else (None, None, None)
+        )
+        display_call = next(item for item in redacted_assistant_tool_calls if item["id"] == outcome.call.id)
+        return VisibleToolEvent.capture(
+            context=session_operation_context,
+            request_id=turn_evidence.request_id if turn_evidence is not None else None,
+            tool_call_id=outcome.call.id,
+            tool_name=outcome.call.function.name,
+            received_arguments=received if received is not None else authoring.raw_arguments if authoring is not None else None,
+            effective_arguments=effective if effective is not None else outcome.call.function.arguments,
+            selected_result=selected,
+            display_arguments=display_call["function"]["arguments"],
+            display_result=display_result,
+        )
+
+    redacted_rows: list[RedactedToolRow] = []
+    for index, tool_outcome in enumerate(tool_outcomes):
+        display_result = _serialize_response_via_walker(
+            tool_outcome,
+            telemetry=redaction_telemetry,
+            failure_status=(
+                None
+                if tool_outcome.error_class is None
+                else (
+                    ComposerToolStatus.PLUGIN_CRASH if crash_pending and index == len(tool_outcomes) - 1 else ComposerToolStatus.ARG_ERROR
+                )
             ),
         )
-        for index, tool_outcome in enumerate(tool_outcomes)
-    )
+        redacted_rows.append(
+            RedactedToolRow(
+                tool_call_id=tool_outcome.call.id,
+                content=display_result,
+                composition_state_payload=(
+                    _state_payload_for_compose_turn(tool_outcome.response, ingress=ingress, chat_ingress_inputs=chat_ingress_inputs)
+                    if tool_outcome.post_version > tool_outcome.pre_version
+                    else None
+                ),
+                visible_event=visible_event_for(tool_outcome, display_result),
+            )
+        )
+    redacted_tool_rows = tuple(redacted_rows)
     failed_turn: FailedTurnMetadata | None = None
     unwind_audit_failed = False
     checkpoint_projection = None

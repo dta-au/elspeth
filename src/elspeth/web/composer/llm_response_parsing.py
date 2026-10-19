@@ -34,7 +34,7 @@ import math
 import re
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import (
@@ -68,7 +68,9 @@ from elspeth.web.composer.bounded_json import (
     JsonTraversalBudget,
     require_bounded_text,
 )
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.provider_quota import ProviderCallCustody, bind_provider_attempt
+from elspeth.web.composer.provider_thinking import parse_native_thinking_blocks
 from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
 
 if TYPE_CHECKING:
@@ -500,6 +502,16 @@ def _json_safe_provider_artifact(value: Any) -> Any:
         return PROVIDER_ARTIFACT_UNAVAILABLE
 
 
+def _native_thinking_artifact(value: object) -> object:
+    """Keep complete native replay separate from bounded diagnostic artifacts."""
+    if value is None:
+        return None
+    try:
+        return parse_native_thinking_blocks(value)
+    except ComposerAdmissionRefused:
+        return PROVIDER_ARTIFACT_UNAVAILABLE
+
+
 def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadata:
     message = _first_response_message(response)
     return _reasoning_metadata_from_message(message)
@@ -533,7 +545,7 @@ def _reasoning_metadata_from_message(message: Any | None) -> _ReasoningMetadata:
     return {
         "reasoning_content": reasoning_content,
         "reasoning_details": _json_safe_provider_artifact(reasoning_details),
-        "thinking_blocks": _json_safe_provider_artifact(_response_field(message, "thinking_blocks")),
+        "thinking_blocks": _native_thinking_artifact(_response_field(message, "thinking_blocks")),
     }
 
 
@@ -730,6 +742,7 @@ def build_llm_call_record(
             strict_tool_count = 0
         else:
             raise AuditIntegrityError("sent tool list mixes strict-stamped and unstamped tools")
+    elapsed_ns = time.monotonic_ns() - started_ns
     call = ComposerLLMCall(
         model_requested=model_requested,
         pricing_model=pricing_model if pricing_model is not None else model_requested,
@@ -748,13 +761,13 @@ def build_llm_call_record(
         thinking_blocks=reasoning_metadata["thinking_blocks"],
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
-        latency_ms=(time.monotonic_ns() - started_ns) // 1_000_000,
+        latency_ms=elapsed_ns // 1_000_000,
         provider_request_id=provider_request_id,
         messages_hash=stable_hash(messages),
         tools_spec_hash=stable_hash(tools) if tools is not None else None,
         declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),
         started_at=started_at,
-        finished_at=datetime.now(UTC),
+        finished_at=started_at + timedelta(microseconds=elapsed_ns // 1_000),
         error_class=error_class,
         error_message=_safe_llm_error_message(error_message),
         private_failure=capture_failure_facts(failure) if failure is not None else None,

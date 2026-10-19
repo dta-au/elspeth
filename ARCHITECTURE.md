@@ -87,9 +87,9 @@ Authenticated fetches remain disabled pending a protected response-evidence
 boundary. Browser admission/archive contracts exist in
 [`core/browser`](src/elspeth/core/browser/), but no live browser plugin or
 enforcing worker is available. Configuration and limits live in the
-[web scrape reference](docs/reference/web-scrape-transform.md); the
-[browser egress gate](docs/design/2026-09-29-web-browser-egress-gate.md) records
-the isolation required before live browser admission.
+[web scrape reference](docs/reference/web-scrape-transform.md). Live browser
+admission requires a separately isolated worker and enforcing gateway, with
+deployment proof that traffic cannot bypass audit and destination policy.
 
 The [graph validation ADR](docs/architecture/adr/003-schema-validation-lifecycle.md),
 [token lifecycle](docs/architecture/token-lifecycle.md), and

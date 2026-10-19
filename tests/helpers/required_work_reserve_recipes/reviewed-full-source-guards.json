@@ -30,7 +30,7 @@
       "worker_lost_error",
       "project_composer_operation_error"
     ],
-    "sha256": "f5e136be9beeefdc3a6b82d7e965f41ad3aa63d50d5b9f5b8d825a600bad9e70"
+    "sha256": "cdfd3808c76f1c75efc353ac106a0c5a357d872b9f199c50beba4ba6d1e6f2f0"
   },
   "src/elspeth/web/sessions/composer_operations.py": {
     "protected_exports": [
@@ -58,10 +58,10 @@
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
-    "sha256": "7a958b2559914e9de66b6a0a3c34ce3397e04219cdb07a689a5d1d0f1b13dd9b"
+    "sha256": "66362e7215018900c42e15495ba0fa673f0e47f83a073c0803abd5589db6db28"
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "b49ee8a9c0182e61ac4765f16551b4e43e3e0643a83eb4675ec2059f2712f733"
+    "sha256": "c09d30315462d853a68edb8cbf2043dfec9eee793d7f50291097dfc091bb9dee"
   }
 }

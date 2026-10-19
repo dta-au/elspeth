@@ -21,12 +21,14 @@ from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     AuditExportFormat,
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
+    SinkEffectAuditContextCapability,
     SinkEffectAuditExportSnapshotInput,
     SinkEffectCommitResult,
     SinkEffectExecutionPurpose,
@@ -75,6 +77,23 @@ from elspeth.plugins.sinks._local_file_effects import (
 )
 
 
+class CSVRowRejectedError(RuntimeError):
+    """A required pipeline row was refused before CSV effect publication."""
+
+
+_AUDIT_CONTEXT_FIELDS = (
+    "run_id",
+    "row_id",
+    "token_id",
+    "ingest_sequence",
+    "outcome",
+    "path",
+    "error_hash",
+    "primary_effect_id",
+    "row_json",
+)
+
+
 class CSVSinkConfig(SinkPathConfig):
     """Configuration for CSV sink plugin.
 
@@ -87,6 +106,44 @@ class CSVSinkConfig(SinkPathConfig):
     delimiter: str = Field(default=",", description="Single-character delimiter used when writing CSV fields.")
     encoding: str = Field(default="utf-8", description="Text encoding used when writing the CSV file.")
     mode: Literal["write", "append"] = Field(default="write", description="Whether to create/replace the CSV file or append rows.")
+    require_all_rows: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "For pipeline rows, fail preparation before publication if any row cannot be represented, "
+            "instead of diverting or discarding it. Use for required retention outputs. "
+            "False preserves on_write_failure routing. Does not roll back earlier publications."
+        ),
+    )
+    include_audit_context: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Write a fixed retention envelope with actual run/row/token identity, outcome/path, audit error reference "
+            "and the complete carried row as canonical row_json. Requires require_all_rows=true, observed schema, "
+            "normalized headers and mode=write. References depend on retained Landscape evidence; no raw diagnostic "
+            "text or business failure explanation is synthesized."
+        ),
+    )
+    include_error_reason: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Add a bounded readable error_reason backed by the exact durable source/transform failure handoff. "
+            "Requires include_audit_context=true. Missing, ambiguous, redacted or unsupported causes stop preparation; "
+            "hash-only linked sink diversions are unsupported. Earlier publications are not rolled back."
+        ),
+    )
+    include_disposition_reason: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Add disposition_kind and disposition_reason backed by an exact durable source/transform failure "
+            "or a unique completed Boolean gate route to this sink. Requires include_audit_context=true; "
+            "mutually exclusive with include_error_reason. Gate routing remains a successful decision, not an error. "
+            "Missing, ambiguous or redacted evidence and linked sink diversions stop preparation."
+        ),
+    )
 
     @field_validator("delimiter")
     @classmethod
@@ -115,8 +172,25 @@ class CSVSinkConfig(SinkPathConfig):
         )
         return self
 
+    @model_validator(mode="after")
+    def _validate_audit_context_configuration(self) -> CSVSinkConfig:
+        if self.include_error_reason and not self.include_audit_context:
+            raise ValueError("include_error_reason requires include_audit_context=true")
+        if self.include_disposition_reason and not self.include_audit_context:
+            raise ValueError("include_disposition_reason requires include_audit_context=true")
+        if self.include_error_reason and self.include_disposition_reason:
+            raise ValueError("include_error_reason and include_disposition_reason are mutually exclusive")
+        if self.include_audit_context and (
+            not self.require_all_rows
+            or not self.schema_config.is_observed
+            or self.headers not in (None, "normalized")
+            or self.mode != "write"
+        ):
+            raise ValueError("include_audit_context requires require_all_rows=true, observed schema, normalized headers and mode=write")
+        return self
 
-class CSVSink(BaseSink):
+
+class CSVSink(BaseSink, SinkEffectAuditContextCapability):
     """Write rows to a CSV file.
 
     Returns ArtifactDescriptor with SHA-256 content hash for audit integrity.
@@ -131,6 +205,10 @@ class CSVSink(BaseSink):
         delimiter: Field delimiter (default: ",")
         encoding: File encoding (default: "utf-8")
         mode: "write" (truncate, default) or "append" (add to existing file)
+        require_all_rows: Stop preparation if a pipeline row is refused (default: False)
+        include_audit_context: Render a fixed, audit-linked retention envelope (default: False)
+        include_error_reason: Require a readable durable source/transform cause (default: False)
+        include_disposition_reason: Require a verified failure or Boolean gate reason (default: False)
 
     The schema can be (all use infer-and-lock pattern):
         - Fixed: {"mode": "fixed", "fields": [...]} - columns from config, extras rejected
@@ -145,7 +223,7 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cb4119567e0d1b1c"
+    source_file_hash: str | None = "sha256:198b2883591f0b54"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -155,11 +233,12 @@ class CSVSink(BaseSink):
 
     usage_when_to_use: str = (
         "Use for portable flat tabular output with controlled columns and headers, including append/resume workflows "
-        "whose first accepted row can lock an observed schema."
+        "whose first accepted row can lock an observed schema. For heterogeneous retained failures, explicitly select "
+        "include_audit_context with require_all_rows to preserve carried rows and their audit references."
     )
     usage_when_not_to_use: str = (
-        "Do not use for nested or binary values, or when output columns may drift after the first accepted row; choose a "
-        "structured format instead."
+        "Do not use raw-column CSV for nested or binary values, or when columns may drift after the first accepted row. "
+        "Choose a structured format, or the explicit audit-context retention envelope for canonical carried rows."
     )
     example_use: str = """sinks:
   results:
@@ -191,6 +270,8 @@ class CSVSink(BaseSink):
 
     @classmethod
     def _validate_audit_export_config(cls, cfg: CSVSinkConfig) -> None:
+        if cfg.include_audit_context:
+            raise SinkEffectCapabilityError("CSV audit-context envelopes are for pipeline rows, not audit exports")
         if cfg.mode != "write" or cfg.collision_policy not in {None, "fail_if_exists"}:
             raise SinkEffectCapabilityError(
                 "CSV audit export requires mode='write' and create-only collision policy 'fail_if_exists' or null"
@@ -227,6 +308,23 @@ class CSVSink(BaseSink):
     # Resume capability: CSV can append to existing files
     supports_resume: bool = True
     _collision_policy: OutputCollisionPolicy | None
+
+    @property
+    def requires_audit_context(self) -> bool:
+        return self._include_audit_context
+
+    @property
+    def requires_error_reason(self) -> bool:
+        return self._include_error_reason
+
+    @property
+    def requires_disposition_reason(self) -> bool:
+        return self._include_disposition_reason
+
+    def _audit_context_fields(self) -> tuple[str, ...]:
+        if self._include_disposition_reason:
+            return (*_AUDIT_CONTEXT_FIELDS, "disposition_kind", "disposition_reason")
+        return (*_AUDIT_CONTEXT_FIELDS, "error_reason") if self._include_error_reason else _AUDIT_CONTEXT_FIELDS
 
     def configure_for_resume(self) -> None:
         """Configure CSV sink for resume mode.
@@ -266,6 +364,15 @@ class CSVSink(BaseSink):
         # Empty file = valid (will write headers on first write)
         if not existing:
             return OutputValidationResult.success()
+
+        if self._include_audit_context:
+            if existing != list(self._audit_context_fields()):
+                return OutputValidationResult.failure(
+                    message="CSV audit-context envelope headers do not match",
+                    target_fields=existing,
+                    schema_fields=list(self._audit_context_fields()),
+                )
+            return OutputValidationResult.success(target_fields=existing)
 
         # Dynamic schema = no validation needed
         if self._schema_config.is_observed:
@@ -331,6 +438,10 @@ class CSVSink(BaseSink):
         self._delimiter = cfg.delimiter
         self._encoding = cfg.encoding
         self._mode = cfg.mode
+        self._require_all_rows = cfg.require_all_rows
+        self._include_audit_context = cfg.include_audit_context
+        self._include_error_reason = cfg.include_error_reason
+        self._include_disposition_reason = cfg.include_disposition_reason
         self._collision_policy = cfg.collision_policy
         if self._mode != "append" and not plugin_preflight_mode_enabled():
             self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
@@ -380,12 +491,16 @@ class CSVSink(BaseSink):
             self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
         return inspect_local_effect(target_path=self._path, request=request)
 
+    def _divert_row(self, row_data: dict[str, object], *, row_index: int, reason: str) -> None:
+        if self._require_all_rows:
+            raise CSVRowRejectedError(f"CSV row {row_index} refused with require_all_rows=true: {reason}") from None
+        super()._divert_row(row_data, row_index=row_index, reason=reason)
+
     def prepare_effect(
         self,
         request: SinkEffectPrepareRequest,
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectPlan:
-        del ctx
         if type(request.effect_input) is SinkEffectAuditExportSnapshotInput:
             return prepare_audit_export_bundle(target_path=self._requested_path, request=request)
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
@@ -402,7 +517,38 @@ class CSVSink(BaseSink):
             target_snapshot_members=target_snapshot_members,
         )
         baseline_nonempty = include_baseline and target.exists() and target.stat().st_size > 0
-        rows = [deep_thaw(member.row) for member in emitted_members]
+        if self._include_audit_context:
+            rows = []
+            for member in emitted_members:
+                routing = member.routing_context
+                if routing is None:
+                    raise CSVRowRejectedError("CSV audit-context envelope requires verified routing context")
+                rows.append(
+                    {
+                        "run_id": ctx.run_id,
+                        "row_id": member.row_id,
+                        "token_id": member.token_id,
+                        "ingest_sequence": member.ingest_sequence,
+                        "outcome": routing.outcome.value,
+                        "path": routing.path.value,
+                        "error_hash": routing.error_hash,
+                        "primary_effect_id": routing.primary_effect_id,
+                        "row_json": canonical_json(deep_thaw(member.row)),
+                    }
+                )
+                if self._include_error_reason:
+                    if routing.error_reason is None:
+                        raise CSVRowRejectedError("Readable CSV error retention requires a verified durable cause")
+                    rows[-1]["error_reason"] = routing.error_reason.text
+                if self._include_disposition_reason:
+                    from elspeth.contracts.sink_effects import SinkEffectErrorReason
+
+                    if routing.disposition_reason is None:
+                        raise CSVRowRejectedError("Readable CSV disposition retention requires a verified durable reason")
+                    rows[-1]["disposition_kind"] = "error" if type(routing.disposition_reason) is SinkEffectErrorReason else "gate_route"
+                    rows[-1]["disposition_reason"] = routing.disposition_reason.text
+        else:
+            rows = [deep_thaw(member.row) for member in emitted_members]
 
         if baseline_nonempty:
             validation = self.validate_output_target()
@@ -417,6 +563,9 @@ class CSVSink(BaseSink):
             else:
                 data_fields = existing_headers
             display_fields = existing_headers
+        elif self._include_audit_context:
+            data_fields = list(self._audit_context_fields())
+            display_fields = data_fields
         else:
             data_fields, display_fields = self._get_field_names_and_display(rows[0])
 
@@ -600,7 +749,8 @@ class CSVSink(BaseSink):
                     "delimiter (default ',', single character) is an operator concern — pick for the consuming tool (Excel: ','; analytics tools may prefer '\\t'). Quoting is fixed (standard csv quoting); only delimiter and encoding are configurable.",
                     "collision_policy: 'fail_if_exists', 'auto_increment', or 'append_or_create' (only with mode: append). Unset is the default and OVERWRITES/truncates an existing file — set it deliberately to protect prior runs.",
                     "To guarantee column order, set schema.mode='fixed' and order schema.fields explicitly, including quarantine sinks. 'observed' infers order from first-row keys. headers changes display names only. Resume appends must preserve established order.",
-                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name so per-row write errors don't crash the run; omitting it fails validation.",
+                    "on_write_failure is REQUIRED (no default): set 'discard' (drop with an audit record) or a quarantine sink name for per-row write errors; omitting it fails validation.",
+                    "Set options.require_all_rows=true when every pipeline row must be retained: a row refusal then stops preparation before publication instead of routing or discarding it. Earlier publications are not rolled back.",
                 ),
             )
         return None

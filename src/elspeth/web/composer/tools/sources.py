@@ -38,6 +38,7 @@ from elspeth.web.composer.source_inspection import (
     delimiter_for_filename,
     facts_to_dict,
     inspect_blob_content,
+    inspect_csv_source_content,
 )
 from elspeth.web.composer.state import (
     CompositionState,
@@ -155,6 +156,7 @@ def _bounded_csv_rows(content: str, *, delimiter: str = ",") -> Iterator[list[st
 
 class InspectSourceArgumentsModel(BaseModel):
     blob_id: str
+    encoding: str | None = Field(default=None, strict=True, min_length=1, max_length=128)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1885,7 +1887,8 @@ def _execute_inspect_source(
     Mirrors the lifecycle and integrity guards of ``_execute_get_blob_content``
     (only ``ready`` blobs are readable; SHA-256 verified; UnicodeDecodeError
     surfaced as tool-failure) but returns ``SourceInspectionFacts`` rather
-    than raw content. Reads at most 8 KiB and parses at most 100 rows.
+    than raw content. Inspects at most an 8 KiB prefix and parses at most
+    100 rows; streams the full file to verify its integrity hash.
 
     Never returns raw row content — only summary facts (headers, inferred
     types, URL candidates, warnings, redacted identity).
@@ -1933,6 +1936,35 @@ def _execute_inspect_source(
         content_hash=blob["content_hash"],
         total_size_bytes=blob["size_bytes"],
     )
+    if validated.encoding is not None:
+        if facts.source_kind != "csv":
+            return _failure_result(state, "Explicit encoding is supported only for CSV or TSV source inspection.")
+        try:
+            encoding = codecs.lookup(validated.encoding).name
+            # Validate the external codec against the bounded bytes before the
+            # owned facts builder. Non-text codecs and unsupported error modes
+            # are user input errors; facts-builder invariant failures still raise.
+            data.decode(encoding, errors="replace")
+        except (LookupError, ValueError):
+            return _failure_result(state, "CSV inspection requires a supported text encoding.")
+        facts = inspect_csv_source_content(
+            content=data,
+            filename=blob["filename"],
+            mime_type=blob["mime_type"],
+            delimiter=delimiter_for_filename(blob["filename"]) or ",",
+            skip_rows=0,
+            blob_id=UUID(blob_id),
+            content_hash=blob["content_hash"],
+            total_size_bytes=blob["size_bytes"],
+            encoding=encoding,
+        )
+        facts = replace(
+            facts,
+            warnings=(
+                *facts.warnings,
+                f"csv_explicit_encoding: {encoding}; applies only to this bounded inspection and does not configure the pipeline source",
+            ),
+        )
     facts_payload = facts_to_dict(facts)
     try:
         require_no_credential_material(facts_payload, surface="composer_source_inspection")
@@ -1954,14 +1986,17 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
         "Return bounded structural facts about a blob-backed source: `source_kind`, "
         "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
         "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
-        "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
-        "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
-        "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
+        "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window "
+        "inspected) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
+        "`content_hash_prefix` — nothing secret). Inspects at most an 8 KiB prefix and parses at most 100 rows; "
+        "streams the full file to verify its integrity hash. Use this "
         "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
         "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
         "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
         "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
         "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+        "For CSV/TSV, pass encoding when the intended source encoding is known (for example utf-8-sig for a UTF-8 BOM). "
+        "This selects only the inspection's decoding; configure the same encoding on the source separately. "
         "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
         "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
         "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
@@ -1974,6 +2009,12 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
             "blob_id": {
                 "type": "string",
                 "description": "ID of the blob to inspect.",
+            },
+            "encoding": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "Explicit CSV/TSV text encoding for this bounded inspection only. Use null for default blob inspection.",
             },
         },
         "required": ["blob_id"],

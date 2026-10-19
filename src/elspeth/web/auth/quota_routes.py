@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import MAX_AUTH_AUDIT_TEXT_LENGTH, AuthAuditWriter
@@ -29,12 +29,16 @@ class IdentityQuotaView(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     identity_id: str
-    tokens_per_day: int | None
-    storage_bytes: int | None
-    container_tokens_per_day: int | None
-    container_storage_bytes: int | None
-    tokens_used_today: int | None
-    storage_bytes_used: int
+    tokens_per_day: str | None
+    storage_bytes: str | None
+    container_tokens_per_day: str | None
+    container_storage_bytes: str | None
+    tokens_used_today: str | None
+    storage_bytes_used: str
+    policy_state: Literal["active", "never_issued", "suspended"]
+    can_edit: bool
+    container_tokens_used_today: str | None
+    container_storage_bytes_used: str
 
 
 class SetQuotaBody(BaseModel):
@@ -44,6 +48,17 @@ class SetQuotaBody(BaseModel):
     value: int = Field(ge=1, le=MAX_QUOTA_VALUE)
     on_behalf_of: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     console_request_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+    @field_validator("value", mode="before", json_schema_input_type=int | str)
+    @classmethod
+    def _exact_quantity(cls, value: object) -> int:
+        # JSON numbers remain accepted for existing clients only when every
+        # JavaScript implementation can represent them exactly.
+        if type(value) is int and 1 <= value <= 2**53 - 1:
+            return value
+        if type(value) is str and value.isascii() and value.isdecimal() and 1 <= len(value) <= 19:
+            return int(value)
+        raise ValueError("quota value must be a decimal string or an exact safe integer")
 
     @model_validator(mode="after")
     def _reject_credential_material(self) -> SetQuotaBody:
@@ -68,27 +83,24 @@ def _authority(request: Request) -> RepositoryQuotaPolicyAuthority:
     return authority
 
 
-def _view(status: IdentityQuotaStatus) -> IdentityQuotaView:
+def _quantity(value: int | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _view(status: IdentityQuotaStatus, settings: WebSettings) -> IdentityQuotaView:
     return IdentityQuotaView(
         identity_id=status.identity_id,
-        tokens_per_day=None if status.identity_policy is None else status.identity_policy.tokens_per_day,
-        storage_bytes=None if status.identity_policy is None else status.identity_policy.storage_bytes,
-        container_tokens_per_day=None if status.container_policy is None else status.container_policy.tokens_per_day,
-        container_storage_bytes=None if status.container_policy is None else status.container_policy.storage_bytes,
-        tokens_used_today=status.tokens_used_today,
-        storage_bytes_used=status.storage_bytes_used,
-    )
-
-
-def _changed_view(change: QuotaPolicyChange) -> IdentityQuotaView:
-    return _view(
-        IdentityQuotaStatus(
-            identity_id=change.identity_id,
-            identity_policy=change.policy,
-            container_policy=change.container_policy,
-            tokens_used_today=change.tokens_used_today,
-            storage_bytes_used=change.storage_bytes_used,
-        )
+        tokens_per_day=_quantity(None if status.identity_policy is None else status.identity_policy.tokens_per_day),
+        storage_bytes=_quantity(None if status.identity_policy is None else status.identity_policy.storage_bytes),
+        container_tokens_per_day=_quantity(None if status.container_policy is None else status.container_policy.tokens_per_day),
+        container_storage_bytes=_quantity(None if status.container_policy is None else status.container_policy.storage_bytes),
+        tokens_used_today=_quantity(status.tokens_used_today),
+        storage_bytes_used=str(status.storage_bytes_used),
+        policy_state=status.policy_state,
+        can_edit=status.policy_state != "never_issued"
+        or (settings.quota_default_tokens_per_day is not None and settings.quota_default_storage_bytes is not None),
+        container_tokens_used_today=_quantity(status.container_tokens_used_today),
+        container_storage_bytes_used=str(status.container_storage_bytes_used),
     )
 
 
@@ -131,7 +143,7 @@ def create_quota_router() -> APIRouter:
         except QuotaTargetNotFound as exc:
             raise _refused(exc) from exc
         _uncacheable(response)
-        return _view(status)
+        return _view(status, request.app.state.settings)
 
     @router.get("/identities/{identity_id}", response_model=IdentityQuotaView)
     async def identity_quota(
@@ -145,7 +157,7 @@ def create_quota_router() -> APIRouter:
         except QuotaTargetNotFound as exc:
             raise _refused(exc) from exc
         _uncacheable(response)
-        return _view(status)
+        return _view(status, request.app.state.settings)
 
     @router.post("/identities/{identity_id}", response_model=IdentityQuotaView)
     async def set_identity_quota(
@@ -163,7 +175,7 @@ def create_quota_router() -> APIRouter:
             recorder.record_quota_set(request, provider=settings.auth_provider, change=change)
 
         try:
-            change = await run_sync_in_worker(
+            await run_sync_in_worker(
                 authority.set_identity_policy,
                 actor=IdentityAdminActor(
                     identity_id=admin.user_id,
@@ -180,7 +192,7 @@ def create_quota_router() -> APIRouter:
         except QuotaPolicyRefusal as exc:
             raise _refused(exc) from exc
         _uncacheable(response)
-        return _changed_view(change)
+        return _view(await run_sync_in_worker(authority.status, identity_id=identity_id), settings)
 
     @router.post("/identities/{identity_id}/revoke", response_model=IdentityQuotaView)
     async def revoke_identity_quota(
@@ -198,7 +210,7 @@ def create_quota_router() -> APIRouter:
             recorder.record_quota_set(request, provider=settings.auth_provider, change=change)
 
         try:
-            change = await run_sync_in_worker(
+            await run_sync_in_worker(
                 authority.revoke_identity_policy,
                 actor=IdentityAdminActor(
                     identity_id=admin.user_id,
@@ -211,6 +223,6 @@ def create_quota_router() -> APIRouter:
         except QuotaPolicyRefusal as exc:
             raise _refused(exc) from exc
         _uncacheable(response)
-        return _changed_view(change)
+        return _view(await run_sync_in_worker(authority.status, identity_id=identity_id), settings)
 
     return router

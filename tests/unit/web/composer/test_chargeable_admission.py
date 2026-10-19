@@ -6,7 +6,9 @@ from typing import cast
 from unittest.mock import patch
 from uuid import UUID
 
+import litellm
 import pytest
+from sqlalchemy import select, update
 
 from elspeth.contracts.chargeable_admission import (
     AdmissionPolicyEvidence,
@@ -17,20 +19,47 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
-from elspeth.web.composer import provider_gateway, provider_quota
+from elspeth.web.composer import provider_quota
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.sessions import _auto_title
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageSource
+from elspeth.web.required_work import RequiredWorkTicket
+from elspeth.web.sessions.models import chat_messages_table, identities_table
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, SessionServiceProtocol
+from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.auto_title import RecordingTitleService, call_auto_title
 
 _SESSION_ID = "00000000-0000-0000-0000-000000000001"
+# Logical admission/scope tests stop before physical custody or durable work.
 _CONTEXT = SessionOperationContext(
-    fence=SessionOperationFence(session_id=_SESSION_ID, operation_id="operation", lease_token="token", operation_epoch=1),
+    fence=SessionOperationFence(
+        session_id=_SESSION_ID, operation_id="00000000-0000-0000-0000-000000000003", lease_token="token", operation_epoch=1
+    ),
     operation_kind=SessionOperationKind.COMPOSE,
 )
+
+
+async def _add_originating_user_message(service: SessionServiceImpl, session_id: UUID, message: str) -> str:
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
+    async with lease:
+        row = await service.add_message(
+            session_id,
+            "user",
+            message,
+            writer_principal="route_user_message",
+            session_operation_context=lease.context,
+        )
+    return str(row.id)
 
 
 class _AdmissionService:
@@ -56,12 +85,6 @@ class _AdmissionService:
         assert session_operation_context == _CONTEXT
         self.operations.append(operation)
         return self.decision
-
-    async def begin_provider_attempt(self, *, session_operation_context: SessionOperationContext, source: str) -> None:
-        assert session_operation_context == _CONTEXT
-        assert source == "auto_title"
-        self.operations.append(ChargeableOperation.AUTO_TITLE)
-        raise ChargeableAdmissionRefused(self.decision)
 
 
 @pytest.mark.asyncio
@@ -148,62 +171,111 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
 @pytest.mark.asyncio
 async def test_auto_title_checks_admission_before_provider() -> None:
     authority = _AdmissionService(AdmissionRefusalReason.IDENTITY_DISABLED)
-    with patch.object(provider_gateway, "_litellm_acompletion", autospec=True) as provider:
-        await _auto_title.maybe_auto_title_session(
-            service=cast(SessionServiceProtocol, authority),
-            session_id=UUID(_SESSION_ID),
+    service = RecordingTitleService()
+    await _add_originating_user_message(service, service.session_id, "Build a pipeline")
+    with service._engine.begin() as connection:
+        connection.execute(update(identities_table).where(identities_table.c.identity_id == "title-user").values(access_state="disabled"))
+    original_begin = service.begin_provider_attempt
+
+    async def observe_admission(
+        *,
+        session_operation_context: SessionOperationContext,
+        source: TokenUsageSource,
+        run_id: UUID | None = None,
+        required_work: RequiredWorkTicket | None = None,
+    ) -> ProviderAttempt:
+        assert session_operation_context is service.last_context
+        assert source == "auto_title"
+        authority.operations.append(ChargeableOperation.AUTO_TITLE)
+        try:
+            return await original_begin(
+                session_operation_context=session_operation_context, source=source, run_id=run_id, required_work=required_work
+            )
+        except ChargeableAdmissionRefused as refusal:
+            assert refusal.decision.refusal_reason is AdmissionRefusalReason.IDENTITY_DISABLED
+            raise
+
+    with (
+        patch.object(service, "begin_provider_attempt", new=observe_admission),
+        patch.object(litellm, "acompletion", autospec=True) as provider,
+    ):
+        await call_auto_title(
+            service=service,
             user_message="Build a pipeline",
             model="test",
             temperature=None,
             seed=None,
-            session_operation_context=_CONTEXT,
+            prompt_guard_mount=None,
+            prompt_guard_mode="debug-when-unconfigured",
         )
     provider.assert_not_called()
     assert authority.operations == [ChargeableOperation.AUTO_TITLE]
+    assert service.attempts == service.updates == service.usage == []
+    with service._engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.role == "audit")).all()
+    assert len(rows) == 1
+    assert rows[0].tool_calls[0]["_kind"] == "prompt_guard_audit"
+    check = rows[0].tool_calls[0]["check"]
+    assert (check["role"], check["mode"], check["disposition"]) == ("composer", "debug-when-unconfigured", "debug_bypass")
 
 
 class _PlannerReached(RuntimeError):
     """Stop at the real planner entry without invoking a network provider."""
 
 
-class _ProviderReached(BaseException):
-    """Stop exactly at the provider boundary without activating provider retries."""
+class _ProviderReached(RuntimeError):
+    """Stop at the SDK with an auditable first-party error that is not retried."""
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("allowed", [True, False])
 async def test_rootless_admission_controls_actual_provider_transition(
-    composer_service_with_real_sessions: ComposerServiceImpl, allowed: bool
+    composer_service_with_real_sessions: ComposerServiceImpl, result_session_id: str, allowed: bool
 ) -> None:
     service = composer_service_with_real_sessions
     sessions = service._sessions_service
     assert sessions is not None
     authority = _AdmissionService(None if allowed else AdmissionRefusalReason.IDENTITY_DISABLED)
+    message = "Build a CSV pipeline"
+    message_id = await _add_originating_user_message(sessions, UUID(result_session_id), message)
+    actual_contexts: list[SessionOperationContext] = []
+
+    async def assess_actual_operation(
+        *, session_operation_context: SessionOperationContext, operation: ChargeableOperation
+    ) -> ChargeableAdmissionDecision:
+        assert session_operation_context.fence.session_id == result_session_id
+        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
+        await sessions._run_sync(sessions.session_operation_authority.compare_and_swap, session_operation_context)
+        actual_contexts.append(session_operation_context)
+        authority.operations.append(operation)
+        return authority.decision
+
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     preferences = ComposerSessionPreferencesRecord(
-        session_id=UUID(_SESSION_ID),
+        session_id=UUID(result_session_id),
         trust_mode="explicit_approve",
         density_default="medium",
         interpretation_review_disabled=False,
         updated_at=datetime.now(UTC),
     )
     with (
-        patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
+        patch.object(sessions, "assess_chargeable_operation", new=assess_actual_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", autospec=True, side_effect=_ProviderReached) as provider,
+        patch.object(litellm, "acompletion", autospec=True, side_effect=_ProviderReached) as provider,
         pytest.raises(_ProviderReached if allowed else ComposerAdmissionRefused),
     ):
         await service.compose(
-            "Build a CSV pipeline",
+            message,
             [],
             state,
-            session_id=_SESSION_ID,
-            user_id="owner",
-            user_message_id="00000000-0000-0000-0000-000000000002",
-            session_operation_context=_CONTEXT,
+            session_id=result_session_id,
+            user_id="phase3-test-user",
+            user_message_id=message_id,
         )
     assert authority.operations == [ChargeableOperation.COMPOSER]
     assert provider.await_count == int(allowed)
+    assert len(actual_contexts) == 1
+    assert provider_quota._SCOPE.get() is None
 
 
 @pytest.mark.asyncio
@@ -276,7 +348,12 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     second_context = SessionOperationContext(
-        fence=SessionOperationFence(session_id="second-session", operation_id="second-operation", lease_token="token", operation_epoch=1),
+        fence=SessionOperationFence(
+            session_id="00000000-0000-0000-0000-000000000004",
+            operation_id="00000000-0000-0000-0000-000000000005",
+            lease_token="token",
+            operation_epoch=1,
+        ),
         operation_kind=SessionOperationKind.COMPOSE,
     )
     reached = asyncio.Event()
@@ -305,6 +382,6 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
             service.explain_run_diagnostics({}, session_operation_context=_CONTEXT),
             service.explain_run_diagnostics({}, session_operation_context=second_context),
         )
-    assert results == [_SESSION_ID, "second-session"]
+    assert results == [_SESSION_ID, second_context.fence.session_id]
     assert contexts == [_CONTEXT, second_context]
     assert provider_quota._SCOPE.get() is None

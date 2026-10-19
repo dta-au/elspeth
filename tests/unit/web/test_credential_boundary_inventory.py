@@ -320,20 +320,18 @@ _PROVIDER_MODULES = (
 )
 _PROVIDER_CALL_DISPOSITIONS = {
     "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": "complete_response_guard",
-    "src/elspeth/web/composer/boot_probe.py:probe_composer_config._litellm_acompletion": "discarded_probe_response",
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body.completion": "complete_response_guard",
+    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/pipeline_planner.py:_complete_planner_provider._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": "request_guard",
-    "src/elspeth/web/sessions/_auto_title.py:maybe_auto_title_session._litellm_acompletion": "admitted_title_only",
     "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": "admitted_title_only",
 }
 _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": (
         ("AdvisorCheckpointOwner._call_advisor_with_audit_body", "_require_no_credential_material_in_completion_fields"),
     ),
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body.completion": (
+    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body._litellm_acompletion": (
         ("_parse_response_tool_calls", "require_no_credential_material"),
         ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
         ("_plan_pipeline_inner", "build_llm_call_record"),
@@ -354,9 +352,6 @@ _PROVIDER_GUARD_OWNERS = {
     ),
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": (
         ("_litellm_acompletion", "require_no_credential_material"),
-    ),
-    "src/elspeth/web/sessions/_auto_title.py:maybe_auto_title_session._litellm_acompletion": (
-        ("_admit_title_candidate", "reject_credential_shaped_content"),
     ),
     "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": (
         ("_admit_title_candidate", "reject_credential_shaped_content"),

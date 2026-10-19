@@ -690,7 +690,7 @@ not required to restore the previous application task definition.
 ## References
 
 - [ELSPETH AWS ECS deployment](aws-ecs-deployment.md)
-- [ELSPETH AWS ECS health and readiness](../operator/aws-ecs-health-and-readiness.md)
+- [ELSPETH AWS ECS health and readiness](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/operator/aws-ecs-health-and-readiness.md)
 - [ELSPETH web plugin policy configuration](../reference/configuration.md#web-plugin-policy)
 - [AWS: Request access to models](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html)
 - [AWS: Claude Opus 4.6 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-6.html)

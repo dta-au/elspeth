@@ -461,6 +461,11 @@ class BaseTransform(ABC):
     # abort at run time.
     requires_aggregation_batch_context: bool = False
 
+    # Complete-source comparisons cannot run after an early flush. Admission
+    # refuses count/timeout/condition triggers; the plugin also checks its
+    # actual durable flush window before producing an admission decision.
+    requires_complete_source_batch: bool = False
+
     # True only for a batch-aware plugin whose every successful flush emits
     # exactly one row per buffered row, in buffered order, as
     # TransformResult.success_multi (also for a one-row batch) and with no

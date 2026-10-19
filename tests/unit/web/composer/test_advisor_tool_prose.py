@@ -9,6 +9,6 @@ def test_advisor_tool_prose_not_stale() -> None:
     description = _REQUEST_ADVISOR_HINT_DEFINITION["description"]
     assert isinstance(description, str)
     assert "Disabled by default" not in description
-    # The mandatory END sign-off is profile-gated and runs independently of the
-    # on-demand escape budget; the corrected prose says so.
-    assert "operator-configured" in description
+    # On-demand advice cannot replace the independent END publication review.
+    assert "Independent END publication review still applies" in description
+    assert "errors do not confirm a stop" in description

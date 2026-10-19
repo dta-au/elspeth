@@ -8068,7 +8068,7 @@ class TestComposerRuntimeBatchPlacementAgreement:
             assert not runtime.is_valid
 
     def test_both_reject_every_registered_non_declaring_batch_plugin_under_passthrough(self, tmp_path: Path) -> None:
-        """Every shipped batch plugin but batch_rank reduces, replicates or skips rows, so passthrough refuses it.
+        """Only the ranker and duplicate annotator preserve one row per batch member.
 
         Both refusals are decided on the class before any plugin option is
         read, so the node carries only a schema.
@@ -8078,7 +8078,10 @@ class TestComposerRuntimeBatchPlacementAgreement:
         batch_plugins = [cls for cls in get_shared_plugin_manager().get_transforms() if cls.is_batch_aware]
         names = sorted(cls.name for cls in batch_plugins if not cls.flush_emits_one_row_per_buffered_row)
         assert len(names) >= 13, names  # positive control: the registry is populated
-        assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == ["batch_rank"]
+        assert sorted(cls.name for cls in batch_plugins if cls.flush_emits_one_row_per_buffered_row) == [
+            "batch_duplicate_annotator",
+            "batch_rank",
+        ]
         for name in names:
             state = self._state(tmp_path, self._aggregation(name, "passthrough"))
 

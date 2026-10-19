@@ -210,15 +210,27 @@ def test_actual_content_producer_preserves_truncation_and_origin_pair(large: boo
     contract = blobs._GET_BLOB_CONTENT_DECLARATION.response_contract
     assert contract is blobs._BLOB_CONTENT_RESPONSE
     wire = contract.admit(result.data).to_wire()
+    end = wire["end_char"]
+    assert 0 < end < len(text) if large else end == len(text)
     assert wire == {
         **_CONTENT,
-        "content": text[:50000],
+        "content": text[:end],
         "truncated": large,
         "created_by": created_by,
         "size_bytes": len(text.encode()),
         "total_chars": len(text),
-        "end_char": min(50000, len(text)),
-        "next_offset_chars": 50000 if large else None,
+        "end_char": end,
+        "next_offset_chars": end if large else None,
+        **(
+            {
+                "read_attachment_suggestion": (
+                    "This is a partial page of a large attachment. If you need the whole file, use read_attachment "
+                    "for complete guarded UTF-8 text in one call; it explicitly refuses if the full response cannot fit."
+                )
+            }
+            if large
+            else {}
+        ),
     }
     assert json.dumps(wire) == json.dumps(deep_thaw(result.data))
 
@@ -249,7 +261,7 @@ def test_ready_null_hash_producer_retains_integrity_exception() -> None:
         blobs._sync_list_ready_blob_inline_descriptors(engine, "response")
 
 
-@pytest.mark.parametrize("filename_chars", [0, 1_000, 6_000])
+@pytest.mark.parametrize("filename_chars", [0, 100, 1_000, 6_000])
 def test_complete_selected_page_bound_includes_variable_metadata(filename_chars: int) -> None:
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 
@@ -259,14 +271,14 @@ def test_complete_selected_page_bound_includes_variable_metadata(filename_chars:
     record = {**_RECORD, "filename": "🙂" * filename_chars}
     with patch.object(blobs, "_locked_read_ready_blob", autospec=True, return_value=(record, b"x" * 50_001)):
         result = blobs._execute_get_blob_content({"blob_id": _ID}, _empty_state(), context)
-    if filename_chars == 6_000:
+    if filename_chars >= 1_000:
         assert not result.success
         assert result.data is None
         assert "no content was returned" in result.validation.errors[0].message
     else:
         assert result.success
         encoded = serialize_admitted_discovery_result(admit_discovery_result("get_blob_content", result))
-        assert len(encoded.encode("utf-8")) <= 65_536
+        assert len(encoded.encode("utf-8")) <= 4_096
         assert 0 < result.data["end_char"] < result.data["total_chars"]
         assert result.data["next_offset_chars"] == result.data["end_char"]
 

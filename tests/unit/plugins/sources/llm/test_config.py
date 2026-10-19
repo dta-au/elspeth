@@ -22,6 +22,11 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 
 TRANSFORM_ONLY_FIELDS = {
     "required_input_fields",
+    # These predicates inspect an arriving row or its transform result. The
+    # source has no arriving row and publishes its own emitted-field contract.
+    "allow_blank_input_fields",
+    "input_checks",
+    "result_checks",
     "queries",
     "query_input_mode",
     "pool_size",

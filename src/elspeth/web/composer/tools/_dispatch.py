@@ -50,6 +50,7 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _composition_canonical_interpretation_requirement_error,
     _failure_result,
+    _saved_graph_rejection_result,
     build_plugin_schemas_for_failure,
     normalize_tool_result_validation,
 )
@@ -135,24 +136,18 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
     {
         "name": "request_advisor_hint",
         "description": (
-            "ESCAPE HATCH — call when one of the declared trigger criteria applies: "
-            "proactive security/safety wiring review before `set_pipeline`, or "
-            "proactive red-listed plugin review before `set_pipeline`. The proactive "
-            "security trigger covers content moderation, prompt-injection defence, "
-            "secret routing, PII/regulatory sinks, and externally fetched content "
-            "flowing toward LLMs. Forwards your problem statement and context to a "
-            "frontier model and returns guidance text. The reply is ADVICE, not "
-            "configuration — you must still call the appropriate mutation tool "
-            "yourself to apply any change. Budget is finite (sized per compose "
-            "request, not per session lifetime) and exhausting it returns a "
-            "structured error rather than crashing — inspect budget_remaining "
-            "in each response. Do NOT call this tool in a loop, do NOT use it "
-            "as a substitute for reading validator output. Availability is "
-            "operator-configured; the mandatory END sign-off checkpoint runs "
-            "independently of this on-demand escape. Each reply carries `status` "
-            "(`SUCCESS`, `BUDGET_EXHAUSTED`, `COMPOSE_TIMEOUT`, `DEADLINE_TOO_CLOSE`, "
-            "or `ADVISOR_ERROR`), the `guidance` text, `budget_remaining`, and a "
-            "`note` restating that the guidance is advice, not configuration."
+            "ESCAPE HATCH — use cannot_complete as soon as missing or contradictory information, "
+            "an unavailable capability, or an unreasonable requirement prevents a faithful result. "
+            "Give your specific reason, evidence and attempted actions. Call it ALONE in its batch. "
+            "The advisor receives the actual request, graph and available evidence and returns "
+            "CONTINUE or CONTINUE_WITH_LIMITATION with a supported next action while useful work remains. "
+            "Retain each scoped limitation for final review. STOP_CONFIRMED applies only when no remaining "
+            "authorized useful action can proceed: explain the limit or ask the precise missing question without claiming completion. "
+            "Unread available information is a discovery action, not evidence of impossibility. "
+            "Proactive security/safety and red-listed-plugin triggers remain advice before set_pipeline. "
+            "Security covers moderation, injection defence, secrets, PII/regulatory sinks and fetched content sent to LLMs. "
+            "Apply advice through your own verified mutation calls. Inspect status; errors do not confirm a stop. "
+            "Read validator output and do not repeat unsupported attempts. Independent END publication review still applies."
         ),
         "parameters": {
             "type": "object",
@@ -161,7 +156,8 @@ _REQUEST_ADVISOR_HINT_DEFINITION: Final[Mapping[str, Any]] = _validate_and_freez
                     "type": "string",
                     "enum": list(ADVISOR_TRIGGER_VALUES),
                     "description": (
-                        "Why this advisor call is allowed. Use "
+                        "Why this advisor call is allowed. Use cannot_complete for an early-return review "
+                        "of a specific suspected blocker, without requiring a formal impossibility proof. Use "
                         "proactive_security_safety before "
                         "set_pipeline for security/safety-sensitive flows. Use "
                         "proactive_red_listed_plugin before set_pipeline when the plan "
@@ -237,6 +233,9 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "the user in assistant prose; this tool is the review surface. If "
             "no composition state exists yet, stage the affected source or node "
             "first, wait for that tool result, then call this tool. "
+            "Finish the requested topology and all independent authorized authoring first: "
+            "a terminal pending-review result hands this turn to the user and removes ordinary authoring tools. "
+            "Use this handoff when user review is the remaining blocker, after resolving non-review errors. "
             "Do not call this merely because a concrete operator is present "
             "(e.g., 'rate 1-10'), but do call it when you authored the scale "
             "semantics, rubric, thresholds, category meaning, or subjective "
@@ -934,10 +933,16 @@ def execute_tool(
             return normalize_tool_result_validation(argument_error, catalog)
 
     if _requires_secret_context(tool_name) and (secret_service is None or user_id is None):
-        return normalize_tool_result_validation(
-            _failure_result(state, "Secret tools require secret service context."),
+        result = normalize_tool_result_validation(
+            _saved_graph_rejection_result(
+                state,
+                "Secret tools require secret service context.",
+                error_code="secret_context_unavailable",
+                rejected_component=None,
+            ),
             catalog,
         )
+        return _augment_with_validation_guidance(result, tool_name)
 
     # ``current_validation`` carries the live state's ValidationSummary
     # into ``diff_pipeline`` so its delta against the baseline is computed
@@ -1023,7 +1028,12 @@ def execute_discovery_tool_with_context(
     assert argument_error is None
     if _requires_secret_context(tool_name) and (context.secret_service is None or context.user_id is None):
         return normalize_tool_result_validation(
-            _failure_result(state, "Secret tools require secret service context."),
+            _saved_graph_rejection_result(
+                state,
+                "Secret tools require secret service context.",
+                error_code="secret_context_unavailable",
+                rejected_component=None,
+            ),
             context.catalog,
         )
     prior_validation = context.current_validation or context.catalog.validate_composition_state(state).validation

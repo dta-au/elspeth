@@ -84,10 +84,12 @@ gateway_oauth_auth_method = "client_secret_basic"
 
 # Bounds exercised by the Composer gateway integration tests: boot submits
 # the complete tool schemas, and sessions include the rendered system prompt.
+# String allowance: measured system 137547 + supported overlay 65536 + separator 7,
+# plus a rounded-up 5% reserve (10155). The independent 1 MiB body cap still applies.
 # Review these against the agency upstream's limits and workload before deploying.
 gateway_max_messages     = 50
 gateway_max_tools        = 60
-gateway_max_string_chars = 131072
+gateway_max_string_chars = 214102
 gateway_max_schema_bytes = 65536
 gateway_max_schema_depth = 15
 

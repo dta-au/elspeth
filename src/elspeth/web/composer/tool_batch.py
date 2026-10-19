@@ -27,6 +27,11 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PromptGuardToolArgumentParts,
+)
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -51,6 +56,7 @@ from elspeth.web.composer._required_paths_validator import (
     _find_missing_required_paths,
 )
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.advisor_request import advisor_feedback_payload
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -82,6 +88,7 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.discovery_cache import (
     admitted_result_from_cached_discovery_payload,
+    tool_result_content_parts,
 )
 from elspeth.web.composer.discovery_cache import (
     cached_discovery_payload as _cached_discovery_payload,
@@ -101,6 +108,7 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_response import (
     AdmittedDiscoveryResult,
     admit_discovery_result,
+    preview_source_proof_stop,
     serialize_admitted_discovery_result,
 )
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
@@ -125,6 +133,8 @@ from elspeth.web.composer.progress import (
     tool_completed_progress_event,
     tool_started_progress_event,
 )
+from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
@@ -165,7 +175,8 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import _candidate_rejection_result, _saved_graph_rejection_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
-from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.composer.tools.generation import MalformedSourceProofClaim, _admit_source_proof_claims
+from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_CANNOT_COMPLETE, RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
 from elspeth.web.credential_guard import (
     require_no_credential_material,
@@ -488,8 +499,29 @@ def _pre_dispatch_argument_error(tool_name: str, category: ToolArgumentErrorCate
     )
 
 
+def _retain_llm_tool_argument_parts(llm_messages: Sequence[dict[str, Any]], *, tool_call_id: str) -> None:
+    """Attach all-untrusted semantic units only after argument admission."""
+    for message in reversed(llm_messages):
+        if message["role"] != "assistant" or "tool_calls" not in message:
+            continue
+        for index, call in enumerate(message["tool_calls"]):
+            if call["id"] != tool_call_id:
+                continue
+            entry = PromptGuardToolArgumentParts(index, json_argument_content_parts(call["function"]["arguments"]))
+            existing = (
+                cast(tuple[PromptGuardToolArgumentParts, ...], message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY])
+                if PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message
+                else ()
+            )
+            message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY] = tuple(
+                sorted((*[part for part in existing if part.tool_call_index != index], entry), key=lambda part: part.tool_call_index)
+            )
+            return
+    raise AuditIntegrityError("Admitted tool argument was not present in the active LLM transcript")
+
+
 def _replace_llm_tool_call_arguments(
-    llm_messages: Sequence[Mapping[str, Any]],
+    llm_messages: Sequence[dict[str, Any]],
     *,
     tool_call_id: str,
     arguments: Mapping[str, Any],
@@ -540,6 +572,7 @@ def _replace_llm_tool_call_arguments(
                 provider_arguments = {"pipeline": arguments}
             encoded = json.dumps(provider_arguments, separators=(",", ":"))
             function["arguments"] = encoded
+            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call_id)
             return
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
@@ -956,6 +989,24 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    mixed_abandonment_batch = False
+    if len(assistant_tool_calls) > 1:
+        for candidate_call in assistant_tool_calls:
+            if candidate_call.function.name != "request_advisor_hint":
+                continue
+            try:
+                candidate_arguments = bounded_json_loads(candidate_call.function.arguments, label="advisor batch admission")
+            except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError):
+                continue
+            if (
+                type(candidate_arguments) is dict
+                and "trigger" in candidate_arguments
+                and candidate_arguments["trigger"] == ADVISOR_TRIGGER_CANNOT_COMPLETE
+            ):
+                mixed_abandonment_batch = True
+                break
+    if ctx.turn_evidence is not None:
+        ctx.turn_evidence.invalidate_abandonment()
     # Scan the complete response metadata before progress, history, audit,
     # proposal, blob, or state effects. Internal adapters can supply an
     # already-admitted completion without passing through ProviderGateway, so
@@ -1016,28 +1067,35 @@ async def run_tool_batch(
     )
 
     # Append the assistant message (with tool_calls metadata)
+    from elspeth.web.composer.provider_thinking import attach_provider_thinking
+
     llm_messages.append(
-        {
-            "role": "assistant",
-            "content": assistant_message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in assistant_tool_calls
-            ],
-        }
+        attach_provider_thinking(
+            {
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in assistant_tool_calls
+                ],
+            },
+            completion.provider_metadata.thinking_blocks,
+        )
     )
 
     # Execute each tool call, tracking whether this turn has
     # budgeted discovery or mutation work. Advisor-only turns are
     # intentionally neither: they spend the advisor-specific budget,
     # not the generic discovery/composition turn budgets.
+    if ctx.turn_evidence is not None:
+        ctx.turn_evidence.transcript.observe_messages(llm_messages)
     turn_has_mutation = False
     turn_has_discovery = False
     all_cache_hits = True
@@ -1131,6 +1189,51 @@ async def run_tool_batch(
                 )
             )
 
+        if mixed_abandonment_batch:
+            detail = "cannot_complete must be the only tool call in its batch; every call in this batch was refused before effects."
+            category = ToolArgumentErrorCategory.MODEL_VALIDATION
+            rejection = ToolArgumentError(
+                argument="tool_calls",
+                expected="cannot_complete as the only call in its batch",
+                actual_type="mixed tool-call batch",
+                category=category,
+            )
+            payload = {"status": "ARG_ERROR", "error": detail, "error_category": category.value}
+            audit = begin_dispatch(
+                tool_call.id,
+                tool_name,
+                tool_call.function.arguments,
+                version_before=state.version,
+                actor=actor,
+                strict_sent=call_wire_facts.strict_sent,
+                wire_conformant=None,
+            )
+            recorder.record_private_tool_authoring(private_authorings_by_call[tool_call.id])
+            recorder.record(
+                finish_arg_error(
+                    audit, error_class=type(rejection).__name__, error_category=category, error_message=detail, error_payload=payload
+                )
+            )
+            _append_tool_outcome(
+                response=None,
+                error_class=type(rejection).__name__,
+                error_category=category,
+                error_message=detail,
+                post_version=state.version,
+            )
+            tool_feedback_json = json.dumps(payload)
+            llm_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+                }
+            )
+            turn_has_discovery = True
+            all_cache_hits = False
+            continue
+
         try:
             decoded_arguments = bounded_json_loads(tool_call.function.arguments, label=f"{tool_name} arguments")
         except (json.JSONDecodeError, JsonBoundaryError, TypeError, ValueError) as exc:
@@ -1202,11 +1305,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1279,11 +1384,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1342,11 +1449,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(error_payload)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 all_cache_hits = False
@@ -1357,6 +1466,7 @@ async def run_tool_batch(
             call_wire_facts.wire_conformant = decoded.wire_conformant
         else:
             arguments = cast(dict[str, Any], decoded_arguments)
+        _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call.id)
         try:
             private_arguments_canonical = canonical_json(arguments)
             if tool_name == "set_pipeline":
@@ -1424,11 +1534,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             all_cache_hits = False
@@ -1456,7 +1568,15 @@ async def run_tool_batch(
             recorder.record(finish_success(audit, result_payload=blocked.to_dict(), version_after=state.version))
             _append_tool_outcome(response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version)
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
-            llm_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": _serialize_tool_result(blocked)})
+            tool_feedback_json = _serialize_tool_result(blocked)
+            llm_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+                }
+            )
             await emit_progress(progress, tool_completed_progress_event(tool_name, False))
             turn_has_mutation = True
             all_cache_hits = False
@@ -1539,6 +1659,9 @@ async def run_tool_batch(
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": cached_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                            cached_admitted if cached_admitted is not None else cached_result, cached_json
+                        ),
                     }
                 )
                 continue
@@ -1584,11 +1707,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash)
+            tool_feedback_json = json.dumps(error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             continue
@@ -2116,11 +2241,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_success()
+                tool_feedback_json = _serialize_tool_result(proposal_result)
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": _serialize_tool_result(proposal_result),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_mutation = True
@@ -2183,11 +2310,13 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_rejection_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_rejection_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2225,11 +2354,13 @@ async def run_tool_batch(
                 # it for §7.7 anchor tracking, since the issue isn't
                 # the LLM repeating an identical request, it's the
                 # operator's policy refusing further hints.
+                tool_feedback_json = json.dumps(advisor_feedback_payload(budget_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(budget_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2284,11 +2415,13 @@ async def run_tool_batch(
                     error_message=None,
                     post_version=state.version,
                 )
+                tool_feedback_json = json.dumps(advisor_feedback_payload(deadline_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(deadline_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2308,13 +2441,28 @@ async def run_tool_batch(
             # outbound advisor call is made.
             advisor_calls_used += 1
 
+            abandonment_context = None
             try:
+                if ctx.turn_evidence is not None:
+                    ctx.turn_evidence.transcript.observe_messages(llm_messages)
+                if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
+                    if ctx.turn_evidence is None or user_message_content is None:
+                        raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
+                    abandonment_context = ctx.turn_evidence.abandonment_context(
+                        request=user_message_content,
+                        current_state=state,
+                        plugin_snapshot=ctx.plugin_snapshot,
+                        messages=llm_messages,
+                    )
                 advisor_outcome = await _await_started_tool_stage(
                     ctx.advisor_checkpoint._call_advisor_for_tool(
                         advisor_arg_error,
                         recorder=recorder,
                         timeout=effective_advisor_timeout,
                         provider_owner=ctx.provider_owner,
+                        abandonment_context=abandonment_context,
+                        advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
+                        current_state=state,
                     ),
                     audit=audit,
                     recorder=recorder,
@@ -2376,15 +2524,20 @@ async def run_tool_batch(
                     post_version=state.version,
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
                 continue
+
+            except Exception as advisor_context_error:
+                advisor_outcome = _AdvisorFirstPartyFailure(original_exc=advisor_context_error)
 
             if type(advisor_outcome) is _AdvisorProviderFailure:
                 # The service owns the Tier-3 provider taxonomy and returns
@@ -2418,11 +2571,13 @@ async def run_tool_batch(
                 # prompt, exactly the pattern the tracker exists
                 # to break.
                 anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": json.dumps(advisor_error_payload),
+                        "content": tool_feedback_json,
+                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                     }
                 )
                 turn_has_discovery = True
@@ -2434,6 +2589,20 @@ async def run_tool_batch(
                 # driver re-raise this exact exception object after the tool
                 # row has been published.
                 first_party_exc = advisor_outcome.original_exc
+                if isinstance(first_party_exc, PromptGuardRefused):
+                    # The tool completed with a semantic refusal. It is neither
+                    # provider-outage feedback nor a plugin implementation fault.
+                    refusal_payload = {"success": False, "outbound_call_made": False, **first_party_exc.to_payload()}
+                    recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                    _append_tool_outcome(
+                        response=refusal_payload,
+                        error_class=None,
+                        error_category=None,
+                        error_message=None,
+                        post_version=state.version,
+                    )
+                    advisor_failure = first_party_exc
+                    break
                 recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
                 _append_tool_outcome(
                     response=None,
@@ -2450,6 +2619,39 @@ async def run_tool_batch(
             guidance = advisor_outcome.guidance
             advisor_meta = advisor_outcome.metadata
 
+            abandonment_decision = None
+            review_binding = None
+            advisor_note = (
+                "ADVICE only — call the appropriate mutation tool to "
+                "apply any change. Do not echo this guidance back as "
+                "configuration without verifying it against the schema."
+            )
+            if advisor_outcome.abandonment_response is not None:
+                if abandonment_context is None or ctx.turn_evidence is None:
+                    raise AuditIntegrityError("Abandonment decision lost its request-owned context")
+                decision = advisor_outcome.abandonment_response
+                ctx.turn_evidence.accept_abandonment(
+                    abandonment_context, decision, current_state=state, plugin_snapshot=ctx.plugin_snapshot
+                )
+                abandonment_decision = decision.decision
+                review_binding = abandonment_context.binding
+                guidance = decision.reason
+                if decision.next_action is not None:
+                    guidance += "\nSupported next action: " + decision.next_action
+                if decision.question is not None:
+                    guidance += "\nQuestion for the user: " + decision.question
+                if decision.decision == "STOP_CONFIRMED":
+                    advisor_note = (
+                        "Stop authoring this request: no remaining authorized useful action can proceed. Explain the confirmed limit "
+                        "or ask the precise question; preserve the draft and do not claim completion. The final reply still receives ordinary END review."
+                    )
+                elif decision.decision == "CONTINUE_WITH_LIMITATION":
+                    advisor_note = (
+                        "Continue the supported work with the advisor's next action. Retain the precise limitation for final review; "
+                        "it does not stop the whole request or establish pipeline completion or graph clearance."
+                    )
+                else:
+                    advisor_note = "Continue with the advisor's supported action. This is not pipeline completion or graph clearance."
             success_payload = {
                 "status": "SUCCESS",
                 "guidance": guidance,
@@ -2460,11 +2662,9 @@ async def run_tool_batch(
                 "advisor_latency_ms": advisor_meta["latency_ms"],
                 "budget_used": advisor_calls_used,
                 "budget_remaining": budget - advisor_calls_used,
-                "note": (
-                    "ADVICE only — call the appropriate mutation tool to "
-                    "apply any change. Do not echo this guidance back as "
-                    "configuration without verifying it against the schema."
-                ),
+                "note": advisor_note,
+                "abandonment_decision": abandonment_decision,
+                "review_binding": review_binding,
             }
             recorder.record(
                 finish_success(
@@ -2485,13 +2685,16 @@ async def run_tool_batch(
             # subsequent set_pipeline failure does not inherit a
             # stale advisor anchor count.
             anti_anchor.record_success()
-            llm_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(success_payload),
-                }
-            )
+            tool_feedback_json = json.dumps(advisor_feedback_payload(success_payload))
+            feedback_message = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": tool_feedback_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+            }
+            if abandonment_context is not None and ctx.turn_evidence is not None:
+                ctx.turn_evidence.seal_abandonment_feedback(abandonment_context, feedback_message)
+            llm_messages.append(feedback_message)
             continue
 
         # Session-aware async tool dispatch.
@@ -2603,7 +2806,15 @@ async def run_tool_batch(
         # before it enters the worker thread pool.
         runtime_preflight_callback: RuntimePreflight | None = None
         structural_preflight_callback: RuntimePreflight | None = None
+        preview_claims_admitted = True
         if tool_name == "preview_pipeline":
+            try:
+                _admit_source_proof_claims(state)
+            except MalformedSourceProofClaim:
+                # The ordinary producer owns the saved-graph refusal. Do not
+                # inspect any resource before its complete scalar admission.
+                preview_claims_admitted = False
+        if tool_name == "preview_pipeline" and preview_claims_admitted:
             try:
                 preview_preflight = await ctx.preflight.cached_runtime_preflight(
                     state,
@@ -2889,11 +3100,13 @@ async def run_tool_batch(
                 post_version=state.version,
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
+            tool_feedback_json = json.dumps(arg_error_payload)
             llm_messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(arg_error_payload),
+                    "content": tool_feedback_json,
+                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
                 }
             )
             continue
@@ -3105,7 +3318,11 @@ async def run_tool_batch(
         result_json = (
             serialize_admitted_discovery_result(admitted_result) if admitted_result is not None else _serialize_tool_result(result)
         )
-        if tool_name == "get_blob_content" and admitted_result is not None and ctx.turn_evidence is not None:
+        if (
+            tool_name in {"get_blob_content", "read_attachment", "inspect_source"}
+            and admitted_result is not None
+            and ctx.turn_evidence is not None
+        ):
             ctx.turn_evidence.register_blob_page(
                 tool_call_id=tool_call.id,
                 admitted=admitted_result,
@@ -3131,6 +3348,9 @@ async def run_tool_batch(
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": result_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
+                    admitted_result if admitted_result is not None else result, result_json
+                ),
             }
         )
 
@@ -3138,6 +3358,12 @@ async def run_tool_batch(
             turn_has_mutation = True
         else:
             turn_has_discovery = True
+
+        # The completed preview has its ordinary audit, message, outcome and
+        # classification. An unavailable saved claim closes this issued batch;
+        # P4 will persist only this executed prefix before the loop terminates.
+        if admitted_result is not None and preview_source_proof_stop(admitted_result, state) is not None:
+            break
 
     dispatch = _DispatchOutcome(
         state=state,

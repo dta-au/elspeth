@@ -21,7 +21,7 @@ from elspeth.web.sessions.schemas import MessageWithStateResponse
 from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch import _build_composer
 from tests.unit.web.composer.test_compose_loop_persistence import _tool_batch_response
 from tests.unit.web.sessions.test_routes import _EMPTY_STATE, _make_app
-from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job
+from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job, _seed_output_only_draft
 
 
 @pytest.mark.asyncio
@@ -99,7 +99,7 @@ async def test_requested_missing_park_finishes_with_trusted_refusal_not_model_su
 async def test_refused_provider_recovery_retains_exact_private_control_and_physical_binding(tmp_path, monkeypatch, malformed_head):
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Private recovery audit", "local")
-    initial = await service.save_composition_state(session.id, checkpoint_data(_EMPTY_STATE), provenance="session_seed")
+    initial = await _seed_output_only_draft(app, service, session.id)
     composer = _build_composer(tmp_path, service)
     monkeypatch.setattr(composer, "_availability", ComposerAvailability(True, "anthropic/claude-opus-4-7", "anthropic"))
     app.state.composer_service = composer

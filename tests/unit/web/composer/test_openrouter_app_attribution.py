@@ -18,6 +18,8 @@ OpenRouter honours.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -31,6 +33,121 @@ from elspeth.web.composer.provider_gateway import (
     _apply_openrouter_app_identity,
     _litellm_acompletion,
 )
+
+
+async def _required_transport_call(
+    data_dir: Path,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    provider: Callable[..., Awaitable[Any]],
+) -> Any:
+    """Keep actual required guard, fenced custody and unknown usage for raw transport stubs."""
+    import json
+    import time
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    import httpx
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+    from elspeth.contracts.session_operation import SessionOperationKind
+    from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+    from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
+    from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
+    from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner, provider_call_scope
+    from elspeth.web.prompt_guard_config import PromptGuardSettings
+    from elspeth.web.required_work import (
+        RequiredAuthorityKind,
+        RequiredWorkAuthority,
+        RequiredWorkBinding,
+        RequiredWorkCoordinator,
+        RequiredWorkRole,
+    )
+    from tests.unit.web.composer.test_prompt_guard_admission import _checks
+    from tests.unit.web.sessions.test_token_usage_adapters import _ledger, _quota_service
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    engine, authority, service = _quota_service(data_dir)
+    session = authority.create_session_with_initial_fence(
+        user_id="alice", title="Transport fixture", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
+    )
+    context = authority.acquire(
+        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
+    )
+    coordinator = RequiredWorkCoordinator(
+        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
+    )
+    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    user_prompt = messages[-1]["content"]
+    requests: list[httpx.Request] = []
+
+    def serve_guard(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "userPromptAnalysis": {"attackDetected": False},
+                "documentsAnalysis": [{"attackDetected": False} for _ in body["documents"]],
+            },
+        )
+
+    mount = PromptGuardMount(
+        AzurePromptGuardClient(
+            PromptGuardSettings(endpoint="https://guard.example.test", subscription_key="fixture-guard-key"),
+            http_transport=httpx.MockTransport(serve_guard),
+        )
+    )
+
+    async def checked_provider(**kwargs: Any) -> Any:
+        [check] = _checks(engine)
+        assert check["operation_id"] == context.fence.operation_id
+        assert check["operation_epoch"] == context.fence.operation_epoch
+        assert (check["adapter"], check["mode"], check["role"]) == ("azure_prompt_shields", "required", "composer")
+        assert (check["disposition"], check["reason"]) == ("allow", "clean")
+        assert check["policy_fingerprint"] == mount.client.policy_fingerprint
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["userPrompt"] == user_prompt
+        assert custody.attempt is not None
+        return await provider(**kwargs)
+
+    try:
+        with prompt_guard_user_scope(user_prompt), patch("litellm.acompletion", new=checked_provider):
+            async with provider_call_scope(custody):
+                started_at = datetime.now(UTC)
+                started_ns = time.monotonic_ns()
+                result = await _litellm_acompletion(
+                    model=model,
+                    messages=messages,
+                    prompt_guard_mount=mount,
+                    prompt_guard_mode="required",
+                    prompt_guard_role="composer",
+                    provider_custody=custody,
+                )
+                call = build_llm_call_record(
+                    model_requested=model,
+                    messages=messages,
+                    tools=None,
+                    status=ComposerLLMCallStatus.SUCCESS,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    temperature=None,
+                    seed=None,
+                    response=result,
+                    provider_custody=custody,
+                )
+                # Original raw stubs report no usage: preserve absence.
+                assert call.prompt_tokens is None and call.completion_tokens is None
+        assert custody.attempt is None and custody.call is None
+        ledger = _ledger(engine)
+        assert len(ledger) == 1 and ledger[0][-2:] == (None, None)
+        coordinator.assert_completed()
+        return result
+    finally:
+        authority.release(context)
+        engine.dispose()
 
 
 def test_injects_elspeth_identity_for_openrouter_model() -> None:
@@ -93,7 +210,7 @@ def test_caller_supplied_headers_win() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wrapper_forwards_identity_headers_to_litellm() -> None:
+async def test_wrapper_forwards_identity_headers_to_litellm(tmp_path: Path) -> None:
     captured: dict[str, Any] = {}
 
     async def _fake_acompletion(**kwargs: Any) -> str:
@@ -101,9 +218,11 @@ async def test_wrapper_forwards_identity_headers_to_litellm() -> None:
         return "ok"
 
     with patch("litellm.acompletion", new=_fake_acompletion):
-        result = await _litellm_acompletion(
+        result = await _required_transport_call(
+            tmp_path,
             model="openrouter/openai/gpt-5.4-mini",
             messages=[{"role": "user", "content": "hi"}],
+            provider=_fake_acompletion,
         )
 
     assert result == "ok"
