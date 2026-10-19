@@ -12,7 +12,7 @@ remains available.
 These commands operate an **existing** ELSPETH container app. Run them from
 the repository/worktree containing the code to deploy. They deliberately do
 not bootstrap or destroy Azure infrastructure. Every literal comes from the
-platform facts (`docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md`).
+[archived platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md).
 
 ## 0. Shell and authentication
 

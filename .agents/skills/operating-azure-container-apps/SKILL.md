@@ -29,8 +29,8 @@ The historical container loop is:
 Keep it operational. Image digests, revision identity, database
 compatibility, the managed identity and runtime evidence protect real
 artifacts and behaviour. The platform facts every command relies on are
-measured in
-`docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md`; the
+recorded in the
+[archived platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md); the
 procedures are `docs/runbooks/azure-container-apps-cold-install.md`,
 `docs/runbooks/azure-container-apps-existing-service-redeploy.md` and
 `docs/runbooks/azure-container-apps-deployment.md`.
@@ -253,8 +253,8 @@ Common interpretations:
 
 - `deploy/azure-container-apps/` — the Bicep bundle, parameter examples, KQL
   evidence queries and the acceptance driver.
-- `docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md` —
-  every platform literal, with provenance.
+- [Archived platform facts](https://github.com/dta-au/elspeth/blob/58b25d524d9c5a2550b0f895ea8f70e1dea9ea51/docs/plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md) —
+  historical platform literals and their provenance; current procedures are in the maintained runbooks.
 - `src/elspeth/web/deployment_contract.py` — the external-PostgreSQL target
   contract; `src/elspeth/web/doctor.py` — `doctor deployment`.
 - `src/elspeth/web/key_derivation.py` and

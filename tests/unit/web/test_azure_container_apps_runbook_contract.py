@@ -31,7 +31,6 @@ ACCEPTANCE_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-deployment.md"
 COLD_INSTALL_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-cold-install.md"
 REDEPLOY_RUNBOOK = RUNBOOK_DIR / "azure-container-apps-existing-service-redeploy.md"
 RUNBOOKS = (ACCEPTANCE_RUNBOOK, COLD_INSTALL_RUNBOOK, REDEPLOY_RUNBOOK)
-PLATFORM_FACTS = REPO_ROOT / "docs" / "plans" / "2026-09-05-phase6b-azure-container-apps-platform-facts.md"
 KEY_DERIVATION_MODULE = REPO_ROOT / "src" / "elspeth" / "web" / "key_derivation.py"
 KEY_DERIVATION_TEST = REPO_ROOT / "tests" / "unit" / "web" / "test_key_derivation_wiring.py"
 
@@ -382,7 +381,6 @@ def test_cold_install_describes_independent_durable_job_budget_and_sync_headroom
 
 
 def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_status() -> None:
-    assert PLATFORM_FACTS.is_file()
     for runbook in RUNBOOKS:
         text = _text(runbook)
         assert FACTS_LINK in text, runbook.name
@@ -399,6 +397,11 @@ def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_statu
         assert "reconnect" in normalized, runbook.name
         assert "not a support claim" not in normalized, runbook.name
         assert "**LIVE" in text, runbook.name
+    for surface in (
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "SKILL.md",
+        REPO_ROOT / ".agents" / "skills" / "operating-azure-container-apps" / "references" / "command-cheatsheet.md",
+    ):
+        assert FACTS_LINK in _text(surface), surface
 
 
 def test_prospective_receipt_paths_match_the_current_release() -> None:

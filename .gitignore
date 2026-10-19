@@ -343,7 +343,10 @@ docs/audit
 docs/composer
 docs/design
 docs/diagnostics
-docs/operator
+docs/operator/*
+!docs/operator/migrations/
+docs/operator/migrations/*
+!docs/operator/migrations/adr-019.md
 docs/reviews
 docs/github-issues
 docs/plans
