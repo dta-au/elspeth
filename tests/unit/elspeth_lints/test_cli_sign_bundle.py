@@ -3381,7 +3381,50 @@ def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
 
     assert rc == 0
     assert not any("regen_fingerprint_baseline.py" in str(call) for call in calls)
-    assert "canonical-allowlist-only" in capsys.readouterr().out
+    assert "baseline regeneration deferred" in capsys.readouterr().out
+
+
+def test_sign_bundle_canonical_success_does_not_launch_repository_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Canonical publication must not start repository code with signing authority."""
+    root = tmp_path / "src" / "elspeth"
+    root.mkdir(parents=True)
+    allowlist_dir = _build_allowlist_dir(tmp_path / "config" / "cicd", name="enforce_tier_model")
+    regen_script = tmp_path / "scripts" / "cicd" / "regen_fingerprint_baseline.py"
+    regen_script.parent.mkdir(parents=True)
+    regen_script.write_text("raise AssertionError('repository maintenance must not execute')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "elspeth_lints.core.cli.__file__",
+        str(tmp_path / "elspeth-lints" / "src" / "elspeth_lints" / "core" / "cli.py"),
+    )
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+    )
+    bundle_path = _write_bundle_file(tmp_path, bundle)
+    forbidden_launches: list[tuple[object, bool]] = []
+    real_run = subprocess.run
+
+    def observe_run(*args: Any, **kwargs: Any) -> Any:
+        if args and str(regen_script) in args[0]:
+            child_env = kwargs.get("env", os.environ)
+            forbidden_launches.append((args[0], "ELSPETH_JUDGE_METADATA_HMAC_KEY" in child_env))
+            return subprocess.CompletedProcess(args[0], 0)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", observe_run)
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 0
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert forbidden_launches == []
+    assert "baseline regeneration deferred" in capsys.readouterr().out
 
 
 def test_sign_bundle_resume_rejects_candidate_and_manifest_co_tamper(

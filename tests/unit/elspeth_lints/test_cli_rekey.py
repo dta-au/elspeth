@@ -363,6 +363,48 @@ def test_rekey_reseals_under_new_key(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert not _production_verify(allowlist_dir, key, hmac_key=_OLD_KEY, monkeypatch=monkeypatch)
 
 
+def test_rekey_canonical_success_does_not_launch_repository_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Key rotation must not pass either fixture key into repository maintenance."""
+    _set_keys(monkeypatch)
+    root = tmp_path / "src" / "elspeth"
+    root.mkdir(parents=True)
+    canonical_parent = tmp_path / "config" / "cicd"
+    canonical_parent.mkdir(parents=True)
+    allowlist_dir = _build_allowlist_dir(canonical_parent)
+    allowlist_dir = allowlist_dir.rename(canonical_parent / "enforce_tier_model")
+    regen_script = tmp_path / "scripts" / "cicd" / "regen_fingerprint_baseline.py"
+    regen_script.parent.mkdir(parents=True)
+    regen_script.write_text("raise AssertionError('repository maintenance must not execute')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "elspeth_lints.core.cli.__file__",
+        str(tmp_path / "elspeth-lints" / "src" / "elspeth_lints" / "core" / "cli.py"),
+    )
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding, hmac_key=_OLD_KEY)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    bundle_path = _rekey_bundle(tmp_path, root, allowlist_dir, keys=(key,))
+    forbidden_launches: list[tuple[object, bool]] = []
+    real_run = subprocess.run
+
+    def observe_run(*args: Any, **kwargs: Any) -> Any:
+        if args and str(regen_script) in args[0]:
+            child_env = kwargs.get("env", os.environ)
+            forbidden_launches.append((args[0], _OLD_ENV in child_env and _NEW_ENV in child_env))
+            return subprocess.CompletedProcess(args[0], 0)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", observe_run)
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 0
+    assert _production_verify(allowlist_dir, key, hmac_key=_NEW_KEY, monkeypatch=monkeypatch)
+    assert not _production_verify(allowlist_dir, key, hmac_key=_OLD_KEY, monkeypatch=monkeypatch)
+    assert forbidden_launches == []
+    assert "baseline regeneration deferred" in capsys.readouterr().out
+
+
 def test_rekey_rejects_stale_source_binding_before_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)

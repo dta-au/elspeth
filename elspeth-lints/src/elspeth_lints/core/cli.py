@@ -3380,7 +3380,7 @@ def _execute_sign_bundle(
                     "resume with --continue-on-block to skip them and publish the survivors.\n"
                 )
         return _SignBundleOutcome(result.exit_code, resumable=True)
-    _maybe_regen_fingerprint_baseline(args)
+    _emit_deferred_baseline_notice(args)
     _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
     _emit_sign_bundle_post_state(args)
     prefix = "recovered completed coherent publish" if result.recovered_publish else "completed"
@@ -3690,44 +3690,12 @@ def _emit_sign_bundle_post_state(args: argparse.Namespace) -> None:
     sys.stdout.write(render_judge_signature_diagnosis_text(report))
 
 
-def _maybe_regen_fingerprint_baseline(args: argparse.Namespace) -> None:
-    """Regenerate the fingerprint baseline ONLY for the canonical allowlist pair.
-
-    ``regen_fingerprint_baseline.py`` is hard-wired to the real repo
-    (``REPO_ROOT/src/elspeth`` + ``REPO_ROOT/config/cicd/enforce_tier_model``)
-    and ignores ``--root``/``--allowlist-dir``. So shell it only when the run's
-    pair resolves to that canonical target; otherwise skip with an explicit
-    message. This keeps ``tmp_path`` tests hermetic and stops a non-canonical
-    operator run from regenerating the wrong baseline. When it does run, its exit
-    is surfaced as a WARNING -- the signed enforce gate is held deliberately RED
-    in prerelease, so a non-zero regen must not retroactively fail an
-    authoritative successful sign.
-    """
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parents[4]
-    canonical_src = repo_root / "src" / "elspeth"
-    canonical_allowlist = repo_root / "config" / "cicd" / "enforce_tier_model"
-    regen_script = repo_root / "scripts" / "cicd" / "regen_fingerprint_baseline.py"
-
-    is_canonical = args.root.resolve() == canonical_src and args.allowlist_dir.resolve() == canonical_allowlist and regen_script.is_file()
-    if not is_canonical:
-        sys.stdout.write(
-            f"{args.command}: baseline regen is canonical-allowlist-only -- skipped (--root/--allowlist-dir are not the canonical pair).\n"
-        )
-        return
-
-    result = subprocess.run(
-        [sys.executable, str(regen_script)],
-        cwd=str(repo_root),
-        check=False,
+def _emit_deferred_baseline_notice(args: argparse.Namespace) -> None:
+    """Keep repository maintenance outside the key-bearing completion path."""
+    sys.stdout.write(
+        f"{args.command}: baseline regeneration deferred; this completion step launches no repository maintenance script or test. "
+        "Separate maintenance must preserve authoritative signature verification and keep capture/tests keyless.\n"
     )
-    if result.returncode != 0:
-        sys.stderr.write(
-            f"{args.command}: WARNING -- regen_fingerprint_baseline.py exited "
-            f"{result.returncode} (the signed enforce gate is held RED in prerelease; "
-            "this does NOT fail the authoritative sign).\n"
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -3917,9 +3885,7 @@ def _run_rekey(args: argparse.Namespace) -> int:
         f"{len(specs_by_yaml)} file(s) under {args.new_key_env}.\n"
     )
 
-    # Regen baseline last, under the same canonical-only + warning-not-return-code
-    # treatment as sign-bundle (Task 2.5): a tmp_path run never shells the script.
-    _maybe_regen_fingerprint_baseline(args)
+    _emit_deferred_baseline_notice(args)
     return 0
 
 
