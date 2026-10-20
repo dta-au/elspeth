@@ -32,6 +32,7 @@ import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.resources import files
 from importlib.util import resolve_name
 from pathlib import Path
 
@@ -56,17 +57,17 @@ TRUST_BOUNDARY_ALLOWLIST_DIR = "enforce_trust_boundary_honesty"
 
 
 def _canonical_star_exports(module: str) -> tuple[str, ...]:
-    """Read the owned literal export contract without importing runtime code.
+    """Read the installed rule's owned contract, independent of candidate paths.
 
-    This workspace-only analyzer reads its own checkout, never a source path
-    supplied by the scanned import. Export drift fails closed instead of
-    silently treating an unknown wildcard as granting marker identity.
+    The literal data ships inside the lints wheel. The contract parity tests
+    bind it to the owned runtime export lists. An adjacent checkout and the
+    scanned import cannot supply its bytes. Malformed contracts fail closed.
     """
-    relative_path = {
-        "elspeth.contracts": "src/elspeth/contracts/__init__.py",
-        "elspeth.contracts.trust_boundary": "src/elspeth/contracts/trust_boundary.py",
+    resource_name = {
+        "elspeth.contracts": "contracts.txt",
+        "elspeth.contracts.trust_boundary": "trust_boundary.txt",
     }[module]
-    source_path = Path(__file__).resolve().parents[5] / relative_path
+    source_path = files("elspeth_lints.rules.trust_boundary").joinpath("contract_exports", resource_name)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     exports = [
         node.value
