@@ -376,33 +376,91 @@ describe("shareableReviews API client", () => {
     });
   });
 
-  it("fetchSharedInspect treats 401 as a capability-token error without clearing auth", async () => {
-    localStorage.setItem("auth_token", "reviewer-session-token");
-    useAuthStore.setState({
-      token: "reviewer-session-token",
-      user: {
-        user_id: "reviewer",
-        username: "reviewer",
-        display_name: null,
-        email: null,
-        groups: [],
-      },
-      loginError: null,
-      isLoading: false,
-    } as never);
-    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "Invalid or expired share token" }), {
+  it.each([undefined, "Basic", "BearerOther", 'Bearer realm="other"', "Bearer, Basic"])(
+    "fetchSharedInspect preserves auth for an unrecognized challenge %s",
+    async (challenge) => {
+      localStorage.setItem("auth_token", "reviewer-session-token");
+      useAuthStore.setState({
+        token: "reviewer-session-token",
+        user: {
+          user_id: "reviewer",
+          username: "reviewer",
+          display_name: null,
+          email: null,
+          groups: [],
+        },
+        loginError: null,
+        isLoading: false,
+      } as never);
+      (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "Invalid or expired share token" }), {
+          status: 401,
+          headers: {
+            "content-type": "application/json",
+            ...(challenge === undefined ? {} : { "WWW-Authenticate": challenge }),
+          },
+        }),
+      );
+      const request = fetchSharedInspect("bad-token");
+      await expect(request).rejects.toMatchObject({
         status: 401,
-        headers: { "content-type": "application/json" },
+      });
+      await expect(request).rejects.not.toMatchObject({ error_type: "authentication_required" });
+      expect(useAuthStore.getState().token).toBe("reviewer-session-token");
+      expect(useAuthStore.getState().user?.username).toBe("reviewer");
+      expect(localStorage.getItem("auth_token")).toBe("reviewer-session-token");
+    },
+  );
+
+  it.each(["Bearer", "bearer"])("fetchSharedInspect clears rejected authentication with a %s challenge", async (challenge) => {
+    localStorage.setItem("auth_token", "expired-reviewer-token");
+    useAuthStore.setState({ token: "expired-reviewer-token", isLoading: false });
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ detail: "Token expired" }), {
+        status: 401,
+        headers: { "content-type": "application/json", "WWW-Authenticate": challenge },
       }),
     );
-    await expect(fetchSharedInspect("bad-token")).rejects.toMatchObject({
+
+    await expect(fetchSharedInspect("valid-share-token")).rejects.toMatchObject({
       status: 401,
+      error_type: "authentication_required",
+      detail: "Token expired",
     });
-    expect(useAuthStore.getState().token).toBe("reviewer-session-token");
-    expect(useAuthStore.getState().user?.username).toBe("reviewer");
-    expect(localStorage.getItem("auth_token")).toBe("reviewer-session-token");
+    expect(useAuthStore.getState().token).toBeNull();
+    expect(localStorage.getItem("auth_token")).toBeNull();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["replacement-token", "original-reviewer-token"])(
+    "preserves the replacement login %s after a delayed shared authentication refusal",
+    async (replacementToken) => {
+      let finishRequest!: (value: Response) => void;
+      const oldResponse = new Promise<Response>((resolve) => { finishRequest = resolve; });
+      localStorage.setItem("auth_token", "original-reviewer-token");
+      useAuthStore.setState({ token: "original-reviewer-token", isLoading: false });
+      (globalThis.fetch as ReturnType<typeof vi.fn>)
+        .mockReturnValueOnce(oldResponse)
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          user_id: "reviewer", username: "reviewer", display_name: null,
+          email: null, groups: [], dev_admin: false,
+        })))
+        .mockResolvedValueOnce(new Response(JSON.stringify({
+          provider: "local", registration_mode: "closed", sso_start_url: null,
+        })));
+      const pending = fetchSharedInspect("valid-share-token");
+      await useAuthStore.getState().loginWithToken(replacementToken);
+      finishRequest(new Response(JSON.stringify({ detail: "Token expired" }), {
+        status: 401,
+        headers: { "content-type": "application/json", "WWW-Authenticate": "Bearer" },
+      }));
+
+      await expect(pending).rejects.toMatchObject({ status: 401, error_type: "authentication_required" });
+      expect(useAuthStore.getState().token).toBe(replacementToken);
+      expect(localStorage.getItem("auth_token")).toBe(replacementToken);
+      expect(useAuthStore.getState().user?.username).toBe("reviewer");
+    },
+  );
 
   it("fetchSharedInspect propagates 404 from the parser (blob expired)", async () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(

@@ -549,6 +549,7 @@ export interface ValidationCheck {
   name: string;
   passed: boolean;
   detail: string;
+  request_rejection?: SafeRequestRejection;
   affected_nodes: string[];
   outcome_code: ValidationCheckOutcomeCode | null;
 }
@@ -603,11 +604,22 @@ export interface SemanticEdgeContract {
   requirement_code: string;
 }
 
+export interface SafeRequestRejection {
+  category: "request_rejected";
+  exception_type: "BadRequestError";
+  reason_code: "invalid_request" | "context_length_exceeded" | "unsupported_parameter" | null;
+  reason_disposition: "retained" | "absent" | "unrecognized" | "unavailable";
+  reason_source: "sdk_body" | "http_response" | "unavailable";
+  diagnostic_reference: string | null;
+  retryable: false;
+}
+
 export interface ValidationReadinessBlocker {
   code: string;
   component_id: string | null;
   component_type: string | null;
   detail: string;
+  request_rejection?: SafeRequestRejection;
   suggestion: string | null;
   /** The advisor's own words, bounded and labelled, on `advisor_signoff_blocked` only; null elsewhere. */
   note: string | null;

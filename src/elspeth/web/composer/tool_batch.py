@@ -2551,6 +2551,9 @@ async def run_tool_batch(
                     "budget_used": advisor_calls_used,
                     "budget_remaining": budget - advisor_calls_used,
                 }
+                if advisor_outcome.provider_failure is not None:
+                    advisor_error_payload["request_rejection"] = advisor_outcome.provider_failure.details.to_wire()
+                    advisor_error_payload["error"] = advisor_outcome.provider_failure.details.explanation
                 recorder.record(
                     finish_success(
                         audit,

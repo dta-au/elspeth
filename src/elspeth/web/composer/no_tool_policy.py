@@ -13,6 +13,7 @@ from opentelemetry import metrics
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.provider_rejection import ReasonDisposition, RequestRejectionReason, SafeRequestRejection
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import is_discovery_tool
 from elspeth.web.composer.turn_effects import CHECKPOINT_SCOPE_TEMPLATES, TurnEvidence
@@ -632,8 +633,35 @@ _ADVISOR_PUBLISHED_WRAPPED_SHAPES: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
-def _canonical_base_suffix_segments(suffix: str) -> tuple[VisibleMessageSegment, ...] | None:
+def _canonical_base_suffix_segments(suffix: str, *, allow_request_rejection: bool = True) -> tuple[VisibleMessageSegment, ...] | None:
     """Recognize only pre-receipt shapes, including one final unavailable notice."""
+    rejection_prefix, separator, rejection_notice = suffix.rpartition(_TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER)
+    if separator and allow_request_rejection:
+        # Reconstruct from the closed safe reason vocabulary. An arbitrary
+        # provider string or a changed reference cannot acquire system origin.
+        reasons: tuple[tuple[RequestRejectionReason | None, ReasonDisposition], ...] = (
+            ("invalid_request", "retained"),
+            ("context_length_exceeded", "retained"),
+            ("unsupported_parameter", "retained"),
+            (None, "absent"),
+            (None, "unrecognized"),
+            (None, "unavailable"),
+        )
+        for reason_code, disposition in reasons:
+            rejection = SafeRequestRejection(
+                reason_code=reason_code,
+                reason_disposition=disposition,
+                reason_source="sdk_body" if reason_code is not None else "unavailable",
+            )
+            for base in (rejection.public_detail, rejection.handoff_detail):
+                tail = rejection_notice.removeprefix(base)
+                reference = re.fullmatch(r" Diagnostic reference: provider-failure:[0-9a-f]{64}\.", tail)
+                if rejection_notice == base or (rejection_notice.startswith(base) and reference is not None):
+                    preceding_segments = (
+                        _canonical_base_suffix_segments(rejection_prefix, allow_request_rejection=False) if rejection_prefix else ()
+                    )
+                    if preceding_segments is not None:
+                        return (*preceding_segments, TrustedSystemNoticeSegment(rejection_notice))
     if suffix == _GRAPH_RECOVERY_REFUSAL_SUFFIX:
         return (TrustedSystemNoticeSegment(_GRAPH_RECOVERY_REFUSAL_NOTICE),)
     if suffix == _REVIEW_REPLY_UNAVAILABLE_SUFFIX:
@@ -936,7 +964,7 @@ def compose_advisor_signoff_unverified_message(content: str) -> str:
 
 
 def compose_advisor_signoff_unrendered_pending_message(
-    content: str, *, failure_class: Literal["unavailable", "malformed", "budget_exhausted"]
+    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
 ) -> str:
     """GREEN preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -947,6 +975,8 @@ def compose_advisor_signoff_unrendered_pending_message(
     """
     if failure_class == "budget_exhausted":
         return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "request_rejected":
+        return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_PENDING_PUBLISHED_FINALIZE_SUFFIX
     else:
@@ -955,7 +985,7 @@ def compose_advisor_signoff_unrendered_pending_message(
 
 
 def compose_advisor_signoff_unrendered_unverified_message(
-    content: str, *, failure_class: Literal["unavailable", "malformed", "budget_exhausted"]
+    content: str, *, failure_class: Literal["unavailable", "request_rejected", "malformed", "budget_exhausted"]
 ) -> str:
     """ABSENT preflight + an UNRENDERED advisory verdict (unavailable/malformed).
 
@@ -965,11 +995,18 @@ def compose_advisor_signoff_unrendered_unverified_message(
     """
     if failure_class == "budget_exhausted":
         return _append_advisor_suffix(content, _ADVISOR_REVIEW_BUDGET_SUFFIX)
+    if failure_class == "request_rejected":
+        return content
     if failure_class == "unavailable":
         suffix = _ADVISOR_SIGNOFF_UNAVAILABLE_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
     else:
         suffix = _ADVISOR_SIGNOFF_MALFORMED_UNVERIFIED_PUBLISHED_FINALIZE_SUFFIX
     return _append_advisor_suffix(content, suffix)
+
+
+def compose_request_rejected_message(content: str, *, rejection: SafeRequestRejection, handoff: bool) -> str:
+    """Append only the admitted descriptor's canonical system notice."""
+    return _append_advisor_suffix(content, _bare_trusted_suffix(rejection.handoff_detail if handoff else rejection.public_detail))
 
 
 def compose_advisor_signoff_unrepairable_message(content: str) -> str:

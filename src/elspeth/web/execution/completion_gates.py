@@ -23,6 +23,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, NotRequired, TypedDict
 
+from elspeth.contracts.provider_rejection import SafeRequestRejection, SafeRequestRejectionData
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.advisor_decision import (
     AdvisorBlockCause,
@@ -80,6 +81,7 @@ class AdvisorSignoffGateDict(TypedDict):
     # refuses rather than defaults.
     note: str | None
     cause: str
+    request_rejection: NotRequired[SafeRequestRejectionData]
 
 
 class CompletionGatesDict(TypedDict):
@@ -137,12 +139,15 @@ def advisor_signoff_check_failed(checks: Sequence[ValidationCheck]) -> bool:
     )
 
 
-def _reconcile_advisor_check(checks: Sequence[ValidationCheck], *, detail: str) -> list[ValidationCheck]:
+def _reconcile_advisor_check(
+    checks: Sequence[ValidationCheck], *, detail: str, request_rejection: SafeRequestRejection | None = None
+) -> list[ValidationCheck]:
     """Replace every prior advisor record with one canonically ordered failure."""
     replacement = ValidationCheck(
         name=CHECK_ADVISOR_SIGNOFF,
         passed=False,
         detail=detail,
+        request_rejection=request_rejection,
         affected_nodes=(),
         outcome_code=None,
     )
@@ -163,6 +168,7 @@ def _reconcile_advisor_blocker(
     detail: str,
     suggestion: str | None,
     note: str | None,
+    request_rejection: SafeRequestRejection | None = None,
 ) -> list[ValidationReadinessBlocker]:
     """Replace duplicate advisor blockers while retaining the first slot."""
     replacement = ValidationReadinessBlocker(
@@ -172,6 +178,7 @@ def _reconcile_advisor_blocker(
         detail=detail,
         suggestion=suggestion,
         note=note,
+        request_rejection=request_rejection,
     )
     reconciled: list[ValidationReadinessBlocker] = []
     replaced = False
@@ -232,16 +239,19 @@ def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> Compl
     """
     if facts is None or facts.advisor_signoff is None:
         return {"schema_version": 2}
+    signoff = AdvisorSignoffGateDict(
+        status=_GATE_STATUS_BLOCKED,
+        detail=facts.advisor_signoff.detail,
+        suggestion=facts.advisor_signoff.suggestion,
+        for_graph=facts.advisor_signoff.for_graph,
+        note=facts.advisor_signoff.note,
+        cause=facts.advisor_signoff.cause.value,
+    )
+    if facts.advisor_signoff.request_rejection is not None:
+        signoff["request_rejection"] = facts.advisor_signoff.request_rejection.to_wire()
     return {
         "schema_version": 2,
-        "advisor_signoff": AdvisorSignoffGateDict(
-            status=_GATE_STATUS_BLOCKED,
-            detail=facts.advisor_signoff.detail,
-            suggestion=facts.advisor_signoff.suggestion,
-            for_graph=facts.advisor_signoff.for_graph,
-            note=facts.advisor_signoff.note,
-            cause=facts.advisor_signoff.cause.value,
-        ),
+        "advisor_signoff": signoff,
     }
 
 
@@ -341,7 +351,7 @@ def parse_completion_gates(
     note = raw_signoff["note"]
     if note is not None and (type(note) is not str or not note):
         raise ValueError("Tier 1: completion_gates.advisor_signoff.note must be a non-empty string or null")
-    allowed_fields = {"status", "detail", "suggestion", "for_graph", "note", "cause"}
+    allowed_fields = {"status", "detail", "suggestion", "for_graph", "note", "cause", "request_rejection"}
     cause_raw = raw_signoff["cause"] if "cause" in raw_signoff else None
     if type(cause_raw) is not str:
         raise ValueError("Tier 1: completion_gates.advisor_signoff.cause must be a string")
@@ -351,8 +361,15 @@ def parse_completion_gates(
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff.cause is unknown: {cause_raw!r}") from exc
     if set(raw_signoff) - allowed_fields:
         raise ValueError("Tier 1: completion_gates.advisor_signoff has unknown fields")
+    rejection = SafeRequestRejection.from_wire(raw_signoff["request_rejection"]) if "request_rejection" in raw_signoff else None
+    if (cause is AdvisorBlockCause.REQUEST_REJECTED and rejection is None) or (
+        rejection is not None and cause not in {AdvisorBlockCause.REQUEST_REJECTED, AdvisorBlockCause.BUDGET_EXHAUSTED}
+    ):
+        raise ValueError("Tier 1: request-rejected gate must carry its safe rejection descriptor")
     return CompletionGateFacts(
-        advisor_signoff=AdvisorSignoffGateFact(detail=detail, suggestion=suggestion, for_graph=for_graph, note=note, cause=cause)
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail=detail, suggestion=suggestion, for_graph=for_graph, note=note, cause=cause, request_rejection=rejection
+        )
     )
 
 
@@ -391,10 +408,18 @@ def merge_completion_gates(
             "The evidence-scoped completion advisory review has not cleared. "
             "Resolve the pending interpretation review cards; the advisory review remains outstanding."
         )
-        return result.model_copy(update={"checks": _reconcile_advisor_check(result.checks, detail=handoff_detail)})
+        if current and fact.request_rejection is not None:
+            handoff_detail += " " + fact.request_rejection.explanation
+        return result.model_copy(
+            update={
+                "checks": _reconcile_advisor_check(
+                    result.checks, detail=handoff_detail, request_rejection=fact.request_rejection if current else None
+                )
+            }
+        )
     return result.model_copy(
         update={
-            "checks": _reconcile_advisor_check(result.checks, detail=detail),
+            "checks": _reconcile_advisor_check(result.checks, detail=detail, request_rejection=fact.request_rejection if current else None),
             "readiness": ValidationReadiness(
                 authoring_valid=result.readiness.authoring_valid,
                 execution_ready=result.readiness.execution_ready,
@@ -407,6 +432,7 @@ def merge_completion_gates(
                     # a changed graph they are dropped with the verdict they
                     # came from, exactly like ``suggestion``.
                     note=fact.note if current else None,
+                    request_rejection=fact.request_rejection if current else None,
                 ),
             ),
         }

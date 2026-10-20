@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
+from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools.sessions import ADVISOR_TRIGGER_DETERMINISTIC_END
@@ -395,6 +396,7 @@ def advisor_signoff_blocked_wording(
     notice: str = _ADVISOR_SIGNOFF_PENDING_PUBLISHED_NOTICE,
     category: str = "other",
     step_ids: Sequence[str] = (),
+    request_rejection: SafeRequestRejection | None = None,
 ) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
 
@@ -441,8 +443,9 @@ def advisor_signoff_blocked_wording(
     header: it is not a reviewer's judgement about a step.
     """
     if reason == "budget_exhausted":
+        rejection_detail = " " + request_rejection.explanation if request_rejection is not None else ""
         return (
-            "The reply was withheld because the completion review could not run within the existing request limits.",
+            "The reply was withheld because the completion review could not run within the existing request limits." + rejection_detail,
             "Saved draft progress remains available; continue in a new message.",
         )
     if reason == "publication_withheld":
@@ -491,6 +494,16 @@ def advisor_signoff_blocked_wording(
         )
     # Provider failures are turn-scoped; another message may obtain a verdict
     # without editing the graph, and its decision replaces the durable block.
+    if reason == "request_rejected":
+        rejection = (
+            request_rejection
+            if request_rejection is not None
+            else SafeRequestRejection(reason_code=None, reason_disposition="unavailable", reason_source="unavailable")
+        )
+        return (
+            rejection.public_detail,
+            "An unchanged rejected request will not be retried automatically. Review the rejection reason before sending another message.",
+        )
     if reason == "unavailable":
         return (
             f"The evidence-scoped completion advisory review could not be obtained; the Composer cannot mark this turn complete. {findings}",

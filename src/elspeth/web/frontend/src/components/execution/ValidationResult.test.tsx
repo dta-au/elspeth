@@ -16,6 +16,25 @@ const READY_READINESS = {
   blockers: [],
 };
 
+it("renders a rejected Advisor request's safe reason after serialization", () => {
+  const safe = {
+    category: "request_rejected" as const, exception_type: "BadRequestError" as const,
+    reason_code: "context_length_exceeded" as const, reason_disposition: "retained" as const,
+    reason_source: "http_response" as const, diagnostic_reference: null, retryable: false as const,
+  };
+  const result = makePassResult({
+    checks: [{ name: "advisor_signoff", passed: false,
+      detail: "The review request was rejected because the context limit was exceeded.",
+      affected_nodes: [], outcome_code: null, request_rejection: safe }],
+    readiness: { ...READY_READINESS, completion_ready: false,
+      blockers: [{ code: "advisor_signoff_blocked", component_id: "pipeline", component_type: "pipeline",
+        detail: "Review request rejected", suggestion: null, note: null, request_rejection: safe }] },
+  });
+  render(<ValidationResultBanner result={JSON.parse(JSON.stringify(result))} />);
+  expect(screen.getByText(/review request was rejected because the context limit was exceeded/)).toBeInTheDocument();
+  expect(screen.queryByText(/model was unavailable/)).toBeNull();
+});
+
 function makePassResult(overrides: Partial<ValidationResult> = {}): ValidationResult {
   return {
     is_valid: true,

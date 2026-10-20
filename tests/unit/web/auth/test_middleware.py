@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.testclient import TestClient
 
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity, UserProfile
 from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 
 
 @dataclass
@@ -145,6 +147,7 @@ class TestGetCurrentUser:
 
         assert exc_info.value.status_code == 401
         assert exc_info.value.detail == "Missing or invalid Authorization header"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Bearer"}
 
     async def test_missing_authorization_header_rate_limits_audit_writes(self) -> None:
         provider = _FakeAuthProvider()
@@ -193,6 +196,7 @@ class TestGetCurrentUser:
             await get_current_user(request)
 
         assert exc_info.value.status_code == 401
+        assert exc_info.value.headers == {"WWW-Authenticate": "Bearer"}
 
     async def test_invalid_authorization_header_rate_limits_audit_writes(self) -> None:
         provider = _FakeAuthProvider()
@@ -230,6 +234,7 @@ class TestGetCurrentUser:
 
         assert exc_info.value.status_code == 401
         assert exc_info.value.detail == "Token expired"
+        assert exc_info.value.headers == {"WWW-Authenticate": "Bearer"}
 
     @pytest.mark.parametrize("provider_type", ["oidc", "entra"])
     async def test_nonlocal_auth_failure_propagates_audit_write_failure(self, provider_type: str) -> None:
@@ -295,3 +300,19 @@ class TestGetCurrentUser:
             await get_current_user(request)
 
         assert exc_info.value.status_code == 401
+
+
+def test_shared_inspect_authentication_failure_challenges_without_resolving_a_snapshot() -> None:
+    provider = _FakeAuthProvider(error=AuthenticationError("Token expired"))
+    recorder = _CountingAuthAuditRecorder()
+    app = _make_app(provider, recorder=recorder)
+    app.include_router(create_shareable_reviews_router())
+    with TestClient(app) as client:
+        response = client.get("/api/sessions/shared/synthetic-share-token", headers={"Authorization": "Bearer expired-token"})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Token expired"}
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+    assert provider.authenticated_tokens == ["expired-token"]
+    assert len(recorder.failures) == 1
+    assert recorder.failures[0]["failure_stage"] == "authenticate"

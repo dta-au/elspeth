@@ -6,7 +6,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -24,6 +24,7 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardTrust,
     detach_prompt_guard_evidence,
 )
+from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
@@ -79,6 +80,7 @@ from elspeth.web.composer.no_tool_policy import (
     compose_advisor_signoff_unrepairable_red_message,
     compose_advisor_signoff_unrepairable_unverified_message,
     compose_advisor_signoff_unverified_message,
+    compose_request_rejected_message,
     enforce_augmentation_prefix_invariant,
     is_pending_interpretation_handoff,
     state_is_structurally_empty,
@@ -88,7 +90,7 @@ from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emi
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.composer.provider_errors import classify_provider_failure
+from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
@@ -176,7 +178,10 @@ class AdvisorCheckpointVerdict:
     # value gets the fail-closed malformed wording. The classification is
     # applied inline by ``_run_advisor_checkpoint``'s exception handling and
     # read by ``_evaluate_terminal_no_tool_advisor_gate``.
-    failure_class: Literal["none", "unavailable", "malformed", "budget_exhausted"] = "none"
+    failure_class: Literal["none", "unavailable", "request_rejected", "malformed", "budget_exhausted"] = "none"
+    # Internal custody only. Public/persisted projections use details, never
+    # this carrier or its original SDK exception.
+    provider_failure: ProviderRequestFailure | None = field(default=None, repr=False, compare=False)
     # A failed checkpoint may be re-asked within this request unless the
     # shared provider policy requires intervention. This is retry control,
     # never publication permission; observed format errors remain retryable.
@@ -340,6 +345,7 @@ class AdvisorCheckpointOwner:
             internal_request["abandonment_context"] = abandonment_context
         elif abandonment_context is not None:
             raise InvariantError("Proactive advice cannot acquire an abandonment review")
+        attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
         try:
             if current_state is not None:
                 if type(current_state) is not CompositionState:
@@ -363,6 +369,14 @@ class AdvisorCheckpointOwner:
         except AdvisorAbandonmentContextUnavailable as exc:
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except advisor_provider_failure_types() as exc:
+            failure = classify_provider_failure(exc)
+            if failure is not None and failure.request_rejection is not None:
+                return _AdvisorProviderFailure(
+                    error_class="BadRequestError",
+                    provider_failure=self._retain_request_failure(
+                        exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
+                    ),
+                )
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except Exception as exc:
             return _AdvisorFirstPartyFailure(original_exc=exc)
@@ -372,6 +386,23 @@ class AdvisorCheckpointOwner:
                 return _AdvisorProviderFailure(error_class=None)
             return _AdvisorCallSuccess(guidance=guidance, metadata=metadata, abandonment_response=decision)
         return _AdvisorCallSuccess(guidance=guidance, metadata=metadata)
+
+    @staticmethod
+    def _retain_request_failure(
+        exc: BaseException,
+        rejection: SafeRequestRejection,
+        *,
+        recorder: BufferingRecorder | None,
+        attempt_call_offset: int,
+    ) -> ProviderRequestFailure:
+        attempt_calls = recorder.llm_calls[attempt_call_offset:] if recorder is not None else ()
+        if len(attempt_calls) == 1 and attempt_calls[0].status is ComposerLLMCallStatus.BAD_REQUEST_ERROR:
+            from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+
+            call_id = attempt_calls[0].call_id
+            if call_id is not None:
+                rejection = rejection.model_copy(update={"diagnostic_reference": diagnostic_evidence_identity("provider-failure", call_id)})
+        return ProviderRequestFailure(original=exc, details=rejection)
 
     async def _call_advisor_with_audit_body(
         self,
@@ -935,6 +966,7 @@ class AdvisorCheckpointOwner:
         note = None if verdict.findings_backend_authored else verdict.note
         cause = {
             "unavailable": AdvisorBlockCause.UNAVAILABLE,
+            "request_rejected": AdvisorBlockCause.REQUEST_REJECTED,
             "malformed": AdvisorBlockCause.MALFORMED,
             "budget_exhausted": AdvisorBlockCause.BUDGET_EXHAUSTED,
             "publication_withheld": AdvisorBlockCause.PUBLICATION_REJECTED,
@@ -942,12 +974,18 @@ class AdvisorCheckpointOwner:
             "flagged_final_pass": AdvisorBlockCause.GRAPH_REJECTED,
             "flagged_no_repair": AdvisorBlockCause.GRAPH_REJECTED,
         }[reason]
+        rejection = verdict.provider_failure.details if verdict.provider_failure is not None else None
+        if (reason == "request_rejected" and rejection is None) or (
+            rejection is not None and reason not in {"request_rejected", "budget_exhausted"}
+        ):
+            raise AuditIntegrityError("Request rejection lost its owned safe descriptor")
         detail, suggestion = _advisor_policy.advisor_signoff_blocked_wording(
             reason=reason,
             findings=verdict.findings_text,
             findings_backend_authored=verdict.findings_backend_authored,
             category=verdict.category,
             step_ids=step_ids,
+            request_rejection=rejection,
         )
         decision = AdvisorGateBlocked(
             fact=AdvisorSignoffGateFact(
@@ -956,6 +994,7 @@ class AdvisorCheckpointOwner:
                 for_graph=completion_gate_fingerprint(state),
                 note=note or None,
                 cause=cause,
+                request_rejection=rejection,
             )
         )
         validated_base = runtime_preflight if runtime_preflight is not None and runtime_preflight.is_valid else None
@@ -982,6 +1021,8 @@ class AdvisorCheckpointOwner:
                     if reason == "budget_exhausted"
                     else "unavailable"
                     if reason == "unavailable"
+                    else "request_rejected"
+                    if reason == "request_rejected"
                     else "malformed",
                 )
         elif runtime_preflight is not None and is_pending_interpretation_handoff(runtime_preflight):
@@ -1017,6 +1058,8 @@ class AdvisorCheckpointOwner:
                     if reason == "budget_exhausted"
                     else "unavailable"
                     if reason == "unavailable"
+                    else "request_rejected"
+                    if reason == "request_rejected"
                     else "malformed",
                 )
         else:
@@ -1042,6 +1085,36 @@ class AdvisorCheckpointOwner:
                 augmented = compose_advisor_signoff_flagged_red_message(raw_content, runtime_result=runtime_preflight)
             else:
                 augmented = compose_advisor_signoff_unrendered_red_message(raw_content, runtime_result=runtime_preflight)
+        if rejection is not None:
+            # Keep each preflight axis and validator objection, enriching only
+            # the Advisor-owned check/blocker with the admitted safe descriptor.
+            handoff = runtime_preflight is not None and is_pending_interpretation_handoff(runtime_preflight)
+            runtime_result = runtime_result.model_copy(
+                update={
+                    "checks": [
+                        check.model_copy(
+                            update={
+                                "detail": check.detail + " " + rejection.explanation if handoff else detail,
+                                "request_rejection": rejection,
+                            }
+                        )
+                        if check.name == "advisor_signoff"
+                        else check
+                        for check in runtime_result.checks
+                    ],
+                    "readiness": runtime_result.readiness.model_copy(
+                        update={
+                            "blockers": [
+                                blocker.model_copy(update={"detail": detail, "suggestion": suggestion, "request_rejection": rejection})
+                                if blocker.code == "advisor_signoff_blocked"
+                                else blocker
+                                for blocker in runtime_result.readiness.blockers
+                            ]
+                        }
+                    ),
+                }
+            )
+            augmented = compose_request_rejected_message(augmented, rejection=rejection, handoff=handoff)
         if reason == "flagged_unrepairable":
             # elspeth-25f7b757e7 (A1, fix round 1 N1): the block's cause is
             # the user's own chat message, so every variant names the reword
@@ -1193,7 +1266,7 @@ class AdvisorCheckpointOwner:
                 raise AuditIntegrityError("Planner continuation changed its actual provider owner")
             continuation_budget.require_publication(publication_review)
 
-        def continuation_withheld() -> AdvisorCheckpointVerdict:
+        def continuation_withheld(*, provider_failure: ProviderRequestFailure | None = None) -> AdvisorCheckpointVerdict:
             # No schema-admitted model decision is fabricated when accounting
             # prevents admission. Actual attempted calls retain their own audit.
             return AdvisorCheckpointVerdict(
@@ -1201,6 +1274,8 @@ class AdvisorCheckpointOwner:
                 blocking=False,
                 findings_text="Final review cannot be admitted within the existing planner budget.",
                 failure_class="budget_exhausted",
+                provider_failure=provider_failure,
+                retryable=provider_failure is None,
             )
 
         first_attempt_schema_valid: bool | None = None
@@ -1208,11 +1283,17 @@ class AdvisorCheckpointOwner:
         format_reprompt_sent = False
 
         async def completed(verdict: AdvisorCheckpointVerdict, *, source: AdvisorCheckpointVerdictSource) -> AdvisorCheckpointVerdict:
-            audit_verdict: Literal["clean", "flagged", "unavailable", "malformed"]
+            audit_verdict: Literal["clean", "flagged", "unavailable", "request_rejected", "malformed"]
             if verdict.ok:
                 audit_verdict = "flagged" if verdict.blocking else "clean"
             else:
-                audit_verdict = "unavailable" if verdict.failure_class == "unavailable" else "malformed"
+                audit_verdict = (
+                    "request_rejected"
+                    if verdict.failure_class == "request_rejected"
+                    else "unavailable"
+                    if verdict.failure_class == "unavailable"
+                    else "malformed"
+                )
             await persist_advisor_checkpoint_pass(
                 sessions=self._sessions_service,
                 session_id=session_id,
@@ -1268,6 +1349,7 @@ class AdvisorCheckpointOwner:
         last_exc: Exception | None = None
         last_response_unparseable = False
         last_failure_retryable = True
+        last_request_failure: ProviderRequestFailure | None = None
         call_arguments: dict[str, Any] = arguments
         format_reprompt_pending = False
 
@@ -1309,6 +1391,7 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
+            attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
             try:
                 if remaining is None:
                     guidance, _meta = await self._call_advisor_with_audit(
@@ -1354,8 +1437,6 @@ class AdvisorCheckpointOwner:
                     format_reprompt_pending = False
                 continue
             except provider_failures as exc:
-                if continuation_budget is not None and not continuation_budget.has_cost_headroom():
-                    return continuation_withheld()
                 # Only declared provider failures become provider verdicts.
                 # Audit failures and defects in controlled code must propagate.
                 # Retain exceptions only to classify the final outcome.
@@ -1364,6 +1445,12 @@ class AdvisorCheckpointOwner:
                 call_arguments = arguments
                 format_reprompt_pending = False
                 failure = classify_provider_failure(exc)
+                if failure is not None and failure.request_rejection is not None:
+                    last_request_failure = self._retain_request_failure(
+                        exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
+                    )
+                if continuation_budget is not None and not continuation_budget.has_cost_headroom():
+                    return continuation_withheld(provider_failure=last_request_failure)
                 last_failure_retryable = failure is None or failure.retryable
                 if not last_failure_retryable:
                     # The primary path uses this same value-free policy.
@@ -1412,15 +1499,21 @@ class AdvisorCheckpointOwner:
         # parsed-but-unusable text was handled above. Other failures mean no
         # usable review was obtained. Both classes still block completion, and
         # neither fixed detail exposes raw provider diagnostics.
-        failure_class: Literal["none", "unavailable", "malformed"]
+        failure_class: Literal["none", "unavailable", "request_rejected", "malformed"]
         if isinstance(last_exc, _MalformedLLMResponseError):
             failure_class = "malformed"
+        elif last_request_failure is not None:
+            failure_class = "request_rejected"
         else:
             failure_class = "unavailable"
         findings_text = (
-            _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
-            if failure_class == "unavailable"
-            else _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+            last_request_failure.details.explanation
+            if last_request_failure is not None
+            else (
+                _advisor_policy.ADVISOR_UNAVAILABLE_USER_DETAIL
+                if failure_class == "unavailable"
+                else _advisor_policy.ADVISOR_MALFORMED_USER_DETAIL
+            )
         )
         return await completed(
             AdvisorCheckpointVerdict(
@@ -1429,6 +1522,7 @@ class AdvisorCheckpointOwner:
                 failure_class=failure_class,
                 findings_text=findings_text,
                 retryable=last_failure_retryable,
+                provider_failure=last_request_failure,
             ),
             source="model",
         )

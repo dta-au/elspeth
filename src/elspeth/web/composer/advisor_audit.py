@@ -73,7 +73,7 @@ def _require_review_hash(value: object) -> None:
         raise AuditIntegrityError("Graph review identity requires a canonical SHA256")
 
 
-type GraphReviewSource = Literal["model", "prescan", "unavailable", "malformed", "budget_exhausted"]
+type GraphReviewSource = Literal["model", "prescan", "unavailable", "request_rejected", "malformed", "budget_exhausted"]
 
 
 @cache
@@ -113,7 +113,7 @@ class AdvisorGraphReviewIdentity:
     def __post_init__(self) -> None:
         _require_review_hash(self.binding)
         _require_review_hash(self.for_graph)
-        if self.source not in {"model", "prescan", "unavailable", "malformed", "budget_exhausted"}:
+        if self.source not in {"model", "prescan", "unavailable", "request_rejected", "malformed", "budget_exhausted"}:
             raise AuditIntegrityError("Unknown graph review identity source")
 
 
@@ -282,7 +282,7 @@ class AdvisorGraphReviewFact:
 
 
 _CHECKPOINT_PHASES: Final[frozenset[str]] = frozenset({"early", "end"})
-_CHECKPOINT_VERDICTS: Final[frozenset[str]] = frozenset({"clean", "flagged", "unavailable", "malformed"})
+_CHECKPOINT_VERDICTS: Final[frozenset[str]] = frozenset({"clean", "flagged", "unavailable", "request_rejected", "malformed"})
 _CHECKPOINT_SOURCES: Final[frozenset[str]] = frozenset({"prescan", "model"})
 _PUBLICATION_BRANCHES: Final[frozenset[str]] = frozenset(
     {
@@ -301,6 +301,7 @@ _PREFLIGHT_SHAPES: Final[frozenset[str]] = frozenset({"absent", "green", "pendin
 # the ``terminal_block`` branch carries one; every repair branch passes None.
 AdvisorTerminalBlockReason = Literal[
     "unavailable",
+    "request_rejected",
     "malformed",
     "budget_exhausted",
     "publication_withheld",
@@ -311,6 +312,7 @@ AdvisorTerminalBlockReason = Literal[
 _TERMINAL_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
     {
         "unavailable",
+        "request_rejected",
         "malformed",
         "budget_exhausted",
         "publication_withheld",
@@ -431,7 +433,7 @@ class AdvisorCheckpointPassRecord:
             if self.provider_attempts != 0 or self.verdict != "flagged" or self.first_attempt_schema_valid is not None:
                 raise AuditIntegrityError("AdvisorCheckpointPassRecord prescan must be flagged without provider attempts or conformance")
         elif self.provider_attempts == 0 and (
-            self.verdict not in {"unavailable", "malformed"} or self.first_attempt_schema_valid is not None
+            self.verdict not in {"unavailable", "request_rejected", "malformed"} or self.first_attempt_schema_valid is not None
         ):
             # Admission can fail before the SDK call starts. That completed
             # failure has no provider response to describe, unlike an

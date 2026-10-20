@@ -139,6 +139,19 @@ describe("SharedInspectView", () => {
     expect(screen.getByTestId("shared-inspect-return-link")).toBeInTheDocument();
   });
 
+  it("describes an authentication refusal without declaring the shared link invalid", async () => {
+    vi.spyOn(api, "fetchSharedInspect").mockRejectedValueOnce({
+      status: 401,
+      error_type: "authentication_required",
+      detail: "Invalid or expired share token",
+    });
+    render(<SharedInspectView token="valid-share-token" />);
+    const error = await screen.findByTestId("shared-inspect-error");
+    expect(error).toHaveTextContent(/sign.in/i);
+    expect(error).not.toHaveTextContent(/no longer valid|expired or been revoked/i);
+    expect(screen.queryByTestId("shared-inspect-graph")).toBeNull();
+  });
+
   it("renders the 404 error path for expired blobs", async () => {
     vi.spyOn(api, "fetchSharedInspect").mockRejectedValueOnce({
       status: 404,

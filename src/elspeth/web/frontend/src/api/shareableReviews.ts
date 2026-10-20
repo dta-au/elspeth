@@ -13,8 +13,9 @@ import { authFetch } from "./authSession";
  * capability, NOT an authenticator — see plan 19a §"Capability vs
  * authenticator"). Owner-auth endpoints participate in the global 401 logout
  * interceptor via the shared parseResponse helper in api/client.ts; the
- * shared-inspect capability endpoint preserves the reviewer session so the
- * caller can render invalid/revoked-link errors in place.
+ * shared-inspect endpoint preserves the reviewer session for capability
+ * refusals. A Bearer authentication challenge uses the normal credential
+ * expiry handling, which can only clear the login that sent the request.
  *
  * Wire shapes mirror src/elspeth/web/shareable_reviews/models.py verbatim;
  * any drift here is a typed-parse failure.
@@ -211,8 +212,20 @@ export async function fetchSharedInspect(
     headers: authHeaders(),
     signal,
   });
-  return validateSharedInspectResponse(
-    await parseResponse<unknown>(response, { logoutOnUnauthorized: false }),
-    response.status,
-  );
+  // This is the backend's bare challenge, not a general challenge parser.
+  // Older servers and capability refusals retain the existing no-logout path.
+  const authenticationRefused = response.status === 401 &&
+    response.headers.get("WWW-Authenticate")?.trim().toLowerCase() === "bearer";
+  let body: unknown;
+  try {
+    body = await parseResponse<unknown>(response, { logoutOnUnauthorized: authenticationRefused });
+  } catch (error) {
+    if (authenticationRefused && isRecord(error) && error.status === 401 && typeof error.detail === "string") {
+      // Classification belongs to this request even when a newer login
+      // prevents the original response from clearing authentication.
+      throw { ...error, error_type: "authentication_required" };
+    }
+    throw error;
+  }
+  return validateSharedInspectResponse(body, response.status);
 }

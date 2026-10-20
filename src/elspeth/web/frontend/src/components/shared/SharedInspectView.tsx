@@ -52,7 +52,8 @@
  *
  * Error handling:
  *
- * * 401 (tampered/expired token) → "This share link is no longer valid"
+ * * Authentication 401 → sign-in recovery, without declaring the link invalid.
+ * * Capability 401 (tampered/expired token) → "This share link is no longer valid"
  *   with a "Return to my workspace" CTA.
  * * 404 (blob reaped) → "This shared snapshot is no longer available"
  *   with a "Ask the sender for a fresh link" message.
@@ -146,6 +147,12 @@ function _isApiError(value: unknown): value is ApiError {
 function _classifyError(exc: unknown): { status: number | null; message: string } {
   if (_isApiError(exc)) {
     if (exc.status === 401) {
+      if (exc.error_type === "authentication_required") {
+        return {
+          status: 401,
+          message: "Your sign-in was not accepted for this request. Reload this link or sign in again.",
+        };
+      }
       return {
         status: 401,
         message:

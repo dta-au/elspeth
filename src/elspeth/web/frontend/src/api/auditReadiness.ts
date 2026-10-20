@@ -20,7 +20,7 @@ import type {
 } from "../types/api";
 import { VALIDATION_CHECK_OUTCOME_CODE_VALUES } from "../types/index";
 import { authHeaders, parseResponse } from "./client";
-import { isValidationReadiness } from "./validationReadiness";
+import { isSafeRequestRejection, isValidationReadiness } from "./validationReadiness";
 
 type AuditReadinessBaseEnvelope = {
   session_id: string;
@@ -91,6 +91,7 @@ function isValidationCheck(check: unknown): check is ValidationCheck {
     typeof check.name === "string" &&
     typeof check.passed === "boolean" &&
     typeof check.detail === "string" &&
+    (!("request_rejection" in check) || isSafeRequestRejection(check.request_rejection)) &&
     Array.isArray(check.affected_nodes) &&
     check.affected_nodes.every((node) => typeof node === "string") &&
     (

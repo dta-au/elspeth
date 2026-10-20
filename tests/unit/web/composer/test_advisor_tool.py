@@ -847,7 +847,8 @@ async def test_exhausted_advisor_turn_preserves_discovery_accounting_and_deadlin
 
 
 @pytest.mark.asyncio
-async def test_advisor_call_failure_records_inner_status_and_outer_error() -> None:
+@pytest.mark.parametrize("rejected", [False, True])
+async def test_advisor_call_failure_records_inner_status_and_outer_error(rejected: bool) -> None:
     """When the advisor LiteLLM call raises (timeout, API error, malformed
     response), the interception must:
       - Convert the failure into a structured ADVISOR_ERROR tool result so
@@ -863,6 +864,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     entry's safety: field is an unverified claim.
     """
     from litellm.exceptions import APIError as LiteLLMAPIError
+    from litellm.exceptions import BadRequestError
 
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
@@ -875,7 +877,11 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
 
     # LiteLLMAPIError is a recognised provider error class — _call_advisor_with_audit
     # catches it, records an API_ERROR-status ComposerLLMCall, and re-raises.
-    api_error = LiteLLMAPIError(status_code=500, message="upstream server error", llm_provider="anthropic", model="claude-sonnet-4-6")
+    api_error = (
+        BadRequestError("PRIVATE_UPSTREAM_BODY", llm_provider="anthropic", model="claude-sonnet-4-6", body={"code": "invalid_request"})
+        if rejected
+        else LiteLLMAPIError(status_code=500, message="upstream server error", llm_provider="anthropic", model="claude-sonnet-4-6")
+    )
 
     with (
         patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
@@ -898,7 +904,13 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     )
     result_canonical = _result_canonical(invs[0])
     assert "ADVISOR_ERROR" in result_canonical
-    assert "APIError" in result_canonical, (
+    if rejected:
+        payload = json.loads(result_canonical)
+        assert payload["request_rejection"]["reason_code"] == "invalid_request"
+        assert payload["request_rejection"]["retryable"] is False
+        assert payload["request_rejection"]["diagnostic_reference"].startswith("provider-failure:")
+        assert "PRIVATE_UPSTREAM_BODY" not in result_canonical
+    assert ("BadRequestError" if rejected else "APIError") in result_canonical, (
         "result must carry the underlying error class so the composer LLM can distinguish "
         "transient API failures from auth/budget/disabled cases"
     )
@@ -907,7 +919,7 @@ async def test_advisor_call_failure_records_inner_status_and_outer_error() -> No
     # _call_advisor_with_audit finally block.
     advisor_llm_calls = [c for c in result.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
     assert len(advisor_llm_calls) == 1
-    assert advisor_llm_calls[0].status.name == "API_ERROR", (
+    assert advisor_llm_calls[0].status.name == ("BAD_REQUEST_ERROR" if rejected else "API_ERROR"), (
         f"inner LLM call status was {advisor_llm_calls[0].status.name}, expected API_ERROR; "
         "the finally block in _call_advisor_with_audit may not be classifying LiteLLMAPIError correctly"
     )

@@ -113,6 +113,289 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from elspeth_lints.core.ast_walker import iter_python_files
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason_code", ["invalid_request", "context_length_exceeded", None, "PRIVATE_UNKNOWN_CODE"])
+async def test_rejected_review_retains_safe_reason_through_sdk_gate_and_wire(
+    monkeypatch, make_service, clean_runnable_state, physical_advisor, reason_code
+):
+    """A real SDK mapping may drop body.code while retaining the HTTP response."""
+    import httpx
+    import litellm
+    from litellm.exceptions import BadRequestError
+    from litellm.litellm_core_utils.exception_mapping_utils import _map_openai_exception
+    from openai import BadRequestError as OriginalBadRequestError
+
+    from elspeth.contracts.freeze import deep_freeze
+    from elspeth.web.execution.completion_gates import completion_gates_meta_from_facts, merge_completion_gates, parse_completion_gates
+
+    private = "PRIVATE_PROMPT_AND_PROVIDER_BODY"
+    body = {"message": private, "type": "request_validation"}
+    if reason_code is not None:
+        body["code"] = reason_code
+    response = httpx.Response(400, request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"), json={"error": body})
+    original = OriginalBadRequestError(private, response=response, body=body)
+    with pytest.raises(BadRequestError) as mapped:
+        _map_openai_exception(
+            model="advisor",
+            original_exception=original,
+            custom_llm_provider="openai",
+            error_str="rejected input",
+            exception_type="BadRequestError",
+            exception_provider="OpenAI",
+            extra_information="",
+        )
+    # Known-positive control for the installed SDK's generic HTTP-400 body loss.
+    assert mapped.value.body is None
+    assert mapped.value.response is response
+    calls = 0
+
+    async def rejected(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise mapped.value
+
+    service = make_service()
+    physical_advisor.bind(service)
+    monkeypatch.setattr(litellm, "acompletion", rejected)
+    with prompt_guard_user_scope(""):
+        outcome = await drive_try_terminate(
+            service,
+            clean_runnable_state,
+            advisor_checkpoint_passes_used=0,
+            candidate="UNREVIEWED_CANDIDATE",
+            session_operation_context=physical_advisor.context,
+            provider_owner=physical_advisor.owner,
+        )
+    result = outcome.result
+    assert result.advisor_gate_decision.fact.cause.value == "request_rejected"
+    detail = result.advisor_gate_decision.fact.request_rejection
+    known = reason_code in {"invalid_request", "context_length_exceeded"}
+    assert detail.reason_code == (reason_code if known else None)
+    assert detail.reason_disposition == ("retained" if known else "absent" if reason_code is None else "unrecognized")
+    assert detail.diagnostic_reference is not None
+    assert calls == 1 and outcome.advisor_passes_delta == 1
+    assert result.runtime_preflight.is_valid
+    assert not result.runtime_preflight.readiness.completion_ready
+    blocker = next(b for b in result.runtime_preflight.readiness.blockers if b.code == "advisor_signoff_blocked")
+    assert blocker.request_rejection == detail
+    assert detail.explanation in blocker.detail
+    assert detail.explanation in result.message
+    wire = completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=result.advisor_gate_decision.fact))
+    assert wire["advisor_signoff"]["request_rejection"]["reason_code"] == detail.reason_code
+    persisted = parse_completion_gates({"completion_gates": wire})
+    assert persisted.advisor_signoff.request_rejection == detail
+    assert parse_completion_gates(deep_freeze({"completion_gates": wire})) == persisted
+    invalid = json.loads(json.dumps(wire))
+    invalid["advisor_signoff"]["request_rejection"]["reason_code"] = "PRIVATE_BAD_CODE"
+    with pytest.raises(ValueError):
+        parse_completion_gates(deep_freeze({"completion_gates": invalid}))
+    assert wire["advisor_signoff"]["request_rejection"]["reason_code"] == detail.reason_code
+    reloaded = merge_completion_gates(result.runtime_preflight, persisted, clean_runnable_state)
+    assert next(b for b in reloaded.readiness.blockers if b.code == "advisor_signoff_blocked").request_rejection == detail
+    assert next(c for c in reloaded.checks if c.name == "advisor_signoff").request_rejection == detail
+    assert not reloaded.readiness.completion_ready
+    exposed = result.message + result.runtime_preflight.model_dump_json() + json.dumps(wire)
+    assert private not in exposed and "PRIVATE_UNKNOWN_CODE" not in exposed and "UNREVIEWED_CANDIDATE" not in exposed
+    assert "model was unavailable" not in exposed and "returned no usable verdict" not in exposed
+
+
+@pytest.mark.parametrize("call_id", [None, "recorded-provider-attempt"])
+def test_rejection_reference_requires_recorded_call_identity(call_id):
+    from datetime import UTC, datetime
+
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+    from elspeth.contracts.provider_rejection import SafeRequestRejection
+    from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+
+    now = datetime.now(UTC)
+    recorder = make_recorder()
+    recorder.record_llm_call(
+        ComposerLLMCall(
+            model_requested="advisor",
+            model_returned=None,
+            status=ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+            prompt_tokens=None,
+            completion_tokens=None,
+            total_tokens=None,
+            latency_ms=1,
+            provider_request_id=None,
+            messages_hash="owned-request-hash",
+            tools_spec_hash=None,
+            declared_tool_names=(),
+            started_at=now,
+            finished_at=now,
+            error_class="BadRequestError",
+            error_message="PRIVATE_PROVIDER_DETAIL",
+            temperature=None,
+            seed=None,
+            call_id=call_id,
+        )
+    )
+    original = ValueError("PRIVATE_ORIGINAL")
+    detail = SafeRequestRejection(reason_code="invalid_request", reason_disposition="retained", reason_source="sdk_body")
+    retained = AdvisorCheckpointOwner._retain_request_failure(original, detail, recorder=recorder, attempt_call_offset=0)
+    assert retained.original is original
+    assert retained.details.reason_code == "invalid_request" and retained.details.retryable is False
+    expected_reference = diagnostic_evidence_identity("provider-failure", call_id) if call_id is not None else None
+    assert retained.details.diagnostic_reference == expected_reference
+    assert "PRIVATE" not in json.dumps(retained.details.to_wire())
+
+
+@pytest.mark.asyncio
+async def test_rejected_checkpoint_keeps_original_exception_internal(make_service, simple_state):
+    from litellm.exceptions import BadRequestError
+
+    failure = BadRequestError("PRIVATE_PROVIDER_BODY", model="advisor", llm_provider="openai", body={"code": "invalid_request"})
+    original_cause = ValueError("PRIVATE_CAUSAL_VALUE")
+    failure.__cause__ = original_cause
+    service = make_service()
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=failure)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, **_fenced_session(service), recorder=make_recorder()
+    )
+    assert verdict.failure_class == "request_rejected"
+    assert verdict.provider_failure.original is failure
+    assert verdict.provider_failure.original.__cause__ is original_cause
+    assert verdict.provider_failure.details.reason_code == "invalid_request"
+    assert not verdict.retryable and not verdict.ok and verdict.publication_verdict is None
+    assert "PRIVATE_PROVIDER_BODY" not in repr(verdict)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["green", "absent", "red", "handoff"])
+async def test_rejected_review_preserves_each_preflight_shape_and_safe_notice(make_service, clean_runnable_state, shape):
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
+
+    failure = BadRequestError("PRIVATE_BODY", model="advisor", llm_provider="openai", body={"code": "invalid_request"})
+    details = classify_provider_failure(failure).request_rejection
+    verdict = AdvisorCheckpointVerdict(
+        ok=False,
+        blocking=False,
+        findings_text=details.explanation,
+        failure_class="request_rejected",
+        retryable=False,
+        provider_failure=ProviderRequestFailure(original=failure, details=details),
+    )
+    service = make_service()
+    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(return_value=verdict)
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, **_shape_drive_kwargs(shape))
+    result = outcome.result
+    assert details.explanation in result.message
+    check = next(c for c in result.runtime_preflight.checks if c.name == "advisor_signoff")
+    assert check.request_rejection == details and details.explanation in check.detail
+    if shape == "green":
+        assert result.runtime_preflight.is_valid and not result.runtime_preflight.readiness.completion_ready
+    elif shape == "red":
+        assert _HONESTY_GATE_RED_OBJECTION in result.message
+    elif shape == "handoff":
+        assert is_pending_interpretation_handoff(result.runtime_preflight)
+        assert "completion remains withheld" not in check.detail.lower()
+        assert "completion remains withheld" not in result.message.lower()
+    else:
+        assert not result.runtime_preflight.readiness.authoring_valid
+    segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
+    assert any(isinstance(s, TrustedSystemNoticeSegment) and details.explanation in s.content for s in segments)
+    tampered = result.message.replace(details.explanation, "PRIVATE_FORGED_PROVIDER_TEXT")
+    assert not any(
+        isinstance(s, TrustedSystemNoticeSegment) and "PRIVATE_FORGED_PROVIDER_TEXT" in s.content
+        for s in visible_message_segments(content=tampered, raw_content=result.raw_assistant_content)
+    )
+
+
+@pytest.mark.asyncio
+async def test_hint_rejection_keeps_private_cause_and_safe_reason(make_service):
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+
+    failure = BadRequestError("PRIVATE_BODY", model="advisor", llm_provider="openai", body={"code": "unsupported_parameter"})
+    service = make_service()
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=failure)
+    outcome = await service._advisor_checkpoint._call_advisor_for_tool(
+        RequestAdvisorHintArgumentsModel(
+            trigger="proactive_security_safety", problem_summary="Review this configuration.", recent_errors=[], attempted_actions=[]
+        ),
+        recorder=make_recorder(),
+    )
+    assert outcome.provider_failure.original is failure
+    assert outcome.provider_failure.details.reason_code == "unsupported_parameter"
+    assert "PRIVATE_BODY" not in repr(outcome) + json.dumps(outcome.provider_failure.details.to_wire())
+
+
+@pytest.mark.asyncio
+async def test_rejection_survives_simultaneous_cost_refusal(make_service, clean_runnable_state, physical_advisor, monkeypatch):
+    from decimal import Decimal
+
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget
+
+    service = make_service()
+    fenced = physical_advisor.bind(service)
+    request = "Review this graph"
+    evidence = TurnEvidence(
+        session_id=fenced["session_id"],
+        session_operation_context=fenced["session_operation_context"],
+        request_id="rejection-budget",
+        request=request,
+        initial_state_id=None,
+        initial_state=clean_runnable_state,
+    )
+    review = evidence.review_candidate(candidate="UNREVIEWED_CANDIDATE", request=request, current_state=clean_runnable_state)
+    budget = PlannerContinuationBudget(
+        policy=PlannerBudgetPolicy(1, 1_000_000, 100, Decimal("1")),
+        session_id=fenced["session_id"],
+        request_id="rejection-budget",
+        request_hash=stable_hash(request),
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+        deadline=asyncio.get_running_loop().time() + 60,
+        reserved_calls=0,
+        validated_cost=Decimal("0"),
+        cost_known=True,
+    )
+    budget.validate_for(
+        session_id=fenced["session_id"],
+        request_id="rejection-budget",
+        request=request,
+        provider_owner=fenced["provider_owner"],
+        evidence_owner=evidence,
+    )
+    budget.bind_publication(review)
+    failure = BadRequestError("PRIVATE_BODY", model="advisor", llm_provider="openai", body={"code": "invalid_request"})
+    calls = _install_budget_advisor_transport(monkeypatch, [failure])
+    recorder = make_recorder()
+    with prompt_guard_user_scope(request):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="end",
+            state=clean_runnable_state,
+            publication_review=review,
+            continuation_budget=budget,
+            recorder=recorder,
+            **fenced,
+        )
+    assert verdict.failure_class == "budget_exhausted" and not verdict.ok
+    assert verdict.provider_failure.original is failure
+    assert verdict.provider_failure.details.reason_code == "invalid_request"
+    assert not verdict.retryable and len(calls) == 1 and len(recorder.llm_calls) == 1
+    service._advisor_checkpoint._run_advisor_checkpoint = _AsyncRecorder(return_value=verdict)
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        session_operation_context=fenced["session_operation_context"],
+        provider_owner=fenced["provider_owner"],
+    )
+    fact = outcome.result.advisor_gate_decision.fact
+    assert fact.cause is AdvisorBlockCause.BUDGET_EXHAUSTED
+    assert fact.request_rejection == verdict.provider_failure.details
+    assert fact.request_rejection.explanation in fact.detail
+    assert not outcome.result.runtime_preflight.readiness.completion_ready
+
+
 _ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -2313,7 +2596,7 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
 @pytest.mark.parametrize(
     ("outcome", "failure_class", "attempts", "audit_status"),
     [
-        ("bad_request", "unavailable", 1, "BAD_REQUEST_ERROR"),
+        ("bad_request", "request_rejected", 1, "BAD_REQUEST_ERROR"),
         ("api_error", "unavailable", 2, "API_ERROR"),
         ("outage", "unavailable", 2, "API_ERROR"),
         ("malformed_text", "malformed", 2, "SUCCESS"),
@@ -2366,7 +2649,13 @@ async def test_checkpoint_sdk_failure_requires_response_evidence_for_malformed(
     assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus[audit_status]] * attempts
     assert verdict.ok is False and verdict.publication_verdict is None
     assert verdict.failure_class == failure_class
-    assert verdict.findings_text == (ADVISOR_UNAVAILABLE_USER_DETAIL if failure_class == "unavailable" else ADVISOR_MALFORMED_USER_DETAIL)
+    assert verdict.findings_text == (
+        verdict.provider_failure.details.explanation
+        if failure_class == "request_rejected"
+        else ADVISOR_UNAVAILABLE_USER_DETAIL
+        if failure_class == "unavailable"
+        else ADVISOR_MALFORMED_USER_DETAIL
+    )
     assert private_detail not in repr(verdict)
     writes = service._sessions_service.add_message.await_args_list
     assert len(writes) == 1
@@ -4427,8 +4716,13 @@ async def test_end_gate_nonretryable_sdk_failure_waits_for_later_request(
     assert first.action == "return" and first.advisor_passes_delta == 1
     assert first.result.runtime_preflight.readiness.completion_ready is False
     fact = first.result.advisor_gate_decision.fact
-    assert fact.cause is AdvisorBlockCause.UNAVAILABLE
-    assert first.result.graph_review_identity.source == "unavailable"
+    assert fact.cause is (AdvisorBlockCause.UNAVAILABLE if failure_kind == "auth" else AdvisorBlockCause.REQUEST_REJECTED)
+    assert first.result.graph_review_identity.source == ("unavailable" if failure_kind == "auth" else "request_rejected")
+    if failure_kind == "bad_request":
+        assert fact.request_rejection is not None
+        assert fact.request_rejection.retryable is False
+    else:
+        assert fact.request_rejection is None
     assert private_detail not in first.result.message + first.result.runtime_preflight.model_dump_json()
     assert "UNREVIEWED_FIRST_CANDIDATE" not in first.result.message
     assert first_recorder.llm_calls[0].status is (
@@ -4566,10 +4860,15 @@ async def test_end_gate_sdk_request_failure_withholds_without_malformed_claim(
     assert outcome.advisor_passes_delta == (1 if failure_kind == "bad_request" else 2)
     result = outcome.result
     assert result.runtime_preflight.readiness.completion_ready is False
-    assert result.advisor_gate_decision.fact.cause is AdvisorBlockCause.UNAVAILABLE
-    assert result.graph_review_identity.source == "unavailable"
+    assert result.advisor_gate_decision.fact.cause is (
+        AdvisorBlockCause.REQUEST_REJECTED if failure_kind == "bad_request" else AdvisorBlockCause.UNAVAILABLE
+    )
+    assert result.graph_review_identity.source == ("request_rejected" if failure_kind == "bad_request" else "unavailable")
     exposed = result.message + result.runtime_preflight.model_dump_json()
-    assert ADVISOR_UNAVAILABLE_USER_DETAIL in exposed
+    if failure_kind == "bad_request":
+        assert result.advisor_gate_decision.fact.request_rejection.explanation in exposed
+    else:
+        assert ADVISOR_UNAVAILABLE_USER_DETAIL in exposed
     assert "malformed" not in exposed
     assert private_detail not in exposed and candidate not in exposed
     assert "advisor_publication_withheld" in {
