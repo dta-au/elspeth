@@ -1,4 +1,7 @@
-import type { SafeRequestRejection, ValidationReadiness } from "../types/index";
+import type { SafeRequestRejection, ValidationCheck, ValidationReadiness } from "../types/index";
+import { VALIDATION_CHECK_OUTCOME_CODE_VALUES } from "../types/index";
+
+const VALIDATION_CHECK_OUTCOME_CODES = new Set<string>(VALIDATION_CHECK_OUTCOME_CODE_VALUES);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -19,6 +22,21 @@ export function isSafeRequestRejection(value: unknown): value is SafeRequestReje
     (disposition === "retained") === known && !(known && source === "unavailable") &&
     (value.diagnostic_reference === null || typeof value.diagnostic_reference === "string" &&
       /^provider-failure:[0-9a-f]{64}$/.test(value.diagnostic_reference)) && value.retryable === false
+  );
+}
+
+/** Shared check admission for live validation and audit reload. */
+export function isValidationCheck(check: unknown): check is ValidationCheck {
+  return (
+    isRecord(check) &&
+    typeof check.name === "string" &&
+    typeof check.passed === "boolean" &&
+    typeof check.detail === "string" &&
+    (!("request_rejection" in check) || isSafeRequestRejection(check.request_rejection)) &&
+    Array.isArray(check.affected_nodes) &&
+    check.affected_nodes.every((node) => typeof node === "string") &&
+    (check.outcome_code === null ||
+      typeof check.outcome_code === "string" && VALIDATION_CHECK_OUTCOME_CODES.has(check.outcome_code))
   );
 }
 

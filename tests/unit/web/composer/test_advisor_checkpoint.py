@@ -395,6 +395,10 @@ async def test_rejection_survives_simultaneous_cost_refusal(make_service, clean_
     assert fact.request_rejection.explanation in fact.detail
     assert not outcome.result.runtime_preflight.readiness.completion_ready
 
+    publication = outcome.result.advisor_terminal_publication
+    assert publication.reason == "budget_exhausted"
+    assert publication.to_dict()["request_rejection"] == verdict.provider_failure.details.to_wire()
+
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -633,6 +637,91 @@ def _make_settings(**overrides: object) -> WebSettings:
 def make_recorder() -> BufferingRecorder:
     """Module-level helper (NOT a fixture): a fresh in-flight recorder."""
     return BufferingRecorder()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["early", "planner_decline"])
+@pytest.mark.parametrize("reason_code", ["invalid_request", "context_length_exceeded"])
+async def test_audit_only_request_rejection_paths_retain_closed_evidence(
+    make_service, physical_advisor, nonempty_state, empty_state, monkeypatch, entry, reason_code
+):
+    from decimal import Decimal
+
+    from litellm.exceptions import BadRequestError
+
+    from elspeth.contracts.provider_rejection import SafeRequestRejection
+    from elspeth.web.composer.advisor_audit import AdvisorCheckpointPassRecord, AdvisorTerminalPublication
+    from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget, PlannerDeclined
+    from elspeth.web.composer.turn_effects import TurnEvidence
+
+    service = make_service()
+    request = "Review the fixed synthetic pipeline."
+    fenced = physical_advisor.bind(service, request=request)
+    failure = BadRequestError("PRIVATE_PROVIDER_BODY", model="advisor", llm_provider="openai", body={"code": reason_code})
+    calls = _install_budget_advisor_transport(monkeypatch, [failure])
+    recorder = make_recorder()
+    with prompt_guard_user_scope(""):
+        if entry == "early":
+            messages = []
+            ran = await service._advisor_checkpoint._maybe_run_early_checkpoint(
+                state=nonempty_state,
+                prev_state=empty_state,
+                llm_messages=messages,
+                recorder=recorder,
+                **fenced,
+            )
+            assert ran and messages == []  # Failed EARLY review remains advisory/nonblocking.
+        else:
+            deadline = asyncio.get_running_loop().time() + 60
+            evidence = TurnEvidence(
+                session_id=fenced["session_id"],
+                session_operation_context=fenced["session_operation_context"],
+                request_id="audit-only-rejection",
+                request=request,
+                initial_state_id=None,
+                initial_state=nonempty_state,
+            )
+            budget = PlannerContinuationBudget(
+                policy=PlannerBudgetPolicy(1, 1_000_000, 100, Decimal("1")),
+                session_id=fenced["session_id"],
+                request_id="audit-only-rejection",
+                request_hash=stable_hash(request),
+                provider_owner=physical_advisor.owner,
+                evidence_owner=evidence,
+                deadline=deadline,
+                reserved_calls=0,
+                validated_cost=Decimal("0"),
+                cost_known=True,
+            )
+            result = await service._planning_application._review_planner_decline(
+                declined=PlannerDeclined("declined", decline_text="Cannot assemble that pipeline.", continuation_budget=budget),
+                candidate="Cannot assemble that pipeline.",
+                request=request,
+                request_id="audit-only-rejection",
+                state=nonempty_state,
+                recorder=recorder,
+                progress=None,
+                turn_evidence=evidence,
+                deadline=deadline,
+                **fenced,
+            )
+            assert result.advisor_gate_decision is None
+            assert result.advisor_terminal_publication.reason == "budget_exhausted"
+    assert len(calls) == 1 and len(recorder.llm_calls) == 1
+    with physical_advisor.engine.connect() as connection:
+        rows = connection.execute(select(chat_messages_table)).all()
+    envelopes = [envelope for row in rows for envelope in (row.tool_calls or ())]
+    kind = "advisor_checkpoint_pass_audit" if entry == "early" else "advisor_terminal_publication_audit"
+    retained = [envelope for envelope in envelopes if envelope["_kind"] == kind]
+    assert len(retained) == 1
+    payload = retained[0]["pass" if entry == "early" else "publication"]
+    details = SafeRequestRejection.from_wire(payload["request_rejection"])
+    assert details.reason_code == reason_code and details.reason_source == "sdk_body"
+    assert details.diagnostic_reference == diagnostic_evidence_identity("provider-failure", recorder.llm_calls[0].call_id)
+    decoded = AdvisorCheckpointPassRecord.from_dict(payload) if entry == "early" else AdvisorTerminalPublication.from_dict(payload)
+    assert decoded.request_rejection == details
+    assert "PRIVATE_PROVIDER_BODY" not in json.dumps(envelopes)
 
 
 def test_advisor_checkpoint_telemetry_counter_uses_phase_verdict_and_source(monkeypatch) -> None:

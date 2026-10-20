@@ -941,11 +941,11 @@ class AdvisorCheckpointOwner:
         """
         # Minted here, persisted by the gate that calls this builder: the
         # record is the result's own proof of which branch published it.
-        publication = AdvisorTerminalPublication(
-            branch="terminal_block",
+        publication = AdvisorTerminalPublication.for_block(
             reason=reason,
             preflight_shape=_advisor_policy.advisor_preflight_shape(runtime_preflight),
             findings_backend_authored=verdict.findings_backend_authored,
+            request_rejection=verdict.provider_failure.details if verdict.provider_failure is not None else None,
         )
         # Graph findings alone grant no publication permission. A missing or
         # mismatched binding cannot restore the original candidate through
@@ -1317,6 +1317,7 @@ class AdvisorCheckpointOwner:
                     email_redactions=verdict.email_redactions if source == "model" and verdict.ok else None,
                     publication_verdict=verdict.publication_verdict if phase == "end" and source == "model" and verdict.ok else None,
                     publication_binding=verdict.publication_binding if phase == "end" and source == "model" and verdict.ok else None,
+                    request_rejection=verdict.provider_failure.details if verdict.provider_failure is not None else None,
                 ),
             )
             return verdict

@@ -13,14 +13,12 @@ import type {
   ReadinessRow,
   ReadinessRowId,
   ReadinessStatus,
-  ValidationCheck,
   ValidationError,
   ValidationResult,
   ValidationWarning,
 } from "../types/api";
-import { VALIDATION_CHECK_OUTCOME_CODE_VALUES } from "../types/index";
 import { authHeaders, parseResponse } from "./client";
-import { isSafeRequestRejection, isValidationReadiness } from "./validationReadiness";
+import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
 
 type AuditReadinessBaseEnvelope = {
   session_id: string;
@@ -36,7 +34,6 @@ const READINESS_ROW_IDS = new Set<ReadinessRowId>([
   "secrets",
 ]);
 const READINESS_STATUSES = new Set<ReadinessStatus>(["ok", "warning", "error", "not_applicable"]);
-const VALIDATION_CHECK_OUTCOME_CODES = new Set<string>(VALIDATION_CHECK_OUTCOME_CODE_VALUES);
 
 function unexpectedShape(status: number): ApiError {
   return {
@@ -81,25 +78,6 @@ function isValidationEntry(entry: unknown): entry is ValidationError | Validatio
       entry.error_code === undefined ||
       typeof entry.error_code === "string" ||
       entry.error_code === null
-    )
-  );
-}
-
-function isValidationCheck(check: unknown): check is ValidationCheck {
-  return (
-    isRecord(check) &&
-    typeof check.name === "string" &&
-    typeof check.passed === "boolean" &&
-    typeof check.detail === "string" &&
-    (!("request_rejection" in check) || isSafeRequestRejection(check.request_rejection)) &&
-    Array.isArray(check.affected_nodes) &&
-    check.affected_nodes.every((node) => typeof node === "string") &&
-    (
-      check.outcome_code === null ||
-      (
-        typeof check.outcome_code === "string" &&
-        VALIDATION_CHECK_OUTCOME_CODES.has(check.outcome_code)
-      )
     )
   );
 }
