@@ -99,9 +99,9 @@ cannot share session stores or replicas.
 
 These notes describe the 0.8.9 source package. Final-head CI and the protected
 merge remain required; this entry does not establish a published tag or image.
-Automatic image publication from main remains held. Tag and container
-publication, operator signing, live-provider acceptance and deployment remain
-separate steps.
+Automatic image publication from main remains held. The 0.8.9 tag and container
+publication follow successful required checks and the protected merge.
+Operator signing, live-provider acceptance and deployment remain separate steps.
 
 ### Azure Container Apps (0.8.8 development)
 
