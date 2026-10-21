@@ -727,7 +727,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
     )
-    sign_bundle.add_argument(
+    sign_bundle_scope = sign_bundle.add_mutually_exclusive_group()
+    sign_bundle_scope.add_argument(
         "--lanes",
         type=_sign_bundle_lanes,
         default=None,
@@ -742,6 +743,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "journalled in the transaction and a resume must use the same "
             "--lanes value (omitting the flag on resume inherits it). Default: "
             "all lanes."
+        ),
+    )
+    sign_bundle_scope.add_argument(
+        "--stale-key",
+        default=None,
+        metavar="KEY",
+        help=(
+            "Retire exactly one verified orphan by its full key, without judge calls. "
+            "The complete bundle is still verified. Resume inherits this immutable scope; "
+            "exact-scope journals require this version or newer."
         ),
     )
     sign_bundle.add_argument(

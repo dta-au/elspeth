@@ -2783,6 +2783,46 @@ def _pop_allow_hits_entry(target_yaml: Path, entry_key: str) -> str:
     return _pop_allow_hits_entry_with_position(target_yaml, entry_key).text
 
 
+def _preview_allow_hits_entry_removal(current: str, target_yaml: Path, entry_key: str) -> tuple[str, _RemovedAllowHitsEntry]:
+    """Preview the canonical text surgery without parsing/reserializing neighbors."""
+    lines = current.splitlines(keepends=True)
+    _require_single_allow_hits_header(lines, target_yaml)
+    header_index = None
+    for idx, line in enumerate(lines):
+        if line.rstrip("\r\n") == "allow_hits:":
+            header_index = idx
+            break
+    if header_index is None:
+        raise ValueError(f"{target_yaml}: no allow_hits block found")
+
+    block_end = len(lines)
+    for idx in range(header_index + 1, len(lines)):
+        line = lines[idx]
+        if not line.strip():
+            continue
+        if _is_allow_hits_block_line(line):
+            continue
+        block_end = idx
+        break
+
+    entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
+    matching_ranges = [
+        (entry_start, entry_end) for entry_start, entry_end in entry_ranges if lines[entry_start].rstrip("\r\n") == f"- key: {entry_key}"
+    ]
+    if not matching_ranges:
+        raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
+    if len(matching_ranges) > 1:
+        raise ValueError(f"{target_yaml}: duplicate allow_hits entries found for key {entry_key!r}")
+
+    entry_start, entry_end = matching_ranges[0]
+    removed_entry = _RemovedAllowHitsEntry(
+        text="".join(lines[entry_start:entry_end]),
+        index=entry_ranges.index((entry_start, entry_end)),
+    )
+    new_lines = [*lines[:entry_start], *lines[entry_end:]]
+    return _normalize_empty_allow_hits("".join(new_lines)), removed_entry
+
+
 def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _RemovedAllowHitsEntry:
     """Remove one exact entry and retain its original sequence position."""
     removed_entry: _RemovedAllowHitsEntry | None = None
@@ -2792,50 +2832,24 @@ def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _R
         if current is None:
             raise ValueError(f"{target_yaml}: allowlist YAML file is required")
 
-        lines = current.splitlines(keepends=True)
-        _require_single_allow_hits_header(lines, target_yaml)
-        header_index = None
-        for idx, line in enumerate(lines):
-            if line.rstrip("\r\n") == "allow_hits:":
-                header_index = idx
-                break
-        if header_index is None:
-            raise ValueError(f"{target_yaml}: no allow_hits block found")
-
-        block_end = len(lines)
-        for idx in range(header_index + 1, len(lines)):
-            line = lines[idx]
-            if not line.strip():
-                continue
-            if _is_allow_hits_block_line(line):
-                continue
-            block_end = idx
-            break
-
-        entry_ranges = _allow_hit_entry_ranges(lines, start=header_index + 1, end=block_end)
-        matching_ranges = [
-            (entry_start, entry_end)
-            for entry_start, entry_end in entry_ranges
-            if lines[entry_start].rstrip("\r\n") == f"- key: {entry_key}"
-        ]
-        if not matching_ranges:
-            raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
-        if len(matching_ranges) > 1:
-            raise ValueError(f"{target_yaml}: duplicate allow_hits entries found for key {entry_key!r}")
-
-        entry_start, entry_end = matching_ranges[0]
-        removed_entry = _RemovedAllowHitsEntry(
-            text="".join(lines[entry_start:entry_end]),
-            index=entry_ranges.index((entry_start, entry_end)),
-        )
-        new_lines = [*lines[:entry_start], *lines[entry_end:]]
-        return _normalize_empty_allow_hits("".join(new_lines))
+        result, removed_entry = _preview_allow_hits_entry_removal(current, target_yaml, entry_key)
+        return result
 
     with allowlist_mutation_lock(target_yaml.parent):
         atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
     if removed_entry is None:
         raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
     return removed_entry
+
+
+def _exact_stale_preview(original: bytes, *, source_file: str, key: str) -> bytes:
+    # The general text writer normalizes CRLF. Exact retirement refuses that
+    # input rather than authorizing unrelated newline edits in its byte guard.
+    text = original.decode("utf-8")
+    if "\r" in text:
+        raise ValueError("exact stale retirement requires LF-only YAML; refusing newline normalization")
+    rendered, _removed = _preview_allow_hits_entry_removal(text, Path(source_file), key)
+    return rendered.encode("utf-8")
 
 
 def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
@@ -2998,6 +3012,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         load_manifest,
         publication_disposition,
         rollback_pending_publish,
+        selected_action_indices,
         source_validation_pending,
         transaction_lock,
     )
@@ -3099,6 +3114,29 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             sys.stderr.write(f"  mismatch: {mismatch}\n")
         return 2
 
+    try:
+        selected = selected_action_indices(bundle, verification=verification, selected_lanes=args.lanes, stale_key=args.stale_key)
+    except (ValueError, SignBundleTransactionError) as exc:
+        sys.stderr.write(f"sign-bundle: selection error: {exc}\n")
+        return 2
+    exact_stale_selection = None
+    preview_stale_delete: Callable[[bytes], bytes] | None = None
+    if args.stale_key is not None:
+        index = next(iter(selected))
+        source_file = bundle.actions[index].source_file
+        exact_stale_selection = {"key": args.stale_key, "index": index, "source_file": source_file}
+
+        def preview_exact(original: bytes) -> bytes:
+            assert source_file is not None
+            return _exact_stale_preview(original, source_file=source_file, key=args.stale_key)
+
+        preview_stale_delete = preview_exact
+        try:
+            preview_exact((verification_allowlist_dir / source_file).read_bytes())
+        except (OSError, ValueError) as exc:
+            sys.stderr.write(f"sign-bundle: exact stale preview error: {exc}\n")
+            return 2
+
     # --- Pre-write summary (pure read) ---------------------------------------
     _emit_sign_bundle_summary(bundle, verification=verification, args=args)
     if args.lanes is not None:
@@ -3107,6 +3145,11 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         sys.stdout.write(
             f"sign-bundle: --lanes {','.join(args.lanes)} — {excluded} action(s) outside the selected lane(s) "
             "will not be attempted and stay fail-closed.\n"
+        )
+
+    if args.stale_key is not None:
+        sys.stdout.write(
+            f"sign-bundle: exact stale key {args.stale_key}; {len(bundle.actions) - 1} unselected action(s); zero judge calls.\n"
         )
 
     if args.dry_run:
@@ -3131,6 +3174,8 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
                     rotation_log=args.rotation_log,
                     signing_policy=signing_policy,
                     selected_lanes=args.lanes,
+                    exact_stale_selection=exact_stale_selection,
+                    preview_stale_delete=preview_stale_delete,
                 )
                 sys.stderr.write(f"sign-bundle: private transaction created at {tx_path}; if interrupted, resume with --resume {tx_path}\n")
             else:
@@ -3215,6 +3260,14 @@ def _assert_resume_lanes(manifest: dict[str, Any], args: argparse.Namespace) -> 
     """
     from elspeth_lints.core.sign_bundle_transaction import SignBundleTransactionError
 
+    exact = manifest.get("exact_stale")
+    if exact is not None:
+        if args.lanes is not None or (args.stale_key is not None and args.stale_key != exact["key"]):
+            raise SignBundleTransactionError("resume exact stale selection mismatch; scope cannot be changed")
+        args.stale_key = exact["key"]
+        return
+    if args.stale_key is not None:
+        raise SignBundleTransactionError("resume cannot add an exact stale selection to a legacy transaction")
     manifest_lanes = manifest.get("selected_lanes")
     if args.lanes is None:
         args.lanes = None if manifest_lanes is None else tuple(manifest_lanes)
@@ -3252,8 +3305,10 @@ def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.
     # Scope to --lanes: the operator confirms what will be attempted, so an
     # unselected action must not appear as planned work or a planned override
     # (mirrors the lane filter in _execute_sign_bundle).
-    selected_lanes = None if args.lanes is None else set(args.lanes)
-    selected_actions = [a for a in bundle.actions if selected_lanes is None or a.lane in selected_lanes]
+    from elspeth_lints.core.sign_bundle_transaction import selected_action_indices
+
+    selected = selected_action_indices(bundle, verification=verification, selected_lanes=args.lanes, stale_key=args.stale_key)
+    selected_actions = [bundle.actions[index] for index in sorted(selected)]
     counts = {"justify": 0, "drift_repair": 0, "rotation": 0, "stale_delete": 0}
     for action in selected_actions:
         counts[action.kind] = counts.get(action.kind, 0) + 1
@@ -3310,10 +3365,10 @@ def _execute_sign_bundle(
     # is a stale claim -- abort before any write, mirroring sign-judge-signatures.
     # Actions outside the selected lanes are never attempted, so their claims
     # cannot gate the transaction.
-    selected_lanes = None if args.lanes is None else set(args.lanes)
-    blocked = {
-        a.key for a in bundle.actions if a.kind == "drift_repair" and (selected_lanes is None or a.lane in selected_lanes)
-    } & unrepairable_keys
+    from elspeth_lints.core.sign_bundle_transaction import run_sign_bundle_transaction, selected_action_indices
+
+    selected = selected_action_indices(bundle, verification=verification, selected_lanes=args.lanes, stale_key=args.stale_key)
+    blocked = {bundle.actions[index].key for index in selected if bundle.actions[index].kind == "drift_repair"} & unrepairable_keys
     if blocked:
         sys.stderr.write("sign-bundle: drift_repair action(s) are no longer signable in the fresh diagnosis; re-run stage_scan:\n")
         for key in sorted(blocked):
@@ -3321,8 +3376,6 @@ def _execute_sign_bundle(
         # A stale claim is re-staged, not resumed: nothing was written, and a
         # resume re-derives the same fresh diagnosis and stops here again.
         return _SignBundleOutcome(2, resumable=False)
-
-    from elspeth_lints.core.sign_bundle_transaction import run_sign_bundle_transaction
 
     result = run_sign_bundle_transaction(
         bundle=bundle,
@@ -3348,6 +3401,13 @@ def _execute_sign_bundle(
             stale_delete_sources=stale_delete_sources,
             args=action_args,
             before_write=before_write,
+        ),
+        preview_stale_delete=(
+            None
+            if args.stale_key is None
+            else lambda original: _exact_stale_preview(
+                original, source_file=bundle.actions[next(iter(selected))].source_file, key=args.stale_key
+            )
         ),
     )
     if result.exit_code != 0:
@@ -3380,8 +3440,9 @@ def _execute_sign_bundle(
                     "resume with --continue-on-block to skip them and publish the survivors.\n"
                 )
         return _SignBundleOutcome(result.exit_code, resumable=True)
-    _emit_deferred_baseline_notice(args)
-    _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
+    if args.stale_key is None:
+        _emit_deferred_baseline_notice(args)
+        _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
     _emit_sign_bundle_post_state(args)
     prefix = "recovered completed coherent publish" if result.recovered_publish else "completed"
     sys.stdout.write(f"sign-bundle: {prefix}; {result.completed_count} action(s) applied in one coherent publish.\n")
@@ -3488,6 +3549,8 @@ def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reaso
         command.append("--continue-on-block")
     if args.lanes is not None:
         command.extend(("--lanes", ",".join(args.lanes)))
+    if args.stale_key is not None:
+        command.extend(("--stale-key", args.stale_key))
     if args.judge_concurrency != 1:
         command.extend(("--judge-concurrency", str(args.judge_concurrency)))
     sys.stderr.write(

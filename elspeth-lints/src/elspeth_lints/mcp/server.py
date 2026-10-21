@@ -206,6 +206,7 @@ def _sign_bundle_command_text(
     *,
     lanes: str | None,
     continue_on_block: bool,
+    stale_key: str | None = None,
 ) -> str:
     """Render one paste-ready ``sign-bundle`` invocation at the given scope.
 
@@ -233,6 +234,10 @@ def _sign_bundle_command_text(
         "--judge-tools",
         "readonly",
     ]
+    if stale_key is not None:
+        if lanes is not None:
+            raise ValueError("stale-key selection cannot be combined with lanes")
+        parts.extend(("--stale-key", stale_key))
     if lanes is not None:
         parts.extend(("--lanes", lanes))
     if continue_on_block:
@@ -383,7 +388,13 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     bundle_path = _resolve_bundle_path(ctx, arguments)
     bundle = read_bundle(bundle_path)
+    stale_key = arguments.get("stale_key")
+    if "stale_key" in arguments and (not isinstance(stale_key, str) or not stale_key.strip()):
+        raise ValueError("stale_key must be a nonempty exact key")
+    exact_plan = None
     if bundle.rekey is not None and not bundle.actions:
+        if stale_key is not None:
+            raise ValueError("stale_key cannot select a rekey-only bundle")
         from elspeth_lints.core.source_snapshot import capture_source_snapshot
 
         if (
@@ -410,6 +421,19 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
         if not verification.ok:
             raise ValueError("staged bundle is stale; re-run stage_scan: " + "; ".join(verification.mismatches))
+        if stale_key is not None:
+            from elspeth_lints.core.sign_bundle_transaction import selected_action_indices
+
+            selected = selected_action_indices(bundle, verification=verification, stale_key=stale_key)
+            index = next(iter(selected))
+            exact_plan = {
+                "actions_total": 1,
+                "judge_calls_total": 0,
+                "stale_key": stale_key,
+                "original_action_index": index,
+                "source_file": bundle.actions[index].source_file,
+                "unselected_actions": len(bundle.actions) - 1,
+            }
 
     lane_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
@@ -439,8 +463,12 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "preview_outcomes": preview_outcomes,
         "justify_missing_rationale": justify_missing_rationale,
         "has_rekey_plan": bundle.rekey is not None,
-        "sign_bundle_command": _sign_bundle_command(ctx, bundle_path, bundle),
-        "sign_bundle_plan": _sign_bundle_plan(ctx, bundle_path, bundle),
+        "sign_bundle_command": (
+            _sign_bundle_command(ctx, bundle_path, bundle)
+            if stale_key is None
+            else _sign_bundle_command_text(ctx, bundle_path, lanes=None, continue_on_block=False, stale_key=stale_key)
+        ),
+        "sign_bundle_plan": _sign_bundle_plan(ctx, bundle_path, bundle) if exact_plan is None else exact_plan,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
@@ -946,6 +974,7 @@ _TOOLS.update(
                 "type": "object",
                 "properties": {
                     "bundle_id": {"type": "string", "description": "Bundle id (file is <staged-dir>/<id>.json)"},
+                    "stale_key": {"type": "string", "minLength": 1, "description": "Plan exactly one verified orphan; zero judge calls"},
                 },
                 "required": ["bundle_id"],
             },

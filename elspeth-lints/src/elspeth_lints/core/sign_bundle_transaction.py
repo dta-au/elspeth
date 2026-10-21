@@ -38,6 +38,7 @@ from elspeth_lints.core.review_bundle import DEFAULT_SIGN_BUNDLE_RATIONALE
 from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
 
 SCHEMA_VERSION = 1
+EXACT_STALE_SCHEMA_VERSION = 2
 TRANSACTION_DIRNAME = ".sign-bundle-transactions"
 MANIFEST_NAME = "transaction.json"
 _MANIFEST_HMAC_FIELD = "manifest_hmac"
@@ -92,6 +93,12 @@ def tree_snapshot(root: Path) -> dict[str, str]:
             raise SignBundleTransactionError(f"allowlist transaction refuses non-regular file: {path}")
         snapshot[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     return snapshot
+
+
+def _exact_tree_modes(root: Path) -> dict[str, int]:
+    """Include directories, including empty ones, in exact-mode path custody."""
+    tree_snapshot(root)  # retain the same symlink/non-regular-file refusal
+    return {path.relative_to(root).as_posix(): stat.S_IMODE(path.stat().st_mode) for path in [root, *sorted(root.rglob("*"))]}
 
 
 def file_sha256(path: Path) -> str:
@@ -151,6 +158,8 @@ def create_transaction(
     rotation_log: Path,
     signing_policy: dict[str, Any],
     selected_lanes: tuple[str, ...] | None = None,
+    exact_stale_selection: dict[str, Any] | None = None,
+    preview_stale_delete: Callable[[bytes], bytes] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Copy the active allowlist and initialize a secret-free durable journal."""
     active = allowlist_dir.resolve()
@@ -174,10 +183,33 @@ def create_transaction(
     with allowlist_mutation_lock(active):
         base_directory_identity = directory_identity(active)
         base_snapshot = tree_snapshot(active)
+        base_modes = None if exact_stale_selection is None else _exact_tree_modes(active)
         shutil.copytree(active, candidate)
         candidate_directory_identity = directory_identity(candidate)
         if directory_identity(active) != base_directory_identity or tree_snapshot(candidate) != base_snapshot:
             raise SignBundleTransactionError("active allowlist changed while creating its transaction candidate")
+        if base_modes is not None and _exact_tree_modes(candidate) != base_modes:
+            raise SignBundleTransactionError("active allowlist modes changed while copying its exact candidate")
+
+    exact_stale = None
+    if exact_stale_selection is not None:
+        if selected_lanes is not None or preview_stale_delete is None:
+            raise SignBundleTransactionError("exact stale selection requires its preview and excludes lane selection")
+        exact_stale = dict(exact_stale_selection)
+        owner = _local_allowlist_filename(exact_stale["source_file"])
+        original = (candidate / owner).read_bytes()
+        if hashlib.sha256(original).hexdigest() != base_snapshot[owner]:
+            raise SignBundleTransactionError("exact stale original bytes differ from the authenticated base")
+        expected = dict(base_snapshot)
+        expected[owner] = hashlib.sha256(preview_stale_delete(original)).hexdigest()
+        exact_stale["expected_snapshot"] = expected
+        if base_modes is None:
+            raise SignBundleTransactionError("exact stale transaction lacks its base modes")
+        exact_stale["base_modes"] = base_modes
+        exact_stale["expected_modes"] = {**base_modes, owner: 0o600}
+        before_image = tx_path / "exact-stale-before.bin"
+        before_image.write_bytes(original)
+        _fsync_file(before_image)
 
     rotation_base = tx_path / "rotation-base.bin"
     rotation_staged = tx_path / "rotation-staged.log"
@@ -186,7 +218,7 @@ def create_transaction(
     rotation_staged.write_bytes(base_rotation_bytes)
 
     manifest: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if exact_stale is None else EXACT_STALE_SCHEMA_VERSION,
         "bundle_path": str(bundle_resolved),
         "bundle_sha256": verified_bundle_sha256,
         "root": str(source_root),
@@ -210,6 +242,8 @@ def create_transaction(
         # and the publish invariant covers the selected set only.
         "selected_lanes": None if selected_lanes is None else sorted(selected_lanes),
     }
+    if exact_stale is not None:
+        manifest["exact_stale"] = exact_stale
     _fsync_tree(candidate)
     _fsync_directory(candidate_parent)
     _fsync_file(rotation_base)
@@ -292,7 +326,11 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         raw = strict_json_loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, StrictJSONError) as exc:
         raise SignBundleTransactionError(f"cannot read transaction manifest {manifest_path}: {exc}") from exc
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not isinstance(raw, dict)
+        or type(raw.get("schema_version")) is not int
+        or raw["schema_version"] not in {SCHEMA_VERSION, EXACT_STALE_SCHEMA_VERSION}
+    ):
         raise SignBundleTransactionError(f"unsupported sign-bundle transaction manifest: {manifest_path}")
     recorded_hmac = raw.get(_MANIFEST_HMAC_FIELD)
     if not isinstance(recorded_hmac, str) or not hmac.compare_digest(recorded_hmac, _manifest_hmac(raw)):
@@ -322,6 +360,7 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
         not isinstance(selected_lanes, list) or not all(isinstance(lane, str) and lane for lane in selected_lanes)
     ):
         raise SignBundleTransactionError("transaction manifest selected_lanes must be a list of lane names or null")
+    _validate_exact_stale_manifest(resolved, raw)
     if not isinstance(raw.get("rotation_base_sha256"), str) or not isinstance(raw.get("rotation_staged_sha256"), str):
         raise SignBundleTransactionError("transaction manifest rotation hashes must be strings")
     if raw.get("checkpoint_snapshot") is not None and not isinstance(raw.get("checkpoint_snapshot"), dict):
@@ -344,6 +383,118 @@ def load_manifest(tx_path: Path) -> dict[str, Any]:
     # its best-effort deletion cannot strand recovery. The next action replaces
     # it before journalling a new running_action.
     return raw
+
+
+def selected_action_indices(
+    bundle: Any,
+    *,
+    verification: Any,
+    selected_lanes: tuple[str, ...] | list[str] | None = None,
+    stale_key: str | None = None,
+) -> set[int]:
+    """Select original indices only after the complete bundle has verified."""
+    if stale_key is None:
+        return {i for i, action in enumerate(bundle.actions) if selected_lanes is None or action.lane in selected_lanes}
+    if selected_lanes is not None or not isinstance(stale_key, str) or not stale_key.strip():
+        raise ValueError("exact stale key must be nonempty and cannot be combined with lanes")
+    if not verification.ok:
+        raise ValueError("exact stale selection requires complete bundle verification")
+    matching = [(i, action) for i, action in enumerate(bundle.actions) if action.key == stale_key]
+    if len(matching) != 1 or matching[0][1].kind != "stale_delete":
+        raise ValueError("exact stale key must identify one verified stale_delete action")
+    index, action = matching[0]
+    owner = _action_source_file(action, verification=verification, specs_by_stale_key={})
+    if owner is None or owner != action.source_file:
+        raise ValueError("exact stale key must have one matching fresh diagnosis owner")
+    return {index}
+
+
+def _validate_exact_stale_manifest(tx_path: Path, manifest: dict[str, Any]) -> None:
+    exact = manifest.get("exact_stale")
+    if manifest["schema_version"] == SCHEMA_VERSION:
+        if exact is not None:
+            raise SignBundleTransactionError("legacy journal cannot carry exact stale scope")
+        return
+    if (
+        not isinstance(exact, dict)
+        or set(exact) != {"key", "index", "source_file", "expected_snapshot", "base_modes", "expected_modes"}
+        or not isinstance(exact["key"], str)
+        or not exact["key"].strip()
+        or type(exact["index"]) is not int
+        or exact["index"] < 0
+        or not isinstance(exact["source_file"], str)
+        or manifest.get("selected_lanes") is not None
+    ):
+        raise SignBundleTransactionError("invalid exact stale journal scope")
+    owner = _local_allowlist_filename(exact["source_file"])
+    base = manifest["base_snapshot"]
+    expected = exact["expected_snapshot"]
+    if (
+        not isinstance(expected, dict)
+        or set(expected) != set(base)
+        or owner not in base
+        or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in expected.values())
+        or {name for name in base if base[name] != expected[name]} != {owner}
+    ):
+        raise SignBundleTransactionError("invalid exact stale expected byte snapshot")
+    base_modes, expected_modes = exact["base_modes"], exact["expected_modes"]
+    if (
+        not isinstance(base_modes, dict)
+        or not isinstance(expected_modes, dict)
+        or set(base_modes) != set(expected_modes)
+        or not set(base).issubset(base_modes)
+        or "." not in base_modes
+        or any(type(mode) is not int or not 0 <= mode <= 0o7777 for mode in [*base_modes.values(), *expected_modes.values()])
+        or expected_modes.get(owner) != 0o600
+        or any(expected_modes[name] != mode for name, mode in base_modes.items() if name != owner)
+    ):
+        raise SignBundleTransactionError("invalid exact stale expected modes or path set")
+    original = tx_path / "exact-stale-before.bin"
+    if original.is_symlink() or not original.is_file() or file_sha256(original) != base[owner]:
+        raise SignBundleTransactionError("exact stale original-byte authentication failed")
+    completed = manifest["completed_actions"]
+    blocked = manifest.get("blocked_actions", [])
+    running = manifest.get("running_action")
+    if (
+        any(type(i) is not int or i != exact["index"] for i in completed)
+        or len(completed) != len(set(completed))
+        or blocked != []
+        or (running is not None and (type(running) is not int or running != exact["index"] or running in completed))
+    ):
+        raise SignBundleTransactionError("invalid exact stale journal action state")
+
+
+def _assert_exact_stale_bytes(manifest: dict[str, Any], *, published: bool = False) -> None:
+    exact = manifest.get("exact_stale")
+    if exact is None:
+        return
+    if published:
+        # Preserve a later writer's bytes, but refuse to certify them as this
+        # exact deletion. Legacy recovery retains its existing drift handling.
+        actual = tree_snapshot(Path(manifest["allowlist_dir"]))
+    else:
+        candidate = Path(manifest["candidate_dir"])
+        lock_name = f".{exact['source_file']}.lock"
+        lock = candidate / lock_name
+        if lock_name not in manifest["base_snapshot"] and lock.exists():
+            # Only the canonical writer's empty lock in this private candidate
+            # is disposable. Never remove a pre-existing or active-tree lock.
+            if lock.is_symlink() or not lock.is_file() or lock.read_bytes() != b"":
+                raise SignBundleTransactionError("unexpected exact stale private lock bytes")
+            lock.unlink()
+            _fsync_directory(candidate)
+        actual = tree_snapshot(candidate)
+    if actual != exact["expected_snapshot"]:
+        raise SignBundleTransactionError("exact stale candidate differs from the canonical one-entry byte transition")
+    actual_root = Path(manifest["allowlist_dir"] if published else manifest["candidate_dir"])
+    if _exact_tree_modes(actual_root) != exact["expected_modes"]:
+        raise SignBundleTransactionError("exact stale candidate modes or path set differ from its expected transition")
+
+
+def _assert_exact_stale_active_modes(manifest: dict[str, Any]) -> None:
+    exact = manifest.get("exact_stale")
+    if exact is not None and _exact_tree_modes(Path(manifest["allowlist_dir"])) != exact["base_modes"]:
+        raise SignBundleTransactionError("active allowlist modes or path set changed before exact publication")
 
 
 def save_manifest(tx_path: Path, manifest: dict[str, Any]) -> None:
@@ -555,6 +706,7 @@ def rollback_pending_publish(tx_path: Path, manifest: dict[str, Any]) -> None:
     with allowlist_mutation_lock(active):
         disposition = publication_disposition(manifest)
         if disposition == "published":
+            _assert_exact_stale_bytes(manifest, published=True)
             _rename_exchange(active, candidate)
             for parent in {active.parent, candidate.parent}:
                 _fsync_directory(parent)
@@ -828,6 +980,7 @@ def run_sign_bundle_transaction(
     continue_on_block: bool = False,
     judge_concurrency: int = 1,
     prefetch_execute_action: Callable[[Any, argparse.Namespace, Callable[[], None]], int] | None = None,
+    preview_stale_delete: Callable[[bytes], bytes] | None = None,
 ) -> SignBundleRunResult:
     """Reconcile/fire journaled actions and publish one verified candidate.
 
@@ -867,15 +1020,31 @@ def run_sign_bundle_transaction(
         raise SignBundleTransactionError("transaction journal records an action as both completed and blocked")
     if any(index < 0 or index >= len(bundle.actions) for index in blocked):
         raise SignBundleTransactionError("transaction blocked_actions index is out of range")
-    manifest_lanes = manifest.get("selected_lanes")
-    if manifest_lanes is None:
-        selected = set(range(len(bundle.actions)))
-    else:
-        lane_set = set(manifest_lanes)
-        selected = {index for index, action in enumerate(bundle.actions) if action.lane in lane_set}
+    _validate_exact_stale_manifest(tx_path, manifest)
+    exact = manifest.get("exact_stale")
+    try:
+        selected = selected_action_indices(
+            bundle,
+            verification=verification,
+            selected_lanes=manifest.get("selected_lanes"),
+            stale_key=None if exact is None else exact["key"],
+        )
+    except ValueError as exc:
+        raise SignBundleTransactionError(str(exc)) from exc
+    if exact is not None:
+        if selected != {exact["index"]} or bundle.actions[exact["index"]].source_file != exact["source_file"]:
+            raise SignBundleTransactionError("exact stale journal index or owner differs from the verified bundle")
+        if preview_stale_delete is None:
+            raise SignBundleTransactionError("exact stale recovery requires the canonical deletion preview")
+        expected = dict(manifest["base_snapshot"])
+        expected[exact["source_file"]] = hashlib.sha256(preview_stale_delete((tx_path / "exact-stale-before.bin").read_bytes())).hexdigest()
+        if expected != exact["expected_snapshot"]:
+            raise SignBundleTransactionError("exact stale expected bytes do not match its authenticated original")
     if (completed | blocked) - selected:
-        raise SignBundleTransactionError("transaction journal records actions outside its selected lanes")
+        raise SignBundleTransactionError("transaction journal records actions outside its selected scope")
     running = manifest.get("running_action")
+    if running is not None and (type(running) is not int or running not in selected):
+        raise SignBundleTransactionError("transaction running_action is outside its selected scope")
     recorded_rotation_hash = cast("str", manifest["rotation_staged_sha256"])
     if running is None:
         if file_sha256(tx_path / "rotation-staged.log") != recorded_rotation_hash:
@@ -886,6 +1055,7 @@ def run_sign_bundle_transaction(
             raise SignBundleTransactionError("transaction running-action rotation checkpoint authentication failed")
 
     if disposition.startswith("published"):
+        _assert_exact_stale_bytes(manifest, published=True)
         if completed | blocked != selected:
             raise SignBundleTransactionError("published transaction journal does not contain every selected bundle action")
         _validate_pending_source_publish(
@@ -919,6 +1089,7 @@ def run_sign_bundle_transaction(
             blocked_keys=tuple(bundle.actions[index].key for index in sorted(blocked)),
         )
 
+    _assert_exact_stale_active_modes(manifest)
     if running is not None:
         running_index = int(running)
         if running_index < 0 or running_index >= len(bundle.actions):
@@ -951,6 +1122,7 @@ def run_sign_bundle_transaction(
             authoritative=True,
         )
         if running_complete:
+            _assert_exact_stale_bytes(manifest)
             _prepare_completed_judge_evidence(
                 running_action,
                 tx_path=tx_path,
@@ -1000,6 +1172,8 @@ def run_sign_bundle_transaction(
         manifest["completed_actions"] = sorted(completed)
         commit_action_state(tx_path, manifest)
 
+    if exact is not None and completed:
+        _assert_exact_stale_bytes(manifest)
     assert_candidate_unchanged(manifest)
     _verify_completed_actions(
         bundle,
@@ -1144,6 +1318,7 @@ def _fire_one_action(
         repair_keys_by_stale_key=repair_keys_by_stale_key,
     )
     if code == 0:
+        _assert_exact_stale_bytes(manifest)
         _prepare_completed_judge_evidence(
             action,
             tx_path=tx_path,
@@ -1213,6 +1388,7 @@ def _publish_transaction(
     """Re-verify the bindings, then exchange the candidate into the active directory."""
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
 
+    _assert_exact_stale_bytes(manifest)
     final_verification = verify_bundle_against_tree(
         bundle,
         root=args.root,
@@ -1257,6 +1433,8 @@ def _publish_transaction(
     manifest["source_validation_state"] = _SOURCE_VALIDATION_PENDING
     save_manifest(tx_path, manifest)
     with allowlist_mutation_lock(Path(manifest["allowlist_dir"])):
+        _assert_exact_stale_active_modes(manifest)
+        _assert_exact_stale_bytes(manifest)
         publish_candidate(tx_path, manifest)
         _validate_pending_source_publish(
             bundle=bundle,

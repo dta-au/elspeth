@@ -13,10 +13,11 @@ cross-test imports.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -44,6 +45,44 @@ _RATIONALE = "original judge said the boundary was genuine"
 def _keyless(monkeypatch: pytest.MonkeyPatch) -> None:
     # The MCP surface is structurally key-free; default every test to no key.
     monkeypatch.delenv(_JUDGE_METADATA_SIGNATURE_ENV_VAR, raising=False)
+
+
+async def _stage_status_input_schema(tmp_path: Path) -> dict[str, Any]:
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    server = judge_server.create_server(
+        root=tmp_path / "source",
+        allowlist_dir=tmp_path / "allowlist",
+        staged_dir=tmp_path / "staged",
+    )
+    async with create_connected_server_and_client_session(server, read_timeout_seconds=timedelta(seconds=5)) as session:
+        response = await session.list_tools()
+    status_tools = [tool for tool in response.tools if tool.name == "stage_status"]
+    assert len(status_tools) == 1
+    return status_tools[0].inputSchema
+
+
+def _assert_exact_stale_status_schema(schema: dict[str, Any]) -> None:
+    assert schema["type"] == "object"
+    assert schema["required"] == ["bundle_id"]
+    assert "stale_key" in schema["properties"], "stage_status tools/list omitted stale_key"
+    assert schema["properties"]["stale_key"]["type"] == "string"
+    assert schema["properties"]["stale_key"]["minLength"] == 1
+
+
+def test_stage_status_tools_list_advertises_exact_stale_key(tmp_path: Path) -> None:
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+
+
+def test_stage_status_tools_list_contract_detects_removed_stale_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+    # Mutate registration only for fault injection; inspect both results over MCP.
+    monkeypatch.delitem(judge_server._TOOLS["stage_status"].input_schema["properties"], "stale_key")
+
+    advertised = asyncio.run(_stage_status_input_schema(tmp_path))
+
+    with pytest.raises(AssertionError, match="stage_status tools/list omitted stale_key"):
+        _assert_exact_stale_status_schema(advertised)
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +319,46 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "--judge-transport codex-cli" in payload["sign_bundle_command"]
     assert "--judge-tools readonly" in payload["sign_bundle_command"]
     assert "--dry-run" in payload["sign_bundle_command"]
+
+
+def test_stage_status_stale_key_selects_one_orphan_without_judge_work(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    assert Path(subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], text=True).strip()) == tmp_path
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "exact-stale-status")
+
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle.bundle_id, "stale_key": key})
+
+    assert outcome.is_error is False, outcome.text
+    payload = json.loads(outcome.text)
+    assert "--stale-key" in payload["sign_bundle_command"]
+    assert key in payload["sign_bundle_command"]
+    assert "--lanes" not in payload["sign_bundle_command"]
+    assert payload["sign_bundle_plan"]["actions_total"] == 1
+    assert payload["sign_bundle_plan"]["judge_calls_total"] == 0
+    assert payload["sign_bundle_plan"]["unselected_actions"] == len(bundle.actions) - 1
+    assert payload["sign_bundle_plan"]["source_file"] == "widget.yaml"
+    _assert_exact_stale_status_schema(asyncio.run(_stage_status_input_schema(tmp_path)))
+
+
+@pytest.mark.parametrize("key", ["unknown-key", "", 42, None])
+def test_stage_status_refuses_invalid_stale_key(tmp_path: Path, key: Any) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "invalid-exact-stale")
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle.bundle_id, "stale_key": key})
+    assert outcome.is_error is True
+    assert "--dry-run" not in outcome.text
 
 
 def test_stage_status_rejects_stale_bundle_without_command(tmp_path: Path) -> None:

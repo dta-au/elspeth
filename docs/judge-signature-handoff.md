@@ -143,7 +143,7 @@ present in the environment.
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
-| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command plus the `sign_bundle_plan` that prices it. Arg: `bundle_id` (required). |
+| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle and emit its priced operator command. Args: `bundle_id` (required), `stale_key` (optional exact orphan key; selects one action and zero judge calls). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
 | `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
@@ -196,7 +196,7 @@ before touching the configured active allowlist.
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
+  [--lanes resign|new_judgment[,...] | --stale-key KEY] [--continue-on-block] [--judge-concurrency N]
 ```
 
 `--judge-concurrency N` (1–8, default 1) runs up to N judge calls at once for
@@ -219,6 +219,31 @@ allowlist; the coherent publish covers the selected lanes only. The selection is
 journalled, and a resume must use the same value (omitting the flag on resume
 inherits it). `--continue-on-block` journals a judged BLOCK and keeps firing
 instead of stopping, leaving each blocked entry fail-closed and exiting 3.
+To retire one orphan, request `stage_status(bundle_id=..., stale_key=KEY)`.
+Its primary command contains `--stale-key KEY`; its plan reports one action,
+zero judge calls, the original bundle index, owning YAML and unselected count.
+`--stale-key` and `--lanes` are mutually exclusive. The CLI still requires the
+operator key for dry-run and firing, and verifies the complete unchanged v2
+bundle, source binding and census before selecting that exact stale deletion.
+Do not filter a bundle, narrow its roots or hand-edit signed YAML.
+
+Exact retirement preserves every other allowlist byte and path, including
+surviving comments, signatures, defaults and existing lock files. Removing the
+last row uses the canonical `allow_hits: []` normalization. LF-only target YAML
+is required; CRLF is refused before publication rather than silently rewritten.
+Exact mode does not regenerate the fingerprint baseline or override counters.
+Directory membership and surviving modes are also bound. The selected YAML
+uses the existing atomic writer's mode `0600`. Recovery refuses later active
+byte, mode or path changes without overwriting them; legacy recovery is unchanged.
+
+An exact transaction authenticates its original target bytes, expected complete
+snapshot, key, owner and original action index in journal schema 2. Older CLI
+versions refuse this journal; use the current CLI to resume. Omitting scope on
+resume inherits the recorded key; changing it or adding lanes is refused.
+Existing lane/all-action journals retain schema 1 and their existing behavior.
+Review-bundle schema v2 is unchanged. Staging remains key-free; only the operator
+runs the public keyed dry-run and firing command against the settled source.
+
 Prefer the forms `stage_status` renders in `sign_bundle_plan` — they are derived
 from the bundle and carry each scope's judge-call price — over hand-writing
 either flag.

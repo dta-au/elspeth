@@ -131,12 +131,15 @@ bundles must be re-staged.
    summarise the bundle (source identity, per-lane counts, preview outcomes,
    and which justify actions still lack a rationale) and emit the
    **paste-ready operator `sign-bundle` command** plus `sign_bundle_plan`,
-   which prices it. Arg: `bundle_id`.
+   which prices it. Args: `bundle_id`, optional exact `stale_key`. With that
+   selector the primary command retires only one verified orphan, and the plan
+   reports one action, zero judge calls, original index, owning YAML and the
+   unselected action count. Full-bundle verification still precedes selection.
 6. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
    entries and flag broken ones into a rekey bundle, recording env-var **names**
    only, never key bytes. Args: `old_key_env`, `new_key_env`.
 
-Every one of those tools emits `sign_bundle_command` (the whole-bundle form) and
+By default those tools emit `sign_bundle_command` (the whole-bundle form) and
 `sign_bundle_plan`, both derived from the bundle's own contents.
 `sign_bundle_plan.per_lane` lists each staged lane cheapest-first with its action
 count, its **judge-call** count, and a `--lanes`-scoped command that fires only
@@ -163,7 +166,7 @@ the tree and abort before the first write on any mismatch.
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
+  [--lanes resign|new_judgment[,...] | --stale-key KEY] [--continue-on-block] [--judge-concurrency N]
 elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
 
@@ -187,6 +190,23 @@ elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NE
   blocked entries fail-closed and exiting 3 so a partial run never reads as
   clean. Paste the forms from `sign_bundle_plan` rather than hand-writing
   either flag — those carry each scope's judge-call price.
+- For one orphan, use public `stage_status(bundle_id=..., stale_key=KEY)` and
+  hand the operator its exact `--stale-key` dry-run command. Never substitute
+  `--lanes resign`: that lane can contain unrelated judge calls. Do not filter
+  the bundle, narrow the roots, retarget a shared MCP instance or invoke private
+  handlers. The complete unchanged v2 bundle/census must verify first. The
+  operator key remains required even for mechanical dry-run; agents stay key-free.
+  Exact mode preserves all surviving bytes and paths, permits only canonical
+  last-row `allow_hits: []` normalization, refuses CRLF target YAML before
+  publication and skips broader baseline/counter refreshes. Its authenticated
+  mode/path guard retains surviving modes and directory membership; the selected
+  YAML uses the canonical atomic writer's `0600` mode. Exact recovery refuses
+  unrelated active drift without overwriting it; legacy recovery is unchanged.
+  Its authenticated
+  schema-2 journal retains original bytes, expected snapshot, original action
+  index, key and owner; older CLIs refuse it. Resume inherits omitted scope and
+  refuses a changed key or lane selection. Existing schema-1 lane/all-action
+  journals remain supported; review-bundle schema v2 does not change.
 - Non-dry-run `sign-bundle` works in a private same-filesystem transaction.
   Accepted decisions are HMAC-authenticated and journalled there; the active
   allowlist remains byte-identical on BLOCK, failure, or interruption. Only a
