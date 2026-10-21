@@ -13,6 +13,7 @@ from dataclasses import replace
 
 import pytest
 
+from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.composer.advisor_decision import (
     AdvisorBlockCause,
     AdvisorGateBlocked,
@@ -202,6 +203,9 @@ def test_persisted_advisor_fact_preserves_pending_handoff_until_reviews_resolve(
         for_graph=completion_gate_fingerprint(state),
         note=None,
         cause=cause,
+        request_rejection=SafeRequestRejection(reason_code="invalid_request", reason_disposition="retained", reason_source="sdk_body")
+        if cause is AdvisorBlockCause.REQUEST_REJECTED
+        else None,
     )
     persisted = completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=fact))
     reloaded = parse_completion_gates({COMPLETION_GATES_META_KEY: persisted})

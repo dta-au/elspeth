@@ -619,3 +619,182 @@ def test_checkpoint_event_mirrors_exact_counts_without_unbounded_metric_dimensio
     telemetry.record_advisor_checkpoint_pass(session_id="session-canary", **_telemetry_data(record))
     logger.info.assert_called_once_with("composer.advisor_checkpoint_pass", session_id="session-canary", **_telemetry_data(record))
     counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged", "source": "model"})
+
+
+@pytest.mark.parametrize("code", ["invalid_request", "context_length_exceeded"])
+def test_rejected_audit_records_roundtrip_only_closed_evidence(code):
+    from elspeth.contracts.provider_rejection import SafeRequestRejection
+
+    details = SafeRequestRejection(
+        reason_code=code,
+        reason_disposition="retained",
+        reason_source="http_response",
+        diagnostic_reference="provider-failure:" + "a" * 64,
+    )
+    record = AdvisorCheckpointPassRecord.from_findings(
+        phase="early",
+        pass_index=0,
+        verdict="request_rejected",
+        source="model",
+        findings_text="PRIVATE_FINDINGS_CANARY",
+        provider_attempts=1,
+        first_attempt_schema_valid=None,
+        first_attempt_accepted=None,
+        format_reprompt_sent=False,
+        step_ids_offered=None,
+        step_ids_kept=None,
+        note_present=None,
+        url_redactions=None,
+        email_redactions=None,
+        publication_verdict=None,
+        publication_binding=None,
+        request_rejection=details,
+    )
+    publication = AdvisorTerminalPublication.for_block(
+        reason="request_rejected",
+        preflight_shape="absent",
+        findings_backend_authored=False,
+        request_rejection=details,
+    )
+    assert record.to_dict()["request_rejection"] == details.to_wire()
+    assert publication.to_dict()["request_rejection"] == details.to_wire()
+    assert AdvisorCheckpointPassRecord.from_dict(json.loads(json.dumps(record.to_dict()))) == record
+    assert AdvisorTerminalPublication.from_dict(json.loads(json.dumps(publication.to_dict()))) == publication
+    with pytest.raises(AuditIntegrityError):
+        AdvisorCheckpointPassRecord.from_dict({**record.to_dict(), "source": "prescan"})
+    assert record.findings_hash == stable_hash({"advisor_findings": "PRIVATE_FINDINGS_CANARY"})
+    assert "PRIVATE_FINDINGS_CANARY" not in json.dumps(record.to_dict())
+    assert "original" not in json.dumps([record.to_dict(), publication.to_dict()])
+
+
+def test_historical_audit_absence_loads_but_new_rejected_producers_require_evidence():
+    old = replace(
+        _pass_record(),
+        verdict="request_rejected",
+        first_attempt_schema_valid=None,
+        first_attempt_accepted=None,
+        step_ids_offered=None,
+        step_ids_kept=None,
+        note_present=None,
+        url_redactions=None,
+        email_redactions=None,
+        publication_verdict=None,
+        publication_binding=None,
+    ).to_dict()
+    restored = AdvisorCheckpointPassRecord.from_dict(json.loads(json.dumps(old)))
+    assert restored.request_rejection is None and "request_rejection" not in restored.to_dict()
+    old_publication = {
+        "branch": "terminal_block",
+        "reason": "request_rejected",
+        "preflight_shape": "absent",
+        "findings_backend_authored": False,
+    }
+    assert AdvisorTerminalPublication.from_dict(old_publication).request_rejection is None
+    assert AdvisorCheckpointPassRecord.from_dict(_pass_record().to_dict()) == _pass_record()
+    with pytest.raises(AuditIntegrityError, match="safe rejection evidence"):
+        AdvisorCheckpointPassRecord.from_findings(
+            phase="early",
+            pass_index=0,
+            verdict="request_rejected",
+            source="model",
+            findings_text="rejected",
+            provider_attempts=1,
+            first_attempt_schema_valid=None,
+            first_attempt_accepted=None,
+            format_reprompt_sent=False,
+            step_ids_offered=None,
+            step_ids_kept=None,
+            note_present=None,
+            url_redactions=None,
+            email_redactions=None,
+            publication_verdict=None,
+            publication_binding=None,
+        )
+    with pytest.raises(AuditIntegrityError, match="safe rejection evidence"):
+        AdvisorTerminalPublication.for_block(
+            reason="request_rejected",
+            preflight_shape="absent",
+            findings_backend_authored=False,
+            request_rejection=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        {"message": "PRIVATE_PROVIDER_TEXT"},
+        {
+            "category": "request_rejected",
+            "exception_type": "BadRequestError",
+            "reason_code": "PRIVATE_UNKNOWN",
+            "reason_disposition": "retained",
+            "reason_source": "sdk_body",
+            "diagnostic_reference": None,
+            "retryable": False,
+        },
+    ],
+)
+def test_present_rejection_audit_evidence_is_never_trusted_as_raw_data(bad):
+    for factory, base in (
+        (AdvisorCheckpointPassRecord.from_dict, _pass_record().to_dict()),
+        (AdvisorTerminalPublication.from_dict, _publication().to_dict()),
+    ):
+        with pytest.raises(AuditIntegrityError):
+            factory({**base, "request_rejection": bad})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"reason_source": "unavailable"},
+        {"diagnostic_reference": "PRIVATE_REFERENCE"},
+        {"retryable": True},
+        {"extra": "PRIVATE_PROVIDER_TEXT"},
+    ],
+)
+def test_rejection_audit_reader_refuses_malformed_evidence_and_verdict_mismatches(changes):
+    from elspeth.contracts.provider_rejection import SafeRequestRejection
+
+    details = SafeRequestRejection(reason_code="invalid_request", reason_disposition="retained", reason_source="sdk_body")
+    wire = details.to_wire()
+    for factory, base in (
+        (AdvisorCheckpointPassRecord.from_dict, _pass_record().to_dict()),
+        (AdvisorTerminalPublication.from_dict, _publication().to_dict()),
+    ):
+        with pytest.raises(AuditIntegrityError):
+            factory({**base, "request_rejection": {**wire, **changes}})
+        # Even a valid descriptor cannot be attached to a flagged pass or repair publication.
+        with pytest.raises(AuditIntegrityError):
+            factory({**base, "request_rejection": wire})
+
+
+@pytest.mark.asyncio
+async def test_private_rejection_audit_precedes_unchanged_telemetry(monkeypatch):
+    from elspeth.contracts.provider_rejection import SafeRequestRejection
+
+    details = SafeRequestRejection(reason_code="invalid_request", reason_disposition="retained", reason_source="sdk_body")
+    record = replace(
+        _pass_record(),
+        verdict="request_rejected",
+        first_attempt_schema_valid=None,
+        first_attempt_accepted=None,
+        step_ids_offered=None,
+        step_ids_kept=None,
+        note_present=None,
+        url_redactions=None,
+        email_redactions=None,
+        publication_verdict=None,
+        publication_binding=None,
+        request_rejection=details,
+    )
+    sink = _OrderedSink()
+    monkeypatch.setattr(advisor_audit, "record_advisor_checkpoint_pass", sink.telemetry)
+    session_id = str(uuid.uuid4())
+    await persist_advisor_checkpoint_pass(
+        sessions=sink.sessions, session_id=session_id, session_operation_context=_context(session_id), record=record
+    )
+    assert [name for name, _ in sink.events] == ["audit", "telemetry"]
+    assert sink.events[0][1]["tool_calls"][0]["pass"]["request_rejection"] == details.to_wire()
+    assert "request_rejection" not in sink.events[1][1]
+    assert "provider-failure" not in json.dumps(sink.events[1][1])

@@ -6,6 +6,7 @@ import codecs
 import csv
 import hashlib
 import io
+import json
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -25,6 +26,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
@@ -2241,6 +2243,19 @@ def _execute_patch_source_options(
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     if echo_note is not None:
         data = {"server_owned_metadata_note": echo_note}
+
+    previous_content = project_composer_authority_payload(state.to_dict())
+    reconciled_content = project_composer_authority_payload(new_state.to_dict())
+    reconciled_content["version"] = state.version
+    # Compare the complete reconciled content, including review evidence.
+    # Standard JSON preserves bool/int/float distinctions that Python
+    # equality and RFC 8785 hashes can erase; the projection retains
+    # meaningful source and branch order while sorting ordinary mappings.
+    unchanged = json.dumps(previous_content, sort_keys=True, allow_nan=False) == json.dumps(
+        reconciled_content, sort_keys=True, allow_nan=False
+    )
+    if unchanged:
+        return _mutation_result(state, (), data=data)
     return _mutation_result(new_state, (_source_component_id(source_name),), data=data)
 
 

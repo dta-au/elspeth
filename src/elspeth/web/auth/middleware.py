@@ -103,6 +103,7 @@ async def get_current_user(request: Request) -> UserIdentity:
         raise HTTPException(
             status_code=401,
             detail="Missing or invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     auth_header = request.headers["Authorization"]
 
@@ -120,22 +121,11 @@ async def get_current_user(request: Request) -> UserIdentity:
         raise HTTPException(
             status_code=401,
             detail="Missing or invalid Authorization header",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     token = parts[1].strip()
     request.state.auth_token = token
-
-    # Decode claims without verification for downstream use (e.g. iat
-    # for refresh chain enforcement).  The authenticated call below
-    # verifies the signature — this is a pure parse, not a trust decision.
-    # On decode failure, set None (not {}) so downstream can distinguish
-    # "no iat in valid claims" from "claims unparseable."
-    import jwt as _jwt
-
-    try:
-        request.state.auth_claims = _jwt.decode(token, options={"verify_signature": False}, algorithms=["HS256"])
-    except _jwt.PyJWTError:
-        request.state.auth_claims = None
 
     auth_provider: AuthProvider = request.app.state.auth_provider
 
@@ -162,7 +152,7 @@ async def get_current_user(request: Request) -> UserIdentity:
             username=None,
             exception_class=type(exc).__name__,
         )
-        raise HTTPException(status_code=401, detail=exc.detail) from exc
+        raise HTTPException(status_code=401, detail=exc.detail, headers={"WWW-Authenticate": "Bearer"}) from exc
 
 
 async def require_pipeline_user(

@@ -982,6 +982,8 @@ class PlanningApplication:
                 if verdict.ok
                 else "unavailable"
                 if verdict.failure_class == "unavailable"
+                else "request_rejected"
+                if verdict.failure_class == "request_rejected"
                 else "malformed"
             )
             blocked = self._advisor_checkpoint._advisor_blocked_result(

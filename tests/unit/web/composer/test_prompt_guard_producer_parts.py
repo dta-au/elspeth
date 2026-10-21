@@ -100,6 +100,118 @@ async def test_compose_loaded_llm_schema_preserves_wire_and_graph_omission_evide
     assert "current_state" in "\n".join(request.documents)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
+@pytest.mark.parametrize("configured", [False, True])
+async def test_patched_large_scalar_survives_storage_and_short_followup_without_wire_changes(
+    invocation, monkeypatch, tmp_path, catalog, azure, mode, configured
+):
+    from uuid import UUID
+
+    from elspeth.web.composer import provider_gateway
+    from elspeth.web.composer.provider_quota import ProviderInvocationFamily
+    from elspeth.web.composer.tools._common import ToolContext
+    from elspeth.web.composer.tools.transforms import _execute_patch_node_options
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.routes._helpers import _state_from_record
+    from tests.unit.web.composer._helpers import _make_settings
+    from tests.unit.web.composer.test_prompt_guard_admission import _checks
+
+    policy, snapshot = catalog
+    engine, sessions, owner, coordinator = invocation
+    context = owner.required_work.coordinator.authority.context
+    original = _empty().with_node(
+        NodeSpec(
+            id="label",
+            node_type="transform",
+            plugin="value_transform",
+            input="records",
+            on_success="labelled",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}, "operations": [{"target": "label", "expression": "'short'"}]},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+    )
+    expression = "'" + "x" * 25_000 + "境界😀'"
+    result = _execute_patch_node_options(
+        {"node_id": "label", "patch": {"operations": [{"target": "label", "expression": expression}]}},
+        original,
+        ToolContext(catalog=policy, plugin_snapshot=snapshot, data_dir=str(tmp_path)),
+    )
+    assert result.success and result.updated_state.version > original.version
+    assert original.nodes[0].options["operations"][0]["expression"] == "'short'"
+    state_data = result.updated_state.to_dict()
+    saved = await sessions.save_composition_state(
+        UUID(context.fence.session_id),
+        CompositionStateData(
+            sources=state_data["sources"],
+            nodes=state_data["nodes"],
+            edges=state_data["edges"],
+            outputs=state_data["outputs"],
+            metadata_=state_data["metadata"],
+        ),
+        provenance="tool_call",
+        session_operation_context=context,
+    )
+    reloaded = await sessions.get_current_state(UUID(context.fence.session_id))
+    assert reloaded.id == saved.id
+    restored = _state_from_record(reloaded)
+    assert restored.nodes[0].options["operations"][0]["expression"] == expression
+    followup = "Keep the saved draft."
+    messages = build_messages([], restored, followup, policy, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    evidence = guard_contracts.detach_prompt_guard_evidence(messages)
+    graph_parts = evidence.content_parts[-2]
+    assert graph_parts is not None and "".join(part.text for part in graph_parts) == messages[-2]["content"]
+    scalar_parts = [part for part in graph_parts if part.inspection_text == expression]
+    assert len(scalar_parts) == 1 and scalar_parts[0].trust is None
+    client, sent = azure
+    monkeypatch.setattr(provider_gateway, "build_prompt_guard_mount", lambda _settings: PromptGuardMount(client) if configured else None)
+    settings = _make_settings(composer_model="gpt-4o", composer_prompt_guard_mode=mode)
+    gateway = provider_gateway.ProviderGateway(
+        model=settings.composer_model, settings=settings, endpoint_base_url=None, endpoint_api_key=None
+    )
+    transmitted = []
+
+    async def completion(**kwargs):
+        assert _checks(engine)[0]["disposition"] == "debug_bypass"
+        transmitted.append(kwargs)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": "The saved draft is retained."}}],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(followup):
+        operation = gateway._call_llm_with_audit(messages, [], timeout=10, recorder=recorder, provider_custody=custody)
+        if mode == "debug-when-unconfigured" and not configured:
+            await operation
+            assert len(transmitted) == len(recorder.llm_calls) == 1
+            assert transmitted[0]["messages"] == evidence.messages
+        else:
+            with pytest.raises(prompt_guard.PromptGuardRefused) as refused:
+                await operation
+            assert refused.value.http_status == 422
+            assert transmitted == [] and recorder.llm_calls == () and custody.attempt is None
+    assert sent == []
+    current = await sessions.get_current_state(UUID(context.fence.session_id))
+    assert current.id == saved.id and _state_from_record(current).nodes[0].options["operations"][0]["expression"] == expression
+    check = _checks(engine)[0]
+    assert (check["disposition"], check["reason"]) == (
+        ("debug_bypass", "guard_not_configured")
+        if mode == "debug-when-unconfigured" and not configured
+        else ("unavailable", "unsupported_input")
+    )
+    coordinator.assert_completed()
+
+
 def _diagnostics(count):
     now = datetime(2026, 10, 18, tzinfo=UTC)
     tokens: list[dict[str, Any]] = []
@@ -625,6 +737,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     hashed = {
         "role": "composer",
         "policy_fingerprint": client.policy_fingerprint,
+        "enforce_azure_character_limits": True,
         "user_prompt": _USER,
         "messages": wire["messages"],
         "tools": wire["tools"],

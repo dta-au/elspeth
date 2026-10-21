@@ -12,6 +12,37 @@ describe("api/client execution state binding", () => {
     fetchSpy.mockRestore();
   });
 
+  const safeRejection = {
+    category: "request_rejected", exception_type: "BadRequestError", reason_code: "invalid_request",
+    reason_disposition: "retained", reason_source: "sdk_body", diagnostic_reference: null, retryable: false,
+  };
+
+  function validationBody(rejection: unknown) {
+    return {
+      is_valid: false, errors: [], warnings: [],
+      checks: [{ name: "advisor_signoff", passed: false, detail: "Review rejected.",
+        affected_nodes: [], outcome_code: null, request_rejection: rejection }],
+      readiness: { authoring_valid: true, execution_ready: true, completion_ready: false, blockers: [] },
+    };
+  }
+
+  it("admits and preserves a closed live check rejection", async () => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify(validationBody(safeRejection)), { status: 200 }));
+    const result = await validatePipeline("session-1");
+    expect(result.checks[0].request_rejection).toEqual(safeRejection);
+  });
+
+  it.each([
+    null, { message: "PRIVATE_PROVIDER_TEXT" }, { ...safeRejection, reason_code: "PRIVATE_UNKNOWN" },
+    { ...safeRejection, reason_source: "unavailable" }, { ...safeRejection, diagnostic_reference: "PRIVATE_REFERENCE" },
+    { ...safeRejection, retryable: true }, { ...safeRejection, raw_body: "PRIVATE_PROVIDER_TEXT" },
+  ])("refuses malformed live check rejection %j", async (rejection) => {
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify(validationBody(rejection)), { status: 200 }));
+    await expect(validatePipeline("session-1")).rejects.toMatchObject({
+      status: 200, detail: "Unexpected validation checks from validate endpoint",
+    });
+  });
+
   it("sends the reviewed state id when validating a pipeline", async () => {
     fetchSpy.mockResolvedValue({
       ok: true,

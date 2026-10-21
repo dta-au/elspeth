@@ -37,11 +37,13 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
-from typing import TYPE_CHECKING, Final, Literal, TypedDict, final
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal, NotRequired, TypedDict, final
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.provider_rejection import SafeRequestRejection, SafeRequestRejectionData
 from elspeth.web.composer.advisor_checkpoint_telemetry import (
     AdvisorCheckpointPhase,
     AdvisorCheckpointTelemetryVerdict,
@@ -73,7 +75,7 @@ def _require_review_hash(value: object) -> None:
         raise AuditIntegrityError("Graph review identity requires a canonical SHA256")
 
 
-type GraphReviewSource = Literal["model", "prescan", "unavailable", "malformed", "budget_exhausted"]
+type GraphReviewSource = Literal["model", "prescan", "unavailable", "request_rejected", "malformed", "budget_exhausted"]
 
 
 @cache
@@ -113,7 +115,7 @@ class AdvisorGraphReviewIdentity:
     def __post_init__(self) -> None:
         _require_review_hash(self.binding)
         _require_review_hash(self.for_graph)
-        if self.source not in {"model", "prescan", "unavailable", "malformed", "budget_exhausted"}:
+        if self.source not in {"model", "prescan", "unavailable", "request_rejected", "malformed", "budget_exhausted"}:
             raise AuditIntegrityError("Unknown graph review identity source")
 
 
@@ -282,7 +284,7 @@ class AdvisorGraphReviewFact:
 
 
 _CHECKPOINT_PHASES: Final[frozenset[str]] = frozenset({"early", "end"})
-_CHECKPOINT_VERDICTS: Final[frozenset[str]] = frozenset({"clean", "flagged", "unavailable", "malformed"})
+_CHECKPOINT_VERDICTS: Final[frozenset[str]] = frozenset({"clean", "flagged", "unavailable", "request_rejected", "malformed"})
 _CHECKPOINT_SOURCES: Final[frozenset[str]] = frozenset({"prescan", "model"})
 _PUBLICATION_BRANCHES: Final[frozenset[str]] = frozenset(
     {
@@ -301,6 +303,7 @@ _PREFLIGHT_SHAPES: Final[frozenset[str]] = frozenset({"absent", "green", "pendin
 # the ``terminal_block`` branch carries one; every repair branch passes None.
 AdvisorTerminalBlockReason = Literal[
     "unavailable",
+    "request_rejected",
     "malformed",
     "budget_exhausted",
     "publication_withheld",
@@ -311,6 +314,7 @@ AdvisorTerminalBlockReason = Literal[
 _TERMINAL_BLOCK_REASONS: Final[frozenset[str]] = frozenset(
     {
         "unavailable",
+        "request_rejected",
         "malformed",
         "budget_exhausted",
         "publication_withheld",
@@ -340,15 +344,17 @@ class AdvisorCheckpointPassData(TypedDict):
     email_redactions: int | None
     publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
     publication_binding: str | None
+    request_rejection: NotRequired[SafeRequestRejectionData]
 
 
 class AdvisorTerminalPublicationData(TypedDict):
-    """Serialised :class:`AdvisorTerminalPublication` — the audit row's and the event's payload."""
+    """Private publication audit; telemetry retains its existing bounded fields."""
 
     branch: AdvisorTerminalPublicationBranch
     reason: AdvisorTerminalBlockReason | None
     preflight_shape: AdvisorPreflightShape
     findings_backend_authored: bool
+    request_rejection: NotRequired[SafeRequestRejectionData]
 
 
 # Functional syntax: ``pass`` is a keyword, so it cannot be a class-body attribute name.
@@ -398,8 +404,13 @@ class AdvisorCheckpointPassRecord:
     email_redactions: int | None
     publication_verdict: Literal["ADMIT", "WITHHOLD"] | None
     publication_binding: str | None
+    request_rejection: SafeRequestRejection | None = None
 
     def __post_init__(self) -> None:
+        if self.request_rejection is not None and (
+            not isinstance(self.request_rejection, SafeRequestRejection) or self.verdict != "request_rejected" or self.source != "model"
+        ):
+            raise AuditIntegrityError("Checkpoint rejection evidence requires an owned model request-rejected verdict")
         vocabulary_fields: tuple[tuple[str, object, frozenset[str]], ...] = (
             ("phase", self.phase, _CHECKPOINT_PHASES),
             ("verdict", self.verdict, _CHECKPOINT_VERDICTS),
@@ -431,7 +442,7 @@ class AdvisorCheckpointPassRecord:
             if self.provider_attempts != 0 or self.verdict != "flagged" or self.first_attempt_schema_valid is not None:
                 raise AuditIntegrityError("AdvisorCheckpointPassRecord prescan must be flagged without provider attempts or conformance")
         elif self.provider_attempts == 0 and (
-            self.verdict not in {"unavailable", "malformed"} or self.first_attempt_schema_valid is not None
+            self.verdict not in {"unavailable", "request_rejected", "malformed"} or self.first_attempt_schema_valid is not None
         ):
             # Admission can fail before the SDK call starts. That completed
             # failure has no provider response to describe, unlike an
@@ -495,7 +506,10 @@ class AdvisorCheckpointPassRecord:
         email_redactions: int | None,
         publication_verdict: Literal["ADMIT", "WITHHOLD"] | None,
         publication_binding: str | None,
+        request_rejection: SafeRequestRejection | None = None,
     ) -> AdvisorCheckpointPassRecord:
+        if verdict == "request_rejected" and request_rejection is None:
+            raise AuditIntegrityError("New rejected checkpoint requires its safe rejection evidence")
         # ``stable_hash`` is ELSPETH-owned: a canonicalization refusal is a
         # programmer error about our own payload and propagates from here,
         # before any row is written or any event is emitted.
@@ -516,10 +530,27 @@ class AdvisorCheckpointPassRecord:
             email_redactions=email_redactions,
             publication_verdict=publication_verdict,
             publication_binding=publication_binding,
+            request_rejection=request_rejection,
         )
 
+    @classmethod
+    def from_dict(cls, value: object) -> AdvisorCheckpointPassRecord:
+        """Read historical absence without inventing evidence; strictly admit present evidence."""
+        if type(value) is dict:
+            data = value.copy()
+        elif isinstance(value, MappingProxyType):
+            data = dict(value)
+        else:
+            raise AuditIntegrityError("Checkpoint audit payload requires an owned dictionary")
+        try:
+            if "request_rejection" in data:
+                data["request_rejection"] = SafeRequestRejection.from_wire(data["request_rejection"])
+            return cls(**data)
+        except (TypeError, ValueError) as exc:
+            raise AuditIntegrityError("Checkpoint audit payload is malformed") from exc
+
     def to_dict(self) -> AdvisorCheckpointPassData:
-        return {
+        data: AdvisorCheckpointPassData = {
             "phase": self.phase,
             "pass_index": self.pass_index,
             "verdict": self.verdict,
@@ -537,6 +568,9 @@ class AdvisorCheckpointPassRecord:
             "publication_verdict": self.publication_verdict,
             "publication_binding": self.publication_binding,
         }
+        if self.request_rejection is not None:
+            data["request_rejection"] = self.request_rejection.to_wire()
+        return data
 
 
 @final
@@ -560,8 +594,15 @@ class AdvisorTerminalPublication:
     reason: AdvisorTerminalBlockReason | None
     preflight_shape: AdvisorPreflightShape
     findings_backend_authored: bool
+    request_rejection: SafeRequestRejection | None = None
 
     def __post_init__(self) -> None:
+        if self.request_rejection is not None and (
+            not isinstance(self.request_rejection, SafeRequestRejection)
+            or self.branch != "terminal_block"
+            or self.reason not in {"request_rejected", "budget_exhausted"}
+        ):
+            raise AuditIntegrityError("Terminal rejection evidence requires its matching blocked request or budget reason")
         if self.branch not in _PUBLICATION_BRANCHES:
             raise AuditIntegrityError("AdvisorTerminalPublication.branch is outside the closed vocabulary")
         if self.reason is not None and self.reason not in _TERMINAL_BLOCK_REASONS:
@@ -575,13 +616,51 @@ class AdvisorTerminalPublication:
         if self.findings_backend_authored and self.branch != "terminal_block":
             raise AuditIntegrityError("AdvisorTerminalPublication: only the terminal_block branch can carry a backend-authored finding")
 
+    @classmethod
+    def for_block(
+        cls,
+        *,
+        reason: AdvisorTerminalBlockReason,
+        preflight_shape: AdvisorPreflightShape,
+        findings_backend_authored: bool,
+        request_rejection: SafeRequestRejection | None,
+    ) -> AdvisorTerminalPublication:
+        if reason == "request_rejected" and request_rejection is None:
+            raise AuditIntegrityError("New rejected terminal requires its safe rejection evidence")
+        return cls(
+            branch="terminal_block",
+            reason=reason,
+            preflight_shape=preflight_shape,
+            findings_backend_authored=findings_backend_authored,
+            request_rejection=request_rejection,
+        )
+
+    @classmethod
+    def from_dict(cls, value: object) -> AdvisorTerminalPublication:
+        """Historical omission remains absent; present descriptors are never trusted as raw dictionaries."""
+        if type(value) is dict:
+            data = value.copy()
+        elif isinstance(value, MappingProxyType):
+            data = dict(value)
+        else:
+            raise AuditIntegrityError("Publication audit payload requires an owned dictionary")
+        try:
+            if "request_rejection" in data:
+                data["request_rejection"] = SafeRequestRejection.from_wire(data["request_rejection"])
+            return cls(**data)
+        except (TypeError, ValueError) as exc:
+            raise AuditIntegrityError("Publication audit payload is malformed") from exc
+
     def to_dict(self) -> AdvisorTerminalPublicationData:
-        return {
+        data: AdvisorTerminalPublicationData = {
             "branch": self.branch,
             "reason": self.reason,
             "preflight_shape": self.preflight_shape,
             "findings_backend_authored": self.findings_backend_authored,
         }
+        if self.request_rejection is not None:
+            data["request_rejection"] = self.request_rejection.to_wire()
+        return data
 
 
 def advisor_checkpoint_pass_audit_envelope(record: AdvisorCheckpointPassRecord) -> AdvisorCheckpointPassAuditEnvelope:

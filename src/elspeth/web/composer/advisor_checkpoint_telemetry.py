@@ -21,7 +21,7 @@ from opentelemetry import metrics
 from elspeth.contracts import errors as contract_errors
 
 AdvisorCheckpointPhase = Literal["early", "end"]
-AdvisorCheckpointTelemetryVerdict = Literal["clean", "flagged", "unavailable", "malformed"]
+AdvisorCheckpointTelemetryVerdict = Literal["clean", "flagged", "unavailable", "request_rejected", "malformed"]
 # elspeth-25f7b757e7 (A2): which mechanism rendered the verdict. "prescan" is
 # the deterministic backend pre-scan (no provider call was made); "model"
 # covers everything downstream of a provider call attempt — parsed CLEAN or

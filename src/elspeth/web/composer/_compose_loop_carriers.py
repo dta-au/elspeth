@@ -37,7 +37,7 @@ Layer: L3 (application). Imports from L0 (``contracts/freeze``,
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
@@ -47,6 +47,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
+from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
@@ -147,6 +148,7 @@ class _AdvisorProviderFailure:
     """Recognised Tier-3 provider failure that may become tool feedback."""
 
     error_class: str | None
+    provider_failure: ProviderRequestFailure | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

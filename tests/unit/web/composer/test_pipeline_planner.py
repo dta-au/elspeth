@@ -12,7 +12,7 @@ import hashlib
 import inspect
 import json
 import threading
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -33,6 +33,7 @@ from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
@@ -2149,7 +2150,15 @@ async def test_two_supplied_inventory_reads_complete_protocol_without_hatch(
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["success"] for result in tool_results] == [True, True]
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources", "list_sinks"]
+    # Audit rows arrive in completion order; wire replies follow admitted call order.
+    assert sorted((invocation.tool_call_id, invocation.tool_name) for invocation in recorder.invocations) == [
+        ("call-1", "list_sources"),
+        ("call-2", "list_sinks"),
+    ]
+    assert [message["tool_call_id"] for message in completion.requests[1]["messages"] if message["role"] == "tool"] == [
+        "call-1",
+        "call-2",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2301,9 +2310,19 @@ async def test_schema_fact_survives_rejection_while_issue_specific_discovery_add
     )
 
     assert result.proposal.repair_count == 1
-    invocation_names = [invocation.tool_name for invocation in recorder.invocations]
-    assert invocation_names[0] == "get_plugin_schema"
-    assert invocation_names == ["get_plugin_schema", "get_plugin_schema", "get_plugin_assistance", "explain_validation_error"]
+    first_schema, second_schema, *batch_invocations = recorder.invocations
+    assert [(invocation.tool_call_id, invocation.tool_name) for invocation in (first_schema, second_schema)] == [
+        ("call-1", "get_plugin_schema"),
+        ("call-1", "get_plugin_schema"),
+    ]
+    assert sorted((invocation.tool_call_id, invocation.tool_name) for invocation in batch_invocations) == [
+        ("call-1", "get_plugin_assistance"),
+        ("call-2", "explain_validation_error"),
+    ]
+    assert [message["tool_call_id"] for message in completion.requests[-1]["messages"] if message["role"] == "tool"][-2:] == [
+        "call-1",
+        "call-2",
+    ]
     schema_results = [
         json.loads(message["content"])
         for message in completion.requests[-1]["messages"]
@@ -2502,20 +2521,31 @@ async def test_full_discovery_batch_preserves_complete_results_above_old_aggrega
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_completed_tool", ["list_sources", "list_sinks"])
 async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
+    first_completed_tool: str,
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
     original = planner_module.execute_discovery_tool_with_context
     rendezvous = threading.Barrier(2)
+    first_recorded = threading.Event()
     expected_data: dict[str, Any] = {}
+
+    class CompletionOrderRecorder(BufferingRecorder):
+        def record(self, invocation: ComposerToolInvocation) -> None:
+            super().record(invocation)
+            if invocation.tool_name == first_completed_tool:
+                first_recorded.set()
 
     def synchronized_discovery(*args: Any, **kwargs: Any) -> Any:
         tool_name = args[0]
         rendezvous.wait(timeout=2)
+        if tool_name != first_completed_tool:
+            assert first_recorded.wait(timeout=5), "first completion must be audited before the second finishes"
         result = original(*args, **kwargs)
         expected_data[tool_name] = json.loads(pipeline_planner.serialize_tool_result(result))["data"]
         return result
@@ -2525,10 +2555,14 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
         _response(("list_sources", {}), ("list_sinks", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
-    recorder = BufferingRecorder()
+    recorder = CompletionOrderRecorder()
 
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
+    assert [call.tool_name for call in recorder.invocations] == [
+        first_completed_tool,
+        "list_sinks" if first_completed_tool == "list_sources" else "list_sources",
+    ]
     tool_messages = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert expected_data["list_sources"] != expected_data["list_sinks"], "correlation witness must discriminate the two payloads"
     assert [(message["tool_call_id"], json.loads(message["content"])["data"]) for message in tool_messages] == [
@@ -5048,6 +5082,7 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
                 {
                     "mount": None,
                     "mode": "debug-when-unconfigured",
+                    "enforce_azure_character_limits": False,
                     "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                     "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                 },
@@ -5766,19 +5801,45 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scope", ["primary-operation", "hatch-operation", "guard-bound"])
+@pytest.mark.parametrize(
+    ("scope", "discovery_delay_seconds", "gateway_delay_seconds"),
+    [
+        pytest.param("primary-operation", 0.0, 0.0, id="primary-operation"),
+        pytest.param("hatch-operation", 0.0, 0.0, id="hatch-operation"),
+        pytest.param("guard-bound", 0.0, 0.0, id="guard-bound"),
+        pytest.param("hatch-operation", 0.6, 0.0, id="hatch-operation-delayed-discovery"),
+        pytest.param("hatch-operation", 0.0, 0.25, id="hatch-operation-delayed-gateway"),
+    ],
+)
 async def test_guard_deadline_preserves_operation_timeout_without_provider_attempt(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
     scope: str,
+    discovery_delay_seconds: float,
+    gateway_delay_seconds: float,
 ) -> None:
     engine, origin = await _session_context()
+    real_time = asyncio.get_running_loop().time
+    clock_origin = real_time()
+    target_attempt_started_at: float | None = None
     guard_started_at: float | None = None
     guard_cancelled = False
+
+    def deadline_clock() -> float:
+        # Discovery must reach the request this test exercises. Charge real
+        # elapsed time from its timer boundary, including gateway preparation,
+        # guard inspection, cancellation and settlement;
+        # the whole-operation and sync-phase tests cover preparation timeouts.
+        if target_attempt_started_at is None:
+            return clock_origin
+        return clock_origin + real_time() - target_attempt_started_at
+
+    monkeypatch.setattr(pipeline_planner, "_planner_deadline_time", deadline_clock)
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    # Warm catalog validation before the operation's real deadline starts.
+    # Exercise warm catalog validation before entering the controlled phase.
     build_planner_authoring_aids(policy)
     policy.validate_composition_state(_empty_state())
 
@@ -5802,7 +5863,7 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
             nonlocal guard_started_at, guard_cancelled
             if not self.slow:
                 return PromptGuardDecision("allow", "clean")
-            guard_started_at = asyncio.get_running_loop().time()
+            guard_started_at = real_time()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -5813,7 +5874,33 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
     hatch = scope == "hatch-operation"
     slow_guard = DeadlineGuard(slow=True)
     primary_guard = DeadlineGuard(slow=False) if hatch else slow_guard
-    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else _ScriptedCompletion()
+    target_mount = PromptGuardMount(slow_guard)
+    primary_mount = PromptGuardMount(primary_guard) if hatch else target_mount
+    original_complete = pipeline_planner._complete_planner_provider
+
+    async def complete_after_gateway_delay(**kwargs: Any) -> Any:
+        if kwargs["mount"] is target_mount and gateway_delay_seconds:
+            await asyncio.sleep(gateway_delay_seconds)
+        return await original_complete(**kwargs)
+
+    def complete_target_attempt(**kwargs: Any) -> Awaitable[Any]:
+        nonlocal target_attempt_started_at
+        if kwargs["mount"] is target_mount:
+            # Arm before returning the coroutine to the real wait_for timer.
+            # Starting at inspect entry would omit gateway preparation and
+            # misclassify hatch expiry as a short provider timeout.
+            target_attempt_started_at = real_time()
+        return complete_after_gateway_delay(**kwargs)
+
+    monkeypatch.setattr(pipeline_planner, "_complete_planner_provider", complete_target_attempt)
+
+    class DiscoveryCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            if discovery_delay_seconds:
+                await asyncio.sleep(discovery_delay_seconds)
+            return await super().__call__(**kwargs)
+
+    completion = DiscoveryCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else DiscoveryCompletion()
     recorder = BufferingRecorder()
     events: list[str] = []
     failure: BaseException | None = None
@@ -5831,10 +5918,10 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
                     "timeout_seconds": 1.0,
                     "max_discovery_turns": 1,
                     "prompt_guard_mode": "required",
-                    "prompt_guard_mount": PromptGuardMount(primary_guard),
+                    "prompt_guard_mount": primary_mount,
                     "escape_hatch_model": "anthropic/claude-planner" if hatch else None,
                     "escape_hatch_provider": "test-provider" if hatch else None,
-                    "escape_hatch_prompt_guard_mount": PromptGuardMount(slow_guard) if hatch else None,
+                    "escape_hatch_prompt_guard_mount": target_mount if hatch else None,
                 },
                 lifecycle=_lifecycle(events),
             )
@@ -5849,6 +5936,7 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
             row["tool_calls"][0]["check"] for row in rows if row["tool_calls"] and row["tool_calls"][0]["_kind"] == "prompt_guard_audit"
         ]
         expected_attempts = 2 if hatch else 0
+        assert target_attempt_started_at is not None
         assert guard_started_at is not None
         assert guard_cancelled
         assert len(completion.requests) == len(recorder.llm_calls) == len(attempts) == len(ledger) == expected_attempts

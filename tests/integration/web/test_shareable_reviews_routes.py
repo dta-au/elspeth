@@ -449,6 +449,21 @@ def test_get_shared_inspect_requires_auth(
     assert response.status_code == 401
 
 
+def test_get_shared_inspect_preserves_real_authentication_challenge(
+    audit_readiness_test_client: TestClient,
+) -> None:
+    client = audit_readiness_test_client
+    original_override = client.app.dependency_overrides.pop(get_current_user)
+    try:
+        response = client.get("/api/sessions/shared/some-token")
+    finally:
+        client.app.dependency_overrides[get_current_user] = original_override
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Missing or invalid Authorization header"}
+    assert response.headers["WWW-Authenticate"] == "Bearer"
+
+
 def test_get_shared_inspect_tampered_token_returns_401(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
@@ -458,6 +473,7 @@ def test_get_shared_inspect_tampered_token_returns_401(
     response = client.get(f"/api/sessions/shared/{tampered}")
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid or expired share token"}
+    assert "WWW-Authenticate" not in response.headers
 
 
 def test_get_shared_inspect_expired_token_returns_401(
@@ -513,6 +529,7 @@ def test_get_shared_inspect_expired_token_returns_401(
     response = client.get(f"/api/sessions/shared/{expired_token}")
     assert response.status_code == 401
     assert response.json() == {"detail": "Invalid or expired share token"}
+    assert "WWW-Authenticate" not in response.headers
 
 
 def test_get_shared_inspect_blob_expired_returns_404(

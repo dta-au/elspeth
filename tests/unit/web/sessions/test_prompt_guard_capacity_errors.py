@@ -14,9 +14,10 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.composer import prompt_guard_clients
+from elspeth.web.composer import prompt_guard_clients, provider_gateway
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.availability import ComposerAvailability
-from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, enforce_prompt_guard
+from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, enforce_prompt_guard, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -28,6 +29,7 @@ from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.models import quota_provider_attempts_table, session_operation_fences_table, token_usage_ledger_table
 from tests.helpers.composer_operations import message_body, submit_and_settle
 from tests.unit.web.composer import test_prompt_guard_admission as guard_admission
+from tests.unit.web.composer._helpers import _make_settings
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.sessions.test_routes import _make_app
 from tests.unit.web.sessions.test_run_composer_turn import _TestSnapshotFactory
@@ -63,19 +65,23 @@ def _remote_response(request: httpx.Request, *, outcome: str, requests: list[htt
 @pytest.mark.parametrize(
     ("case", "mounted", "mode", "expected_status", "expected_code", "expected_reason", "expected_http_calls"),
     [
-        ("user_unit", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
-        ("document_unit", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("user_unit", True, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("document_unit", True, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("user_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("document_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("user_unit", False, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("document_unit", False, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("unavailable", True, "required", 503, "prompt_guard_unavailable", "service_error", 1),
         ("blocked", True, "debug-when-unconfigured", 422, "prompt_guard_blocked", "policy_blocked", 1),
         ("unconfigured", False, "required", 503, "prompt_guard_unavailable", "guard_not_configured", 0),
     ],
     ids=[
-        "local-user-debug",
-        "local-document-debug",
+        "configured-user-debug",
+        "configured-document-debug",
         "local-user-required",
         "local-document-required",
+        "unconfigured-user-required",
+        "unconfigured-document-required",
         "azure-unavailable",
         "azure-blocked",
         "required-unconfigured",
@@ -156,15 +162,66 @@ async def test_actual_guard_refusal_preserves_local_cause_and_remote_fail_closed
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["user_unit", "document_unit"])
+async def test_unconfigured_debug_capacity_preserves_complete_model_wire_and_audit(authority, monkeypatch, case):
+    engine, _service, owner, coordinator = authority
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    user = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1) if case == "user_unit" else "Explain the complete document."
+    messages = [{"role": "user", "content": user}]
+    if case == "document_unit":
+        messages.insert(0, {"role": "assistant", "content": "d" * PROMPT_GUARD_MAX_TEXT_CHARACTERS})
+        assert len(json.dumps(messages[0], separators=(",", ":"))) > PROMPT_GUARD_MAX_TEXT_CHARACTERS
+    transmitted = []
+
+    async def completion(**kwargs):
+        checks = _checks(engine)
+        assert len(checks) == 1
+        assert (checks[0]["disposition"], checks[0]["reason"]) == ("debug_bypass", "guard_not_configured")
+        transmitted.append(kwargs)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[{"message": {"role": "assistant", "content": "The complete input arrived.", "tool_calls": None}}],
+            usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    gateway = provider_gateway.ProviderGateway(
+        model="openai/gpt-4.1-mini",
+        settings=_make_settings(composer_prompt_guard_mode="debug-when-unconfigured"),
+        endpoint_base_url=None,
+        endpoint_api_key=None,
+    )
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(user):
+        result = await gateway._call_llm_with_audit(messages, [], timeout=5, recorder=recorder, provider_custody=custody)
+    assert result.message.content == "The complete input arrived."
+    assert len(transmitted) == 1 and transmitted[0]["messages"] == messages
+    check = _checks(engine)[0]
+    assert check["adapter"] == "unconfigured" and check["mode"] == "debug-when-unconfigured"
+    assert check["operation_id"] == custody.context.fence.operation_id
+    assert check["operation_epoch"] == custody.context.fence.operation_epoch
+    assert len(recorder.llm_calls) == 1
+    with engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        ledger = connection.execute(select(token_usage_ledger_table)).all()
+    assert len(attempts) == len(ledger) == 1
+    assert attempts[0].ledger_entry_id == ledger[0].entry_id and attempts[0].settled_at is not None
+    assert attempts[0].operation_id == custody.context.fence.operation_id
+    assert attempts[0].operation_epoch == custody.context.fence.operation_epoch
+    assert ledger[0].prompt_tokens == 4 and ledger[0].completion_tokens == 3
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("case", "mounted", "mode", "expected_status", "expected_code", "expected_reason", "expected_http_calls"),
     [
-        ("user_unit", False, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
+        ("user_unit", True, "debug-when-unconfigured", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("user_unit", True, "required", 422, "prompt_guard_unsupported_input", "unsupported_input", 0),
         ("unavailable", True, "required", 503, "prompt_guard_unavailable", "service_error", 1),
         ("blocked", True, "debug-when-unconfigured", 422, "prompt_guard_blocked", "policy_blocked", 1),
     ],
-    ids=["local-debug", "local-required", "azure-unavailable", "azure-blocked"],
+    ids=["configured-debug", "local-required", "azure-unavailable", "azure-blocked"],
 )
 async def test_actual_async_authoring_refusal_persists_and_replays_safe_cause(
     tmp_path, monkeypatch, case, mounted, mode, expected_status, expected_code, expected_reason, expected_http_calls
@@ -270,5 +327,121 @@ async def test_actual_async_authoring_refusal_persists_and_replays_safe_cause(
         serialized = json.dumps(public) + json.dumps(deep_thaw(checks))
         assert user not in serialized and _REMOTE_BODY not in serialized
         assert "offline-guard-key" not in serialized and "offline-model-key" not in serialized
+    finally:
+        service._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_debug_async_capacity_dispatches_complete_input_and_replays_once(tmp_path, monkeypatch):
+    app, service = _make_app(tmp_path, quota_enabled=True)
+    sdk_calls = []
+    user = "u" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + 1)
+
+    async def completion(**kwargs):
+        rows = await service.get_messages(session.id, limit=None)
+        checks = [envelope["check"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"]
+        assert len(checks) == 1
+        assert (checks[0]["disposition"], checks[0]["reason"]) == ("debug_bypass", "guard_not_configured")
+        assert any(user in message["content"] for message in kwargs["messages"] if isinstance(message["content"], str))
+        sdk_calls.append(kwargs)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "capacity-handoff",
+                                "type": "function",
+                                "function": {
+                                    "name": "handoff_to_user",
+                                    "arguments": json.dumps(
+                                        {"action": "reset_to_safe_checkpoint", "message": "The complete input arrived."}
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            usage={"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
+        )
+
+    def unexpected_guard_client(settings):
+        raise AssertionError("An unconfigured guard must not construct an external client")
+
+    monkeypatch.setattr(prompt_guard_clients, "build_prompt_guard_client", unexpected_guard_client)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **kwargs: ComposerAvailability(available=True, provider="test", model=kwargs["model"]),
+    )
+    app.state.settings = app.state.settings.model_copy(
+        update={
+            "composer_model": "openai/gpt-4.1-mini",
+            "composer_advisor_model": "openai/gpt-4.1-mini",
+            "composer_endpoint_base_url": "https://model.example.test/v1",
+            "composer_endpoint_api_key": SecretStr("offline-model-key"),  # secret-scan: allow-this-line
+            "composer_advisor_endpoint_base_url": "https://model.example.test/v1",
+            "composer_advisor_endpoint_api_key": SecretStr("offline-model-key"),  # secret-scan: allow-this-line
+            "composer_prompt_guard_mode": "debug-when-unconfigured",
+            "composer_prompt_guard": None,
+            "composer_advisor_prompt_guard": None,
+            "composer_boot_probe_enabled": False,
+        }
+    )
+    app.state.composer_service = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(), app.state.settings, sessions_service=service, session_engine=app.state.session_engine
+    )
+    app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
+    session = await service.create_session("alice", "Existing capacity session", "local")
+    path = f"/api/sessions/{session.id}/messages"
+    body = message_body(user)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            settled = await submit_and_settle(client, app, path=path, body=body)
+            result = settled.result()
+            assert result["message"]["content"] == "The complete input arrived."
+            before = await service.get_messages(session.id, limit=None)
+            replay = await client.post(path, json=body)
+            assert replay.status_code == 202 and replay.json()["operation_id"] == body["operation_id"]
+            await app.state.composer_async_worker.run_until_idle()
+            observed = await client.get(f"/api/sessions/{session.id}/operations/{body['operation_id']}")
+            assert observed.status_code == 200 and observed.json() == settled.final.json()
+            history = await client.get(f"/api/sessions/{session.id}/operations", params={"operation_id": body["operation_id"]})
+            assert history.status_code == 200
+            # The operation feed exposes failures; successful replay adds none.
+            assert history.json()["items"] == []
+        record = await run_sync_in_worker(
+            app.state.composer_async_operation_authority.get, session_id=session.id, operation_id=body["operation_id"]
+        )
+        assert record is not None and record.status == "completed"
+        rows = await service.get_messages(session.id, limit=None)
+        assert [row.id for row in rows] == [row.id for row in before]
+        assert [row.content for row in rows if row.role == "user"] == [user]
+        assert len(sdk_calls) == 1
+        checks = [envelope["check"] for row in rows for envelope in (row.tool_calls or ()) if envelope["_kind"] == "prompt_guard_audit"]
+        assert len(checks) == 1
+        check = checks[0]
+        assert (check["disposition"], check["reason"]) == ("debug_bypass", "guard_not_configured")
+        assert check["adapter"] == "unconfigured" and check["mode"] == "debug-when-unconfigured"
+        assert check["operation_id"] == record.session_operation_id
+        assert check["operation_epoch"] == record.session_operation_epoch
+        with service._engine.connect() as connection:
+            attempts = connection.execute(select(quota_provider_attempts_table)).all()
+            ledger = connection.execute(select(token_usage_ledger_table)).all()
+            fence = connection.execute(
+                select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == str(session.id))
+            ).one()
+        assert len(attempts) == len(ledger) == 1
+        assert attempts[0].ledger_entry_id == ledger[0].entry_id and attempts[0].settled_at is not None
+        assert attempts[0].operation_id == record.session_operation_id
+        assert attempts[0].operation_epoch == record.session_operation_epoch
+        assert ledger[0].prompt_tokens == 4 and ledger[0].completion_tokens == 3
+        assert fence.released_at is not None
+        assert user not in json.dumps(deep_thaw(checks))
     finally:
         service._engine.dispose()

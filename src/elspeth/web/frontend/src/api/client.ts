@@ -9,7 +9,7 @@ import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwns
 // in development; same-origin serving works in production.
 // ============================================================================
 
-import { isValidationReadiness } from "./validationReadiness";
+import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
 import type {
   ApiError,
   ApiStructuredError,
@@ -1367,6 +1367,9 @@ export async function validatePipeline(
   });
   if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
     throw { status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+  }
+  if (!Array.isArray(result.checks) || !result.checks.every(isValidationCheck)) {
+    throw { status, detail: "Unexpected validation checks from validate endpoint" } satisfies ApiError;
   }
   return result;
 }

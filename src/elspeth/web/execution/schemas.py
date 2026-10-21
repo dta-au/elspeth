@@ -15,6 +15,7 @@ from typing import Annotated, Any, ClassVar, Final, Literal, Self, TypeAliasType
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import OPERATION_TYPE_VALUES, NodeStateStatus, Operation, OperationType, TerminalOutcome
+from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.web.sessions.protocol import (
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SessionRunStatus,
@@ -186,6 +187,7 @@ class ValidationCheck(_StrictResponse):
     name: ValidationCheckName
     passed: bool
     detail: str
+    request_rejection: SafeRequestRejection | None = Field(default=None, exclude_if=lambda value: value is None)
     # Structured field: node ids affected by this check (e.g. identity-node
     # advisories). Populated by the producer (validation.py) in the same
     # commit that adds this field — no compat-shim default, per
@@ -256,6 +258,7 @@ class ValidationReadinessBlocker(_StrictResponse):
     component_type: str | None
     detail: str
     suggestion: str | None
+    request_rejection: SafeRequestRejection | None = Field(default=None, exclude_if=lambda value: value is None)
     # elspeth-032ec69c41: the advisor's own words, bounded and labelled, on the
     # ``advisor_signoff_blocked`` row only. Every other blocker sets None.
     # REQUIRED (no default) so a builder cannot forget the decision.

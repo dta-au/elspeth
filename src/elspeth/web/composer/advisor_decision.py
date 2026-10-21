@@ -3,10 +3,13 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
+from elspeth.contracts.provider_rejection import SafeRequestRejection
+
 
 class AdvisorBlockCause(StrEnum):
     GRAPH_REJECTED = "graph_rejected"
     UNAVAILABLE = "unavailable"
+    REQUEST_REJECTED = "request_rejected"
     MALFORMED = "malformed"
     MESSAGE_REJECTED = "message_rejected"
     PUBLICATION_REJECTED = "publication_rejected"
@@ -22,6 +25,7 @@ class AdvisorSignoffGateFact:
     for_graph: str
     note: str | None
     cause: AdvisorBlockCause
+    request_rejection: SafeRequestRejection | None = None
 
 
 @dataclass(frozen=True, slots=True)

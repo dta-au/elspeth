@@ -2348,6 +2348,8 @@ class CompositionCompletion:
             if verdict.ok and verdict.publication_binding == publication_review.binding
             else "unavailable"
             if verdict.failure_class == "unavailable"
+            else "request_rejected"
+            if verdict.failure_class == "request_rejected"
             else "budget_exhausted"
             if verdict.failure_class == "budget_exhausted"
             else "malformed",
@@ -2504,6 +2506,8 @@ class CompositionCompletion:
                     if verdict.failure_class == "budget_exhausted"
                     else "unavailable"
                     if verdict.failure_class == "unavailable"
+                    else "request_rejected"
+                    if verdict.failure_class == "request_rejected"
                     else "malformed"
                 ),
                 verdict=verdict,

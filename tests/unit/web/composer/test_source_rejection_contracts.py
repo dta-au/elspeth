@@ -339,7 +339,13 @@ def test_source_profile_prevalidation_keeps_distinct_owned_tuple_code(
     result = _invoke(surface, tool, args, state, context)
     assert state.to_dict() == before
     if profile_case == "valid-alias":
-        assert result.success and result.updated_state.version == 18
+        assert result.success
+        if tool == "patch_source_options":
+            assert result.updated_state is state
+            assert result.updated_state.version == 17
+            assert result.affected_nodes == () and result.applied_component is None
+        else:
+            assert result.updated_state.version == 18
         assert deep_thaw(result.updated_state.sources["orders"].options) == dict(_VALID_AWS_S3_PROFILE_OPTIONS)
         return
     if profile_case == "profile-outage":

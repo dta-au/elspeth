@@ -100,13 +100,19 @@ describe what is exported and how to configure it.
 
 ## What changed in 0.8.9
 
-0.8.9 is unreleased. Full-replacement refusals and incremental output refusals
+0.8.9 combines Composer, Azure Container Apps and engine improvements.
+Full-replacement refusals and incremental output refusals
 retain their distinct candidate and saved-graph meanings, safe path diagnostics
 and repair guidance. Shared-link failures preserve the requested link instead
 of opening the recipient's workspace. Configured container token ceilings are
 provisioned before serving; configured container storage ceilings bound aggregate
 retained and reserved bytes. Automatic title
 requests disable the adapter and SDK retry paths. See the [release notes](CHANGELOG.md).
+
+Provider request rejections retain sanitized reason codes through tool feedback,
+audit records and readiness responses while remaining nonretryable and blocking
+publication. Exact no-op source patches preserve graph state. Shared-inspect
+links distinguish Bearer authentication failures from invalid links.
 
 Primary Composer and advisor requests use independently configured Azure AI
 Content Safety Prompt Shields, with required fail-closed protection by default.
@@ -126,7 +132,7 @@ Doctor measures TLS on its initial schema-inspection connections and blocks
 schema initialization when preflight fails. Separate initialization, final
 verification and later web connections are outside that measurement. Offline
 instruction rehearsal does not establish live cloud acceptance. These ACA
-enhancements are attributed to 0.8.8 within the combined 0.8.9 candidate.
+enhancements were developed under 0.8.8 and are included in 0.8.9.
 
 Session epoch 78 replaces session epoch 77 and retains its committed graph-review
 authority while strengthening quota custody and shared rate-limit policy binding.
@@ -137,7 +143,7 @@ session store and epoch 50 Landscape store. Keep old workers isolated from the n
 Compatible stores still require exact schema admission; unsupported stores are
 preserved and refused before incompatible writes. Backwards compatibility is
 permitted and considered from 0.8.5 within explicitly supported boundaries. This
-candidate authorizes no in-place migration, reset or downgrade. Package metadata
+release authorizes no in-place migration, reset or downgrade. Package metadata
 is 0.8.9; the package version alone does not establish qualification or image
 publication. Automatic image publication from main is held; verify the release
 tag and image digest before installing a published image.

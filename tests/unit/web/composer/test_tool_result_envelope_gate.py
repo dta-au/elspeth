@@ -3207,6 +3207,7 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     "pre_call_timeout_payload": ("status", "error", "budget_used", "budget_remaining"),
     "timeout_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
     "advisor_error_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
+    "request_rejection_payload": ("status", "error", "error_class", "budget_used", "budget_remaining", "request_rejection"),
     "refusal_payload": ("success", "outbound_call_made", "error_type", "detail", "audit_id"),
     "success_payload": (
         "status",
@@ -3392,6 +3393,42 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
     # same escape would silently widen an envelope no census reaches at all.
     reshaped = {name: _dict_mutations(fn, _aliases_of(fn, name), frozenset()) for name in sorted(mappings)}
     assert not any(reshaped.values()), f"an advisor payload is re-shaped after its literal: {reshaped}"
+
+
+@pytest.mark.parametrize(
+    "mutation_source",
+    [
+        pytest.param("request_rejection_payload['unexpected'] = True", id="extra-key"),
+        pytest.param("request_rejection_payload['request_rejection'] = {}", id="replace-rejection"),
+        pytest.param(
+            "rejection_alias = request_rejection_payload\nrejection_alias['error'] = 'foreign'",
+            id="alias-mutation",
+        ),
+    ],
+)
+def test_advisor_request_rejection_mapping_rejects_post_literal_mutation(monkeypatch: pytest.MonkeyPatch, mutation_source: str) -> None:
+    test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
+    original = _parse
+
+    def changed_source(path: Path) -> ast.Module:
+        tree = original(path)
+        if path != TOOL_BATCH:
+            return tree
+        fn = _function(tree, "run_tool_batch")
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If):
+                continue
+            for index, statement in enumerate(node.orelse):
+                if isinstance(statement, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == "request_rejection_payload" for target in statement.targets
+                ):
+                    node.orelse[index + 1 : index + 1] = ast.parse(mutation_source).body
+                    return tree
+        raise AssertionError("Request-rejection payload literal was not found")
+
+    monkeypatch.setattr(importlib.import_module(__name__), "_parse", changed_source)
+    with pytest.raises(AssertionError, match="an advisor payload is re-shaped after its literal"):
+        test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
 
 
 @pytest.mark.parametrize(

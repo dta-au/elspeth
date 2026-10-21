@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tomllib
+from datetime import date
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -71,7 +72,8 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in current_release
     assert "Drain and isolate old/new deployments" in current_release
     assert "no migration,\nreset, restamping or downgrade" in current_release
-    assert "Unreleased" in current_release
+    release_date = current_release.splitlines()[0].strip()
+    assert date.fromisoformat(release_date).isoformat() == release_date
     assert "Composer correctness and recovery" in release_086
     assert "Reply admission does not clear graph" in release_086
     assert "Session epoch advances from 75 to 76" in release_086

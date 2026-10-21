@@ -911,16 +911,7 @@ class TestTokenRefreshEndpoint:
         assert new_token not in serialized
 
     async def test_refresh_does_not_read_the_unverified_claim_decode(self, tmp_path) -> None:
-        """The chain bound must survive the middleware's decode failing.
-
-        The route used to read ``iat`` from ``request.state.auth_claims``, an
-        UNVERIFIED decode, and 401 when it was unavailable. It now hands the
-        provider the token and the provider's issuer reads ``iat`` from its
-        own VERIFIED decode — so a failed unverified decode is no longer able
-        to influence the refresh path at all, and a genuine token still
-        refreshes. This asserts the stronger property that replaced the old
-        one: unverified claims are not an input.
-        """
+        """A genuine token refreshes without any unverified claims decoding."""
         from unittest.mock import patch
 
         import jwt as pyjwt
@@ -941,7 +932,7 @@ class TestTokenRefreshEndpoint:
             def selective_decode(token, *args, **kwargs):
                 opts = kwargs.get("options", {})
                 if not opts.get("verify_signature", True):
-                    raise pyjwt.PyJWTError("simulated decode failure")
+                    raise AssertionError("Authentication must not decode unverified claims")
                 return original_decode(token, *args, **kwargs)
 
             with patch("jwt.decode", side_effect=selective_decode):

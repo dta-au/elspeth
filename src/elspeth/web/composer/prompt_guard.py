@@ -203,6 +203,7 @@ def _request(
     content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
     tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
     thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+    enforce_azure_character_limits: bool = True,
 ) -> tuple[PromptGuardRequest, bool]:
     """Bind exact supported wire input and preserve user/document provenance.
 
@@ -210,6 +211,8 @@ def _request(
     role strings or model JSON. Every other message field, including tool
     arguments, remains in its complete evidence document.
     """
+    if type(enforce_azure_character_limits) is not bool:
+        raise AuditIntegrityError("Prompt guard size policy requires an exact enforcement decision")
     genuine_user = _USER_PROMPT.get() if user_prompt is None else user_prompt
     supported = genuine_user is not None
     user = genuine_user if genuine_user is not None else ""
@@ -228,6 +231,7 @@ def _request(
     exact = {
         "role": role,
         "policy_fingerprint": policy_fingerprint,
+        "enforce_azure_character_limits": enforce_azure_character_limits,
         "user_prompt": genuine_user,
         "messages": list(messages),
         "tools": list(tools),
@@ -332,8 +336,13 @@ def _request(
         supported = False
     supported = (
         supported
-        and len(user) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
-        and all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in packed)
+        and (
+            not enforce_azure_character_limits
+            or (
+                len(user) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS
+                and all(len(document) <= PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in packed)
+            )
+        )
         and bool(user or any(packed))
     )
     return PromptGuardRequest(role, user, packed, request_hash), supported
@@ -428,6 +437,10 @@ async def enforce_prompt_guard(
     started = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     audit_id = str(uuid4())
+    # The service's character limits apply whenever inspection is required.
+    # Explicit unconfigured debug mode still builds and validates the complete
+    # request; its audit records skipped inspection rather than a clean result.
+    enforce_azure_character_limits = not (mount is None and mode == "debug-when-unconfigured")
     policy_fingerprint = (
         mount.client.policy_fingerprint
         if mount is not None
@@ -436,6 +449,7 @@ async def enforce_prompt_guard(
                 {
                     "mount": None,
                     "mode": mode,
+                    "enforce_azure_character_limits": enforce_azure_character_limits,
                     "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                     "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                 },
@@ -453,6 +467,7 @@ async def enforce_prompt_guard(
         content_parts=content_parts,
         tool_argument_parts=tool_argument_parts,
         thinking_parts=thinking_parts,
+        enforce_azure_character_limits=enforce_azure_character_limits,
     )
     original_cancellation: asyncio.CancelledError | None = None
     if not supported:

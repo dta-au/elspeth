@@ -7041,7 +7041,7 @@ class SessionServiceImpl:
         if receipt is None or type(receipt.tool_calls) is not list or len(receipt.tool_calls) != 1:
             raise AuditIntegrityError("Graph review lost its exact model review receipt")
         try:
-            accepted = AdvisorCheckpointPassRecord(**receipt.tool_calls[0]["pass"])
+            accepted = AdvisorCheckpointPassRecord.from_dict(receipt.tool_calls[0]["pass"])
         except (KeyError, TypeError, ValueError) as exc:
             raise AuditIntegrityError("Graph review model receipt is malformed") from exc
         if accepted.provider_attempts < 1:
