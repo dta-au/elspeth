@@ -71,7 +71,13 @@ judge misjudged boundary code it could not see and forced bulk operator
 overrides. [O1] is unchanged (tool access is read-only context, not key access),
 and readonly-mode rationales are secret-scrubbed before persistence.
 `--judge-tools readonly` accepts `codex-cli` and the legacy `agent` (Claude
-Agent SDK) transport; OpenRouter has no tool loop. Use `codex-cli` for the
+Agent SDK) transport; OpenRouter has no tool loop. The SDK transport refuses
+before import when the signing-key environment variable is present, even if
+empty. Key-free SDK judging remains available; this guard does not establish
+process isolation or erase keys previously loaded in memory. Key-bearing SDK
+signing requires a protected worker and SDK artifact qualification, which are
+still pending. Real signing remains disabled pending on-prem migration and
+operator-boundary qualification. Use `codex-cli` for the
 normal signing workflow. Do not recommend blinded OpenRouter runs except as a
 deliberate fallback.
 

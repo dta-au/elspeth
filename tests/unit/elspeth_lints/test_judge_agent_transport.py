@@ -346,6 +346,25 @@ def test_agent_transport_missing_sdk_raises_configuration_error(monkeypatch: pyt
         call_judge(_request(), transport=TRANSPORT_AGENT)
 
 
+@pytest.mark.parametrize("signing_key", ["synthetic-signing-key", ""])
+@pytest.mark.parametrize("sdk_available", [False, True])
+def test_agent_transport_requires_key_free_process_before_sdk_import(
+    monkeypatch: pytest.MonkeyPatch, signing_key: str, sdk_available: bool
+) -> None:
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", signing_key)
+    capture: dict[str, object] = {}
+    if sdk_available:
+        _install_fake_sdk(monkeypatch, assistant_text=_GOOD_JSON, capture=capture)
+    else:
+        monkeypatch.delitem(sys.modules, "claude_agent_sdk", raising=False)
+        monkeypatch.setattr("builtins.__import__", _import_raising("claude_agent_sdk"))
+
+    with pytest.raises(JudgeConfigurationError, match="key-free"):
+        call_judge(_request(), transport=TRANSPORT_AGENT)
+
+    assert capture == {}
+
+
 def test_agent_transport_auth_failure_names_auth_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # The real SDK raises CLINotFoundError (a ClaudeSDKError subclass) when the
     # Claude Code CLI is absent — the operator-actionable config signal. The

@@ -1605,6 +1605,16 @@ def _call_agent_sdk(
     therefore Anthropic-API convention (doc-derived), not pinned by the SDK
     Python source. See ``_agent_cache_accounting``.
     """
+    # Refuse before importing optional third-party code into a keyed process.
+    # Presence includes an empty value. This prerequisite does not establish
+    # process isolation or prove that a previously loaded key left memory.
+    if "ELSPETH_JUDGE_METADATA_HMAC_KEY" in os.environ:
+        raise JudgeConfigurationError(
+            "The Claude Agent SDK transport requires a key-free process; "
+            "ELSPETH_JUDGE_METADATA_HMAC_KEY is present in the environment. "
+            "A protected judge worker is required for key-bearing signing."
+        )
+
     # Lazy import (inside the function, mirroring ``_call_openrouter``): keeps
     # ``claude_agent_sdk`` out of module scope so importing this module — and
     # type-checking it — does not require the optional ``judge-agent`` extra.

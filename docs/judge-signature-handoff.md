@@ -185,6 +185,16 @@ Every rendered command carries `--dry-run`, so pasting one spends nothing; the
 
 ## Operator commands (key-bearing shell)
 
+The legacy `agent` (Claude Agent SDK) transport now refuses before SDK import
+whenever `ELSPETH_JUDGE_METADATA_HMAC_KEY` is present, including an empty value.
+This intentionally disables direct SDK judging in a keyed signing process;
+key-free SDK judging retains its existing authentication and tool modes.
+Removing the environment variable does not erase a key already loaded in
+memory, and this guard does not provide process isolation. A protected worker
+and SDK artifact qualification are still required before this transport can
+serve key-bearing signing. Real signing remains disabled pending the on-prem
+migration and qualification of the operator boundary.
+
 Run these only in an operator-controlled shell that holds
 `ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
 installed CLI account and does not need a provider API key in that shell. Both
