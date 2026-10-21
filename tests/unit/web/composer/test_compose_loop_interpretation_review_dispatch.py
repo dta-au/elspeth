@@ -581,7 +581,7 @@ def _state_with_unreviewed_raw_html_cleanup() -> CompositionState:
                 id="drop_raw_html",
                 node_type="transform",
                 plugin="field_mapper",
-                input="scored_rows",
+                input="scraped_rows",
                 on_success="clean_rows",
                 on_error="discard",
                 options={
@@ -3035,14 +3035,18 @@ def test_pending_interpretation_repair_message_requires_one_call_per_site() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scrape_reachable", [True, False], ids=["upstream-scrape", "independent-stream"])
 async def test_unreviewed_raw_html_cleanup_forces_pipeline_decision_staging_retry(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
+    scrape_reachable: bool,
 ) -> None:
-    """A field_mapper that drops web-scrape raw fields needs a review site."""
+    """Only a mapper receiving scraped rows owes the raw-field cleanup review."""
 
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_unreviewed_raw_html_cleanup()
+    if not scrape_reachable:
+        state = replace(state, nodes=(state.nodes[0], replace(state.nodes[1], input="independent_rows")))
     session_id, _state_id = await _seed_session_and_state(sessions_service, state=state)
 
     missing = await composer._interpretation_surfacing._missing_pending_interpretation_review_sites(
@@ -3050,7 +3054,8 @@ async def test_unreviewed_raw_html_cleanup_forces_pipeline_decision_staging_retr
         session_id=str(session_id),
     )
 
-    assert missing == (("drop_raw_html", "drop_raw_html_fields", InterpretationKind.PIPELINE_DECISION),)
+    expected = (("drop_raw_html", "drop_raw_html_fields", InterpretationKind.PIPELINE_DECISION),) if scrape_reachable else ()
+    assert missing == expected
 
 
 @pytest.mark.asyncio
