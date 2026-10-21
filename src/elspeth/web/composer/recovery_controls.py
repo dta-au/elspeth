@@ -23,13 +23,25 @@ class HandoffArguments(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["park", "reset_to_turn_start", "reset_to_safe_checkpoint"]
-    message: str = Field(min_length=1, max_length=16000)
+    message: str = Field(
+        min_length=1,
+        max_length=16000,
+        description="Message to the user (1 to 16000 characters; whitespace-only values are rejected).",
+    )
 
 
 class RestoreArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    park_id: str = Field(min_length=1, max_length=128)
-    message: str = Field(min_length=1, max_length=16000)
+    park_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="Exact advertised parked graph identity (1 to 128 characters; whitespace-only values are rejected).",
+    )
+    message: str = Field(
+        min_length=1,
+        max_length=16000,
+        description="Message to the user (1 to 16000 characters; whitespace-only values are rejected).",
+    )
 
 
 def recovery_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, object]]:
