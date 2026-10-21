@@ -40,7 +40,7 @@ from tests.unit.web.composer.test_prompt_guard_clients import _settings
 authority = _authority
 
 
-def _prepare(messages, *, content_parts=None, tool_argument_parts=None, user_prompt="Build a graph"):
+def _prepare(messages, *, content_parts=None, tool_argument_parts=None, user_prompt="Build a graph", enforce_azure_character_limits=True):
     return _request(
         policy_fingerprint="a" * 64,
         role="composer",
@@ -50,6 +50,7 @@ def _prepare(messages, *, content_parts=None, tool_argument_parts=None, user_pro
         trusted_message_indexes=frozenset(),
         content_parts=content_parts,
         tool_argument_parts=tool_argument_parts,
+        enforce_azure_character_limits=enforce_azure_character_limits,
     )
 
 
@@ -136,6 +137,37 @@ def test_identical_wire_has_distinct_hashes_for_distinct_coverage_and_trust():
     assert "reference" not in "".join(requests[-1].documents)
     with pytest.raises(AuditIntegrityError, match="complete wire content"):
         _prepare([{**messages[0], "content": "changed"}], content_parts=partitions[-1])
+
+
+def test_size_policy_changes_request_binding_without_changing_complete_documents():
+    messages = [{"role": "tool", "content": "x" * 10_001}]
+    strict, strict_supported = _prepare(messages)
+    debug, debug_supported = _prepare(messages, enforce_azure_character_limits=False)
+    assert not strict_supported and debug_supported
+    assert strict.documents == debug.documents and "x" * 10_001 in debug.documents[0]
+    assert strict.request_hash != debug.request_hash
+
+
+@pytest.mark.parametrize("overhead_delta", [-1, 0, 1])
+def test_size_policy_counts_wrapped_decoded_unicode_without_changing_escaped_wire(overhead_delta):
+    prefix = "Message 0, content part 0:\n"
+    decoded = "界" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS - len(prefix) + overhead_delta)
+    serialized = json.dumps(decoded)
+    part = PromptGuardContentPart(serialized, inspection_text=decoded)
+    messages = [{"role": "tool", "content": serialized}]
+    strict, supported = _prepare(messages, content_parts=((part,),))
+    debug, debug_supported = _prepare(messages, content_parts=((part,),), enforce_azure_character_limits=False)
+    assert len(serialized) > PROMPT_GUARD_MAX_TEXT_CHARACTERS
+    assert max(map(len, strict.documents)) == PROMPT_GUARD_MAX_TEXT_CHARACTERS + overhead_delta
+    assert supported is (overhead_delta <= 0) and debug_supported
+    assert strict.documents == debug.documents and prefix + decoded in debug.documents
+    assert part.text == messages[0]["content"] == serialized and part.trust is None
+
+
+@pytest.mark.parametrize("invalid", [None, 0, 1, "false"])
+def test_size_policy_refuses_non_boolean_enforcement(invalid):
+    with pytest.raises(AuditIntegrityError, match="exact enforcement decision"):
+        _prepare([], enforce_azure_character_limits=invalid)
 
 
 @pytest.mark.parametrize("index", [True, -1, "0"])
@@ -364,10 +396,11 @@ async def test_complete_large_reply_context_uses_real_guard_before_fenced_sdk(au
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
 @pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("role", ["composer", "advisor"])
 @pytest.mark.parametrize("kind", ["atomic", "oversized_part", "user", "surrogate_user", "surrogate_part"])
-async def test_unrepresentable_input_is_audited_without_truncation_or_transport(authority, mode, configured, kind):
+async def test_size_policy_preserves_other_input_refusals_and_complete_audit(authority, mode, configured, role, kind):
     engine, _service, owner, coordinator = authority
-    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY if role == "composer" else ProviderInvocationFamily.ADVISOR)
     messages = [{"role": "tool", "content": "Ordinary tool evidence"}]
     user = "Build a graph"
     parts = None
@@ -390,19 +423,49 @@ async def test_unrepresentable_input_is_audited_without_truncation_or_transport(
         return _allow(sent)
 
     mount = PromptGuardMount(AzurePromptGuardClient(_settings(), http_transport=httpx.MockTransport(serve)))
-    with pytest.raises(PromptGuardRefused):
+    operation = enforce_prompt_guard(
+        mount=mount if configured else None,
+        mode=mode,
+        role=role,
+        provider_custody=custody,
+        messages=messages,
+        content_parts=parts,
+        user_prompt=user,
+    )
+    debug_size_only = mode == "debug-when-unconfigured" and not configured and kind in {"atomic", "oversized_part", "user"}
+    if debug_size_only:
+        await operation
+    else:
+        with pytest.raises(PromptGuardRefused):
+            await operation
+    assert observed == []
+    checks = _checks(engine)
+    assert len(checks) == 1 and checks[0]["role"] == role
+    assert (checks[0]["disposition"], checks[0]["reason"]) == (
+        ("debug_bypass", "guard_not_configured") if debug_size_only else ("unavailable", "unsupported_input")
+    )
+    assert custody.attempt is None
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parts", [None, (PromptGuardContentPart("partial"),), ({"text": "x" * 10_001},)])
+async def test_unconfigured_debug_size_policy_still_refuses_foreign_or_incomplete_coverage(authority, parts):
+    engine, _service, owner, coordinator = authority
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    messages = [{"role": "tool", "content": "x" * 10_001, PROMPT_GUARD_CONTENT_PARTS_KEY: parts}]
+    with pytest.raises(AuditIntegrityError):
+        evidence = detach_prompt_guard_evidence(messages)
         await enforce_prompt_guard(
-            mount=mount if configured else None,
-            mode=mode,
+            mount=None,
+            mode="debug-when-unconfigured",
             role="composer",
             provider_custody=custody,
-            messages=messages,
-            content_parts=parts,
-            user_prompt=user,
+            messages=evidence.messages,
+            content_parts=evidence.content_parts,
+            user_prompt="Inspect this evidence.",
         )
-    assert observed == []
-    assert [check["reason"] for check in _checks(engine)] == ["unsupported_input"]
-    assert custody.attempt is None
+    assert _checks(engine) == [] and custody.attempt is None
     coordinator.assert_completed()
 
 

@@ -173,6 +173,24 @@ async def test_unconfigured_requires_explicit_named_debug_mode_with_distinct_aud
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [None, "debug", "unknown"])
+async def test_unconfigured_unknown_mode_refuses_before_size_policy_or_audit(authority, mode):
+    engine, _service, owner, coordinator = authority
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    with pytest.raises(AuditIntegrityError, match="closed vocabulary"):
+        await enforce_prompt_guard(
+            mount=None,
+            mode=mode,
+            role="composer",
+            provider_custody=custody,
+            messages=[{"role": "user", "content": "x" * 25_000}],
+            user_prompt="x" * 25_000,
+        )
+    assert _checks(engine) == [] and custody.attempt is None
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
 async def test_unconfigured_fingerprint_binds_every_input_limit_and_mode(authority, monkeypatch, mode):
     from elspeth.web.composer import prompt_guard
@@ -200,6 +218,7 @@ async def test_unconfigured_fingerprint_binds_every_input_limit_and_mode(authori
     expected_policy = {
         "mount": None,
         "mode": mode,
+        "enforce_azure_character_limits": mode == "required",
         "max_prompt_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
         "max_document_characters": prompt_guard.PROMPT_GUARD_MAX_TEXT_CHARACTERS,
     }
@@ -214,7 +233,8 @@ async def test_unconfigured_fingerprint_binds_every_input_limit_and_mode(authori
 
 
 @pytest.mark.asyncio
-async def test_actual_audit_sql_failure_rolls_back_and_never_admits_model(authority, monkeypatch):
+@pytest.mark.parametrize("debug_unconfigured", [False, True])
+async def test_actual_audit_sql_failure_rolls_back_and_never_admits_model(authority, monkeypatch, debug_unconfigured):
     engine, service, owner, coordinator = authority
     custody = owner.mint(ProviderInvocationFamily.PRIMARY)
     original_failure = RuntimeError("private SQL failure marker")
@@ -223,14 +243,15 @@ async def test_actual_audit_sql_failure_rolls_back_and_never_admits_model(author
         raise original_failure
 
     monkeypatch.setattr(service, "_insert_chat_message", broken_insert)
+    content = "x" * 10_001 if debug_unconfigured else "Hello"
     with pytest.raises(RuntimeError) as caught:
         await enforce_prompt_guard(
-            mount=PromptGuardMount(_GuardClient(PromptGuardDecision("allow", "clean"))),
-            mode="required",
+            mount=None if debug_unconfigured else PromptGuardMount(_GuardClient(PromptGuardDecision("allow", "clean"))),
+            mode="debug-when-unconfigured" if debug_unconfigured else "required",
             role="composer",
             provider_custody=custody,
-            messages=[{"role": "user", "content": "Hello"}],
-            user_prompt="Hello",
+            messages=[{"role": "user", "content": content}],
+            user_prompt=content,
         )
     assert caught.value is original_failure
     assert _checks(engine) == []
@@ -395,7 +416,8 @@ def test_terminal_refusal_carries_only_unpersisted_state_and_frozen_evidence(ini
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_sql", [False, True])
-async def test_repeated_cancellation_joins_actual_sql_outcome_and_retains_failure(authority, monkeypatch, fail_sql):
+@pytest.mark.parametrize("debug_unconfigured", [False, True])
+async def test_repeated_cancellation_joins_actual_sql_outcome_and_retains_failure(authority, monkeypatch, fail_sql, debug_unconfigured):
     engine, service, owner, coordinator = authority
     custody = owner.mint(ProviderInvocationFamily.PRIMARY)
     entered = threading.Event()
@@ -412,14 +434,15 @@ async def test_repeated_cancellation_joins_actual_sql_outcome_and_retains_failur
         return original_insert(*args, **kwargs)
 
     monkeypatch.setattr(service, "_insert_chat_message", blocked_insert)
+    content = "x" * 10_001 if debug_unconfigured else "Hello"
     task = asyncio.create_task(
         enforce_prompt_guard(
-            mount=PromptGuardMount(_GuardClient(PromptGuardDecision("allow", "clean"))),
-            mode="required",
+            mount=None if debug_unconfigured else PromptGuardMount(_GuardClient(PromptGuardDecision("allow", "clean"))),
+            mode="debug-when-unconfigured" if debug_unconfigured else "required",
             role="composer",
             provider_custody=custody,
-            messages=[{"role": "user", "content": "Hello"}],
-            user_prompt="Hello",
+            messages=[{"role": "user", "content": content}],
+            user_prompt=content,
         )
     )
     try:
@@ -447,6 +470,6 @@ async def test_repeated_cancellation_joins_actual_sql_outcome_and_retains_failur
     else:
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert [check["disposition"] for check in _checks(engine)] == ["allow"]
+        assert [check["disposition"] for check in _checks(engine)] == ["debug_bypass" if debug_unconfigured else "allow"]
     assert custody.attempt is None
     coordinator.assert_completed()

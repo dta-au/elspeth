@@ -372,7 +372,7 @@ class AdvisorCheckpointOwner:
             failure = classify_provider_failure(exc)
             if failure is not None and failure.request_rejection is not None:
                 return _AdvisorProviderFailure(
-                    error_class="BadRequestError",
+                    error_class=type(exc).__name__,
                     provider_failure=self._retain_request_failure(
                         exc, failure.request_rejection, recorder=recorder, attempt_call_offset=attempt_call_offset
                     ),

@@ -606,6 +606,94 @@ async def test_debug_mode_is_audited_before_sdk_and_never_changes_wire_kwargs(in
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("configured_role", ["composer", "advisor"])
+async def test_mixed_mounts_preserve_configured_role_size_refusal(invocation, monkeypatch, configured_role):
+    from tests.unit.web.composer.test_prompt_guard_admission import _checks
+
+    engine, sessions, owner, coordinator = invocation
+    client = _Client(PromptGuardDecision("allow", "clean"))
+    configured_mount = PromptGuardMount(client)
+    monkeypatch.setattr(
+        provider_gateway, "build_prompt_guard_mount", lambda _settings: configured_mount if configured_role == "composer" else None
+    )
+    monkeypatch.setattr(
+        service_module, "build_prompt_guard_mount", lambda _settings: configured_mount if configured_role == "advisor" else None
+    )
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(),
+        settings=_make_settings(composer_prompt_guard_mode="debug-when-unconfigured"),
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+    mounts = {"composer": service.composer_prompt_guard_mount, "advisor": service._advisor_prompt_guard_mount}
+    assert mounts[configured_role] is configured_mount
+    messages = [{"role": "tool", "content": "x" * 25_000}, {"role": "user", "content": "Keep this draft."}]
+    transmitted = []
+
+    async def completion(**kwargs):
+        assert _checks(engine)[-1]["disposition"] == "debug_bypass"
+        transmitted.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    for role in ("composer", "advisor"):
+        custody = owner.mint(ProviderInvocationFamily.PRIMARY if role == "composer" else ProviderInvocationFamily.ADVISOR)
+        operation = provider_gateway._litellm_acompletion(
+            provider_custody=custody,
+            prompt_guard_mount=mounts[role],
+            prompt_guard_mode="debug-when-unconfigured",
+            prompt_guard_role=role,
+            prompt_guard_user_prompt="Keep this draft.",
+            model="test/model",
+            messages=messages,
+        )
+        if role == configured_role:
+            with pytest.raises(PromptGuardRefused) as refused:
+                await operation
+            assert refused.value.http_status == 422 and custody.attempt is None
+        else:
+            assert mounts[role] is None
+            await operation
+    assert client.requests == []
+    assert len(transmitted) == 1 and transmitted[0]["messages"] == messages
+    checks = {check["role"]: check for check in _checks(engine)}
+    assert set(checks) == {"composer", "advisor"}
+    assert (checks[configured_role]["disposition"], checks[configured_role]["reason"]) == ("unavailable", "unsupported_input")
+    other_role = "advisor" if configured_role == "composer" else "composer"
+    assert (checks[other_role]["disposition"], checks[other_role]["reason"]) == ("debug_bypass", "guard_not_configured")
+    with engine.connect() as connection:
+        assert len(connection.execute(select(quota_provider_attempts_table)).all()) == 1
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_debug_oversize_still_checks_complete_credentials_before_sdk(invocation, monkeypatch):
+    from elspeth.web.credential_guard import CredentialMaterialRefused
+    from tests.unit.web.composer.test_prompt_guard_admission import _checks
+
+    engine, _sessions, owner, coordinator = invocation
+    custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+    content = "x" * 25_000 + " https://fixture-user:fixture-pass@example.test"
+
+    async def completion(**kwargs):
+        raise AssertionError("Credential-bearing input must not enter the SDK")
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    with pytest.raises(CredentialMaterialRefused):
+        await provider_gateway._litellm_acompletion(
+            provider_custody=custody,
+            prompt_guard_mount=None,
+            prompt_guard_mode="debug-when-unconfigured",
+            prompt_guard_role="composer",
+            prompt_guard_user_prompt="Keep this draft.",
+            model="test/model",
+            messages=[{"role": "tool", "content": content}],
+        )
+    assert _checks(engine) == [] and custody.attempt is None
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 async def test_owned_trust_is_stripped_but_unmarked_system_text_remains_guard_evidence(invocation, monkeypatch):
     _engine, _service, owner, coordinator = invocation
     client = _Client(PromptGuardDecision("blocked", "policy_blocked"))
@@ -765,6 +853,7 @@ async def test_captured_planner_catalog_reference_preserves_complete_untrusted_g
     hashed = {
         "role": "composer",
         "policy_fingerprint": client.policy_fingerprint,
+        "enforce_azure_character_limits": True,
         "user_prompt": "Build the requested pipeline.",
         "messages": wire["messages"],
         "tools": wire["tools"],

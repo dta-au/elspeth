@@ -33,6 +33,7 @@ from litellm.exceptions import Timeout as LiteLLMTimeout
 from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
@@ -2149,7 +2150,15 @@ async def test_two_supplied_inventory_reads_complete_protocol_without_hatch(
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["success"] for result in tool_results] == [True, True]
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources", "list_sinks"]
+    # Audit rows arrive in completion order; wire replies follow admitted call order.
+    assert sorted((invocation.tool_call_id, invocation.tool_name) for invocation in recorder.invocations) == [
+        ("call-1", "list_sources"),
+        ("call-2", "list_sinks"),
+    ]
+    assert [message["tool_call_id"] for message in completion.requests[1]["messages"] if message["role"] == "tool"] == [
+        "call-1",
+        "call-2",
+    ]
 
 
 @pytest.mark.asyncio
@@ -2301,9 +2310,19 @@ async def test_schema_fact_survives_rejection_while_issue_specific_discovery_add
     )
 
     assert result.proposal.repair_count == 1
-    invocation_names = [invocation.tool_name for invocation in recorder.invocations]
-    assert invocation_names[0] == "get_plugin_schema"
-    assert invocation_names == ["get_plugin_schema", "get_plugin_schema", "get_plugin_assistance", "explain_validation_error"]
+    first_schema, second_schema, *batch_invocations = recorder.invocations
+    assert [(invocation.tool_call_id, invocation.tool_name) for invocation in (first_schema, second_schema)] == [
+        ("call-1", "get_plugin_schema"),
+        ("call-1", "get_plugin_schema"),
+    ]
+    assert sorted((invocation.tool_call_id, invocation.tool_name) for invocation in batch_invocations) == [
+        ("call-1", "get_plugin_assistance"),
+        ("call-2", "explain_validation_error"),
+    ]
+    assert [message["tool_call_id"] for message in completion.requests[-1]["messages"] if message["role"] == "tool"][-2:] == [
+        "call-1",
+        "call-2",
+    ]
     schema_results = [
         json.loads(message["content"])
         for message in completion.requests[-1]["messages"]
@@ -2502,20 +2521,31 @@ async def test_full_discovery_batch_preserves_complete_results_above_old_aggrega
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_completed_tool", ["list_sources", "list_sinks"])
 async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
+    first_completed_tool: str,
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
     original = planner_module.execute_discovery_tool_with_context
     rendezvous = threading.Barrier(2)
+    first_recorded = threading.Event()
     expected_data: dict[str, Any] = {}
+
+    class CompletionOrderRecorder(BufferingRecorder):
+        def record(self, invocation: ComposerToolInvocation) -> None:
+            super().record(invocation)
+            if invocation.tool_name == first_completed_tool:
+                first_recorded.set()
 
     def synchronized_discovery(*args: Any, **kwargs: Any) -> Any:
         tool_name = args[0]
         rendezvous.wait(timeout=2)
+        if tool_name != first_completed_tool:
+            assert first_recorded.wait(timeout=5), "first completion must be audited before the second finishes"
         result = original(*args, **kwargs)
         expected_data[tool_name] = json.loads(pipeline_planner.serialize_tool_result(result))["data"]
         return result
@@ -2525,10 +2555,14 @@ async def test_parallel_discovery_results_remain_correlated_by_tool_call_id(
         _response(("list_sources", {}), ("list_sinks", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
-    recorder = BufferingRecorder()
+    recorder = CompletionOrderRecorder()
 
     await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
+    assert [call.tool_name for call in recorder.invocations] == [
+        first_completed_tool,
+        "list_sinks" if first_completed_tool == "list_sources" else "list_sources",
+    ]
     tool_messages = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert expected_data["list_sources"] != expected_data["list_sinks"], "correlation witness must discriminate the two payloads"
     assert [(message["tool_call_id"], json.loads(message["content"])["data"]) for message in tool_messages] == [
@@ -5048,6 +5082,7 @@ def _assert_debug_guard_audit(row: dict[str, Any], context: SessionOperationCont
                 {
                     "mount": None,
                     "mode": "debug-when-unconfigured",
+                    "enforce_azure_character_limits": False,
                     "max_prompt_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                     "max_document_characters": PROMPT_GUARD_MAX_TEXT_CHARACTERS,
                 },

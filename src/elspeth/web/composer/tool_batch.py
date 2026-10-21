@@ -2544,37 +2544,60 @@ async def run_tool_batch(
                 # this explicit recoverable outcome. Budget was already
                 # consumed above: the outbound attempt counts whether or not
                 # it produced guidance.
-                advisor_error_payload = {
-                    "status": "ADVISOR_ERROR",
-                    "error": "Advisor call failed; no guidance returned.",
-                    "error_class": advisor_outcome.error_class,
-                    "budget_used": advisor_calls_used,
-                    "budget_remaining": budget - advisor_calls_used,
-                }
-                if advisor_outcome.provider_failure is not None:
-                    advisor_error_payload["request_rejection"] = advisor_outcome.provider_failure.details.to_wire()
-                    advisor_error_payload["error"] = advisor_outcome.provider_failure.details.explanation
-                recorder.record(
-                    finish_success(
-                        audit,
-                        result_payload=advisor_error_payload,
-                        version_after=state.version,
-                    )
-                )
-                _append_tool_outcome(
-                    response=advisor_error_payload,
-                    error_class=None,
-                    error_category=None,
-                    error_message=None,
-                    post_version=state.version,
-                )
                 # Advisor failure IS counted for §7.7 anchor
                 # tracking — repeated identical failed advisor
                 # calls indicate the LLM is spamming a broken
                 # prompt, exactly the pattern the tracker exists
                 # to break.
-                anti_anchor.record_failure(tool_name, audit.arguments_hash)
-                tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
+                if advisor_outcome.provider_failure is None:
+                    advisor_error_payload = {
+                        "status": "ADVISOR_ERROR",
+                        "error": "Advisor call failed; no guidance returned.",
+                        "error_class": advisor_outcome.error_class,
+                        "budget_used": advisor_calls_used,
+                        "budget_remaining": budget - advisor_calls_used,
+                    }
+                    recorder.record(
+                        finish_success(
+                            audit,
+                            result_payload=advisor_error_payload,
+                            version_after=state.version,
+                        )
+                    )
+                    _append_tool_outcome(
+                        response=advisor_error_payload,
+                        error_class=None,
+                        error_category=None,
+                        error_message=None,
+                        post_version=state.version,
+                    )
+                    anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                    tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
+                else:
+                    request_rejection_payload = {
+                        "status": "ADVISOR_ERROR",
+                        "error": advisor_outcome.provider_failure.details.explanation,
+                        "error_class": advisor_outcome.error_class,
+                        "budget_used": advisor_calls_used,
+                        "budget_remaining": budget - advisor_calls_used,
+                        "request_rejection": advisor_outcome.provider_failure.details.to_wire(),
+                    }
+                    recorder.record(
+                        finish_success(
+                            audit,
+                            result_payload=request_rejection_payload,
+                            version_after=state.version,
+                        )
+                    )
+                    _append_tool_outcome(
+                        response=request_rejection_payload,
+                        error_class=None,
+                        error_category=None,
+                        error_message=None,
+                        post_version=state.version,
+                    )
+                    anti_anchor.record_failure(tool_name, audit.arguments_hash)
+                    tool_feedback_json = json.dumps(advisor_feedback_payload(request_rejection_payload))
                 llm_messages.append(
                     {
                         "role": "tool",
