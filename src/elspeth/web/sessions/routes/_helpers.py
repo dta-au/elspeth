@@ -78,6 +78,7 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
     ComposerProgressSnapshot,
@@ -989,6 +990,7 @@ def _state_response(
         id=str(state.id),
         session_id=str(state.session_id),
         version=state.version,
+        composition_content_hash=(composition_content_hash(_state_from_record(state)) if state.metadata_ is not None else None),
         sources=sources_data,
         nodes=deep_thaw(state.nodes),
         edges=deep_thaw(state.edges),

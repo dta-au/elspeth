@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import dagre from "@dagrejs/dagre";
 import { GraphView } from "./GraphView";
@@ -408,6 +408,37 @@ describe("GraphView", () => {
     // leaks into a later one.
     resetStore(usePluginCatalogStore);
     document.documentElement.removeAttribute("style");
+  });
+
+  it("shows the server checksum outside the diagram and invalidates comparison when the saved state changes", async () => {
+    const hash = "0123456789abcdef".repeat(4);
+    const state = makeState({ composition_content_hash: hash, nodes: [makeNode()] });
+    useSessionStore.setState({ compositionState: state });
+    const user = userEvent.setup();
+    render(<GraphView />);
+
+    const checksum = screen.getByRole("region", { name: "Graph checksum" });
+    expect(within(checksum).getByLabelText("Graph content checksum")).toHaveTextContent(hash);
+    expect(screen.getByRole("img")).not.toContainElement(checksum);
+    await user.click(within(checksum).getByRole("button", { name: "Paste checksum" }));
+    await user.type(screen.getByRole("textbox", { name: "Checksum to compare" }), hash);
+    await user.click(screen.getByRole("button", { name: "Compare checksum" }));
+    expect(within(checksum).getByRole("status")).toHaveTextContent("Checksum matches this graph.");
+
+    // Zustand updates are exercised through the store subscription, rather
+    // than a direct prop rerender of the checksum component.
+    await user.click(screen.getByRole("button", { name: "Hide quarantine and discard routes" }));
+    expect(within(checksum).getByRole("status")).toHaveTextContent("Checksum matches this graph.");
+    act(() => { useSessionStore.setState({ compositionState: { ...state, id: "next-state", version: 2 } }); });
+    expect(within(screen.getByRole("region", { name: "Graph checksum" })).getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  it("shows the checksum for a saved composition with no drawable nodes", () => {
+    const hash = "0123456789abcdef".repeat(4);
+    useSessionStore.setState({ compositionState: makeState({ composition_content_hash: hash }) });
+    render(<GraphView />);
+    expect(screen.getByLabelText("Graph content checksum")).toHaveTextContent(hash);
+    expect(screen.getByText("No pipeline to visualise.")).toBeInTheDocument();
   });
 
   it("renders nodes with type badge and plugin name", () => {

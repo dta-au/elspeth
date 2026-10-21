@@ -378,6 +378,9 @@ class CompositionStateResponse(_StrictResponse):
     id: str
     session_id: str
     version: int
+    # Readable records with null metadata cannot enter the runnable-state
+    # converter and therefore have no authored-content checksum.
+    composition_content_hash: str | None = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     sources: dict[str, CompositionObject] | None = None
     nodes: CompositionObjectList | None = None
     edges: CompositionObjectList | None = None

@@ -26,6 +26,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
@@ -35,6 +36,7 @@ from elspeth.web.execution.schemas import ValidationError
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.routes import create_session_router
@@ -1655,6 +1657,12 @@ sinks:
         assert record.sources["source"]["plugin"] == "csv"
         assert record.sources["source"]["options"]["path"] == str(blob_path)
         assert record.outputs[0]["name"] == "main"
+
+        checksum = composition_content_hash(state_from_record(record))
+        assert resp.json()["composition_content_hash"] == checksum
+        state_response = client.get(f"/api/sessions/{session.id}/state")
+        assert state_response.status_code == 200
+        assert state_response.json()["composition_content_hash"] == checksum
 
     @pytest.mark.asyncio
     async def test_post_state_yaml_surfaces_llm_review_events(self, tmp_path) -> None:

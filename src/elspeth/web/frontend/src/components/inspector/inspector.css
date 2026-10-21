@@ -303,6 +303,79 @@
   padding: var(--space-xs);
 }
 
+.graph-checksum {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
+  font-size: var(--font-size-sm);
+}
+
+.graph-checksum-heading,
+.graph-checksum-actions,
+.graph-checksum-feedback {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs) var(--space-sm);
+}
+
+.graph-checksum-title {
+  font-weight: var(--font-weight-semibold);
+}
+
+.graph-checksum-algorithm,
+.graph-checksum-note,
+.graph-checksum-scope {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+}
+
+.graph-checksum-value {
+  display: block;
+  margin: var(--space-xs) 0 var(--space-sm);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.graph-checksum-paste {
+  display: grid;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.graph-checksum-paste .btn-compact {
+  justify-self: start;
+}
+
+.graph-checksum-feedback {
+  margin-top: var(--space-xs);
+}
+
+.graph-checksum-feedback-match {
+  color: var(--color-success);
+}
+
+.graph-checksum-feedback-mismatch {
+  color: var(--color-error);
+}
+
+.graph-checksum-scope {
+  margin-top: var(--space-xs);
+}
+
+.graph-checksum-scope summary {
+  cursor: pointer;
+}
+
+.graph-checksum-scope p {
+  margin: var(--space-xs) 0 0;
+}
+
 /* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
    register (shared.css), which centres content within its own box — but the
    box was content-height, so the one-line message pinned to the top edge of

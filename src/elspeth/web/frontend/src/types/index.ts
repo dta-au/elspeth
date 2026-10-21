@@ -265,6 +265,8 @@ export interface CompositionState {
   id: string;
   session_id: string;
   version: number;
+  /** Server-authored content identity; absent only on responses from older servers. */
+  composition_content_hash?: string;
   sources: Record<string, SourceSpec>;
   nodes: NodeSpec[];
   edges: EdgeSpec[];
