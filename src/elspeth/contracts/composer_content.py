@@ -37,6 +37,72 @@ class CompleteValueManifestPayload(TypedDict):
     values: list[CompleteValueReferencePayload]
 
 
+class ContentPublicationPayload(TypedDict):
+    schema_version: Literal[1]
+    session_id: str
+    state_id: str
+    state_version: int
+    storage_content_hash: str
+    applicability: Literal["requires_current_inspection"]
+
+
+@dataclass(frozen=True, slots=True)
+class ContentPublication:
+    """One immutable storage binding, never a detector result or dispatch permit.
+
+    The storage hash binds the exact authored columns, including historical
+    nulls. It is distinct from a reconstructed composition's content hash.
+    Identical-content reverts still require a new state/version binding.
+    """
+
+    session_id: UUID
+    state_id: UUID
+    state_version: int
+    storage_content_hash: str
+
+    def __post_init__(self) -> None:
+        if type(self.session_id) is not UUID or type(self.state_id) is not UUID:
+            raise AuditIntegrityError("Content publication lacks exact session/state identities")
+        if type(self.state_version) is not int or self.state_version < 1:
+            raise AuditIntegrityError("Content publication lacks an exact positive state version")
+        _require_hash(self.storage_content_hash)
+
+    def to_payload(self) -> ContentPublicationPayload:
+        return {
+            "schema_version": 1,
+            "session_id": str(self.session_id),
+            "state_id": str(self.state_id),
+            "state_version": self.state_version,
+            "storage_content_hash": self.storage_content_hash,
+            "applicability": "requires_current_inspection",
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> ContentPublication:
+        if type(value) is MappingProxyType:
+            value = dict(value)
+        payload = _payload_object(value, frozenset(ContentPublicationPayload.__required_keys__))
+        if type(payload["schema_version"]) is not int or payload["schema_version"] != 1:
+            raise AuditIntegrityError("Content publication schema version is unsupported")
+        if payload["applicability"] != "requires_current_inspection":
+            raise AuditIntegrityError("Content publication cannot carry inspection clearance")
+        session, state, version, digest = (
+            payload["session_id"],
+            payload["state_id"],
+            payload["state_version"],
+            payload["storage_content_hash"],
+        )
+        if type(session) is not str or type(state) is not str or type(version) is not int or type(digest) is not str:
+            raise AuditIntegrityError("Content publication identity is malformed")
+        try:
+            publication = cls(UUID(session), UUID(state), version, digest)
+        except ValueError:
+            raise AuditIntegrityError("Content publication identity is malformed") from None
+        if str(publication.session_id) != session or str(publication.state_id) != state:
+            raise AuditIntegrityError("Content publication identities are not canonical")
+        return publication
+
+
 def _canonical_value(value: object, *, sort_keys: bool = False) -> str:
     """Encode compact graph JSON while retaining authored member order."""
     try:
@@ -46,6 +112,16 @@ def _canonical_value(value: object, *, sort_keys: bool = False) -> str:
     except (ValidationError, TypeError, ValueError):
         raise AuditIntegrityError("Complete composition value is not finite UTF-8 JSON") from None
     return encoded
+
+
+def content_storage_digest(value: object) -> str:
+    """Bind lossless JSON values, including numeric types and authored order.
+
+    RFC 8785 authority hashes intentionally identify 1 and 1.0 and impose a
+    finite integer domain. Storage identity must not make either change to
+    otherwise supported JSON values. This uses the complete-value encoder.
+    """
+    return hashlib.sha256(_canonical_value(value).encode("utf-8")).hexdigest()
 
 
 def _payload_object(value: object, keys: frozenset[str]) -> dict[str, JsonValue]:

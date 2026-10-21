@@ -635,11 +635,11 @@ class TestCompositionStateVersioning:
         assert loaded.composer_meta["repair_turns_used"] == 1
 
     @pytest.mark.asyncio
-    async def test_composer_meta_absent_persists_as_none(
+    async def test_absent_operational_metadata_stays_absent_beside_content_publication(
         self,
         service,
     ) -> None:
-        """``composer_meta`` defaulting to ``None`` round-trips as ``None``.
+        """Content identity must not fabricate operational authoring evidence.
 
         Honest absence: revert/fork paths and historical pre-plumbing rows
         must not synthesise a fake ``repair_turns_used: 0``. The eval scorer
@@ -649,11 +649,13 @@ class TestCompositionStateVersioning:
         session = await service.create_session("alice", "Pipeline", "local")
         state_data = CompositionStateData(is_valid=True)
         saved = await service.save_composition_state(session.id, state_data, provenance="session_seed")
-        assert saved.composer_meta is None
+        assert saved.composer_meta is not None
+        assert set(saved.composer_meta) == {"content_publication"}
+        assert saved.composer_meta["content_publication"]["applicability"] == "requires_current_inspection"
 
         loaded = await service.get_current_state(session.id)
         assert loaded is not None
-        assert loaded.composer_meta is None
+        assert loaded.composer_meta == saved.composer_meta
 
     @pytest.mark.asyncio
     async def test_get_state_versions_returns_all_ascending(

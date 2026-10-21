@@ -105,6 +105,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationFenceLost,
     ComposerOperationPreconditionRefused,
 )
+from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -395,7 +396,7 @@ _ACTIVE_RUN_COMPOSITION_COLUMNS = (
 
 def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
     """Project one active-run join row onto its exact composition-state record."""
-    return CompositionStateRecord(
+    record = CompositionStateRecord(
         id=UUID(str(active_run.state_id)),
         session_id=UUID(str(active_run.state_session_id)),
         version=active_run.state_version,
@@ -411,6 +412,8 @@ def _active_run_state_record(active_run: Any) -> CompositionStateRecord:
         derived_from_state_id=(UUID(str(active_run.derived_from_state_id)) if active_run.derived_from_state_id is not None else None),
         composer_meta=unwrap_state_column(active_run.composer_meta),
     )
+    read_content_publication(record)
+    return record
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
@@ -892,7 +895,7 @@ class _RepositoryCompositionStateMutations:
                 )
             ).scalar_one()
         )
-        data = creation.data
+        data = prepare_content_publication(creation.data, session_id=UUID(state._session_id), state_id=creation.id, state_version=version)
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
@@ -989,7 +992,7 @@ class _RepositoryInterpretationMutations:
 
     @classmethod
     def _state_record(cls, row: Row[Any]) -> CompositionStateRecord:
-        return CompositionStateRecord(
+        record = CompositionStateRecord(
             id=UUID(row.id),
             session_id=UUID(row.session_id),
             version=row.version,
@@ -1005,6 +1008,8 @@ class _RepositoryInterpretationMutations:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=cls._state_column(row.composer_meta),
         )
+        read_content_publication(record)
+        return record
 
     @staticmethod
     def _event_record(row: Row[Any]) -> InterpretationEventRecord:
@@ -1340,7 +1345,9 @@ class _RepositoryInterpretationMutations:
                     )
                 ).scalar_one()
             )
-            data = appended_state.data
+            data = prepare_content_publication(
+                appended_state.data, session_id=UUID(state._session_id), state_id=appended_state.id, state_version=version
+            )
             # This append is a genuine session HEAD (version MAX+1, derived_from
             # set), so retire pending reviews whose site the new head extinguished
             # in this transaction.
@@ -4187,6 +4194,9 @@ class _ForkChildSessionMutations:
             )
         ).scalar_one()
         connection = self._require_exact_child_context()
+        state = prepare_content_publication(
+            state, session_id=UUID(self.__child_session_id), state_id=creation.id, state_version=int(next_version)
+        )
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),

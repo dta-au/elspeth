@@ -181,6 +181,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRecord,
     ComposerOperationRunning,
 )
+from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.dead_site_supersession import supersede_dead_site_pending_interpretation_events
 from elspeth.web.sessions.fork_custody import (
@@ -1772,6 +1773,9 @@ class SessionServiceImpl:
             )
         ).scalar_one()
         allocated_state_id = state_id or str(uuid.uuid4())
+        state = prepare_content_publication(
+            state, session_id=UUID(session_id), state_id=UUID(allocated_state_id), state_version=int(next_version)
+        )
         conn.execute(
             insert(composition_states_table).values(
                 id=allocated_state_id,
@@ -3688,7 +3692,15 @@ class SessionServiceImpl:
                     committed_hash = composition_content_hash(state_from_record(committed_record))
                     if committed_hash != state_content_hash:
                         raise AuditIntegrityError("pipeline exact retry state content mismatch")
-                    if deep_thaw(committed_record.composer_meta) != deep_thaw(final_composer_metadata):
+                    expected_metadata = final_composer_metadata
+                    if read_content_publication(committed_record) is not None:
+                        expected_metadata = prepare_content_publication(
+                            settled_state,
+                            session_id=session_id,
+                            state_id=committed_record.id,
+                            state_version=committed_record.version,
+                        ).composer_meta
+                    if deep_thaw(committed_record.composer_meta) != deep_thaw(expected_metadata):
                         raise AuditIntegrityError("pipeline exact retry final metadata mismatch")
                     return (
                         self._read_pipeline_settlement_replay(
@@ -3884,7 +3896,7 @@ class SessionServiceImpl:
                     authority=authority,
                     state_id=state_id,
                     state_content_hash=state_content_hash,
-                    final_composer_metadata=final_composer_metadata,
+                    final_composer_metadata=accepted_state.composer_meta,
                     dispatch=dispatch,
                 )
                 terminal_payload = PipelineAcceptedEvidence(
@@ -6919,7 +6931,7 @@ class SessionServiceImpl:
         dataclass field. JSON columns are unwrapped from their _version envelope.
         """
         row_mapping = row._mapping
-        return CompositionStateRecord(
+        record = CompositionStateRecord(
             id=UUID(row.id),
             session_id=UUID(row.session_id),
             version=row.version,
@@ -6935,6 +6947,8 @@ class SessionServiceImpl:
             derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
             composer_meta=self._unwrap_envelope(row.composer_meta),
         )
+        read_content_publication(record)
+        return record
 
     def _graph_review_on_connection(
         self,
@@ -8021,7 +8035,8 @@ class SessionServiceImpl:
                     session_id=sid,
                     payload=StatePayload(
                         data=CompositionStateData(
-                            sources=self._unwrap_envelope(prior_row.sources),
+                            source=prior_record.source if prior_record.sources is None else None,
+                            sources=prior_record.sources,
                             nodes=self._unwrap_envelope(prior_row.nodes),
                             edges=self._unwrap_envelope(prior_row.edges),
                             outputs=self._unwrap_envelope(prior_row.outputs),

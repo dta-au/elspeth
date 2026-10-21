@@ -13,6 +13,7 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.web.sessions.content_publication import CONTENT_PUBLICATION_KEY, read_content_publication
 from elspeth.web.sessions.pending_interpretation import (
     _interpretation_hash_domain_v2,
     _resolve_invented_source,
@@ -193,15 +194,22 @@ def verify_opt_out_transformation(
         )
     else:
         raise AuditIntegrityError("unsupported opt-out replay transformation")
+    read_content_publication(previous)
+    produced_publication = read_content_publication(produced)
+    expected_metadata = deep_thaw(previous.composer_meta)
+    if produced_publication is not None:
+        expected_metadata = {} if expected_metadata is None else expected_metadata
+        expected_metadata[CONTENT_PUBLICATION_KEY] = produced_publication.to_payload()
     if (
         produced.derived_from_state_id != previous.id
         or produced.session_id != previous.session_id
+        or produced.version <= previous.version
         or deep_thaw(produced.sources) != deep_thaw(sources)
         or deep_thaw(produced.nodes) != deep_thaw(nodes)
         or produced.edges != previous.edges
         or produced.outputs != previous.outputs
         or produced.metadata_ != previous.metadata_
-        or produced.composer_meta != previous.composer_meta
+        or deep_thaw(produced.composer_meta) != expected_metadata
     ):
         raise AuditIntegrityError("accepted opt-out derived state transformation mismatch")
     if (
