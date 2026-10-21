@@ -47,24 +47,10 @@ interface ComposingIndicatorProps {
   lastRejection?: ToolCall["rejection"];
 }
 
-interface RequestFocus {
-  headline: string;
-  focus: string;
-  nextMove: string;
-}
-
 interface WorkingView {
   headline: string;
   evidence: string[];
   likelyNext: string;
-  /**
-   * Provenance of the view (elspeth-b189b5b3b8 part c): "backend" views carry
-   * evidence the server actually reported for this compose request;
-   * "estimated" views are keyword-guessed from the user's message text and
-   * must not read as if ELSPETH reported them. Rendering italicises estimated
-   * views and appends a visible "(estimated)" marker to the headline.
-   */
-  source: "backend" | "estimated";
 }
 
 function isTerminalPhase(
@@ -103,56 +89,6 @@ function describeCurrentSetup(compositionState: CompositionState | null | undefi
   return `Current setup: ${input}, ${steps}, ${outputs}.`;
 }
 
-function describeRequestFocus(latestRequest: string | null | undefined): RequestFocus {
-  const normalized = latestRequest?.toLocaleLowerCase() ?? "";
-
-  if (normalized.includes("html") && normalized.includes("json")) {
-    return {
-      headline: "Working on: convert HTML into JSON",
-      focus: "Request focus: turn HTML content into structured JSON.",
-      nextMove: "Likely next move: choose an input, extract the useful fields, then save structured JSON.",
-    };
-  }
-
-  if (/\b(database|sql|table|query)\b/.test(normalized)) {
-    return {
-      headline: "Working on: database-backed data flow",
-      focus: "Request focus: read data from a database source.",
-      nextMove: "Likely next move: identify the input query, shape the records, then send them to an output.",
-    };
-  }
-
-  if (/\b(scrape|website|web page|url|fetch)\b/.test(normalized)) {
-    return {
-      headline: "Working on: web content pipeline",
-      focus: "Request focus: fetch or parse web content.",
-      nextMove: "Likely next move: choose a web input, extract the useful content, then structure the result.",
-    };
-  }
-
-  if (/\b(output|save|export|write|artifact)\b/.test(normalized)) {
-    return {
-      headline: "Working on: saved output",
-      focus: "Request focus: produce or update saved output.",
-      nextMove: "Likely next move: check the current pipeline shape and wire the final output.",
-    };
-  }
-
-  if (/\b(file|csv|excel|upload|input)\b/.test(normalized)) {
-    return {
-      headline: "Working on: file input pipeline",
-      focus: "Request focus: use a supplied file as input.",
-      nextMove: "Likely next move: connect the file, inspect its fields, then add the needed processing steps.",
-    };
-  }
-
-  return {
-    headline: "Working through your request",
-    focus: "Request focus: update the pipeline from your latest message.",
-    nextMove: "Likely next move: compare your request with the current setup, then update the graph or explain what is missing.",
-  };
-}
-
 function backendWorkingView(
   composerProgress: ComposerProgressSnapshot | null | undefined,
 ): WorkingView | null {
@@ -169,23 +105,19 @@ function backendWorkingView(
     likelyNext:
       composerProgress.likely_next ??
       "ELSPETH will continue through the visible composer workflow.",
-    source: "backend",
   };
 }
 
-function heuristicWorkingView(
-  latestRequest: string | null | undefined,
+function waitingWorkingView(
   compositionState: CompositionState | null | undefined,
 ): WorkingView {
-  const requestFocus = describeRequestFocus(latestRequest);
   return {
-    headline: requestFocus.headline,
+    headline: "Waiting for Composer progress",
     evidence: [
-      requestFocus.focus,
+      "No live Composer progress has been reported yet.",
       describeCurrentSetup(compositionState),
     ],
-    likelyNext: requestFocus.nextMove,
-    source: "estimated",
+    likelyNext: "Live updates will appear when Composer reports progress.",
   };
 }
 
@@ -239,9 +171,8 @@ export function ComposingIndicator({
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
-    heuristicWorkingView(latestRequest, compositionState);
+    waitingWorkingView(compositionState);
   const isTerminal = isTerminalPhase(composerProgress?.phase);
-  const isEstimated = workingView.source === "estimated";
   const progressKey = latestRequest ?? composerProgress?.request_id ?? "idle";
   const toolLogCaptionId = `${useId()}-tool-log`;
   const retryReasonId = `${useId()}-retry-reason`;
@@ -267,9 +198,7 @@ export function ComposingIndicator({
             <span className="composing-dot" />
           </div>
         )}
-        <div
-          className={`composing-working-view${isEstimated ? " composing-working-view--estimated" : ""}`}
-        >
+        <div className="composing-working-view">
           <div className="composing-status-summary" role="status">
             <div className="composing-label">
               {isTerminal ? (
@@ -292,9 +221,6 @@ export function ComposingIndicator({
             </div>
             <div className="composing-title">
               {workingView.headline}
-              {isEstimated && (
-                <span className="composing-estimated-tag"> (estimated)</span>
-              )}
             </div>
             {composerProgress?.phase === "cancelled" && (
               <div className="composing-text">
@@ -398,7 +324,7 @@ export function ComposingIndicator({
             <div className="composing-details">
               <div className="composing-section">
                 <div className="composing-label">
-                  {isEstimated ? "Best guess from your request" : "What ELSPETH can see"}
+                  What ELSPETH can see
                 </div>
                 <ul className="composing-evidence">
                   {workingView.evidence.map((item) => (
