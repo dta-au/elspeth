@@ -1,0 +1,39 @@
+[Unit]
+Description=ELSPETH independent judge supervisor (Ubuntu source profile)
+After=systemd-journald.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+RootDirectory=/opt/elspeth/judge-supervisor
+MountAPIVFS=yes
+ExecStart=/usr/bin/python3 -I -B -m elspeth_lints.core.judge_supervisor
+Environment=PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1
+PassEnvironment=
+WorkingDirectory=/
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+LimitCORE=0
+UMask=0077
+BindReadOnlyPaths=/etc/elspeth/judge-workers.json
+BindReadOnlyPaths=/etc/elspeth/judge-supervisor.json
+BindReadOnlyPaths=/opt/elspeth/judge-workers
+BindReadOnlyPaths=/var/lib/elspeth-judge/providers
+BindReadOnlyPaths=/sys/fs/cgroup
+BindPaths=/run/systemd/private
+BindPaths=/run/elspeth-judge
+ReadWritePaths=/run/elspeth-judge
+KillMode=control-group
+TimeoutStopSec=5
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -26,6 +26,8 @@ from elspeth_lints.core.judge import (
     call_judge,
 )
 
+pytestmark = pytest.mark.usefixtures("synthetic_judge_worker")
+
 # The COMPLETE set of Codex feature settings the judge transport is allowed to
 # send, in order. The judge's shell being ON is a security property of
 # `543066e17`, so it is pinned by asserting the WHOLE config list, unfiltered.

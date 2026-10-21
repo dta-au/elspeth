@@ -119,7 +119,17 @@ _PINNED_FILES: tuple[Path, ...] = ()
 # ``tests/conftest.py`` fingerprints EVERY directory entry (lstat of each
 # name, sorted) to detect stray writes into ``.elspeth/`` — pruning anything
 # from it would defeat its purpose.
-_NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset({REPO_ROOT / "tests" / "conftest.py"})
+# Artifact authentication must inventory every file, including dependency and
+# hidden directories. Snapshot permission/cleanup walks likewise visit every
+# directory. Applying source-discovery exclusions to these would hide injected
+# artifacts or leave worker evidence permissions/cleanup incomplete.
+_NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset(
+    {
+        REPO_ROOT / "tests" / "conftest.py",
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/operator_runtime.py",
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/judge_supervisor.py",
+    }
+)
 
 
 def test_no_private_python_file_walk_outside_the_authority() -> None:

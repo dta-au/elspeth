@@ -54,6 +54,8 @@ from elspeth_lints.core.judge import DEFAULT_JUDGE_MODEL
 # ---------- helpers ----------
 
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime", "synthetic_judge_worker")
+
 _SYNTHETIC_SOURCE = '''\
 """Synthetic module used in YAML round-trip tests."""
 

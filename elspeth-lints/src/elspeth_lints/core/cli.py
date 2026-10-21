@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from elspeth_lints.core import ast_walker
+from elspeth_lints.core import ast_walker, operator_runtime
 from elspeth_lints.core.allowlist import (
     _JUDGE_METADATA_SIGNATURE_ENV_VAR,
     _JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR,
@@ -90,8 +90,6 @@ _JUDGE_SIGNING_ENV_FILE_KEYS = frozenset(
     {
         "ELSPETH_JUDGE_METADATA_HMAC_KEY",
         "ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE",
-        "OPENROUTER_API_KEY",
-        "ANTHROPIC_API_KEY",
         OPERATOR_OVERRIDE_TOKEN_ENV,
         OPERATOR_OVERRIDE_TOKEN_SHA256_ENV,
     }
@@ -168,6 +166,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the elspeth-lints CLI."""
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if (
+        _JUDGE_METADATA_SIGNATURE_ENV_VAR in os.environ
+        or args.command in {"sign-judge-signatures", "sign-bundle", "rekey", "migrate-judge-scope"}
+        or (args.command == "justify" and not args.dry_run)
+        or (args.command == "audit-verdict" and not args.dry_run)
+        or (args.command == "diagnose-judge-signatures" and args.env_file is not None)
+    ):
+        try:
+            operator_runtime.require_operator_runtime()
+        except operator_runtime.OperatorRuntimeUnavailableError as exc:
+            sys.stderr.write(f"Operator runtime unavailable: {exc}\n")
+            return 2
     if args.command == "check":
         if _parse_rules(args.rules):
             DEFAULT_REGISTRY.load_builtin_rules()
@@ -2612,6 +2622,7 @@ def _load_judge_signing_env_file(env_file: Path | None) -> None:
     """Load only signing-relevant dotenv keys, with existing env winning."""
     if env_file is None:
         return
+    operator_runtime.require_operator_runtime()
     from dotenv import dotenv_values
 
     resolved = env_file.resolve()
@@ -2931,7 +2942,7 @@ def _namespace_for_signing_spec(
 
 def _render_signing_spec_command(spec: _JudgeSignatureSigningSpec, args: argparse.Namespace) -> str:
     parts = [
-        "elspeth-lints",
+        operator_runtime.OPERATOR_ENTRYPOINT,
         "justify",
         "--root",
         str(args.root),
@@ -3516,7 +3527,7 @@ def _execute_one_sign_bundle_action(
 def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reason: str) -> None:
     """Print a paste-ready, secret-free resume command."""
     command = [
-        "elspeth-lints",
+        operator_runtime.OPERATOR_ENTRYPOINT,
         "sign-bundle",
         str(args.bundle.resolve()),
         "--root",

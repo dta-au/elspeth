@@ -1120,6 +1120,9 @@ def _call_openrouter(
     """
     if tool_scope is not None:
         raise ValueError("the openrouter transport cannot use judge tools; --judge-tools readonly requires --judge-transport agent")
+    from elspeth_lints.core.judge_worker import require_worker_execution
+
+    require_worker_execution()
     # Lazy import: keeping ``openai`` out of module-level scope means
     # importing ``elspeth_lints.core.judge`` does not require the SDK to
     # be installed; only callers of ``call_judge`` do. This mirrors the
@@ -1614,6 +1617,10 @@ def _call_agent_sdk(
             "ELSPETH_JUDGE_METADATA_HMAC_KEY is present in the environment. "
             "A protected judge worker is required for key-bearing signing."
         )
+
+    from elspeth_lints.core.judge_worker import require_worker_execution
+
+    require_worker_execution()
 
     # Lazy import (inside the function, mirroring ``_call_openrouter``): keeps
     # ``claude_agent_sdk`` out of module scope so importing this module — and
@@ -2269,6 +2276,9 @@ def _call_codex_cli(
     output schema and shared parser still fail closed on truncation/malformed
     output.
     """
+    from elspeth_lints.core.judge_worker import require_worker_execution
+
+    require_worker_execution()
     del max_tokens
     prompt = _codex_prompt(request, tool_mode=tool_scope is not None)
     base_config = [
@@ -2386,21 +2396,21 @@ def call_judge(
 ) -> JudgeResponse:
     """Send a judge request through the selected transport and return the verdict.
 
-    ``transport`` selects the provider path (``TRANSPORT_OPENROUTER`` /
+    ``transport`` selects the independently supervised provider path (``TRANSPORT_OPENROUTER`` /
     ``TRANSPORT_AGENT`` / ``TRANSPORT_CODEX_CLI``). When ``model_id`` is omitted, the default is resolved
     **by transport** — the OpenRouter slug and the Agent-SDK model id are
     different namespaces (see ``DEFAULT_AGENT_JUDGE_MODEL``). ``transport_impl``
-    is a test seam: inject a fake to exercise the shared validation path without
-    a real provider call. All transports funnel their extracted assistant text
+    is a Python-only test seam, refused in an admitted operator runtime: inject
+    a fake to exercise shared validation without a real provider call. Production
+    always uses authenticated worker RPC with no in-process fallback. All transports funnel their extracted assistant text
     through the identical ``_parse_judge_payload`` → validators path, so a
     verdict is validated the same way regardless of origin.
 
-    ``tool_scope`` (local agent transports only) enables the read-only
-    tool-augmented investigation mode, confined to that filesystem scope. The
+    ``tool_scope`` (agent transports only) enables the read-only
+    tool-augmented investigation mode over a frozen evidence copy. The
     OpenRouter transport rejects a non-None ``tool_scope`` (it has no tool loop). When
-    ``tool_scope`` is None every transport is called exactly as before — the
-    blinded path is unchanged — which also keeps the ``transport_impl`` test
-    seam backward-compatible (fakes are invoked with the old 3-arg signature).
+    ``tool_scope`` is None the worker receives no candidate evidence mount.
+    Explicit test fakes retain the old 3-argument signature in blinded mode.
 
     Raises:
         JudgeConfigurationError: transport SDK not installed, or auth missing.
@@ -2409,7 +2419,7 @@ def call_judge(
             rather than coerce — a malformed judge response is never an
             acceptable audit primitive.
     """
-    if max_tokens <= 0:
+    if type(max_tokens) is not int or max_tokens <= 0:
         raise ValueError(f"max_tokens must be positive, got {max_tokens}")
     if transport not in _VALID_TRANSPORTS:
         raise ValueError(f"unknown judge transport {transport!r}; expected one of {sorted(_VALID_TRANSPORTS)}")
@@ -2424,14 +2434,20 @@ def call_judge(
         else:
             model_id = DEFAULT_JUDGE_MODEL
 
-    impl = transport_impl if transport_impl is not None else _TRANSPORTS[transport]
-    # Pass tool_scope only when set, so existing 3-arg fakes and call sites are
-    # invoked exactly as before (backward-compatible test seam). The blinded
-    # path never reaches the keyword form.
-    if tool_scope is not None:
-        result = impl(request, model_id, max_tokens, tool_scope=tool_scope)
+    if transport_impl is not None:
+        from elspeth_lints.core.operator_runtime import current_operator_runtime
+
+        if current_operator_runtime() is not None:
+            raise JudgeConfigurationError("an installed operator runtime cannot inject an in-process judge transport")
+        # Explicit Python-only test seam, never selectable through RPC/config.
+        if tool_scope is not None:
+            result = transport_impl(request, model_id, max_tokens, tool_scope=tool_scope)
+        else:
+            result = transport_impl(request, model_id, max_tokens)
     else:
-        result = impl(request, model_id, max_tokens)
+        from elspeth_lints.core.judge_rpc import call_worker
+
+        result = call_worker(request, model_id=model_id, max_tokens=max_tokens, transport=transport, tool_scope=tool_scope)
 
     parsed = _parse_judge_payload(result.raw_text)
     verdict = _verdict_from_string(parsed["verdict"])
@@ -2554,13 +2570,14 @@ def _parse_judge_payload(raw_text: str) -> dict[str, Any]:
     response that ignores that constraint is itself a malformation
     signal worth surfacing.
     """
-    stripped = raw_text.strip()
+    from elspeth_lints.core.judge_rpc import decode_json
+
     try:
-        parsed = json.loads(stripped)
-    except json.JSONDecodeError as exc:
-        raise JudgeContractError(f"judge returned non-JSON response; refusing to coerce. raw: {stripped!r}") from exc
-    if not isinstance(parsed, dict):
-        raise JudgeContractError(f"judge JSON must be an object; got {type(parsed).__name__}")
+        parsed = decode_json(raw_text.strip().encode("utf-8"))
+    except UnicodeError as exc:
+        raise JudgeContractError("judge returned invalid Unicode") from exc
+    except JudgeContractError as exc:
+        raise JudgeContractError(f"judge returned a non-JSON response or invalid JSON contract: {exc}") from exc
     required_fields = frozenset({"verdict", "rationale", "confidence", "should_use_decorator"})
     for required in required_fields:
         if required not in parsed:

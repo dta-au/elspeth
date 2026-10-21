@@ -48,6 +48,8 @@ from elspeth_lints.core.judge import (
     call_judge,
 )
 
+pytestmark = pytest.mark.usefixtures("synthetic_judge_worker")
+
 
 def _request() -> JudgeRequest:
     return JudgeRequest(

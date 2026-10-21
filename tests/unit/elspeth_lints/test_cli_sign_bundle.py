@@ -59,6 +59,8 @@ from elspeth_lints.core.review_bundle import (
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _HMAC_KEY = "x" * 32
 _RECORDED_AT = "2024-01-01T00:00:00+00:00"
 _MODEL = "claude-opus-4-7"
@@ -3264,7 +3266,7 @@ def test_sign_bundle_source_observation_oserror_is_normal_verify_failure_without
     before = _tree_bytes(allowlist_dir)
 
     with (
-        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        patch("elspeth_lints.core.trusted_git.subprocess.Popen", side_effect=OSError("git unavailable")),
         patch("elspeth_lints.core.sign_bundle_transaction.create_transaction") as create_transaction,
     ):
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))

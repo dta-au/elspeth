@@ -63,6 +63,8 @@ from elspeth_lints.core.override_rate import judge_decision_events_path
 # (`dict.get` on data that is not at a Tier-3 boundary). The exact text
 # matters less than the fact that the tier_model rule reports a finding
 # at a stable symbol_context.
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime", "synthetic_judge_worker")
+
 _SYNTHETIC_SOURCE = '''\
 """Synthetic module used in justify tests."""
 

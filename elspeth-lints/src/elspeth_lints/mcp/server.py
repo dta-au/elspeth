@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR, JudgeVerdict
+from elspeth_lints.core.operator_runtime import OPERATOR_ENTRYPOINT
 
 __all__ = [
     "HmacKeyPresentError",
@@ -217,10 +218,7 @@ def _sign_bundle_command_text(
     parts = [
         "env",
         _OPERATOR_KEY_PLACEHOLDER,
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        OPERATOR_ENTRYPOINT,
         "sign-bundle",
         str(bundle_path),
         "--root",
@@ -339,10 +337,7 @@ def _rekey_command(ctx: _ServerContext, bundle_path: Path, *, old_key_env: str, 
         "env",
         f"{old_key_env}=<old-operator-key>",
         f"{new_key_env}=<new-operator-key>",
-        "PYTHONPATH=elspeth-lints/src",
-        ".venv/bin/python",
-        "-m",
-        "elspeth_lints.core.cli",
+        OPERATOR_ENTRYPOINT,
         "rekey",
         "--in",
         str(bundle_path),

@@ -68,7 +68,6 @@ the gate.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass
 from datetime import date
@@ -90,6 +89,7 @@ from elspeth_lints.core.allowlist_io import (
 from elspeth_lints.core.allowlist_io import (
     PerFileRuleRecord as PerFileRuleCoverageEntry,
 )
+from elspeth_lints.core.trusted_git import SourceSnapshotError, git_metadata_operation, run_git_metadata
 
 UNRECOGNIZED_ENTRY_SHAPE = "UNRECOGNIZED_ENTRY_SHAPE"
 PER_FILE_RULE_REQUIRES_JUDGE = "PER_FILE_RULE_REQUIRES_JUDGE"
@@ -148,6 +148,23 @@ def check_judge_coverage(
     repo_root: Path,
     forbid_unverified_judge_metadata: bool = False,
 ) -> dict[str, JudgeCoverageReport]:
+    """Check directories within one callback-free metadata operation."""
+    with git_metadata_operation(repo_root):
+        return _check_judge_coverage(
+            allowlist_root=allowlist_root,
+            baseline_ref=baseline_ref,
+            repo_root=repo_root,
+            forbid_unverified_judge_metadata=forbid_unverified_judge_metadata,
+        )
+
+
+def _check_judge_coverage(
+    *,
+    allowlist_root: Path,
+    baseline_ref: str,
+    repo_root: Path,
+    forbid_unverified_judge_metadata: bool = False,
+) -> dict[str, JudgeCoverageReport]:
     """Diff every judge-covered allowlist under ``allowlist_root``.
 
     ``allowlist_root`` is typically ``config/cicd``; every
@@ -189,6 +206,23 @@ def check_judge_coverage(
 
 
 def check_one_directory(
+    *,
+    allowlist_dir: Path,
+    baseline_ref: str,
+    repo_root: Path,
+    forbid_unverified_judge_metadata: bool = False,
+) -> JudgeCoverageReport:
+    """Check a directory, sharing an enclosing audit's immutable metadata view."""
+    with git_metadata_operation(repo_root):
+        return _check_one_directory(
+            allowlist_dir=allowlist_dir,
+            baseline_ref=baseline_ref,
+            repo_root=repo_root,
+            forbid_unverified_judge_metadata=forbid_unverified_judge_metadata,
+        )
+
+
+def _check_one_directory(
     *,
     allowlist_dir: Path,
     baseline_ref: str,
@@ -759,20 +793,10 @@ def _git_show(
 
 
 def _run_git(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
-    """Run git with a stable C locale so diagnostics are not localized."""
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        raise JudgeCoverageError(f"git command failed to start: {exc}") from exc
+        return run_git_metadata(args, repo_root=repo_root)
+    except SourceSnapshotError as exc:
+        raise JudgeCoverageError(f"git metadata observation failed: {exc}") from exc
 
 
 def _git_commit_exists(*, baseline_ref: str, repo_root: Path) -> bool:

@@ -52,6 +52,8 @@ from elspeth_lints.core.reaudit import (
 )
 
 # Synthetic source: one R1 finding inside Widget.lookup.
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime", "synthetic_judge_worker")
+
 _SYNTHETIC_SOURCE = '''\
 """Synthetic module used in reaudit tests."""
 

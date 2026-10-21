@@ -185,15 +185,23 @@ Every rendered command carries `--dry-run`, so pasting one spends nothing; the
 
 ## Operator commands (key-bearing shell)
 
-The legacy `agent` (Claude Agent SDK) transport now refuses before SDK import
-whenever `ELSPETH_JUDGE_METADATA_HMAC_KEY` is present, including an empty value.
-This intentionally disables direct SDK judging in a keyed signing process;
-key-free SDK judging retains its existing authentication and tool modes.
-Removing the environment variable does not erase a key already loaded in
-memory, and this guard does not provide process isolation. A protected worker
-and SDK artifact qualification are still required before this transport can
-serve key-bearing signing. Real signing remains disabled pending the on-prem
-migration and qualification of the operator boundary.
+Key-bearing operations require the separately installed absolute entrypoint
+`/usr/local/libexec/elspeth-operator`. Editable Python/console entrypoints refuse
+key custody; they cannot retroactively protect an already exposed environment.
+The static native launcher authenticates protected startup paths, starts an
+isolated interpreter with a closed environment, then authenticates the installed
+artifact before admitting selected signer values. Candidate paths remain data.
+Relative paths, UTF-8 values and explicitly named rekey variables are retained.
+
+All three judge transports use an independently started supervisor and isolated
+workers. Provider SDK imports and CLI execution occur in the worker's separate
+principal, filesystem and authentication home. Read-only mode receives a bounded
+fixed evidence copy; blinded mode receives no candidate files. The signer owns
+verdict validation, policy, timestamps, HMACs, journals and publication. Missing
+protected runtime or qualified worker profile refuses without an in-process
+fallback. Provider credentials belong in the independent worker profile, not the
+signer's `--env-file`. SDK and exact artifact/profile qualification remain pending;
+real signing remains disabled pending on-prem migration and qualification.
 
 The legacy `scripts/cicd/regen_fingerprint_baseline.py` command also refuses
 execution, including its `--env-file` and `--commit` forms. It loads no key and
@@ -203,16 +211,16 @@ a signed enforce result bound to the current source and allowlist; a protected
 verifier is pending. Shape-only checks or a caller's asserted gate result do not
 authorize regeneration.
 
-Run these only in an operator-controlled shell that holds
-`ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
-installed CLI account and does not need a provider API key in that shell. Both
+Run these only under the separately authorized operator principal. The selected
+signer values remain within that protected runtime; provider login/API/cloud
+credentials are provisioned independently in the worker home. Both
 commands re-derive every binding from the live tree and abort on any staleness
 before touching the configured active allowlist.
 
 ### `sign-bundle` — fire a staged review bundle
 
 ```
-elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
+/usr/local/libexec/elspeth-operator sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
   [--lanes resign|new_judgment[,...] | --stale-key KEY] [--continue-on-block] [--judge-concurrency N]
 ```
@@ -370,7 +378,7 @@ deleting one.
 ### `rekey` — rotate the HMAC key
 
 ```
-elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
+/usr/local/libexec/elspeth-operator rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
 
 A scheme-preserving, **signature-only** swap: it verifies every judge-gated entry
@@ -458,6 +466,8 @@ In those cases re-stage; never force or edit the transaction journal.
 This seam replaces the per-release signing runbooks and the one-shot
 `scripts/cicd/sign_accept_backlog.py` driver. Instead of hand-edited ceremony
 scripts, an agent stages a bundle via `elspeth-judge` and the operator fires
-`sign-bundle` / `rekey` in a key-bearing shell. `scripts/codex_tier_model_rejudge.py`
-is retained (it belongs to a separate active workflow); the `notes/060-*` signing
+`sign-bundle` / `rekey` through the protected operator entrypoint.
+`scripts/codex_tier_model_rejudge.py` remains a key-free proposal workflow and
+refuses the signing-key variable; it never runs inside the signer runtime.
+The `notes/060-*` signing
 runbooks were gitignored scratch and have been removed.

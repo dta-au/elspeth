@@ -46,6 +46,8 @@ from elspeth_lints.core.review_bundle import RekeyPlan, ReviewBundle, write_bund
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rule import RULES
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _OLD_KEY = "o" * 32
 _NEW_KEY = "n" * 32
 _THIRD_KEY = "z" * 32
@@ -436,7 +438,7 @@ def test_rekey_source_observation_oserror_is_normal_failure_without_write(
     before = (allowlist_dir / "widget.yaml").read_bytes()
     _set_keys(monkeypatch)
 
-    with patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")):
+    with patch("elspeth_lints.core.trusted_git.subprocess.Popen", side_effect=OSError("git unavailable")):
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     stderr = capsys.readouterr().err
