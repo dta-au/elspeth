@@ -12,7 +12,7 @@ import hashlib
 import inspect
 import json
 import threading
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -5801,19 +5801,45 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scope", ["primary-operation", "hatch-operation", "guard-bound"])
+@pytest.mark.parametrize(
+    ("scope", "discovery_delay_seconds", "gateway_delay_seconds"),
+    [
+        pytest.param("primary-operation", 0.0, 0.0, id="primary-operation"),
+        pytest.param("hatch-operation", 0.0, 0.0, id="hatch-operation"),
+        pytest.param("guard-bound", 0.0, 0.0, id="guard-bound"),
+        pytest.param("hatch-operation", 0.6, 0.0, id="hatch-operation-delayed-discovery"),
+        pytest.param("hatch-operation", 0.0, 0.25, id="hatch-operation-delayed-gateway"),
+    ],
+)
 async def test_guard_deadline_preserves_operation_timeout_without_provider_attempt(
     tmp_path: Path,
     tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
     scope: str,
+    discovery_delay_seconds: float,
+    gateway_delay_seconds: float,
 ) -> None:
     engine, origin = await _session_context()
+    real_time = asyncio.get_running_loop().time
+    clock_origin = real_time()
+    target_attempt_started_at: float | None = None
     guard_started_at: float | None = None
     guard_cancelled = False
+
+    def deadline_clock() -> float:
+        # Discovery must reach the request this test exercises. Charge real
+        # elapsed time from its timer boundary, including gateway preparation,
+        # guard inspection, cancellation and settlement;
+        # the whole-operation and sync-phase tests cover preparation timeouts.
+        if target_attempt_started_at is None:
+            return clock_origin
+        return clock_origin + real_time() - target_attempt_started_at
+
+    monkeypatch.setattr(pipeline_planner, "_planner_deadline_time", deadline_clock)
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    # Warm catalog validation before the operation's real deadline starts.
+    # Exercise warm catalog validation before entering the controlled phase.
     build_planner_authoring_aids(policy)
     policy.validate_composition_state(_empty_state())
 
@@ -5837,7 +5863,7 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
             nonlocal guard_started_at, guard_cancelled
             if not self.slow:
                 return PromptGuardDecision("allow", "clean")
-            guard_started_at = asyncio.get_running_loop().time()
+            guard_started_at = real_time()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
@@ -5848,7 +5874,33 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
     hatch = scope == "hatch-operation"
     slow_guard = DeadlineGuard(slow=True)
     primary_guard = DeadlineGuard(slow=False) if hatch else slow_guard
-    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else _ScriptedCompletion()
+    target_mount = PromptGuardMount(slow_guard)
+    primary_mount = PromptGuardMount(primary_guard) if hatch else target_mount
+    original_complete = pipeline_planner._complete_planner_provider
+
+    async def complete_after_gateway_delay(**kwargs: Any) -> Any:
+        if kwargs["mount"] is target_mount and gateway_delay_seconds:
+            await asyncio.sleep(gateway_delay_seconds)
+        return await original_complete(**kwargs)
+
+    def complete_target_attempt(**kwargs: Any) -> Awaitable[Any]:
+        nonlocal target_attempt_started_at
+        if kwargs["mount"] is target_mount:
+            # Arm before returning the coroutine to the real wait_for timer.
+            # Starting at inspect entry would omit gateway preparation and
+            # misclassify hatch expiry as a short provider timeout.
+            target_attempt_started_at = real_time()
+        return complete_after_gateway_delay(**kwargs)
+
+    monkeypatch.setattr(pipeline_planner, "_complete_planner_provider", complete_target_attempt)
+
+    class DiscoveryCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            if discovery_delay_seconds:
+                await asyncio.sleep(discovery_delay_seconds)
+            return await super().__call__(**kwargs)
+
+    completion = DiscoveryCompletion(_response(("list_sources", {})), _response(("list_sinks", {}))) if hatch else DiscoveryCompletion()
     recorder = BufferingRecorder()
     events: list[str] = []
     failure: BaseException | None = None
@@ -5866,10 +5918,10 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
                     "timeout_seconds": 1.0,
                     "max_discovery_turns": 1,
                     "prompt_guard_mode": "required",
-                    "prompt_guard_mount": PromptGuardMount(primary_guard),
+                    "prompt_guard_mount": primary_mount,
                     "escape_hatch_model": "anthropic/claude-planner" if hatch else None,
                     "escape_hatch_provider": "test-provider" if hatch else None,
-                    "escape_hatch_prompt_guard_mount": PromptGuardMount(slow_guard) if hatch else None,
+                    "escape_hatch_prompt_guard_mount": target_mount if hatch else None,
                 },
                 lifecycle=_lifecycle(events),
             )
@@ -5884,6 +5936,7 @@ async def test_guard_deadline_preserves_operation_timeout_without_provider_attem
             row["tool_calls"][0]["check"] for row in rows if row["tool_calls"] and row["tool_calls"][0]["_kind"] == "prompt_guard_audit"
         ]
         expected_attempts = 2 if hatch else 0
+        assert target_attempt_started_at is not None
         assert guard_started_at is not None
         assert guard_cancelled
         assert len(completion.requests) == len(recorder.llm_calls) == len(attempts) == len(ledger) == expected_attempts
