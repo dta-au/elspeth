@@ -4,6 +4,10 @@ This directory prepares the separately installed signer runtime. It does not
 install it, create OS principals, change access settings or activate signing.
 The supported source profile is Ubuntu on x86-64 Linux; other or unqualified
 layouts refuse. Real signing remains disabled until operator qualification.
+Separate native builds select CPython 3.12 or 3.13 with `make PYTHON_MINOR=12`
+or `13`. The sealed handoff binds that compile-time choice to actual interpreter
+version and fixed paths. Baseline generation requires the 3.13 build. Rebuild
+launcher, bootstrap and admission modules together; old handoff formats refuse.
 
 `launcher.c` builds a statically linked, non-setuid executable for the fixed
 `/usr/local/libexec/elspeth-operator` entrypoint. The default build has no admitted
@@ -49,8 +53,33 @@ timestamps, signature verification, journals, rollback and publication.
 Editable CLI and key-reader guards refuse accidental custody but cannot undo
 earlier imports in an editable process. Use only the independently authenticated
 entrypoint for signing, rekey and authoritative verification. Missing protected
-startup or worker admission has no editable/in-process fallback. The legacy
-baseline generator remains disabled.
+startup or worker admission has no editable/in-process fallback. The editable
+baseline script refuses and prints the protected replacement command:
+
+```sh
+/usr/local/libexec/elspeth-operator regenerate-fingerprint-baseline \
+  --repo-root /path/to/protected-checkout --env-file /path/to/operator.env
+```
+
+The environment file must be outside the checkout. Required signature
+verification and expected raw capture use authenticated installed code and a
+private full snapshot. Installed first-party rule/resource and application
+Python bytes must match that snapshot; rebuild and independently qualify an
+artifact when those bytes change. Candidate capture/tests run in the separate
+[maintenance worker](../baseline-runtime/ubuntu/README.md). NOTE observations
+remain in raw capture without turning a valid enforce gate red. Skip/xfail
+cannot substitute for a passing confirmation or signed verification.
+
+Publication additionally requires an externally protected checkout: root or
+operator ownership, no candidate-writable input/path ancestry/Git metadata,
+and exclusive operator writer custody. The command refuses an ordinary mutable
+candidate checkout; it never changes ownership or permissions to manufacture
+that condition. A private per-checkout lock serializes baseline operations.
+Every byte, tracked census, mode, missing path, HEAD and index binding is
+rechecked before the atomic baseline-only replacement. The original fixture
+permissions are preserved. Review and commit afterward in a key-free shell;
+`--commit` explicitly refuses before loading an environment file or changing
+the baseline. The command never executes Git mutation or hooks under keys.
 
 Source tests use synthetic keys, controlled metadata and fake providers. They
 do not qualify installed ownership, genuine admitted startup, filesystem/process

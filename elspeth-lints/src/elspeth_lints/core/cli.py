@@ -168,7 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if (
         _JUDGE_METADATA_SIGNATURE_ENV_VAR in os.environ
-        or args.command in {"sign-judge-signatures", "sign-bundle", "rekey", "migrate-judge-scope"}
+        or args.command in {"sign-judge-signatures", "sign-bundle", "rekey", "migrate-judge-scope", "regenerate-fingerprint-baseline"}
         or (args.command == "justify" and not args.dry_run)
         or (args.command == "audit-verdict" and not args.dry_run)
         or (args.command == "diagnose-judge-signatures" and args.env_file is not None)
@@ -182,6 +182,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         if _parse_rules(args.rules):
             DEFAULT_REGISTRY.load_builtin_rules()
         return _run_check(args, registry=DEFAULT_REGISTRY)
+    if args.command == "regenerate-fingerprint-baseline":
+        from elspeth_lints.core.baseline_generation import BaselineGenerationError, BaselinePublicationUncertainError, regenerate
+        from elspeth_lints.core.judge import JudgeConfigurationError, JudgeContractError, JudgeTransportError
+
+        if args.commit:
+            sys.stderr.write("Commit the regenerated baseline separately in a key-free shell; no files changed.\n")
+            return 2
+        try:
+            if args.env_file is not None and args.env_file.resolve().is_relative_to(args.repo_root.resolve()):
+                raise BaselineGenerationError("the signing environment file must be outside the candidate checkout")
+            _load_judge_signing_env_file(args.env_file)
+            regenerate(args.repo_root)
+        except BaselinePublicationUncertainError:
+            sys.stderr.write("Baseline replacement durability is unknown; inspect the fixture before retrying.\n")
+            return 1
+        except (BaselineGenerationError, JudgeConfigurationError, JudgeContractError, JudgeTransportError, OSError, ValueError):
+            sys.stderr.write("Fingerprint baseline generation refused; no signed-gate result or baseline was accepted.\n")
+            return 1
+        sys.stdout.write("Fingerprint baseline verified and regenerated; review and commit it in a key-free shell.\n")
+        return 0
     if args.command == "dump-edges":
         return _run_dump_edges(args)
     if args.command == "rotate":

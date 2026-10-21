@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import stat
 import struct
 import subprocess
@@ -18,6 +19,7 @@ from elspeth_lints.core.operator_runtime import (
     OperatorRuntimeUnavailableError,
     _admit_native_runtime,
     _decode_native_handoff,
+    _validate_python_startup,
     current_operator_runtime,
     require_operator_runtime,
     runtime_private_directory,
@@ -37,7 +39,7 @@ def test_operator_entrypoint_is_fixed_and_outside_repository() -> None:
     assert OPERATOR_ENTRYPOINT == "/usr/local/libexec/elspeth-operator"
 
 
-def _native_packet(*, selected_name: str = "LD_PRELOAD", secret: bytes = "clé-秘密".encode()) -> bytes:
+def _native_packet(*, selected_name: str = "LD_PRELOAD", secret: bytes = "clé-秘密".encode(), python_minor: int = 12) -> bytes:
     def integer(value: int) -> bytes:
         return struct.pack("!I", value)
 
@@ -46,11 +48,12 @@ def _native_packet(*, selected_name: str = "LD_PRELOAD", secret: bytes = "clé-�
 
     arguments = (b"rekey", b"--old-key-env", b"LD_PRELOAD", b"--new-key-env=NEW_KEY")
     return (
-        b"ELSPETHOP1\x00"
+        b"ELSPETHOP2\x00"
         + string(b"/opt/elspeth/operator")
         + string(b"/candidate/original-cwd")
         + integer(123)
         + integer(456)
+        + integer(python_minor)
         + integer(len(arguments))
         + b"".join(string(argument) for argument in arguments)
         + integer(1)
@@ -67,6 +70,51 @@ def test_native_data_preserves_utf8_arbitrary_rekey_name_without_admitting_it(mo
     assert "LD_PRELOAD" not in os.environ
     assert "clé-秘密" not in repr(handoff)
     assert current_operator_runtime() is None
+
+
+@pytest.mark.parametrize("minor", [12, 13])
+def test_python_profile_binds_evidence_and_native_handoff(minor: int) -> None:
+    evidence = OperatorRuntimeEvidence(Path("/opt/elspeth/operator"), "a" * 64, 123, 456, Path("/candidate"), ("rekey",), minor)
+    assert evidence.python_version == (3, minor)
+    assert evidence.interpreter == Path(f"/usr/bin/python3.{minor}")
+    assert evidence.stdlib == Path(f"/usr/lib/python3.{minor}")
+    assert _decode_native_handoff(_native_packet(python_minor=minor)).python_minor == minor
+
+
+@pytest.mark.parametrize("minor", [0, 11, 14, 313])
+def test_native_handoff_refuses_unsupported_python_profile(minor: int) -> None:
+    with pytest.raises(OperatorRuntimeUnavailableError, match="Python profile"):
+        _decode_native_handoff(_native_packet(python_minor=minor))
+
+
+@pytest.mark.parametrize("minor", [12, 13])
+def test_startup_profile_admission_requires_matching_version_and_exact_import_roots(minor: int) -> None:
+    paths = (f"/usr/lib/python3.{minor}", f"/usr/lib/python3.{minor}/lib-dynload", "/opt/elspeth/operator/lib")
+    assert _validate_python_startup(minor, version=(3, minor), search_path=paths) == (
+        Path(f"/usr/bin/python3.{minor}"),
+        Path(f"/usr/lib/python3.{minor}"),
+    )
+    with pytest.raises(OperatorRuntimeUnavailableError, match="interpreter startup"):
+        _validate_python_startup(minor, version=(3, 25 - minor), search_path=paths)
+    with pytest.raises(OperatorRuntimeUnavailableError, match="interpreter startup"):
+        _validate_python_startup(minor, version=(3, minor), search_path=(*paths, "/candidate"))
+
+
+def test_bootstrap_uses_only_supported_builtin_version_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    bootstrap = Path(__file__).resolve().parents[3] / "elspeth-lints/operator-runtime/bootstrap.py"
+    namespace = runpy.run_path(str(bootstrap))
+    select = namespace["_fixed_import_paths"]
+    monkeypatch.setenv("ELSPETH_PYTHON_MINOR", "99")
+    monkeypatch.setenv("PYTHONHOME", "/candidate")
+    for minor in (12, 13):
+        assert select(3, minor) == [
+            f"/usr/lib/python3.{minor}",
+            f"/usr/lib/python3.{minor}/lib-dynload",
+            "/opt/elspeth/operator/lib",
+        ]
+    for major, minor in ((3, 11), (3, 14), (4, 13), (True, 13), (3, True)):
+        with pytest.raises(ValueError, match="unsupported"):
+            select(major, minor)
 
 
 @pytest.mark.parametrize(
@@ -198,12 +246,24 @@ def test_manifest_inventory_and_hash_controls(tmp_path: Path, monkeypatch: pytes
         validate_artifact_manifest(tmp_path)
 
 
-def test_unqualified_native_launcher_refuses_before_python(tmp_path: Path) -> None:
+@pytest.mark.parametrize("python_minor", [12, 13])
+def test_unqualified_native_launcher_refuses_before_python(tmp_path: Path, python_minor: int) -> None:
     project = Path(__file__).resolve().parents[3]
     source = project / "elspeth-lints/operator-runtime/launcher.c"
     executable = tmp_path / "operator-launcher"
     built = subprocess.run(
-        ["/usr/bin/cc", "-static", "-Wall", "-Wextra", "-Werror", "-O2", str(source), "-o", str(executable)],
+        [
+            "/usr/bin/cc",
+            "-static",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-O2",
+            f"-DELSPETH_PYTHON_MINOR={python_minor}",
+            str(source),
+            "-o",
+            str(executable),
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -225,3 +285,58 @@ def test_unqualified_native_launcher_refuses_before_python(tmp_path: Path) -> No
     assert "unqualified" in refused.stderr
     assert "ld.so" not in refused.stderr
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("minor", [12, 13, 14])
+def test_native_build_selects_only_fixed_supported_profile(tmp_path: Path, minor: int) -> None:
+    source = Path(__file__).resolve().parents[3] / "elspeth-lints/operator-runtime/launcher.c"
+    executable = tmp_path / "profile-probe"
+    harness = (
+        "#define main protected_launcher_main\n"
+        f"#include {json.dumps(str(source))}\n"
+        "#undef main\n"
+        'int main(void) { printf("%d\\n%s\\n%s\\n", ELSPETH_PYTHON_MINOR, INTERPRETER, STDLIB); return 0; }\n'
+    )
+    compiled = subprocess.run(
+        ["/usr/bin/cc", "-static", "-Wall", "-Wextra", "-Werror", f"-DELSPETH_PYTHON_MINOR={minor}", "-x", "c", "-", "-o", str(executable)],
+        input=harness,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if minor == 14:
+        assert compiled.returncode != 0
+        assert "must select supported CPython 3.12 or 3.13" in compiled.stderr
+        return
+    assert compiled.returncode == 0, compiled.stderr
+    result = subprocess.run(
+        [str(executable)],
+        env={"ELSPETH_PYTHON_MINOR": str(25 - minor)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert result.stdout == f"{minor}\n/usr/bin/python3.{minor}\n/usr/lib/python3.{minor}\n"
+
+
+def test_make_profile_selection_survives_explicit_cppflags() -> None:
+    source = Path(__file__).resolve().parents[3] / "elspeth-lints/operator-runtime"
+    result = subprocess.run(
+        [
+            "/usr/bin/make",
+            "--no-print-directory",
+            "-n",
+            "-C",
+            str(source),
+            "PYTHON_MINOR=13",
+            "CPPFLAGS=-DELSPETH_OPERATOR_UID=123 -DELSPETH_CANDIDATE_UID=456",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "-DELSPETH_PYTHON_MINOR=13" in result.stdout
+    assert "-DELSPETH_OPERATOR_UID=123" in result.stdout
+    assert "-static" in result.stdout

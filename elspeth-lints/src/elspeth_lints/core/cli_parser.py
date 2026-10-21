@@ -159,6 +159,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="elspeth-lints")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    baseline = subparsers.add_parser(
+        "regenerate-fingerprint-baseline",
+        help="Verify signed inputs and regenerate through an isolated maintenance worker",
+    )
+    baseline.add_argument("--repo-root", type=Path, default=Path.cwd())
+    baseline.add_argument("--env-file", type=Path)
+    baseline.add_argument("--commit", action="store_true", help="Legacy option; commit separately from key custody")
+
     check = subparsers.add_parser("check", help="Run static-analysis rules")
     check.add_argument(
         "--rules",

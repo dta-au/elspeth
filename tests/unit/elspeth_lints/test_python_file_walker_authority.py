@@ -42,6 +42,7 @@ LEAK_FILES: tuple[Path, ...] = (
     Path(".claude/worktrees/wt/src/elspeth/LEAK.py"),
     Path(".worktrees/y/src/elspeth/dotwt.py"),
     Path(".venv/lib/v.py"),
+    Path(".hypothesis/constants/ignored.py"),
     Path("node_modules/x/n.py"),
 )
 
@@ -128,6 +129,8 @@ _NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset(
         REPO_ROOT / "tests" / "conftest.py",
         REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/operator_runtime.py",
         REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/judge_supervisor.py",
+        # Maintenance snapshot cleanup chmods all directories, not Python files.
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/baseline_supervisor.py",
     }
 )
 

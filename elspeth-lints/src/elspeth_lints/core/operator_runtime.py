@@ -19,10 +19,9 @@ from pathlib import Path, PurePosixPath
 
 OPERATOR_ENTRYPOINT = "/usr/local/libexec/elspeth-operator"
 OPERATOR_ARTIFACT_ROOT = Path("/opt/elspeth/operator")
-OPERATOR_INTERPRETER = Path("/usr/bin/python3.12")
 OPERATOR_LOADER = Path("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
 _PRIVATE_DIRECTORY = Path("/run/elspeth/operator")
-_HANDOFF_MAGIC = b"ELSPETHOP1\x00"
+_HANDOFF_MAGIC = b"ELSPETHOP2\x00"
 _MAX_HANDOFF_BYTES = 1_048_576
 _MANIFEST_NAME = "runtime-manifest.json"
 _MAX_MANIFEST_BYTES = 4_194_304
@@ -40,6 +39,25 @@ class OperatorRuntimeUnavailableError(RuntimeError):
     """The protected operator runtime is absent or cannot be authenticated."""
 
 
+def _python_profile(minor: int) -> tuple[Path, Path]:
+    """Select one compiled Ubuntu profile, never an ambient executable path."""
+    if type(minor) is not int:
+        raise OperatorRuntimeUnavailableError("unsupported operator Python profile")
+    if minor == 12:
+        return Path("/usr/bin/python3.12"), Path("/usr/lib/python3.12")
+    if minor == 13:
+        return Path("/usr/bin/python3.13"), Path("/usr/lib/python3.13")
+    raise OperatorRuntimeUnavailableError("unsupported operator Python profile")
+
+
+def _validate_python_startup(minor: int, *, version: tuple[int, int], search_path: tuple[str, ...]) -> tuple[Path, Path]:
+    interpreter, stdlib = _python_profile(minor)
+    expected_path = (str(stdlib), str(stdlib / "lib-dynload"), str(OPERATOR_ARTIFACT_ROOT / "lib"))
+    if version != (3, minor) or search_path != expected_path:
+        raise OperatorRuntimeUnavailableError("operator Python profile does not match interpreter startup")
+    return interpreter, stdlib
+
+
 @dataclass(frozen=True, slots=True)
 class OperatorRuntimeEvidence:
     """Observed startup identity, created before signer values enter Python."""
@@ -50,6 +68,22 @@ class OperatorRuntimeEvidence:
     candidate_uid: int
     invocation_cwd: Path
     argv: tuple[str, ...]
+    python_minor: int = 12
+
+    def __post_init__(self) -> None:
+        _python_profile(self.python_minor)
+
+    @property
+    def python_version(self) -> tuple[int, int]:
+        return (3, self.python_minor)
+
+    @property
+    def interpreter(self) -> Path:
+        return _python_profile(self.python_minor)[0]
+
+    @property
+    def stdlib(self) -> Path:
+        return _python_profile(self.python_minor)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +92,7 @@ class _NativeHandoff:
     invocation_cwd: Path
     operator_uid: int
     candidate_uid: int
+    python_minor: int
     argv: tuple[str, ...]
     selected_environment: tuple[tuple[str, str], ...] = field(repr=False)
 
@@ -225,6 +260,8 @@ def _decode_native_handoff(raw: bytes) -> _NativeHandoff:
 
     artifact_root, cwd = Path(string()), Path(string())
     operator_uid, candidate_uid = integer(), integer()
+    python_minor = integer()
+    _python_profile(python_minor)
     argument_count = integer()
     if argument_count > 1024:
         raise OperatorRuntimeUnavailableError("too many operator arguments")
@@ -241,7 +278,7 @@ def _decode_native_handoff(raw: bytes) -> _NativeHandoff:
         if not name or "=" in name or name not in allowed or name in names:
             raise OperatorRuntimeUnavailableError("invalid selected signer value")
         names.add(name)
-    return _NativeHandoff(artifact_root, cwd, operator_uid, candidate_uid, argv, environment)
+    return _NativeHandoff(artifact_root, cwd, operator_uid, candidate_uid, python_minor, argv, environment)
 
 
 def _admit_native_runtime() -> OperatorRuntimeEvidence:
@@ -255,7 +292,6 @@ def _admit_native_runtime() -> OperatorRuntimeEvidence:
     if Path(__file__) != expected_module or Path(os.readlink("/proc/self/exe")) != OPERATOR_LOADER:
         raise OperatorRuntimeUnavailableError("operator startup artifact is not the installed runtime")
     validate_protected_path(Path(OPERATOR_ENTRYPOINT))
-    validate_protected_path(OPERATOR_INTERPRETER)
     validate_protected_path(OPERATOR_LOADER)
     descriptor = 3
     try:
@@ -272,6 +308,14 @@ def _admit_native_runtime() -> OperatorRuntimeEvidence:
         with suppress(OSError):
             os.close(descriptor)
     handoff = _decode_native_handoff(raw)
+    interpreter, stdlib = _validate_python_startup(
+        handoff.python_minor,
+        version=(sys.version_info.major, sys.version_info.minor),
+        search_path=tuple(sys.path),
+    )
+    validate_protected_path(interpreter)
+    validate_protected_path(stdlib, directory=True)
+    validate_protected_path(stdlib / "lib-dynload", directory=True)
     if handoff.artifact_root != OPERATOR_ARTIFACT_ROOT or handoff.argv != tuple(sys.argv[1:]):
         raise OperatorRuntimeUnavailableError("native startup operation binding mismatch")
     expected_command = (
@@ -281,7 +325,7 @@ def _admit_native_runtime() -> OperatorRuntimeEvidence:
         str(OPERATOR_ARTIFACT_ROOT / "platform/lib"),
         "--glibc-hwcaps-mask",
         "",
-        str(OPERATOR_INTERPRETER),
+        str(interpreter),
         "-I",
         "-S",
         "-B",
@@ -310,6 +354,7 @@ def _admit_native_runtime() -> OperatorRuntimeEvidence:
         handoff.candidate_uid,
         handoff.invocation_cwd,
         handoff.argv,
+        handoff.python_minor,
     )
     os.chdir(handoff.invocation_cwd)
     for name, value in handoff.selected_environment:

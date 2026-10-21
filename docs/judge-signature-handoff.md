@@ -207,9 +207,15 @@ The legacy `scripts/cicd/regen_fingerprint_baseline.py` command also refuses
 execution, including its `--env-file` and `--commit` forms. It loads no key and
 runs no checkout capture code, tests, or Git callbacks. Automatic regeneration
 after signing or rekey is already removed. Baseline regeneration still requires
-a signed enforce result bound to the current source and allowlist; a protected
-verifier is pending. Shape-only checks or a caller's asserted gate result do not
-authorize regeneration.
+a signed enforce result bound to the current source and allowlist. Its source
+replacement is `/usr/local/libexec/elspeth-operator regenerate-fingerprint-baseline`
+under the qualified Python 3.13 build and separate maintenance profile. It
+requires externally protected checkout custody and installed first-party bytes
+matching the frozen input, verifies signatures itself, independently derives
+the raw baseline and rechecks inputs before atomic publication. Review and
+commit separately in a key-free shell. See the [operator runtime guide](../elspeth-lints/operator-runtime/README.md).
+Actual installation and qualification remain pending. Shape-only checks or a
+caller's asserted gate result do not authorize regeneration.
 
 Run these only under the separately authorized operator principal. The selected
 signer values remain within that protected runtime; provider login/API/cloud

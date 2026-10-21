@@ -28,13 +28,24 @@
 #ifndef ELSPETH_CANDIDATE_UID
 #define ELSPETH_CANDIDATE_UID (-1)
 #endif
+#ifndef ELSPETH_PYTHON_MINOR
+#define ELSPETH_PYTHON_MINOR 12
+#endif
+
+#if ELSPETH_PYTHON_MINOR == 12
+#define INTERPRETER "/usr/bin/python3.12"
+#define STDLIB "/usr/lib/python3.12"
+#elif ELSPETH_PYTHON_MINOR == 13
+#define INTERPRETER "/usr/bin/python3.13"
+#define STDLIB "/usr/lib/python3.13"
+#else
+#error "ELSPETH_PYTHON_MINOR must select supported CPython 3.12 or 3.13"
+#endif
 
 #define ARTIFACT_ROOT "/opt/elspeth/operator"
 #define ENTRYPOINT "/usr/local/libexec/elspeth-operator"
-#define INTERPRETER "/usr/bin/python3.12"
 #define LOADER "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"
 #define LIBRARY_ROOT ARTIFACT_ROOT "/platform/lib"
-#define STDLIB "/usr/lib/python3.12"
 #define BOOTSTRAP ARTIFACT_ROOT "/bootstrap.py"
 #define MAX_PACKET 1048576U
 #define MAX_SELECTED 64U
@@ -257,11 +268,12 @@ int main(int argc, char **argv) {
     int fd = memfd_create("elspeth-operator-startup", MFD_ALLOW_SEALING);
     if (fd < 0)
         refuse("sealed operator startup channel is unavailable");
-    packet_write(fd, "ELSPETHOP1\0", 11);
+    packet_write(fd, "ELSPETHOP2\0", 11);
     packet_string(fd, ARTIFACT_ROOT);
     packet_string(fd, cwd);
     packet_integer(fd, (uint32_t)ELSPETH_OPERATOR_UID);
     packet_integer(fd, (uint32_t)ELSPETH_CANDIDATE_UID);
+    packet_integer(fd, (uint32_t)ELSPETH_PYTHON_MINOR);
     packet_integer(fd, (uint32_t)(argc - 1));
     for (int i = 1; i < argc; i++)
         packet_string(fd, argv[i]);

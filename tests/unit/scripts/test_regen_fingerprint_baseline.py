@@ -1,4 +1,4 @@
-"""The legacy baseline command must refuse without loading keys or running code."""
+"""The editable baseline wrapper directs operators to protected startup."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from scripts.cicd import regen_fingerprint_baseline
 
 @pytest.mark.parametrize("signing_key", [None, "", "synthetic-signing-key"])
 @pytest.mark.parametrize("options", [[], ["--env-file", "unread-operator.env", "--commit"]])
-def test_regeneration_is_disabled_before_repository_callbacks(
+def test_editable_regeneration_refuses_before_repository_callbacks(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     signing_key: str | None,
@@ -30,5 +30,5 @@ def test_regeneration_is_disabled_before_repository_callbacks(
         regen_fingerprint_baseline.main()
 
     assert exc_info.value.code == 1
-    assert "Baseline regeneration is disabled" in capsys.readouterr().err
+    assert "Baseline regeneration requires the protected operator entrypoint" in capsys.readouterr().err
     run.assert_not_called()
