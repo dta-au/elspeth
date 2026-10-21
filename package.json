@@ -7,7 +7,7 @@
   },
   "packageManager": "npm@11.6.2",
   "devDependencies": {
-    "acorn": "^8.18.0",
+    "acorn": "^8.19.0",
     "azurite": "^3.36.0",
     "sprintf-js": "file:tools/tedious-formatter"
   },
@@ -16,7 +16,7 @@
     "test:formatter": "node --test tools/tedious-formatter/index.test.cjs"
   },
   "dependencies": {
-    "playwright": "^1.63.0"
+    "playwright": "^1.64.1"
   },
   "overrides": {
     "uuid": "^11.1.1",
