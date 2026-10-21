@@ -4,10 +4,13 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## 0.8.9 - Unreleased (Engine and miscellaneous improvements)
+## 0.8.9 - 2026-10-21
 
-The combined merge groups Composer changes under 0.8.7, Azure Container Apps
-changes under 0.8.8, and engine and miscellaneous changes under 0.8.9.
+This release combines the Composer work developed under 0.8.7, Azure Container
+Apps work developed under 0.8.8, and engine and runtime improvements developed
+under 0.8.9. The sections below retain those development groupings.
+
+### Engine and runtime
 
 - **CSV sinks can require retention and include verified audit context.** The
   opt-in `require_all_rows` stops a rejected member before publishing that
@@ -74,6 +77,12 @@ changes under 0.8.8, and engine and miscellaneous changes under 0.8.9.
   Collection failures retain diagnostic evidence even when coverage never starts.
   Mutation tooling errors and missing, empty or malformed result inventories
   fail the job; mutation-score thresholds remain advisory.
+- **Dependency updates address Python and JavaScript advisories.** Both Python
+  projects require `certifi>=2026.10.19`; the frontend uses Vite 6.4.5 and root
+  tooling uses `follow-redirects` 1.16.1. Existing audit thresholds and exceptions
+  are unchanged.
+
+### Upgrade notes
 
 Session epoch advances from 77 to 78; Landscape advances from epoch 49 to 50.
 The combined package retains committed graph-review authority over immutable graph snapshots
@@ -86,12 +95,15 @@ blockers or cannot admit the new quota shape. This authorizes no migration,
 reset, restamping or downgrade. Drain and isolate old/new deployments; they
 cannot share session stores or replicas.
 
-These unreleased notes describe implemented source changes across 0.8.7–0.8.9,
-not completed integrated qualification. Automatic image publication from main remains held.
-The 0.8.9 tag and container publication follow successful required checks and
-the protected merge; operator signing and deployment remain separate.
+### Publication and acceptance
 
-## 0.8.8 - Unreleased (Azure Container Apps readiness)
+These notes describe the 0.8.9 source package. Final-head CI and the protected
+merge remain required; this entry does not establish a published tag or image.
+Automatic image publication from main remains held. Tag and container
+publication, operator signing, live-provider acceptance and deployment remain
+separate steps.
+
+### Azure Container Apps (0.8.8 development)
 
 - **First-install instructions can be rehearsed offline.** The instructions
   select an explicit GHCR account, export the transport ceiling required by
@@ -114,7 +126,25 @@ Offline rehearsal does not establish cloud deployment, guard health or provider
 access. First installation requires explicitly new compatible stores;
 existing-service redeploy, transition and rollback holds remain in place.
 
-## 0.8.7 - Unreleased (Composer correctness and recovery)
+### Composer correctness and recovery (0.8.7 development)
+
+- **Provider request rejections retain safe, actionable reasons.** Tool
+  feedback, Advisor audit records and readiness responses carry a closed
+  rejection descriptor with recognized reason codes and a diagnostic reference
+  when available. Upstream prose and request values are excluded. Rejections
+  remain nonretryable and continue to block publication; malformed stored
+  descriptors refuse replay.
+- **Explicit debug authoring accepts complete input without an unconfigured
+  guard's Azure limits.** With `debug-when-unconfigured` selected and no guard
+  configured, the Azure inspection limits no longer reject otherwise supported
+  authoring input. Configured and required inspection retain their limits and
+  refusal behavior.
+- **Exact no-op source patches preserve graph state.** A patch whose reconciled
+  source configuration is unchanged returns the existing graph and version.
+  Actual value, type and ordering changes retain normal mutation behavior.
+- **Shared-inspect links distinguish authentication from link failures.**
+  Bearer authentication failures request fresh credentials; invalid shared
+  links retain their link-specific failure without discarding a valid login.
 
 - **Empty-session conversations reach the planner without wording heuristics.**
   Graph and session prerequisites select the authoring surface. The model can
@@ -262,9 +292,9 @@ existing-service redeploy, transition and rollback holds remain in place.
   is added. Structural checks and artifact-bound approval retain their
   existing behavior.
 
-The combined candidate's schema cutover and qualification limits are recorded
-under 0.8.9 above. Graph visibility toggles now redraw filtered routes correctly
-without changing the authored graph or execution behavior.
+Graph visibility toggles now redraw filtered routes correctly without changing
+the authored graph or execution behavior. The upgrade and publication limits
+above apply to the complete 0.8.9 package.
 
 ## 0.8.6 - Candidate (Composer correctness and recovery)
 
