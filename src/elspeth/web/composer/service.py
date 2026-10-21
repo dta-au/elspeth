@@ -94,6 +94,7 @@ from elspeth.web.composer.composition_completion import (
     _append_interpretation_review_handoff_message,
     _with_advisor_gate_decision,
 )
+from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -2458,6 +2459,7 @@ class ComposerServiceImpl:
             user_id=user_id,
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
+            session_operation_context=session_operation_context,
         )
         turn_evidence.transcript.begin_messages(llm_messages)
         tools = composer_loop_tool_definitions(self._planner_dialect)
@@ -3195,6 +3197,8 @@ class ComposerServiceImpl:
         user_id: str | None = None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         policy_catalog: PolicyCatalogView | None = None,
+        *,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> list[dict[str, Any]]:
         """Build the message list. Returns a NEW list on every call.
 
@@ -3221,6 +3225,17 @@ class ComposerServiceImpl:
         """
         if plugin_snapshot is None or policy_catalog is None:
             plugin_snapshot, policy_catalog = self._policy_context.build(user_id)
+        content_scope = composition_scope_for_operation(
+            state,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            session_operation_authority=self._require_sessions_service().session_operation_authority,
+        )
+        env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id))
+            if self._secret_service is not None and user_id is not None
+            else frozenset()
+        )
         try:
             return build_messages(
                 chat_history=chat_history,
@@ -3231,6 +3246,8 @@ class ComposerServiceImpl:
                 plugin_snapshot=plugin_snapshot,
                 rendered_skill=self._composer_skill_text,
                 schemas_loaded=self._schema_disclosure.schemas_loaded_for_session(session_id),
+                content_scope=content_scope,
+                env_ref_names=env_ref_names,
             )
         except OSError as exc:
             raise ComposerServiceError(f"Failed to load deployment skill ({type(exc).__name__})") from exc

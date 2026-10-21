@@ -14,6 +14,7 @@ from openai import OpenAIError
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
@@ -60,6 +61,7 @@ from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
@@ -319,6 +321,8 @@ class AdvisorCheckpointOwner:
         abandonment_context: AdvisorAbandonmentReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
         current_state: CompositionState | None = None,
+        session_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -350,11 +354,21 @@ class AdvisorCheckpointOwner:
             if current_state is not None:
                 if type(current_state) is not CompositionState:
                     raise TypeError("Advisor hint graph must be the owned current state")
+                if session_id is None or session_operation_context is None:
+                    raise _advisor_context.AdvisorGraphCoverageUnavailable("Advisor graph requires current session authority")
+                content_scope = composition_scope_for_operation(
+                    current_state,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                    session_operation_authority=self._require_sessions_service().session_operation_authority,
+                )
                 summary = _advisor_context.fit_advisor_checkpoint_summary(
                     current_state,
                     internal_request,
                     self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
+                    content_scope=content_scope,
                 )
+                self._require_complete_graph_summary(summary)
                 internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
                 internal_request["_elspeth_advisor_summary_parts"] = summary
             guidance, metadata = await self._call_advisor_with_audit(
@@ -366,7 +380,7 @@ class AdvisorCheckpointOwner:
             )
         except TimeoutError:
             raise
-        except AdvisorAbandonmentContextUnavailable as exc:
+        except (AdvisorAbandonmentContextUnavailable, _advisor_context.AdvisorGraphCoverageUnavailable) as exc:
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except advisor_provider_failure_types() as exc:
             failure = classify_provider_failure(exc)
@@ -735,6 +749,7 @@ class AdvisorCheckpointOwner:
         *,
         phase: AdvisorCheckpointPhase,
         state: CompositionState,
+        content_scope: ComposerContentScope,
         user_message: str | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
@@ -776,7 +791,7 @@ class AdvisorCheckpointOwner:
             }
             if advisor_transcript is not None:
                 early_arguments["advisor_transcript"] = advisor_transcript
-            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap, content_scope=content_scope)
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
@@ -851,10 +866,17 @@ class AdvisorCheckpointOwner:
             end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
-        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap, content_scope=content_scope)
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
+
+    @staticmethod
+    def _require_complete_graph_summary(summary: _advisor_context.AdvisorSummaryParts) -> None:
+        if type(summary) is not _advisor_context.AdvisorSummaryParts or summary.content_manifest is None:
+            raise AuditIntegrityError("Advisor graph review lost its current content manifest")
+        if summary.content_manifest.values:
+            raise _advisor_context.AdvisorGraphCoverageUnavailable("Advisor complete values require explicit resolved coverage")
 
     def _advisor_blocked_result(
         self,
@@ -1334,14 +1356,24 @@ class AdvisorCheckpointOwner:
 
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
         try:
+            if session_id is None or session_operation_context is None:
+                raise _advisor_context.AdvisorGraphCoverageUnavailable("Advisor graph requires current session authority")
+            content_scope = composition_scope_for_operation(
+                state,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                session_operation_authority=self._require_sessions_service().session_operation_authority,
+            )
             arguments = self._build_checkpoint_arguments(
                 phase=phase,
                 state=state,
+                content_scope=content_scope,
                 user_message=user_message,
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
                 advisor_transcript=advisor_transcript,
             )
+            self._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
         except _advisor_context.AdvisorGraphCoverageUnavailable:
             return graph_coverage_withheld()
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
@@ -1368,7 +1400,16 @@ class AdvisorCheckpointOwner:
                 # The format instruction can change rendered budget overhead.
                 # Refit the same complete saved graph, never a fitted prefix.
                 try:
-                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap)
+                    content_scope = composition_scope_for_operation(
+                        state,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        session_operation_authority=self._require_sessions_service().session_operation_authority,
+                    )
+                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+                        state, call_arguments, char_cap, content_scope=content_scope
+                    )
+                    self._require_complete_graph_summary(summary_parts)
                 except _advisor_context.AdvisorGraphCoverageUnavailable:
                     return graph_coverage_withheld()
                 call_arguments = {

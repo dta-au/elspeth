@@ -17,6 +17,7 @@ PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
     "diff_pipeline",
     "explain_validation_error",
     "get_audit_info",
+    "get_complete_pipeline_value",
     "get_expression_grammar",
     "get_pipeline_state",
     "get_plugin_assistance",

@@ -151,6 +151,7 @@ class _Literal(NamedTuple):
 # appear here; the walker refuses an unattributed one.
 _DATA_HELPER_PAYLOADS: dict[str, type | _ListPayload | _Literal | None] = {
     "_blob_create_payload": blobs.BlobCreatePayload,
+    "_encode_complete_pipeline_value_response": _Literal(TOOLS_DIR / "sessions.py", "_encode_complete_pipeline_value_response"),
     "_serialize_full_pipeline_state": common._FullPipelineStatePayload,
     "_serialize_set_pipeline_arguments": _Literal(COMMON, "_serialize_set_pipeline_arguments"),
     "_inventory_item_payload": secrets._SecretInventoryItemPayload,

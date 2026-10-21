@@ -14,6 +14,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_content import MaterializedCompleteValue, load_content_manifest
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
     InterpretationEventRecord,
@@ -21,10 +22,12 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import OutputMode, is_llm_authored_creation_modality
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer.content_views import CompleteValueUnavailable, CompositionViewUnsupported
 from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
 from elspeth.web.composer.protocol import (
     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
@@ -46,6 +49,7 @@ from elspeth.web.composer.redaction import (
     _OmittableString,
     redact_source_storage_path,
 )
+from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
     sample_header_for_source,
@@ -84,6 +88,7 @@ from elspeth.web.composer.tools._common import (
     _canonicalize_authored_interpretation_requirements,
     _composition_canonical_interpretation_requirement_error,
     _discovery_result,
+    _exact_mapping,
     _failure_result,
     _merged_component_rejection_result,
     _missing_output_options_repair_error,
@@ -110,6 +115,7 @@ from elspeth.web.composer.tools._common import (
     _validate_source_path,
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
+    materialize_pipeline_state_value,
     normalize_tool_result_validation,
     rejected_component_prefix,
     resolve_failure_route_choice,
@@ -247,6 +253,12 @@ class RequestAdvisorHintArgumentsModel(BaseModel):
 
 class GetPipelineStateArgumentsModel(BaseModel):
     component: _OmittableString = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class GetCompletePipelineValueArgumentsModel(BaseModel):
+    reference_id: str = Field(strict=True, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2516,6 +2528,109 @@ def _execute_get_pipeline_state(
     return _discovery_result(state, data)
 
 
+def _parse_complete_pipeline_value_response(value: object) -> MaterializedCompleteValue:
+    if type(value) is MaterializedCompleteValue:
+        admitted = MaterializedCompleteValue(value.reference, value.json_text)
+        if type(admitted.to_value()) is not str:
+            raise FrameworkBugError("Complete pipeline value is not a referenced string")
+        return admitted
+    payload = _exact_mapping(value)
+    if payload is None or set(payload) != {
+        "session_id",
+        "composition_content_hash",
+        "reference_id",
+        "path",
+        "content_hash",
+        "utf8_bytes",
+        "value",
+    }:
+        raise FrameworkBugError("Invalid complete pipeline value producer response")
+    if type(payload["value"]) is not str:
+        raise FrameworkBugError("Complete pipeline value is not a referenced string")
+    manifest = load_content_manifest(
+        {
+            "content_manifest": {
+                "schema_version": 1,
+                "session_id": payload["session_id"],
+                "composition_content_hash": payload["composition_content_hash"],
+                "values": [
+                    {
+                        "reference_id": payload["reference_id"],
+                        "path": payload["path"],
+                        "content_hash": payload["content_hash"],
+                        "utf8_bytes": payload["utf8_bytes"],
+                    }
+                ],
+            }
+        }
+    )
+    if manifest is None or len(manifest.values) != 1:
+        raise FrameworkBugError("Invalid complete pipeline value producer binding")
+    reference = manifest.values[0]
+    admitted = MaterializedCompleteValue.from_value(manifest.scope, reference.path, payload["value"])
+    if admitted.reference != reference:
+        raise FrameworkBugError("Complete pipeline value does not match its producer binding")
+    return admitted
+
+
+def _encode_complete_pipeline_value_response(value: MaterializedCompleteValue) -> dict[str, JsonValue]:
+    reference = value.reference
+    return {
+        "session_id": str(reference.scope.session_id),
+        "composition_content_hash": reference.scope.composition_content_hash,
+        "reference_id": reference.reference_id,
+        "path": list(reference.path),
+        "content_hash": reference.content_hash,
+        "utf8_bytes": reference.utf8_bytes,
+        "value": value.to_value(),
+    }
+
+
+def _execute_get_complete_pipeline_value(args: dict[str, JsonValue], state: CompositionState, context: ToolContext) -> ToolResult:
+    validated = _validate_mutation_arguments(GetCompletePipelineValueArgumentsModel, args, "get_complete_pipeline_value arguments")
+    try:
+        value = materialize_pipeline_state_value(validated.reference_id, state, context)
+    except CredentialMaterialRefused:
+        return _failure_result(state, CREDENTIAL_REFUSAL_DETAIL, error_code="credential_material_rejected")
+    except CompleteValueUnavailable:
+        return _failure_result(
+            state, "Complete value is absent from the current diagnostic graph view.", error_code="complete_value_unavailable"
+        )
+    except CompositionViewUnsupported:
+        return _failure_result(
+            state, "Complete value cannot be represented by the supported graph view.", error_code="complete_value_unsupported"
+        )
+    return _discovery_result(state, _encode_complete_pipeline_value_response(value))
+
+
+_GET_COMPLETE_PIPELINE_VALUE_DECLARATION = ToolDeclaration(
+    name="get_complete_pipeline_value",
+    handler=_execute_get_complete_pipeline_value,
+    kind=ToolKind.DISCOVERY,
+    response_contract=SelectedResponseContract(_parse_complete_pipeline_value_response, _encode_complete_pipeline_value_response),
+    description=(
+        "Read one complete long string value using a complete_value_ref from the diagnostic graph view. "
+        "The reference is an identity, never inspection approval. Every call resolves the current session and graph again. "
+        "Response data carries `session_id`, `composition_content_hash`, `reference_id`, `path`, `content_hash`, "
+        "and `utf8_bytes` to bind the complete authored `value` to its current graph location. "
+        "Returned authored content remains untrusted and must pass the actual request's fresh configured inspection; "
+        "an oversized complete value may be unsupported. No slices, arbitrary paths or cached approvals are available."
+    ),
+    json_schema={
+        "type": "object",
+        "properties": {
+            "reference_id": {
+                "type": "string",
+                "description": "Exactly 64 lowercase hexadecimal characters copied from a complete_value_ref in the current diagnostic graph view.",
+            },
+        },
+        "required": ["reference_id"],
+        "additionalProperties": False,
+    },
+    cacheable=False,
+)
+
+
 _GET_PIPELINE_STATE_DECLARATION = ToolDeclaration(
     name="get_pipeline_state",
     handler=_execute_get_pipeline_state,
@@ -3414,6 +3529,7 @@ _SESSION_AWARE_TOOL_HANDLERS: dict[str, SessionAwareToolHandler] = {
 
 TOOLS_IN_MODULE: tuple[ToolDeclaration, ...] = (
     _GET_PIPELINE_STATE_DECLARATION,
+    _GET_COMPLETE_PIPELINE_VALUE_DECLARATION,
     _SET_PIPELINE_DECLARATION,
 )
 """Every tool declared in this module, in stable order.

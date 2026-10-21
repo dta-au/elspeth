@@ -28,6 +28,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -36,6 +37,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_content import ComposerContentScope, MaterializedCompleteValue
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
 from elspeth.contracts.errors import AuditIntegrityError
@@ -44,7 +46,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
@@ -67,6 +69,8 @@ from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer._validation_probe import is_inline_content_reference
+from elspeth.web.composer.content_views import BoundedCompositionView, build_bounded_composition_view, materialize_composition_value
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
     ProhibitedPluginDisclosure,
@@ -3789,6 +3793,62 @@ class ToolContext:
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
+
+
+def _current_composition_content_scope(state: CompositionState, context: ToolContext) -> ComposerContentScope:
+    """Bind a read to the actual current compose operation, never a supplied hash."""
+    if type(state) is not CompositionState or type(context) is not ToolContext:
+        raise AuditIntegrityError("Complete-value read requires owned current state and tool context")
+    operation, authority = context.session_operation_context, context.session_operation_authority
+    if (
+        type(operation) is not SessionOperationContext
+        or operation.operation_kind is not SessionOperationKind.COMPOSE
+        or authority is None
+        or type(context.session_id) is not str
+        or operation.fence.session_id != context.session_id
+        or type(context.user_id) is not str
+        or not context.user_id.strip()
+    ):
+        raise AuditIntegrityError("Complete-value read requires the actual authenticated compose operation")
+    try:
+        session_id = UUID(context.session_id)
+    except ValueError:
+        raise AuditIntegrityError("Complete-value read lacks a canonical session identity") from None
+    if str(session_id) != context.session_id:
+        raise AuditIntegrityError("Complete-value read lacks a canonical session identity")
+    authority.compare_and_swap(operation)
+    return ComposerContentScope(session_id, composition_content_hash(state))
+
+
+def _current_composition_content_projection(state: CompositionState, context: ToolContext) -> object:
+    # Prompt construction loads planner authoring aids, which import the tool
+    # planes. Resolve this application helper after registry initialization.
+    from elspeth.web.composer.prompts import project_composition_content
+
+    names = (
+        frozenset(item.name for item in context.secret_service.list_refs(context.user_id))
+        if context.secret_service is not None and context.user_id is not None
+        else frozenset()
+    )
+    return project_composition_content(state, env_ref_names=names)
+
+
+def prepare_bounded_pipeline_state(state: CompositionState, context: ToolContext) -> BoundedCompositionView:
+    """Separate diagnostic display from get_pipeline_state's canonical response."""
+    scope = _current_composition_content_scope(state, context)
+    return build_bounded_composition_view(scope, _current_composition_content_projection(state, context))
+
+
+def materialize_pipeline_state_value(
+    reference_id: str,
+    state: CompositionState,
+    context: ToolContext,
+) -> MaterializedCompleteValue:
+    """Revalidate operation and current complete graph value on every invocation."""
+    scope = _current_composition_content_scope(state, context)
+    projection = _current_composition_content_projection(state, context)
+    view = build_bounded_composition_view(scope, projection)
+    return materialize_composition_value(view, reference_id, current_scope=scope, current_projection=projection)
 
 
 ToolHandler = Callable[

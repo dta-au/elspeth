@@ -3834,6 +3834,15 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
             )
         ),
+        "get_complete_pipeline_value": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("reference_id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=False,
+                sensitive_response_keys=("data",),
+                known_response_keys=_tool_result_response_keys(data=True),
+            )
+        ),
         "preview_pipeline": ToolRedaction(
             policy=ToolRedactionPolicy(
                 redact_unknown_argument_keys=True,

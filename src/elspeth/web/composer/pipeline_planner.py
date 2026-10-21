@@ -172,6 +172,7 @@ from elspeth.web.composer.tools._common import (
     RuntimePreflight,
     ToolContext,
     ToolResult,
+    prepare_bounded_pipeline_state,
 )
 from elspeth.web.composer.tools._dispatch import _schema_violation_loc, execute_discovery_tool_with_context
 from elspeth.web.composer.tools._generation_schema_response import AdmittedPluginSchemaResponse
@@ -3464,9 +3465,10 @@ async def _plan_pipeline_inner(
         canonical_bytes_used=schema_contract_evidence["canonical_bytes_used"],
         schemas=schema_contract_evidence["schemas"],
     )
+    bounded_state = await run_planner_sync(prepare_bounded_pipeline_state, current_state, request_context)
     provider_request: dict[str, Any] = {
         "intent": intent,
-        "current_state": provider_current_state,
+        "current_state": json.loads(bounded_state.serialized),
         "schema_contract_evidence": {
             "omitted": schema_contract_evidence["omitted"],
             "omissions_withheld_count": schema_contract_evidence["omissions_withheld_count"],

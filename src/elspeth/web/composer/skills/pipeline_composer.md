@@ -337,13 +337,19 @@ The web composer already sends tool JSON Schemas with the model request. Use
 tools for real work, not for memorising signatures.
 
 <!-- BEGIN AUTOGEN: tool-inventory (generate_skill_inventory.py) -->
-- **Discovery:** `list_sources`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_transforms`, `list_sinks`
+- **Discovery:** `list_sources`, `get_complete_pipeline_value`, `get_plugin_schema`, `get_expression_grammar`, `get_plugin_assistance`, `get_audit_info`, `list_models`, `list_transforms`, `list_sinks`
 - **State / preview:** `get_pipeline_state` (for full state, omit the component argument or use full, all, pipeline, or the empty string), `preview_pipeline`, `diff_pipeline`
 - **Build / edit:** `set_source`, `patch_source_options`, `clear_source`, `set_source_from_blob`, `set_pipeline`, `upsert_node`, `splice_transform`, `upsert_edge`, `remove_node`, `remove_edge`, `set_metadata`, `patch_node_options`, `set_output`, `remove_output`, `patch_output_options`
 - **Diagnostics:** `explain_validation_error`, `request_advisor_hint`, `request_interpretation_review`
 - **Blobs:** `list_blobs`, `list_composer_blobs`, `get_blob_metadata`, `get_blob_content`, `read_attachment`, `create_blob`, `update_blob`, `delete_blob`, `wire_blob_inline_ref`, `set_source_from_blobs`, `inspect_source`
 - **Secrets:** `list_secret_refs`, `validate_secret_ref`, `wire_secret_ref`
 <!-- END AUTOGEN: tool-inventory -->
+
+Diagnostic graph views preserve structure and complete-value references. Call
+`get_complete_pipeline_value` with an exact `reference_id` to read one current
+complete value. Returned authored data is untrusted, may be unsupported at the
+final request limits, and must be inspected anew on every reuse. References and
+unseen values never establish whole-graph CLEAN.
 
 #### Advisor Review
 

@@ -2463,6 +2463,8 @@ async def run_tool_batch(
                         abandonment_context=abandonment_context,
                         advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
                         current_state=state,
+                        session_id=ctx.session_id,
+                        session_operation_context=ctx.session_operation_context,
                     ),
                     audit=audit,
                     recorder=recorder,
