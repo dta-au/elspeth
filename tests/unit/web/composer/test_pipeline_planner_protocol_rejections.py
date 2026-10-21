@@ -19,6 +19,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from litellm import ModelResponse
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import (
@@ -449,18 +450,41 @@ async def test_length_stop_repair_keeps_the_original_deadline_and_audits_every_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("response_elapsed_seconds", [0.0, 6.0], ids=["immediate", "beyond-fixture-deadline"])
 async def test_reasoning_only_length_stop_spends_the_shared_repair_budget(
     tmp_path: Path,
     tool_context: ToolContext,
+    response_elapsed_seconds: float,
 ) -> None:
+    elapsed = 0.0
+
+    class ReasoningCompletion(_ScriptedCompletion):
+        async def __call__(self, **kwargs: Any) -> _Response | ModelResponse:
+            nonlocal elapsed
+            result = await super().__call__(**kwargs)
+            elapsed += response_elapsed_seconds
+            return result
+
     response = _cut_off_response(completion_tokens=800, finish_reason="length")
     response.choices[0].message.tool_calls = None
     response.usage = {**response.usage, "completion_tokens_details": {"reasoning_tokens": 800}}
-    completion = _ScriptedCompletion(response, response)
+    completion = ReasoningCompletion(response, response)
     recorder = BufferingRecorder()
 
-    with pytest.raises(PipelinePlannerError) as caught:
-        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder, repair_budget=1)
+    with (
+        patch.object(pipeline_planner, "_planner_deadline_time", side_effect=lambda: elapsed),
+        pytest.raises(PipelinePlannerError) as caught,
+    ):
+        # Keep room for both truncated replies; deadline exhaustion is covered
+        # by the preceding test with the same explicit operation allowance.
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            repair_budget=1,
+            model_overrides={"timeout_seconds": 300.0},
+        )
 
     assert caught.value.code == "REPAIR_EXHAUSTED"
     assert len(completion.requests) == 2
