@@ -195,6 +195,14 @@ and SDK artifact qualification are still required before this transport can
 serve key-bearing signing. Real signing remains disabled pending the on-prem
 migration and qualification of the operator boundary.
 
+The legacy `scripts/cicd/regen_fingerprint_baseline.py` command also refuses
+execution, including its `--env-file` and `--commit` forms. It loads no key and
+runs no checkout capture code, tests, or Git callbacks. Automatic regeneration
+after signing or rekey is already removed. Baseline regeneration still requires
+a signed enforce result bound to the current source and allowlist; a protected
+verifier is pending. Shape-only checks or a caller's asserted gate result do not
+authorize regeneration.
+
 Run these only in an operator-controlled shell that holds
 `ELSPETH_JUDGE_METADATA_HMAC_KEY`. The Codex transport authenticates from the
 installed CLI account and does not need a provider API key in that shell. Both
