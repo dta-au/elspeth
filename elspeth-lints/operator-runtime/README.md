@@ -34,6 +34,26 @@ symlinks and traversal, and inventories the resulting artifact. Run its `--help`
 for source packaging arguments. This prepares bytes for review; it does not
 authenticate a supplied wheel, install a dependency closure or qualify an SDK.
 
+`build_release.py` prepares a complete offline release from an independently
+digest-bound catalog and locally supplied native launcher, signer image, judge
+supervisor, three judge worker images, baseline supervisor and baseline worker.
+Every image needs a complete manifest and ordinary symlink-free archive; flatten
+platform links in a separately reviewed preparation environment. The builder
+does not acquire artifacts, resolve packages or execute supplied code. It checks
+declared ELF dependencies and records exact host interpreter/stdlib/loader/Git
+prerequisites. Static checks cannot establish dynamic-import or native closure,
+SDK behavior or target-host compatibility.
+
+The key-free `install_release.py verify` and `stage` commands require an
+independently supplied release SHA-256; `stage --root` writes only a fresh fixture
+tree. Admissions and service units use `.pending` destinations, so checksum
+verification does not activate a profile. The future root `install` implementation
+also requires existing explicit numeric principals and protected matching host
+prerequisites. It refuses existing destinations and never downloads, provisions
+accounts, replaces host `/usr`, starts/reloads/enables services or enrolls provider
+credentials. Installation, directory ownership changes, activation and actual
+artifact qualification have not been exercised by this source work.
+
 The installed runtime also needs a private `/run/elspeth/operator` directory
 with protected ancestors and an operator-owned mode-0700 leaf. Git observation
 uses that directory rather than ambient `TMPDIR`. It copies bounded regular Git

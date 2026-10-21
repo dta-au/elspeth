@@ -158,6 +158,11 @@ def _read_manifest(artifact_root: Path) -> tuple[bytes, dict[str, object]]:
     validate_protected_path(manifest_path)
     with manifest_path.open("rb") as stream:
         raw = stream.read(_MAX_MANIFEST_BYTES + 1)
+    return raw, parse_runtime_manifest(raw)
+
+
+def parse_runtime_manifest(raw: bytes) -> dict[str, object]:
+    """Parse exact artifact data without asserting installed filesystem custody."""
     if len(raw) > _MAX_MANIFEST_BYTES:
         raise OperatorRuntimeUnavailableError("runtime manifest exceeds size limit")
     try:
@@ -174,16 +179,9 @@ def _read_manifest(artifact_root: Path) -> tuple[bytes, dict[str, object]]:
             raise OperatorRuntimeUnavailableError("invalid runtime principal")
     if value["operator_uid"] == value["candidate_uid"]:
         raise OperatorRuntimeUnavailableError("operator and candidate principals must differ")
-    return raw, value
-
-
-def validate_artifact_manifest(artifact_root: Path) -> str:
-    """Check the exact protected artifact inventory and return manifest SHA256."""
-    raw, manifest = _read_manifest(artifact_root)
-    files = manifest["files"]
+    files = value["files"]
     if not isinstance(files, dict) or not files or len(files) > 65_536:
         raise OperatorRuntimeUnavailableError("invalid runtime artifact inventory")
-    expected: set[str] = set()
     for relative, digest in files.items():
         if not isinstance(relative, str) or not isinstance(digest, str):
             raise OperatorRuntimeUnavailableError("invalid runtime artifact inventory entry")
@@ -198,7 +196,16 @@ def validate_artifact_manifest(artifact_root: Path) -> str:
             or any(character not in "0123456789abcdef" for character in digest)
         ):
             raise OperatorRuntimeUnavailableError("invalid runtime artifact inventory entry")
-        expected.add(relative)
+    return value
+
+
+def validate_artifact_manifest(artifact_root: Path) -> str:
+    """Check the exact protected artifact inventory and return manifest SHA256."""
+    raw, manifest = _read_manifest(artifact_root)
+    files = manifest["files"]
+    if not isinstance(files, dict):
+        raise OperatorRuntimeUnavailableError("invalid runtime artifact inventory")
+    expected = set(files)
     observed: set[str] = set()
     for parent, directories, filenames in os.walk(artifact_root, followlinks=False):
         directory = Path(parent)
