@@ -291,6 +291,126 @@ def test_synthetic_protected_checkout_passes_custody_policy(baseline_repo: Path,
     _PRODUCTION_CUSTODY(baseline_repo)
 
 
+@pytest.fixture
+def custody_metadata(monkeypatch: pytest.MonkeyPatch) -> dict[Path, tuple[int, int]]:
+    """Model protected ancestry while preserving individually unsafe entries."""
+    import os
+    import stat
+
+    real_lstat = Path.lstat
+    entries: dict[Path, tuple[int, int]] = {}
+
+    def metadata(path: Path) -> os.stat_result:
+        actual = real_lstat(path)
+        values = list(actual)
+        values[0] &= ~0o022
+        values[4] = 0
+        if path in entries:
+            owner, permissions = entries[path]
+            values[0] = stat.S_IFMT(actual.st_mode) | permissions
+            values[4] = owner
+        return os.stat_result(values)
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    return entries
+
+
+@pytest.mark.parametrize("owner,permissions", [(2002, 0o755), (0, 0o775), (0, 0o757)])
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_individually_unsafe_source_directory_refuses_custody(
+    baseline_repo: Path, custody_metadata: dict[Path, tuple[int, int]], owner: int, permissions: int, nonempty: bool
+) -> None:
+    directory = baseline_repo / "src/elspeth/new_area"
+    directory.mkdir()
+    if nonempty:
+        (directory / "existing.py").write_text("value = 2\n")
+    custody_metadata[directory] = (owner, permissions)
+    with pytest.raises(baseline_generation.BaselineGenerationError, match="custody"):
+        _PRODUCTION_CUSTODY(baseline_repo)
+
+
+def test_protected_empty_source_directory_preserves_file_snapshot_and_publication(
+    baseline_repo: Path, custody_metadata: dict[Path, tuple[int, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = baseline_generation.freeze_inputs(baseline_repo)
+    directory = baseline_repo / "src/elspeth/new_area"
+    directory.mkdir()
+    custody_metadata[directory] = (0, 0o755)
+    assert baseline_generation.freeze_inputs(baseline_repo) == before
+    _PRODUCTION_CUSTODY(baseline_repo)
+    monkeypatch.setattr(baseline_generation, "require_publication_custody", _PRODUCTION_CUSTODY)
+    _accept_scans(monkeypatch, [])
+    monkeypatch.setattr(baseline_generation, "run_capture", lambda **_kwargs: None)
+    baseline_generation.regenerate(baseline_repo)
+    assert (baseline_repo / baseline_generation.BASELINE_PATH).read_text() == '{\n  "test.rule": []\n}\n'
+    assert list(directory.iterdir()) == []
+
+
+@pytest.mark.parametrize("include_directories", [False, True])
+def test_directory_custody_census_retains_the_existing_file_limit(
+    baseline_repo: Path, monkeypatch: pytest.MonkeyPatch, include_directories: bool
+) -> None:
+    files = baseline_generation._census(baseline_repo, ignored=frozenset())
+    monkeypatch.setattr(baseline_generation, "_MAX_FILES", len(files))
+    directory = baseline_repo / "src/elspeth/new_area"
+    directory.mkdir()
+    observed = baseline_generation._census(baseline_repo, ignored=frozenset(), include_directories=include_directories)
+    assert files <= observed
+    assert ("src/elspeth/new_area" in observed) == include_directories
+    (directory / "exceeds_file_limit.py").write_text("value = 2\n")
+    with pytest.raises(baseline_generation.BaselineGenerationError, match="census exceeds"):
+        baseline_generation._census(baseline_repo, ignored=frozenset(), include_directories=include_directories)
+
+
+@pytest.mark.parametrize("unsafe_at", ["entry", "after-worker"])
+@pytest.mark.parametrize("owner,permissions", [(2002, 0o755), (0, 0o775)])
+def test_empty_directory_custody_prevents_final_check_insertion_and_preserves_baseline(
+    baseline_repo: Path,
+    custody_metadata: dict[Path, tuple[int, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_at: str,
+    owner: int,
+    permissions: int,
+) -> None:
+    import stat
+
+    directory = baseline_repo / "src/elspeth/new_area"
+    directory.mkdir()
+    custody_metadata[directory] = (owner, permissions) if unsafe_at == "entry" else (0, 0o755)
+    target = baseline_repo / baseline_generation.BASELINE_PATH
+    target.chmod(0o640)
+    original = target.read_bytes()
+    inserted = directory / "candidate_added.py"
+    boundary_calls: list[str] = []
+    worker_calls: list[str] = []
+    unchanged = baseline_generation._unchanged
+    monkeypatch.setattr(baseline_generation, "require_publication_custody", _PRODUCTION_CUSTODY)
+    _accept_scans(monkeypatch, [])
+
+    def worker(**_kwargs: object) -> None:
+        worker_calls.append("worker")
+        custody_metadata[directory] = (owner, permissions)
+
+    def insert_after_last_check(root: Path, frozen: baseline_generation.FrozenInputs, *, ignored: frozenset[str] = frozenset()) -> None:
+        unchanged(root, frozen, ignored=ignored)
+        if ignored:
+            # This is _publish's final input check, after its temporary exists
+            # and before os.replace. The old custody check admits this writer.
+            boundary_calls.append("insertion")
+            inserted.write_text("value = 'inserted after final snapshot check'\n")
+
+    monkeypatch.setattr(baseline_generation, "run_capture", worker)
+    monkeypatch.setattr(baseline_generation, "_unchanged", insert_after_last_check)
+    with pytest.raises(baseline_generation.BaselineGenerationError, match="custody"):
+        baseline_generation.regenerate(baseline_repo)
+    assert boundary_calls == []
+    assert worker_calls == ([] if unsafe_at == "entry" else ["worker"])
+    assert not inserted.exists()
+    assert target.read_bytes() == original
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert sorted(path.name for path in target.parent.iterdir()) == [target.name]
+
+
 def test_note_observations_remain_in_capture_and_do_not_turn_gate_red(baseline_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import json
 

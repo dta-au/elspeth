@@ -98,7 +98,7 @@ def require_publication_custody(root: Path) -> None:
                 raise BaselineGenerationError("publication metadata symlink is unsupported")
 
     protected(root)
-    for relative in _census(root, ignored=frozenset()):
+    for relative in _census(root, ignored=frozenset(), include_directories=True):
         protected(root / relative, link=True)
     with TrustedGitRepository(root) as repository:
         marker = root / ".git"
@@ -143,11 +143,12 @@ def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
-def _census(root: Path, *, ignored: frozenset[str]) -> set[str]:
-    """Enumerate every non-cache input, without following directory symlinks."""
+def _census(root: Path, *, ignored: frozenset[str], include_directories: bool = False) -> set[str]:
+    """Enumerate non-cache inputs, including empty directories for custody."""
     paths: set[str] = set()
     pending = [Path()]
     visited = 0
+    files = 0
     while pending:
         relative = pending.pop()
         descriptor = _open_directory(root / relative)
@@ -165,9 +166,12 @@ def _census(root: Path, *, ignored: frozenset[str]) -> set[str]:
                         continue
                     if child.is_dir(follow_symlinks=False):
                         pending.append(path)
+                        if include_directories:
+                            paths.add(path.as_posix())
                     else:
                         paths.add(path.as_posix())
-                        if len(paths) > _MAX_FILES:
+                        files += 1
+                        if files > _MAX_FILES:
                             raise BaselineGenerationError("repository input census exceeds its bound")
         finally:
             os.close(descriptor)
