@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from unittest.mock import Mock
+from unittest.mock import create_autospec
 
 import pytest
 from scripts.cicd import regen_fingerprint_baseline
@@ -23,7 +23,7 @@ def test_editable_regeneration_refuses_before_repository_callbacks(
     else:
         monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", signing_key)
     monkeypatch.setattr(sys, "argv", ["regen_fingerprint_baseline.py", *options])
-    run = Mock(side_effect=AssertionError("disabled maintenance must not execute subprocesses"))
+    run = create_autospec(subprocess.run, spec_set=True, side_effect=AssertionError("disabled maintenance must not execute subprocesses"))
     monkeypatch.setattr(subprocess, "run", run)
 
     with pytest.raises(SystemExit) as exc_info:

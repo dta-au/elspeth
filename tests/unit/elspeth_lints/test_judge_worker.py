@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
@@ -10,7 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
@@ -25,8 +26,8 @@ def test_every_production_transport_uses_worker_client(monkeypatch: pytest.Monke
         10,
         None,
     )
-    worker = Mock(return_value=observed)
-    forbidden = Mock(side_effect=AssertionError("provider executed in signer"))
+    worker = create_autospec(judge_rpc.call_worker, spec_set=True, return_value=observed)
+    forbidden = create_autospec(judge._TRANSPORTS[transport], spec_set=True, side_effect=AssertionError("provider executed in signer"))
     monkeypatch.setattr(judge_rpc, "call_worker", worker)
     monkeypatch.setitem(judge._TRANSPORTS, transport, forbidden)
     request = judge.JudgeRequest("module.py", "R1", "Widget.lookup", "abc", "Boundary", "code")
@@ -40,8 +41,10 @@ def test_every_production_transport_uses_worker_client(monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("transport", [judge.TRANSPORT_OPENROUTER, judge.TRANSPORT_AGENT, judge.TRANSPORT_CODEX_CLI])
 def test_missing_supervisor_never_falls_back(monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
-    worker = Mock(side_effect=judge.JudgeConfigurationError("protected worker unavailable"))
-    forbidden = Mock(side_effect=AssertionError("provider executed in signer"))
+    worker = create_autospec(
+        judge_rpc.call_worker, spec_set=True, side_effect=judge.JudgeConfigurationError("protected worker unavailable")
+    )
+    forbidden = create_autospec(judge._TRANSPORTS[transport], spec_set=True, side_effect=AssertionError("provider executed in signer"))
     monkeypatch.setattr(judge_rpc, "call_worker", worker)
     monkeypatch.setitem(judge._TRANSPORTS, transport, forbidden)
     request = judge.JudgeRequest("module.py", "R1", "Widget.lookup", "abc", "Boundary", "code")
@@ -51,12 +54,16 @@ def test_missing_supervisor_never_falls_back(monkeypatch: pytest.MonkeyPatch, tr
 
 
 def test_explicit_fake_transport_retains_existing_test_seam(monkeypatch: pytest.MonkeyPatch) -> None:
-    forbidden = Mock(side_effect=AssertionError("production RPC reached by explicit test seam"))
+    forbidden = create_autospec(
+        judge_rpc.call_worker, spec_set=True, side_effect=AssertionError("production RPC reached by explicit test seam")
+    )
     monkeypatch.setattr(judge_rpc, "call_worker", forbidden)
-    fake = Mock(
+    fake = create_autospec(
+        judge._call_openrouter,
+        spec_set=True,
         return_value=judge._TransportResult(
             '{"verdict":"BLOCKED","rationale":"Wrong","confidence":0.1,"should_use_decorator":null}', "fake", 0, 0
-        )
+        ),
     )
     request = judge.JudgeRequest("module.py", "R1", "Widget.lookup", "abc", "Boundary", "code")
     result = judge.call_judge(request, transport_impl=fake)
@@ -74,7 +81,7 @@ def test_explicit_fake_transport_retains_existing_test_seam(monkeypatch: pytest.
 )
 def test_owned_verdict_parser_rejects_ambiguous_json(raw: str) -> None:
     request = judge.JudgeRequest("module.py", "R1", "Widget.lookup", "abc", "Boundary", "code")
-    fake = Mock(return_value=judge._TransportResult(raw, "fake", 0, None))
+    fake = create_autospec(judge._call_openrouter, spec_set=True, return_value=judge._TransportResult(raw, "fake", 0, None))
     with pytest.raises(judge.JudgeContractError):
         judge.call_judge(request, transport_impl=fake)
 
@@ -134,15 +141,17 @@ def test_supervisor_reaps_and_confirms_unit_death_before_returning_error(monkeyp
     events: list[str] = []
     process = Mock(spec=subprocess.Popen)
     process.poll.return_value = None
-    process.stdin = Mock()
-    process.stdout = Mock()
+    process.stdin = Mock(spec_set=io.BufferedWriter)
+    process.stdout = Mock(spec_set=io.BufferedReader)
     process.kill.side_effect = lambda: events.append("kill")
     process.wait.side_effect = lambda **_kwargs: events.append("wait")
     monkeypatch.setattr(judge_supervisor, "materialize_snapshot", lambda *_args: Path("/run/elspeth-judge/evidence/call"))
     monkeypatch.setattr(judge_supervisor, "_check_startup", lambda *_args: None)
     monkeypatch.setattr(judge_supervisor, "validate_artifact_manifest", lambda _path: "a" * 64)
     monkeypatch.setattr(judge_supervisor.subprocess, "Popen", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(judge_supervisor, "_exchange_process", Mock(side_effect=failure))
+    monkeypatch.setattr(
+        judge_supervisor, "_exchange_process", create_autospec(judge_supervisor._exchange_process, spec_set=True, side_effect=failure)
+    )
     monkeypatch.setattr(judge_supervisor, "stop_unit", lambda _unit: events.append("unit-stop"))
     monkeypatch.setattr(judge_supervisor, "ensure_unit_dead", lambda _unit, **_kwargs: events.append("unit-dead"))
     monkeypatch.setattr(judge_supervisor, "remove_snapshot", lambda _path: events.append("snapshot-removed"))
@@ -160,15 +169,19 @@ def test_complete_observation_is_refused_if_unit_death_cannot_be_confirmed(monke
     process = Mock(spec=subprocess.Popen)
     process.poll.return_value = 0
     process.returncode = 0
-    process.stdin = Mock()
-    process.stdout = Mock()
+    process.stdin = Mock(spec_set=io.BufferedWriter)
+    process.stdout = Mock(spec_set=io.BufferedReader)
     monkeypatch.setattr(judge_supervisor, "materialize_snapshot", lambda *_args: Path("/run/elspeth-judge/evidence/call"))
     monkeypatch.setattr(judge_supervisor, "_check_startup", lambda *_args: None)
     monkeypatch.setattr(judge_supervisor, "validate_artifact_manifest", lambda _path: "a" * 64)
     monkeypatch.setattr(judge_supervisor.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(judge_supervisor, "_exchange_process", lambda *_args: judge_rpc.frame_bytes(reply))
     monkeypatch.setattr(judge_supervisor, "stop_unit", lambda _unit: None)
-    monkeypatch.setattr(judge_supervisor, "ensure_unit_dead", Mock(side_effect=judge.JudgeTransportError("still alive")))
+    monkeypatch.setattr(
+        judge_supervisor,
+        "ensure_unit_dead",
+        create_autospec(judge_supervisor.ensure_unit_dead, spec_set=True, side_effect=judge.JudgeTransportError("still alive")),
+    )
     monkeypatch.setattr(judge_supervisor, "remove_snapshot", lambda _path: None)
     assert judge_supervisor.run_worker(request, Mock(spec=socket.socket), _profile())["status"] == "error"
     process.wait.assert_called_once_with(timeout=5)
@@ -222,7 +235,9 @@ def test_nonroot_preview_authenticates_root_peer_when_kernel_hides_proc(monkeypa
     admission = judge_rpc.SupervisorAdmission(
         judge_rpc.SUPERVISOR_IMAGE, "a" * 64, judge_rpc.SUPERVISOR_IMAGE / "usr/bin/python3", "b" * 64, (os.getuid(),), {}
     )
-    monkeypatch.setattr(judge_rpc.os, "readlink", Mock(side_effect=PermissionError("kernel hides root process")))
+    monkeypatch.setattr(
+        judge_rpc.os, "readlink", create_autospec(os.readlink, spec_set=True, side_effect=PermissionError("kernel hides root process"))
+    )
     judge_rpc.authenticate_supervisor(channel, admission)
 
 
@@ -260,7 +275,7 @@ def test_unit_collected_state_requires_reaped_launcher_and_absent_kernel_cgroup(
     monkeypatch.setattr(judge_supervisor, "_systemctl", lambda *_args: subprocess.CompletedProcess([], 1, status))
     monkeypatch.setattr(Path, "is_file", lambda _path: True)
     monkeypatch.setattr(Path, "is_dir", lambda _path: True)
-    monkeypatch.setattr(Path, "read_text", Mock(side_effect=FileNotFoundError()))
+    monkeypatch.setattr(Path, "read_text", create_autospec(Path.read_text, spec_set=True, side_effect=FileNotFoundError()))
     unit = "elspeth-judge-" + "a" * 32 + ".service"
     with pytest.raises(judge.JudgeTransportError, match="launcher"):
         judge_supervisor.ensure_unit_dead(unit, launcher_reaped=False)
@@ -285,7 +300,7 @@ def test_installed_operator_runtime_cannot_inject_callable_transport(monkeypatch
     from elspeth_lints.core import operator_runtime
 
     monkeypatch.setattr(operator_runtime, "current_operator_runtime", lambda: object())
-    injected = Mock(side_effect=AssertionError("in-process transport executed"))
+    injected = create_autospec(judge._call_openrouter, spec_set=True, side_effect=AssertionError("in-process transport executed"))
     with pytest.raises(judge.JudgeConfigurationError, match="cannot inject"):
         judge.call_judge(judge.JudgeRequest("x.py", "R1", "x", "abc", "Reason", "code"), transport_impl=injected)
     injected.assert_not_called()

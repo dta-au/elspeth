@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
@@ -116,7 +117,7 @@ def test_real_xfail_drift_cannot_be_reported_as_success_under_runxfail(tmp_path:
 def test_lying_capture_is_rejected_before_confirmation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker, "admit_worker", lambda _request: None)
     monkeypatch.setitem(worker._CHILD_ENV, "HOME", str(tmp_path / "home"))
-    run = Mock(return_value=rpc.canonical_json({"demo.rule": []}))
+    run = create_autospec(worker.run_child, spec_set=True, return_value=rpc.canonical_json({"demo.rule": []}))
     monkeypatch.setattr(worker, "run_child", run)
     with pytest.raises(JudgeContractError, match="independently"):
         worker.execute(_request())
@@ -173,8 +174,8 @@ def test_worker_terminal_is_refused_unless_supervisor_confirms_death(monkeypatch
     request = _request()
     events: list[str] = []
     process = Mock(spec=subprocess.Popen)
-    process.stdin = Mock()
-    process.stdout = Mock()
+    process.stdin = Mock(spec_set=io.BufferedWriter)
+    process.stdout = Mock(spec_set=io.BufferedReader)
     process.poll.return_value = 0
     process.returncode = 0
     process.wait.side_effect = lambda **_kwargs: events.append("reaped")
@@ -186,7 +187,11 @@ def test_worker_terminal_is_refused_unless_supervisor_confirms_death(monkeypatch
     monkeypatch.setattr(supervisor.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(supervisor, "exchange_process", lambda *_args: rpc.frame_bytes(reply))
     monkeypatch.setattr(supervisor, "stop_unit", lambda _unit: events.append("stopped"))
-    monkeypatch.setattr(supervisor, "ensure_unit_dead", Mock(side_effect=JudgeTransportError("not dead")))
+    monkeypatch.setattr(
+        supervisor,
+        "ensure_unit_dead",
+        create_autospec(supervisor.ensure_unit_dead, spec_set=True, side_effect=JudgeTransportError("not dead")),
+    )
     monkeypatch.setattr(supervisor, "remove_snapshot", lambda _path: events.append("removed"))
     result = supervisor.run_worker(request, _admission(), Mock(spec=socket.socket))
     assert result["status"] == "error"
