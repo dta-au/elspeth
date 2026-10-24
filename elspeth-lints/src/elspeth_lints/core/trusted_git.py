@@ -105,6 +105,20 @@ def _optional_file(path: Path, *, limit: int = _FILE_LIMIT) -> bytes | None:
         raise SourceSnapshotError(f"cannot read Git metadata without symbolic links: {path}") from exc
 
 
+def _beyond_non_directory(root: Path, directory: Path) -> bool:
+    """Whether a component from root down to directory is not a real directory now."""
+    current = root
+    for part in directory.relative_to(root).parts:
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(mode):
+            return True
+    return False
+
+
 def _working_entry(path: Path) -> tuple[bytes, str] | None:
     parent = _open_directory(path.parent)
     try:
@@ -518,12 +532,22 @@ class TrustedGitRepository:
         return result
 
     def require_untransformed(self, paths: tuple[str, ...], entries: dict[str, GitEntry]) -> None:
-        attributes = {self.repo_root / ".gitattributes", self._common_dir / "info" / "attributes"}
+        fixed = {self.repo_root / ".gitattributes", self._common_dir / "info" / "attributes"}
+        attributes = set(fixed)
         for relative in paths:
             path = self.repo_root / relative
             attributes.update(parent / ".gitattributes" for parent in path.parents if parent.is_relative_to(self.repo_root))
         for path in attributes:
-            payload = _optional_file(path)
+            try:
+                payload = _optional_file(path)
+            except SourceSnapshotError:
+                # A per-directory file under a baseline-only parent that is now a
+                # symlink or a file is one Git never reads. The fixed locations
+                # always refuse. Ancestry is checked after the failed read, so a
+                # directory swapped back in re-raises rather than skipping.
+                if path in fixed or not _beyond_non_directory(self.repo_root, path.parent):
+                    raise
+                payload = None
             if payload is not None and any(line.strip() and not line.lstrip().startswith(b"#") for line in payload.splitlines()):
                 raise SourceSnapshotError("Git attributes are unsupported for raw source observation")
             if path.is_relative_to(self.repo_root):

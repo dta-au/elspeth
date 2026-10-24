@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -160,3 +161,64 @@ def test_protected_runtime_uses_validated_scratch_instead_of_ambient_tmpdir(tmp_
     monkeypatch.setenv("TMPDIR", str(tmp_path / "candidate-scratch"))
     with TrustedGitRepository(repo) as observed:
         assert observed.private.parent == scratch
+
+
+def _commit_all(repo: Path, message: str) -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=Observer", "-c", "user.email=observer@example.invalid", "commit", "-qm", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _replace_directory(repo: Path, kind: str) -> str:
+    (repo / "real").mkdir()
+    (repo / "real" / "y.py").write_bytes(b"y\n")
+    (repo / "d").mkdir()
+    (repo / "d" / "x.py").write_bytes(b"x\n")
+    baseline = _commit_all(repo, "directory")
+    (repo / "d" / "x.py").unlink()
+    (repo / "d").rmdir()
+    if kind == "symlink":
+        os.symlink("real", repo / "d")
+    else:
+        (repo / "d").write_bytes(b"now a file\n")
+    _commit_all(repo, "replace directory")
+    return baseline
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file"])
+def test_changed_paths_survive_a_baseline_directory_replaced_by_a_non_directory(tmp_path: Path, kind: str) -> None:
+    # Git never reads d/.gitattributes once d is a symlink or a file, so the
+    # attribute probe for the baseline-only path d/x.py must not abort.
+    repo = _repo(tmp_path)
+    baseline = _replace_directory(repo, kind)
+    expected = tuple(_git(repo, "diff", "--name-only", "--diff-filter=ACMR", baseline, "--").splitlines())
+    with TrustedGitRepository(repo) as observed:
+        assert observed.changed_worktree_paths(baseline) == expected == ("d",)
+
+
+def test_attributes_beyond_a_replaced_directory_are_still_read_at_their_real_path(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    baseline = _replace_directory(repo, "symlink")
+    (repo / "real" / ".gitattributes").write_bytes(b"*.py filter=candidate\n")
+    with TrustedGitRepository(repo) as observed, pytest.raises(SourceSnapshotError, match="attributes are unsupported"):
+        observed.changed_worktree_paths(baseline)
+
+
+def test_symlinked_attributes_file_in_a_real_directory_still_refuses(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / "elsewhere").write_bytes(b"*.py filter=candidate\n")
+    os.symlink("../elsewhere", repo / "source" / ".gitattributes")
+    with TrustedGitRepository(repo) as observed, pytest.raises(SourceSnapshotError, match="without symbolic links"):
+        observed.changed_worktree_paths(_git(repo, "rev-parse", "HEAD"))
+
+
+def test_symlinked_repository_info_attributes_still_refuse(tmp_path: Path) -> None:
+    # $GIT_DIR/info/attributes is read through a symlinked info directory, so
+    # the replaced-directory exemption must never cover the fixed locations.
+    repo = _repo(tmp_path)
+    shutil.rmtree(repo / ".git" / "info")
+    (tmp_path / "info").mkdir()
+    (tmp_path / "info" / "attributes").write_bytes(b"*.py text eol=crlf\n")
+    os.symlink(tmp_path / "info", repo / ".git" / "info")
+    with pytest.raises(SourceSnapshotError), TrustedGitRepository(repo) as observed:
+        observed.changed_worktree_paths(_git(repo, "rev-parse", "HEAD"))
