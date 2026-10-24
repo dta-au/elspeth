@@ -490,7 +490,7 @@ async def test_primary_input_refuses_changed_selected_message_after_actual_compl
     }
     try:
         actual = await asyncio.to_thread(_freeze_input, **args)
-        assert actual.messages == list(produced.messages)
+        assert tuple(actual.messages) == tuple(produced.messages)
         changed = [dict(message) for message in produced.messages]
         changed[-1]["content"] += " changed untrusted request"
         before = stored_rows(operation_store[0])

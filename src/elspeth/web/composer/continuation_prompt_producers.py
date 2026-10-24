@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
@@ -577,7 +578,10 @@ class CurrentContinuationMessageProducers:
 @dataclass(frozen=True, slots=True)
 class CurrentMessageProduction:
     producers: CurrentContinuationMessageProducers
-    messages: tuple[dict[str, Any], ...] | None
+    messages: tuple[Mapping[str, Any], ...] | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "messages")
 
 
 def _produce_current_messages(

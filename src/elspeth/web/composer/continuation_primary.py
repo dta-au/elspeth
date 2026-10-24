@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import math
-from copy import deepcopy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -40,8 +41,11 @@ from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
 @dataclass(frozen=True, slots=True)
 class PreparedPrimaryInvocation:
     request: PreparedContinuationPrimaryRequest
-    messages: list[dict[str, Any]] = field(repr=False)
-    tools: list[dict[str, Any]] = field(repr=False)
+    messages: Sequence[Mapping[str, Any]] = field(repr=False)
+    tools: Sequence[Mapping[str, Any]] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "messages", "tools")
 
 
 def _require_owners(
@@ -157,10 +161,11 @@ def _freeze_input(
         raise AuditIntegrityError("primary input changed its selected complete message/shelf join")
     if recorder.snapshot_for_continuation(drained=drained) != decode_recorder_snapshot(by_ref[frame.audit_buffer]):
         raise AuditIntegrityError("primary input changed its complete current recorder prefix")
-    frozen_messages, frozen_tools = deepcopy(messages), deepcopy(tools)
-    request = service._provider_gateway.prepare_continuation_primary(frozen_messages, frozen_tools)
+    # Owned copies of the admitted input; the invocation record freezes them.
+    owned_messages, owned_tools = deep_thaw(messages), deep_thaw(tools)
+    request = service._provider_gateway.prepare_continuation_primary(owned_messages, owned_tools)
     producers._require_current()
-    return PreparedPrimaryInvocation(request, frozen_messages, frozen_tools)
+    return PreparedPrimaryInvocation(request, owned_messages, owned_tools)
 
 
 async def run_continuation_primary(
@@ -269,8 +274,8 @@ async def run_continuation_primary(
     if remaining <= 0:
         raise TimeoutError("primary action allowance expired before actual provider entry")
     actual = await service._provider_gateway._call_llm_outcome_with_audit(
-        invocation.messages,
-        invocation.tools,
+        deep_thaw(invocation.messages),
+        deep_thaw(invocation.tools),
         timeout=remaining,
         recorder=recorder,
         provider_custody=custody,

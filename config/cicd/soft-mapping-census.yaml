@@ -824,10 +824,11 @@ files:
   src/elspeth/web/composer/continuation_prepared_p4.py:
     Mapping[str, Any]: 3
   src/elspeth/web/composer/continuation_primary.py:
-    dict[str, Any]: 6
+    Mapping[str, Any]: 2
+    dict[str, Any]: 4
   src/elspeth/web/composer/continuation_prompt_producers.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 25
+    Mapping[str, Any]: 6
+    dict[str, Any]: 24
   src/elspeth/web/composer/continuation_provider_input.py:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/continuation_tool_argument_messages.py:
@@ -879,8 +880,8 @@ files:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
   src/elspeth/web/composer/provider_gateway.py:
-    Mapping[str, Any]: 11
-    dict[str, Any]: 13
+    Mapping[str, Any]: 12
+    dict[str, Any]: 12
   src/elspeth/web/composer/provider_telemetry.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/provider_thinking.py:
@@ -1130,10 +1131,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 820
+  Mapping[str, Any]: 824
   Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1194
+  dict[str, Any]: 1190
   dict[str, object]: 398
   soft: 2738

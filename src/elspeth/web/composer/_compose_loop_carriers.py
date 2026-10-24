@@ -36,7 +36,7 @@ Layer: L3 (application). Imports from L0 (``contracts/freeze``,
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -531,6 +531,9 @@ class _ComposeIterationBindings:
     required_work: RequiredWorkBinding | None
     provider_owner: ProviderInvocationOwner | None
     ingress: CompositionIngressRecord | None
-    chat_ingress_inputs: list[ChatIngressInput] | None
+    chat_ingress_inputs: Sequence[ChatIngressInput] | None
     actor: str
     session_scope: str
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "chat_ingress_inputs")

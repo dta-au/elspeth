@@ -2684,7 +2684,8 @@ class ComposerServiceImpl:
         required_work = bindings.required_work
         provider_owner = bindings.provider_owner
         ingress = bindings.ingress
-        chat_ingress_inputs = bindings.chat_ingress_inputs
+        # The bindings hold a frozen sequence; the audit path takes its own list.
+        chat_ingress_inputs = None if bindings.chat_ingress_inputs is None else list(bindings.chat_ingress_inputs)
         actor = bindings.actor
         session_scope = bindings.session_scope
         for _continuation_iteration in (None,):

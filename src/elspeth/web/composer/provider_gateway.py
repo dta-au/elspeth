@@ -15,6 +15,7 @@ from openai import OpenAIError
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.prompt_guard import (
     PromptGuardContentPart,
     PromptGuardMode,
@@ -647,7 +648,10 @@ async def _litellm_acompletion(
 @dataclass(frozen=True, slots=True)
 class PreparedContinuationPrimaryRequest:
     input_sha256: str
-    kwargs: dict[str, Any] = field(repr=False)
+    kwargs: Mapping[str, Any] = field(repr=False)
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "kwargs")
 
 
 class ProviderGateway:
