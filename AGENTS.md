@@ -393,7 +393,10 @@ Building, installing and qualifying that runtime and its judge supervisor is
 post-release operator work. Until then the signer findings stay open. Key-free
 staging through the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`) still
 prepares a worklist for that operator step, which re-derives every binding from
-the live tree. Judging runs with read-only judge tool access. Background is in
+the live tree. Every judge call needs the installed judge supervisor and refuses
+without it; there is no local Codex/SDK fallback. That covers `stage_preview`,
+`reaudit`, `check-judge-quality` and `justify --dry-run`. Judging runs with
+read-only judge tool access. Background is in
 the `judge-signature-workflow` skill and
 [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 

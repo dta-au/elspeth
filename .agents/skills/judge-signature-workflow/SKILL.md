@@ -124,8 +124,12 @@ bundles must be re-staged.
    question 7): an unverifiable one is BLOCK-PENDING, a contradicted one is
    BLOCKED. The mirror error is worse than a block: a suppression justified
    by "X already checks this" where X is not reached deletes the only gate.
-4. **`stage_preview`** (needs installed + authenticated Codex CLI and the
-   `[mcp]` extra) — run the read-only Codex judge over each `new_judgment`
+4. **`stage_preview`** (needs the installed, admitted judge supervisor; see
+   ADR-052. It is **unavailable** until that runtime is installed. Every
+   judge call, including this preview, `reaudit`, `check-judge-quality` and
+   `justify --dry-run`, refuses with "protected judge supervisor admission is
+   unavailable or invalid", and there is no local Codex/SDK fallback. Skip
+   this step and leave the action for the operator.) — run the read-only Codex judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);
    surfaces BLOCKED reasons so you can fix the code or rationale *before* the
    operator spends a real judge call. The previewed request carries the same

@@ -21,16 +21,17 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 
+from elspeth_lints.core import judge, judge_rpc
 from elspeth_lints.core.allowlist import (
     _JUDGE_METADATA_SIGNATURE_ENV_VAR,
     JudgeVerdict,
     compute_judge_metadata_signature,
 )
-from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI, JudgeConfigurationError
+from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.mcp import server as judge_server
@@ -1111,17 +1112,17 @@ def test_stage_preview_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
 
 
-def test_stage_preview_missing_codex_cli_returns_actionable_hint(tmp_path: Path) -> None:
-    """Key absent + Codex CLI absent yields an actionable configuration error."""
+def test_stage_preview_without_installed_supervisor_refuses_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Key absent, supervisor absent: the real call_judge route refuses; no local transport runs."""
     ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
-    codex_absent = JudgeConfigurationError("The Codex CLI is required for --judge-transport codex-cli.")
-    with (
-        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
-        patch("elspeth_lints.core.judge.call_judge", side_effect=codex_absent),
-    ):
+    monkeypatch.setattr(judge_rpc, "ADMISSION_PATH", tmp_path / "absent-judge-workers.json")
+    local = create_autospec(judge._TRANSPORTS[TRANSPORT_CODEX_CLI], spec_set=True, side_effect=AssertionError("local fallback"))
+    monkeypatch.setitem(judge._TRANSPORTS, TRANSPORT_CODEX_CLI, local)
+    with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
         outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
     assert outcome.is_error is True
-    assert "Codex CLI" in outcome.text
+    assert "protected judge supervisor admission is unavailable or invalid" in outcome.text
+    local.assert_not_called()
 
 
 def test_stage_preview_still_fails_closed_with_judge_agent_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

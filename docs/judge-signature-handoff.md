@@ -135,9 +135,12 @@ and incomplete bundles are rejected and must be re-staged.
 Registered in `.mcp.json` as `elspeth-judge`, launched as
 `python -m elspeth_lints.mcp --root src/elspeth --allowlist-dir
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
-`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra and an installed
-and authenticated Codex CLI. All six tools fail closed when the HMAC key is
-present in the environment.
+`PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra. All six tools
+fail closed when the HMAC key is present in the environment. `stage_preview` is
+the only tool that calls a judge. Like every judge call it now goes through the
+protected judge supervisor (ADR-052). Until that runtime is installed it
+refuses with "protected judge supervisor admission is unavailable or invalid",
+and an installed Codex CLI is not used as a fallback.
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
@@ -145,7 +148,7 @@ present in the environment.
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle and emit its priced operator command. Args: `bundle_id` (required), `stale_key` (optional exact orphan key; selects one action and zero judge calls). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
-| `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
+| `stage_preview` | yes | yes (read-only judge via the protected supervisor; **unavailable until installed**) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
