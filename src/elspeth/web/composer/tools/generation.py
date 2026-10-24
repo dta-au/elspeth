@@ -2194,12 +2194,14 @@ def _execute_explain_validation_error(
     exact = explain_validation_code(error_text)
     if exact is not None:
         explanation, fix = exact
+        # TC-004: the exact (case-sensitive) catalogue key is the canonical
+        # code, so name it as the noisy-code branch already does.
         return ToolResult(
             success=True,
             updated_state=state,
             validation=validation,
             affected_nodes=(),
-            data={"error_text": error_text, "explanation": explanation, "suggested_fix": fix},
+            data={"error_text": error_text, "error_code": error_text, "explanation": explanation, "suggested_fix": fix},
         )
     for pattern, explanation, fix in _VALIDATION_ERROR_PATTERNS:
         if re.search(pattern, error_text):

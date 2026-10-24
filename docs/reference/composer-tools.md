@@ -178,7 +178,7 @@ Get a human-readable explanation of a validation error with suggested fixes.
 |-----------|------|----------|-------------|
 | `error_text` | string | **Yes** | The exact validation error message to explain |
 
-**Returns:** Explanation of what the error means and how to fix it.
+**Returns:** `error_text` (echoed), `explanation` and `suggested_fix`. When the text is a closed validation code (exact, case-sensitive) or contains one (any case), the result also carries that canonical `error_code`. A runtime-only reason such as `union_field_collision`, a matched message pattern and unmatched text carry no `error_code`; unmatched text lists the closed codes inside `suggested_fix`. Lookup order: runtime-only reason, exact code, message patterns, a code inside other text, then usage guidance.
 
 **When to use:** When a mutation tool or export surface returns validation errors that aren't immediately clear. Pass the exact error text from the validation result.
 

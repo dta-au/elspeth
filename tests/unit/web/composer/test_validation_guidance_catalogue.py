@@ -252,7 +252,8 @@ def test_new_policy_guidance_does_not_extend_legacy_patterns(monkeypatch: pytest
 def test_direct_exact_and_noisy_lookup_and_help_derive_from_records() -> None:
     for record in generation._DIRECT_VALIDATION_GUIDANCE:
         exact = execute_tool("explain_validation_error", {"error_text": record.code}, _empty_state(), _mock_catalog())
-        assert list(exact.data) == ["error_text", "explanation", "suggested_fix"]
+        assert list(exact.data) == ["error_text", "error_code", "explanation", "suggested_fix"]
+        assert exact.data["error_code"] == record.code
         assert exact.data["explanation"] == record.explanation
         assert exact.data["suggested_fix"] == record.suggested_fix
         noisy = execute_tool("explain_validation_error", {"error_text": f"LOG {record.code.upper()} END"}, _empty_state(), _mock_catalog())
@@ -333,3 +334,57 @@ def test_the_shared_batch_placement_code_teaches_every_arm_that_emits_it() -> No
     # The collector arm's own message gives the same remedy, never "make the collector an aggregation".
     assert "downstream of the collector" in (arms["collector"] or "")
     assert "Configure this node as node_type='aggregation'" not in (arms["collector"] or "")
+
+
+def test_exact_closed_code_emits_expected_canonical_code() -> None:
+    """TC-004 (#327): an exact closed-code lookup names the canonical code it explained.
+
+    Iterates the live catalogue rather than a hand-picked sample, so a code
+    added later is covered without editing this test.
+    """
+    codes = generation._CLOSED_VALIDATION_ERROR_CODES
+    assert codes, "the closed validation-code catalogue must not be empty"
+    for code in codes:
+        expected = generation.explain_validation_code(code)
+        assert expected is not None, code
+        result = execute_tool("explain_validation_error", {"error_text": code}, _empty_state(), _mock_catalog())
+        assert result.success is True
+        assert result.data.get("error_code") == code, code
+        assert (result.data["explanation"], result.data["suggested_fix"]) == expected, code
+        assert result.affected_nodes == ()
+
+
+def test_explanation_branch_precedence_keeps_code_only_on_closed_code_branches() -> None:
+    """Runtime reason, prose pattern and unmatched results omit the code; exact and noisy carry it.
+
+    The prose fixture also contains a different closed code whose guidance is
+    distinct, so moving the noisy-code lookup ahead of the prose patterns, or
+    classifying the runtime reason as a closed code, changes the result.
+    """
+    state = _empty_state()
+    runtime = execute_tool("explain_validation_error", {"error_text": "union_field_collision"}, state, _mock_catalog())
+    assert "error_code" not in runtime.data
+
+    prose_only = execute_tool("explain_validation_error", {"error_text": "unknown node_type. Expected a gate."}, state, _mock_catalog())
+    noisy_guidance = generation.explain_validation_code("quarantine_unknown_output")
+    assert noisy_guidance is not None
+    assert prose_only.data["explanation"] != noisy_guidance[0]
+    mixed = execute_tool(
+        "explain_validation_error",
+        {"error_text": "unknown node_type. Expected a gate. LOG QUARANTINE_UNKNOWN_OUTPUT"},
+        state,
+        _mock_catalog(),
+    )
+    assert "error_code" not in mixed.data
+    assert mixed.data["explanation"] == prose_only.data["explanation"]
+
+    unmatched = execute_tool("explain_validation_error", {"error_text": "ZZZ_UNRECOGNIZED_QQQ"}, state, _mock_catalog())
+    assert "error_code" not in unmatched.data
+
+    noisy = execute_tool("explain_validation_error", {"error_text": "LOG QUARANTINE_UNKNOWN_OUTPUT END"}, state, _mock_catalog())
+    assert noisy.data["error_code"] == "quarantine_unknown_output"
+    exact = execute_tool("explain_validation_error", {"error_text": "quarantine_unknown_output"}, state, _mock_catalog())
+    assert exact.data.get("error_code") == "quarantine_unknown_output"
+    for result in (runtime, mixed, unmatched, noisy, exact):
+        assert result.updated_state is state
+        assert result.affected_nodes == ()
