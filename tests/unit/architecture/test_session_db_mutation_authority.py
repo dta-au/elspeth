@@ -5054,7 +5054,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="6d19cc377aa5042b",
         ordinal=1,
         authority=None,
-        line=506,
+        line=511,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5065,7 +5065,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="6d0dc169d76447ab",
         ordinal=1,
         authority=None,
-        line=541,
+        line=546,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5076,7 +5076,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="a447ba3ecc90a1f8",
         ordinal=1,
         authority=None,
-        line=566,
+        line=571,
         connection_escape=False,
     ),
     WriterIdentity(
