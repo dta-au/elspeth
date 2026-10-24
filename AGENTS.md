@@ -365,14 +365,37 @@ fix (see elspeth-63cf3803e6), never a reason to route around the provider.
 
 ## Operator signature verification (tier-model allowlist signing)
 
-CI does not run the signed trust-tier check or the historical blanket ratchet.
-Its green result covers the checks that actually run, not operator signature
-clearance. Fix tier-model defects as you find them and do not add drift; compare
-keyless finding sets before and after a change. The operator verifies and signs
-the reviewed package in a trusted context after churn has settled. Keep the
-operator-held key out of CI and agent environments.
+**Signing is suspended** pending the on-prem migration (maintainer ruling;
+[docs/release/0.8.10-custody-handover-prompt.md](docs/release/0.8.10-custody-handover-prompt.md)
+§ 2), and it is not part of CI. No sign-bundle, rekey or fingerprint-baseline
+regeneration runs. Never plan a re-sign, a "sign before land" ordering or an
+owed signature. CI does not run the signed trust-tier check or the historical
+blanket ratchet. Its green covers the checks that actually run, not signature
+clearance.
 
-The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
+Track tier-model findings with the **keyless set-diff**. Run the keyless scan
+(§ Quick reference) on the base and on the tip, and compare the finding *sets*
+(added and removed), not counts and not against zero. Fix tier-model defects as
+you find them and do not add drift. Shape-only verification cannot detect forged
+judge metadata, so a keyless result is never signature clearance.
+
+An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody
+rule). Keep it out of CI and agent environments, and never hand-edit a
+`judge_metadata_signature`. Key-bearing verbs refuse from the editable checkout:
+`sign-bundle`, `rekey`, `sign-judge-signatures`, `migrate-judge-scope`,
+`regenerate-fingerprint-baseline`, non-dry-run `justify`/`audit-verdict`, and any
+command run with the key set all exit 2 with `Operator runtime unavailable`.
+
+When signing is re-enabled, the operator fires those verbs only through the
+**protected entrypoint `/usr/local/libexec/elspeth-operator`**
+([ADR-052](docs/architecture/adr/052-key-bearing-lint-operations-run-only-in-a-protected-operator-runtime.md)).
+Building, installing and qualifying that runtime and its judge supervisor is
+post-release operator work. Until then the signer findings stay open. Key-free
+staging through the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`) still
+prepares a worklist for that operator step, which re-derives every binding from
+the live tree. Judging runs with read-only judge tool access. Background is in
+the `judge-signature-workflow` skill and
+[docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
 ## Shared issue tracking
 

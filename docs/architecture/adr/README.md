@@ -69,6 +69,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [049](049-tutorial-canary-baseline-is-configuration-relative.md) | The Tutorial Canary's Baseline Is Configuration-Relative, Not Byte-Fixed | 2026-09-28 | **Proposed** |
 | [050](050-transform-outputs-declare-sources-infer-and-lock.md) | Transform Outputs Declare, Sources Infer-and-Lock — Join Only at Multi-Producer Seams | 2026-09-25 | **Accepted** |
 | [051](051-a-template-sees-only-its-declared-fields.md) | A Template Sees Only Its Declared Fields | 2026-09-26 | **Accepted** |
+| [052](052-key-bearing-lint-operations-run-only-in-a-protected-operator-runtime.md) | Key-Bearing Lint Operations Run Only in a Protected Operator Runtime | 2026-10-24 | **Proposed** |
 
 ## Status Definitions
 
