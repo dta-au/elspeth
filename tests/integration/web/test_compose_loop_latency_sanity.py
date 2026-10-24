@@ -27,6 +27,10 @@ from tests.helpers.session_fences import FencedComposeTurnHarness
 # Integration-suite shared session-insert helper.
 from .conftest import _make_session
 
+# A stored state always carries its pipeline metadata (state_from_record refuses a
+# row without it); this is the empty graph's default PipelineMetadata as serialised.
+_EMPTY_STATE_DATA = CompositionStateData(metadata_={"name": "Untitled Pipeline", "description": ""})
+
 
 @pytest.fixture
 def service(tmp_path):
@@ -58,7 +62,7 @@ def _build_turn(turn: int):
             f"turn_{turn}_tc_{i}",
             '{"ok": true}',
             StatePayload(
-                data=CompositionStateData(),
+                data=_EMPTY_STATE_DATA,
                 derived_from_state_id=None,
             ),
         )
