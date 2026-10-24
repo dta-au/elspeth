@@ -45,3 +45,12 @@ and environment values are never accepted.
 
 This directory is the maintained current proof catalog. Historical v2 bytes
 remain pinned for strict reruns of v2 assessments.
+
+The current plugin inventory includes `batch_duplicate_annotator`, a deterministic
+complete-source batch transform. Its default PB-09 case retains all ten required
+dimensions at each of the four supported profiles. The lifecycle fixture flushes
+it at EOF, respecting its complete-source capability; count-triggered batch
+plugins retain their existing fixture behavior. Selector assignment adds proof
+obligations and local lifecycle selectors, without promoting assessment results
+or claiming PostgreSQL, follower-profile, or live execution evidence. Historical
+catalogs and retained assessment artifacts remain unchanged.

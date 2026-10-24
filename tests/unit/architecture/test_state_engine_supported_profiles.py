@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -99,11 +100,9 @@ def test_frozen_v2_catalog_remains_valid_historical_input() -> None:
 
     assert FROZEN_V2_CATALOG_PATH.is_file(), "the frozen v2 proof catalog must remain in the tree"
     frozen = json.loads(FROZEN_V2_CATALOG_PATH.read_text(encoding="utf-8"))
-    current = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
-
     assert frozen["catalog_id"] == "elspeth-state-engine-v2"
-    assert current["catalog_id"] == "elspeth-state-engine-v3"
-    assert frozen["execution_profiles"] == current["execution_profiles"]
+    profile_bytes = json.dumps(frozen["execution_profiles"], sort_keys=True, separators=(",", ":")).encode()
+    assert hashlib.sha256(profile_bytes).hexdigest() == "a31b3fed112d69b8992f4e00c111c474d420b81e9ffe1a7775cdec4d733593d6"
     assert {profile["id"] for profile in frozen["execution_profiles"]["state_store"]} == {
         "sqlite-wal",
         "postgresql-16",

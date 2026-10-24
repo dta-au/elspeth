@@ -427,15 +427,16 @@ JSON-escaped, so grep the bare hex token), then any
   (`EXPECTED_COUNTS`, `EXPECTED_VARIANT_COUNT`),
   `tests/golden/state_engine/plugin_lifecycle_matrix.json`,
   `tests/unit/plugins/test_state_engine_plugin_matrix.py`, and the PB-09
-  cases in **both** `docs/architecture/state_engine/proof-catalog/v2` and
-  `v3` (`catalog.json`, `evidence_selectors.json`). The five matrix fields
+  cases in the maintained `docs/architecture/state_engine/proof-catalog/v3`
+  (`catalog.json`, `evidence_selectors.json`). The five matrix fields
   are derived field-by-field from the existing corpus, never guessed and
-  never clustered; the inventory edit is a mirror sweep across both
-  catalogs (surgical text edits — a `json.dumps` round-trip reflows v2),
-  then `CANONICAL_V2_LEGS_SHA256`, `CANONICAL_V2_EXECUTION_PROFILES_SHA256`
-  (`scripts/state_engine_assessment_lib/common.py`), the case-count pin, and
-  `tests/unit/architecture/test_state_engine_catalog_contract.py::V2_CATALOG_SHA256`
-  **last**.
+  never clustered. Update the current inventory, PB-09 cases, selectors and
+  `CANONICAL_V3_EXECUTION_PROFILES_SHA256`
+  (`scripts/state_engine_assessment_lib/common.py`), then
+  `tests/unit/architecture/test_state_engine_catalog_contract.py::V3_CATALOG_SHA256`
+  **last**. Frozen v1/v2 bytes, vocabulary, profiles and historical pins stay
+  unchanged. New profile-case identities require an explicit applicability
+  policy for their cells as well as the current support-policy amendment.
 - `src/elspeth/web/audit_readiness/boundary_expectations.py`
   (`EXPECTED_TRANSFORM_DETERMINISMS`); editing it requires the commit trailer
   `telemetry-backfill: audit-readiness`.

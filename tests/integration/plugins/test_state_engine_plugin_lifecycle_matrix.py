@@ -137,7 +137,8 @@ def _rows_for(plugin_key: str) -> list[dict[str, object]]:
         ],
         "transform:batch_duplicate_annotator": [
             {"first_text": "alpha", "second_text": "beta"},
-            {"first_text": "alpha", "second_text": "gamma"},
+            {"first_text": "unique", "second_text": "different"},
+            {"first_text": "beta", "second_text": "alpha"},
         ],
         "transform:batch_effect_size": [
             {"prompt_variant": "control", "score": 0.2},
@@ -299,7 +300,9 @@ def _materialize_pipeline(
             aggregation = yaml.safe_load(cast(str, plugin_type.example_use))["aggregations"][0]
             aggregation["input"] = "subject_input"
             aggregation["on_success"] = "output"
-            if not plugin_type.requires_complete_source_batch:
+            if plugin_type.requires_complete_source_batch:
+                aggregation.pop("trigger", None)
+            else:
                 aggregation["trigger"] = {"count": len(rows)}
             aggregation["options"] = options
             pipeline["aggregations"] = [aggregation]
