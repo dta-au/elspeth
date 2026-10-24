@@ -1,0 +1,52 @@
+"""Serial PostgreSQL actual title/ready atomicity, current reads and contention."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_actual_fresh_claim_applies_or_replays_paid_title_without_second_sdk as test_actual_fresh_claim_applies_or_replays_paid_title_without_second_sdk,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_actual_ready_finisher_requires_the_real_original_title_write as test_actual_ready_finisher_requires_the_real_original_title_write,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_actual_sql_title_admission_rejects_caller_candidate_after_real_positive as test_actual_sql_title_admission_rejects_caller_candidate_after_real_positive,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_current_ready_read_rejects_coherent_source_changes_after_real_positive as test_current_ready_read_rejects_coherent_source_changes_after_real_positive,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_malformed_owned_title_decision_closes_unsubmitted_ticket_without_sql as test_malformed_owned_title_decision_closes_unsubmitted_ticket_without_sql,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_original_codec_refuses_logical_request_without_matching_ceiling as test_original_codec_refuses_logical_request_without_matching_ceiling,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_paid_title_application_preserves_original_result_and_applies_exact_title_once as test_paid_title_application_preserves_original_result_and_applies_exact_title_once,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_real_pending_title_accounting_refuses_application_without_writes as test_real_pending_title_accounting_refuses_application_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_and_ready_rollback_together_after_actual_title_setter as test_title_and_ready_rollback_together_after_actual_title_setter,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_application_cancellation_joins_actual_commit_and_replays_without_write as test_title_application_cancellation_joins_actual_commit_and_replays_without_write,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_application_cannot_choose_or_discard_actual_paid_candidate as test_title_application_cannot_choose_or_discard_actual_paid_candidate,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_application_current_actor_refusal_keeps_complete_sql as test_title_application_current_actor_refusal_keeps_complete_sql,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_application_current_business_authority_refuses_cancelled_owed_cut as test_title_application_current_business_authority_refuses_cancelled_owed_cut,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_preflight_preserves_original_nominal_source_and_fence_refusals as test_title_preflight_preserves_original_nominal_source_and_fence_refusals,
+)
+from tests.unit.web.sessions.test_continuation_title_application import (
+    test_title_ready_two_actual_writers_have_one_atomic_commit as test_title_ready_two_actual_writers_have_one_atomic_commit,
+)
+
+pytestmark = pytest.mark.testcontainer

@@ -24,7 +24,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
@@ -143,9 +143,9 @@ def _guarded_service(invocation, monkeypatch, *, composer_client=None, advisor_c
 
 
 @pytest.mark.asyncio
-async def test_composer_planner_entry_preserves_guard_identity_after_prior_calls(invocation, monkeypatch):
+async def test_common_primary_preserves_guard_identity_after_prior_calls(invocation, monkeypatch):
     from elspeth.web.dependencies import create_catalog_service
-    from tests.unit.web.composer.test_pipeline_planner import _response, _ScriptedCompletion
+    from tests.unit.web.composer.test_pipeline_planner import _response_with_call_id, _ScriptedCompletion
 
     engine, sessions, owner, coordinator = invocation
     context = owner.required_work.coordinator.authority.context
@@ -157,14 +157,26 @@ async def test_composer_planner_entry_preserves_guard_identity_after_prior_calls
         writer_principal="route_user_message",
         session_operation_context=context,
     )
+    composer_client = _Client(PromptGuardDecision("allow", "clean"))
     service = _guarded_service(
         invocation,
         monkeypatch,
+        composer_client=composer_client,
         catalog=create_catalog_service(),
         settings=_make_settings(composer_prompt_guard_mode="required", composer_max_discovery_turns=1),
     )
-    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {})))
-    monkeypatch.setattr(litellm, "acompletion", completion)
+    completion = _ScriptedCompletion(
+        _response_with_call_id("guard-source-discovery", "list_sources", {}),
+        _response_with_call_id("guard-sink-discovery", "list_sinks", {}),
+    )
+
+    async def complete_then_block_next_primary(**kwargs):
+        response = await completion(**kwargs)
+        if len(completion.requests) == 2:
+            composer_client.decision = PromptGuardDecision("blocked", "policy_blocked")
+        return response
+
+    monkeypatch.setattr(litellm, "acompletion", complete_then_block_next_primary)
     with pytest.raises(PromptGuardRefused) as caught:
         await service.compose(
             message,
@@ -178,13 +190,17 @@ async def test_composer_planner_entry_preserves_guard_identity_after_prior_calls
             provider_owner=owner,
         )
     assert caught.value.disposition == "blocked" and len(completion.requests) == 2
-    assert caught.value.llm_calls == () and caught.value.tool_invocations == ()
+    assert len(composer_client.requests) == 3
+    assert caught.value.tool_invocations == ()
     with engine.connect() as connection:
         rows = connection.execute(select(chat_messages_table)).all()
         assert connection.execute(select(composition_states_table)).all() == []
         assert connection.execute(select(composition_proposals_table)).all() == []
     llm_rows = [row for row in rows if row.tool_calls and row.tool_calls[0].get("_kind") == "llm_call_audit"]
     assert len(llm_rows) == 2
+    assert [llm_call_audit_envelope(call) for call in caught.value.llm_calls] == [
+        row.tool_calls[0] for row in sorted(llm_rows, key=lambda row: row.sequence_no)
+    ]
     coordinator.assert_completed()
 
 

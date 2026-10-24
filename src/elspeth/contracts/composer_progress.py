@@ -113,6 +113,7 @@ type ComposerProgressReason = Literal[
     "planner_repair_exhausted",
     # Generic ComposerServiceError — prompt prep / availability / catch-all.
     "service_setup_failed",
+    "mutation_authority_revoked",
     "admission_refused",
     "accounting_unavailable",
     # Client closed the HTTP connection or operator cancelled the request

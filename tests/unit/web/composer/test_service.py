@@ -44,14 +44,15 @@ from elspeth.web import async_workers
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
-from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedLLMCompletion,
+    _ComposeIterationBindings,
+    _ComposeIterationState,
+)
 from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _compose_preflight_repair_message
-from elspeth.web.composer.planning_application import (
-    _freeform_planner_conversation_context,
-)
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.proposals import build_tool_proposal_summary
@@ -69,6 +70,9 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
+from elspeth.web.composer.request_history import (
+    authoritative_conversation_context as _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
@@ -124,6 +128,7 @@ from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.required_executor import assert_owned_executor_fixture_settled
 from tests.helpers.advisor_review import parse_advisor_publication_review
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -265,8 +270,33 @@ def _assert_reconciliation_turn(mock_llm: AsyncMock, script: _ReconciliationLLMS
     assert prompt["tool_call_id"] == calls[0].id
 
 
+class _RawReconciliationSDKScript:
+    """Finite raw replies with actual SDK prompts retained before further mutation."""
+
+    def __init__(self, *responses: FakeLLMResponse) -> None:
+        self.responses = responses
+        self.prompts: list[list[dict[str, Any]]] = []
+
+    async def respond(self, *, messages: list[dict[str, Any]], **_kwargs: Any) -> FakeLLMResponse:
+        assert len(self.prompts) < len(self.responses), "Unexpected extra primary SDK call"
+        self.prompts.append(deepcopy(messages))
+        return self.responses[len(self.prompts) - 1]
+
+
+def _assert_raw_reconciliation_turn(mock_llm: AsyncMock, script: _RawReconciliationSDKScript) -> None:
+    """Bind real second SDK feedback to the exact original raw tool-call ID."""
+    assert mock_llm.await_count == len(script.responses) == 2
+    assert len(script.prompts) == 2
+    prompt = script.prompts[1][-1]
+    assert prompt["role"] == "tool"
+    calls = script.responses[0].choices[0].message.tool_calls
+    assert calls is not None
+    assert len(calls) == 1
+    assert prompt["tool_call_id"] == calls[0].id
+
+
 class _PlannerPublicationLLMScript:
-    """Finite planner/END responses with real provider custody and publication review."""
+    """Finite common PRIMARY/EARLY/END responses with real custody and publication review."""
 
     def __init__(
         self,
@@ -274,7 +304,7 @@ class _PlannerPublicationLLMScript:
         request: str,
         planner_responses: tuple[_AdmittedLLMCompletion, ...],
         *,
-        phases: tuple[Literal["planner", "end"], ...],
+        phases: tuple[Literal["planner", "early", "end"], ...],
         publication_verdicts: tuple[Literal["ADMIT", "WITHHOLD"], ...] = (),
         findings: str = "",
     ) -> None:
@@ -310,22 +340,25 @@ class _PlannerPublicationLLMScript:
             assert kwargs["model"] == self.service._model
         else:
             schema = kwargs["response_format"]["json_schema"]
-            assert schema["name"] == "advisor_end_response"
-            phase = "end"
+            assert schema["name"] in {"advisor_checkpoint_response", "advisor_end_response"}
+            phase = "early" if schema["name"] == "advisor_checkpoint_response" else "end"
             assert kwargs["model"] == self.service._settings.composer_advisor_model
         assert len(self.phases) < len(self.expected_phases), "Unexpected extra provider transition"
         assert phase == self.expected_phases[len(self.phases)]
         owner, family, custody = self.mints[-1]
         assert owner.service is self.service._require_sessions_service()
-        assert family is (ProviderInvocationFamily.PLANNER if phase == "planner" else ProviderInvocationFamily.ADVISOR)
+        assert family is (ProviderInvocationFamily.PRIMARY if phase == "planner" else ProviderInvocationFamily.ADVISOR)
         assert custody.attempt is not None
         self.attempt_ids.append(custody.attempt.attempt_id)
         self.phases.append(phase)
         self.requests.append(deepcopy(kwargs))
         tool_calls = None
         if phase == "planner":
-            assert "emit_pipeline_proposal" in {tool["function"]["name"] for tool in kwargs["tools"]}
+            tool_names = {tool["function"]["name"] for tool in kwargs["tools"]}
+            assert {"set_pipeline", "get_expression_grammar", "inspect_source"} <= tool_names
+            assert "emit_pipeline_proposal" not in tool_names
             response = self.planner_responses[len(self.planner_requests)]
+            assert all(call.function.name in tool_names for call in response.tool_batch.calls)
             self.planner_requests.append(deepcopy(kwargs))
             content = response.message.content
             if response.tool_batch.calls:
@@ -350,7 +383,7 @@ class _PlannerPublicationLLMScript:
                 assert evidence["candidate_reply"] == self.planner_responses[len(self.planner_requests) - 1].message.content
                 assert len(self.end_inputs) <= len(self.publication_verdicts)
                 payload["publication_verdict"] = self.publication_verdicts[len(self.end_inputs) - 1]
-                payload["findings"] = self.findings
+                payload["findings"] = self.findings if payload["publication_verdict"] == "WITHHOLD" else ""
             content = json.dumps(payload)
         return litellm.ModelResponse(
             model=kwargs["model"],
@@ -360,10 +393,14 @@ class _PlannerPublicationLLMScript:
                     "finish_reason": "tool_calls" if tool_calls else "stop",
                 }
             ],
-            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
         )
 
     def assert_finished(self) -> None:
+        from hashlib import sha256
+
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+
         assert tuple(self.phases) == self.expected_phases
         assert len(self.planner_requests) == len(self.planner_responses)
         assert tuple(verdict.publication_verdict for verdict in self.end_outputs) == self.publication_verdicts
@@ -399,16 +436,40 @@ class _PlannerPublicationLLMScript:
         assert [(check["role"], check["disposition"]) for check in guards] == [
             ("composer" if phase == "planner" else "advisor", "debug_bypass") for phase in self.expected_phases
         ]
-        if "WITHHOLD" in self.publication_verdicts:
-            candidate = self.planner_responses[-1].message.content
-            assert any(
-                row.content == candidate
-                and any(
-                    envelope["_kind"] == COMPOSER_WITHHELD_REPLY_KIND and envelope["origin"] == "advisor_publication_withheld"
-                    for envelope in (row.tool_calls or ())
-                )
+        end_passes = [
+            envelope["pass"]
+            for row in audit_rows
+            for envelope in (row.tool_calls or ())
+            if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND and envelope["pass"]["phase"] == "end"
+        ]
+        assert len(end_passes) == len(self.end_inputs) == len(self.publication_verdicts)
+        for index, (review, verdict, record) in enumerate(zip(self.end_inputs, self.publication_verdicts, end_passes, strict=True)):
+            assert record["pass_index"] == index + 1
+            assert record["source"] == "model" and record["verdict"] == "clean"
+            assert record["first_attempt_schema_valid"] is True and record["first_attempt_accepted"] is True
+            assert record["provider_attempts"] == 1 and record["format_reprompt_sent"] is False
+            assert record["publication_verdict"] == verdict
+            assert record["publication_binding"] == review.binding
+            if verdict != "WITHHOLD":
+                continue
+            candidate = json.loads(review.payload_json)["candidate_reply"]
+            assert type(candidate) is str and candidate
+            origin = "repair_gate_superseded" if index + 1 < len(self.end_inputs) else "advisor_publication_withheld"
+            private_rows = [
+                row
                 for row in audit_rows
-            )
+                if row.content == candidate
+                and row.tool_calls
+                == [
+                    {
+                        "_kind": COMPOSER_WITHHELD_REPLY_KIND,
+                        "schema": "composer.withheld-reply.v1",
+                        "origin": origin,
+                        "content_hash": sha256(candidate.encode("utf-8")).hexdigest(),
+                    }
+                ]
+            ]
+            assert len(private_rows) == 1
         assert not any(
             message["role"] == "user"
             and isinstance(message["content"], str)
@@ -1263,7 +1324,7 @@ class TestComposerTextOnlyResponse:
         )
 
         with (
-            patch("elspeth.web.composer.service.build_messages") as build,
+            patch("elspeth.web.composer.continuation_message_builders.build_messages") as build,
             patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider,
             pytest.raises(CredentialMaterialRefused) as caught,
         ):
@@ -1281,10 +1342,12 @@ class TestComposerTextOnlyResponse:
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
-        llm_response = _make_llm_response(content="I'll help you build a pipeline!")
+        llm_response = _make_raw_llm_response(content="I'll help you build a pipeline!")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.return_value = llm_response
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
+            mock_llm.side_effect = [llm_response]
             result = await service.compose("What can this composer do?", [], state, session_id=session_id)
 
         assert isinstance(result, ComposerResult)
@@ -1308,27 +1371,42 @@ class TestComposerTextOnlyResponse:
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
         model_prose = "I set up the workflow conceptually and can continue."
+        repaired_prose = "I have not built or saved a workflow, and the requested task is not complete."
         request = 'Build the workflow described by the accepted request: "Read leads_q3.csv and write JSON".'
         user_message_id = _insert_user_message(service._session_engine, session_id, request)
         script = _PlannerPublicationLLMScript(
             service,
             request,
-            (_make_llm_response(content=model_prose),),
-            phases=("planner", "end"),
-            publication_verdicts=("WITHHOLD",),
+            (_make_llm_response(content=model_prose), _make_llm_response(content=repaired_prose)),
+            phases=("planner", "end", "planner", "end"),
+            publication_verdicts=("WITHHOLD", "ADMIT"),
             findings="The reply claims a configured workflow without any saved composition work.",
         )
         with _real_planner_publication_sdk(script):
             result = await service.compose(request, [], state, session_id=session_id, user_id="test-user", user_message_id=user_message_id)
 
         script.assert_finished()
-        assert result.state.version == state.version
+        _assert_checkpoint_reply(result, repaired_prose, count=0, changed=False)
+        assert len(script.planner_requests) == 2 and len(result.llm_calls) == 4
+        assert result.state is state and result.state.version == state.version
+        assert await service._require_sessions_service().get_current_state(UUID(session_id)) is None
         assert not result.tool_invocations
         assert result.repair_turns_used == 0
         assert model_prose not in result.message
         assert "without calling any build/edit tool" not in result.message
         assert "No mutation completed successfully" not in result.message
-        assert all(json.loads(review.payload_json)["saved_effects"]["saved_revision_count"] == 0 for review in script.end_inputs)
+        assert [json.loads(review.payload_json)["candidate_reply"] for review in script.end_inputs] == [model_prose, repaired_prose]
+        for review in script.end_inputs:
+            evidence = json.loads(review.payload_json)
+            assert evidence["saved_effects"]["saved_revision_count"] == 0
+            assert evidence["saved_effects"]["net_changed"] is False
+        repair_messages = script.planner_requests[1]["messages"]
+        assert any(message["role"] == "assistant" and message["content"] == model_prose for message in repair_messages)
+        assert any(
+            message["role"] == "user"
+            and "A prose-only correction is valid; do not mutate the graph merely to satisfy this review." in message["content"]
+            for message in repair_messages
+        )
 
     @pytest.mark.asyncio
     async def test_failed_mutation_then_empty_state_reply_names_blocking_tool_error(self) -> None:
@@ -1337,7 +1415,7 @@ class TestComposerTextOnlyResponse:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
-        failed_set_pipeline = _make_llm_response(
+        failed_set_pipeline = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad_pipeline",
@@ -1352,14 +1430,16 @@ class TestComposerTextOnlyResponse:
             ],
         )
         final_prose = "I tried to build it, but the workflow is still conceptual."
-        text_response = _make_llm_response(content=final_prose)
+        text_response = _make_raw_llm_response(content=final_prose)
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(failed_set_pipeline, text_response)
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
+            script = _RawReconciliationSDKScript(failed_set_pipeline, text_response)
             mock_llm.side_effect = script.respond
             result = await service.compose("Build the CSV workflow now.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         assert result.state.version == state.version
         assert result.raw_assistant_content == final_prose
@@ -1406,7 +1486,7 @@ class TestComposerSingleToolCall:
                 affected_nodes=("metadata",),
             )
 
-        turn = _make_llm_response(
+        turn = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_set_metadata",
@@ -1415,11 +1495,13 @@ class TestComposerSingleToolCall:
                 }
             ],
         )
-        done = _make_llm_response(content="Done.")
+        done = _make_raw_llm_response(content="Done.")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fake_execute_tool),
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
         ):
             mock_llm.side_effect = [turn, done]
             await service.compose("Update metadata", [], state, session_id=session_id)
@@ -1499,7 +1581,7 @@ class TestComposerSingleToolCall:
                 affected_nodes=("metadata",),
             )
 
-        turn = _make_llm_response(
+        turn = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_set_metadata",
@@ -1508,11 +1590,13 @@ class TestComposerSingleToolCall:
                 }
             ],
         )
-        done = _make_llm_response(content="Done.")
+        done = _make_raw_llm_response(content="Done.")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fake_execute_tool),
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
         ):
             mock_llm.side_effect = [turn, done]
             await service.compose(
@@ -1949,7 +2033,7 @@ class TestComposerSingleToolCall:
         state = _empty_state()
 
         # Turn 1: tool call to set_source
-        tool_response = _make_llm_response(
+        tool_response = _make_raw_llm_response(
             content=None,
             tool_calls=[
                 {
@@ -1968,11 +2052,13 @@ class TestComposerSingleToolCall:
             ],
         )
         # Turn 2: text response
-        text_response = _make_llm_response(content="I've set up a CSV source.")
+        text_response = _make_raw_llm_response(content="I've set up a CSV source.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [tool_response, text_response]
@@ -1995,7 +2081,7 @@ class TestComposerSingleToolCall:
         async def record_progress(event: ComposerProgressEvent) -> None:
             progress_events.append(event)
 
-        tool_response = _make_llm_response(
+        tool_response = _make_raw_llm_response(
             content=None,
             tool_calls=[
                 {
@@ -2005,13 +2091,15 @@ class TestComposerSingleToolCall:
                 }
             ],
         )
-        text_response = _make_llm_response(content="I checked the available credentials.")
+        text_response = _make_raw_llm_response(content="I checked the available credentials.")
 
         async def inline_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
             return func(*args, **kwargs)
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch("elspeth.web.composer.service.asyncio.to_thread", side_effect=inline_to_thread),
         ):
             mock_llm.side_effect = [tool_response, text_response]
@@ -2029,8 +2117,20 @@ class TestComposerSingleToolCall:
         assert "checking available secret references" in progress_text.lower()
 
     @pytest.mark.asyncio
-    async def test_inline_complete_pipeline_incremental_replay_uses_atomic_tool_shape(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("start_empty", "early_reply_mode"),
+        [
+            pytest.param(False, "complete", id="existing-graph"),
+            pytest.param(True, "complete", id="empty-graph"),
+            pytest.param(True, "missing", id="empty-graph-missing-early"),
+            pytest.param(True, "end-only", id="empty-graph-misrouted-end"),
+        ],
+    )
+    async def test_inline_complete_pipeline_incremental_replay_uses_atomic_tool_shape(
+        self, tmp_path: Path, start_empty: bool, early_reply_mode: Literal["complete", "missing", "end-only"]
+    ) -> None:
         """Incremental inline full replacement retains the atomic tool shape."""
+        from elspeth.contracts.composer_content import CompleteValueManifest
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
         from elspeth.web.composer.turn_effects import authored_state_hash
         from tests.helpers.advisor_review import parse_advisor_publication_review
@@ -2058,6 +2158,8 @@ class TestComposerSingleToolCall:
             metadata=PipelineMetadata(name="Existing pipeline"),
             version=1,
         )
+        if start_empty:
+            state = _empty_state()
         user_message_content = "I want a pipeline that takes the string 'hello' and appends ' world' to it."
         user_message_id = _insert_user_message(engine, session_id, user_message_content)
         output_path = tmp_path / "outputs" / session_id / "append.csv"
@@ -2126,13 +2228,75 @@ class TestComposerSingleToolCall:
         final_turn = _make_raw_llm_response(content="Pipeline configured.")
         primary_requests = []
         reviews = []
+        advisor_requests = []
+        graph_manifests = []
+        transitions = []
+        expected_transitions = ["primary", "early", "primary", "primary", "end"] if start_empty else ["primary"] * 3 + ["end"]
+        advisor_reply_phases = ["early", "end"] if start_empty else ["end"]
+        if early_reply_mode == "missing":
+            advisor_reply_phases = []
+        elif early_reply_mode == "end-only":
+            advisor_reply_phases = ["end"]
+
+        def accounted_sdk_response(response: FakeLLMResponse, *, model: str) -> litellm.ModelResponse:
+            raw_message = response.choices[0].message
+            tool_calls = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.function.name, "arguments": call.function.arguments},
+                }
+                for call in raw_message.tool_calls or ()
+            ]
+            return litellm.ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "message": {"role": "assistant", "content": raw_message.content, "tool_calls": tool_calls or None},
+                        "finish_reason": "tool_calls" if tool_calls else "stop",
+                    }
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
+            )
 
         async def completion(**kwargs: Any):
             if kwargs["model"] == service._model:
+                phase = "primary"
+                assert "response_format" not in kwargs
+            else:
+                assert kwargs["model"] == settings.composer_advisor_model, "No response is supplied for another role"
+                schema_name = kwargs["response_format"]["json_schema"]["name"]
+                assert schema_name in {"advisor_checkpoint_response", "advisor_end_response"}
+                phase = "early" if schema_name == "advisor_checkpoint_response" else "end"
+                assert [message["role"] for message in kwargs["messages"]] == ["system", "user"]
+                assert kwargs["messages"][1]["content"].startswith(f"Advisor trigger: deterministic_{phase}_checkpoint\n")
+            assert len(transitions) < len(expected_transitions), "No extra provider transition is supplied"
+            assert phase == expected_transitions[len(transitions)]
+            transitions.append(phase)
+            if phase == "primary":
                 primary_requests.append(deepcopy(kwargs))
                 assert len(primary_requests) <= 3, "Only the original build/preview/final primary responses are supplied"
-                return (build_turn, preview_turn, final_turn)[len(primary_requests) - 1]
-            assert kwargs["model"] == settings.composer_advisor_model, "No response is supplied for another role"
+                return accounted_sdk_response((build_turn, preview_turn, final_turn)[len(primary_requests) - 1], model=kwargs["model"])
+            advisor_requests.append(deepcopy(kwargs))
+            assert advisor_reply_phases, f"No SDK response supplied for {phase}"
+            supplied_phase = advisor_reply_phases.pop(0)
+            assert supplied_phase == phase, f"SDK response for {supplied_phase} cannot serve {phase}"
+            summary = kwargs["messages"][1]["content"].split(
+                "Diagnostic graph view; complete-value references are not reviewed content.\n", 1
+            )[1]
+            graph_manifest = CompleteValueManifest.from_payload(
+                json.loads(summary.split("\nEND_UNTRUSTED_PIPELINE_SUMMARY", 1)[0])["content_manifest"]
+            )
+            assert graph_manifest.scope.session_id == UUID(session_id)
+            assert graph_manifest.values == ()
+            graph_hash = graph_manifest.scope.composition_content_hash
+            assert type(graph_hash) is str and len(graph_hash) == 64
+            graph_manifests.append(graph_manifest)
+            if phase == "early":
+                return accounted_sdk_response(
+                    _make_raw_llm_response(content=_advisor_checkpoint_reply(verdict="CLEAN", findings="", note=None)),
+                    model=kwargs["model"],
+                )
             assert not reviews, "Only one independent END SDK response is supplied"
             review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
             reviews.append(review)
@@ -2140,10 +2304,13 @@ class TestComposerSingleToolCall:
             assert review["current_request"] == user_message_content
             assert review["saved_effects"]["saved_revision_count"] == 1
             assert review["saved_effects"]["net_changed"] is True
-            return _make_raw_llm_response(
-                content=json.dumps(
-                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
-                )
+            return accounted_sdk_response(
+                _make_raw_llm_response(
+                    content=json.dumps(
+                        {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
+                    )
+                ),
+                model=kwargs["model"],
             )
 
         with (
@@ -2160,25 +2327,50 @@ class TestComposerSingleToolCall:
                 return_value=ValidationResult(is_valid=True, checks=[], errors=[]),
             ),
         ):
-            result = await service.compose(
+            compose_call = service.compose(
                 user_message_content,
                 [],
                 state,
                 session_id=session_id,
                 user_message_id=user_message_id,
             )
+            if early_reply_mode == "complete":
+                result = await compose_call
+            else:
+                expected_failure = (
+                    "No SDK response supplied for early" if early_reply_mode == "missing" else "SDK response for end cannot serve early"
+                )
+                with pytest.raises(AssertionError, match=expected_failure):
+                    await compose_call
+
+        if early_reply_mode != "complete":
+            assert transitions == ["primary", "early"]
+            assert len(primary_requests) == len(advisor_requests) == 1
+            assert mock_llm.call_count == 2
+            assert not reviews
+            stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
+            assert not any(
+                row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+                for row in stored
+            )
+            return
 
         _assert_checkpoint_reply(result, "Pipeline configured.", count=1, changed=True)
         assert len(primary_requests) == 3 and len(reviews) == 1
-        assert mock_llm.call_count == 4
+        assert transitions == expected_transitions
+        assert not advisor_reply_phases
+        assert len(advisor_requests) == (2 if start_empty else 1)
+        expected_call_count = 5 if start_empty else 4
+        assert mock_llm.call_count == expected_call_count
         assert reviews[0]["current_graph_hash"] == authored_state_hash(result.state)
+        assert all(manifest == graph_manifests[0] for manifest in graph_manifests)
         tool_names = [inv.tool_name for inv in result.tool_invocations]
         assert tool_names == ["set_pipeline", "preview_pipeline"]
         assert "create_blob" not in tool_names
         assert "set_source_from_blob" not in tool_names
         assert "upsert_node" not in tool_names
         assert "set_output" not in tool_names
-        assert len(result.llm_calls) == 4
+        assert len(result.llm_calls) == expected_call_count
         assert result.state.sources["source"] is not None
         assert "blob_ref" in result.state.sources["source"].options
         stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
@@ -2187,11 +2379,16 @@ class TestComposerSingleToolCall:
             for row in stored
             if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
         ]
-        assert len(passes) == 1
-        assert passes[0]["phase"] == "end" and passes[0]["source"] == "model"
-        assert passes[0]["publication_verdict"] == "ADMIT" and passes[0]["first_attempt_accepted"] is True
-        assert passes[0]["provider_attempts"] == 1
-        assert type(passes[0]["publication_binding"]) is str and len(passes[0]["publication_binding"]) == 64
+        assert [record["phase"] for record in passes] == (["early", "end"] if start_empty else ["end"])
+        for record in passes:
+            assert record["source"] == "model" and record["verdict"] == "clean"
+            assert record["first_attempt_schema_valid"] is True and record["first_attempt_accepted"] is True
+            assert record["provider_attempts"] == 1 and record["format_reprompt_sent"] is False
+            assert record["pass_index"] == 1
+        if start_empty:
+            assert passes[0]["publication_verdict"] is None and passes[0]["publication_binding"] is None
+        assert passes[-1]["publication_verdict"] == "ADMIT"
+        assert type(passes[-1]["publication_binding"]) is str and len(passes[-1]["publication_binding"]) == 64
 
 
 class TestComposerMultiTurnToolCalls:
@@ -2204,7 +2401,7 @@ class TestComposerMultiTurnToolCalls:
         state = _empty_state()
 
         # Turn 1: set_source
-        turn1 = _make_llm_response(
+        turn1 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_1",
@@ -2222,7 +2419,7 @@ class TestComposerMultiTurnToolCalls:
             ],
         )
         # Turn 2: set_metadata
-        turn2 = _make_llm_response(
+        turn2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_2",
@@ -2232,11 +2429,13 @@ class TestComposerMultiTurnToolCalls:
             ],
         )
         # Turn 3: text
-        turn3 = _make_llm_response(content="Pipeline configured.")
+        turn3 = _make_raw_llm_response(content="Pipeline configured.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3]
@@ -2275,13 +2474,13 @@ class TestComposerMultiTurnToolCalls:
         )
 
         # Turn 1: no tool calls -> END advisor gate runs, FLAGGED.
-        turn1 = _make_llm_response(content="Looks ready to me.")
+        turn1 = _make_raw_llm_response(content="Looks ready to me.")
         # Turn 2: a genuine repair tool call.
-        turn2 = _make_llm_response(
+        turn2 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
         # Turn 3: no tool calls again -> END advisor gate re-runs, CLEAN -> finalize.
-        turn3 = _make_llm_response(content="The pipeline name is now Repaired.")
+        turn3 = _make_raw_llm_response(content="The pipeline name is now Repaired.")
         reviews: list[AdvisorPublicationReview] = []
 
         async def _fake_advisor_checkpoint(*_args: object, **kwargs: Any) -> AdvisorCheckpointVerdict:
@@ -2301,23 +2500,27 @@ class TestComposerMultiTurnToolCalls:
 
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
+        iteration_elision_boundaries: list[tuple[int, ...]] = []
+        real_advance = service._advance_live_compose_iteration
 
-        async def _fake_call_llm(
-            messages: list[dict[str, Any]],
-            _tools: list[dict[str, Any]],
-            *,
-            provider_custody: object | None = None,
-            credential_state: object | None = None,
-            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-        ) -> Any:
+        async def observe_iteration(live: _ComposeIterationState, bindings: _ComposeIterationBindings) -> ComposerResult | None:
+            try:
+                return await real_advance(live, bindings)
+            finally:
+                iteration_elision_boundaries.append(tuple(live.pending_advisor_elision_indices))
+
+        async def _fake_call_llm(**kwargs: Any) -> Any:
+            messages = kwargs["messages"]
             captured_messages.append(list(messages))
             return next(responses)
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
+
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service, "_advance_live_compose_iteration", new=observe_iteration),
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=_fake_advisor_checkpoint),
         ):
@@ -2355,6 +2558,7 @@ class TestComposerMultiTurnToolCalls:
         assert captured_messages[2][: len(turn2_minus_exchange)] == turn2_minus_exchange
         roles = [m.get("role") for m in captured_messages[2]]
         assert all(pair != ("assistant", "assistant") for pair in itertools.pairwise(roles))
+        assert tuple(bool(indexes) for indexes in iteration_elision_boundaries) == (True, False, False)
 
     @pytest.mark.asyncio
     async def test_flagged_repair_clean_replaces_every_public_and_persisted_echo_surface(self) -> None:
@@ -2411,19 +2615,18 @@ class TestComposerMultiTurnToolCalls:
         findings = "\n".join((f"FLAGGED: {false_claim}", foreign_repair, *sentinels))
         echoed_primary_prose = f"The advisor says {false_claim}. {foreign_repair} {' '.join(sentinels)}"
         responses = [
-            _make_llm_response(content="The pipeline is ready."),
-            _make_llm_response(
+            _make_raw_llm_response(content="The pipeline is ready."),
+            _make_raw_llm_response(
                 content=echoed_primary_prose,
                 tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
             ),
-            _make_llm_response(content=echoed_primary_prose),
+            _make_raw_llm_response(content=echoed_primary_prose),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         reviews: list[dict[str, Any]] = []
 
-        async def review_echo(
-            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
-        ) -> tuple[str, dict[str, object]]:
+        async def review_echo(**kwargs: Any) -> Any:
+            arguments = advisor_call.await_args.args[0]
             review = json.loads(arguments["publication_review"].payload_json)
             reviews.append(review)
             assert len(reviews) <= 2, "Only two END responses are supplied"
@@ -2431,10 +2634,8 @@ class TestComposerMultiTurnToolCalls:
             assert review["candidate_reply"] == ("The pipeline is ready.", echoed_primary_prose)[len(reviews) - 1]
             assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
             assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
-            if on_provider_dispatch is not None:
-                on_provider_dispatch()
             flagged = len(reviews) == 1
-            return json.dumps(
+            content = json.dumps(
                 {
                     "verdict": "FLAGGED" if flagged else "CLEAN",
                     "category": "other",
@@ -2445,16 +2646,25 @@ class TestComposerMultiTurnToolCalls:
                     # findings and internal sentinels in the candidate reply.
                     "publication_verdict": "WITHHOLD",
                 }
-            ), {}
+            )
+            return _make_raw_llm_response(content=content)
+
+        sdk_script = ComposerSDKScript(
+            primary_model=service._settings.composer_model,
+            primary=responses,
+            advisor_model=service._settings.composer_advisor_model,
+        )
+        primary_call = sdk_script.primary
+        sdk_script.advisor.side_effect = review_echo
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as primary_call,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=review_echo,
+                wraps=service._advisor_checkpoint._call_advisor_with_audit,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2565,9 +2775,9 @@ class TestComposerMultiTurnToolCalls:
             version=1,
         )
         llm_responses = [
-            _make_llm_response(content="Looks ready."),
-            _make_llm_response(tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}]),
-            _make_llm_response(content="The pipeline name is now Repaired."),
+            _make_raw_llm_response(content="Looks ready."),
+            _make_raw_llm_response(tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}]),
+            _make_raw_llm_response(content="The pipeline name is now Repaired."),
         ]
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         prior_finding = "FLAGGED: sink omits rating"
@@ -2576,9 +2786,8 @@ class TestComposerMultiTurnToolCalls:
         )  # type: ignore[method-assign]
         reviews = []
 
-        async def rereview(
-            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
-        ) -> tuple[str, dict[str, object]]:
+        async def rereview(**kwargs: Any) -> Any:
+            arguments = advisor_call.await_args.args[0]
             review = json.loads(arguments["publication_review"].payload_json)
             reviews.append(review)
             assert len(reviews) <= 2, "Only the original two review responses are supplied"
@@ -2586,10 +2795,8 @@ class TestComposerMultiTurnToolCalls:
             assert review["candidate_reply"] == ("Looks ready.", "The pipeline name is now Repaired.")[len(reviews) - 1]
             assert review["saved_effects"]["saved_revision_count"] == len(reviews) - 1
             assert review["saved_effects"]["net_changed"] is (len(reviews) == 2)
-            if on_provider_dispatch is not None:
-                on_provider_dispatch()
             flagged = len(reviews) == 1
-            return json.dumps(
+            content = json.dumps(
                 {
                     "verdict": "FLAGGED" if flagged else "CLEAN",
                     "category": "other",
@@ -2598,16 +2805,25 @@ class TestComposerMultiTurnToolCalls:
                     "note": "Add the rating field to the sink output." if flagged else None,
                     "publication_verdict": "WITHHOLD" if flagged else "ADMIT",
                 }
-            ), {}
+            )
+            return _make_raw_llm_response(content=content)
+
+        sdk_script = ComposerSDKScript(
+            primary_model=service._settings.composer_model,
+            primary=llm_responses,
+            advisor_model=service._settings.composer_advisor_model,
+        )
+        primary_call = sdk_script.primary
+        sdk_script.advisor.side_effect = rereview
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses) as primary_call,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=rereview,
+                wraps=service._advisor_checkpoint._call_advisor_with_audit,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2668,9 +2884,8 @@ class TestComposerMultiTurnToolCalls:
         )  # type: ignore[method-assign]
         reviewed: list[dict[str, Any]] = []
 
-        async def rereview(
-            arguments: dict[str, Any], *, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any
-        ) -> tuple[str, dict[str, object]]:
+        async def rereview(**kwargs: Any) -> Any:
+            arguments = advisor_call.await_args.args[0]
             review = json.loads(arguments["publication_review"].payload_json)
             reviewed.append(review)
             assert len(reviewed) <= 2, "Only two END responses are supplied"
@@ -2678,9 +2893,7 @@ class TestComposerMultiTurnToolCalls:
             assert review["candidate_reply"] == ("Looks ready.", "The pipeline has no configured output.")[len(reviewed) - 1]
             assert review["saved_effects"]["saved_revision_count"] == 0
             assert review["saved_effects"]["net_changed"] is False
-            if on_provider_dispatch is not None:
-                on_provider_dispatch()
-            return json.dumps(
+            content = json.dumps(
                 {
                     "verdict": "FLAGGED",
                     "category": "other",
@@ -2689,24 +2902,28 @@ class TestComposerMultiTurnToolCalls:
                     "note": "Configure a pipeline output.",
                     "publication_verdict": "WITHHOLD",
                 }
-            ), {}
+            )
+            return _make_raw_llm_response(content=content)
+
+        sdk_script = ComposerSDKScript(
+            primary_model=service._settings.composer_model,
+            primary=[
+                _make_raw_llm_response(content="Looks ready."),
+                _make_raw_llm_response(content="The pipeline has no configured output."),
+            ],
+            advisor_model=service._settings.composer_advisor_model,
+        )
+        primary_call = sdk_script.primary
+        sdk_script.advisor.side_effect = rereview
 
         with (
-            patch.object(
-                service._provider_gateway,
-                "_call_llm",
-                new_callable=AsyncMock,
-                side_effect=[
-                    _make_llm_response(content="Looks ready."),
-                    _make_llm_response(content="The pipeline has no configured output."),
-                ],
-            ) as primary_call,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
                 "_call_advisor_with_audit",
                 new_callable=AsyncMock,
-                side_effect=rereview,
+                wraps=service._advisor_checkpoint._call_advisor_with_audit,
             ) as advisor_call,
         ):
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -2746,24 +2963,20 @@ class TestComposerMultiTurnToolCalls:
         provider context. Without it the next call shows a user-role repair
         message answering an assistant turn the model cannot see."""
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-        replies = [_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")]
+        replies = [_make_raw_llm_response(content="Looks ready."), _make_raw_llm_response(content="Still ready.")]
         provider_contexts: list[list[dict[str, Any]]] = []
 
-        async def scripted_call_llm(
-            messages: list[dict[str, Any]],
-            tools: list[dict[str, Any]],
-            *,
-            provider_custody: object | None = None,
-            credential_state: object | None = None,
-            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-        ) -> Any:
+        async def scripted_call_llm(**kwargs: Any) -> Any:
+            messages = kwargs["messages"]
             provider_contexts.append([dict(item) for item in messages])
             return replies[len(provider_contexts) - 1]
 
+        sdk_script = ComposerSDKScript(primary_model=service._settings.composer_model, primary=[])
+
+        sdk_script.primary.side_effect = scripted_call_llm
+
         with (
-            patch.object(service._provider_gateway, "_call_llm", side_effect=scripted_call_llm),
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
@@ -2793,13 +3006,13 @@ class TestComposerMultiTurnToolCalls:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
 
+        sdk_script = ComposerSDKScript(
+            primary_model=service._settings.composer_model,
+            primary=[_make_raw_llm_response(content="Looks ready."), _make_raw_llm_response(content="Still ready.")],
+        )
+
         with (
-            patch.object(
-                service._provider_gateway,
-                "_call_llm",
-                new_callable=AsyncMock,
-                side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
-            ),
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
@@ -2840,10 +3053,13 @@ class TestComposerMultiTurnToolCalls:
         outage = AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="advisor unavailable", failure_class="unavailable")
         state = self._wired_source_only_state()
 
+        sdk_script = ComposerSDKScript(
+            primary_model=service._settings.composer_model, primary=[_make_raw_llm_response(content="Looks ready.")]
+        )
+        primary_call = sdk_script.primary
+
         with (
-            patch.object(
-                service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[_make_llm_response(content="Looks ready.")]
-            ) as primary_call,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(
                 service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])
             ) as preflight,
@@ -2931,12 +3147,12 @@ class TestComposerMultiTurnToolCalls:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
-            _make_llm_response(content="Looks ready to me."),
-            _make_llm_response(
+            _make_raw_llm_response(content="Looks ready to me."),
+            _make_raw_llm_response(
                 content="Renaming it as the review asked.",
                 tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
             ),
-            _make_llm_response(content="The pipeline name is now Repaired."),
+            _make_raw_llm_response(content="The pipeline name is now Repaired."),
         ]
         reviews: list[AdvisorPublicationReview] = []
 
@@ -2955,8 +3171,10 @@ class TestComposerMultiTurnToolCalls:
                 publication_binding=review.binding,
             )
 
+        sdk_script = ComposerSDKScript(primary_model=service._settings.composer_model, primary=responses)
+
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
             patch.object(
                 service._advisor_checkpoint,
@@ -3019,16 +3237,16 @@ class TestComposerMultiTurnToolCalls:
             version=1,
         )
 
-        turn1 = _make_llm_response(content="Looks ready to me.")
+        turn1 = _make_raw_llm_response(content="Looks ready to me.")
         # Turn 2: discovery only — no mutation. Must NOT drain.
-        turn2 = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
+        turn2 = _make_raw_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
         # Turn 3: a metadata mutation drains the exchange, but cannot repair
         # the missing output or authorize a completion claim.
-        turn3 = _make_llm_response(
+        turn3 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
         # The final no-tool reply requires a new independent END review.
-        turn4 = _make_llm_response(content="Pipeline is ready.")
+        turn4 = _make_raw_llm_response(content="Pipeline is ready.")
         replies = [turn1, turn2, *([turn3] if mutate_after_discovery else []), turn4]
         responses = iter(replies)
         captured_messages: list[list[dict[str, Any]]] = []
@@ -3047,16 +3265,8 @@ class TestComposerMultiTurnToolCalls:
                     )
                 )
 
-        async def _fake_call_llm(
-            messages: list[dict[str, Any]],
-            _tools: list[dict[str, Any]],
-            *,
-            provider_custody: object | None = None,
-            credential_state: object | None = None,
-            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-        ) -> Any:
+        async def _fake_call_llm(**kwargs: Any) -> Any:
+            messages = kwargs["messages"]
             assert len(captured_messages) < len(replies), "Only the original finite primary responses are supplied"
             captured_messages.append(deepcopy(messages))
             revision_snapshots.append(saved_revisions())
@@ -3104,15 +3314,19 @@ class TestComposerMultiTurnToolCalls:
             )
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=settings.composer_model, primary=[], advisor_model=settings.composer_advisor_model)
+        mock_llm = sdk_script.primary
+        advisor_sdk = sdk_script.advisor
+        advisor_sdk.side_effect = review_completion
+
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(litellm, "acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight) as preflight,
             patch.object(
                 service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 side_effect=_REAL_RUN_ADVISOR_CHECKPOINT.__get__(service._advisor_checkpoint, AdvisorCheckpointOwner),
             ) as checkpoints,
-            patch.object(litellm, "acompletion", side_effect=review_completion) as advisor_sdk,
         ):
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state, session_id=session_id)
@@ -3239,11 +3453,11 @@ class TestComposerMultiTurnToolCalls:
             version=1,
         )
 
-        turn1 = _make_llm_response(content="Looks ready to me.")
-        turn2 = _make_llm_response(
+        turn1 = _make_raw_llm_response(content="Looks ready to me.")
+        turn2 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
         )
-        turn3 = _make_llm_response(content="Should be fine now.")
+        turn3 = _make_raw_llm_response(content="Should be fine now.")
 
         verdicts = iter(
             [
@@ -3258,22 +3472,17 @@ class TestComposerMultiTurnToolCalls:
         responses = iter([turn1, turn2, turn3])
         captured_messages: list[list[dict[str, Any]]] = []
 
-        async def _fake_call_llm(
-            messages: list[dict[str, Any]],
-            _tools: list[dict[str, Any]],
-            *,
-            provider_custody: object | None = None,
-            credential_state: object | None = None,
-            prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-            prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-            prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-        ) -> Any:
+        async def _fake_call_llm(**kwargs: Any) -> Any:
+            messages = kwargs["messages"]
             captured_messages.append(list(messages))
             return next(responses)
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
+
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
         ):
@@ -3378,15 +3587,17 @@ class TestComposerConvergence:
         state = _empty_state()
 
         # Two different discovery tools to avoid cache hits
-        disc1 = _make_llm_response(
+        disc1 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
         )
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            mock_llm.side_effect = [disc1, disc2, _make_llm_response(content="Exploration complete.")]
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
+            mock_llm.side_effect = [disc1, disc2, _make_raw_llm_response(content="Exploration complete.")]
             result = await service.compose("Explore the available plugins", [], state, session_id=session_id)
         assert mock_llm.await_count == 3
         assert result.raw_assistant_content == "Exploration complete."
@@ -3401,7 +3612,7 @@ class TestComposerConvergence:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        mut = _make_llm_response(
+        mut = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -3411,7 +3622,7 @@ class TestComposerConvergence:
             ],
         )
         # Bonus call also returns tool calls — convergence error
-        mut2 = _make_llm_response(
+        mut2 = _make_raw_llm_response(
             content=content,
             tool_calls=[
                 {
@@ -3422,7 +3633,9 @@ class TestComposerConvergence:
             ],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [mut, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Keep mutating", [], state, session_id=session_id)
@@ -3437,7 +3650,7 @@ class TestComposerConvergence:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        mut = _make_llm_response(
+        mut = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -3446,11 +3659,13 @@ class TestComposerConvergence:
                 }
             ],
         )
-        text = _make_llm_response(content=marker + "Done after final correction.")
+        text = _make_raw_llm_response(content=marker + "Done after final correction.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [mut, text]
@@ -3475,11 +3690,11 @@ class TestComposerConvergence:
         state = _empty_state()
 
         # Turn 1: discovery (list_sources) — discovery counter = 1
-        disc = _make_llm_response(
+        disc = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
         )
         # Turn 2: mutation (set_metadata) — composition counter = 1
-        mut = _make_llm_response(
+        mut = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -3489,11 +3704,13 @@ class TestComposerConvergence:
             ],
         )
         # Turn 3: text response — loop terminates
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [disc, mut, text]
@@ -3521,7 +3738,7 @@ class TestFailedMutationBudgetClassification:
         # Turn 1: set_source with missing required key → KeyError
         # This is a mutation tool, so even though it fails, it should
         # charge composition budget (1/1 → exhausted).
-        bad_mutation = _make_llm_response(
+        bad_mutation = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -3532,7 +3749,7 @@ class TestFailedMutationBudgetClassification:
         )
         # Bonus call (composition exhausted gives one last chance) also
         # returns a tool call → convergence error
-        bad_mutation2 = _make_llm_response(
+        bad_mutation2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -3542,7 +3759,9 @@ class TestFailedMutationBudgetClassification:
             ],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [bad_mutation, bad_mutation2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Setup source", [], state, session_id=session_id)
@@ -3569,7 +3788,7 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg = FakeMessage(content=None, tool_calls=[call])
-        response = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg)]))
+        response = FakeLLMResponse(choices=[FakeChoice(message=msg)])
 
         # Bonus call also fails
         call2 = FakeToolCall(
@@ -3580,9 +3799,11 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg2 = FakeMessage(content=None, tool_calls=[call2])
-        response2 = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg2)]))
+        response2 = FakeLLMResponse(choices=[FakeChoice(message=msg2)])
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [response, response2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Setup source", [], state, session_id=session_id)
@@ -3608,19 +3829,21 @@ class TestFailedMutationBudgetClassification:
             ),
         )
         msg = FakeMessage(content=None, tool_calls=[call])
-        response = _admit_composer_llm_completion(FakeLLMResponse(choices=[FakeChoice(message=msg)]))
+        response = FakeLLMResponse(choices=[FakeChoice(message=msg)])
 
         # Turn 2: another discovery call
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [
                 response,
                 disc2,
-                _make_llm_response(tool_calls=[{"id": "c3", "name": "set_metadata", "arguments": {"patch": {"name": "first"}}}]),
-                _make_llm_response(tool_calls=[{"id": "c4", "name": "set_metadata", "arguments": {"patch": {"name": "second"}}}]),
+                _make_raw_llm_response(tool_calls=[{"id": "c3", "name": "set_metadata", "arguments": {"patch": {"name": "first"}}}]),
+                _make_raw_llm_response(tool_calls=[{"id": "c4", "name": "set_metadata", "arguments": {"patch": {"name": "second"}}}]),
             ]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Explore", [], state, session_id=session_id)
@@ -3636,9 +3859,11 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
         # Turn 1: invalid tool
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -3648,9 +3873,9 @@ class TestComposerErrorHandling:
             ],
         )
         # Turn 2: text response (self-corrected)
-        text = _make_llm_response(content="Sorry, let me try again.")
+        text = _make_raw_llm_response(content="Sorry, let me try again.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch("litellm.acompletion", new=sdk):
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Do something", [], state, session_id=session_id)
 
@@ -3665,6 +3890,8 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
         supplied_arguments = {"plugin": "csv"}
         declared_required = tuple(tool_registry._DECLARATIONS_BY_NAME["set_source"].json_schema["required"])
         missing = tuple(name for name in declared_required if name not in supplied_arguments)
@@ -3672,7 +3899,7 @@ class TestComposerErrorHandling:
         missing_detail = ", ".join(missing)
 
         # Turn 1: set_source with missing required field
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -3682,14 +3909,14 @@ class TestComposerErrorHandling:
             ],
         )
         # Turn 2: text
-        text = _make_llm_response(content="No pipeline changes were saved.")
+        text = _make_raw_llm_response(content="No pipeline changes were saved.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text)
+        with patch("litellm.acompletion", new=sdk):
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -3719,9 +3946,11 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
         # Turn 1: tool call that triggers ToolArgumentError from Tier 3 type guard
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -3736,7 +3965,7 @@ class TestComposerErrorHandling:
             ],
         )
         # Turn 2: LLM self-corrects
-        text = _make_llm_response(content="Fixed.")
+        text = _make_raw_llm_response(content="Fixed.")
 
         with (
             patch(
@@ -3747,13 +3976,13 @@ class TestComposerErrorHandling:
                     actual_type="int",
                 ),
             ),
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
         ):
-            script = _ReconciliationLLMScript(bad_call, text)
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -3774,8 +4003,10 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -3814,14 +4045,14 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Recovered.")
+        text = _make_raw_llm_response(content="Recovered.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text)
+        with patch("litellm.acompletion", new=sdk):
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -3853,8 +4084,10 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
-        good_call = _make_llm_response(
+        good_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_ok",
@@ -3899,18 +4132,18 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="No pipeline changes were saved.")
+        text = _make_raw_llm_response(content="No pipeline changes were saved.")
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
-            script = _ReconciliationLLMScript(good_call, text)
+            script = _RawReconciliationSDKScript(good_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         # The pre-dispatch validator must not have rejected the call.
         # Verify by inspecting the tool-result message content: the
@@ -3943,8 +4176,10 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
-        partial_call = _make_llm_response(
+        partial_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_partial",
@@ -3985,14 +4220,14 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Adjusted.")
+        text = _make_raw_llm_response(content="Adjusted.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(partial_call, text)
+        with patch("litellm.acompletion", new=sdk):
+            script = _RawReconciliationSDKScript(partial_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -4018,10 +4253,12 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
         # Provide all required arguments so pre-validation passes,
         # but patch execute_tool to raise a KeyError from "internal logic"
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -4037,13 +4274,13 @@ class TestComposerErrorHandling:
         )
 
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=KeyError("internal_state_key"),
             ),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=session_id)
         # The underlying KeyError is preserved on the wrapper so callers
@@ -4060,9 +4297,11 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
         # set_source requires plugin, on_success, options, on_validation_failure
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -4071,14 +4310,14 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Ok.")
+        text = _make_raw_llm_response(content="Ok.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text)
+        with patch("litellm.acompletion", new=sdk):
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             await service.compose("Setup", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         # Verify the error message sent back to the LLM mentions the missing keys
         tool_msg = script.prompts[1][-1]  # last message in second call
@@ -4094,8 +4333,10 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -4104,20 +4345,20 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Recovered.")
+        text = _make_raw_llm_response(content="Recovered.")
 
         with (
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_execute_tool,
             ) as mock_execute_tool,
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
         ):
-            script = _ReconciliationLLMScript(bad_call, text)
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -4137,8 +4378,10 @@ class TestComposerErrorHandling:
         settings = _make_settings()
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
 
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -4147,21 +4390,21 @@ class TestComposerErrorHandling:
                 }
             ],
         )
-        text = _make_llm_response(content="Recovered.")
+        text = _make_raw_llm_response(content="Recovered.")
 
         with (
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 wraps=_execute_tool,
             ) as mock_execute_tool,
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
         ):
             mock_llm.side_effect = [bad_call, text]
             result = await service.compose("Explore", [], state, session_id=session_id)
 
         _assert_checkpoint_reply(result, "Recovered.", count=0)
         mock_execute_tool.assert_not_called()
-        tool_msg = mock_llm.call_args_list[1][0][0][-1]
+        tool_msg = mock_llm.call_args_list[1].kwargs["messages"][-1]
         error_content = json.loads(tool_msg["content"])
         assert "arguments must be a JSON object" in error_content["error"]
 
@@ -4433,7 +4676,7 @@ class TestBuildMessages:
 
         with (
             fenced_operation_context(service._session_engine, session_id) as operation,
-            patch("elspeth.web.composer.service.build_messages", side_effect=_raise_oserror),
+            patch("elspeth.web.composer.continuation_message_builders.build_messages", side_effect=_raise_oserror),
             pytest.raises(ComposerServiceError) as excinfo,
         ):
             service._build_messages([], state, "Hi", session_id=session_id, session_operation_context=operation)
@@ -4466,7 +4709,7 @@ class TestComposerMultipleToolCallsPerTurn:
         state = _empty_state()
 
         # Turn 1: two tool calls in one response
-        multi_call = _make_llm_response(
+        multi_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_1",
@@ -4489,11 +4732,13 @@ class TestComposerMultipleToolCallsPerTurn:
             ],
         )
         # Turn 2: text
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [multi_call, text]
@@ -4511,7 +4756,7 @@ class TestDiscoveryCache:
     async def test_one_compose_call_threads_one_snapshot_object(self) -> None:
         """Prompt and every tool dispatch share one principal snapshot."""
 
-        from elspeth.web.composer import service as service_module
+        from elspeth.web.composer import continuation_message_builders as message_builders
         from elspeth.web.composer import tool_batch as tool_batch_module
         from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
         from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -4536,7 +4781,7 @@ class TestDiscoveryCache:
             sessions_service=_test_sessions_service(engine, Path(settings.data_dir)),
             session_engine=engine,
         )
-        real_build_messages = service_module.build_messages
+        real_build_messages = message_builders.build_messages
         real_execute_tool = tool_batch_module.execute_tool
 
         def capture_prompt(*args: Any, **kwargs: Any) -> Any:
@@ -4547,11 +4792,12 @@ class TestDiscoveryCache:
             tool_snapshots.append(kwargs["plugin_snapshot"])
             return real_execute_tool(*args, **kwargs)
 
-        discovery = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
-        final = _make_llm_response(content="Done.")
+        discovery = _make_raw_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
+        final = _make_raw_llm_response(content="Done.")
+        script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[discovery, final])
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=[discovery, final]),
-            patch.object(service_module, "build_messages", side_effect=capture_prompt),
+            patch("litellm.acompletion", new=script),
+            patch.object(message_builders, "build_messages", side_effect=capture_prompt),
             patch.object(tool_batch_module, "execute_tool", side_effect=capture_tool),
         ):
             await service.compose("List sources", [], _empty_state(), user_id="user-1", session_id=session_id)
@@ -4575,16 +4821,18 @@ class TestDiscoveryCache:
         # Turn 1: list_sources (first call — executes, charges discovery: 1/2)
         # Turn 2: list_sources AGAIN (cache hit — no budget charge)
         # Turn 3: text
-        disc1 = _make_llm_response(
+        disc1 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
         )
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "list_sources", "arguments": {}}],
         )
-        text = _make_llm_response(content="Found sources.")
+        text = _make_raw_llm_response(content="Found sources.")
 
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
             mock_llm.side_effect = [disc1, disc2, text]
@@ -4615,13 +4863,13 @@ class TestDiscoveryCache:
         service, session_id = _composer_service_with_session(catalog, _make_settings())
         arguments = {"plugin_type": "source", "name": "missing_plugin"}
         responses = [
-            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_plugin_schema", "arguments": arguments}])
+            _make_raw_llm_response(tool_calls=[{"id": call_id, "name": "get_plugin_schema", "arguments": arguments}])
             for call_id in ("c1", "c2")
         ]
         if change_state:
             responses.insert(
                 1,
-                _make_llm_response(
+                _make_raw_llm_response(
                     tool_calls=[
                         {
                             "id": "mutation",
@@ -4636,9 +4884,11 @@ class TestDiscoveryCache:
                     ]
                 ),
             )
-        responses.append(_make_llm_response(content="That plugin is unavailable."))
+        responses.append(_make_raw_llm_response(content="That plugin is unavailable."))
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload", wraps=cached_discovery_payload) as cache_payload,
             patch.object(service._preflight, "runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
@@ -4649,7 +4899,7 @@ class TestDiscoveryCache:
         cache_payload.assert_not_called()
         tool_messages = [
             message
-            for message in completion.call_args_list[-1][0][0]
+            for message in completion.call_args_list[-1].kwargs["messages"]
             if message["role"] == "tool" and message["tool_call_id"] in ("c1", "c2")
         ]
         assert len(tool_messages) == 2
@@ -4684,10 +4934,10 @@ class TestDiscoveryCache:
         service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
-        disc1 = _make_llm_response(
+        disc1 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": tool_name, "arguments": {}}],
         )
-        mutate = _make_llm_response(
+        mutate = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -4704,14 +4954,16 @@ class TestDiscoveryCache:
                 }
             ],
         )
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c3", "name": tool_name, "arguments": {}}],
         )
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk),
             patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
         ):
@@ -4720,9 +4972,9 @@ class TestDiscoveryCache:
 
         assert result.state.version == 2
         assert dispatch.call_count == 2  # one discovery miss and one mutation
-        cached_tool_message = mock_llm.call_args_list[3][0][0][-1]
+        cached_tool_message = mock_llm.call_args_list[3].kwargs["messages"][-1]
         cached_payload = json.loads(cached_tool_message["content"])
-        first_message = next(message for message in mock_llm.call_args_list[3][0][0] if message.get("tool_call_id") == "c1")
+        first_message = next(message for message in mock_llm.call_args_list[3].kwargs["messages"] if message.get("tool_call_id") == "c1")
         first_payload = json.loads(first_message["content"])
         assert first_payload["version"] == 1
         assert cached_payload["data"] == first_payload["data"]
@@ -4753,11 +5005,13 @@ class TestDiscoveryCache:
             success=True, updated_state=state, validation=state.validate(), affected_nodes=(), data={"unexpected": "producer bug"}
         )
         responses = [
-            _make_llm_response(tool_calls=[{"id": "bad-response", "name": tool_name, "arguments": {}}]),
-            _make_llm_response(content="This must never see malformed output."),
+            _make_raw_llm_response(tool_calls=[{"id": "bad-response", "name": tool_name, "arguments": {}}]),
+            _make_raw_llm_response(content="This must never see malformed output."),
         ]
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", return_value=malformed),
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
             patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4794,12 +5048,14 @@ class TestDiscoveryCache:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
-            _make_llm_response(tool_calls=[{"id": call_id, "name": tool_name, "arguments": {"unexpected": 1}}])
+            _make_raw_llm_response(tool_calls=[{"id": call_id, "name": tool_name, "arguments": {"unexpected": 1}}])
             for call_id in ("invalid-1", "invalid-2")
         ]
-        responses.append(_make_llm_response(content="The arguments were invalid."))
+        responses.append(_make_raw_llm_response(content="The arguments were invalid."))
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
@@ -4808,7 +5064,7 @@ class TestDiscoveryCache:
         assert dispatch.call_count == 2
         cache_payload.assert_not_called()
         assert [entry.status for entry in result.tool_invocations] == [ComposerToolStatus.ARG_ERROR, ComposerToolStatus.ARG_ERROR]
-        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        messages = [message for message in completion.call_args_list[-1].kwargs["messages"] if message["role"] == "tool"]
         assert len(messages) == 2
         assert all("error" in json.loads(message["content"]) for message in messages)
 
@@ -4833,12 +5089,14 @@ class TestDiscoveryCache:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
-            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            _make_raw_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("miss", "corrupt-hit")
         ]
-        responses.append(_make_llm_response(content="This must never see corrupt cached output."))
+        responses.append(_make_raw_llm_response(content="This must never see corrupt cached output."))
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload", side_effect=corrupt_cache) as cache_payload,
             patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4850,7 +5108,7 @@ class TestDiscoveryCache:
         assert cache_payload.call_count == 1
         assert completion.call_count == 2
         assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
-        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        messages = [message for message in completion.call_args_list[-1].kwargs["messages"] if message["role"] == "tool"]
         assert [message["tool_call_id"] for message in messages] == ["miss"]
 
     @pytest.mark.asyncio
@@ -4863,12 +5121,14 @@ class TestDiscoveryCache:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
-            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            _make_raw_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("failed-1", "failed-2")
         ]
-        responses.append(_make_llm_response(content="Discovery was unavailable."))
+        responses.append(_make_raw_llm_response(content="Discovery was unavailable."))
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+            patch("litellm.acompletion", new=sdk),
             patch.object(tool_batch_module, "execute_tool", side_effect=fail_discovery) as dispatch,
             patch.object(tool_batch_module, "_cached_discovery_payload") as cache_payload,
         ):
@@ -4876,7 +5136,7 @@ class TestDiscoveryCache:
 
         assert dispatch.call_count == 2
         cache_payload.assert_not_called()
-        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        messages = [message for message in completion.call_args_list[-1].kwargs["messages"] if message["role"] == "tool"]
         assert len(messages) == 2
         for message in messages:
             envelope = json.loads(message["content"])
@@ -4892,10 +5152,12 @@ class TestDiscoveryCache:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         responses = [
-            _make_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
+            _make_raw_llm_response(tool_calls=[{"id": call_id, "name": "get_expression_grammar", "arguments": {}}])
             for call_id in ("miss", "encoder-failure")
         ]
-        responses.append(_make_llm_response(content="This must never see failed encoder output."))
+        responses.append(_make_raw_llm_response(content="This must never see failed encoder output."))
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=responses)
+        completion = sdk.primary
         with contextlib.ExitStack() as patches:
 
             def fail_hit_encoder(*args: Any, **kwargs: Any) -> Any:
@@ -4905,7 +5167,7 @@ class TestDiscoveryCache:
                 return admitted
 
             with (
-                patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock, side_effect=responses) as completion,
+                patch("litellm.acompletion", new=sdk),
                 patch.object(tool_batch_module, "execute_tool", wraps=_strict_execute_tool) as dispatch,
                 patch.object(tool_batch_module, "admitted_result_from_cached_discovery_payload", side_effect=fail_hit_encoder),
                 patch.object(BufferingRecorder, "record", autospec=True, side_effect=BufferingRecorder.record) as record,
@@ -4916,7 +5178,7 @@ class TestDiscoveryCache:
         assert dispatch.call_count == 1
         assert completion.call_count == 2
         assert [call.args[1].status for call in record.call_args_list] == [ComposerToolStatus.SUCCESS, ComposerToolStatus.PLUGIN_CRASH]
-        messages = [message for message in completion.call_args_list[-1][0][0] if message["role"] == "tool"]
+        messages = [message for message in completion.call_args_list[-1].kwargs["messages"] if message["role"] == "tool"]
         assert [message["tool_call_id"] for message in messages] == ["miss"]
 
     @pytest.mark.asyncio
@@ -4927,7 +5189,7 @@ class TestDiscoveryCache:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        schema1 = _make_llm_response(
+        schema1 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -4936,7 +5198,7 @@ class TestDiscoveryCache:
                 }
             ],
         )
-        schema2 = _make_llm_response(
+        schema2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -4945,9 +5207,11 @@ class TestDiscoveryCache:
                 }
             ],
         )
-        text = _make_llm_response(content="Got schemas.")
+        text = _make_raw_llm_response(content="Got schemas.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
+        with patch("litellm.acompletion", new=sdk):
             mock_llm.side_effect = [schema1, schema2, text]
             await service.compose("Get schemas", [], state, session_id=session_id)
 
@@ -4965,7 +5229,7 @@ class TestDiscoveryCache:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        mut1 = _make_llm_response(
+        mut1 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -4974,7 +5238,7 @@ class TestDiscoveryCache:
                 }
             ],
         )
-        mut2 = _make_llm_response(
+        mut2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -4983,9 +5247,11 @@ class TestDiscoveryCache:
                 }
             ],
         )
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk.primary
+        with patch("litellm.acompletion", new=sdk):
             mock_llm.side_effect = [mut1, mut2, text]
             result = await service.compose("Update metadata", [], state, session_id=session_id)
 
@@ -5184,10 +5450,32 @@ class TestComposeTimeout:
         """EARLY expiry publishes the completed tool turn before timeout."""
         import time
 
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+        from elspeth.web.composer import provider_gateway
+        from elspeth.web.composer.audit import llm_call_audit_envelope
+
         service, session_id = _composer_service_with_session(
             catalog=_mock_catalog(),
             settings=_make_settings(composer_timeout_seconds=1.0),
         )
+        sessions = service._require_sessions_service()
+        created_calls = []
+        settled_calls = []
+        original_build = provider_gateway.build_llm_call_record
+        original_settle = type(sessions).finish_provider_attempt
+
+        def observe_build(**kwargs):
+            call = original_build(**kwargs)
+            created_calls.append(call)
+            return call
+
+        async def observe_settle(owner, **kwargs):
+            assert owner is sessions
+            settled_calls.append(kwargs["call"])
+            return await original_settle(owner, **kwargs)
+
+        monkeypatch.setattr(provider_gateway, "build_llm_call_record", observe_build)
+        monkeypatch.setattr(type(sessions), "finish_provider_attempt", observe_settle)
         service._advisor_checkpoint._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(
             service._advisor_checkpoint, AdvisorCheckpointOwner
         )  # type: ignore[method-assign]
@@ -5218,19 +5506,22 @@ class TestComposeTimeout:
                 data=None,
             )
 
-        async def mutation_response(*_args: object, **_kwargs: object) -> Any:
-            return _make_llm_response(
-                tool_calls=[
-                    {
-                        "id": "source-1",
-                        "name": "set_source",
-                        "arguments": source_arguments,
-                    }
-                ]
-            )
-
+        script = ComposerSDKScript(
+            primary_model=service._provider_gateway._model,
+            primary=[
+                _make_raw_llm_response(
+                    tool_calls=[
+                        {
+                            "id": "source-1",
+                            "name": "set_source",
+                            "arguments": source_arguments,
+                        }
+                    ]
+                )
+            ],
+        )
         with (
-            patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=mutation_response),
+            patch("litellm.acompletion", new=script),
             patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
             pytest.raises(ComposerConvergenceError) as exc_info,
@@ -5240,17 +5531,48 @@ class TestComposeTimeout:
         assert advisor_call.await_count == 0
         checkpoint_persist.assert_not_awaited()
         assert exc_info.value.budget_exhausted == "timeout"
-        assert exc_info.value.llm_calls == ()
+        assert script.primary.await_count == 1
+        assert len(created_calls) == len(settled_calls) == len(exc_info.value.llm_calls) == 1
+        primary_call = exc_info.value.llm_calls[0]
+        assert primary_call is created_calls[0] is settled_calls[0]
+        assert primary_call.status is ComposerLLMCallStatus.SUCCESS
+        assert primary_call.model_requested == service._provider_gateway._model
         # Durable P4 audit must not be replayed from the exception payload.
         assert exc_info.value.tool_invocations == ()
-        sessions = service._require_sessions_service()
         with sessions._engine.connect() as conn:
+            attempts = conn.execute(
+                select(quota_provider_attempts_table).where(
+                    quota_provider_attempts_table.c.session_id == session_id,
+                )
+            ).all()
+            ledger = conn.execute(
+                select(token_usage_ledger_table).where(
+                    token_usage_ledger_table.c.session_id == session_id,
+                )
+            ).all()
+            audit_rows = conn.execute(
+                select(chat_messages_table.c.tool_calls).where(
+                    chat_messages_table.c.session_id == session_id,
+                    chat_messages_table.c.role == "audit",
+                    chat_messages_table.c.tool_calls.is_not(None),
+                )
+            ).all()
             tool_rows = conn.execute(
                 select(chat_messages_table.c.tool_call_id, chat_messages_table.c.composition_state_id).where(
                     chat_messages_table.c.session_id == session_id,
                     chat_messages_table.c.role == "tool",
                 )
             ).all()
+        assert len(attempts) == len(ledger) == 1
+        assert attempts[0].attempt_id == primary_call.call_id
+        assert attempts[0].settled_at is not None
+        assert attempts[0].ledger_entry_id == ledger[0].entry_id
+        assert attempts[0].identity_id == ledger[0].identity_id
+        assert attempts[0].source == ledger[0].source == "composer"
+        assert ledger[0].prompt_tokens == primary_call.prompt_tokens
+        assert ledger[0].completion_tokens == primary_call.completion_tokens
+        public_calls = [item for row in audit_rows for item in row.tool_calls if item["_kind"] == "llm_call_audit"]
+        assert public_calls == [llm_call_audit_envelope(primary_call)]
         assert len(tool_rows) == 1
         assert tool_rows[0].tool_call_id == "source-1"
         assert tool_rows[0].composition_state_id is not None
@@ -5292,13 +5614,22 @@ class TestComposeTimeout:
                 success=True, updated_state=updated_state, validation=updated_state.validate(), affected_nodes=("source",), data=None
             )
 
+        script = ComposerSDKScript(
+            primary_model=service._provider_gateway._model,
+            primary=[
+                _make_raw_llm_response(
+                    tool_calls=[
+                        {
+                            "id": "source-1",
+                            "name": "set_source",
+                            "arguments": source_arguments,
+                        }
+                    ]
+                )
+            ],
+        )
         with (
-            patch.object(
-                service,
-                "_call_llm_before_deadline",
-                new_callable=AsyncMock,
-                return_value=_make_llm_response(tool_calls=[{"id": "source-1", "name": "set_source", "arguments": source_arguments}]),
-            ),
+            patch("litellm.acompletion", new=script),
             patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock, side_effect=failure) as advisor,
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
             pytest.raises(error_type) as raised,
@@ -5376,7 +5707,7 @@ class TestComposeTimeout:
             call_count += 1
             if call_count == 1:
                 # First call: return tool call (fast)
-                return _make_llm_response(
+                return _make_raw_llm_response(
                     tool_calls=[
                         {
                             "id": "c1",
@@ -5394,8 +5725,10 @@ class TestComposeTimeout:
             # capture path without depending on wall-clock scheduling.
             raise TimeoutError
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        sdk_script.primary.side_effect = first_tool_then_timeout_llm
         with (
-            patch.object(service._provider_gateway, "_call_llm", new=first_tool_then_timeout_llm),
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_slow_mutation_tool,
@@ -5438,7 +5771,7 @@ class TestConvergenceProgressDispatch:
         async def record_progress(event: ComposerProgressEvent) -> None:
             progress_events.append(event)
 
-        mut1 = _make_llm_response(
+        mut1 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -5447,7 +5780,7 @@ class TestConvergenceProgressDispatch:
                 }
             ],
         )
-        mut2 = _make_llm_response(
+        mut2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -5457,7 +5790,9 @@ class TestConvergenceProgressDispatch:
             ],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [mut1, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("loop forever", [], state, progress=record_progress, session_id=session_id)
@@ -5479,14 +5814,16 @@ class TestConvergenceProgressDispatch:
         async def record_progress(event: ComposerProgressEvent) -> None:
             progress_events.append(event)
 
-        disc1 = _make_llm_response(
+        disc1 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
         )
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [disc1, disc2, TimeoutError()]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("discover forever", [], state, progress=record_progress, session_id=session_id)
@@ -5544,7 +5881,9 @@ class TestConvergenceProgressDispatch:
             async def record(event: ComposerProgressEvent) -> None:
                 events.append(event)
 
-            with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+            sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+            mock_llm = sdk_script.primary
+            with patch("litellm.acompletion", new=sdk_script):
                 mock_llm.side_effect = llm_side_effect
                 with contextlib.suppress(ComposerConvergenceError):
                     await service.compose("x", [], state, progress=record, session_id=session_id)
@@ -5554,14 +5893,14 @@ class TestConvergenceProgressDispatch:
         composition_reason = await collect_failure_reason(
             _make_settings(composer_max_composition_turns=1),
             [
-                _make_llm_response(tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "x"}}}]),
-                _make_llm_response(tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "y"}}}]),
+                _make_raw_llm_response(tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "x"}}}]),
+                _make_raw_llm_response(tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "y"}}}]),
             ],
         )
 
         async def slow(*args: Any, **kwargs: Any) -> Any:
             await asyncio.sleep(1.0)
-            return _make_llm_response(content="late")
+            return _make_raw_llm_response(content="late")
 
         timeout_reason = await collect_failure_reason(
             _make_settings(composer_timeout_seconds=0.1),
@@ -5585,7 +5924,7 @@ class TestPartialStatePreservation:
         state = _empty_state()
 
         # Turn 1: mutation (set_source) — composition budget exhausted (1/1)
-        mut = _make_llm_response(
+        mut = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -5603,7 +5942,7 @@ class TestPartialStatePreservation:
             ],
         )
         # Bonus call also returns tool calls — convergence error
-        mut2 = _make_llm_response(
+        mut2 = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c2",
@@ -5613,7 +5952,9 @@ class TestPartialStatePreservation:
             ],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [mut, mut2]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Build pipeline", [], state, session_id=session_id)
@@ -5631,14 +5972,16 @@ class TestPartialStatePreservation:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        disc1 = _make_llm_response(
+        disc1 = _make_raw_llm_response(
             tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
         )
-        disc2 = _make_llm_response(
+        disc2 = _make_raw_llm_response(
             tool_calls=[{"id": "c2", "name": "list_transforms", "arguments": {}}],
         )
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
             mock_llm.side_effect = [disc1, disc2, TimeoutError()]
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Just looking", [], state, session_id=session_id)
@@ -5868,7 +6211,7 @@ class TestEmptyChoicesValidation:
 
         with (
             patch(
-                "elspeth.web.composer.provider_gateway._litellm_acompletion",
+                "litellm.acompletion",
                 new_callable=AsyncMock,
                 side_effect=[mutation_call, empty_response],
             ) as mock_acomp,
@@ -6275,7 +6618,7 @@ class TestPluginBugCrashesFromToolExecution:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6290,14 +6633,16 @@ class TestPluginBugCrashesFromToolExecution:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("invalid expression syntax — plugin bug"),
             ),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=session_id)
         # Crash on first tool call → no prior mutations → partial_state is None.
@@ -6313,7 +6658,7 @@ class TestPluginBugCrashesFromToolExecution:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6328,14 +6673,16 @@ class TestPluginBugCrashesFromToolExecution:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=TypeError("NoneType + int — plugin bug"),
             ),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=session_id)
         assert exc_info.value.partial_state is None
@@ -6350,7 +6697,7 @@ class TestPluginBugCrashesFromToolExecution:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6365,14 +6712,16 @@ class TestPluginBugCrashesFromToolExecution:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "plugin bug"),
             ),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=session_id)
         assert exc_info.value.partial_state is None
@@ -6402,7 +6751,7 @@ class TestPluginBugCrashesFromToolExecution:
 
         # Two tool calls in a single LLM turn: first succeeds (mutates
         # state), second raises a plugin-bug exception.
-        two_calls = _make_llm_response(
+        two_calls = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6445,14 +6794,16 @@ class TestPluginBugCrashesFromToolExecution:
                 return successful_result
             raise ValueError("plugin bug: crash AFTER first mutation")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_fake_execute_tool,
             ),
         ):
-            mock_llm.return_value = two_calls
+            mock_llm.side_effect = [two_calls]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=session_id)
 
@@ -6472,7 +6823,7 @@ class TestPluginBugCrashesFromToolExecution:
         service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6486,10 +6837,12 @@ class TestPluginBugCrashesFromToolExecution:
                 }
             ],
         )
-        text = _make_llm_response(content="Got it, trying again.")
+        text = _make_raw_llm_response(content="Got it, trying again.")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ToolArgumentError(
@@ -6499,11 +6852,11 @@ class TestPluginBugCrashesFromToolExecution:
                 ),
             ),
         ):
-            script = _ReconciliationLLMScript(valid_call, text)
+            script = _RawReconciliationSDKScript(valid_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         assert isinstance(result, ComposerResult)
         second_call_messages = script.prompts[1]
@@ -6556,7 +6909,7 @@ class TestPluginBugCrashesFromToolExecution:
 
         service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
         state = _empty_state()
-        tool_call = _make_llm_response(
+        tool_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6570,7 +6923,7 @@ class TestPluginBugCrashesFromToolExecution:
                 }
             ],
         )
-        text = _make_llm_response(content="Got it.")
+        text = _make_raw_llm_response(content="Got it.")
         leaky = ToolArgumentError(
             argument=f"field_{canary}",
             expected=f"the secret path /srv/{canary}",
@@ -6583,15 +6936,17 @@ class TestPluginBugCrashesFromToolExecution:
             BaseException.__setattr__(leaky, private_name, canary)
         BaseException.__setattr__(leaky, "_tool_argument_error_sealed", False)
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=leaky),
         ):
-            script = _ReconciliationLLMScript(tool_call, text)
+            script = _RawReconciliationSDKScript(tool_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Setup", [], state, session_id=session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         second_call_messages = script.prompts[1]
         prompt_blob = json.dumps(second_call_messages, sort_keys=True)
@@ -6672,7 +7027,7 @@ class TestPluginCrashSessionPersistence:
         )
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6687,14 +7042,16 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug: /etc/secrets/bootstrap.key is bad"),
             ),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=self.session_id)
         # The underlying plugin exception is preserved on the wrapper.
@@ -6762,7 +7119,7 @@ class TestPluginCrashSessionPersistence:
         )
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6781,8 +7138,10 @@ class TestPluginCrashSessionPersistence:
             mutation.side_effect = OperationalError("UPDATE sessions", {}, Exception("db unavailable"))
             raise ValueError("original plugin bug")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=fail_tool,
@@ -6794,7 +7153,7 @@ class TestPluginCrashSessionPersistence:
             ) as mutation,
             capture_logs() as cap_logs,
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=self.session_id)
         # Original plugin exception survives the wrap.
@@ -6854,7 +7213,7 @@ class TestPluginCrashSessionPersistence:
         )
         state = _empty_state()
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -6869,15 +7228,17 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
             ),
             capture_logs() as cap_logs,
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=self.session_id)
         assert isinstance(exc_info.value.original_exc, ValueError)
@@ -7012,7 +7373,7 @@ class TestPluginCrashSessionPersistence:
             persist_thread = threading.current_thread()
             return original_mutate(context, mutation)
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -7027,15 +7388,17 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=ValueError("plugin bug"),
             ),
             patch.object(authority, "mutate", side_effect=capture_thread),
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError):
                 await service.compose("Setup", [], state, session_id=self.session_id)
 
@@ -7159,7 +7522,7 @@ class TestPluginCrashSessionPersistence:
         state = _empty_state()
         authority = sessions_service.session_operation_authority
 
-        valid_call = _make_llm_response(
+        valid_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -7174,17 +7537,30 @@ class TestPluginCrashSessionPersistence:
             ],
         )
 
+        denied_rows: list[dict[str, Any]] = []
+        lost_fence = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+
+        def refuse_breadcrumb(*_args: Any, **_kwargs: Any) -> None:
+            # Original provider settlement and the crashed turn's P4 audit
+            # have completed before this distinct best-effort mutation.
+            with self.engine.connect() as conn:
+                row = conn.execute(sessions_table.select().where(sessions_table.c.id == self.session_id)).mappings().one()
+                denied_rows.append(dict(row))
+            raise lost_fence
+
         def fail_tool(*_args: Any, **_kwargs: Any) -> None:
-            mutation.side_effect = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+            mutation.side_effect = refuse_breadcrumb
             raise ValueError("plugin bug")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=fail_tool),
             patch.object(authority, "mutate", wraps=authority.mutate) as mutation,
             capture_logs() as cap_logs,
         ):
-            mock_llm.return_value = valid_call
+            mock_llm.side_effect = [valid_call]
             with pytest.raises(ComposerPluginCrashError) as exc_info:
                 await service.compose("Setup", [], state, session_id=self.session_id)
 
@@ -7194,11 +7570,11 @@ class TestPluginCrashSessionPersistence:
         assert persistence_failure_events[0]["audit_exc_class"] == "SessionOperationFenceLost"
         assert persistence_failure_events[0]["original_exc_class"] == "ValueError"
 
-        with self.engine.begin() as conn:
-            row = conn.execute(sessions_table.select().where(sessions_table.c.id == self.session_id)).one()
-        row_updated_at = row.updated_at
-        seeded = self.seeded_at.replace(tzinfo=None) if row_updated_at.tzinfo is None else self.seeded_at
-        assert row_updated_at == seeded, "a lost fence must not bump updated_at"
+        assert len(denied_rows) == 1, "the refused breadcrumb must be reached exactly once"
+        with self.engine.connect() as conn:
+            row_after = dict(conn.execute(sessions_table.select().where(sessions_table.c.id == self.session_id)).mappings().one())
+        assert row_after == denied_rows[0], "the failed breadcrumb must not write any session column"
+        assert row_after["updated_at"] == denied_rows[0]["updated_at"], "a lost fence must not bump updated_at"
 
 
 class TestToolExecutionThreadOffloading:
@@ -7211,8 +7587,8 @@ class TestToolExecutionThreadOffloading:
 
     @staticmethod
     async def _assert_tool_runs_off_event_loop(
-        tool_call_response: _AdmittedLLMCompletion,
-        text_response: _AdmittedLLMCompletion,
+        tool_call_response: FakeLLMResponse,
+        text_response: FakeLLMResponse,
         user_message: str,
     ) -> None:
         """Shared helper: verify a tool call executes in a worker thread."""
@@ -7237,8 +7613,10 @@ class TestToolExecutionThreadOffloading:
             tool_execution_thread = threading.current_thread()
             return _strict_execute_tool(_tool_name, _arguments, current_state, _catalog, **kwargs)
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_capture_thread,
@@ -7256,10 +7634,10 @@ class TestToolExecutionThreadOffloading:
     async def test_discovery_tool_runs_off_event_loop_thread(self) -> None:
         """Discovery tools run in a worker thread (read-only I/O)."""
         await self._assert_tool_runs_off_event_loop(
-            tool_call_response=_make_llm_response(
+            tool_call_response=_make_raw_llm_response(
                 tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}],
             ),
-            text_response=_make_llm_response(content="Here are the sources."),
+            text_response=_make_raw_llm_response(content="Here are the sources."),
             user_message="List sources",
         )
 
@@ -7272,7 +7650,7 @@ class TestToolExecutionThreadOffloading:
         requests in the single-process server.
         """
         await self._assert_tool_runs_off_event_loop(
-            tool_call_response=_make_llm_response(
+            tool_call_response=_make_raw_llm_response(
                 tool_calls=[
                     {
                         "id": "c1",
@@ -7286,7 +7664,7 @@ class TestToolExecutionThreadOffloading:
                     }
                 ],
             ),
-            text_response=_make_llm_response(content="Source configured."),
+            text_response=_make_raw_llm_response(content="Source configured."),
             user_message="Set CSV source",
         )
 
@@ -7336,7 +7714,7 @@ class TestToolExecutionThreadOffloading:
 
         # Use a mutation tool — the original bug was specifically about
         # mutation tools running synchronously on the event loop.
-        tool_call = _make_llm_response(
+        tool_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "c1",
@@ -7350,10 +7728,12 @@ class TestToolExecutionThreadOffloading:
                 }
             ],
         )
-        text = _make_llm_response(content="Done.")
+        text = _make_raw_llm_response(content="Done.")
 
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
         with (
-            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch(
                 "elspeth.web.composer.tool_batch.execute_tool",
                 side_effect=_blocking_tool,
@@ -7876,7 +8256,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         )
         state = _empty_state()
 
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -7889,14 +8269,16 @@ class TestToolArgumentErrorAcrossThreadBoundary:
                 }
             ],
         )
-        text = _make_llm_response(content="Fixed.")
+        text = _make_raw_llm_response(content="Fixed.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text)
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         assert result.state == state
         assert result.runtime_preflight is None
@@ -7962,7 +8344,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
             )
         blob_id = create_result.data["blob_id"]
 
-        bad_call = _make_llm_response(
+        bad_call = _make_raw_llm_response(
             tool_calls=[
                 {
                     "id": "call_bad",
@@ -7975,14 +8357,16 @@ class TestToolArgumentErrorAcrossThreadBoundary:
                 }
             ],
         )
-        text = _make_llm_response(content="Fixed.")
+        text = _make_raw_llm_response(content="Fixed.")
 
-        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-            script = _ReconciliationLLMScript(bad_call, text)
+        sdk_script = ComposerSDKScript(primary_model=service._provider_gateway._model, primary=[])
+        mock_llm = sdk_script.primary
+        with patch("litellm.acompletion", new=sdk_script):
+            script = _RawReconciliationSDKScript(bad_call, text)
             mock_llm.side_effect = script.respond
             result = await service.compose("Set up the pipeline.", [], state, session_id=self.session_id)
 
-        _assert_reconciliation_turn(mock_llm, script)
+        _assert_raw_reconciliation_turn(mock_llm, script)
 
         _assert_no_mutation_empty_state_blocker(
             result,
@@ -9967,15 +10351,17 @@ class TestComposeLoopForcedRepair:
             tool_calls=None,
         )
 
+        repaired_prose = "I have not inspected the uploaded CSV or built or saved a workflow. The requested task is not complete."
+        repaired = _make_llm_response(content=repaired_prose)
         empty = _empty_state()
         request = 'Build from my uploaded CSV using this specification: "CSV source to JSON output; preserve every observed column".'
         user_message_id = _insert_user_message(self.engine, self.session_id, request)
         script = _PlannerPublicationLLMScript(
             self.service,
             request,
-            (turn1_stall,),
-            phases=("planner", "end"),
-            publication_verdicts=("WITHHOLD",),
+            (turn1_stall, repaired),
+            phases=("planner", "end", "planner", "end"),
+            publication_verdicts=("WITHHOLD", "ADMIT"),
             findings="The header-only claim lacks current source inspection, and the authorized uploaded-source build remains unstarted.",
         )
         with _real_planner_publication_sdk(script):
@@ -9989,16 +10375,32 @@ class TestComposeLoopForcedRepair:
             )
 
         script.assert_finished()
-        assert len(script.planner_requests) == 1
+        _assert_checkpoint_reply(result, repaired_prose, count=0, changed=False)
+        assert len(script.planner_requests) == 2 and len(result.llm_calls) == 4
         assert result.repair_turns_used == 0
         assert result.state is empty
+        assert await self.service._require_sessions_service().get_current_state(UUID(self.session_id)) is None
         assert result.tool_invocations == ()
         assert turn1_stall.message.content not in result.message
         assert "without calling any build/edit tool" not in result.message
-        review = json.loads(script.end_inputs[0].payload_json)
-        assert review["saved_effects"]["saved_revision_count"] == 0
-        assert review["saved_effects"]["net_changed"] is False
-        assert review["inspection"]["currently_available"] == []
+        assert [json.loads(review.payload_json)["candidate_reply"] for review in script.end_inputs] == [
+            turn1_stall.message.content,
+            repaired_prose,
+        ]
+        for reviewed in script.end_inputs:
+            review = json.loads(reviewed.payload_json)
+            assert review["saved_effects"]["saved_revision_count"] == 0
+            assert review["saved_effects"]["net_changed"] is False
+            assert review["inspection"]["currently_available"] == []
+            assert "source_metadata_currently_available" not in review["inspection"]
+            assert "source_metadata_historically_delivered" not in review["inspection"]
+        repair_messages = script.planner_requests[1]["messages"]
+        assert any(message["role"] == "assistant" and message["content"] == turn1_stall.message.content for message in repair_messages)
+        assert any(
+            message["role"] == "user"
+            and "A prose-only correction is valid; do not mutate the graph merely to satisfy this review." in message["content"]
+            for message in repair_messages
+        )
 
     @pytest.mark.asyncio
     async def test_inspect_source_receipt_reaches_actual_end_after_planner_delivery(self) -> None:
@@ -10028,7 +10430,7 @@ class TestComposeLoopForcedRepair:
                 user_message_id=user_message_id,
             )
         script.assert_finished()
-        assert result.message == done.message.content
+        _assert_checkpoint_reply(result, "The uploaded source metadata has been inspected.", count=0, changed=False)
         assert result.state == _empty_state()
         inspection_messages = [
             message
@@ -10063,8 +10465,10 @@ class TestComposeLoopForcedRepair:
 
     @pytest.mark.asyncio
     async def test_planner_proposes_authorized_fallback_for_unsupported_from_json(self, tmp_path: Path) -> None:
-        """The provider proposes the accepted routing fallback as one full pipeline."""
+        """The common provider authors and END reviews the accepted atomic routing fallback."""
         from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.turn_effects import authored_state_hash
         from elspeth.web.sessions.models import blobs_table
 
         event_blob_id = str(uuid4())
@@ -10105,9 +10509,9 @@ class TestComposeLoopForcedRepair:
             ]
         )
         fallback = self._from_json_fallback_pipeline_tool_calls(event_blob_id)[0]["arguments"]
-        propose = _make_llm_response(
-            tool_calls=[{"id": "fallback-proposal", "name": "emit_pipeline_proposal", "arguments": {"pipeline": fallback}}]
-        )
+        propose = _make_llm_response(tool_calls=[{"id": "fallback-proposal", "name": "set_pipeline", "arguments": fallback}])
+        assert json.loads(propose.tool_batch.calls[0].function.arguments) == {"pipeline": fallback}
+        done = _make_llm_response(content="Configured the requested routing fallback.")
 
         empty = _empty_state()
         request = (
@@ -10118,8 +10522,9 @@ class TestComposeLoopForcedRepair:
         script = _PlannerPublicationLLMScript(
             self.service,
             request,
-            (discover, propose),
-            phases=("planner", "planner"),
+            (discover, propose, done),
+            phases=("planner", "planner", "early", "planner", "end"),
+            publication_verdicts=("ADMIT",),
         )
         with (
             _real_planner_publication_sdk(script),
@@ -10135,22 +10540,52 @@ class TestComposeLoopForcedRepair:
             )
 
         script.assert_finished()
-        assert len(script.planner_requests) == 2
+        assert len(script.planner_requests) == 3
         assert result.repair_turns_used == 0
-        assert result.state is empty
-        assert result.pipeline_commit_intent is not None
-        authority = await self.service._require_sessions_service().get_authoritative_pipeline_proposal(
-            session_id=UUID(self.session_id), proposal_id=result.pipeline_commit_intent.proposal_id
-        )
-        proposal = authority.proposal.to_dict()
-        assert proposal["draft_hash"] == result.pipeline_commit_intent.draft_hash
-        assert proposal["pipeline"]["source"]["blob_id"] == event_blob_id
-        assert {node["id"] for node in proposal["pipeline"]["nodes"]} == {"gate_signup", "gate_upgrade"}
-        assert {output["sink_name"] for output in proposal["pipeline"]["outputs"]} == {"signups", "upgrades", "other"}
-        assert all(node["node_type"] == "gate" for node in proposal["pipeline"]["nodes"])
-        assert "from_json" not in json.dumps(proposal["pipeline"])
+        assert result.state is not empty
+        assert result.pipeline_commit_intent is None
+        _assert_checkpoint_reply(result, "Configured the requested routing fallback.", count=1, changed=True)
+        assert [inv.tool_name for inv in result.tool_invocations] == ["get_expression_grammar", "set_pipeline"]
+        assert len(result.llm_calls) == 5
+        pipeline = result.state.to_dict()
+        assert pipeline["sources"]["source"]["options"]["blob_ref"] == event_blob_id
+        assert {node["id"] for node in pipeline["nodes"]} == {"gate_signup", "gate_upgrade"}
+        assert {output["name"] for output in pipeline["outputs"]} == {"signups", "upgrades", "other"}
+        assert all(node["node_type"] == "gate" for node in pipeline["nodes"])
+        assert [(node["input"], node["condition"], node["routes"]) for node in pipeline["nodes"]] == [
+            (node["input"], node["condition"], node["routes"]) for node in fallback["nodes"]
+        ]
+        assert "from_json" not in json.dumps(pipeline)
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
-        assert await self.service._require_sessions_service().get_current_state(UUID(self.session_id)) is None
+        current = await self.service._require_sessions_service().get_current_state(UUID(self.session_id))
+        assert current is not None
+        assert deep_thaw(current.sources) == pipeline["sources"]
+        assert deep_thaw(current.nodes) == pipeline["nodes"]
+        assert deep_thaw(current.edges) == pipeline["edges"]
+        assert deep_thaw(current.outputs) == pipeline["outputs"]
+        assert deep_thaw(current.metadata_) == pipeline["metadata"]
+        review = json.loads(script.end_inputs[-1].payload_json)
+        assert review["current_request"] == request
+        assert review["candidate_reply"] == done.message.content
+        assert review["current_graph_hash"] == authored_state_hash(result.state)
+        assert review["saved_effects"]["saved_revision_count"] == 1
+        assert review["saved_effects"]["net_changed"] is True
+        stored = await self.service._require_sessions_service().get_messages(UUID(self.session_id), limit=None)
+        passes = [
+            row.tool_calls[0]["pass"]
+            for row in stored
+            if row.role == "audit" and row.tool_calls and row.tool_calls[0]["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert [record["phase"] for record in passes] == ["early", "end"]
+        for record in passes:
+            assert record["source"] == "model" and record["verdict"] == "clean"
+            assert record["first_attempt_schema_valid"] is True and record["first_attempt_accepted"] is True
+            assert record["provider_attempts"] == 1 and record["format_reprompt_sent"] is False
+            assert record["pass_index"] == 1
+        assert passes[0]["publication_verdict"] is None and passes[0]["publication_binding"] is None
+        assert passes[-1]["publication_verdict"] == "ADMIT"
+        assert passes[-1]["publication_binding"] == script.end_inputs[-1].binding
+        assert storage_path.read_bytes() == body
 
     def _futile_repair_tool_call(self, call_id: str, name_value: str) -> list[dict[str, Any]]:
         """Tool call that mutates state but does NOT clear the proof blocker.
@@ -10187,14 +10622,17 @@ class TestComposeLoopForcedRepair:
           - is_valid True (no blocking diagnostic remaining)
         """
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
-        turn1 = _make_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls())
-        turn2_done = _make_llm_response(content="All set.", tool_calls=None)
-        turn3 = _make_llm_response(content=None, tool_calls=self._repair_tool_call())
-        turn4_done = _make_llm_response(content="Repaired and ready.", tool_calls=None)
+        turn1 = _make_raw_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls())
+        turn2_done = _make_raw_llm_response(content="All set.", tool_calls=None)
+        turn3 = _make_raw_llm_response(content=None, tool_calls=self._repair_tool_call())
+        turn4_done = _make_raw_llm_response(content="Repaired and ready.", tool_calls=None)
 
         empty = _empty_state()
+        sdk_script = ComposerSDKScript(primary_model=self.service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
+
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2_done, turn3, turn4_done]
@@ -10218,7 +10656,7 @@ class TestComposeLoopForcedRepair:
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
         # The synthesised repair message reaches the LLM history before
         # turn 3 — inspect the messages of turn 3 (index 2).
-        turn3_messages = mock_llm.call_args_list[2].args[0]
+        turn3_messages = mock_llm.call_args_list[2].kwargs["messages"]
         repair_msgs = [
             m
             for m in turn3_messages
@@ -10261,17 +10699,20 @@ class TestComposeLoopForcedRepair:
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         turns = [
-            _make_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls()),
-            _make_llm_response(content="claim 1", tool_calls=None),
-            _make_llm_response(content=None, tool_calls=self._futile_repair_tool_call("call_a", "attempt-1")),
-            _make_llm_response(content="claim 2", tool_calls=None),
-            _make_llm_response(content=None, tool_calls=self._futile_repair_tool_call("call_b", "attempt-2")),
-            _make_llm_response(content="final", tool_calls=None),
+            _make_raw_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls()),
+            _make_raw_llm_response(content="claim 1", tool_calls=None),
+            _make_raw_llm_response(content=None, tool_calls=self._futile_repair_tool_call("call_a", "attempt-1")),
+            _make_raw_llm_response(content="claim 2", tool_calls=None),
+            _make_raw_llm_response(content=None, tool_calls=self._futile_repair_tool_call("call_b", "attempt-2")),
+            _make_raw_llm_response(content="final", tool_calls=None),
         ]
 
         empty = _empty_state()
+        sdk_script = ComposerSDKScript(primary_model=self.service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
+
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 self.service._advisor_checkpoint,
@@ -10331,15 +10772,18 @@ class TestComposeLoopForcedRepair:
         # (turns 2 and 3 since the cap is 2), the third claim-complete
         # finalises.
         turns = [
-            _make_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls()),
-            _make_llm_response(content="claim 1", tool_calls=None),
-            _make_llm_response(content="claim 2", tool_calls=None),
-            _make_llm_response(content="final", tool_calls=None),
+            _make_raw_llm_response(content=None, tool_calls=self._wire_blocking_pipeline_tool_calls()),
+            _make_raw_llm_response(content="claim 1", tool_calls=None),
+            _make_raw_llm_response(content="claim 2", tool_calls=None),
+            _make_raw_llm_response(content="final", tool_calls=None),
         ]
 
         empty = _empty_state()
+        sdk_script = ComposerSDKScript(primary_model=self.service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
+
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
             patch.object(
                 self.service._advisor_checkpoint,
@@ -10433,12 +10877,15 @@ class TestComposeLoopForcedRepair:
         # gate must fire here even though state.version was not advanced.
         # Turn 2: apply the repair. Turn 3: claim completion again, gate
         # finds no blocker, finalize cleanly.
-        turn1_done = _make_llm_response(content="Already configured.", tool_calls=None)
-        turn2_repair = _make_llm_response(content=None, tool_calls=self._repair_tool_call())
-        turn3_done = _make_llm_response(content="Repaired and ready.", tool_calls=None)
+        turn1_done = _make_raw_llm_response(content="Already configured.", tool_calls=None)
+        turn2_repair = _make_raw_llm_response(content=None, tool_calls=self._repair_tool_call())
+        turn3_done = _make_raw_llm_response(content="Repaired and ready.", tool_calls=None)
+
+        sdk_script = ComposerSDKScript(primary_model=self.service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
 
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done, turn2_repair, turn3_done]
@@ -10456,7 +10903,7 @@ class TestComposeLoopForcedRepair:
         assert result.repair_turns_used == 1
         # Turn 2 received the synthesised repair message before the model
         # acted on it — verify the diagnostic landed in the LLM history.
-        turn2_messages = mock_llm.call_args_list[1].args[0]
+        turn2_messages = mock_llm.call_args_list[1].kwargs["messages"]
         repair_msgs = [
             m
             for m in turn2_messages
@@ -10509,10 +10956,13 @@ class TestComposeLoopForcedRepair:
             version=4,
         )
 
-        turn1_done = _make_llm_response(content="All set.", tool_calls=None)
+        turn1_done = _make_raw_llm_response(content="All set.", tool_calls=None)
+
+        sdk_script = ComposerSDKScript(primary_model=self.service._settings.composer_model, primary=[])
+        mock_llm = sdk_script.primary
 
         with (
-            patch.object(self.service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch("litellm.acompletion", new=sdk_script),
             patch.object(self.service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done]

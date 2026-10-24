@@ -1,0 +1,49 @@
+"""Serial PG genuine ready/first-Compose current source, rollback and contention."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_actual_new_claim_constructs_or_consumes_first_compose_without_repeating_work as test_actual_new_claim_constructs_or_consumes_first_compose_without_repeating_work,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_cancelled_first_publication_joins_commit_and_read_only_replay as test_cancelled_first_publication_joins_commit_and_read_only_replay,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_cancelled_ready_cannot_publish_compose_under_owed_relief as test_cancelled_ready_cannot_publish_compose_under_owed_relief,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_constructed_first_compose_enters_original_guarded_primary_once as test_constructed_first_compose_enters_original_guarded_primary_once,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_current_first_compose_refuses_coherent_forward_rewrite_without_writes as test_current_first_compose_refuses_coherent_forward_rewrite_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_first_compose_refuses_changed_original_excluded_prefix as test_first_compose_refuses_changed_original_excluded_prefix,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_initial_capture_retains_actual_reader_and_rechecks_historical_blob_access as test_initial_capture_retains_actual_reader_and_rechecks_historical_blob_access,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_initial_compose_publication_rolls_back_complete_sql_then_replays as test_initial_compose_publication_rolls_back_complete_sql_then_replays,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_paid_ready_and_first_compose_replay_preserve_real_later_rename as test_paid_ready_and_first_compose_replay_preserve_real_later_rename,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_postcommit_restore_error_keeps_original_cut_and_retry_never_recaptures as test_postcommit_restore_error_keeps_original_cut_and_retry_never_recaptures,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_prepared_first_capture_refuses_real_source_or_skill_change_without_writes as test_prepared_first_capture_refuses_real_source_or_skill_change_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_ready_cannot_enter_existing_runtime_without_first_compose_publication as test_ready_cannot_enter_existing_runtime_without_first_compose_publication,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_real_ready_publishes_complete_first_compose_once as test_real_ready_publishes_complete_first_compose_once,
+)
+from tests.unit.web.sessions.test_continuation_composition_initialization import (
+    test_two_real_preparations_have_one_complete_initialization_commit as test_two_real_preparations_have_one_complete_initialization_commit,
+)
+
+pytestmark = pytest.mark.testcontainer

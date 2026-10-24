@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
@@ -536,6 +537,39 @@ class GraphRecoveryResponse:
 
 class ComposerServiceError(Exception):
     """Base exception for composer service errors."""
+
+
+class ComposerMutationAuthorityRevoked(ComposerServiceError):
+    http_status = 409
+
+    def __init__(
+        self,
+        *,
+        revocation: ComposerMutationRevocation,
+        llm_calls: tuple[ComposerLLMCall, ...],
+        failed_turn: FailedTurnMetadata | None,
+        state: CompositionState,
+        initial_version: int,
+    ) -> None:
+        if type(revocation) is not ComposerMutationRevocation:
+            raise TypeError("Mutation failure requires its actual owned revocation")
+        self.revocation = revocation
+        self.llm_calls = llm_calls
+        self.failed_turn = failed_turn
+        self.partial_state = state if state.version > initial_version else None
+        self.tool_invocations = ()
+        super().__init__(
+            "Automatic mutation authority was revoked. Review the saved session and tool evidence before sending another request."
+        )
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "error_type": "composer_mutation_authority_revoked",
+            "detail": str(self.args[0]),
+            "request_id": self.revocation.ceiling.request_id,
+            "initial_trust_mode": self.revocation.ceiling.initial_trust_mode,
+            "current_trust_mode": self.revocation.current_trust_mode,
+        }
 
 
 class ComposerAdmissionRefused(ComposerServiceError):
@@ -1774,6 +1808,8 @@ class ComposerService(Protocol):
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        *,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

@@ -648,27 +648,45 @@ def make_recorder() -> BufferingRecorder:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["early", "planner_decline"])
+@pytest.mark.parametrize("entry", ["early", "end"])
 @pytest.mark.parametrize("reason_code", ["invalid_request", "context_length_exceeded"])
 async def test_audit_only_request_rejection_paths_retain_closed_evidence(
     make_service, physical_advisor, nonempty_state, empty_state, monkeypatch, entry, reason_code
 ):
-    from decimal import Decimal
+    import hashlib
 
     from litellm.exceptions import BadRequestError
 
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
     from elspeth.contracts.provider_rejection import SafeRequestRejection
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
     from elspeth.web.composer.advisor_audit import AdvisorCheckpointPassRecord, AdvisorTerminalPublication
-    from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
-    from elspeth.web.composer.pipeline_planner import PlannerBudgetPolicy, PlannerContinuationBudget, PlannerDeclined
+    from elspeth.web.composer.advisor_decision import AdvisorGateBlocked
+    from elspeth.web.composer.advisor_output import advisor_response_format
+    from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
+    from elspeth.web.composer.discovery_cache import RuntimePreflightCache
     from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.sessions.models import token_usage_ledger_table
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history
+    from tests.helpers.advisor_review import parse_advisor_publication_review
 
     service = make_service()
     request = "Review the fixed synthetic pipeline."
     fenced = physical_advisor.bind(service, request=request)
+    service._interpretation_surfacing._sessions_service = physical_advisor.sessions
     failure = BadRequestError("PRIVATE_PROVIDER_BODY", model="advisor", llm_provider="openai", body={"code": reason_code})
     calls = _install_budget_advisor_transport(monkeypatch, [failure])
     recorder = make_recorder()
+    actual_checkpoint = service._advisor_checkpoint._run_advisor_checkpoint
+    verdicts = []
+
+    async def observe_checkpoint(**kwargs):
+        verdict = await actual_checkpoint(**kwargs)
+        verdicts.append(verdict)
+        return verdict
+
+    monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", observe_checkpoint)
+    assert physical_advisor.owner.cost_budget is None
     with prompt_guard_user_scope(""):
         if entry == "early":
             messages = []
@@ -681,55 +699,213 @@ async def test_audit_only_request_rejection_paths_retain_closed_evidence(
             )
             assert ran and messages == []  # Failed EARLY review remains advisory/nonblocking.
         else:
-            deadline = asyncio.get_running_loop().time() + 60
+            candidate = "Cannot assemble that pipeline."
             evidence = TurnEvidence(
                 session_id=fenced["session_id"],
                 session_operation_context=fenced["session_operation_context"],
                 request_id="audit-only-rejection",
                 request=request,
                 initial_state_id=None,
-                initial_state=nonempty_state,
+                initial_state=empty_state,
             )
-            budget = PlannerContinuationBudget(
-                policy=PlannerBudgetPolicy(1, 1_000_000, 100, Decimal("1")),
-                session_id=fenced["session_id"],
-                request_id="audit-only-rejection",
-                request_hash=stable_hash(request),
-                provider_owner=physical_advisor.owner,
-                evidence_owner=evidence,
-                deadline=deadline,
-                reserved_calls=0,
-                validated_cost=Decimal("0"),
-                cost_known=True,
-            )
-            result = await service._planning_application._review_planner_decline(
-                declined=PlannerDeclined("declined", decline_text="Cannot assemble that pipeline.", continuation_budget=budget),
-                candidate="Cannot assemble that pipeline.",
-                request=request,
-                request_id="audit-only-rejection",
-                state=nonempty_state,
+            outcome = await service._completion._evaluate_terminal_no_tool_advisor_gate(
+                state=empty_state,
+                turn_evidence=evidence,
+                current_state_id=None,
+                assistant_message=_AdmittedAssistantMessage(content=candidate),
+                llm_messages=[],
                 recorder=recorder,
                 progress=None,
-                turn_evidence=evidence,
-                deadline=deadline,
+                advisor_checkpoint_passes_used=0,
+                repair_turns_used=0,
+                persisted_assistant_message_id=None,
+                persisted_assistant_content=None,
+                persisted_tool_call_turn=False,
+                allow_repair_continue=False,
+                runtime_preflight=None,
+                user_message=request,
+                user_id="alice",
+                runtime_preflight_cache=RuntimePreflightCache(),
+                initial_version=empty_state.version,
+                session_scope=fenced["session_id"],
+                plugin_snapshot=None,
+                deadline=asyncio.get_running_loop().time() + 60,
                 **fenced,
             )
-            assert result.advisor_gate_decision is None
-            assert result.advisor_terminal_publication.reason == "budget_exhausted"
+            assert outcome.action == "return" and outcome.result is not None
+            assert outcome.advisor_passes_delta == 1
+            result = outcome.result
+            assert result.repair_turns_used == 0 and result.state is empty_state
+            decision = result.advisor_gate_decision
+            assert type(decision) is AdvisorGateBlocked
+            assert decision.fact.cause is AdvisorBlockCause.REQUEST_REJECTED
+            assert decision.fact.for_graph == completion_gate_fingerprint(empty_state)
+            publication = result.advisor_terminal_publication
+            assert type(publication) is AdvisorTerminalPublication
+            assert publication.branch == "terminal_block" and publication.reason == "request_rejected"
+            assert publication.preflight_shape == "absent" and publication.findings_backend_authored is False
+            assert decision.fact.request_rejection is publication.request_rejection
     assert len(calls) == 1 and len(recorder.llm_calls) == 1
+    assert len(verdicts) == 1
+    verdict = verdicts[0]
+    assert verdict.ok is False and verdict.failure_class == "request_rejected" and verdict.retryable is False
+    assert verdict.publication_verdict is None and verdict.publication_binding is None
+    assert verdict.provider_failure is not None and verdict.provider_failure.original is failure
+    recorded_call = recorder.llm_calls[0]
+    assert recorded_call.call_id is not None
+    assert recorded_call.status is ComposerLLMCallStatus.BAD_REQUEST_ERROR
+    assert recorded_call.error_class == "BadRequestError"
+    sdk_request = calls[0]
+    assert sdk_request["model"] == service._settings.composer_advisor_model
+    assert "tools" not in sdk_request
+    assert sdk_request["response_format"] == advisor_response_format(phase=entry)
+    assert recorded_call.messages_hash == stable_hash(sdk_request["messages"])
+    assert recorded_call.tools_spec_hash is None
+    if entry == "end":
+        review = parse_advisor_publication_review(sdk_request["messages"][1]["content"])
+        assert review["current_request"] == request and review["candidate_reply"] == candidate
+        assert review["saved_effects"]["saved_revision_count"] == 0
+        assert review["saved_effects"]["net_changed"] is False
+        assert verdict.provider_failure.details is publication.request_rejection
+
+    fence = fenced["session_operation_context"].fence
     with physical_advisor.engine.connect() as connection:
-        rows = connection.execute(select(chat_messages_table)).all()
+        rows = connection.execute(
+            select(chat_messages_table)
+            .where(chat_messages_table.c.session_id == fenced["session_id"])
+            .order_by(chat_messages_table.c.sequence_no)
+        ).all()
+        attempts = connection.execute(
+            select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == fenced["session_id"])
+        ).all()
+        ledger = connection.execute(
+            select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == fenced["session_id"])
+        ).all()
+    assert len(attempts) == len(ledger) == 1
+    attempt = attempts[0]
+    assert attempt.attempt_id == recorded_call.call_id
+    assert attempt.operation_id == fence.operation_id
+    assert attempt.operation_epoch == fence.operation_epoch and attempt.lease_token == fence.lease_token
+    assert attempt.settled_at is not None and attempt.ledger_entry_id == ledger[0].entry_id
+    assert attempt.identity_id == ledger[0].identity_id == "alice"
+    assert attempt.session_id == ledger[0].session_id == fenced["session_id"]
+    assert attempt.source == ledger[0].source == "composer"
+    assert ledger[0].model == recorded_call.model_requested
+    physical_advisor.coordinator.assert_completed()
     envelopes = [envelope for row in rows for envelope in (row.tool_calls or ())]
+    call_audits = [envelope["call"] for envelope in envelopes if envelope["_kind"] == "llm_call_audit"]
+    assert len(call_audits) == 1
+    assert call_audits[0]["call_id"] == recorded_call.call_id
+    assert call_audits[0]["status"] == ComposerLLMCallStatus.BAD_REQUEST_ERROR.value
+    assert call_audits[0]["messages_hash"] == recorded_call.messages_hash
+    assert call_audits[0]["tools_spec_hash"] is None
     kind = "advisor_checkpoint_pass_audit" if entry == "early" else "advisor_terminal_publication_audit"
     retained = [envelope for envelope in envelopes if envelope["_kind"] == kind]
     assert len(retained) == 1
     payload = retained[0]["pass" if entry == "early" else "publication"]
     details = SafeRequestRejection.from_wire(payload["request_rejection"])
     assert details.reason_code == reason_code and details.reason_source == "sdk_body"
-    assert details.diagnostic_reference == diagnostic_evidence_identity("provider-failure", recorder.llm_calls[0].call_id)
+    assert details.reason_disposition == "retained" and details.retryable is False
+    assert details.diagnostic_reference == diagnostic_evidence_identity("provider-failure", recorded_call.call_id)
     decoded = AdvisorCheckpointPassRecord.from_dict(payload) if entry == "early" else AdvisorTerminalPublication.from_dict(payload)
     assert decoded.request_rejection == details
-    assert "PRIVATE_PROVIDER_BODY" not in json.dumps(envelopes)
+    assert details == verdict.provider_failure.details
+    assert decoded.to_dict() == payload
+    passes = [envelope["pass"] for envelope in envelopes if envelope["_kind"] == "advisor_checkpoint_pass_audit"]
+    assert len(passes) == 1
+    checkpoint_pass = AdvisorCheckpointPassRecord.from_dict(passes[0])
+    assert checkpoint_pass.to_dict() == passes[0] and checkpoint_pass.request_rejection == details
+    assert checkpoint_pass.phase == entry and checkpoint_pass.pass_index == 1
+    assert checkpoint_pass.verdict == "request_rejected" and checkpoint_pass.source == "model"
+    assert checkpoint_pass.provider_attempts == 1
+    assert checkpoint_pass.first_attempt_schema_valid is None and checkpoint_pass.first_attempt_accepted is None
+    assert checkpoint_pass.format_reprompt_sent is False
+    assert checkpoint_pass.publication_verdict is None and checkpoint_pass.publication_binding is None
+    if entry == "end":
+        assert decoded == publication and decoded.request_rejection == decision.fact.request_rejection
+
+    private = [
+        ComposerDiagnosticEvidence.from_envelope(
+            envelope,
+            expected_session_id=fenced["session_id"],
+            expected_operation_id=fence.operation_id,
+            expected_tool_call_id=recorded_call.call_id,
+        )
+        for envelope in envelopes
+        if envelope["_kind"] == "composer_diagnostic_evidence"
+    ]
+    failures = [item for item in private if item.status == "provider_failure"]
+    requests = [item for item in private if item.status == "provider_request"]
+    assert len(failures) == len(requests) == 1
+    private_failure = failures[0]
+    assert private_failure.evidence_id == details.diagnostic_reference
+    assert private_failure.tool_call_id == recorded_call.call_id and private_failure.operation_epoch == attempt.operation_epoch
+    assert private_failure.result.disposition == "retained" and private_failure.result.content is not None
+    assert "PRIVATE_PROVIDER_BODY" in private_failure.result.content
+    private_request = requests[0]
+    assert private_request.evidence_id == diagnostic_evidence_identity("provider-request", recorded_call.call_id)
+    assert private_request.tool_call_id == recorded_call.call_id and private_request.operation_epoch == attempt.operation_epoch
+    assert private_request.arguments.disposition == "retained" and private_request.arguments.content is not None
+    context = json.loads(private_request.arguments.content)
+    assert context == {
+        "schema_version": "composer.provider-context.v1",
+        "capture_boundary": "prepared_litellm_messages_and_tools",
+        "messages": sdk_request["messages"],
+        "tools": None,
+    }
+    assert "PRIVATE_PROVIDER_BODY" not in json.dumps(details.to_wire(), ensure_ascii=False)
+    assert all("PRIVATE_PROVIDER_BODY" not in row.content for row in rows)
+    assert all(
+        "PRIVATE_PROVIDER_BODY" not in json.dumps(envelope, ensure_ascii=False)
+        for envelope in envelopes
+        if envelope["_kind"] != "composer_diagnostic_evidence"
+    )
+    if entry == "end":
+        exposed = (
+            result.message
+            + (result.raw_assistant_content or "")
+            + result.runtime_preflight.model_dump_json()
+            + json.dumps(publication.to_dict(), ensure_ascii=False)
+            + decision.fact.detail
+            + (decision.fact.suggestion or "")
+            + (decision.fact.note or "")
+        )
+        assert "PRIVATE_PROVIDER_BODY" not in exposed
+        assert candidate not in result.message and candidate not in (result.raw_assistant_content or "")
+        withheld_rows = [row for row in rows if any(envelope["_kind"] == "composer_withheld_reply" for envelope in (row.tool_calls or ()))]
+        assert len(withheld_rows) == 1
+        withheld = withheld_rows[0]
+        assert withheld.role == "audit" and withheld.writer_principal == "compose_loop" and withheld.content == candidate
+        assert withheld.tool_calls == [
+            {
+                "_kind": "composer_withheld_reply",
+                "schema": "composer.withheld-reply.v1",
+                "origin": "advisor_publication_withheld",
+                "content_hash": hashlib.sha256(candidate.encode("utf-8")).hexdigest(),
+            }
+        ]
+        publication_rows = [
+            row for row in rows if any(envelope["_kind"] == "advisor_terminal_publication_audit" for envelope in (row.tool_calls or ()))
+        ]
+        disclosure_rows = [
+            row for row in rows if any(envelope.get("origin") == "advisor_signoff_withheld" for envelope in (row.tool_calls or ()))
+        ]
+        assert len(publication_rows) == len(disclosure_rows) == 1
+        assert withheld.sequence_no < disclosure_rows[0].sequence_no < publication_rows[0].sequence_no
+        history = _composer_chat_history(await physical_advisor.sessions.get_messages(uuid.UUID(fenced["session_id"]), limit=None))
+        assert candidate not in json.dumps(history, ensure_ascii=False)
+        assert "PRIVATE_PROVIDER_BODY" not in json.dumps(history, ensure_ascii=False)
+    fenced_writes = [
+        write
+        for write in physical_advisor.sessions.add_message.await_args_list
+        if any(
+            envelope["_kind"] in {"advisor_checkpoint_pass_audit", "advisor_terminal_publication_audit", "composer_withheld_reply"}
+            or envelope.get("origin") == "advisor_signoff_withheld"
+            for envelope in (write.kwargs.get("tool_calls") or ())
+        )
+    ]
+    assert len(fenced_writes) == (1 if entry == "early" else 4)
+    assert all(write.kwargs["session_operation_context"] is fenced["session_operation_context"] for write in fenced_writes)
 
 
 def test_advisor_checkpoint_telemetry_counter_uses_phase_verdict_and_source(monkeypatch) -> None:

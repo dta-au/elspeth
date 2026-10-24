@@ -16,7 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import litellm
 import pytest
@@ -25,12 +25,12 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
-from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.request_history import (
+    authoritative_conversation_context as _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
@@ -39,6 +39,7 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.unit.web.composer._helpers import _composer_service_with_session
 
 from .conftest import build_test_sessions_service
@@ -74,17 +75,17 @@ class _FakeLLMResponse:
 
 @dataclass
 class _ScriptedCompletion:
-    turns: list[_AdmittedLLMCompletion]
+    turns: list[_FakeLLMResponse]
     messages: list[list[dict[str, Any]]] = field(default_factory=list)
 
-    async def respond(self, messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _AdmittedLLMCompletion:
+    async def respond(self, messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _FakeLLMResponse:
         self.messages.append(deepcopy(messages))
         assert len(self.messages) <= len(self.turns), "the provider exceeded the finite scripted call sequence"
         return self.turns[len(self.messages) - 1]
 
 
 @contextmanager
-def _review_terminal_reply(service: ComposerServiceImpl, expected_reply: str):
+def _review_terminal_reply(service: ComposerServiceImpl, expected_reply: str, *, primary):
     """Keep real END ownership; supply one SDK verdict for this exact diagnostic reply."""
     assert service._advisor_checkpoint._run_advisor_checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
     reviews = []
@@ -125,8 +126,15 @@ def _review_terminal_reply(service: ComposerServiceImpl, expected_reply: str):
             usage={"prompt_tokens": 10, "completion_tokens": 20},
         )
 
-    with patch("litellm.acompletion", side_effect=complete):
-        yield reviews
+    script = ComposerSDKScript(
+        primary_model=service._provider_gateway._model,
+        primary=[],
+        advisor_model=service._settings.composer_advisor_model,
+    )
+    script.primary.side_effect = primary
+    script.advisor.side_effect = complete
+    with patch("litellm.acompletion", new=script):
+        yield script.primary
     assert len(reviews) == 1
 
 
@@ -175,28 +183,26 @@ def _make_settings() -> WebSettings:
     )
 
 
-def _make_response_with_tool(tool_id: str, tool_name: str, args: dict[str, Any]) -> _AdmittedLLMCompletion:
-    return _admit_composer_llm_completion(
-        _FakeLLMResponse(
-            choices=[
-                _FakeChoice(
-                    message=_FakeMessage(
-                        content=None,
-                        tool_calls=[
-                            _FakeToolCall(
-                                id=tool_id,
-                                function=_FakeFunction(name=tool_name, arguments=json.dumps(args)),
-                            )
-                        ],
-                    )
+def _make_response_with_tool(tool_id: str, tool_name: str, args: dict[str, Any]) -> _FakeLLMResponse:
+    return _FakeLLMResponse(
+        choices=[
+            _FakeChoice(
+                message=_FakeMessage(
+                    content=None,
+                    tool_calls=[
+                        _FakeToolCall(
+                            id=tool_id,
+                            function=_FakeFunction(name=tool_name, arguments=json.dumps(args)),
+                        )
+                    ],
                 )
-            ]
-        )
+            )
+        ]
     )
 
 
-def _make_text_only_response(content: str) -> _AdmittedLLMCompletion:
-    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))]))
+def _make_text_only_response(content: str) -> _FakeLLMResponse:
+    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
 
 
 @pytest.fixture(autouse=True)
@@ -224,7 +230,7 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
 
     identical_args = {"patch": {"name": "Anchored Build"}}
 
-    def turn_with_failure(call_id: str) -> _AdmittedLLMCompletion:
+    def turn_with_failure(call_id: str) -> _FakeLLMResponse:
         return _make_response_with_tool(call_id, "set_metadata", identical_args)
 
     turns = [
@@ -251,14 +257,12 @@ async def test_three_identical_arg_error_failures_inject_hint_before_fourth_turn
         events.append(event)
 
     with (
-        _review_terminal_reply(service, "I give up."),
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        _review_terminal_reply(service, "I give up.", primary=scripted.respond) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=errors,
         ),
     ):
-        mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id, progress=capture_progress)
 
     # The fourth LLM call is the post-hint LLM call. Inspect its messages
@@ -307,7 +311,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
     call_count = 0
     dispatched_messages: list[list[dict[str, Any]]] = []
 
-    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _AdmittedLLMCompletion:
+    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _FakeLLMResponse:
         nonlocal call_count
         call_count += 1
         dispatched_messages.append(deepcopy(messages))
@@ -349,8 +353,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         return _make_text_only_response("The durable hint changed my next action.")
 
     with (
-        _review_terminal_reply(service, "The durable hint changed my next action."),
-        patch.object(service._provider_gateway, "_call_llm", side_effect=respond),
+        _review_terminal_reply(service, "The durable hint changed my next action.", primary=respond),
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -428,7 +431,7 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
     call_count = 0
     dispatched_messages: list[list[dict[str, Any]]] = []
 
-    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _AdmittedLLMCompletion:
+    async def respond(messages: list[dict[str, Any]], *_args: object, **_kwargs: object) -> _FakeLLMResponse:
         nonlocal call_count
         call_count += 1
         dispatched_messages.append(deepcopy(messages))
@@ -444,11 +447,13 @@ async def test_identical_failure_hint_does_not_solicit_canary_into_assistant_pro
             return _make_text_only_response(f"The prior value was {canary}.")
         return _make_text_only_response("The validator named patch.name; the structural mismatch is its expected shape.")
 
-    mock_llm = AsyncMock(spec=service._provider_gateway._call_llm, side_effect=respond)
     arg_error = ToolArgumentError(argument="patch", expected="non-anchored payload", actual_type="dict")
     with (
-        _review_terminal_reply(service, "The validator named patch.name; the structural mismatch is its expected shape."),
-        patch.object(service._provider_gateway, "_call_llm", mock_llm),
+        _review_terminal_reply(
+            service,
+            "The validator named patch.name; the structural mismatch is its expected shape.",
+            primary=respond,
+        ) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
@@ -487,14 +492,12 @@ async def test_three_distinct_arg_error_failures_inject_drift_hint_before_fourth
     arg_error = ToolArgumentError(argument="patch", expected="valid metadata patch", actual_type="dict")
 
     with (
-        _review_terminal_reply(service, "I am stuck."),
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        _review_terminal_reply(service, "I am stuck.", primary=scripted.respond) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, arg_error],
         ),
     ):
-        mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 4
@@ -569,11 +572,9 @@ async def test_discovery_success_between_mutation_failures_does_not_break_anchor
     # path was already gated above; this test verifies the dispatch path
     # gate too.)
     with (
-        _review_terminal_reply(service, "Either the hint will help me or I give up."),
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        _review_terminal_reply(service, "Either the hint will help me or I give up.", primary=scripted.respond) as mock_llm,
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=dispatch_with_mutation_failures) as mock_execute,
     ):
-        mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
     # 6th LLM call should see the hint after the 3rd identical mutation failure.
@@ -641,14 +642,12 @@ async def test_mutation_success_breaks_anchor() -> None:
     )
 
     with (
-        _review_terminal_reply(service, "Below threshold post-reset."),
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        _review_terminal_reply(service, "Below threshold post-reset.", primary=scripted.respond) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error, mutation_success, arg_error, arg_error],
         ),
     ):
-        mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 6
@@ -677,14 +676,12 @@ async def test_two_identical_failures_do_not_inject_hint() -> None:
     arg_error = ToolArgumentError(argument="patch", expected="x", actual_type="dict")
 
     with (
-        _review_terminal_reply(service, "not stuck yet"),
-        patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        _review_terminal_reply(service, "not stuck yet", primary=scripted.respond) as mock_llm,
         patch(
             "elspeth.web.composer.tool_batch.execute_tool",
             side_effect=[arg_error, arg_error],
         ),
     ):
-        mock_llm.side_effect = scripted.respond
         result = await service.compose("Build something", [], state, session_id=session_id)
 
     assert mock_llm.call_count == 3

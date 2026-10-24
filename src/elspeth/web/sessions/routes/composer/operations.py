@@ -80,7 +80,7 @@ def composer_operation_deadline_remaining_ms(*, deadline_at: datetime, db_now: d
 def composer_operation_status_response(
     row: ComposerOperationRecord, *, db_now: datetime, poll_after_ms: int
 ) -> ComposerOperationStatusResponse:
-    remaining_ms = composer_operation_deadline_remaining_ms(deadline_at=row.deadline_at, db_now=db_now)
+    remaining_ms = composer_operation_deadline_remaining_ms(deadline_at=row.legacy_deadline_at, db_now=db_now)
     if row.status in ("completed", "failed") and row.result_json is None:
         raise AuditIntegrityError("Terminal operation has no sealed result")
     result = MessageWithStateResponse.model_validate_json(cast(str, row.result_json), strict=True) if row.status == "completed" else None
@@ -91,7 +91,7 @@ def composer_operation_status_response(
         status=row.status,
         poll_after_ms=poll_after_ms,
         cancel_requested=row.cancel_requested_at is not None and row.status in ("queued", "running"),
-        deadline_at=row.deadline_at,
+        deadline_at=row.legacy_deadline_at,
         deadline_remaining_ms=remaining_ms if row.status in ("queued", "running") else 0,
         result=result,
         error=error,
@@ -375,7 +375,7 @@ async def stream_operation(
                     payload=ComposerOperationStreamStatusPayload(
                         status="queued" if snapshot.status == "queued" else "running",
                         cancel_requested=snapshot.cancel_requested_at is not None,
-                        deadline_remaining_ms=composer_operation_deadline_remaining_ms(deadline_at=snapshot.deadline_at, db_now=now),
+                        deadline_remaining_ms=composer_operation_deadline_remaining_ms(deadline_at=snapshot.legacy_deadline_at, db_now=now),
                     ),
                 )
             )

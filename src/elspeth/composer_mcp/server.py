@@ -47,7 +47,6 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -67,6 +66,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     require_no_credential_material,
@@ -1093,7 +1093,7 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
             validate_pipeline,
             state,
             settings,
-            yaml_generator,
+            ComposerYamlSerializer(),
             plugin_snapshot=plugin_snapshot,
             profile_registry=None,
             catalog=catalog,

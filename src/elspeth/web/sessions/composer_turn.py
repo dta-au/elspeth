@@ -59,6 +59,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -71,7 +72,7 @@ from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.audit import ComposerToolCancellation, ComposerToolFailure
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.invariants import InvariantError
-from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message
+from elspeth.web.composer.no_tool_policy import compose_graph_recovery_refusal_message, state_is_structurally_empty
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
@@ -80,6 +81,7 @@ from elspeth.web.composer.protocol import (
     PIPELINE_STAGED_REVIEW_MESSAGE,
     ComposerAdmissionRefused,
     ComposerConvergenceError,
+    ComposerMutationAuthorityRevoked,
     ComposerPluginCrashError,
     ComposerResult,
     ComposerRuntimePreflightError,
@@ -87,6 +89,7 @@ from elspeth.web.composer.protocol import (
     GraphRecoveryResponse,
     RetainedOperationContext,
 )
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused, capture_common_provider_cost
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.state import ValidationSummary
@@ -1397,6 +1400,17 @@ async def _run_composer_turn(
         if retained_operation_context is None:
             raise AuditIntegrityError("Retained history success lacks its actual projected context")
 
+        provider_owner.bind_cost_budget(
+            capture_common_provider_cost(
+                session_id=str(session.id),
+                request_id=str(turn_user_message_id),
+                lifecycle_version=1,
+                initially_empty=state is not None and state_is_structurally_empty(state),
+                settings=settings,
+            )
+        )
+        initial_preferences = await service.get_composer_preferences(turn.session_id)
+        mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)
         composer = services.composer_service
         post_provider_error: BaseException | None = None
         settled_record: ComposerOperationRecord | None = None
@@ -1493,6 +1507,7 @@ async def _run_composer_turn(
                     progress=progress_sink,
                     session_operation_context=lease.context,
                     user_message_id=str(turn_user_message_id),
+                    mutation_ceiling=mutation_ceiling,
                     completion_gates=prior_completion_gates_facts,
                     budget_seconds=compose_budget_seconds,
                     required_work=provider_binding,
@@ -1747,12 +1762,28 @@ async def _run_composer_turn(
             )
             observation.audit_cohort_durable = True
             raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
-        except PipelinePlannerError as exc:
+        except (PipelinePlannerError, CommonProviderCostRefused) as exc:
             # elspeth-54c11243a3. D7 (visible recompose change): both kinds now use
             # send's COST_UNAVAILABLE copy and actor attribution (messages.py:819-837).
-            # The planner's calls are already durable (llm_calls_durable), so this
-            # records () and _handle_planner_failure persists none.
+            # The direct planner has already drained its calls. Common policy
+            # refusal drains its actual buffered cohort before the disposition.
             observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
+            if isinstance(exc, CommonProviderCostRefused) and observation.pending_exception_llm_calls:
+                await _required_audit(
+                    observation,
+                    _persist_llm_calls(
+                        service,
+                        session.id,
+                        observation.pending_exception_llm_calls,
+                        compose_base_state_id,
+                        plugin_crash_pending=False,
+                        session_operation_context=lease.context,
+                        required_audit=True,
+                        required_work=observation.required_work,
+                    ),
+                )
+                observation.audit_cohort_durable = True
+                observation.pending_exception_llm_calls = ()
             await _publish_progress(
                 progress_sink,
                 event=ComposerProgressEvent(
@@ -1841,6 +1872,19 @@ async def _run_composer_turn(
                 status_code=403,
                 detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},
             ) from exc
+        except ComposerMutationAuthorityRevoked as exc:
+            observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)
+            await _publish_progress(
+                progress_sink,
+                event=ComposerProgressEvent(
+                    phase="failed",
+                    headline="Automatic mutation authority was revoked.",
+                    evidence=(str(exc),),
+                    likely_next="Review the saved session before retrying.",
+                    reason="mutation_authority_revoked",
+                ),
+            )
+            raise HTTPException(status_code=409, detail=exc.to_payload()) from exc
         except ComposerServiceError as exc:
             llm_calls = _llm_calls_from_exception(exc)
             observation.pending_exception_llm_calls = llm_calls

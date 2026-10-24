@@ -76,9 +76,11 @@ class StateAccessError(Exception):
 class YamlGenerator(Protocol):
     """Protocol for objects that generate YAML from CompositionState.
 
-    The production implementation is the ``elspeth.web.composer.yaml_generator``
-    module, which satisfies this protocol via its module-level ``generate_yaml``
-    function. Injected as a dependency so tests can substitute a stub.
+    Production wiring uses the stateless ``ComposerYamlSerializer`` adapter,
+    which delegates to the canonical Composer YAML function without retaining
+    its module. The callable shape is unchanged: explicit module/object
+    injection and test stubs remain supported. This protocol is a typing
+    interface, not a runtime authority check.
     """
 
     def generate_yaml(self, state: CompositionState) -> str: ...

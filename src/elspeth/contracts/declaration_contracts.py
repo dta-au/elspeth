@@ -604,6 +604,8 @@ def _resolve_typeddict_key_sets(schema: type) -> tuple[frozenset[str], frozenset
     required: set[str] = set()
     optional: set[str] = set()
     for key, annotation in hints.items():
+        if type(key) is not str:
+            raise TypeError("Payload schema annotation keys must be exact strings")
         origin = get_origin(annotation)
         if origin is Required:
             required.add(key)

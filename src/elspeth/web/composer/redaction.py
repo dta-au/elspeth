@@ -157,6 +157,7 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
                 "COMPOSE_TIMEOUT",
                 "DEADLINE_TOO_CLOSE",
                 "ADVISOR_ERROR",
+                "PROVIDER_POLICY_REFUSED",
             }
         ),
         "_kind": frozenset(
@@ -177,6 +178,18 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
         # server-authored identifier. Only codes in the emitted-code registry
         # survive; any other value is summarized like free text.
         "error_code": REGISTERED_ERROR_CODES,
+    }
+)
+_SAFE_ADVISOR_POLICY_REFUSAL_CODES = frozenset(
+    {
+        "REPAIR_POLICY_UNSUPPORTED",
+        "COST_UNAVAILABLE",
+        "COST_CAP_EXCEEDED",
+        "PROVIDER_CALLS_EXHAUSTED",
+        "REQUEST_BYTES_EXHAUSTED",
+        "MALFORMED_RESPONSE",
+        "COMPLETION_TOKENS_EXCEEDED",
+        "RESPONSE_TRUNCATED",
     }
 )
 _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
@@ -4122,6 +4135,8 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 # note}.  Union of all shapes, guidance included per the sensitive⊆known rule.
                 known_response_keys=(
                     "status",
+                    "code",
+                    "outbound_call_made",
                     "error",
                     "error_class",
                     "budget_used",
@@ -4163,6 +4178,15 @@ def _redact_declarative_known_response_value(
     """Apply a type/value disposition after declarative key admission."""
     if field_name == "success":
         return value if type(value) is bool else _summarize_external_response_value(value)
+    if tool_name == "request_advisor_hint":
+        if field_name == "code":
+            return (
+                value
+                if isinstance(value, str) and value in _SAFE_ADVISOR_POLICY_REFUSAL_CODES
+                else _summarize_external_response_value(value)
+            )
+        if field_name == "outbound_call_made":
+            return value if type(value) is bool else _summarize_external_response_value(value)
     if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
         return value if type(value) is int else _summarize_external_response_value(value)
     if field_name == "status":

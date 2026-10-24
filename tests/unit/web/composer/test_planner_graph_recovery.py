@@ -2,21 +2,13 @@
 
 from pathlib import Path
 from unittest.mock import patch
-from uuid import uuid4
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_planner
-from elspeth.web.composer.audit import BufferingRecorder, PrivatePlannerCandidate
-from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerHandoff
 from elspeth.web.composer.tools._common import ToolContext
-from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from tests.helpers.session_fences import fenced_operation_context
-from tests.unit.web.composer._helpers import _composer_service_with_session, _empty_state, _make_settings
 from tests.unit.web.composer.test_pipeline_planner import _invalid_pipeline, _plan, _response, _ScriptedCompletion
 
 pytestmark = pytest.mark.asyncio
@@ -99,46 +91,3 @@ async def test_handoff_does_not_construct_or_capture_a_candidate(tmp_path: Path,
     ):
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
     assert len(completion.requests) == 1
-
-
-async def test_application_handoff_defers_audit_and_omits_optional_candidate_capture() -> None:
-    catalog = create_catalog_service()
-    service, session_id = _composer_service_with_session(catalog, _make_settings())
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    recorder = BufferingRecorder()
-    intent = GraphRecoveryIntent("reset_to_safe_checkpoint", "Let's recover and discuss.", None, "recovery-call")
-
-    def choose_recovery(**_kwargs: object) -> None:
-        recorder.record_withheld_reply("planner_prose_unadmitted", "Earlier provider explanation.")
-        recorder.record_private_candidate(
-            PrivatePlannerCandidate("candidate-one", "candidate-call", "emit_pipeline_proposal", "{}", "{}", "{}")
-        )
-        raise PlannerHandoff(intent)
-
-    with (
-        fenced_operation_context(service._session_engine, session_id) as context,
-        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True, side_effect=choose_recovery),
-        patch.object(service._planning_application, "_persist_pipeline_planner_audit", autospec=True) as persist,
-        patch("elspeth.web.composer.diagnostic_evidence.build_private_tool_evidence", autospec=True) as capture,
-    ):
-        result = await service._planning_application._plan_and_stage_empty_pipeline(
-            message="Recover and talk to me.",
-            messages=[],
-            state=_empty_state(),
-            session_id=session_id,
-            current_state_id=None,
-            user_id="test-user",
-            session_operation_context=context,
-            progress=None,
-            user_message_id=str(uuid4()),
-            recorder=recorder,
-            plugin_snapshot=snapshot,
-            policy_catalog=policy,
-        )
-    persist.assert_not_called()
-    capture.assert_not_called()
-    assert result.graph_recovery_intent == intent
-    assert [draft.content for draft in result.recovery_audit_drafts] == ["Earlier provider explanation."]
-    assert result.llm_calls == ()
-    assert result.tool_invocations == ()

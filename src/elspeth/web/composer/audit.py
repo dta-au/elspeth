@@ -75,6 +75,7 @@ from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, RecorderSnapshot
     from elspeth.web.composer.provider_quota import ProviderCallCustody
 
 
@@ -294,6 +295,61 @@ class BufferingRecorder(
         self._private_candidates: list[PrivatePlannerCandidate] = []
         self._private_authorings: dict[str, PrivateToolAuthoring] = {}
         self._lock = threading.Lock()
+
+    def snapshot_for_continuation(self, *, drained: RecorderDrainCursors) -> RecorderSnapshot:
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, RetainedVisibleLink
+
+        with self._lock:
+            invocations = tuple(self._invocations)
+            links = []
+            for invocation, event in self._visible_tool_events:
+                indexes = tuple(index for index, item in enumerate(invocations) if item is invocation)
+                if len(indexes) != 1:
+                    raise AuditIntegrityError("visible event does not own exactly one buffered invocation")
+                links.append(RetainedVisibleLink(indexes[0], event))
+            snapshot = RecorderSnapshot(
+                invocations=invocations,
+                llm_calls=tuple(self._llm_calls),
+                planner_attempts=tuple(self._planner_attempts),
+                withheld_replies=tuple(self._withheld_replies),
+                visible_tool_events=tuple(links),
+                private_candidates=tuple(self._private_candidates),
+                private_authorings=tuple(self._private_authorings.values()),
+                drained=drained,
+            )
+        snapshot.validate_links_and_cursors()
+        return snapshot
+
+    @classmethod
+    def for_continuation(cls, snapshot: RecorderSnapshot) -> tuple[BufferingRecorder, RecorderDrainCursors]:
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+
+        if type(snapshot) is not RecorderSnapshot:
+            raise TypeError("audit buffer restoration requires its owned snapshot")
+        snapshot.validate_links_and_cursors()
+        owner = cls()
+        owner._invocations = list(snapshot.invocations)
+        owner._llm_calls = list(snapshot.llm_calls)
+        owner._planner_attempts = list(snapshot.planner_attempts)
+        owner._withheld_replies = list(snapshot.withheld_replies)
+        owner._visible_tool_events = [(owner._invocations[link.invocation_index], link.event) for link in snapshot.visible_tool_events]
+        owner._private_candidates = list(snapshot.private_candidates)
+        owner._private_authorings = {item.tool_call_id: item for item in snapshot.private_authorings}
+        return owner, snapshot.drained
+
+    def restore_received_llm_call(self, call: ComposerLLMCall) -> None:
+        from elspeth.web.composer.continuation_provider_outcomes import encode_physical_audit_call
+
+        if type(call) is not ComposerLLMCall or call.call_id is None:
+            raise AuditIntegrityError("historical received audit has no actual complete physical identity")
+        canonical = encode_physical_audit_call(call)
+        with self._lock:
+            existing = tuple(item for item in self._llm_calls if item.call_id == call.call_id)
+            if existing:
+                if len(existing) != 1 or encode_physical_audit_call(existing[0]) != canonical:
+                    raise AuditIntegrityError("one physical identity contains different complete historical audits")
+                return
+            self._llm_calls.append(call)
 
     def record(self, invocation: ComposerToolInvocation) -> None:
         with self._lock:

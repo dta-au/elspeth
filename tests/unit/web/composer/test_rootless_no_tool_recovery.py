@@ -16,6 +16,7 @@ from tests.unit.web.composer.test_service import (
     ValidationResult,
     _composer_service_with_session,
     _empty_state,
+    _insert_user_message,
     _make_llm_response,
     _make_settings,
     _mock_catalog,
@@ -27,6 +28,52 @@ _REQUEST = (
 )
 _FALSE_COMPLETION = "The six complaints are bound as the pipeline CSV source. Please confirm the urgency rubric."
 _CLARIFICATION = "Which urgency categories should the pipeline use?"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "Build a pipeline that reads CSV and writes JSON.",
+        "Please create the requested workflow.",
+        "How does CSV parsing work?",
+        "Do not change the graph; explain routing.",
+        'What does "source:csv" mean?',
+        "neutral context " * 400 + "Please describe the available inputs.",
+    ],
+    ids=["build", "workflow", "explanation", "revocation", "quoted-source", "long-context"],
+)
+async def test_persisted_empty_request_uses_the_common_provider_entry(user_message: str) -> None:
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    assert service._session_engine is not None
+    request_id = _insert_user_message(service._session_engine, sid, user_message)
+    explanation = "Here is an explanation without changing the graph."
+    with (
+        patch.object(service._provider_gateway, "_call_llm", return_value=_make_llm_response(content=explanation)) as provider,
+        patch("litellm.acompletion", side_effect=AssertionError("common gateway was bypassed")),
+    ):
+        result = await service.compose(
+            user_message,
+            [],
+            _empty_state(),
+            session_id=sid,
+            user_id="test-user",
+            user_message_id=request_id,
+        )
+
+    assert provider.call_count == 1
+    assert result.message.startswith(explanation)
+    assert result.state.version == 1
+    assert not result.state.sources
+    assert not result.state.nodes
+    assert not result.state.outputs
+    assert not result.tool_invocations
+    assert result.graph_recovery_intent is None
+    messages, tools = provider.call_args.args[:2]
+    assert any(message["role"] == "user" and message["content"] == user_message for message in messages)
+    tool_names = {tool["function"]["name"] for tool in tools}
+    assert "set_pipeline" in tool_names
+    assert "emit_pipeline_proposal" not in tool_names
 
 
 @pytest.mark.asyncio
@@ -217,3 +264,50 @@ async def test_marked_clarification_after_tool_preserves_receipt_policy(tool_nam
         assert "set_pipeline failed before mutation" in result.message
         assert result.runtime_preflight is not None and not result.runtime_preflight.is_valid
         assert "No pipeline has been built yet" not in result.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "Build a pipeline that reads CSV and writes JSON.",
+        "Please assemble the requested workflow.",
+        'Explain the example "build a pipeline" without changing it.',
+        "Do not build anything; explain the review error.",
+        "Read the complete instruction before replying. " + "neutral detail " * 400,
+    ],
+)
+async def test_pre_state_review_error_does_not_inject_a_host_tool_sequence(user_message: str) -> None:
+    service, sid = _composer_service_with_session(_mock_catalog(), _make_settings())
+    refusal_reply = "The interpretation review could not be staged; you can ask me to retry."
+    replies = [
+        _make_llm_response(
+            tool_calls=[
+                {
+                    "id": "review-before-state",
+                    "name": "request_interpretation_review",
+                    "arguments": {
+                        "affected_node_id": "rank",
+                        "kind": "vague_term",
+                        "user_term": "urgency",
+                    },
+                }
+            ]
+        ),
+        _make_llm_response(content=refusal_reply),
+    ]
+    with patch.object(service._provider_gateway, "_call_llm", side_effect=replies) as provider:
+        result = await service.compose(user_message, [], _empty_state(), session_id=sid)
+    assert provider.call_count == 2
+    assert result.repair_turns_used == 0
+    assert [entry.tool_name for entry in result.tool_invocations] == ["request_interpretation_review"]
+    assert result.tool_invocations[0].status.value == "arg_error"
+    assert result.tool_invocations[0].error_message
+    assert not result.state.sources
+    assert not result.state.nodes
+    assert result.message.startswith(refusal_reply)
+    sent_text = "\n".join(
+        message["content"] for call in provider.call_args_list for message in call.args[0] if isinstance(message.get("content"), str)
+    )
+    assert "First call set_pipeline or another state-staging tool" not in sent_text
+    assert "Do not reply to the user yet" not in sent_text

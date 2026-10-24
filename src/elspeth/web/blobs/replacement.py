@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Engine
 
 from elspeth.contracts.blobs import BlobRecord, BlobReplacementPlan
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.protocol import BlobIntegrityError
@@ -235,6 +236,7 @@ class BlobReplacementCoordinator:
         context: SessionOperationContext,
         max_storage_per_session: int,
         accepting_proposal_id: UUID | None,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> BlobRecord:
         _require_blob_operation_context(context, allowed_kinds=_REPLACE_KINDS)
         if type(expected) is not BlobRecord or type(replacement) is not BlobRecord or type(content) is not bytes:
@@ -291,6 +293,7 @@ class BlobReplacementCoordinator:
                             max_storage_per_session=max_storage_per_session,
                             accepting_proposal_id=accepting_proposal_id,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                 except Exception as exc:
                     observed = self._observe(context, expected.id, exc)
@@ -311,7 +314,9 @@ class BlobReplacementCoordinator:
                         write_guard=stage_guard,
                         directory_fd=directory_fd.session_fd,
                     )
-                    plan = self._authority.mutate(context, lambda transaction: transaction.blobs.mark_blob_replacement_staged(plan=plan))
+                    plan = self._authority.mutate(
+                        context, lambda transaction: transaction.blobs.mark_blob_replacement_staged(plan=plan), auto_mutation=auto_mutation
+                    )
                     self._rename(storage, backup, directory_fd, context)
                     self._rename(staging, storage, directory_fd, context)
                     self._authority.compare_and_swap(context)
@@ -322,6 +327,7 @@ class BlobReplacementCoordinator:
                             max_storage_per_session=max_storage_per_session,
                             accepting_proposal_id=accepting_proposal_id,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                 except Exception as exc:
                     observed = self._observe(context, expected.id, exc)

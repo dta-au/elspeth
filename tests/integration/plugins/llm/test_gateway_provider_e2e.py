@@ -251,7 +251,12 @@ def _build_gateway_app(
     inspect how many times (and with what bearer) the gateway's internal
     HTTP client actually hit the OAuth token endpoint / the upstream
     endpoint.
+
+    The existing gateway test client supplies an in-process worker RPC exchange.
+    These HTTP tests do not qualify native worker isolation or protected admission.
     """
+    from gateway.tests.adapter_test_support import client_for_adapter
+
     oauth_app = create_mock_oauth_app(client_id=_OAUTH_CLIENT_ID, client_secret=_OAUTH_CLIENT_SECRET)
     upstream_app = create_mock_upstream_app(require_bearer_prefix=require_bearer_prefix)
 
@@ -293,7 +298,11 @@ def _build_gateway_app(
         "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS": json.dumps({model_alias: {"target": model_target}}),
     }
     config = load_config(env)
-    app = create_app(config, adapter=adapter, upstream_client=upstream_client)
+    app = create_app(
+        config,
+        adapter=client_for_adapter(ReferenceV1InvokeAdapter() if adapter is None else adapter),
+        upstream_client=upstream_client,
+    )
     return app, oauth_transport, upstream_transport
 
 

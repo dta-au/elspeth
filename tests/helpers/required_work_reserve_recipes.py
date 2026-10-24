@@ -43,6 +43,8 @@ SELECTION = {
         "TelemetryInstallation.reserve",
     ),
     "src/elspeth/web/operator_telemetry_custody.py": ("OperatorTelemetryCleanupOwner.assert_process",),
+    "src/elspeth/web/sessions/state_decoder.py": ("state_record_from_row",),
+    "src/elspeth/web/sessions/chat_message_decoder.py": ("chat_message_record_from_row",),
 }
 
 

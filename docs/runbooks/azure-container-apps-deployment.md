@@ -116,7 +116,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The exact published candidate image digest (session epoch 78, Landscape epoch 50), once available, in the registry.
+- The exact published candidate image digest (session epoch 79, Landscape epoch 50), once available, in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -481,7 +481,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both fresh schemas at session epoch 78
+  with the schema-owner URLs and initializes both fresh schemas at session epoch 79
   and Landscape epoch 50. Existing stores must be preserved and refused.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
@@ -494,7 +494,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   where the process runs.
 
 > **LIVE:** for 0.8.9 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initial creation at session epoch 78
+> require both schema checks to pass after initial creation at session epoch 79
 > and Landscape epoch 50. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
@@ -568,7 +568,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 78, "landscape_epoch": 50, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 79, "landscape_epoch": 50, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",

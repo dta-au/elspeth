@@ -1,0 +1,22 @@
+"""Serial PostgreSQL current TITLE known-envelope SQL admission witnesses."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_title_audit_envelopes import (
+    test_actual_title_reader_preserves_heterogeneous_and_explicit_null_id_metadata as test_actual_title_reader_preserves_heterogeneous_and_explicit_null_id_metadata,
+)
+from tests.unit.web.sessions.test_continuation_title_audit_envelopes import (
+    test_actual_title_reader_retains_exact_correlated_cohort_refusals as test_actual_title_reader_retains_exact_correlated_cohort_refusals,
+)
+from tests.unit.web.sessions.test_continuation_title_audit_envelopes import (
+    test_genuine_pending_title_refuses_malformed_known_gap_without_writes as test_genuine_pending_title_refuses_malformed_known_gap_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_title_audit_envelopes import (
+    test_genuine_pending_title_refuses_malformed_known_public_audit_without_writes as test_genuine_pending_title_refuses_malformed_known_public_audit_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_title_audit_envelopes import (
+    test_settled_title_complete_cohort_still_rejects_unrelated_malformed_known_audit as test_settled_title_complete_cohort_still_rejects_unrelated_malformed_known_audit,
+)
+
+pytestmark = pytest.mark.testcontainer

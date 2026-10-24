@@ -227,7 +227,8 @@ class TestProcessSingleTokenOrchestration:
         dispatched: list[object] = []
         success = TransformResult.success(make_row({"value": 2}), success_reason={"action": "mapped"})
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is True
             dispatched.append(transform)
             return success, token, None
 
@@ -525,7 +526,8 @@ class TestHandleTransformNode:
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
         success = TransformResult.success(make_row({"value": 2}), success_reason={"action": "mapped"})
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             return success, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
@@ -556,7 +558,8 @@ class TestHandleTransformNode:
             success_reason={"action": "split"},
         )
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             return multi, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
@@ -582,7 +585,8 @@ class TestHandleTransformNode:
         empty = TransformResult.success_empty(success_reason={"action": "filtered"})
         recorded: list[dict[str, object]] = []
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             return empty, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
@@ -628,7 +632,8 @@ class TestHandleTransformNode:
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
         empty = TransformResult.success_empty(success_reason={"action": "filtered"})
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             return empty, token, None
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
@@ -668,7 +673,8 @@ class TestHandleTransformNode:
         token = make_token_info(row_id="row-1", token_id="tok-1", data={"value": 1})
         recorded: list[dict[str, object]] = []
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             raise MaxRetriesExceeded(3, ValueError("boom"))
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]
@@ -716,7 +722,8 @@ class TestHandleTransformNode:
         _persist_token_for_scheduler(factory, token)
         raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 
-        def _exec(transform, token, ctx, attempt_offset=0):
+        def _exec(transform, token, ctx, *, attempt_offset, allow_unstarted_shutdown):
+            assert allow_unstarted_shutdown is False
             raise MaxRetriesExceeded(3, ConnectionError(f"provider failed: {raw_secret}"))
 
         processor._execute_transform_with_retry = _exec  # type: ignore[method-assign]

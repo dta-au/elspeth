@@ -139,3 +139,26 @@ describe("live backend producer serialization parity", () => {
     for (const field of ["created_at", "updated_at"]) for (const value of ["not a timestamp", "1", 22, null]) expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, proposals: [{ ...producerFixtures.proposal, [field]: value }] } }, sid, id)).toThrow();
   });
 });
+
+
+it("retains actual saved facts for mutation authority refusal without inventing proposals", () => {
+  const outcome = {
+    session_id: sid, operation_id: id, kind: "compose_message", user_message_id: null,
+    settled_at: "2026-10-22T08:00:00Z", failure_code: "http_error",
+    error_type: "composer_mutation_authority_revoked", diagnostic_id: null,
+    request_id: "request", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: id, latest_version: 2 },
+  };
+  const page = { session_id: sid, items: [outcome], next_cursor: null };
+  expect(decodeComposerOperationFailurePage(page, sid).items[0]).toEqual(outcome);
+  for (const changes of [{ proposal_id: id }, { error_type: "invented_auto_proposal" }]) {
+    expect(() => decodeComposerOperationFailurePage({ ...page, items: [{ ...outcome, ...changes }] }, sid)).toThrow();
+  }
+  const frame = { ...heartbeat, event: "progress", payload: {
+    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    phase: "failed", headline: "Automatic mutation authority was revoked.", evidence: [],
+    likely_next: "Review the saved session before retrying.", reason: "mutation_authority_revoked",
+    updated_at: "2026-10-22T08:00:00Z",
+  } };
+  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
+  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "invented_auto_proposal" } }, sid, id)).toThrow();
+});

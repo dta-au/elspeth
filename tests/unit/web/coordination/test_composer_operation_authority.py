@@ -31,6 +31,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRecord,
     ComposerOperationRunning,
     composer_operation_request_hash,
+    composer_operation_v2_request_hash,
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -73,7 +74,538 @@ async def _wait_for_thread_event(event: Event) -> None:
         await asyncio.sleep(0.01)
 
 
-def admit(authority, sid, request=None, *, actor="alice", provider="local", maximum=64, deadline_seconds=180.0, quota=None):
+@pytest.mark.parametrize("segment_state", ["queued", "running"])
+def test_known_historical_fence_cannot_fall_back_to_sync_compose(operation_store, segment_state):
+    from datetime import timedelta
+
+    from sqlalchemy import insert
+
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, _repository, _authority, _service, sid = operation_store
+    record, running = start(operation_store)
+    fence = running.session_operation_context.fence
+    with engine.begin() as conn:
+        now = database_now(conn)
+        conn.execute(
+            insert(segments).values(
+                session_id=str(sid),
+                operation_id=record.operation_id,
+                sequence=1,
+                state=segment_state,
+                generation=1,
+                enqueued_at=now,
+                next_eligible_at=now,
+                checkpoint_id=str(uuid4()),
+                next_action_json="{}",
+                policy_sha256="a" * 64,
+                started_at=now if segment_state == "running" else None,
+                cooperative_at=now + timedelta(seconds=10) if segment_state == "running" else None,
+                deadline_at=now + timedelta(minutes=1) if segment_state == "running" else None,
+                session_operation_id=fence.operation_id,
+                session_operation_epoch=fence.operation_epoch,
+                session_operation_lease_token=fence.lease_token,
+            )
+        )
+        conn.execute(
+            insert(attempts).values(
+                session_id=str(sid),
+                operation_id=record.operation_id,
+                sequence=1,
+                generation=1,
+                claim_attempt=running.claim.attempt,
+                session_operation_id=fence.operation_id,
+                session_operation_epoch=fence.operation_epoch,
+                session_operation_lease_token=fence.lease_token,
+                owner_instance_id="test-owner",
+                started_at=now,
+                claim_expires_at=now,
+            )
+        )
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(ComposerOperationFenceLost):
+            require_composer_operation_mutation_on_connection(conn, running.session_operation_context)
+        assert _continuation_guard_rows(conn) == before
+
+
+def _continuation_guard_rows(conn):
+    from pathlib import Path
+
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    rows = tuple(tuple(conn.execute(select(table)).all()) for table in (jobs, segments, attempts, fences, sessions_table))
+    database = conn.engine.url.database
+    database_bytes = Path(database).read_bytes() if conn.dialect.name == "sqlite" and database is not None else None
+    return rows, database_bytes
+
+
+def _seed_live_continuation_history(operation_store, *, parent_status="running"):
+    from datetime import timedelta
+
+    from sqlalchemy import insert
+
+    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, repository, _authority, _service, sid = operation_store
+    context = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=180
+    )
+    fence = context.fence
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Continuation SQL prerequisite")
+    with engine.begin() as conn:
+        now = database_now(conn)
+        started = now - timedelta(minutes=1)
+        conn.execute(
+            insert(jobs).values(
+                session_id=str(sid),
+                operation_id=request.operation_id,
+                kind="compose_message",
+                status=parent_status,
+                lifecycle_version=2,
+                phase="executing" if parent_status == "running" else "queued",
+                current_segment_sequence=1,
+                ownership_generation=1,
+                checkpoint_id=str(uuid4()),
+                ingress_phase="pending",
+                reserved_user_message_id=str(uuid4()),
+                request_hash=composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request),
+                actor_user_id="alice",
+                request_json=request.model_dump_json(),
+                attempt=1,
+                created_at=started,
+                updated_at=now,
+                started_at=started,
+            )
+        )
+        conn.execute(
+            insert(segments).values(
+                session_id=str(sid),
+                operation_id=request.operation_id,
+                sequence=1,
+                state="running",
+                generation=1,
+                claim_token="segment-claim",
+                claim_owner_instance_id="test-owner",
+                claim_expires_at=now + timedelta(minutes=3),
+                session_operation_id=fence.operation_id,
+                session_operation_epoch=fence.operation_epoch,
+                session_operation_lease_token=fence.lease_token,
+                enqueued_at=started,
+                next_eligible_at=started,
+                started_at=started,
+                cooperative_at=started + timedelta(seconds=10),
+                deadline_at=now + timedelta(minutes=3),
+                checkpoint_id=str(uuid4()),
+                next_action_json="{}",
+                policy_sha256="a" * 64,
+            )
+        )
+        conn.execute(
+            insert(attempts).values(
+                session_id=str(sid),
+                operation_id=request.operation_id,
+                sequence=1,
+                generation=1,
+                claim_attempt=1,
+                session_operation_id=fence.operation_id,
+                session_operation_epoch=fence.operation_epoch,
+                session_operation_lease_token=fence.lease_token,
+                owner_instance_id="test-owner",
+                started_at=started,
+                claim_expires_at=now + timedelta(minutes=3),
+            )
+        )
+    return context, request.operation_id
+
+
+def test_continuation_history_live_sql_identity_allows_mutation_without_changes(operation_store):
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.continuation import require_continuation_mutation
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.begin() as conn:
+        before = _continuation_guard_rows(conn)
+        assert require_continuation_mutation(conn, context) is True
+        require_composer_operation_mutation_on_connection(conn, context)
+        assert _continuation_guard_rows(conn) == before
+
+
+@pytest.mark.parametrize("changed", ["parent_attempt", "history_claim_attempt"])
+def test_continuation_history_current_attempt_must_match_immutable_history(operation_store, changed):
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, _repository, _authority, _service, sid = operation_store
+    context, operation_id = _seed_live_continuation_history(operation_store)
+    with engine.begin() as conn:
+        if changed == "parent_attempt":
+            conn.execute(update(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == operation_id).values(attempt=2))
+        else:
+            conn.execute(update(attempts).where(attempts.c.session_id == str(sid)).values(claim_attempt=2))
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(ComposerOperationFenceLost):
+            require_composer_operation_mutation_on_connection(conn, context)
+        assert _continuation_guard_rows(conn) == before
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "parent_sequence",
+        "parent_generation",
+        "parent_queued",
+        "parent_terminal",
+        "principal_actor",
+        "principal_archive",
+        "segment_generation",
+        "segment_queued",
+        "segment_yielded",
+        "segment_operation_id",
+        "segment_epoch",
+        "segment_token",
+        "segment_deadline",
+        "history_revoked",
+        "history_operation_id",
+        "history_token",
+        "fence_operation_id",
+        "fence_epoch",
+        "fence_token",
+        "fence_kind",
+        "fence_released",
+        "fence_expired",
+        "fence_missing",
+    ],
+)
+def test_continuation_history_rejects_independent_sql_identity_and_liveness_substitutions(operation_store, changed):
+    from datetime import timedelta
+
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.composer_operations import composer_operation_result_hash
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, _repository, _authority, _service, sid = operation_store
+    context, operation_id = _seed_live_continuation_history(
+        operation_store, parent_status="queued" if changed == "parent_queued" else "running"
+    )
+    with engine.begin() as conn:
+        now = database_now(conn)
+        if changed == "parent_sequence":
+            conn.execute(update(jobs).values(current_segment_sequence=2))
+        elif changed == "parent_generation":
+            conn.execute(update(jobs).values(ownership_generation=2))
+        elif changed == "parent_queued":
+            assert conn.execute(select(jobs.c.status)).scalar_one() == "queued"
+        elif changed == "parent_terminal":
+            error_json = failed().model_dump_json()
+            conn.execute(
+                update(jobs).values(
+                    status="failed",
+                    phase="settled",
+                    request_json=None,
+                    settled_at=now,
+                    settled_by="owner_terminal",
+                    failure_code="worker_lost",
+                    result_schema="composer_operation_error.v1",
+                    result_json=error_json,
+                    result_sha256=composer_operation_result_hash(error_json),
+                )
+            )
+        elif changed == "principal_actor":
+            ensure_test_identity(conn, identity_id="another-actor")
+            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(user_id="another-actor"))
+        elif changed == "principal_archive":
+            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(archived_at=now))
+        elif changed == "segment_generation":
+            conn.execute(update(segments).values(generation=2))
+        elif changed == "segment_queued":
+            conn.execute(update(segments).values(state="queued", started_at=None, cooperative_at=None, deadline_at=None))
+        elif changed == "segment_yielded":
+            conn.execute(update(segments).values(state="yielded"))
+        elif changed == "segment_operation_id":
+            conn.execute(update(segments).values(session_operation_id="other-fence"))
+        elif changed == "segment_epoch":
+            conn.execute(update(segments).values(session_operation_epoch=context.fence.operation_epoch + 1))
+        elif changed == "segment_token":
+            conn.execute(update(segments).values(session_operation_lease_token="other-token"))
+        elif changed == "segment_deadline":
+            conn.execute(update(segments).values(deadline_at=now - timedelta(seconds=1)))
+        elif changed == "history_revoked":
+            conn.execute(update(attempts).values(revoked_at=now, outcome="interrupted"))
+        elif changed == "history_operation_id":
+            conn.execute(update(attempts).values(session_operation_id="other-fence"))
+        elif changed == "history_token":
+            conn.execute(update(attempts).values(session_operation_lease_token="other-token"))
+        elif changed == "fence_operation_id":
+            conn.execute(update(fences).values(operation_id="other-fence"))
+        elif changed == "fence_epoch":
+            conn.execute(update(fences).values(operation_epoch=context.fence.operation_epoch + 1))
+        elif changed == "fence_token":
+            conn.execute(update(fences).values(lease_token="other-token"))
+        elif changed == "fence_kind":
+            conn.execute(update(fences).values(operation_kind="proposal"))
+        elif changed == "fence_released":
+            conn.execute(update(fences).values(released_at=now))
+        elif changed == "fence_expired":
+            conn.execute(update(fences).values(lease_expires_at=now - timedelta(seconds=1)))
+        else:
+            assert changed == "fence_missing"
+            conn.execute(delete(fences))
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(ComposerOperationFenceLost):
+            require_composer_operation_mutation_on_connection(conn, context)
+        assert _continuation_guard_rows(conn) == before
+    with engine.connect() as conn:
+        assert conn.execute(select(jobs.c.operation_id)).scalar_one() == operation_id
+
+
+def test_continuation_history_stop_and_deadline_are_transaction_local_controls(operation_store):
+    from datetime import timedelta
+
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.continuation import require_continuation_mutation
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, operation_id = _seed_live_continuation_history(operation_store)
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        now = database_now(conn)
+        conn.execute(update(jobs).values(cancel_requested_at=now))
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(ComposerOperationCancelledDuringTurn) as stopped:
+            require_composer_operation_mutation_on_connection(conn, context)
+        assert stopped.value.claim.operation_id == operation_id
+        assert stopped.value.claim.attempt == 1
+        assert stopped.value.claim.segment_sequence == stopped.value.claim.ownership_generation == 1
+        assert _continuation_guard_rows(conn) == before
+        assert require_continuation_mutation(conn, context, allow_cancel=True) is True
+        conn.execute(update(segments).values(deadline_at=now - timedelta(seconds=1)))
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(ComposerOperationFenceLost):
+            require_continuation_mutation(conn, context, allow_cancel=True)
+        assert require_continuation_mutation(conn, context, allow_cancel=True, allow_expired_segment=True) is True
+        assert _continuation_guard_rows(conn) == before
+        transaction.rollback()
+    with engine.begin() as conn:
+        assert require_continuation_mutation(conn, context) is True
+
+
+def test_continuation_history_missing_segment_is_refused_by_actual_foreign_key(operation_store):
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    _seed_live_continuation_history(operation_store)
+    with engine.begin() as conn:
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(IntegrityError), conn.begin_nested():
+            conn.execute(update(attempts).values(sequence=2))
+        assert _continuation_guard_rows(conn) == before
+
+
+def test_continuation_history_unknown_sync_and_noncompose_preserve_prior_behavior(operation_store):
+    from elspeth.web.coordination.composer_operation_authority import require_composer_operation_mutation_on_connection
+    from elspeth.web.sessions.continuation import require_continuation_mutation
+
+    engine, repository, _authority, _service, sid = operation_store
+    context = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    with engine.begin() as conn:
+        before = _continuation_guard_rows(conn)
+        assert require_continuation_mutation(conn, context) is False
+        require_composer_operation_mutation_on_connection(conn, context)
+        assert _continuation_guard_rows(conn) == before
+    repository.release(context)
+    noncompose = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.PROPOSAL, owner_instance_id="test-owner", lease_seconds=30
+    )
+    with engine.begin() as conn:
+        before = _continuation_guard_rows(conn)
+        assert require_continuation_mutation(conn, noncompose) is False
+        require_composer_operation_mutation_on_connection(conn, noncompose)
+        assert _continuation_guard_rows(conn) == before
+
+
+def test_continuation_history_owed_p4_scope_predicate_has_exact_nominal_positive_control(operation_store):
+    from elspeth.web.sessions.continuation import (
+        _OWED_P4_SCOPE_KEY,
+        _OWED_P4_SEAL,
+        _owed_continuation_p4_active,
+        _OwedP4Scope,
+    )
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.begin() as conn:
+        assert _owed_continuation_p4_active(conn, context) is False
+        before = _continuation_guard_rows(conn)
+        conn.info[_OWED_P4_SCOPE_KEY] = _OwedP4Scope(conn, context, _OWED_P4_SEAL)
+        try:
+            assert _owed_continuation_p4_active(conn, context) is True
+            assert _continuation_guard_rows(conn) == before
+        finally:
+            del conn.info[_OWED_P4_SCOPE_KEY]
+
+
+@pytest.mark.parametrize("changed", ["impostor", "seal", "connection", "context", "inactive"])
+def test_continuation_history_owed_p4_scope_cannot_escape_exact_active_transaction(operation_store, changed):
+    from dataclasses import replace
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import (
+        _OWED_P4_SCOPE_KEY,
+        _OWED_P4_SEAL,
+        _owed_continuation_p4_active,
+        _OwedP4Scope,
+    )
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.connect() as conn, engine.connect() as other:
+        conn.begin()
+        other.begin()
+        scope = _OwedP4Scope(conn, context, _OWED_P4_SEAL)
+        if changed == "impostor":
+            selected = object()
+        elif changed == "seal":
+            selected = replace(scope, seal=object())
+        elif changed == "connection":
+            selected = replace(scope, connection=other)
+        elif changed == "context":
+            selected = replace(scope, context=replace(context, operation_kind=SessionOperationKind.PROPOSAL))
+        else:
+            selected = scope
+            assert changed == "inactive"
+            conn.rollback()
+        conn.info[_OWED_P4_SCOPE_KEY] = selected
+        try:
+            with pytest.raises(AuditIntegrityError, match="exact current SQL owner transaction"):
+                _owed_continuation_p4_active(conn, context)
+        finally:
+            del conn.info[_OWED_P4_SCOPE_KEY]
+
+
+@pytest.mark.parametrize("end", ["commit", "rollback"])
+@pytest.mark.parametrize("stop", ["cancel", "expired"])
+def test_continuation_history_owed_scope_refuses_root_transaction_replacement(operation_store, end, stop):
+    from datetime import timedelta
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import (
+        _OWED_P4_SCOPE_KEY,
+        _OWED_P4_SEAL,
+        _owed_continuation_p4_active,
+        _OwedP4Scope,
+        require_continuation_mutation,
+    )
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.connect() as conn:
+        first = conn.begin()
+        scope = _OwedP4Scope(conn, context, _OWED_P4_SEAL)
+        conn.info[_OWED_P4_SCOPE_KEY] = scope
+        assert _owed_continuation_p4_active(conn, context) is True
+        assert require_continuation_mutation(conn, context) is True
+        if end == "commit":
+            first.commit()
+        else:
+            first.rollback()
+        with pytest.raises(AuditIntegrityError):
+            _owed_continuation_p4_active(conn, context)
+        second = conn.begin()
+        assert second is not first
+        now = database_now(conn)
+        if stop == "cancel":
+            conn.execute(update(jobs).values(cancel_requested_at=now))
+            expected = ComposerOperationCancelledDuringTurn
+        else:
+            conn.execute(update(segments).values(deadline_at=now - timedelta(seconds=1)))
+            expected = ComposerOperationFenceLost
+        del conn.info[_OWED_P4_SCOPE_KEY]
+        before = _continuation_guard_rows(conn)
+        with pytest.raises(expected):
+            require_continuation_mutation(conn, context)
+        assert _continuation_guard_rows(conn) == before
+        conn.info[_OWED_P4_SCOPE_KEY] = scope
+        try:
+            with pytest.raises(AuditIntegrityError, match="exact current SQL owner transaction"):
+                require_continuation_mutation(conn, context)
+            assert _continuation_guard_rows(conn) == before
+        finally:
+            del conn.info[_OWED_P4_SCOPE_KEY]
+            second.rollback()
+
+
+def test_continuation_history_owed_scope_construction_requires_active_root_transaction(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import _OWED_P4_SEAL, _OwedP4Scope
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.connect() as conn:
+        assert conn.get_transaction() is None
+        with pytest.raises(AuditIntegrityError, match="active SQL owner transaction"):
+            _OwedP4Scope(conn, context, _OWED_P4_SEAL)
+
+
+@pytest.mark.parametrize("end", ["commit", "rollback"])
+def test_continuation_history_owed_scope_preserves_savepoints_within_same_root(operation_store, end):
+    from elspeth.web.sessions.continuation import (
+        _OWED_P4_SCOPE_KEY,
+        _OWED_P4_SEAL,
+        _owed_continuation_p4_active,
+        _OwedP4Scope,
+        require_continuation_mutation,
+    )
+
+    engine, _repository, _authority, _service, _sid = operation_store
+    context, _operation_id = _seed_live_continuation_history(operation_store)
+    with engine.begin() as conn:
+        root = conn.get_transaction()
+        conn.info[_OWED_P4_SCOPE_KEY] = _OwedP4Scope(conn, context, _OWED_P4_SEAL)
+        try:
+            nested = conn.begin_nested()
+            assert conn.get_transaction() is root
+            before = _continuation_guard_rows(conn)
+            assert _owed_continuation_p4_active(conn, context) is True
+            assert require_continuation_mutation(conn, context) is True
+            assert _continuation_guard_rows(conn) == before
+            if end == "commit":
+                nested.commit()
+            else:
+                nested.rollback()
+            assert conn.get_transaction() is root
+            assert _owed_continuation_p4_active(conn, context) is True
+            before = _continuation_guard_rows(conn)
+            assert require_continuation_mutation(conn, context) is True
+            assert _continuation_guard_rows(conn) == before
+        finally:
+            del conn.info[_OWED_P4_SCOPE_KEY]
+
+
+def admit(
+    authority,
+    sid,
+    request=None,
+    *,
+    actor="alice",
+    provider="local",
+    maximum=64,
+    deadline_seconds=180.0,
+    quota=None,
+    lifecycle_version=1,
+    continuation_enabled=False,
+    seed=None,
+):
     request = request or SendMessageRequest(operation_id=str(uuid4()), content="Build")
     kind = "compose_message" if isinstance(request, SendMessageRequest) else "compose_recompose"
     return authority.admit(
@@ -85,7 +617,9 @@ def admit(authority, sid, request=None, *, actor="alice", provider="local", maxi
         session_id=sid,
         operation_id=request.operation_id,
         kind=kind,
-        request_hash=composer_operation_request_hash(session_id=sid, kind=kind, request=request),
+        request_hash=(composer_operation_request_hash if lifecycle_version == 1 else composer_operation_v2_request_hash)(
+            session_id=sid, kind=kind, request=request
+        ),
         actor_user_id=actor,
         request_id="correlation",
         base_state_id=request.state_id,
@@ -93,7 +627,748 @@ def admit(authority, sid, request=None, *, actor="alice", provider="local", maxi
         deadline_seconds=deadline_seconds,
         max_nonterminal=maximum,
         auth_provider_type=provider,
+        lifecycle_version=lifecycle_version,
+        continuation_enabled=continuation_enabled,
+        seed=seed,
     )
+
+
+def _admission_v2_authority(operation_store, *, policy=None):
+    from tests.helpers.continuation_policy import minimal_continuation_policy
+
+    return ComposerAsyncOperationAuthority(
+        operation_store[0],
+        owner_instance_id="test-owner",
+        claim_lease_seconds=30,
+        continuation_policy=policy if policy is not None else minimal_continuation_policy(),
+    )
+
+
+def _admission_rows(engine):
+    from elspeth.web.sessions.models import metadata
+
+    with engine.connect() as conn:
+        return {
+            table.name: sorted((tuple(row) for row in conn.execute(select(table))), key=repr)
+            for table in sorted(metadata.tables.values(), key=lambda table: table.name)
+        }
+
+
+def _admission_state_data():
+    from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    node = NodeSpec(
+        id="owned-transform",
+        node_type="transform",
+        plugin="field_mapper",
+        input="source",
+        on_success="output",
+        on_error="discard",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    raw = CompositionState(nodes=(node,), edges=(), outputs=(), version=1, metadata=PipelineMetadata()).to_dict()
+    return CompositionStateData(
+        sources=raw["sources"], nodes=raw["nodes"], edges=raw["edges"], outputs=raw["outputs"], metadata_=raw["metadata"]
+    )
+
+
+@pytest.mark.parametrize("lifecycle_version", (1, 2))
+@pytest.mark.parametrize("case", ("valid", "hash_mismatch", "operation_id_mismatch", "state_id_mismatch", "selected_hash_raises"))
+def test_admission_hash_branch_and_early_binding_refusals_preserve_rows(operation_store, monkeypatch, lifecycle_version, case):
+    from elspeth.web.coordination import composer_operation_authority as module
+
+    engine, _repository, legacy_authority, _service, sid = operation_store
+    authority = legacy_authority if lifecycle_version == 1 else _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Admission hash branch")
+    if lifecycle_version == 1:
+        request_hash = composer_operation_request_hash(session_id=sid, kind="compose_message", request=request)
+    else:
+        request_hash = composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request)
+    original_v1 = module.composer_operation_request_hash
+    original_v2 = module.composer_operation_v2_request_hash
+    calls = []
+    selected_error = None
+
+    def observed_v1(*, session_id, kind, request):
+        calls.append(("v1", session_id, kind, request))
+        if selected_error is not None:
+            raise selected_error
+        return original_v1(session_id=session_id, kind=kind, request=request)
+
+    def observed_v2(*, session_id, kind, request):
+        calls.append(("v2", session_id, kind, request))
+        if selected_error is not None:
+            raise selected_error
+        return original_v2(session_id=session_id, kind=kind, request=request)
+
+    # Intercept the authority's bindings only. The real v2 implementation is
+    # allowed to invoke its defining module's v1 helper internally.
+    monkeypatch.setattr(module, "composer_operation_request_hash", observed_v1)
+    monkeypatch.setattr(module, "composer_operation_v2_request_hash", observed_v2)
+    kwargs = {
+        "quota": ComposerQuotaAdmission(RepositoryRateLimitAuthority(engine, signing_key=b"operation-test-quota-key-32-bytes"), 10000),
+        "session_id": sid,
+        "operation_id": request.operation_id,
+        "kind": "compose_message",
+        "request_hash": request_hash,
+        "actor_user_id": "alice",
+        "request_id": "correlation",
+        "base_state_id": request.state_id,
+        "request_json": request.model_dump_json(),
+        "deadline_seconds": 180.0,
+        "max_nonterminal": 64,
+        "auth_provider_type": "local",
+        "lifecycle_version": lifecycle_version,
+        "continuation_enabled": lifecycle_version == 2,
+    }
+    # Every refusal starts with a real fresh positive under the same spies.
+    record, fresh = authority.admit(**kwargs)
+    expected_calls = [("v1" if lifecycle_version == 1 else "v2", sid, "compose_message", request)]
+    assert calls == expected_calls
+    assert fresh and record.lifecycle_version == lifecycle_version
+    assert record.operation_id == request.operation_id and record.request_hash == request_hash
+    if case == "valid":
+        return
+
+    before = _admission_rows(engine)
+    calls.clear()
+    if case == "operation_id_mismatch":
+        kwargs["operation_id"] = str(uuid4())
+    elif case == "state_id_mismatch":
+        kwargs["base_state_id"] = uuid4()
+    elif case == "hash_mismatch":
+        kwargs["request_hash"] = ("0" if request_hash[0] != "0" else "1") + request_hash[1:]
+    else:
+        assert case == "selected_hash_raises"
+        selected_error = RuntimeError("selected admission hash failed")
+
+    if selected_error is not None:
+        with pytest.raises(RuntimeError) as refused:
+            authority.admit(**kwargs)
+        assert refused.value is selected_error
+    else:
+        with pytest.raises(ValueError, match=r"^composer request does not match its immutable admission binding$"):
+            authority.admit(**kwargs)
+    assert calls == ([] if case in {"operation_id_mismatch", "state_id_mismatch"} else expected_calls)
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.parametrize("mode", ["auto_commit", "explicit_approve"])
+@pytest.mark.parametrize("supplied", [False, True])
+def test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress(operation_store, mode, supplied):
+    from elspeth.web.composer.continuation import reserved_user_message_id
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+    from elspeth.web.sessions.continuation import load_snapshot
+    from elspeth.web.sessions.models import chat_messages_table, rate_limit_events_table
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    with engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(trust_mode=mode))
+    before = _admission_rows(engine)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Atomic continuation")
+    record, fresh = admit(
+        authority,
+        sid,
+        request,
+        lifecycle_version=2,
+        continuation_enabled=True,
+        seed=_admission_seed(sid, request, mode=mode) if supplied else None,
+    )
+    assert fresh and record.lifecycle_version == 2 and record.deadline_at is None
+    assert record.ingress_phase == "pending" and record.user_message_id is None
+    assert str(record.reserved_user_message_id) == reserved_user_message_id(sid, request.operation_id)
+    assert record.current_segment_sequence == record.ownership_generation == 1
+    assert record.status_revision == record.journal_cursor == 0
+    with engine.connect() as conn:
+        assert len(conn.execute(select(checkpoints)).all()) == len(conn.execute(select(chunks)).all()) == 1
+        snapshot = load_snapshot(conn, session_id=str(sid), operation_id=request.operation_id)
+        stack = decode_continuation_snapshot(snapshot.payload_json)
+        assert stack.mutation_ceiling.initial_trust_mode == mode
+        assert stack.logical.original_user_message_id == str(record.reserved_user_message_id)
+        assert stack.provider_cost_policy.applicability == "not_applicable"
+        (segment,) = conn.execute(select(segments)).all()
+        assert segment.state == "queued" and segment.sequence == segment.generation == 1
+        assert segment.deadline_at is segment.claim_token is segment.started_at is None
+        assert segment.next_action_json == authority._continuation_policy.actions.session_sql.model_dump_json()
+        assert len(conn.execute(select(checkpoints)).all()) == len(conn.execute(select(chunks)).all()) == 1
+        assert conn.execute(select(attempts)).all() == []
+        assert conn.execute(select(chat_messages_table)).all() == []
+        assert len(conn.execute(select(rate_limit_events_table)).all()) == 1
+    after = _admission_rows(engine)
+    for name in ("sessions", "session_operation_fences", "quota_provider_attempts", "token_usage_ledger"):
+        assert after[name] == before[name]
+
+
+def test_v2_admission_fresh_disabled_refuses_exact_body_without_new_rows(operation_store):
+    engine, _repository, authority, _service, sid = operation_store
+    before = _admission_rows(engine)
+    with pytest.raises(ComposerOperationPreconditionRefused) as refused:
+        admit(authority, sid, lifecycle_version=2)
+    assert refused.value.error.http_status == 409
+    assert refused.value.error.body == {
+        "detail": {
+            "error_type": "composer_continuation_disabled",
+            "detail": "New continuation requests are disabled.",
+        }
+    }
+    assert _admission_rows(engine) == before
+
+
+def _admission_seed(sid, request, *, mode="auto_commit", policy=None):
+    from tests.helpers.continuation_policy import minimal_continuation_policy
+
+    from elspeth.web.composer.continuation import prepare_composer_continuation_admission
+
+    policy = policy if policy is not None else minimal_continuation_policy()
+    kind = "compose_message" if isinstance(request, SendMessageRequest) else "compose_recompose"
+    return prepare_composer_continuation_admission(
+        session_id=sid,
+        operation_id=request.operation_id,
+        kind=kind,
+        request_json=request.model_dump_json(),
+        request_hash=composer_operation_v2_request_hash(session_id=sid, kind=kind, request=request),
+        base_state_id=request.state_id,
+        policy_hash=policy.policy_hash,
+        admission_policy_json=policy.model_dump_json(),
+        initial_trust_mode=mode,
+        initial_action_json=policy.actions.session_sql.model_dump_json(),
+        original_user_message_id=str(request.expected_user_message_id) if isinstance(request, RecomposeRequest) else None,
+    )
+
+
+def test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_state(operation_store, monkeypatch):
+    from sqlalchemy import event
+
+    from elspeth.web.coordination import composer_operation_authority as module
+
+    engine, _repository, old_authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Replay")
+    first, _ = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+    before = _admission_rows(engine)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("exact replay consulted fresh admission prerequisites")
+
+    def no_mode_read(conn, cursor, statement, parameters, context, executemany):
+        assert not (statement.lstrip().upper().startswith("SELECT") and "sessions.trust_mode" in statement)
+
+    monkeypatch.setattr(module, "prepare_composer_continuation_admission", forbidden)
+    monkeypatch.setattr(module, "check_composer_request_preconditions_on_connection", forbidden)
+    event.listen(engine, "before_cursor_execute", no_mode_read)
+    try:
+        replay, fresh = admit(old_authority, sid, request, lifecycle_version=2, continuation_enabled=False)
+        assert not fresh and replay == first
+        changed = request.model_copy(update={"content": "changed", "state_id": uuid4()})
+        with pytest.raises(ComposerOperationConflictError):
+            admit(old_authority, sid, changed, lifecycle_version=2)
+        with pytest.raises(ComposerOperationConflictError):
+            admit(old_authority, sid, request)
+    finally:
+        event.remove(engine, "before_cursor_execute", no_mode_read)
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.parametrize("value", [{}, object()])
+def test_v2_admission_policy_constructor_is_nominal(operation_store, value):
+    engine = operation_store[0]
+    with pytest.raises(TypeError, match="owned complete admission policy"):
+        ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=value)
+
+
+def test_v2_admission_missing_server_policy_refuses_without_mutation(operation_store):
+    engine, _repository, authority, _service, sid = operation_store
+    before = _admission_rows(engine)
+    with pytest.raises(ValueError, match="no validated server policy"):
+        admit(authority, sid, lifecycle_version=2, continuation_enabled=True)
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.parametrize(
+    "changed", ["nominal", "json", "mode", "session", "operation", "request_hash", "base", "reserved", "cursor", "action", "policy"]
+)
+def test_v2_admission_refuses_corrupt_or_substituted_seed_before_writes(operation_store, changed):
+    import json
+    from dataclasses import replace
+
+    from tests.helpers.continuation_policy import minimal_continuation_policy
+
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Exact binding")
+    seed = _admission_seed(sid, request)
+    data = json.loads(seed.snapshot_json)
+    if changed == "nominal":
+        seed = {"snapshot_json": seed.snapshot_json}
+    elif changed == "json":
+        seed = replace(seed, snapshot_json="{}")
+    elif changed == "action":
+        seed = replace(seed, action_json=minimal_continuation_policy().actions.primary.model_dump_json())
+    else:
+        if changed == "mode":
+            data["mutation_ceiling"]["initial_trust_mode"] = "explicit_approve"
+        elif changed in ("session", "operation", "request_hash", "base", "reserved"):
+            key = {
+                "session": "session_id",
+                "operation": "operation_id",
+                "request_hash": "request_hash",
+                "base": "base_state_id",
+                "reserved": "original_user_message_id",
+            }[changed]
+            data["logical"][key] = "b" * 64 if changed == "request_hash" else str(uuid4())
+        elif changed == "cursor":
+            data["cursor"] = 1
+        else:
+            assert changed == "policy"
+            policy = minimal_continuation_policy()
+            policy = policy.model_copy(update={"segment": policy.segment.model_copy(update={"reserve": 26.0})})
+            data["admission_policy_json"] = policy.model_dump_json()
+            data["policy_hash"] = policy.policy_hash
+            seed = replace(seed, policy_hash=policy.policy_hash)
+        seed = replace(seed, snapshot_json=json.dumps(data))
+    before = _admission_rows(engine)
+    with pytest.raises((AuditIntegrityError, ValueError)):
+        admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True, seed=seed)
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["valid", "different", "completed", "missing"])
+async def test_v2_admission_recompose_joins_actual_original_user(operation_store, case):
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+    from elspeth.web.sessions.continuation import load_snapshot
+    from elspeth.web.sessions.models import chat_messages_table
+
+    engine, repository, _authority, service, sid = operation_store
+    context = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    original = None
+    if case != "missing":
+        original = await service.add_message(sid, "user", "Build", writer_principal="route_user_message", session_operation_context=context)
+        await service.add_message(
+            sid,
+            "assistant",
+            "Saved reply" if case == "completed" else "tool prefix",
+            writer_principal="compose_loop",
+            session_operation_context=context,
+            tool_calls=None
+            if case == "completed"
+            else [{"id": "call", "type": "function", "function": {"name": "set_metadata", "arguments": "{}"}}],
+        )
+    repository.release(context)
+    request = RecomposeRequest(
+        operation_id=str(uuid4()), expected_user_message_id=uuid4() if case in ("missing", "different") else original.id
+    )
+    authority = _admission_v2_authority(operation_store)
+    before = _admission_rows(engine)
+    if case != "valid":
+        with pytest.raises(ComposerOperationPreconditionRefused) as refused:
+            admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+        expected = {
+            "missing": {"detail": "No messages to recompose from"},
+            "different": "recompose_user_message_mismatch",
+            "completed": "recompose_already_completed",
+        }[case]
+        if case == "missing":
+            assert refused.value.error.body == expected
+        else:
+            assert refused.value.error.body["detail"]["error_type"] == expected
+        assert _admission_rows(engine) == before
+    else:
+        record, fresh = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+        assert fresh and record.ingress_phase == "committed"
+        assert record.user_message_id == record.reserved_user_message_id == original.id
+        with engine.connect() as conn:
+            assert [row.id for row in conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "user"))] == [
+                str(original.id)
+            ]
+            snapshot = load_snapshot(conn, session_id=str(sid), operation_id=record.operation_id)
+            assert decode_continuation_snapshot(snapshot.payload_json).logical.original_user_message_id == str(original.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consistent_publication", [False, True])
+async def test_malformed_v2_base_refuses_before_fresh_admission_writes(operation_store, consistent_publication):
+    from dataclasses import replace
+    from traceback import extract_tb
+
+    from elspeth.contracts.composer_content import ContentPublication
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.sessions.content_publication import read_content_publication, storage_content_hash
+    from elspeth.web.sessions.converters import state_from_record
+    from elspeth.web.sessions.models import composition_states_table
+    from elspeth.web.sessions.state_envelope import envelope_state_column
+
+    engine, repository, _authority, service, sid = operation_store
+    prior = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    try:
+        saved = await service.save_composition_state(
+            sid, _admission_state_data(), provenance="session_seed", session_operation_context=prior
+        )
+    finally:
+        repository.release(prior)
+    assert read_content_publication(saved) is not None
+    assert state_from_record(saved).nodes[0].node_type == "transform"
+    bad_nodes = deep_thaw(saved.nodes)
+    bad_nodes[0]["branches"] = 17
+    changes = {"nodes": envelope_state_column(bad_nodes)}
+    if consistent_publication:
+        corrupted = replace(saved, nodes=bad_nodes)
+        composer_meta = deep_thaw(saved.composer_meta)
+        composer_meta["content_publication"] = ContentPublication(
+            saved.session_id, saved.id, saved.version, storage_content_hash(corrupted)
+        ).to_payload()
+        changes["composer_meta"] = envelope_state_column(composer_meta)
+    with engine.begin() as conn:
+        conn.execute(update(composition_states_table).where(composition_states_table.c.id == str(saved.id)).values(**changes))
+    request = SendMessageRequest(operation_id=str(uuid4()), state_id=saved.id, content="Inspect graph")
+    before = _admission_rows(engine)
+    assert before["rate_limit_buckets"] == before["rate_limit_events"] == []
+    expected = "base state cannot be hydrated" if consistent_publication else "Content publication does not match"
+    with pytest.raises(AuditIntegrityError, match=expected) as refused:
+        admit(
+            _admission_v2_authority(operation_store),
+            sid,
+            request,
+            lifecycle_version=2,
+            continuation_enabled=True,
+            seed=_admission_seed(sid, request),
+        )
+    if consistent_publication:
+        cause = refused.value.__cause__
+        assert type(cause) is TypeError and str(cause) == "'int' object is not iterable"
+        frame = extract_tb(cause.__traceback__)[-1]
+        assert frame.name == "from_dict" and "tuple(branches)" in frame.line
+    else:
+        assert refused.value.__cause__ is None
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.asyncio
+async def test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_rows(operation_store):
+    from elspeth.web.coordination import composer_operation_authority as operation_authority_module
+    from elspeth.web.coordination.composer_operation_authority import admit_composer_operation
+    from elspeth.web.sessions import service as sessions_service_module
+    from elspeth.web.sessions.composer_operation_preconditions import (
+        ComposerOperationPreconditions,
+        check_composer_operation_preconditions_on_connection,
+        check_composer_request_preconditions_on_connection,
+    )
+    from elspeth.web.sessions.converters import state_record_from_row
+    from elspeth.web.sessions.models import composition_states_table
+    from elspeth.web.sessions.state_decoder import state_record_from_row as canonical_decoder
+
+    assert state_record_from_row is canonical_decoder
+    assert sessions_service_module.state_record_from_row is canonical_decoder
+    assert operation_authority_module.state_record_from_row is canonical_decoder
+    assert canonical_decoder.__module__ == "elspeth.web.sessions.state_decoder"
+
+    engine, repository, _authority, service, sid = operation_store
+    prior = repository.acquire(
+        session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+    )
+    try:
+        saved = await service.save_composition_state(
+            sid, _admission_state_data(), provenance="session_seed", session_operation_context=prior
+        )
+    finally:
+        repository.release(prior)
+    authority = _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Current graph", state_id=saved.id)
+    record, fresh = await admit_composer_operation(
+        authority,
+        quota=ComposerQuotaAdmission(RepositoryRateLimitAuthority(engine, signing_key=b"operation-test-quota-key-32-bytes"), 10000),
+        session_id=sid,
+        operation_id=request.operation_id,
+        kind="compose_message",
+        request_hash=composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request),
+        actor_user_id="alice",
+        request_id=None,
+        base_state_id=saved.id,
+        request_json=request.model_dump_json(),
+        deadline_seconds=180,
+        max_nonterminal=64,
+        auth_provider_type="local",
+        lifecycle_version=2,
+        continuation_enabled=True,
+    )
+    assert fresh and record.lifecycle_version == 2
+    full = authority.get_for_turn(session_id=sid, operation_id=request.operation_id)
+    with engine.connect() as conn:
+        row = conn.execute(select(composition_states_table)).one()
+        assert canonical_decoder(row) == state_record_from_row(row)
+        assert state_record_from_row(row) == service._row_to_state_record(row) == saved
+        assert check_composer_operation_preconditions_on_connection(conn, full, auth_provider_type="local") is None
+        preconditions = ComposerOperationPreconditions(sid, "alice", None, saved.id, "compose_message", request.model_dump_json())
+        assert check_composer_request_preconditions_on_connection(conn, preconditions, auth_provider_type="local") is None
+        with pytest.raises(TypeError, match="job must be ComposerOperationRecord"):
+            check_composer_operation_preconditions_on_connection(conn, preconditions, auth_provider_type="local")
+        with pytest.raises(TypeError, match="job must be ComposerOperationPreconditions"):
+            check_composer_request_preconditions_on_connection(conn, full, auth_provider_type="local")
+
+
+@pytest.mark.parametrize("fault", ["chunk", "checkpoint", "segment", "quota"])
+def test_v2_admission_child_sql_failure_rolls_back_whole_bundle_and_charge(operation_store, fault):
+    from sqlalchemy import event
+
+    from elspeth.web.coordination.rate_limit_authority import ComposerQuotaExceeded
+
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    quota = ComposerQuotaAdmission(RepositoryRateLimitAuthority(engine, signing_key=b"operation-test-quota-key-32-bytes"), 1)
+    if fault == "quota":
+        with engine.begin() as conn:
+            quota.check_on_connection(conn, "alice")
+    before = _admission_rows(engine)
+    observed = []
+    targets = {
+        "chunk": "composer_continuation_chunks",
+        "checkpoint": "composer_continuation_checkpoints",
+        "segment": "composer_operation_segments",
+    }
+
+    def fault_after_real_insert(conn, cursor, statement, parameters, context, executemany):
+        if context.compiled is not None and context.compiled.isinsert and context.compiled.statement.table.name == targets.get(fault):
+            assert conn.execute(select(jobs)).one().lifecycle_version == 2
+            observed.append(context.compiled.statement.table.name)
+            raise RuntimeError("controlled continuation child SQL fault")
+
+    event.listen(engine, "after_cursor_execute", fault_after_real_insert)
+    try:
+        with pytest.raises(ComposerQuotaExceeded if fault == "quota" else RuntimeError):
+            admit(authority, sid, lifecycle_version=2, continuation_enabled=True, quota=quota)
+    finally:
+        event.remove(engine, "after_cursor_execute", fault_after_real_insert)
+    assert observed == ([] if fault == "quota" else [targets[fault]])
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.parametrize("case", ["replay", "disabled", "refused"])
+def test_v2_admission_expired_quota_maintenance_is_separate_from_new_admission(operation_store, case):
+    from datetime import timedelta
+
+    from sqlalchemy import insert
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.models import rate_limit_buckets_table as buckets
+    from elspeth.web.sessions.models import rate_limit_events_table as events
+
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Expiry counterevidence")
+    if case == "replay":
+        admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+    digest = "e" * 64
+    expired_id = str(uuid4())
+    with engine.begin() as conn:
+        now = database_now(conn)
+        conn.execute(
+            insert(buckets).values(
+                subject_digest=digest,
+                window_seconds=60,
+                request_limit=1,
+                updated_at=now - timedelta(minutes=2),
+                expires_at=now - timedelta(minutes=1),
+            )
+        )
+        conn.execute(
+            insert(events).values(
+                event_id=expired_id, subject_digest=digest, occurred_at=now - timedelta(minutes=2), expires_at=now - timedelta(minutes=1)
+            )
+        )
+        expired_bucket = tuple(conn.execute(select(buckets).where(buckets.c.subject_digest == digest)).one())
+        expired_event = tuple(conn.execute(select(events).where(events.c.event_id == expired_id)).one())
+    before = _admission_rows(engine)
+    assert expired_bucket in before["rate_limit_buckets"] and expired_event in before["rate_limit_events"]
+    if case == "replay":
+        record, fresh = admit(operation_store[2], sid, request, lifecycle_version=2)
+        assert not fresh and record.operation_id == request.operation_id
+    elif case == "disabled":
+        with pytest.raises(ComposerOperationPreconditionRefused):
+            admit(authority, sid, request, lifecycle_version=2)
+    else:
+        with pytest.raises(AuditIntegrityError, match="another initial session trust mode"):
+            admit(
+                authority,
+                sid,
+                request,
+                lifecycle_version=2,
+                continuation_enabled=True,
+                seed=_admission_seed(sid, request, mode="explicit_approve"),
+            )
+    after = _admission_rows(engine)
+    for table, rows in before.items():
+        if table == "rate_limit_buckets":
+            assert after[table] == [row for row in rows if row != expired_bucket]
+        elif table == "rate_limit_events":
+            assert after[table] == [row for row in rows if row != expired_event]
+        else:
+            assert after[table] == rows
+
+
+@pytest.mark.parametrize("same_id", [False, True])
+def test_v2_admission_real_concurrency_has_one_atomic_fresh_winner(operation_store, same_id):
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    common_id = str(uuid4())
+
+    def submit(index):
+        request = SendMessageRequest(operation_id=common_id if same_id else str(uuid4()), content="Concurrent")
+        try:
+            return admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+        except ComposerOperationActiveError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, range(2)))
+    assert sum(result is not None and result[1] for result in results) == 1
+    assert sum(result is not None for result in results) == (2 if same_id else 1)
+    rows = _admission_rows(engine)
+    for name in (
+        "composer_async_operations",
+        "composer_continuation_chunks",
+        "composer_continuation_checkpoints",
+        "composer_operation_segments",
+        "rate_limit_events",
+    ):
+        assert len(rows[name]) == 1
+    assert rows["composer_segment_attempts"] == rows["chat_messages"] == []
+
+
+@pytest.mark.parametrize(
+    "changes", [{"lifecycle_version": True}, {"lifecycle_version": 3}, {"continuation_enabled": 1}, {"seed": object()}]
+)
+def test_v2_admission_configuration_refusals_preserve_default_v1(operation_store, changes):
+    engine, _repository, authority, _service, sid = operation_store
+    before = _admission_rows(engine)
+    with pytest.raises(ValueError):
+        admit(authority, sid, **changes)
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "foreign", "stale", "actor", "provider", "archive"])
+async def test_v2_admission_current_principal_and_base_refusals_before_new_writes(operation_store, case):
+    engine, repository, _authority, service, sid = operation_store
+    state_id = None
+    if case in ("foreign", "stale"):
+        state_session = sid
+        if case == "foreign":
+            state_session = repository.create_session_with_initial_fence(
+                user_id="alice", title="Other", auth_provider_type="local", owner_instance_id="test-owner", lease_seconds=30
+            ).id
+        prior = repository.acquire(
+            session_id=state_session, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
+        )
+        try:
+            saved = await service.save_composition_state(
+                state_session, _admission_state_data(), provenance="session_seed", session_operation_context=prior
+            )
+        finally:
+            repository.release(prior)
+        if case == "foreign":
+            state_id = saved.id
+    elif case == "missing":
+        state_id = uuid4()
+    elif case == "archive":
+        with engine.begin() as conn:
+            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(archived_at=database_now(conn)))
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Current authorization", state_id=state_id)
+    before = _admission_rows(engine)
+    with pytest.raises(ComposerOperationPreconditionRefused) as refused:
+        admit(
+            _admission_v2_authority(operation_store),
+            sid,
+            request,
+            lifecycle_version=2,
+            continuation_enabled=True,
+            actor="other" if case == "actor" else "alice",
+            provider="oidc" if case == "provider" else "local",
+        )
+    if case == "stale":
+        assert refused.value.error.http_status == 409
+        assert refused.value.error.body["error_type"] == "stale_compose_state"
+    else:
+        assert refused.value.error.http_status == 404
+    assert _admission_rows(engine) == before
+
+
+@pytest.mark.parametrize("lifecycle", [1, 2])
+def test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle(operation_store, monkeypatch, lifecycle):
+    from sqlalchemy import event
+
+    from elspeth.web.coordination import composer_operation_authority as module
+
+    engine, _repository, _authority, _service, sid = operation_store
+    authority = _admission_v2_authority(operation_store)
+    request = SendMessageRequest(operation_id=str(uuid4()), content="Savepoint conflict")
+    original, _ = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+    before = _admission_rows(engine)
+    actual_read = module._read
+    reads = []
+    errors = []
+
+    def initial_miss(conn, selected_sid, operation_id, *, body=False):
+        row = actual_read(conn, selected_sid, operation_id, body=body)
+        reads.append(row is not None)
+        return None if len(reads) == 1 else row
+
+    def capture_unique_refusal(context):
+        errors.append(context.is_disconnect)
+
+    monkeypatch.setattr(module, "_read", initial_miss)
+    event.listen(engine, "handle_error", capture_unique_refusal)
+    try:
+        if lifecycle == 1:
+            with pytest.raises(ComposerOperationConflictError):
+                admit(authority, sid, request)
+        else:
+            replay, fresh = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+            assert not fresh and replay == original
+    finally:
+        event.remove(engine, "handle_error", capture_unique_refusal)
+    assert reads == [True, True] and errors == [False]
+    assert _admission_rows(engine) == before
+
+
+def test_v2_admission_default_v1_never_consults_continuation_seed(operation_store, monkeypatch):
+    from elspeth.web.coordination import composer_operation_authority as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("V1 invoked continuation seed producer")
+
+    monkeypatch.setattr(module, "prepare_composer_continuation_admission", forbidden)
+    _engine, _repository, authority, _service, sid = operation_store
+    record, fresh = admit(authority, sid)
+    assert fresh and record.lifecycle_version == 1
+    assert record.legacy_deadline_at is not None
+
+
+@pytest.mark.parametrize("deadline", [0, -1, float("nan")])
+def test_v2_admission_keeps_legacy_worker_budget_validation(operation_store, deadline):
+    engine, _repository, _authority, _service, sid = operation_store
+    before = _admission_rows(engine)
+    with pytest.raises(ValueError, match="invalid composer request budget"):
+        admit(_admission_v2_authority(operation_store), sid, deadline_seconds=deadline, lifecycle_version=2, continuation_enabled=True)
+    assert _admission_rows(engine) == before
 
 
 def start(store, request=None, *, deadline_seconds=180.0):
@@ -1593,6 +2868,7 @@ async def test_required_intermediate_cancellation_joins_actual_sql(operation_sto
             assistant_content="Observed",
             redacted_assistant_tool_calls=(),
             redacted_tool_rows=(),
+            revoked_tool_rows=(),
             private_tool_evidence=(),
             parent_composition_state_id=None,
             expected_current_state_id=None,
@@ -1928,3 +3204,181 @@ async def test_expired_job_refuses_business_write_at_database_clock(operation_st
     assert terminal.status == "failed"
     assert terminal.result_json == canonical_json(failure.model_dump(mode="json"))
     repository.release(running.session_operation_context)
+
+
+def test_continuation_chunk_collision_preserves_original_bytes(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import put_chunk, read_chunk
+
+    engine, _repository, authority, _service, sid = operation_store
+    record, _ = admit(authority, sid)
+    with engine.begin() as conn:
+        put_chunk(
+            conn,
+            session_id=str(sid),
+            operation_id=record.operation_id,
+            key="native-response",
+            payload=b'{"value":"exact"}',
+            codec="json.v2",
+        )
+        assert read_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="native-response") == b'{"value":"exact"}'
+        put_chunk(
+            conn,
+            session_id=str(sid),
+            operation_id=record.operation_id,
+            key="native-response",
+            payload=b'{"value":"exact"}',
+            codec="json.v2",
+        )
+        with pytest.raises(AuditIntegrityError, match="immutable chunk collision"):
+            put_chunk(
+                conn,
+                session_id=str(sid),
+                operation_id=record.operation_id,
+                key="native-response",
+                payload=b'{"value":"other"}',
+                codec="json.v2",
+            )
+        assert read_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="native-response") == b'{"value":"exact"}'
+
+
+def test_continuation_chunk_digest_corruption_is_refused(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import put_chunk, read_chunk
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+
+    engine, _repository, authority, _service, sid = operation_store
+    record, _ = admit(authority, sid)
+    with engine.begin() as conn:
+        put_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="native-response", payload=b"one", codec="json.v2")
+        conn.execute(update(chunks).where(chunks.c.operation_id == record.operation_id).values(payload=b"two"))
+        with pytest.raises(AuditIntegrityError, match="chunk digest"):
+            read_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="native-response")
+
+
+def test_continuation_chunk_codec_is_immutable(operation_store):
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.continuation import put_chunk, read_chunk
+
+    engine, _repository, authority, _service, sid = operation_store
+    record, _ = admit(authority, sid)
+    with engine.begin() as conn:
+        put_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="codec", payload=b"exact", codec="json.v2")
+        with pytest.raises(AuditIntegrityError, match="immutable chunk collision"):
+            put_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="codec", payload=b"exact", codec="foreign.v3")
+        assert read_chunk(conn, session_id=str(sid), operation_id=record.operation_id, key="codec") == b"exact"
+
+
+@pytest.mark.asyncio
+async def test_v1_terminal_settlement_clears_claim_token_and_preserves_attribution(operation_store):
+    from hashlib import sha256
+
+    engine, repository, authority, service, sid = operation_store
+    record, running = start(operation_store)
+    try:
+        with engine.connect() as connection:
+            before = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert before.lifecycle_version == 1 and before.status == "running" and before.claim_token is not None
+        failure = failed()
+        terminal = await service.fail_composer_async_operation(running, failure=failure)
+        with engine.connect() as connection:
+            after = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert after.status == "failed" and after.claim_token is None
+        for field in (
+            "claim_owner_instance_id",
+            "session_operation_id",
+            "session_operation_lease_token",
+            "session_operation_epoch",
+            "attempt",
+            "started_at",
+        ):
+            assert after._mapping[field] == before._mapping[field]
+        expected_json = canonical_json(failure.model_dump(mode="json"))
+        assert terminal.result_json == after.result_json == expected_json
+        assert terminal.result_sha256 == after.result_sha256 == sha256(expected_json.encode()).hexdigest()
+        assert authority.get(session_id=sid, operation_id=record.operation_id) == terminal
+    finally:
+        repository.release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    [
+        "claim_owner_instance_id",
+        "session_operation_id",
+        "session_operation_lease_token",
+        "session_operation_epoch",
+        "attempt",
+        "started_at",
+    ],
+)
+async def test_v1_terminal_settlement_refuses_attribution_substitution(operation_store, field):
+    from datetime import timedelta
+    from hashlib import sha256
+
+    engine, repository, authority, service, sid = operation_store
+    record, running = start(operation_store)
+    try:
+        with engine.connect() as connection:
+            before = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert before.lifecycle_version == 1 and before.status == "running"
+        failure = failed()
+        encoded = canonical_json(failure.model_dump(mode="json"))
+        values = {
+            "status": "failed",
+            "request_json": None,
+            "claim_token": None,
+            "claim_expires_at": None,
+            "failure_code": failure.failure_code,
+            "settled_by": "owner_terminal",
+            "result_schema": "composer_operation_error.v1",
+            "result_json": encoded,
+            "result_sha256": sha256(encoded.encode()).hexdigest(),
+        }
+        if field == "started_at":
+            values[field] = before.started_at + timedelta(microseconds=1)
+        elif field in ("attempt", "session_operation_epoch"):
+            values[field] = before._mapping[field] + 1
+        else:
+            values[field] = "forged-terminal-attribution"
+        with pytest.raises(IntegrityError, match="composer operation immutable transition"), engine.begin() as connection:
+            now = database_now(connection)
+            if field == "started_at":
+                # Keep independent timestamp CHECKs valid, exposing the guard.
+                now += timedelta(seconds=1)
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)
+                .values(**values, updated_at=now, settled_at=now)
+            )
+        with engine.connect() as connection:
+            after = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert after == before
+        # The unchanged real owner can still settle normally after the refusal.
+        terminal = await service.fail_composer_async_operation(running, failure=failure)
+        assert terminal.status == "failed" and terminal.result_json == encoded
+        assert authority.get(session_id=sid, operation_id=record.operation_id) == terminal
+    finally:
+        repository.release(running.session_operation_context)
+
+
+@pytest.mark.parametrize("replacement", [None, "forged-running-claim"])
+def test_v1_running_claim_token_change_is_refused_without_row_changes(operation_store, replacement):
+    engine, repository, _authority, _service, sid = operation_store
+    record, running = start(operation_store)
+    try:
+        with engine.connect() as connection:
+            before = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert before.lifecycle_version == 1 and before.status == "running"
+        with pytest.raises(IntegrityError, match="composer operation immutable transition"), engine.begin() as connection:
+            connection.execute(
+                update(jobs)
+                .where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)
+                .values(claim_token=replacement)
+            )
+        with engine.connect() as connection:
+            after = connection.execute(select(jobs).where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)).one()
+        assert after == before
+    finally:
+        repository.release(running.session_operation_context)

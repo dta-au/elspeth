@@ -1,0 +1,34 @@
+"""Actual attachment custody/current-selection cases on PostgreSQL, serial."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_actual_selection_recheck_refuses_cancel_after_successful_read as test_actual_selection_recheck_refuses_cancel_after_successful_read,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_admission_wait_keeps_single_original_cancellation_without_read as test_admission_wait_keeps_single_original_cancellation_without_read,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_complete_read_history_refuses_independent_binding_changes_after_positive as test_complete_read_history_refuses_independent_binding_changes_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_current_read_captures_actual_locked_original_and_preserves_result_alias as test_current_read_captures_actual_locked_original_and_preserves_result_alias,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_original_tail_structured_secret_and_utf8_refuse_without_receipt as test_original_tail_structured_secret_and_utf8_refuse_without_receipt,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_policy_uses_actual_names_inventory_without_resolving_values as test_policy_uses_actual_names_inventory_without_resolving_values,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_reader_integrity_failure_retains_exact_exception_and_settles_projection as test_reader_integrity_failure_retains_exact_exception_and_settles_projection,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_started_read_cancellation_joins_exact_original_before_delivery as test_started_read_cancellation_joins_exact_original_before_delivery,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_valid_same_checkpoint_changed_root_refuses_before_file_read as test_valid_same_checkpoint_changed_root_refuses_before_file_read,
+)
+
+pytestmark = pytest.mark.testcontainer

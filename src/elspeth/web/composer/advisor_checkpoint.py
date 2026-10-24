@@ -53,6 +53,7 @@ from elspeth.web.composer.advisor_audit import (
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
+from elspeth.web.composer.advisor_invocation_outcome import _AdvisorInvocationCapture
 from elspeth.web.composer.advisor_output import (
     AdvisorEndResponse,
     parse_advisor_abandonment_response,
@@ -94,6 +95,7 @@ from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emi
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
 from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
@@ -440,6 +442,7 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_custody: ProviderCallCustody | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        _outcome: _AdvisorInvocationCapture | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -474,6 +477,9 @@ class AdvisorCheckpointOwner:
         max_completion = self._settings.composer_advisor_max_completion_tokens
         if continuation_budget is not None:
             max_completion = min(max_completion, continuation_budget.policy.max_completion_tokens)
+        cost_limit = provider_custody.cost_completion_limit() if provider_custody is not None else None
+        if cost_limit is not None:
+            max_completion = min(max_completion, cost_limit)
 
         trigger = cast(str, arguments["trigger"])
         trigger_instructions = "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
@@ -527,6 +533,7 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -608,6 +615,9 @@ class AdvisorCheckpointOwner:
                 provider_metadata=response_metadata,
                 surface="composer_advisor_response",
             )
+            if _outcome is not None:
+                _outcome.message = message
+                _outcome.provider_metadata = response_metadata
             guidance = raw_content
             status = ComposerLLMCallStatus.SUCCESS
             usage = token_usage_from_response(response)
@@ -618,6 +628,9 @@ class AdvisorCheckpointOwner:
                 "cached_prompt_tokens": usage.cached_prompt_tokens,
                 "latency_ms": (time.monotonic_ns() - started_ns) // 1_000_000,
             }
+            if _outcome is not None:
+                _outcome.guidance = guidance
+                _outcome.metadata = metadata
             return guidance, metadata
         except PromptGuardRefused:
             raise
@@ -632,6 +645,7 @@ class AdvisorCheckpointOwner:
             error_message = type(exc).__name__
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -669,6 +683,8 @@ class AdvisorCheckpointOwner:
             with required_provider_audit_scope(provider_custody):
                 if status is not None and (recorder is not None or provider_custody is not None):
                     if provider_custody is None or provider_custody.needs_terminal_audit():
+                        if _outcome is not None and provider_custody is not None:
+                            _outcome.attempt = provider_custody.attempt
                         call = build_llm_call_record(
                             model_requested=advisor_model,
                             pricing_model=self._settings.composer_advisor_pricing_model,
@@ -681,20 +697,29 @@ class AdvisorCheckpointOwner:
                             seed=self._settings.composer_seed,
                             response=response,
                             response_metadata=response_metadata,
+                            max_completion_tokens_requested=max_completion,
                             error_class=error_class,
                             error_message=error_message,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
                             private_request=private_request,
                         )
+                        if _outcome is not None:
+                            _outcome.audit_call = call
                         if provider_custody is not None:
+                            provider_custody.mark_cost_response_accountable(admitted_metadata=response_metadata is not None)
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                            if _outcome is not None:
+                                _outcome.recorder_completed = True
                         if continuation_budget is not None:
                             continuation_budget.consume_call(
                                 call, retained=recorder is not None and any(retained is call for retained in recorder.llm_calls)
                             )
+                            if _outcome is not None:
+                                _outcome.continuation_budget_completed = True
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
                         attach_llm_calls(current_exc, recorder)
@@ -734,7 +759,12 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        _outcome: _AdvisorInvocationCapture | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if _outcome is not None:
+            if type(_outcome) is not _AdvisorInvocationCapture or _outcome.claimed or provider_owner is None:
+                raise AuditIntegrityError("Advisor observation requires one fresh explicitly owned invocation")
+            _outcome.claimed = True
         if provider_owner is None:
             return await self._call_advisor_with_audit_legacy(
                 arguments,
@@ -754,6 +784,7 @@ class AdvisorCheckpointOwner:
                 on_provider_dispatch=on_provider_dispatch,
                 provider_custody=provider_custody,
                 continuation_budget=continuation_budget,
+                _outcome=_outcome,
             )
 
     def _build_checkpoint_arguments(
@@ -1455,6 +1486,11 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
+            if phase == "end" and provider_owner is not None and provider_owner.cost_budget is not None:
+                try:
+                    provider_owner.cost_budget.require_end_headroom()
+                except CommonProviderCostRefused:
+                    return continuation_withheld()
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
             try:
                 if remaining is None:

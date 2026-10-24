@@ -404,7 +404,6 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.settings = settings
     app.state.composer_service = composer
     app.state.interpretation_surfacing = composer._interpretation_surfacing
-    app.state.planning_application = composer._planning_application
     app.state.schema_disclosure = composer._schema_disclosure
     app.state.rate_limiter = ComposerRateLimiter(limit=1000)
     app.state.catalog_service = catalog

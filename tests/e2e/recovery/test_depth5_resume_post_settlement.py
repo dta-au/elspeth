@@ -287,6 +287,7 @@ def _resume_after_crash(db: LandscapeDB, settings: ElspethSettings, case_dir: Pa
         resume_point=resume_point,
         config=resume_config,
         graph=resume_graph,
+        settings=settings,
         payload_store=FilesystemPayloadStore(case_dir / "payloads"),
     )
 

@@ -134,12 +134,14 @@ verification and later web connections are outside that measurement. Offline
 instruction rehearsal does not establish live cloud acceptance. These ACA
 enhancements were developed under 0.8.8 and are included in 0.8.9.
 
-Session epoch 78 replaces session epoch 77 and retains its committed graph-review
-authority while strengthening quota custody and shared rate-limit policy binding.
-Landscape epoch 50 replaces epoch 49 and records durable provider-attempt identity
-on run calls. Preserve epoch 75, both epoch 76 session-store contracts, epoch 77
-session stores and epoch 49 Landscape stores; use a separately provisioned epoch 78
-session store and epoch 50 Landscape store. Keep old workers isolated from the new stores.
+Session epoch 79 replaces session epoch 78 and retains its committed graph-review
+authority, quota custody and shared rate-limit policy binding while adding
+versioned Composer continuation segments, exact byte chunks, journal events and
+snapshots. Landscape epoch 50 replaces epoch 49 and records durable
+provider-attempt identity on run calls. Preserve epoch 75, both epoch 76
+session-store contracts, epoch 77 and epoch 78 session stores and epoch 49
+Landscape stores; use a separately provisioned epoch 79 session store and epoch
+50 Landscape store. Keep old workers isolated from the new stores.
 Compatible stores still require exact schema admission; unsupported stores are
 preserved and refused before incompatible writes. Backwards compatibility is
 permitted and considered from 0.8.5 within explicitly supported boundaries. This

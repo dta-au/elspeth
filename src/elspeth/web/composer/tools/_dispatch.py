@@ -27,6 +27,7 @@ from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -823,6 +824,7 @@ def execute_tool(
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
     executing_proposal_id: str | None = None,
+    mutation_ceiling: ComposerMutationCeiling | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
@@ -977,6 +979,7 @@ def execute_tool(
         tool_arguments_hash=tool_arguments_hash,
         reviewed_source_authority=reviewed_source_authority,
         executing_proposal_id=executing_proposal_id,
+        mutation_ceiling=mutation_ceiling,
         _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 

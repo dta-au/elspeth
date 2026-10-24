@@ -329,7 +329,7 @@ def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str
 
     Applied between ``CompositionState.to_dict()`` and any planner-facing
     surface (the per-turn state context message here; ``plan_pipeline``'s
-    ``provider_current_state`` in ``planning_application.py``) so a read-modify-write over
+    ``provider_current_state`` in the direct planner library) so a read-modify-write over
     what the planner sees is round-trippable into ``set_pipeline``. Drops
     ``source_authoring`` and ``approved_prompt_artifact_hash`` from every
     source/node/output options block. Public ``prompt_template_parts`` remain

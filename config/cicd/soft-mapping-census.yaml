@@ -750,6 +750,7 @@ files:
     dict[str, Any]: 8
   src/elspeth/web/composer/_compose_loop_carriers.py:
     Mapping[str, Any]: 3
+    dict[str, Any]: 2
   src/elspeth/web/composer/_producer_resolver.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/_required_paths_validator.py:
@@ -769,6 +770,9 @@ files:
   src/elspeth/web/composer/advisor_context.py:
     Mapping[str, Any]: 12
     dict[str, Any]: 1
+  src/elspeth/web/composer/advisor_invocation_outcome.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 3
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 2
   src/elspeth/web/composer/advisor_policy.py:
@@ -778,8 +782,8 @@ files:
     Mapping[str, object]: 1
     dict[str, object]: 3
   src/elspeth/web/composer/advisor_transcript.py:
-    Mapping[str, Any]: 8
-    dict[str, Any]: 12
+    Mapping[str, Any]: 11
+    dict[str, Any]: 15
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 8
     dict[str, Any]: 4
@@ -796,6 +800,38 @@ files:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
+    dict[str, Any]: 4
+  src/elspeth/web/composer/continuation_application_graph.py:
+    dict[str, Any]: 2
+  src/elspeth/web/composer/continuation_attachment_read.py:
+    Mapping[str, Any]: 2
+  src/elspeth/web/composer/continuation_batch_data.py:
+    dict[str, Any]: 4
+  src/elspeth/web/composer/continuation_dispatch_audit.py:
+    Mapping[str, Any]: 1
+  src/elspeth/web/composer/continuation_evidence_graph.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 2
+  src/elspeth/web/composer/continuation_message_builders.py:
+    dict[str, Any]: 4
+  src/elspeth/web/composer/continuation_message_families.py:
+    dict[str, Any]: 6
+  src/elspeth/web/composer/continuation_message_family_builders.py:
+    Mapping[str, Any]: 3
+    dict[str, Any]: 10
+  src/elspeth/web/composer/continuation_p4_batch.py:
+    Mapping[str, object]: 1
+  src/elspeth/web/composer/continuation_prepared_p4.py:
+    Mapping[str, Any]: 3
+  src/elspeth/web/composer/continuation_primary.py:
+    dict[str, Any]: 6
+  src/elspeth/web/composer/continuation_prompt_producers.py:
+    Mapping[str, Any]: 5
+    dict[str, Any]: 25
+  src/elspeth/web/composer/continuation_provider_input.py:
+    Mapping[str, Any]: 2
+  src/elspeth/web/composer/continuation_tool_argument_messages.py:
+    Mapping[str, Any]: 4
     dict[str, Any]: 4
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
@@ -832,8 +868,6 @@ files:
     Mapping[str, object]: 5
     dict[str, Any]: 8
     dict[str, object]: 17
-  src/elspeth/web/composer/planning_application.py:
-    Mapping[str, Any]: 4
   src/elspeth/web/composer/prompt_guard.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/prompts.py:
@@ -845,8 +879,8 @@ files:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
   src/elspeth/web/composer/provider_gateway.py:
-    Mapping[str, Any]: 7
-    dict[str, Any]: 10
+    Mapping[str, Any]: 11
+    dict[str, Any]: 13
   src/elspeth/web/composer/provider_telemetry.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/provider_thinking.py:
@@ -872,9 +906,9 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 3
+    Mapping[str, Any]: 2
     Mapping[str, object]: 1
-    dict[str, Any]: 15
+    dict[str, Any]: 17
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -888,8 +922,8 @@ files:
     Mapping[str, Any]: 17
     dict[str, Any]: 12
   src/elspeth/web/composer/tool_batch.py:
-    Mapping[str, Any]: 10
-    dict[str, Any]: 7
+    Mapping[str, Any]: 11
+    dict[str, Any]: 14
   src/elspeth/web/composer/tool_error_payloads.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
@@ -911,6 +945,8 @@ files:
   src/elspeth/web/composer/tools/blobs.py:
     boundary: 3
     dict[str, Any]: 12
+  src/elspeth/web/composer/tools/continuation_support.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/tools/declarations.py:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/tools/generation.py:
@@ -945,6 +981,8 @@ files:
     Mapping[str, Any]: 7
     boundary: 1
     dict[str, Any]: 23
+  src/elspeth/web/composer/transcript_blob_reader.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/turn_audit.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
@@ -955,8 +993,8 @@ files:
   src/elspeth/web/composer/tutorial_service.py:
     dict[str, Any]: 3
   src/elspeth/web/composer/visible_tool_event.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 3
+    Mapping[str, Any]: 6
+    dict[str, Any]: 2
   src/elspeth/web/composer/yaml_generator.py:
     dict[str, Any]: 28
   src/elspeth/web/composer/yaml_importer.py:
@@ -1038,7 +1076,7 @@ files:
     dict[str, Any]: 1
   src/elspeth/web/sessions/_auto_title.py:
     Mapping[str, Any]: 1
-    dict[str, Any]: 1
+    dict[str, Any]: 2
   src/elspeth/web/sessions/_persist_payload.py:
     Mapping[str, Any]: 1
   src/elspeth/web/sessions/archive_quarantine.py:
@@ -1046,6 +1084,13 @@ files:
     dict[str, object]: 2
   src/elspeth/web/sessions/audit_checkpoint.py:
     Mapping[str, Any]: 2
+  src/elspeth/web/sessions/continuation_owner_results.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 1
+  src/elspeth/web/sessions/continuation_p4.py:
+    Mapping[str, Any]: 1
+  src/elspeth/web/sessions/continuation_primary.py:
+    dict[str, Any]: 8
   src/elspeth/web/sessions/fork_custody.py:
     Mapping[str, Any]: 3
   src/elspeth/web/sessions/interpretation_validation.py:
@@ -1066,7 +1111,7 @@ files:
   src/elspeth/web/sessions/proposal_decoder.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 37
+    Mapping[str, Any]: 38
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 1
@@ -1082,13 +1127,13 @@ files:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
   src/elspeth/web/sessions/service.py:
-    Mapping[str, Any]: 15
+    Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 788
-  Mapping[str, object]: 317
+  Mapping[str, Any]: 820
+  Mapping[str, object]: 318
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1102
+  dict[str, Any]: 1194
   dict[str, object]: 398
-  soft: 2613
+  soft: 2738

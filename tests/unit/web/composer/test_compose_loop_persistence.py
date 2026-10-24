@@ -12,7 +12,7 @@ from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text, update
@@ -1097,10 +1097,13 @@ def test_current_loop_non_arg_failure_projection_matches_legacy(
 
 
 @pytest.mark.asyncio
-async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
+async def test_surviving_tool_writer_rejects_malformed_bound_content_hash(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
 ) -> None:
+    from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
+    from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+
     arguments = {
         "source": {"plugin": "null", "on_success": "rows", "on_validation_failure": "discard"},
         "nodes": [],
@@ -1146,55 +1149,105 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
         authority_arguments_hash=hashlib.sha256(authority_arguments_canonical.encode()).hexdigest(),
     )
 
-    # P4-D6 family A2b: the planner-audit cohort is a fenced session write, so
-    # the call carries the turn's real COMPOSE operation. The malformed hash is
-    # still refused before any row is drafted.
-    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
-    async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
+    sessions = composer_service_with_real_sessions._sessions_service
+    assert sessions is not None
+    session_uuid = UUID(result_session_id)
+    async with acquire_compose_context(sessions, session_uuid) as compose_context:
+        with sessions._engine.connect() as connection:
+            before = [
+                dict(row)
+                for row in connection.execute(
+                    select(chat_messages_table)
+                    .where(chat_messages_table.c.session_id == result_session_id)
+                    .order_by(chat_messages_table.c.sequence_no)
+                ).mappings()
+            ]
         with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
-            await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
-                session_id=UUID(result_session_id),
-                current_state_id=None,
-                llm_calls=(),
-                planner_attempts=(),
-                invocations=(invocation,),
-                withheld_replies=(),
-                private_candidates=(),
+            await _persist_tool_invocations(
+                sessions,
+                session_uuid,
+                (invocation,),
+                None,
+                plugin_crash_pending=False,
                 session_operation_context=compose_context,
             )
+        with sessions._engine.connect() as connection:
+            refused = [
+                dict(row)
+                for row in connection.execute(
+                    select(chat_messages_table)
+                    .where(chat_messages_table.c.session_id == result_session_id)
+                    .order_by(chat_messages_table.c.sequence_no)
+                ).mappings()
+            ]
+        assert refused == before
 
-
-@pytest.mark.asyncio
-async def test_planner_audit_cohort_carries_the_prose_the_planner_refused_to_publish(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    result_session_id: str,
-) -> None:
-    """Unadmitted planner prose joins the SAME atomic cohort as the planner's
-    call and attempt rows, so it lands or is absent with them. It must not be a
-    separate write: the cohort's all-or-nothing settlement is the contract."""
-    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, WithheldReply
-    from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_messages
-
-    prose = "Before I build this: which column holds the colour?"
-    sessions_service = composer_service_with_real_sessions._sessions_service
-    assert sessions_service is not None
-    async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
-        await composer_service_with_real_sessions._planning_application._persist_pipeline_planner_audit(
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            llm_calls=(),
-            planner_attempts=(),
-            invocations=(),
-            withheld_replies=(WithheldReply(origin="planner_prose_unadmitted", content=prose),),
-            private_candidates=(),
+        # Syntactic projection control; this is not a computed graph digest.
+        valid_hash = "0123456789abcdef" * 4
+        valid_result = json.loads(result_canonical)
+        valid_result["pipeline_content_hash"] = valid_hash
+        valid_result_canonical = canonical_json(valid_result)
+        valid = replace(
+            invocation,
+            result_canonical=valid_result_canonical,
+            result_hash=hashlib.sha256(valid_result_canonical.encode()).hexdigest(),
+        )
+        (binding,) = await _persist_tool_invocations(
+            sessions,
+            session_uuid,
+            (valid,),
+            None,
+            plugin_crash_pending=False,
             session_operation_context=compose_context,
         )
+        with sessions._engine.connect() as connection:
+            persisted = [
+                dict(row)
+                for row in connection.execute(
+                    select(chat_messages_table)
+                    .where(chat_messages_table.c.session_id == result_session_id)
+                    .order_by(chat_messages_table.c.sequence_no)
+                ).mappings()
+            ]
+        assert persisted[: len(before)] == before
+        private_row, public_row = persisted[len(before) :]
+        assert private_row["role"] == public_row["role"] == "audit"
+        assert private_row["writer_principal"] == public_row["writer_principal"] == "compose_loop"
+        assert private_row["composition_state_id"] is public_row["composition_state_id"] is None
+        assert public_row["sequence_no"] == private_row["sequence_no"] + 1
+        (private_envelope,) = private_row["tool_calls"]
+        evidence = ComposerDiagnosticEvidence.from_envelope(
+            private_envelope,
+            expected_session_id=result_session_id,
+            expected_operation_id=compose_context.fence.operation_id,
+            expected_tool_call_id=invocation.tool_call_id,
+        )
+        assert evidence.operation_epoch == compose_context.fence.operation_epoch
+        assert evidence.tool_name == "set_pipeline" and evidence.status == "success"
+        assert evidence.arguments.disposition == "retained"
+        assert evidence.arguments.content == arguments_canonical
+        assert evidence.authority_arguments is not None
+        assert evidence.authority_arguments.content == authority_arguments_canonical
+        assert evidence.result.disposition == "retained"
+        assert evidence.result.content == valid_result_canonical
+        assert evidence.result.retained_sha256 == valid.result_hash
 
-    stored = await sessions_service.get_messages(UUID(result_session_id))
-    (row,) = [m for m in stored if m.tool_calls and m.tool_calls[0]["_kind"] == COMPOSER_WITHHELD_REPLY_KIND]
-    assert (row.role, row.content, row.tool_calls[0]["origin"]) == ("audit", prose, "planner_prose_unadmitted")
-    assert row not in _composer_conversation_messages(stored)
-    assert all(item["content"] != prose for item in _composer_chat_history(stored))
+        (public_envelope,) = public_row["tool_calls"]
+        assert public_envelope["_kind"] == "audit"
+        public_invocation = public_envelope["invocation"]
+        public_result = json.loads(public_row["content"])
+        assert public_result["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+        assert public_result["pipeline_content_hash"] == valid_hash
+        assert public_invocation["result_canonical"] == public_row["content"]
+        assert public_invocation["result_hash"] == hashlib.sha256(public_row["content"].encode()).hexdigest()
+        assert public_invocation["arguments_hash"] == hashlib.sha256(public_invocation["arguments_canonical"].encode()).hexdigest()
+        assert type(binding) is PipelineDispatchAuditBinding
+        assert binding == PipelineDispatchAuditBinding.from_persisted_envelope(public_envelope)
+        assert binding.tool_call_id == invocation.tool_call_id and binding.tool_name == "set_pipeline"
+        assert binding.status is ComposerToolStatus.SUCCESS
+        assert binding.result_hash == public_invocation["result_hash"]
+        canary = json.loads(result_canonical)["pipeline_content_hash"]
+        assert all(canary not in row["content"] and canary not in json.dumps(row["tool_calls"]) for row in (private_row, public_row))
 
 
 @pytest.mark.asyncio
@@ -3009,6 +3062,12 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
 
     state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     plugin_snapshot, policy_catalog = service._policy_context.build(None)
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+
+    first_preferences = await sessions_service.get_composer_preferences(UUID(result_session_id))
+    second_preferences = await sessions_service.get_composer_preferences(UUID(second_session_id))
+    first_ceiling = ComposerMutationCeiling(result_session_id, str(uuid4()), first_preferences.trust_mode)
+    second_ceiling = ComposerMutationCeiling(second_session_id, str(uuid4()), second_preferences.trust_mode)
     async with (
         acquire_compose_context(sessions_service, result_session_id) as first_context,
         acquire_compose_context(sessions_service, second_session_id) as second_context,
@@ -3039,6 +3098,7 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
                     deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
                     plugin_snapshot=plugin_snapshot,
                     policy_catalog=policy_catalog,
+                    mutation_ceiling=first_ceiling,
                     session_operation_context=first_context,
                     diagnostics=first_diagnostics,
                 )
@@ -3057,6 +3117,7 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
                 deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                mutation_ceiling=second_ceiling,
                 session_operation_context=second_context,
                 diagnostics=second_diagnostics,
             )
@@ -3292,17 +3353,18 @@ async def test_deferred_cancellation_survives_child_failure() -> None:
     bypass ``deferred``. Python never redelivers a caught CancelledError on
     its own, so the route would finish on the child's error path with the
     task's cancellation requests still pending — swallowing an operator or
-    shutdown cancel. Cancellation must win; the child failure rides along
-    as ``__cause__`` for diagnosis.
+    shutdown cancel. Cancellation must win; its ``__cause__`` group must
+    retain the exact original child failure for diagnosis.
     """
     from elspeth.web.composer.service import _await_tool_turn_with_deferred_cancellation
 
     cancellation_requested = asyncio.Event()
     proceed_to_fail = asyncio.Event()
+    original = RuntimeError("audit persistence failed")
 
     async def child() -> str:
         await proceed_to_fail.wait()
-        raise RuntimeError("audit persistence failed")
+        raise original
 
     captured: dict[str, BaseException] = {}
 
@@ -3325,12 +3387,17 @@ async def test_deferred_cancellation_survives_child_failure() -> None:
     await asyncio.wait_for(cancellation_requested.wait(), timeout=2.0)
     proceed_to_fail.set()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
         await asyncio.wait_for(task, timeout=2.0)
 
     exc = captured["exc"]
     assert isinstance(exc, asyncio.CancelledError), f"the child failure replaced the deferred cancellation: {exc!r}"
-    assert isinstance(exc.__cause__, RuntimeError), "the child failure must stay diagnosable as the cancellation's __cause__"
+    assert caught.value is exc
+    cause = exc.__cause__
+    assert type(cause) is ExceptionGroup
+    assert cause.message == "Tool turn retained original outcomes"
+    assert len(cause.exceptions) == 1
+    assert cause.exceptions[0] is original
     assert task.cancelled(), "the awaiting task must finish as genuinely cancelled"
 
 

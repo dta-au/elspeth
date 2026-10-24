@@ -33,6 +33,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
@@ -684,10 +685,11 @@ class _BlockingRecordingComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
-        del retained_operation_context, advisor_history
+        del retained_operation_context, advisor_history, mutation_ceiling
 
         self.calls.append(
             {
@@ -733,9 +735,10 @@ class _ProgressAwareComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history
+        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history, mutation_ceiling
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -11071,7 +11074,7 @@ def test_composer_chat_history_skips_audit_tool_messages() -> None:
 
 
 def test_composer_chat_history_marks_edited_fork_user_but_not_fork_system_row() -> None:
-    from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
+    from elspeth.web.composer.request_history import authoritative_conversation_context as _freeform_planner_conversation_context
     from elspeth.web.sessions.routes import _composer_chat_history
 
     session_id = uuid.uuid4()

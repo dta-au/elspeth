@@ -6,8 +6,8 @@ All notable changes to ELSPETH are documented here.
 
 ## Unreleased (0.8.10)
 
-These entries cover the work landed on the 0.8.10 assembly so far. Continuation
-and the remaining assembly units add their entries when they land.
+These entries cover the work landed on the 0.8.10 assembly so far. The remaining
+assembly units add their entries when they land.
 
 ### Engine and runtime
 
@@ -54,6 +54,12 @@ and the remaining assembly units add their entries when they land.
 
 ### Composer
 
+- **Composer Continuation is retained durably and ships default-off.** A long
+  Compose run is held as versioned continuation segments with exact byte
+  chunks, attributed journal events and complete snapshots in the Sessions
+  store. Version-2 operation admission is refused unless continuation is
+  enabled, and it is disabled by default, so existing clients keep the version-1
+  lifecycle. The Sessions schema moves to epoch 79 (see Upgrade notes).
 - **Graph views given to models are bounded and carry complete-value
   references.** Long authored values are replaced in diagnostic graph views by a
   `complete_value_ref`. The new discovery tool `get_complete_pipeline_value`
@@ -149,6 +155,13 @@ and the remaining assembly units add their entries when they land.
   manager no longer runs the full suite per lane** (ADR-043).
 
 ### Upgrade notes
+
+**Sessions schema epoch 78 → 79 is a hard cut.** Continuation adds seven tables
+and alters `composer_operations`. An existing epoch-78 Sessions store is
+refused, not migrated; deploy 0.8.10 against a fresh Sessions store and leave
+the epoch-78 database in place. Landscape stays at epoch 50. The AWS ECS and
+Azure Container Apps fresh-store procedures are in
+[docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
 
 Framework retry-shutdown diagnostics now use `RetryShutdownRequestedError`, an
 `InterruptedError` subtype. Persisted pre-attempt `exception_type` values change

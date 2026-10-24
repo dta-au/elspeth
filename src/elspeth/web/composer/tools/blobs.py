@@ -28,7 +28,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -43,6 +43,7 @@ from elspeth.contracts.blobs_inline import (
     is_widened_blob_ref,
 )
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
@@ -69,6 +70,7 @@ from elspeth.web.blobs.service import (
     sanitize_filename,
 )
 from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
+from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy, AttachmentInspectionRefused, inspect_attachment_original
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     READ_ATTACHMENT_MAX_UTF8_BYTES,
@@ -110,6 +112,9 @@ from elspeth.web.sessions.models import (
     blobs_table,
 )
 from elspeth.web.sessions.protocol import SessionOperationAuthority
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadObservations
 
 
 class BlobIdArgumentsModel(BaseModel):
@@ -1503,6 +1508,7 @@ def _persist_prepared_blob_create(
     max_blob_storage_per_session_bytes: int | None = None,
     session_operation_context: SessionOperationContext | None = None,
     session_operation_authority: SessionOperationAuthority | None = None,
+    auto_mutation: ComposerMutationCeiling | None = None,
 ) -> str | None:
     """Persist a prepared blob through the shared blob custody primitive."""
     resolved_storage = prepared.storage_path.expanduser().resolve()
@@ -1535,6 +1541,7 @@ def _persist_prepared_blob_create(
             idempotent=False,
             session_operation_context=session_operation_context,
             session_operation_authority=session_operation_authority,
+            auto_mutation=auto_mutation,
         )
     except BlobQuotaExceededError as exc:
         return (
@@ -1762,6 +1769,7 @@ def _execute_update_blob(
             context=operation,
             max_storage_per_session=_resolve_blob_quota_bytes(context.max_blob_storage_per_session_bytes),
             accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
+            auto_mutation=context.mutation_ceiling,
         )
     except SessionDerivedCustodyError:
         return _failure_result(state, f"Blob '{validated.blob_id}' not found.")
@@ -1850,6 +1858,7 @@ def _execute_delete_blob(
                 blob_id=UUID(blob_id),
                 context=operation,
                 accepting_proposal_id=UUID(context.executing_proposal_id) if context.executing_proposal_id is not None else None,
+                auto_mutation=context.mutation_ceiling,
             )
         except (BlobNotFoundError, BlobActiveRunError, BlobPendingProposalError, BlobInProgressForkError) as exc:
             return _failure_result(state, str(exc))
@@ -1935,6 +1944,8 @@ def _locked_read_ready_blob(
     data_dir: str | None,
     session_operation_context: SessionOperationContext | None,
     session_operation_authority: SessionOperationAuthority | None,
+    attachment_inspection_policy: AttachmentInspectionPolicy | None = None,
+    continuation_read_observations: ContinuationReadObservations | None = None,
 ) -> tuple[BlobToolRecord | None, bytes | None]:
     """Observe one version through the API's exact custody and recovery path."""
     if data_dir is None:
@@ -1943,6 +1954,15 @@ def _locked_read_ready_blob(
         raise AuditIntegrityError("Blob reads require the actual session operation context and authority")
     if session_operation_context.fence.session_id != session_id:
         raise AuditIntegrityError("Blob read context does not match the requested store")
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadObservations
+
+    if (attachment_inspection_policy is None) != (continuation_read_observations is None):
+        raise AuditIntegrityError("Continuation attachment read lost its coupled inspection owner")
+    if attachment_inspection_policy is not None and (
+        type(attachment_inspection_policy) is not AttachmentInspectionPolicy
+        or type(continuation_read_observations) is not ContinuationReadObservations
+    ):
+        raise AuditIntegrityError("Continuation attachment read has an unowned inspection pair")
     authority, operation = session_operation_authority, session_operation_context
     service = BlobServiceImpl(
         session_engine,
@@ -1952,6 +1972,8 @@ def _locked_read_ready_blob(
     try:
         with service._locked_blob_row_for_read(blob_id, operation) as row:
             record = _blob_record_to_tool_dict(row)
+            if continuation_read_observations is not None:
+                continuation_read_observations.observe_blob(record)
             if record["status"] != "ready":
                 return record, None
             try:
@@ -1959,6 +1981,17 @@ def _locked_read_ready_blob(
             except FileNotFoundError:
                 return record, None
             _verify_blob_content_integrity(record, data)
+            if attachment_inspection_policy is not None:
+                if continuation_read_observations is None or record["content_hash"] is None:
+                    raise AuditIntegrityError("Continuation attachment read lost its inspected original")
+                inspection = inspect_attachment_original(
+                    session_id=session_id,
+                    blob_id=blob_id,
+                    verified_hash=record["content_hash"],
+                    raw=data,
+                    policy=attachment_inspection_policy,
+                )
+                continuation_read_observations.observe_attachment(inspection)
             return record, data
     except BlobNotFoundError:
         return None, None
@@ -2017,14 +2050,21 @@ def _execute_get_blob_content(
     # custody lock so the row and the bytes are one version — a read
     # racing update/delete must block rather than pair the old committed
     # hash with freshly-swapped bytes (elspeth-3d1d1fcb6c).
-    blob, data = _locked_read_ready_blob(
-        session_engine,
-        session_id,
-        blob_id,
-        data_dir=context.data_dir,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
-    )
+    try:
+        blob, data = _locked_read_ready_blob(
+            session_engine,
+            session_id,
+            blob_id,
+            data_dir=context.data_dir,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+            attachment_inspection_policy=context.attachment_inspection_policy,
+            continuation_read_observations=context.continuation_read_observations,
+        )
+    except (AttachmentInspectionRefused, CredentialMaterialRefused):
+        return _failure_result(state, "The complete attachment was refused by the current inspection policy; no content was returned.")
+    except UnicodeDecodeError as exc:
+        return _failure_result(state, f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).")
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
 
@@ -2183,14 +2223,21 @@ def _execute_read_attachment(arguments: dict[str, Any], state: CompositionState,
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob, data = _locked_read_ready_blob(
-        session_engine,
-        session_id,
-        blob_id,
-        data_dir=context.data_dir,
-        session_operation_context=context.session_operation_context,
-        session_operation_authority=context.session_operation_authority,
-    )
+    try:
+        blob, data = _locked_read_ready_blob(
+            session_engine,
+            session_id,
+            blob_id,
+            data_dir=context.data_dir,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+            attachment_inspection_policy=context.attachment_inspection_policy,
+            continuation_read_observations=context.continuation_read_observations,
+        )
+    except (AttachmentInspectionRefused, CredentialMaterialRefused):
+        return _failure_result(state, "The complete attachment was refused by the current inspection policy; no content was returned.")
+    except UnicodeDecodeError as exc:
+        return _failure_result(state, f"Blob '{blob_id}' is not valid UTF-8 text ({exc.reason} at byte offset {exc.start}).")
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
     if blob["status"] != "ready":

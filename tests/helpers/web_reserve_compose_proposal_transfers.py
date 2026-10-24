@@ -200,6 +200,31 @@ def _source3_local_transfers(units):
         return ["composer turn exact provider owner producer changed"], None
     if len(_lexical_bindings(turn, "provider_binding")) != 1 or len(_lexical_bindings(turn, "provider_owner")) != 1:
         return ["composer turn provider owner or binding rebound"], None
+    if (
+        not isinstance(turn.body[36], ast.Try)
+        or len(turn.body[36].body) < 16
+        or not _exact(
+            turn.body[36].body[15],
+            "provider_owner.bind_cost_budget(capture_common_provider_cost("
+            "session_id=str(session.id), request_id=str(turn_user_message_id), lifecycle_version=1, "
+            "initially_empty=state is not None and state_is_structurally_empty(state), settings=settings))",
+        )
+    ):
+        return ["composer turn original request cost capture changed"], None
+    if (
+        len(turn.body[36].body) < 18
+        or not _exact(
+            turn.body[36].body[16],
+            "initial_preferences = await service.get_composer_preferences(turn.session_id)",
+        )
+        or not _exact(
+            turn.body[36].body[17],
+            "mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)",
+        )
+        or len(_lexical_bindings(turn, "initial_preferences")) != 1
+        or len(_lexical_bindings(turn, "mutation_ceiling")) != 1
+    ):
+        return ["composer turn original request mutation capture changed"], None
     if len(_lexical_bindings(turn, "required_work")) != 2 or not _exact(
         turn.body[10],
         "if turn.budget_seconds != budget_anchor.remaining_at_running_seconds:\n"
@@ -231,9 +256,9 @@ def _source3_local_transfers(units):
     compose_calls = _calls(turn, compose_predicate)
     if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
         return ["composer turn compose call universe changed"], None
-    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 22:
+    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 25:
         return ["composer call executed path or preceding terminal changed"], None
-    dispatch = composer_dispatch_calls(turn.body[36].body[21])
+    dispatch = composer_dispatch_calls(turn.body[36].body[24])
     if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 36):
         return ["composer turn exact paired call arguments or closed branches changed"], None
     compose_call, recovery_call = dispatch
@@ -242,7 +267,7 @@ def _source3_local_transfers(units):
     for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
         if _executed_path(turn, call) != (
             ("AsyncFunctionDef", "body", 36, "Try"),
-            ("Try", "body", 21, "Try"),
+            ("Try", "body", 24, "Try"),
             ("Try", "body", 2, "If"),
             ("If", arm, index, "Assign"),
             ("Assign", "value", None, "Await"),
@@ -284,6 +309,35 @@ def _source3_local_transfers(units):
         "    provider_owner.required_work.validate_context(session_operation_context)",
     ):
         return ["composer owner, service, binding or context admission changed"], None
+    loop_blocks = [
+        node
+        for node in ast.walk(compose)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(statement, ast.Return)
+            and isinstance(statement.value, ast.Await)
+            and isinstance(statement.value.value, ast.Call)
+            and _shape(statement.value.value.func) == _shape(ast.parse("self._compose_loop", mode="eval").body)
+            for statement in node.body
+        )
+    ]
+    if (
+        len(loop_blocks) != 1
+        or len(loop_blocks[0].body) != 2
+        or not _exact(
+            loop_blocks[0].body[0],
+            "if provider_owner is not None and session_id is not None and user_message_id is not None:\n"
+            "    cost_budget = provider_owner.cost_budget\n"
+            "    if cost_budget is None:\n"
+            "        cost_budget = capture_common_provider_cost(\n"
+            "            session_id=session_id, request_id=user_message_id, lifecycle_version=1,\n"
+            "            initially_empty=_state_is_structurally_empty(state), settings=self._settings)\n"
+            "        provider_owner.bind_cost_budget(cost_budget)\n"
+            "    cost_budget.validate_binding(session_id=session_id, request_id=user_message_id, lifecycle_version=1)\n"
+            "    cost_budget.require_supported_configuration()",
+        )
+    ):
+        return ["composer common entry retained cost policy admission changed"], None
 
     def proposal_predicate(n):
         return isinstance(n.func, ast.Name) and n.func.id == "settle_pipeline_proposal_under_compose_lock"
@@ -385,8 +439,8 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "d25a75d9b850b14d6eb35f77c5984bd39e9f77149249fcfe09440aaf6258c1ff",
-    SERVICE: "0513878f81043a5838f159ca8cddab63a3209b98c03eebd40356976b5745cd84",
+    TURN: "36341c16a42e90fb6dc0a80c18aed6515669612ccbef2866255240f389ea3654",
+    SERVICE: "cda69f2a76801539ffd869b14eff179cf4bb34cb5c030827a1f7188237dda367",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }

@@ -45,6 +45,8 @@ from __future__ import annotations
 
 from collections import deque
 
+from pydantic import BaseModel, ConfigDict, model_validator
+
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 
 _RETRY_THRESHOLD = 3
@@ -118,6 +120,18 @@ def build_drift_hint(failures: FailureDeque) -> str:
         "(c) continue the repair justified by that evidence, or "
         "(d) surface a named gap if the requested shape is unsupported by the available tools."
     )
+
+
+class AntiAnchorSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    failures: tuple[FailureKey, ...]
+    categories: tuple[ToolArgumentErrorCategory | None, ...]
+
+    @model_validator(mode="after")
+    def require_matching_windows(self) -> AntiAnchorSnapshot:
+        if len(self.failures) != len(self.categories) or len(self.failures) > _DEQUE_MAXLEN:
+            raise ValueError("anti-anchor snapshot has inconsistent failure windows")
+        return self
 
 
 class AntiAnchorTracker:
@@ -214,3 +228,18 @@ class AntiAnchorTracker:
         """
         self._failures.clear()
         self._categories.clear()
+
+    def snapshot_for_continuation(self) -> AntiAnchorSnapshot:
+        return AntiAnchorSnapshot(
+            failures=tuple(self._failures),
+            categories=tuple(self._categories),
+        )
+
+    @classmethod
+    def for_continuation(cls, snapshot: AntiAnchorSnapshot) -> AntiAnchorTracker:
+        if type(snapshot) is not AntiAnchorSnapshot:
+            raise TypeError("anti-anchor restoration requires its owned snapshot")
+        owner = cls()
+        owner._failures.extend(snapshot.failures)
+        owner._categories.extend(snapshot.categories)
+        return owner

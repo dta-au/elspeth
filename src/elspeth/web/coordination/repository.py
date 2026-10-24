@@ -56,10 +56,12 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
     InterpretationSurfaceOrigin,
 )
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
+from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
 from elspeth.web.coordination.approval_authority import (
     ApprovalGateInputs,
@@ -70,7 +72,9 @@ from elspeth.web.coordination.approval_authority import (
     supersede_open_approvals,
 )
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
+from elspeth.web.coordination.composer_mutation_guard import require_auto_mutation_on_connection
 from elspeth.web.coordination.composer_operation_authority import (
+    _require_owner,
     get_composer_operation_for_start_on_connection,
     require_composer_operation_mutation_on_connection,
     start_composer_operation_on_connection,
@@ -106,6 +110,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationPreconditionRefused,
 )
 from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
+from elspeth.web.sessions.continuation import _select_segment_start_on_connection, start_segment_on_connection
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
@@ -116,6 +121,7 @@ from elspeth.web.sessions.models import (
     blob_run_links_table,
     blobs_table,
     chat_messages_table,
+    composer_async_operations_table,
     composer_completion_events_table,
     composition_proposals_table,
     composition_rejection_events_table,
@@ -4934,12 +4940,24 @@ class _SessionOperationAuthorityRepository:
         operation_kind: SessionOperationKind,
         owner_instance_id: str,
         lease_seconds: int,
+        composer_operation_id: str | None = None,
     ) -> SessionOperationContext:
         session_row = conn.execute(
             select(sessions_table.c.archived_at).where(sessions_table.c.id == session_id_text).with_for_update()
         ).one_or_none()
         if session_row is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
+        parent = conn.execute(
+            select(composer_async_operations_table.c.operation_id)
+            .where(
+                composer_async_operations_table.c.session_id == session_id_text,
+                composer_async_operations_table.c.lifecycle_version == 2,
+                composer_async_operations_table.c.status.in_(("queued", "running")),
+            )
+            .limit(1)
+        ).scalar_one_or_none()
+        if parent is not None and (operation_kind is not SessionOperationKind.COMPOSE or composer_operation_id != parent):
+            raise SessionOperationConflictError
         row = self._select_fence(conn, session_id=session_id_text)
         if row is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
@@ -4993,6 +5011,227 @@ class _SessionOperationAuthorityRepository:
             operation_kind=operation_kind,
         )
 
+    def recover_composer_segment(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+    ) -> bool:
+        """Advance one unavailable owner while retaining its complete selected cut.
+
+        This never executes a prepared business effect, creates a successor,
+        releases another physical fence or fabricates a current context.
+        """
+        from elspeth.contracts.hashing import canonical_json
+        from elspeth.web.sessions.continuation import (
+            ContinuationEvent,
+            _retained_successor_action,
+            append_complete_snapshot,
+            load_snapshot,
+        )
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if type(session_id) is not UUID or type(operation_id) is not str or str(UUID(operation_id)) != operation_id:
+            raise ValueError("recovery requires canonical logical operation identities")
+        if type(expected_generation) is not int or expected_generation < 1:
+            raise ValueError("recovery requires its actual positive generation")
+        if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
+            raise ValueError("auth_provider_type must name a browser authentication provider")
+        with self._locked_transaction(str(session_id)) as conn:
+            _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == str(session_id),
+                    composer_async_operations_table.c.operation_id == operation_id,
+                    composer_async_operations_table.c.lifecycle_version == 2,
+                )
+            ).one_or_none()
+            if (
+                parent is None
+                or parent.status not in ("queued", "running")
+                or parent.ownership_generation != expected_generation
+                or parent.actor_user_id != actor_user_id
+            ):
+                return False
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == str(session_id),
+                    segments.c.operation_id == operation_id,
+                    segments.c.sequence == parent.current_segment_sequence,
+                )
+            ).one_or_none()
+            if segment is None or segment.state != "running" or segment.generation != expected_generation:
+                return False
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == str(session_id),
+                    attempts.c.operation_id == operation_id,
+                    attempts.c.sequence == segment.sequence,
+                    attempts.c.generation == expected_generation,
+                )
+            ).one_or_none()
+            if (
+                history is None
+                or history.revoked_at is not None
+                or history.outcome is not None
+                or history.claim_attempt != parent.attempt
+                or history.session_operation_id != segment.session_operation_id
+                or history.session_operation_epoch != segment.session_operation_epoch
+                or history.session_operation_lease_token != segment.session_operation_lease_token
+                or history.owner_instance_id != segment.claim_owner_instance_id
+            ):
+                raise AuditIntegrityError("continuation recovery lost its exact immutable attempt")
+            now = self._database_now(conn)
+            fence = self._select_fence(conn, session_id=str(session_id))
+            if (
+                fence is None
+                or fence.operation_kind != SessionOperationKind.COMPOSE.value
+                or fence.operation_id != history.session_operation_id
+                or fence.operation_epoch != history.session_operation_epoch
+                or fence.lease_token != history.session_operation_lease_token
+                or fence.owner_instance_id != history.owner_instance_id
+            ):
+                raise AuditIntegrityError("continuation recovery lost its actual previous physical fence")
+            if fence.released_at is None:
+                if _ensure_utc(fence.lease_expires_at) > now:
+                    return False
+                if self._expired_owner_allows_takeover(conn, owner_instance_id=fence.owner_instance_id, database_now=now) is not True:
+                    return False
+            stored = load_snapshot(conn, session_id=str(session_id), operation_id=operation_id)
+            retained = append_complete_snapshot(
+                conn,
+                session_id=str(session_id),
+                operation_id=operation_id,
+                expected_checkpoint_id=stored.checkpoint_id,
+                expected_cursor=stored.cursor,
+                snapshot_json=stored.payload_json,
+                event_batch=(
+                    ContinuationEvent(
+                        "recovered",
+                        canonical_json(
+                            {
+                                "version": 2,
+                                "same_sequence": segment.sequence,
+                                "previous_generation": expected_generation,
+                                "generation": expected_generation + 1,
+                            }
+                        ),
+                    ),
+                ),
+                handoff=False,
+            )
+            action_json, policy_hash = _retained_successor_action(
+                conn,
+                session_id=str(session_id),
+                operation_id=operation_id,
+                snapshot=retained,
+                next_action_json=None,
+                policy_sha256=None,
+            )
+            previous = conn.execute(
+                update(attempts)
+                .where(
+                    attempts.c.session_id == str(session_id),
+                    attempts.c.operation_id == operation_id,
+                    attempts.c.sequence == segment.sequence,
+                    attempts.c.generation == expected_generation,
+                    attempts.c.claim_attempt == history.claim_attempt,
+                    attempts.c.session_operation_id == history.session_operation_id,
+                    attempts.c.session_operation_epoch == history.session_operation_epoch,
+                    attempts.c.session_operation_lease_token == history.session_operation_lease_token,
+                    attempts.c.revoked_at.is_(None),
+                )
+                .values(revoked_at=now, outcome="interrupted")
+            )
+            recovered = conn.execute(
+                update(segments)
+                .where(
+                    segments.c.session_id == str(session_id),
+                    segments.c.operation_id == operation_id,
+                    segments.c.sequence == segment.sequence,
+                    segments.c.generation == expected_generation,
+                    segments.c.state == "running",
+                    segments.c.claim_token == segment.claim_token,
+                )
+                .values(
+                    state="interrupted",
+                    generation=expected_generation + 1,
+                    checkpoint_id=retained.checkpoint_id,
+                    claim_token=None,
+                    claim_owner_instance_id=None,
+                    claim_expires_at=None,
+                    enqueued_at=now,
+                    next_eligible_at=now,
+                    next_action_json=action_json,
+                    policy_sha256=policy_hash,
+                )
+            )
+            advanced = conn.execute(
+                update(composer_async_operations_table)
+                .where(
+                    composer_async_operations_table.c.session_id == str(session_id),
+                    composer_async_operations_table.c.operation_id == operation_id,
+                    composer_async_operations_table.c.lifecycle_version == 2,
+                    composer_async_operations_table.c.status == "running",
+                    composer_async_operations_table.c.current_segment_sequence == segment.sequence,
+                    composer_async_operations_table.c.ownership_generation == expected_generation,
+                    composer_async_operations_table.c.checkpoint_id == retained.checkpoint_id,
+                    composer_async_operations_table.c.attempt == parent.attempt,
+                )
+                .values(
+                    ownership_generation=expected_generation + 1,
+                    phase="reconciling",
+                    updated_at=now,
+                    status_revision=composer_async_operations_table.c.status_revision + 1,
+                )
+            )
+            if previous.rowcount != 1 or recovered.rowcount != 1 or advanced.rowcount != 1:
+                raise AuditIntegrityError("continuation recovery lost its exact generation transition")
+            return True
+
+    def start_composer_segment(
+        self,
+        claim: ComposerOperationClaim,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+        segment_policy: ContinuationSegmentPolicy | None = None,
+    ) -> SessionOperationContext:
+        if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
+            raise TypeError("continuation start requires its nominal segment claim")
+        if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
+            raise ValueError("auth_provider_type must name a browser authentication provider")
+        _validate_owner(owner_instance_id)
+        _validate_lease_seconds(lease_seconds)
+        with self._locked_transaction(str(claim.session_id)) as conn:
+            parent = conn.execute(
+                select(composer_async_operations_table.c.actor_user_id).where(
+                    composer_async_operations_table.c.session_id == str(claim.session_id),
+                    composer_async_operations_table.c.operation_id == claim.operation_id,
+                    composer_async_operations_table.c.lifecycle_version == 2,
+                    composer_async_operations_table.c.status.in_(("queued", "running")),
+                )
+            ).one_or_none()
+            if parent is None:
+                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+            _require_owner(conn, session_id=claim.session_id, actor_user_id=parent.actor_user_id, auth_provider_type=auth_provider_type)
+            _select_segment_start_on_connection(conn, claim, owner_instance_id=owner_instance_id, segment_policy=segment_policy)
+            context = self._advance_exclusive_fence_on_connection(
+                conn,
+                session_id_text=str(claim.session_id),
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=owner_instance_id,
+                lease_seconds=lease_seconds,
+                composer_operation_id=claim.operation_id,
+            )
+            start_segment_on_connection(conn, claim, context=context, owner_instance_id=owner_instance_id, segment_policy=segment_policy)
+            return context
+
     def start_composer_async_operation(
         self,
         claim: ComposerOperationClaim,
@@ -5011,11 +5250,11 @@ class _SessionOperationAuthorityRepository:
             job = get_composer_operation_for_start_on_connection(conn, claim)
             if job.claim_owner_instance_id != owner_instance_id:
                 raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-            if job.deadline_at <= self._database_now(conn):
+            if job.legacy_deadline_at <= self._database_now(conn):
                 body: dict[str, JsonValue] = {
                     "error_type": "composer_operation_deadline_expired",
                     "detail": "The composer request waited too long to start. Please resubmit.",
-                    "timeout_seconds": (job.deadline_at - job.created_at).total_seconds(),
+                    "timeout_seconds": (job.legacy_deadline_at - job.created_at).total_seconds(),
                 }
                 body["request_id"] = job.request_id
                 raise ComposerOperationPreconditionRefused(
@@ -5454,6 +5693,8 @@ class _SessionOperationAuthorityRepository:
         self,
         context: SessionOperationContext,
         mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> T:
         """CAS the exact context and run one bounded mutation atomically.
 
@@ -5470,6 +5711,8 @@ class _SessionOperationAuthorityRepository:
             self._compare_and_swap_on_connection(conn, context, database_now=database_now)
             if mutation is not _composer_liveness_proof:
                 require_composer_operation_mutation_on_connection(conn, context)
+            if auto_mutation is not None:
+                require_auto_mutation_on_connection(conn, context=context, ceiling=auto_mutation)
             transaction = _RepositoryMutationTransaction(
                 conn,
                 session_id=fence.session_id,

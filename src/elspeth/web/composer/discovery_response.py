@@ -48,18 +48,21 @@ class AdmittedDiscoveryResult:
         return payload
 
 
+def require_discovery_result_data(*, success: bool, data: object | None) -> None:
+    """Require the existing discovery envelope invariant before data admission."""
+    if success:
+        if data is None:
+            raise FrameworkBugError("Successful discovery response has no data")
+    elif data is not None:
+        raise FrameworkBugError("Failed discovery response has unexpected data")
+
+
 def admit_discovery_result(tool_name: str, result: ToolResult) -> AdmittedDiscoveryResult:
     contract = response_contract_for(tool_name)
     if contract is None:
         raise FrameworkBugError("Discovery declaration has no response contract")
-    if result.success:
-        if result.data is None:
-            raise FrameworkBugError("Successful discovery response has no data")
-        response = contract.admit(result.data)
-    else:
-        if result.data is not None:
-            raise FrameworkBugError("Failed discovery response has unexpected data")
-        response = None
+    require_discovery_result_data(success=result.success, data=result.data)
+    response = contract.admit(result.data) if result.success else None
     return AdmittedDiscoveryResult(result, response, contract)
 
 

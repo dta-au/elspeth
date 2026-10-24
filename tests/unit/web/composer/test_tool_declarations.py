@@ -596,7 +596,7 @@ class TestStep3DiscoveryTierMigration:
         }
 
     def test_cacheable_subset_is_correct(self) -> None:
-        """The 10 discovery tools that should be cacheable are; the 3
+        """Discovery tools opted into caching remain cacheable; the four
         session-mutable ones are not."""
         from elspeth.web.composer.tools._registry import _REGISTERED_TOOLS
         from elspeth.web.composer.tools.declarations import derive_cacheable_names
@@ -614,8 +614,9 @@ class TestStep3DiscoveryTierMigration:
             "get_audit_info",
         }
         assert expected_cacheable <= cacheable
-        # The three session-mutable discovery tools MUST NOT be cacheable.
+        # The four session-mutable discovery tools MUST NOT be cacheable.
         assert "get_pipeline_state" not in cacheable
+        assert "get_complete_pipeline_value" not in cacheable
         assert "preview_pipeline" not in cacheable
         assert "diff_pipeline" not in cacheable
 

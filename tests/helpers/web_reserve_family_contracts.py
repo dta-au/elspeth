@@ -468,9 +468,9 @@ def _provider_contracts():
     return {
         "ProviderCallCustody.__init__": (
             ("self",),
-            ("service", "context", "required_work"),
+            ("service", "context", "required_work", "cost_budget"),
             (),
-            (None, None, None),
+            (None, None, None, c(None)),
             False,
             (),
             [
@@ -480,6 +480,15 @@ def _provider_contracts():
                     cmp(a(n("context"), "operation_kind"), ast.IsNot, a(n("SessionOperationKind"), "COMPOSE")),
                     [raising(n("AuditIntegrityError"))],
                 ),
+                iff(
+                    both(
+                        cmp(n("cost_budget"), ast.IsNot, c(None)),
+                        cmp(call("type", n("cost_budget")), ast.IsNot, n("CommonProviderCostBudget")),
+                    ),
+                    [raising(n("AuditIntegrityError"))],
+                ),
+                assign(s("_cost_budget"), n("cost_budget")),
+                assign(s("_cost_response_accountable"), c(False)),
                 assign(s("_service"), n("service")),
                 assign(s("_context"), n("context")),
                 assign(s("_required_work"), n("required_work")),
@@ -495,6 +504,19 @@ def _provider_contracts():
         "ProviderCallCustody.required_work": (("self",), (), (), (), False, ("property",), [ret(s("_required_work"))]),
         "ProviderCallCustody.context": (("self",), (), (), (), False, ("property",), [ret(s("_context"))]),
         "ProviderCallCustody.service": (("self",), (), (), (), False, ("property",), [ret(s("_service"))]),
+        "ProviderCallCustody.cost_completion_limit": (
+            ("self",),
+            (),
+            (),
+            (),
+            False,
+            (),
+            [
+                iff(cmp(s("_cost_budget"), ast.Is, c(None)), [ret(c(None))]),
+                assign(n("policy"), a(call(a(s("_cost_budget"), "snapshot")), "policy")),
+                ret(ast.IfExp(test=cmp(n("policy"), ast.IsNot, c(None)), body=a(n("policy"), "max_completion_tokens"), orelse=c(None))),
+            ],
+        ),
         "ProviderCallCustody._cancel_undispatched": (
             ("self",),
             ("model",),
@@ -585,6 +607,10 @@ def _provider_contracts():
                 iff(
                     cmp(n("projection"), ast.IsNot, c(None)),
                     [expr(call(a(n("projection"), "begin_projection"))), expr(call(a(n("projection"), "complete_owned")))],
+                ),
+                iff(
+                    cmp(s("_cost_budget"), ast.IsNot, c(None)),
+                    [expr(call(a(s("_cost_budget"), "consume_settled"), s("call"), response_accountable=s("_cost_response_accountable")))],
                 ),
                 assign(s("attempt"), c(None)),
                 assign(s("call"), c(None)),
@@ -1865,6 +1891,8 @@ def family_local_contracts(units):
                     "_admitted_ns",
                     "_admitting",
                     "_context",
+                    "_cost_budget",
+                    "_cost_response_accountable",
                     "_required_work",
                     "_sdk_entered",
                     "_service",

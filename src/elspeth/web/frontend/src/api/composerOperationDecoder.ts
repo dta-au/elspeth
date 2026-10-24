@@ -48,7 +48,7 @@ function failureOutcome(value: unknown, sessionId: string): ComposerOperationFai
   const code = failureCode(record.failure_code);
   const diagnostic = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
-  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed"];
+  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked"];
   const category = record.error_type === null ? null : categories.find((item) => item === record.error_type);
   if (category === undefined) throw new ComposerOperationDecodeError("Unknown public failure category");
   const requestId = record.request_id === null ? null : text(record.request_id);
@@ -278,7 +278,7 @@ export function decodeComposerOperationFrame(value: unknown, sessionId: string, 
   if (record.event !== "progress") throw new ComposerOperationDecodeError("Unknown stream event");
   const payload = exactRecord(record.payload, ["session_operation_id", "session_operation_epoch", "request_token", "request_id", "phase", "headline", "evidence", "likely_next", "reason", "updated_at"]);
   const phases = ["idle", "starting", "calling_model", "using_tools", "validating", "saving", "complete", "failed", "cancelled"] as const;
-  const reasons = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "admission_refused", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete"] as const;
+  const reasons = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "admission_refused", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete", "mutation_authority_revoked"] as const;
   const phase = phases.find((item) => item === payload.phase);
   const reason = payload.reason === null ? null : reasons.find((item) => item === payload.reason);
   if (phase === undefined || reason === undefined || ((phase === "failed" || phase === "cancelled") && reason === null)) throw new ComposerOperationDecodeError("Unknown progress vocabulary");

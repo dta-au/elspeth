@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Final, Literal, cast, final
+from typing import TYPE_CHECKING, Any, Final, Literal, cast, final
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -30,6 +30,10 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions._persist_payload import CommittedCheckpointWitness
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.validation import _redact_sensitive_content
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_p4_application import HistoricalP4Application
+
 
 CHECKPOINT_CHANGED_SCOPE: Final = (
     "Verified checkpoint evidence covers {count} saved draft revisions. There are net authored changes from the starting draft."
@@ -286,6 +290,72 @@ class PersistedTurnEffects:
         return self.net_changed_fields
 
 
+def registered_inspection_from_result(
+    *,
+    tool_call_id: str,
+    admitted: AdmittedDiscoveryResult,
+    selected_content: str,
+    producer_call_id: str | None,
+) -> _RegisteredInspection | None:
+    """The actual bounded result projection; no delivery/read authority."""
+    if type(admitted) is not AdmittedDiscoveryResult:
+        raise TypeError("Blob coverage requires a nominal admitted discovery result")
+    if (
+        admitted.contract is not response_contract_for("get_blob_content")
+        and admitted.contract is not response_contract_for("inspect_source")
+        and admitted.contract is not response_contract_for("read_attachment")
+    ) or not admitted.result.success:
+        return None
+    if admitted.response is None or producer_call_id is None:
+        return None
+    if selected_content != serialize_admitted_discovery_result(admitted):
+        raise AuditIntegrityError("Blob registration differs from the selected result envelope")
+    page: _RegisteredInspection
+    if admitted.contract in (response_contract_for("get_blob_content"), response_contract_for("read_attachment")):
+        payload: GetBlobContentDataModel | CompleteAttachmentDataModel
+        if admitted.contract is response_contract_for("read_attachment"):
+            payload = CompleteAttachmentDataModel.model_validate(admitted.response.to_wire())
+        else:
+            payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
+        page = _RegisteredBlobPage(
+            tool_call_id,
+            producer_call_id,
+            stable_hash(selected_content),
+            payload.blob_id,
+            payload.content_hash,
+            payload.total_chars,
+            payload.start_char,
+            payload.end_char,
+        )
+    else:
+        raw_facts = admitted.response.to_wire()
+        if type(raw_facts) is not dict:
+            raise AuditIntegrityError("Source inspection changed its owned object shape")
+        facts = facts_from_dict(raw_facts)
+        identity = facts.redacted_identity
+        if "blob_id" not in identity:
+            raise AuditIntegrityError("Source inspection lost its actual blob identity")
+        if str(UUID(identity["blob_id"])) != identity["blob_id"]:
+            raise AuditIntegrityError("Source inspection blob identity is not canonical")
+        size = identity["byte_size"]
+        if not size.isascii() or not size.isdecimal():
+            raise AuditIntegrityError("Source inspection byte size is not an owned non-negative integer")
+        byte_size = int(size)
+        start, end = facts.byte_range_inspected
+        if not 0 <= start <= end <= byte_size:
+            raise AuditIntegrityError("Source inspection byte range exceeds its immutable blob")
+        page = _RegisteredSourceInspection(
+            tool_call_id,
+            producer_call_id,
+            stable_hash(selected_content),
+            identity["blob_id"],
+            byte_size,
+            facts.byte_range_inspected,
+            facts.source_kind,
+        )
+    return page
+
+
 @final
 class TurnEvidence:
     """One request's private evidence owner; snapshots never cross requests."""
@@ -295,11 +365,17 @@ class TurnEvidence:
         "_abandonment_review",
         "_abandonment_transcript_binding",
         "_conflicting_page_ids",
+        "_continuation_actor_user_id",
+        "_continuation_current_epoch",
         "_current_calls",
         "_current_pages",
         "_delivery_generations",
+        "_historical_p4_applications",
         "_historical_pages",
         "_pages",
+        "_pending_deliveries",
+        "_portable_p4_entry",
+        "_portable_p4_graph",
         "_quoted_inspections",
         "_registration_revision",
         "_retained_history",
@@ -357,6 +433,18 @@ class TurnEvidence:
         self._current_pages: dict[DeliveryScope, tuple[_RegisteredInspection, ...]] = {"primary": (), "planner": ()}
         self._current_calls: dict[DeliveryScope, tuple[str, str] | None] = {"primary": None, "planner": None}
         self._historical_pages: dict[str, _RegisteredInspection] = {}
+        # Live projection receipts are not cold evidence or current authority.
+        self._historical_p4_applications: dict[str, HistoricalP4Application] = {}
+        from elspeth.web.composer.continuation_application_graph import ApplicationGraph
+        from elspeth.web.composer.continuation_evidence_application_values import PortableP4ApplicationEntry
+
+        self._portable_p4_entry: PortableP4ApplicationEntry | None = None
+        self._portable_p4_graph: ApplicationGraph | None = None
+        self._continuation_actor_user_id = actor_user_id
+        self._continuation_current_epoch = (
+            session_operation_context.fence.operation_epoch if session_operation_context is not None else None
+        )
+        self._pending_deliveries: dict[DeliveryScope, BlobDeliveryAttempt] = {}
         initial_hash = authored_state_hash(initial_state)
         self.effects = PersistedTurnEffects(
             initial_state=initial_state,
@@ -406,61 +494,11 @@ class TurnEvidence:
         The legacy method name also carries inspect_source metadata. It never
         converts that bounded structural receipt into get_blob_content coverage.
         """
-        if type(admitted) is not AdmittedDiscoveryResult:
-            raise TypeError("Blob coverage requires a nominal admitted discovery result")
-        if (
-            admitted.contract is not response_contract_for("get_blob_content")
-            and admitted.contract is not response_contract_for("inspect_source")
-            and admitted.contract is not response_contract_for("read_attachment")
-        ) or not admitted.result.success:
+        page = registered_inspection_from_result(
+            tool_call_id=tool_call_id, admitted=admitted, selected_content=selected_content, producer_call_id=producer_call_id
+        )
+        if page is None:
             return False
-        if admitted.response is None or producer_call_id is None:
-            return False
-        if selected_content != serialize_admitted_discovery_result(admitted):
-            raise AuditIntegrityError("Blob registration differs from the selected result envelope")
-        page: _RegisteredInspection
-        if admitted.contract in (response_contract_for("get_blob_content"), response_contract_for("read_attachment")):
-            payload: GetBlobContentDataModel | CompleteAttachmentDataModel
-            if admitted.contract is response_contract_for("read_attachment"):
-                payload = CompleteAttachmentDataModel.model_validate(admitted.response.to_wire())
-            else:
-                payload = GetBlobContentDataModel.model_validate(admitted.response.to_wire())
-            page = _RegisteredBlobPage(
-                tool_call_id,
-                producer_call_id,
-                stable_hash(selected_content),
-                payload.blob_id,
-                payload.content_hash,
-                payload.total_chars,
-                payload.start_char,
-                payload.end_char,
-            )
-        else:
-            raw_facts = admitted.response.to_wire()
-            if type(raw_facts) is not dict:
-                raise AuditIntegrityError("Source inspection changed its owned object shape")
-            facts = facts_from_dict(raw_facts)
-            identity = facts.redacted_identity
-            if "blob_id" not in identity:
-                raise AuditIntegrityError("Source inspection lost its actual blob identity")
-            if str(UUID(identity["blob_id"])) != identity["blob_id"]:
-                raise AuditIntegrityError("Source inspection blob identity is not canonical")
-            size = identity["byte_size"]
-            if not size.isascii() or not size.isdecimal():
-                raise AuditIntegrityError("Source inspection byte size is not an owned non-negative integer")
-            byte_size = int(size)
-            start, end = facts.byte_range_inspected
-            if not 0 <= start <= end <= byte_size:
-                raise AuditIntegrityError("Source inspection byte range exceeds its immutable blob")
-            page = _RegisteredSourceInspection(
-                tool_call_id,
-                producer_call_id,
-                stable_hash(selected_content),
-                identity["blob_id"],
-                byte_size,
-                facts.byte_range_inspected,
-                facts.source_kind,
-            )
         if tool_call_id in self._conflicting_page_ids:
             return False
         existing = self._pages.get(tool_call_id)
@@ -539,7 +577,7 @@ class TurnEvidence:
             seen_ids.add(tool_id)
             if page is not None:
                 selected[tool_id] = page
-        return BlobDeliveryAttempt(
+        attempt = BlobDeliveryAttempt(
             self,
             scope,
             self._delivery_generations[scope],
@@ -549,6 +587,8 @@ class TurnEvidence:
             frozenset(call.call_id for call in previous_calls if call.call_id is not None),
             tuple(page for tool_id, page in selected.items() if tool_id not in duplicate_ids),
         )
+        self._pending_deliveries[scope] = attempt
+        return attempt
 
     def confirm_delivery(self, attempt: BlobDeliveryAttempt, retained_calls: Sequence[ComposerLLMCall]) -> bool:
         """Caller invokes only after admission AND provider custody settle."""
@@ -576,6 +616,8 @@ class TurnEvidence:
         for page in attempt.pages:
             self._historical_pages[page.tool_call_id] = page
             self.transcript.confirm_read_delivery(tool_call_id=page.tool_call_id, provider_call_id=call_id)
+        if self._pending_deliveries.get(attempt.scope) is attempt:
+            del self._pending_deliveries[attempt.scope]
         return True
 
     def current_call_id(self, scope: DeliveryScope) -> str | None:

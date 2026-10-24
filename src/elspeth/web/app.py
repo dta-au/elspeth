@@ -86,12 +86,12 @@ from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
-from elspeth.web.composer import yaml_generator as yaml_generator_module
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.composer_stream import ComposerStreamPermits
 from elspeth.web.composer_stream_auth import ComposerStreamAuthServices
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
@@ -903,7 +903,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             broadcaster=broadcaster,
             settings=settings,
             session_service=session_service,
-            yaml_generator=yaml_generator_module,
+            yaml_generator=ComposerYamlSerializer(),
             telemetry=app.state.sessions_telemetry,
             blob_service=app.state.blob_service,
             secret_service=app.state.scoped_secret_resolver,
@@ -2219,7 +2219,7 @@ def _create_app(
         return validate_pipeline(
             state,
             settings,
-            yaml_generator_module,
+            ComposerYamlSerializer(),
             secret_service=app.state.scoped_secret_resolver,
             secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
@@ -2311,7 +2311,6 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
     )
     app.state.interpretation_surfacing = app.state.composer_service._interpretation_surfacing
-    app.state.planning_application = app.state.composer_service._planning_application
     app.state.schema_disclosure = app.state.composer_service._schema_disclosure
     app.state.composer_availability = app.state.composer_service.get_availability()
     composer_async_authority = ComposerAsyncOperationAuthority(

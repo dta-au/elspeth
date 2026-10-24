@@ -852,6 +852,12 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     )
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    from uuid import UUID, uuid4
+
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(context.fence.session_id))
+    mutation_ceiling = ComposerMutationCeiling(context.fence.session_id, str(uuid4()), preferences.trust_mode)
     with (
         prompt_guard_user_scope(_USER),
         patch.object(provider_gateway, "enforce_prompt_guard", autospec=True, side_effect=provider_gateway.enforce_prompt_guard) as checks,
@@ -865,6 +871,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
             deadline=asyncio.get_running_loop().time() + 30.0,
             plugin_snapshot=snapshot,
             policy_catalog=policy,
+            mutation_ceiling=mutation_ceiling,
             session_operation_context=context,
             required_work=owner.required_work,
             provider_owner=owner,

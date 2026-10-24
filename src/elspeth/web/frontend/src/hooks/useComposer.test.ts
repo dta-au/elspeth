@@ -123,4 +123,20 @@ describe("shared durable authoring hook", () => {
     expect(firstSignal?.reason).toBe(COMPOSE_USER_CANCEL_ABORT_REASON);
     await firstPromise;
   });
+
+  it("shows an authority refusal without retrying or adding a proposal", () => {
+    const send = vi.fn();
+    const retry = vi.fn();
+    const detail = "Automatic mutation authority was revoked. Review the saved session before retrying.";
+    useSessionStore.setState({
+      error: detail, sendMessage: send, retryMessage: retry,
+      isComposing: false, compositionProposals: [],
+    });
+    const { result } = renderHook(() => useComposer());
+    expect(result.current.error).toBe(detail);
+    expect(result.current.isComposing).toBe(false);
+    expect(useSessionStore.getState().compositionProposals).toEqual([]);
+    expect(send).not.toHaveBeenCalled();
+    expect(retry).not.toHaveBeenCalled();
+  });
 });

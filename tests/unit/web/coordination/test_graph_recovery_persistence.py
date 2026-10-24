@@ -7,9 +7,12 @@ import pytest
 from sqlalchemy import func, select, text, update
 from tests.unit.web.coordination.test_composer_operation_authority import response, start
 
+from elspeth.contracts.composer_content import ContentPublication
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
 from elspeth.web.composer.state import PipelineMetadata
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+from elspeth.web.sessions.content_publication import read_content_publication, storage_content_hash
 from elspeth.web.sessions.graph_recovery import checkpoint_data, empty_recovery_state
 from elspeth.web.sessions.models import chat_messages_table, composition_graph_parks_table, composition_states_table
 from elspeth.web.sessions.protocol import StaleComposeStateError
@@ -269,7 +272,11 @@ async def test_safe_checkpoint_skips_lossy_unknown_graph_fields(operation_store)
     await finish(operation_store, running, settlement)
     restored = await service.get_current_state(sid)
     assert restored is not None and restored.version == 3 and not restored.is_valid
-    assert restored.composer_meta is None and restored.derived_from_state_id == good.id
+    assert restored.derived_from_state_id == good.id
+    assert restored.id == settlement.state_id
+    publication = ContentPublication(sid, restored.id, restored.version, storage_content_hash(restored))
+    assert read_content_publication(restored) == publication
+    assert deep_thaw(restored.composer_meta) == {"content_publication": publication.to_payload()}
 
 
 @pytest.mark.asyncio
@@ -369,4 +376,8 @@ async def test_explicit_restore_uses_parked_identity_across_turns(operation_stor
     await finish(operation_store, running, restore)
     result = await service.get_current_state(sid)
     assert result.version == 3 and result.metadata_["name"] == "Parked draft"
-    assert not result.is_valid and result.composer_meta is None
+    assert not result.is_valid
+    assert result.id == restore.state_id
+    publication = ContentPublication(sid, result.id, result.version, storage_content_hash(result))
+    assert read_content_publication(result) == publication
+    assert deep_thaw(result.composer_meta) == {"content_publication": publication.to_payload()}

@@ -139,6 +139,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         recovery_context=None,
         retained_operation_context=None,
         advisor_history=None,
+        mutation_ceiling=None,
     ):
         kwargs = {
             "message": message,
@@ -157,6 +158,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
             "recovery_context": recovery_context,
             "retained_operation_context": retained_operation_context,
             "advisor_history": advisor_history,
+            "mutation_ceiling": mutation_ceiling,
         }
 
         async def call(**kw):

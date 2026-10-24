@@ -289,3 +289,370 @@ def test_stream_closed_frames_and_safe_progress_exact_lease_binding() -> None:
         encode_composer_operation_stream_frame(
             progress.model_copy(update={"payload": payload.model_copy(update={"headline": "x" * 70000})})
         )
+
+
+def queued_v2_record() -> ComposerOperationRecord:
+    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+
+    request = SendMessageRequest(operation_id=OP, content="hello")
+    return replace(
+        queued_record(),
+        deadline_at=None,
+        lifecycle_version=2,
+        phase="queued",
+        status_revision=0,
+        current_segment_sequence=1,
+        ownership_generation=1,
+        checkpoint_id="33333333-3333-4333-8333-333333333333",
+        journal_cursor=0,
+        ingress_phase="pending",
+        reserved_user_message_id=SID,
+        request_hash=composer_operation_v2_request_hash(session_id=SID, kind="compose_message", request=request),
+    )
+
+
+@pytest.mark.parametrize(
+    "status,phase",
+    [
+        ("queued", "queued"),
+        ("running", "executing"),
+        ("running", "continuation_queued"),
+        ("running", "reconciling"),
+        ("running", "retry_waiting"),
+    ],
+)
+def test_v2_active_records_have_no_total_deadline_or_parent_claim(status, phase):
+    record = replace(queued_v2_record(), status=status, phase=phase)
+    assert record.deadline_at is None and record.lifecycle_version == 2
+    assert not record.claim_token_present
+    assert replace(record, request_json=None).request_json is None
+    committed = replace(record, ingress_phase="committed", user_message_id=SID)
+    assert committed.user_message_id == committed.reserved_user_message_id
+    with pytest.raises(AuditIntegrityError, match="legacy deadline"):
+        _ = record.legacy_deadline_at
+
+
+def test_v1_deadline_and_default_lifecycle_are_preserved():
+    record = queued_record()
+    assert record.lifecycle_version == 1
+    assert record.legacy_deadline_at == record.deadline_at == NOW + timedelta(seconds=60)
+    assert record.phase is None and record.status_revision == record.journal_cursor == 0
+    with pytest.raises(AuditIntegrityError):
+        replace(record, deadline_at=None)
+    for changes in ({"phase": "queued"}, {"checkpoint_id": OP}, {"current_segment_sequence": 1}):
+        with pytest.raises(AuditIntegrityError):
+            replace(record, **changes)
+
+
+@pytest.mark.parametrize("version", [0, 3, True, "2"])
+def test_record_rejects_unknown_or_nonexact_lifecycle(version):
+    with pytest.raises(AuditIntegrityError):
+        replace(queued_record(), lifecycle_version=version)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"deadline_at": NOW},
+        {"session_id": str(SID)},
+        {"operation_id": "not-canonical"},
+        {"kind": "unknown"},
+        {"status": "unknown"},
+        {"request_hash": "A" * 64},
+        {"request_hash": "a" * 64},
+        {"actor_user_id": ""},
+        {"request_id": ""},
+        {"status_revision": True},
+        {"status_revision": -1},
+        {"journal_cursor": True},
+        {"journal_cursor": -1},
+        {"current_segment_sequence": True},
+        {"current_segment_sequence": 0},
+        {"ownership_generation": True},
+        {"ownership_generation": 0},
+        {"checkpoint_id": None},
+        {"checkpoint_id": "not-canonical"},
+        {"ingress_phase": None},
+        {"ingress_phase": "unknown"},
+        {"reserved_user_message_id": None},
+        {"reserved_user_message_id": str(SID)},
+        {"user_message_id": SID},
+        {"ingress_phase": "committed"},
+        {"ingress_phase": "committed", "user_message_id": UUID(OP)},
+        {"attempt": True},
+        {"attempt": -1},
+        {"claim_token_present": True},
+        {"claim_expires_at": NOW},
+        {"phase": None},
+        {"phase": "settled"},
+        {"settled_at": NOW},
+        {"result_json": "{}"},
+        {"failure_code": "worker_lost"},
+        {"created_at": "not-time"},
+        {"updated_at": NOW - timedelta(seconds=1)},
+        {"started_at": NOW - timedelta(seconds=1)},
+        {"request_json": "{}"},
+        {"base_state_id": SID},
+    ],
+)
+def test_v2_record_refuses_corrupt_active_bundles(changes):
+    with pytest.raises(AuditIntegrityError):
+        replace(queued_v2_record(), **changes)
+
+
+def failed_v2_record():
+    failure = ComposerOperationError(
+        http_status=503,
+        failure_code="worker_lost",
+        error_type="composer_operation_worker_lost",
+        body={"detail": "Lost"},
+        diagnostic_id=None,
+    )
+    encoded = failure.model_dump_json()
+    return replace(
+        queued_v2_record(),
+        status="failed",
+        phase="settled",
+        request_json=None,
+        settled_at=NOW,
+        failure_code="worker_lost",
+        settled_by="owner_terminal",
+        result_schema="composer_operation_error.v1",
+        result_json=encoded,
+        result_sha256=composer_operation_result_hash(encoded),
+    )
+
+
+def completed_v2_record():
+    from elspeth.web.sessions.operation_codec import strict_response_hash
+    from elspeth.web.sessions.schemas import ChatMessageResponse, MessageWithStateResponse
+
+    response = MessageWithStateResponse(
+        message=ChatMessageResponse(id="assistant", session_id=str(SID), role="assistant", content="Done", segments=[], created_at=NOW),
+        proposals=[],
+    )
+    return replace(
+        queued_v2_record(),
+        status="completed",
+        phase="settled",
+        ingress_phase="committed",
+        user_message_id=SID,
+        request_json=None,
+        settled_at=NOW,
+        settled_by="owner_terminal",
+        result_schema="message_with_state.v1",
+        result_json=response.model_dump_json(),
+        result_sha256=strict_response_hash(response),
+    )
+
+
+def test_v2_terminal_receipts_validate_actual_strict_result_and_digest():
+    assert failed_v2_record().status == "failed"
+    assert completed_v2_record().status == "completed"
+
+
+@pytest.mark.parametrize("factory", [failed_v2_record, completed_v2_record])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"phase": "executing"},
+        {"request_json": "{}"},
+        {"settled_at": None},
+        {"settled_by": None},
+        {"result_json": None},
+        {"result_json": "{}"},
+        {"result_sha256": "a" * 64},
+        {"result_schema": "unknown"},
+        {"claim_token_present": True},
+    ],
+)
+def test_v2_terminal_receipts_refuse_changed_bundles(factory, changes):
+    with pytest.raises(AuditIntegrityError):
+        replace(factory(), **changes)
+
+
+def test_v2_terminal_receipt_refuses_failure_code_mismatch_and_cancelled_success():
+    with pytest.raises(AuditIntegrityError):
+        replace(failed_v2_record(), failure_code="request_cancelled")
+    for changes in ({"failure_code": "worker_lost"}, {"cancel_requested_at": NOW}, {"user_message_id": None, "ingress_phase": "pending"}):
+        with pytest.raises(AuditIntegrityError):
+            replace(completed_v2_record(), **changes)
+
+
+def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
+    from sqlalchemy import insert, select
+
+    from elspeth.web.coordination.composer_operation_authority import _record_from_row
+    from elspeth.web.coordination.database_clock import database_now
+    from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.engine import create_session_engine
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.schema import initialize_session_schema
+    from tests.fixtures.identities import ensure_test_identity
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'v2-record.db'}")
+    try:
+        initialize_session_schema(engine)
+        with engine.begin() as connection:
+            ensure_test_identity(connection, identity_id="alice")
+        repository = SQLiteLocalSessionOperationAuthority(engine)
+        session = repository.create_session_with_initial_fence(
+            user_id="alice", title="V2 record projection", auth_provider_type="local", owner_instance_id="test-owner", lease_seconds=30
+        )
+        request = SendMessageRequest(operation_id=OP, content="hello")
+        with engine.begin() as connection:
+            now = database_now(connection)
+            # Explicit SQL fixture: this does not enable runtime V2 admission.
+            connection.execute(
+                insert(jobs).values(
+                    session_id=str(session.id),
+                    operation_id=OP,
+                    kind="compose_message",
+                    status="queued",
+                    request_hash=composer_operation_v2_request_hash(session_id=session.id, kind="compose_message", request=request),
+                    actor_user_id="alice",
+                    request_id="transport",
+                    request_json=request.model_dump_json(),
+                    deadline_at=None,
+                    lifecycle_version=2,
+                    phase="continuation_queued",
+                    status_revision=7,
+                    current_segment_sequence=2,
+                    ownership_generation=3,
+                    checkpoint_id=OP,
+                    journal_cursor=4,
+                    ingress_phase="pending",
+                    reserved_user_message_id=str(SID),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        with engine.connect() as connection:
+            row = connection.execute(select(jobs)).one()
+            full = _record_from_row(row, request_json=row.request_json)
+            poll = _record_from_row(row)
+        assert full.session_id == session.id and full.lifecycle_version == 2 and full.deadline_at is None
+        assert (full.phase, full.status_revision, full.current_segment_sequence, full.ownership_generation) == (
+            "continuation_queued",
+            7,
+            2,
+            3,
+        )
+        assert (full.checkpoint_id, full.journal_cursor, full.ingress_phase, full.reserved_user_message_id) == (OP, 4, "pending", SID)
+        assert full.request_json == request.model_dump_json()
+        assert poll == replace(full, request_json=None)
+    finally:
+        engine.dispose()
+
+
+def committed_v2_recompose_record(expected_user_message_id=SID):
+    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+
+    request = RecomposeRequest(operation_id=OP, expected_user_message_id=expected_user_message_id)
+    return replace(
+        queued_v2_record(),
+        kind="compose_recompose",
+        ingress_phase="committed",
+        user_message_id=SID,
+        request_json=request.model_dump_json(),
+        request_hash=composer_operation_v2_request_hash(session_id=SID, kind="compose_recompose", request=request),
+    )
+
+
+def test_v2_recompose_record_uses_its_separate_lifecycle_hash():
+    request = RecomposeRequest(operation_id=OP, expected_user_message_id=SID)
+    record = committed_v2_recompose_record()
+    assert record.kind == "compose_recompose"
+    assert record.user_message_id == record.reserved_user_message_id == request.expected_user_message_id
+    assert replace(record, request_json=None).user_message_id == SID
+    with pytest.raises(AuditIntegrityError):
+        replace(record, request_hash=composer_operation_request_hash(session_id=SID, kind="compose_recompose", request=request))
+
+
+def test_v2_recompose_request_refuses_different_reserved_original_message():
+    with pytest.raises(AuditIntegrityError):
+        committed_v2_recompose_record(expected_user_message_id=UUID(OP))
+
+
+@pytest.mark.parametrize("omit_body", [False, True])
+def test_v2_recompose_ingress_must_be_committed_even_for_poll_projection(omit_body):
+    record = committed_v2_recompose_record()
+    with pytest.raises(AuditIntegrityError):
+        replace(record, ingress_phase="pending", user_message_id=None, request_json=None if omit_body else record.request_json)
+
+
+@pytest.mark.parametrize("factory", [failed_v2_record, completed_v2_record])
+def test_v2_terminal_recompose_preserves_committed_original_message(factory):
+    original = committed_v2_recompose_record()
+    terminal = replace(
+        factory(), kind="compose_recompose", ingress_phase="committed", user_message_id=SID, request_hash=original.request_hash
+    )
+    assert terminal.user_message_id == terminal.reserved_user_message_id == SID
+    with pytest.raises(AuditIntegrityError):
+        replace(terminal, ingress_phase="pending", user_message_id=None)
+
+
+@pytest.mark.parametrize("factory", [queued_v2_record, failed_v2_record, completed_v2_record])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"claim_owner_instance_id": 42},
+        {"claim_owner_instance_id": ""},
+        {"claim_owner_instance_id": "x" * 129},
+        {"session_operation_id": 42},
+        {"session_operation_id": ""},
+        {"session_operation_epoch": True},
+        {"session_operation_epoch": 0},
+        {"session_operation_epoch": -1},
+        {"session_operation_epoch": 1.0},
+        {"session_operation_epoch": "1"},
+    ],
+)
+def test_v2_optional_owner_fence_projection_refuses_invalid_nominal_values(factory, changes):
+    with pytest.raises(AuditIntegrityError):
+        replace(factory(), **changes)
+
+
+@pytest.mark.parametrize("factory", [queued_v2_record, failed_v2_record, completed_v2_record])
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {},
+        {"claim_owner_instance_id": "owner"},
+        {"claim_owner_instance_id": "x" * 128},
+        {"session_operation_id": "operation"},
+        {"session_operation_epoch": 1},
+        {"claim_owner_instance_id": "owner", "session_operation_id": "operation", "session_operation_epoch": 2},
+    ],
+)
+def test_v2_optional_owner_fence_projection_allows_absent_and_valid_values(factory, changes):
+    record = replace(factory(), **changes)
+    assert record.status == factory().status
+    assert record.claim_token_present is False
+    assert record.claim_expires_at is None
+    assert replace(record, request_json=None).claim_owner_instance_id == record.claim_owner_instance_id
+
+
+@pytest.mark.parametrize("changes", [{"claim_token_present": 0}, {"base_state_id": str(SID), "request_json": None}])
+def test_v2_record_owned_projection_fields_remain_nominal(changes):
+    with pytest.raises(AuditIntegrityError):
+        replace(queued_v2_record(), **changes)
+
+
+def test_v1_status_projection_preserves_deadline_wire_bytes():
+    from elspeth.web.sessions.routes.composer.operations import composer_operation_status_response
+
+    projected = composer_operation_status_response(queued_record(), db_now=NOW, poll_after_ms=1000)
+    assert projected.model_dump_json() == (
+        '{"operation_id":"22222222-2222-4222-8222-222222222222","kind":"compose_message","status":"queued",'
+        '"poll_after_ms":1000,"cancel_requested":false,"deadline_at":"2026-10-06T00:01:00Z",'
+        '"deadline_remaining_ms":60000,"result":null,"error":null}'
+    )
+
+
+def test_v2_record_is_refused_by_legacy_status_projection():
+    from elspeth.web.sessions.routes.composer.operations import composer_operation_status_response
+
+    with pytest.raises(AuditIntegrityError, match="legacy deadline"):
+        composer_operation_status_response(queued_v2_record(), db_now=NOW, poll_after_ms=1000)

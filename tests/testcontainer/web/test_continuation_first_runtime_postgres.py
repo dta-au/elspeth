@@ -1,0 +1,28 @@
+"""Serial PostgreSQL first-cut cancellation, current read and reclaim."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_actual_evidence_handoff_keeps_original_failure_and_cancellation_group as test_actual_evidence_handoff_keeps_original_failure_and_cancellation_group,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_actual_initial_producer_still_requires_complete_ordered_wire as test_actual_initial_producer_still_requires_complete_ordered_wire,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_cancelled_completed_graph_handoff_never_enters_live_callback as test_cancelled_completed_graph_handoff_never_enters_live_callback,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_first_cohort_refuses_genuine_ready_source_without_publication as test_first_cohort_refuses_genuine_ready_source_without_publication,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_late_runtime_refusal_precedes_schema_disclosure_mutation as test_late_runtime_refusal_precedes_schema_disclosure_mutation,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_post_shelf_current_refusal_precedes_any_live_callback as test_post_shelf_current_refusal_precedes_any_live_callback,
+)
+from tests.unit.web.sessions.test_continuation_first_runtime import (
+    test_postcommit_callback_failure_observes_live_cut_then_reclaims_without_republication as test_postcommit_callback_failure_observes_live_cut_then_reclaims_without_republication,
+)
+
+pytestmark = pytest.mark.testcontainer

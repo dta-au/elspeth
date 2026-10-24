@@ -1,0 +1,22 @@
+"""Same exact nested private-source selection on real PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_nested_selection import (
+    test_complete_nested_sql_cohort_keeps_order_alias_refs_and_current_inventory as test_complete_nested_sql_cohort_keeps_order_alias_refs_and_current_inventory,
+)
+from tests.unit.web.sessions.test_continuation_nested_selection import (
+    test_conflicting_nested_byte_bound_refuses_under_real_sql_owner as test_conflicting_nested_byte_bound_refuses_under_real_sql_owner,
+)
+from tests.unit.web.sessions.test_continuation_nested_selection import (
+    test_nested_selection_keeps_original_head_and_current_claim_refusals as test_nested_selection_keeps_original_head_and_current_claim_refusals,
+)
+from tests.unit.web.sessions.test_continuation_nested_selection import (
+    test_nested_sql_bytes_cannot_be_replaced_or_omitted_after_positive as test_nested_sql_bytes_cannot_be_replaced_or_omitted_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_nested_selection import (
+    test_nominal_selected_owner_refuses_incomplete_or_extra_closure_after_sql_positive as test_nominal_selected_owner_refuses_incomplete_or_extra_closure_after_sql_positive,
+)
+
+pytestmark = pytest.mark.testcontainer

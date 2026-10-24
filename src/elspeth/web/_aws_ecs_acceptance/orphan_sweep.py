@@ -119,8 +119,12 @@ def _build_orphan_sweep_clients(region: str) -> OrphanSweepClients:
         )
     except Exception:
         for created_client in reversed(created):
-            with contextlib.suppress(Exception):
+            try:
                 created_client.close()
+            except Exception:
+                # Attempt the remaining closes without replacing setup failure.
+                # Process-control BaseException groups propagate intact.
+                continue
         raise AcceptanceCheckError("orphan_sweep_runtime") from None
 
 

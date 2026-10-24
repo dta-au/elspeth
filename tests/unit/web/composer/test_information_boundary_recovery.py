@@ -15,8 +15,10 @@ from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.anti_anchor import build_drift_hint
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
+from elspeth.web.composer.request_history import (
+    authoritative_conversation_context as _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.credential_guard import CredentialMaterialRefused

@@ -493,7 +493,8 @@ def test_local_first_party_plugin_crosses_the_production_lifecycle(
                 assert [request["operation"] for request in lifecycle_flow.requests()] == ["read"]
                 assert lifecycle_flow.actions() == []
             else:
-                assert [request["operation"] for request in lifecycle_flow.requests()] == ["status", "write"]
+                # A fresh member has no prior COMMIT history to reconcile.
+                assert [request["operation"] for request in lifecycle_flow.requests()] == ["write"]
                 assert [action["data"] for action in lifecycle_flow.actions()] == _rows_for(case.plugin_key)
 
         with db.engine.connect() as connection:
@@ -800,7 +801,7 @@ def test_public_resume_reconciles_the_subject_pipeline_after_a_finalized_effect_
             )
         assert checkpoints.get_latest_checkpoint(run_id) is not None
         if lifecycle_flow is not None:
-            expected_operations = ["read"] if case.plugin_key == "source:power_automate" else ["status", "write"]
+            expected_operations = ["read"] if case.plugin_key == "source:power_automate" else ["write"]
             assert [request["operation"] for request in lifecycle_flow.requests()] == expected_operations
     finally:
         rate_limits.close()

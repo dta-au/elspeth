@@ -1,0 +1,37 @@
+"""Same actual current message owner/read oracles on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_admission_wait_keeps_exact_original_cancellation_without_message_work as test_admission_wait_keeps_exact_original_cancellation_without_message_work,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_changed_original_row_prefix_refuses_before_producing_instruction as test_changed_original_row_prefix_refuses_before_producing_instruction,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_changed_root_and_unregistered_guarded_wire_refuse_after_normal_factory as test_changed_root_and_unregistered_guarded_wire_refuse_after_normal_factory,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_cold_rebuild_requires_complete_wire_and_actual_current_skill_after_positive as test_cold_rebuild_requires_complete_wire_and_actual_current_skill_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_current_cancellation_during_actual_initial_builder_refuses_projection as test_current_cancellation_during_actual_initial_builder_refuses_projection,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_initial_and_fixed_actual_producers_restore_order_aliases_and_current_policy as test_initial_and_fixed_actual_producers_restore_order_aliases_and_current_policy,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_live_registration_context_is_same_current_session_actor_and_object as test_live_registration_context_is_same_current_session_actor_and_object,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_missing_actual_ingress_receipt_refuses_after_valid_complete_selected_input as test_missing_actual_ingress_receipt_refuses_after_valid_complete_selected_input,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_real_fresh_and_cache_schema_paths_register_full_current_rebuild as test_real_fresh_and_cache_schema_paths_register_full_current_rebuild,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producers import (
+    test_started_current_read_cancellation_retains_original_singleton as test_started_current_read_cancellation_retains_original_singleton,
+)
+
+pytestmark = pytest.mark.testcontainer

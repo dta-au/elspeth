@@ -26,6 +26,7 @@ from sqlalchemy.engine import Connection, Row
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobAtomicDeletionObligation, BlobCreationObligation, BlobDeletionPlan, blob_record_snapshot_hash
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -1485,6 +1486,7 @@ def _persist_blob_content(
     session_operation_authority: SessionOperationAuthority | None = None,
     session_operation_context: SessionOperationContext | None = None,
     quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
+    auto_mutation: ComposerMutationCeiling | None = None,
 ) -> Row[Any] | BlobRecord:
     """Persist one blob through committed reservation, file, and ready phases."""
     if type(blob_id) is not UUID:
@@ -1601,6 +1603,7 @@ def _persist_blob_content(
             content,
             session_operation_context,
             idempotent=idempotent,
+            auto_mutation=auto_mutation,
         )
     if fork_write_fence is None:
         raise AuditIntegrityError("blob persistence requires exact session-operation or composite fork authority")
@@ -2697,6 +2700,7 @@ class BlobServiceImpl:
         session_operation_context: SessionOperationContext,
         *,
         idempotent: bool,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> BlobRecord:
         """Share exact-context reservation, publication and commit recovery."""
         _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
@@ -2733,6 +2737,7 @@ class BlobServiceImpl:
                             max_storage_per_session=self._max_storage_per_session,
                             idempotent=idempotent,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                     reserved = self._fenced_blob_record(blob_id, session_operation_context)
                     if reserved.status == "ready" and not storage.exists():
@@ -2752,6 +2757,7 @@ class BlobServiceImpl:
                         lambda transaction: transaction.blobs.mark_blob_ready(
                             blob_id=blob_id,
                         ),
+                        auto_mutation=auto_mutation,
                     )
                 except BaseException as primary_exc:
                     reconciled = self._session_operation_authority.reconcile_blob_reservation(
@@ -3027,6 +3033,7 @@ class BlobServiceImpl:
         context: SessionOperationContext,
         plan: BlobDeletionPlan,
         accepting_proposal_id: UUID | None = None,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> BlobDeletionPlan:
         storage, tombstone, _temp = self._validated_blob_deletion_paths(plan)
         self._session_operation_authority.compare_and_swap(context)
@@ -3049,6 +3056,7 @@ class BlobServiceImpl:
                     plan=plan,
                     accepting_proposal_id=accepting_proposal_id,
                 ),
+                auto_mutation=auto_mutation,
             )
         except Exception as exc:
             observed = self._observe_after_uncertain_deletion_mutation(
@@ -3121,6 +3129,7 @@ class BlobServiceImpl:
         blob_id: UUID,
         context: SessionOperationContext,
         accepting_proposal_id: UUID | None = None,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> None:
         """Drive one idempotent deletion state machine without holding DB over FS."""
         from elspeth.plugins.sinks._local_file_effects import local_file_storage_bytes
@@ -3208,6 +3217,7 @@ class BlobServiceImpl:
                         expected_file_hash=expected_file_hash,
                         accepting_proposal_id=accepting_proposal_id,
                     ),
+                    auto_mutation=auto_mutation,
                 )
             except Exception as exc:
                 observed = self._observe_after_uncertain_deletion_mutation(
@@ -3226,7 +3236,9 @@ class BlobServiceImpl:
                 plan = self._stage_blob_deletion_plan(context=context, plan=plan)
                 continue
             if plan.phase == "staged":
-                plan = self._commit_blob_deletion_plan(context=context, plan=plan, accepting_proposal_id=accepting_proposal_id)
+                plan = self._commit_blob_deletion_plan(
+                    context=context, plan=plan, accepting_proposal_id=accepting_proposal_id, auto_mutation=auto_mutation
+                )
                 continue
             if plan.phase == "purge_pending":
                 self._purge_blob_deletion_plan(context=context, plan=plan)

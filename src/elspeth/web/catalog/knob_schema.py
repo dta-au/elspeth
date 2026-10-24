@@ -134,7 +134,7 @@ def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
     """Return ``(inner_type, nullable)`` for ``T | None`` and ``Optional[T]``."""
     annotation = _unwrap_annotated(annotation)
     origin = get_origin(annotation)
-    if origin in (types.UnionType, Union):
+    if origin is types.UnionType or origin is Union:
         args = get_args(annotation)
         non_none = [arg for arg in args if arg is not type(None)]
         if len(non_none) == 1 and len(non_none) != len(args):
@@ -244,7 +244,8 @@ def _dual_form_nested_model(annotation: Any) -> tuple[type[BaseModel], bool] | N
     opaque ``json-value`` knob. Returns ``(M, nullable)`` or ``None``.
     """
     annotation = _unwrap_annotated(annotation)
-    if get_origin(annotation) not in (types.UnionType, Union):
+    origin = get_origin(annotation)
+    if origin is not types.UnionType and origin is not Union:
         return None
     args = get_args(annotation)
     nullable = type(None) in args

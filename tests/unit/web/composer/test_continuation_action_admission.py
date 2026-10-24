@@ -1,5 +1,7 @@
 """Independent action headroom and immutable database-time observations."""
 
+import asyncio
+import time
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -7,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from elspeth.web.composer.continuation_clock import (
+    ContinuationActionClock,
     ContinuationTimingObservation,
     SegmentFit,
     admit_action,
@@ -246,3 +249,93 @@ def test_direct_frozen_observations_cannot_claim_inconsistent_or_nonfinite_state
             watermark_seconds=watermark,
             yield_pending=yield_pending,
         )
+
+
+@pytest.mark.asyncio
+async def test_stage_expiry_survives_a_joined_owner_that_retains_cancellation() -> None:
+    policy = ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=0.05, retention=1)
+    normal = ContinuationActionClock(policy)
+    normal.finish_preparation()
+    expected = object()
+
+    async def immediate():
+        return expected
+
+    assert await normal.run("physical", immediate) is expected
+
+    release = asyncio.Event()
+    observed = asyncio.Event()
+    retained = []
+
+    async def actual_child():
+        await release.wait()
+        return expected
+
+    child = asyncio.create_task(actual_child())
+
+    async def joined_owner():
+        try:
+            return await asyncio.shield(child)
+        except asyncio.CancelledError as original:
+            retained.append(original)
+            observed.set()
+            return await asyncio.shield(child)
+
+    clock = ContinuationActionClock(policy)
+    clock.finish_preparation()
+    task = asyncio.create_task(clock.run("physical", joined_owner))
+    try:
+        await asyncio.wait_for(observed.wait(), timeout=2)
+        assert not child.done() and not task.done()
+        release.set()
+        with pytest.raises(TimeoutError, match="actual owner was joined"):
+            await asyncio.wait_for(task, timeout=2)
+        assert child.done() and child.result() is expected
+        assert len(retained) == 1 and isinstance(retained[0], asyncio.CancelledError)
+    finally:
+        release.set()
+        await asyncio.gather(child, task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stage_expiry_checks_actual_monotonic_time_before_timeout_callback() -> None:
+    policy = ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=0.02, retention=1)
+    clock = ContinuationActionClock(policy)
+    clock.finish_preparation()
+
+    async def synchronous_phase():
+        time.sleep(0.04)
+        return "late actual result"
+
+    with pytest.raises(TimeoutError, match="actual owner was joined"):
+        await clock.run("physical", synchronous_phase)
+
+
+@pytest.mark.asyncio
+async def test_a_stage_cannot_replenish_the_same_action_clock() -> None:
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1))
+    clock.finish_preparation()
+
+    async def done():
+        return "complete"
+
+    assert await clock.run("guard", done) == "complete"
+    original = clock.deadline
+    with pytest.raises(ValueError, match="repeated"):
+        await clock.run("guard", done)
+    assert clock.deadline == original
+
+
+@pytest.mark.asyncio
+async def test_physical_timeout_is_its_declared_bound_not_segment_remainder() -> None:
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=0.01, retention=1))
+    clock.finish_preparation()
+
+    async def physical():
+        await asyncio.sleep(0.05)
+        return "too late"
+
+    with pytest.raises(TimeoutError):
+        await clock.run("physical", physical)
+    with pytest.raises(ValueError, match="inapplicable"):
+        await clock.run("quota", physical)

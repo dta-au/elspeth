@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Literal
 
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationSegmentPolicy
 
@@ -121,3 +124,43 @@ def freeze_observation(
     hard = max(0.0, (hard_at - observed_at).total_seconds())
     soft = max(0.0, (cooperative_at - observed_at).total_seconds())
     return ContinuationTimingObservation(sequence, generation, observed_at, hard, soft, mark, soft <= 0 or hard <= mark)
+
+
+type ContinuationTimedStage = Literal["guard", "quota", "physical", "retention"]
+
+
+class ContinuationActionClock:
+    def __init__(self, policy: ContinuationActionPolicy) -> None:
+        self.policy = policy
+        self.started = asyncio.get_running_loop().time()
+        self.deadline = self.started + policy.total
+        self._seen: set[str] = set()
+
+    def finish_preparation(self) -> None:
+        if self._seen:
+            raise ValueError("action preparation cannot renew or follow another stage")
+        if asyncio.get_running_loop().time() > self.started + self.policy.preparation:
+            raise TimeoutError("continuation preparation allowance expired")
+        self._seen.add("preparation")
+
+    async def run[T](self, stage: ContinuationTimedStage, operation: Callable[[], Awaitable[T]]) -> T:
+        if stage in self._seen or "preparation" not in self._seen:
+            raise ValueError("continuation action stage repeated or preparation unbound")
+        match stage:
+            case "guard":
+                seconds = self.policy.guard
+            case "quota":
+                seconds = self.policy.quota
+            case "physical":
+                seconds = self.policy.physical
+            case "retention":
+                seconds = self.policy.retention
+        if seconds is None:
+            raise ValueError("an inapplicable action stage cannot execute")
+        self._seen.add(stage)
+        deadline = min(self.deadline, asyncio.get_running_loop().time() + seconds)
+        async with asyncio.timeout_at(deadline) as timeout:
+            result = await operation()
+            if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("continuation stage expired while its actual owner was joined")
+            return result

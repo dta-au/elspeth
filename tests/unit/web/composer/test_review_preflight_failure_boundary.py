@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
@@ -84,9 +85,12 @@ async def test_review_preflight_failure_is_not_a_plugin_crash(
         )
     )
     deadline = asyncio.get_running_loop().time() + 60
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(result_session_id))
+    mutation_ceiling = ComposerMutationCeiling(result_session_id, str(uuid4()), preferences.trust_mode)
     with pytest.raises(type(failure)) as raised:
         await service._dispatch_tool_batch(
             call_model=_CallModelOutcome(completion=completion),
+            mutation_ceiling=mutation_ceiling,
             state=state,
             last_validation=None,
             last_runtime_preflight=None,

@@ -7,13 +7,13 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Final
 
 from openai import OpenAIError
 
-from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus, ToolContractDialect
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus, ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PromptGuardContentPart,
@@ -34,9 +34,11 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedLLMCompletion,
     _AdmittedLLMProviderMetadata,
     _AdmittedToolBatch,
+    _CallModelOutcome,
 )
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent, scan_prepared_advisor_content
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
 from elspeth.web.composer.llm_response_parsing import (
     admit_llm_provider_metadata,
     apply_anthropic_cache_markers,
@@ -48,6 +50,7 @@ from elspeth.web.composer.private_diagnostic_facts import bind_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
 from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_cost import CommonProviderCostRequest
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import (
     ProviderCallCustody,
@@ -461,6 +464,7 @@ async def _litellm_acompletion(
     prepared_advisor_content: tuple[PreparedAdvisorContent, ...] | None = None,
     provider_custody: ProviderCallCustody | None = None,
     on_provider_dispatch: Callable[[], None] | None = None,
+    continuation_input_sha256: str | None = None,
     **kwargs: Any,
 ) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
@@ -474,6 +478,7 @@ async def _litellm_acompletion(
     """
     if type(provider_custody) is not ProviderCallCustody:
         raise AuditIntegrityError("Physical provider requires exact explicit custody")
+    title = provider_custody.continuation_title
     import litellm
 
     # Endpoint credentials are purpose-specific transport configuration and
@@ -534,39 +539,115 @@ async def _litellm_acompletion(
     if prepared_advisor_content is not None:
         credential_messages = scan_prepared_advisor_content(credential_messages, prepared_advisor_content, role=prompt_guard_role)
     require_no_credential_material(credential_messages, surface="composer_provider_request")
-    await enforce_prompt_guard(
-        mount=prompt_guard_mount,
-        mode=prompt_guard_mode,
-        role=prompt_guard_role,
-        provider_custody=provider_custody,
-        messages=kwargs["messages"],
-        tools=kwargs["tools"] if "tools" in kwargs else (),
-        user_prompt=prompt_guard_user_prompt,
-        trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
-        content_parts=content_parts,
-        tool_argument_parts=argument_parts,
-        thinking_parts=thinking_parts,
-    )
+    cost_request: CommonProviderCostRequest = {"messages": kwargs["messages"]}
+    if "tools" in kwargs:
+        cost_request["tools"] = kwargs["tools"]
+    if "max_tokens" in kwargs:
+        cost_request["max_tokens"] = kwargs["max_tokens"]
+    provider_custody.prepare_cost_request(cost_request)
+    if "max_tokens" in cost_request:
+        kwargs["max_tokens"] = cost_request["max_tokens"]
+    if title is None:
+        await enforce_prompt_guard(
+            mount=prompt_guard_mount,
+            mode=prompt_guard_mode,
+            role=prompt_guard_role,
+            provider_custody=provider_custody,
+            messages=kwargs["messages"],
+            tools=kwargs["tools"] if "tools" in kwargs else (),
+            user_prompt=prompt_guard_user_prompt,
+            trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+            content_parts=content_parts,
+            tool_argument_parts=argument_parts,
+            thinking_parts=thinking_parts,
+        )
+    else:
+
+        async def title_guard() -> None:
+            await enforce_prompt_guard(
+                mount=prompt_guard_mount,
+                mode=prompt_guard_mode,
+                role=prompt_guard_role,
+                provider_custody=provider_custody,
+                messages=kwargs["messages"],
+                tools=kwargs["tools"] if "tools" in kwargs else (),
+                user_prompt=prompt_guard_user_prompt,
+                trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+                content_parts=content_parts,
+                tool_argument_parts=argument_parts,
+                thinking_parts=thinking_parts,
+            )
+
+        await title.clock.run("guard", title_guard)
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
-    await provider_custody.admit(model=kwargs["model"])
-    if on_provider_dispatch is not None:
+    if continuation_input_sha256 is not None and continuation_provider_input_hash(kwargs) != continuation_input_sha256:
+        raise AuditIntegrityError("Primary provider wire changed its actual prepared continuation input")
+    if title is None:
+        await provider_custody.admit(model=kwargs["model"])
+    else:
+
+        async def title_quota() -> None:
+            await provider_custody.admit(model=kwargs["model"])
+
         try:
+            await title.clock.run("quota", title_quota)
+        except BaseException as quota_failure:
+            if provider_custody.attempt is not None:
+                try:
+                    cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
+                except BaseException as disposition_failure:
+                    raise BaseExceptionGroup(
+                        "TITLE quota stage and required undispatched disposition", [quota_failure, disposition_failure]
+                    ) from None
+                if cancellations:
+                    raise BaseExceptionGroup("TITLE quota stage and original cancellations", [quota_failure, *cancellations]) from None
+            raise
+    try:
+        provider_custody.require_cost_dispatch()
+        if on_provider_dispatch is not None:
             on_provider_dispatch()
-        except BaseException as callback_failure:
+    except BaseException as callback_failure:
+        try:
+            cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
+        except BaseException as disposition_failure:
+            raise BaseExceptionGroup(
+                "Provider pre-dispatch callback and required disposition outcomes", [callback_failure, disposition_failure]
+            ) from None
+        if cancellations:
+            raise BaseExceptionGroup(
+                "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
+            ) from None
+        raise
+    if title is None:
+        provider_custody.mark_sdk_entered()
+        return await litellm.acompletion(**kwargs)
+
+    async def title_physical() -> Any:
+        if asyncio.get_running_loop().time() >= title.clock.deadline:
+            raise TimeoutError("TITLE original action deadline expired before SDK entry")
+        provider_custody.mark_sdk_entered()
+        return await litellm.acompletion(**kwargs)
+
+    try:
+        return await title.clock.run("physical", title_physical)
+    except BaseException as physical_failure:
+        if provider_custody.has_undispatched_attempt():
             try:
                 cancellations = await provider_custody.cancel_before_sdk(model=kwargs["model"])
             except BaseException as disposition_failure:
                 raise BaseExceptionGroup(
-                    "Provider pre-dispatch callback and required disposition outcomes", [callback_failure, disposition_failure]
+                    "TITLE physical stage and known-undispatched disposition", [physical_failure, disposition_failure]
                 ) from None
             if cancellations:
-                raise BaseExceptionGroup(
-                    "Provider pre-dispatch callback and original cancellations", [callback_failure, *cancellations]
-                ) from None
-            raise
-    provider_custody.mark_sdk_entered()
-    return await litellm.acompletion(**kwargs)
+                raise BaseExceptionGroup("TITLE physical stage and original cancellations", [physical_failure, *cancellations]) from None
+        raise
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedContinuationPrimaryRequest:
+    input_sha256: str
+    kwargs: dict[str, Any] = field(repr=False)
 
 
 class ProviderGateway:
@@ -596,6 +677,30 @@ class ProviderGateway:
         """The immutable deployment dependency shared with primary-role callers."""
         return self._prompt_guard_mount
 
+    def prepare_continuation_primary(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> PreparedContinuationPrimaryRequest:
+        """Freeze ordinary physical-input identity without guard/quota/SDK clearance."""
+        evidence = detach_prompt_guard_evidence(messages)
+        wire_messages = evidence.messages
+        wire_tools = [dict(tool) for tool in tools]
+        if supports_anthropic_prompt_cache_markers(self._model):
+            wire_messages, selected = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
+            wire_tools = selected if selected is not None else wire_tools
+        kwargs = build_composer_loop_request_kwargs(
+            model=self._model,
+            messages=wire_messages,
+            tools=wire_tools,
+            settings=self._settings,
+            api_base=self._endpoint_base_url,
+            api_key=self._endpoint_api_key,
+        )
+        _apply_openrouter_app_identity(kwargs)
+        _apply_openrouter_usage_accounting(kwargs)
+        return PreparedContinuationPrimaryRequest(continuation_provider_input_hash(kwargs), kwargs)
+
     async def _call_llm(
         self,
         messages: list[dict[str, Any]],
@@ -607,6 +712,7 @@ class ProviderGateway:
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+        continuation_input_sha256: str | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -629,6 +735,7 @@ class ProviderGateway:
                 prompt_guard_content_parts=prompt_guard_content_parts,
                 prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
                 prompt_guard_thinking_parts=prompt_guard_thinking_parts,
+                continuation_input_sha256=continuation_input_sha256,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -754,6 +861,28 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
     ) -> _AdmittedLLMCompletion:
+        """Preserve the completion-returning primary audit boundary."""
+        outcome = await self._call_llm_outcome_with_audit_body(
+            messages,
+            tools,
+            timeout=timeout,
+            recorder=recorder,
+            provider_custody=provider_custody,
+            credential_state=credential_state,
+        )
+        return outcome.completion
+
+    async def _call_llm_outcome_with_audit_body(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody | None = None,
+        credential_state: CompositionState | None = None,
+        continuation_input_sha256: str | None = None,
+    ) -> _CallModelOutcome:
         """Call the primary model once and record the exact marked request."""
         evidence = detach_prompt_guard_evidence(messages)
         wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
@@ -772,8 +901,21 @@ class ProviderGateway:
         error_message: str | None = None
         failure_to_capture: Exception | None = None
         recovery_batch: _AdmittedToolBatch | None = None
+        original_call: ComposerLLMCall | None = None
         try:
-            if any(parts is not None for parts in evidence.thinking_parts):
+            if continuation_input_sha256 is not None:
+                completion_call = self._call_llm(
+                    wire_messages,
+                    wire_tools,
+                    provider_custody=provider_custody,
+                    credential_state=credential_state,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prompt_guard_content_parts=evidence.content_parts,
+                    prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                    prompt_guard_thinking_parts=evidence.thinking_parts,
+                    continuation_input_sha256=continuation_input_sha256,
+                )
+            elif any(parts is not None for parts in evidence.thinking_parts):
                 completion_call = self._call_llm(
                     wire_messages,
                     wire_tools,
@@ -838,7 +980,6 @@ class ProviderGateway:
                     provider_metadata=completion.provider_metadata,
                 )
             status = ComposerLLMCallStatus.SUCCESS
-            return completion
         except PromptGuardRefused:
             raise
         except TimeoutError as exc:
@@ -910,6 +1051,9 @@ class ProviderGateway:
                             temperature=self._settings.composer_temperature,
                             seed=self._settings.composer_seed,
                             response_metadata=response_metadata,
+                            max_completion_tokens_requested=(
+                                provider_custody.cost_completion_limit() if provider_custody is not None else None
+                            ),
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
@@ -954,12 +1098,16 @@ class ProviderGateway:
                                 ),
                             )
                         if provider_custody is not None:
+                            provider_custody.mark_cost_response_accountable(admitted_metadata=response_metadata is not None)
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                        original_call = call
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
                         attach_llm_calls(current_exc, recorder)
+
+        return _CallModelOutcome(completion=completion, audit_call=original_call)
 
     async def _call_text_llm_with_audit_body(
         self,
@@ -1095,6 +1243,9 @@ class ProviderGateway:
                             temperature=self._settings.composer_temperature,
                             seed=self._settings.composer_seed,
                             response_metadata=response_metadata,
+                            max_completion_tokens_requested=(
+                                provider_custody.cost_completion_limit() if provider_custody is not None else None
+                            ),
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
@@ -1102,6 +1253,7 @@ class ProviderGateway:
                             private_request=private_request,
                         )
                         if provider_custody is not None:
+                            provider_custody.mark_cost_response_accountable(admitted_metadata=response_metadata is not None)
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
@@ -1144,6 +1296,32 @@ class ProviderGateway:
                 provider_custody=provider_custody,
                 credential_state=credential_state,
             )
+
+    async def _call_llm_outcome_with_audit(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        timeout: float,
+        recorder: BufferingRecorder | None,
+        provider_custody: ProviderCallCustody,
+        credential_state: CompositionState | None = None,
+        continuation_input_sha256: str | None = None,
+    ) -> _CallModelOutcome:
+        """Carry the original primary audit through its existing settlement."""
+        async with provider_call_scope(provider_custody):
+            outcome = await self._call_llm_outcome_with_audit_body(
+                messages,
+                tools,
+                timeout=timeout,
+                recorder=recorder,
+                provider_custody=provider_custody,
+                credential_state=credential_state,
+                continuation_input_sha256=continuation_input_sha256,
+            )
+        if outcome.audit_call is None:
+            raise AuditIntegrityError("Primary provider outcome lacks its original physical audit")
+        return outcome
 
     @quota_provider_calls
     async def _call_text_llm_with_audit_legacy(

@@ -5873,11 +5873,11 @@ _reserve_FULL_SOURCE_PATHS = (
 )
 
 _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operations.py"
-_reserve_CANCEL_ROUTE_SHA256 = "084791796bc88481d879d0a09b7ab43e8f483c378d56cff6bc46d9e075c8a4e6"
+_reserve_CANCEL_ROUTE_SHA256 = "b9887b44b17dd732ebb21ff07d6eb9eeb1e473839d62c7abfe15e517256d9e12"
 _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "ba2337366bfdc9f6c4181a85e8dcf0dc1d3048b405de3855c882d178e96dda52",
-    "src/elspeth/web/sessions/composer_async_worker.py": "863285bd0bc2ffb3c7002738834c09e892b479b2b11dd3dff062fe91ea905a2a",
+    "src/elspeth/web/sessions/composer_turn.py": "f3bede6fb0a891950b05e8ed8731d93f33fcbc9eb9d8fcb99e9655003908d88b",
+    "src/elspeth/web/sessions/composer_async_worker.py": "cb28e7750821b373a54361e6b422863e7631e3ccee4309c4333c90d9912c1f71",
 }
 
 
@@ -6643,6 +6643,1774 @@ def _reserve_authority_receiver_contract(units):
     return []
 
 
+def _reserve_dataclass_field_local_bindings(unit, bound, origin):
+    """Prove local stores disjoint from this actual imported supplier binding.
+
+    The common origin resolver supplies the qualified import/reexport identity.
+    Only dataclasses.field is newly selected by the live batch receipt. This
+    receipt concerns lexical storage, not the value assigned: common selected
+    object/attribute/reflection checks still inspect every expression and use.
+    Value writes in module/class/unknown scopes, deletion and escaping scope
+    declarations have no receipt. An annotation-only direct module/class target
+    does not assign that name; its annotation expression remains fully scanned.
+    The returned identities belong only to this actual source AST.
+    """
+    if origin != ("object", "dataclasses.field"):
+        return {}
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    stores = {}
+    for node in ast.walk(unit.tree):
+        if not (isinstance(node, ast.Name) and node.id == bound and isinstance(node.ctx, ast.Store)):
+            continue
+        declaration = parents.get(id(node))
+        declaration_scope = parents.get(id(declaration)) if declaration is not None else None
+        if (
+            isinstance(declaration, ast.AnnAssign)
+            and declaration.target is node
+            and declaration.value is None
+            and declaration.simple == 1
+            and isinstance(declaration_scope, (ast.Module, ast.ClassDef))
+            and declaration in declaration_scope.body
+        ):
+            stores[id(node)] = id(declaration_scope)
+            continue
+        current = node
+        while id(current) in parents:
+            owner = parents[id(current)]
+            if isinstance(owner, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                # Only a generator TARGET is stored in the comprehension's
+                # implicit local scope. A walrus target and the first iterable
+                # use the enclosing scope and must continue walking outward.
+                if any(node in ast.walk(generator.target) for generator in owner.generators):
+                    stores[id(node)] = id(owner)
+                    break
+            elif isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Defaults/decorators/annotations are outside the function body.
+                # Walk past them to their actual enclosing execution scope.
+                if current in owner.body:
+                    if not any(
+                        isinstance(part, (ast.Global, ast.Nonlocal)) and bound in part.names
+                        for statement in owner.body
+                        for part in ast.walk(statement)
+                    ):
+                        stores[id(node)] = id(owner)
+                    break
+            elif (isinstance(owner, ast.ClassDef) and current in owner.body) or (isinstance(owner, ast.Lambda) and current is owner.body):
+                # Unsupported class/lambda namespace effects remain refused.
+                # Their defaults/decorators execute outside that namespace.
+                break
+            current = owner
+    return stores
+
+
+def _reserve_dataclass_field_local_stores(unit, bound, origin):
+    return frozenset(_reserve_dataclass_field_local_bindings(unit, bound, origin))
+
+
+def _reserve_dataclass_field_read_scopes(value, bound, parents):
+    """Actual lexical scopes for this source Load, including default execution.
+
+    A comprehension's first iterable executes outside its implicit scope;
+    every generator target binds throughout the implicit scope. Function
+    defaults/decorators/annotations execute outside that function's body.
+    """
+    current = value
+    while id(current) in parents:
+        owner = parents[id(current)]
+        if isinstance(owner, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            in_first_iterable = value in ast.walk(owner.generators[0].iter)
+            if not in_first_iterable and any(
+                isinstance(target, ast.Name) and target.id == bound
+                for generator in owner.generators
+                for target in ast.walk(generator.target)
+            ):
+                yield owner
+                return
+        elif (isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)) and current in owner.body) or (
+            isinstance(owner, ast.Lambda) and current is owner.body
+        ):
+            yield owner
+        current = owner
+
+
+_reserve_AUDIT_EVIDENCE_PATH = "src/elspeth/contracts/audit_evidence.py"
+_reserve_AUDIT_EVIDENCE_SINK = "elspeth.contracts.audit_evidence.AuditEvidenceBase._raise_if_abstract"
+_reserve_AUDIT_EVIDENCE_ORIGINS = frozenset(
+    {
+        "elspeth.contracts.audit_evidence.AuditEvidenceBase",
+        "abc.ABC",
+        "abc.ABCMeta",
+        "abc.abstractmethod",
+        "typing.cast",
+        "builtins.type",
+        "builtins.staticmethod",
+        "builtins.sorted",
+        "builtins.frozenset",
+        "builtins.str",
+        "builtins.super",
+        "builtins.TypeError",
+    }
+)
+# Readable complete contract, never executed. This binds eager declarations,
+# the inherited wrapper, both actual callers, and the complete consuming sink.
+# Native common-origin closure separately protects all supplier identities.
+_reserve_AUDIT_EVIDENCE_SOURCE = r'''
+"""AuditEvidence nominal base class (ADR-010 §Decision 1).
+
+Violation classes that contribute structured context to ExecutionError.context
+via NodeStateGuard.__exit__ MUST inherit AuditEvidenceBase explicitly. A
+structural Protocol was rejected (see ADR-010 §Alternative 3) because
+single-method @runtime_checkable Protocols admit accidental duck-type matches
+from unrelated classes, which would let stray to_audit_dict methods (e.g.,
+in test helpers or third-party exceptions) populate the audit record with
+attacker-chosen or accidental shapes.
+
+This is L0 contracts — no imports from core, engine, or plugins.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Mapping
+from typing import Any, cast
+
+
+class AuditEvidenceBase(ABC):
+    """Nominal abstract base for audit-contributing exceptions.
+
+    Inheriting this class is an explicit author declaration: "this exception
+    contributes a structured payload to the Landscape audit trail." Subclasses
+    MUST implement ``to_audit_dict()`` returning a JSON-serializable mapping.
+
+    Any non-serializable value will surface as AuditIntegrityError at write
+    time (Tier-1) — the canonical-JSON serializer crashes on non-primitive
+    values.
+
+    Implementation note: CPython 3.13 routes ``BaseException.__new__`` through
+    a C-level fast-path that bypasses the ``ABCMeta.__call__`` abstract-method
+    guard for exception subclasses. ``AuditEvidenceBase`` therefore installs a
+    checked ``__init__`` wrapper on every subclass via ``__init_subclass__``
+    and keeps a direct ``__init__`` guard for the base class itself. That
+    restores the invariant even when a subclass uses non-cooperative ``__init__``
+    logic or orders an exception base before ``AuditEvidenceBase`` in the MRO.
+    """
+
+    _InitCallable = Callable[..., None]
+
+    @staticmethod
+    def _raise_if_abstract(cls: type[object]) -> None:
+        # Direct attribute access is safe: ABCMeta always sets
+        # ``__abstractmethods__`` on every class in the hierarchy (empty
+        # frozenset when all are implemented).
+        abstract_methods = cast(frozenset[str], cast(Any, cls).__abstractmethods__)
+        if abstract_methods:
+            names = ", ".join(sorted(abstract_methods))
+            raise TypeError(f"Can't instantiate abstract class {cls.__name__} without an implementation for abstract method(s) {names}")
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+
+        original_init = cast(AuditEvidenceBase._InitCallable, cls.__init__)
+
+        def checked_init(self: object, *args: object, **inner_kwargs: object) -> None:
+            AuditEvidenceBase._raise_if_abstract(type(self))
+            original_init(self, *args, **inner_kwargs)
+
+        cls.__init__ = checked_init  # type: ignore[method-assign]
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        AuditEvidenceBase._raise_if_abstract(type(self))
+        super().__init__(*args, **kwargs)
+
+    @abstractmethod
+    def to_audit_dict(self) -> Mapping[str, Any]:
+        """Return a JSON-serializable mapping for the audit record."""
+        raise NotImplementedError
+'''
+
+
+def _reserve_audit_evidence_recovery_receipt(units):
+    """Return only the two actual abstractness-check argument identities.
+
+    This local source receipt is not usable without the supported boundary's
+    common supplier/effect proof and exact sink-reference join on the same AST.
+    """
+    index = {unit.path: unit for unit in units}
+    if len(index) != len(units) or _reserve_AUDIT_EVIDENCE_PATH not in index:
+        return ["audit evidence recovery source missing or duplicated"], frozenset(), frozenset()
+    unit = index[_reserve_AUDIT_EVIDENCE_PATH]
+    if stable_ast_dump(unit.tree) != stable_ast_dump(ast.parse(_reserve_AUDIT_EVIDENCE_SOURCE)):
+        return ["audit evidence recovery executable contract changed"], frozenset(), frozenset()
+    cls = _reserve_node_at(unit, "AuditEvidenceBase")
+    wrapper = _reserve_node_at(unit, "AuditEvidenceBase.__init_subclass__")
+    direct = _reserve_node_at(unit, "AuditEvidenceBase.__init__")
+    sink = _reserve_node_at(unit, "AuditEvidenceBase._raise_if_abstract")
+    recipes = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
+    if (
+        not isinstance(cls, ast.ClassDef)
+        or cls not in unit.tree.body
+        or not isinstance(wrapper, ast.FunctionDef)
+        or not isinstance(direct, ast.FunctionDef)
+        or not isinstance(sink, ast.FunctionDef)
+        or any(owner not in cls.body for owner in (wrapper, direct, sink))
+        or stable_ast_dump(wrapper) != recipes.get(_reserve_AUDIT_EVIDENCE_PATH + ":AuditEvidenceBase.__init_subclass__")
+    ):
+        return ["audit evidence recovery nominal owner or inherited wrapper changed"], frozenset(), frozenset()
+    nested = [node for node in wrapper.body if isinstance(node, ast.FunctionDef) and node.name == "checked_init"]
+    if len(nested) != 1:
+        return ["audit evidence recovery checked initializer is not unique"], frozenset(), frozenset()
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    sites = set()
+    sink_uses = set()
+    for owner in (direct, nested[0]):
+        statement = owner.body[0]
+        if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+            return ["audit evidence recovery call is not a direct statement"], frozenset(), frozenset()
+        call = statement.value
+        if (
+            not isinstance(call.func, ast.Attribute)
+            or call.func.attr != "_raise_if_abstract"
+            or not isinstance(call.func.value, ast.Name)
+            or call.func.value.id != "AuditEvidenceBase"
+            or len(call.args) != 1
+            or call.keywords
+        ):
+            return ["audit evidence recovery selected sink changed"], frozenset(), frozenset()
+        recovered = call.args[0]
+        if (
+            not isinstance(recovered, ast.Call)
+            or not isinstance(recovered.func, ast.Name)
+            or recovered.func.id != "type"
+            or len(recovered.args) != 1
+            or recovered.keywords
+            or not isinstance(recovered.args[0], ast.Name)
+            or recovered.args[0].id != "self"
+            or parents.get(id(recovered)) is not call
+            or parents.get(id(call)) is not statement
+            or parents.get(id(statement)) is not owner
+        ):
+            return ["audit evidence recovery argument is detached or changed"], frozenset(), frozenset()
+        sites.add((unit.path, id(recovered)))
+        sink_uses.add((unit.path, id(call.func)))
+    if len(sites) != 2 or len(sink_uses) != 2:
+        return ["audit evidence recovery sites are not distinct"], frozenset(), frozenset()
+    return [], frozenset(sites), frozenset(sink_uses)
+
+
+def _reserve_dataclass_field_receiver_shapes(units, *, include_fields=False):
+    """Describe finite ordinary allocations; no grant without common origin closure.
+
+    The returned identities are stores in these exact source ASTs. The caller
+    must protect every returned origin and close all leaf class references
+    before excluding the stores from the unknown-receiver diagnostic.
+    """
+    leaf_bases = {
+        "elspeth.contracts.data.SchemaValidationError": (),
+        "elspeth.contracts.errors.DeclaredOutputTypeViolation": ("elspeth.contracts.errors.PluginContractViolation",),
+        "elspeth.contracts.errors.ContractMergeError": ("ValueError",),
+        "elspeth.contracts.union_merge.UnionTypeConflictError": ("Exception",),
+        "elspeth.plugins.transforms._batch_row_types.BatchRowTypeError": ("Exception",),
+    }
+    if include_fields:
+        # dataclasses.fields is a separate selected supplier. Its terminal name
+        # collides with this actual ordinary exception instance slot; the same
+        # allocation/reference proof must close the receiver before any grant.
+        leaf_bases["elspeth.contracts.errors.DeclaredInputFieldAbsentViolation"] = ("elspeth.contracts.errors.PluginContractViolation",)
+    ancestor_bases = {
+        "elspeth.contracts.errors.PluginContractViolation": ("elspeth.contracts.audit_evidence.AuditEvidenceBase", "RuntimeError"),
+        "elspeth.contracts.audit_evidence.AuditEvidenceBase": ("abc.ABC",),
+    }
+    indexed = {unit.path: unit for unit in units}
+    if len(indexed) != len(units):
+        return ("field receiver source identities are duplicated",), frozenset(), frozenset(), frozenset()
+    failures = []
+    stores = set()
+    writer_recipes = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
+    wrapper_key = "src/elspeth/contracts/audit_evidence.py:AuditEvidenceBase.__init_subclass__"
+    wrapper_unit = indexed.get("src/elspeth/contracts/audit_evidence.py")
+    wrapper = _reserve_node_at(wrapper_unit, "AuditEvidenceBase.__init_subclass__") if wrapper_unit is not None else None
+    if wrapper is None or stable_ast_dump(wrapper) != writer_recipes.get(wrapper_key):
+        failures.append("field receiver initializer wrapper is missing or changed")
+    for qualified, bases in (leaf_bases | ancestor_bases).items():
+        module, name = qualified.rsplit(".", 1)
+        unit = indexed.get("src/" + module.replace(".", "/") + ".py")
+        cls = _reserve_node_at(unit, name) if unit is not None else None
+        if not isinstance(cls, ast.ClassDef) or cls not in unit.tree.body:
+            failures.append("field receiver class source is missing or ambiguous " + qualified)
+            continue
+        resolver = _resolver_for_unit(unit)
+        if (
+            cls.keywords
+            or cls.decorator_list
+            or cls.type_params
+            or tuple(resolver.qualified_name(base, use=cls) for base in cls.bases) != bases
+        ):
+            failures.append("field receiver allocation header changed " + qualified)
+            continue
+        for statement in cls.body:
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(statement.value.value) is str:
+                continue
+            if isinstance(statement, ast.FunctionDef):
+                if statement.name == "__init_subclass__":
+                    if qualified != "elspeth.contracts.audit_evidence.AuditEvidenceBase" or (
+                        stable_ast_dump(statement) != writer_recipes.get(wrapper_key)
+                    ):
+                        failures.append("field receiver initializer wrapper changed " + qualified)
+                elif statement.name in {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "field"} | (
+                    {"fields"} if include_fields else set()
+                ):
+                    failures.append("field receiver allocation or descriptor override " + qualified)
+                continue
+            # The sole non-method ancestor declaration is an inert typing
+            # alias. Its existing module import bindings remain protected.
+            if (
+                qualified == "elspeth.contracts.audit_evidence.AuditEvidenceBase"
+                and isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and statement.targets[0].id == "_InitCallable"
+                and stable_ast_dump(statement) == stable_ast_dump(ast.parse("_InitCallable = Callable[..., None]").body[0])
+                and resolver.qualified_name(statement.value.value, use=statement) == "collections.abc.Callable"
+            ):
+                continue
+            failures.append("field receiver class namespace effect is unsupported " + qualified)
+        if qualified not in leaf_bases:
+            continue
+        constructor = _reserve_node_at(unit, name + ".__init__")
+        if (
+            not isinstance(constructor, ast.FunctionDef)
+            or constructor not in cls.body
+            or constructor.decorator_list
+            or constructor.type_params
+            or constructor.args.posonlyargs
+            or not constructor.args.args
+            or constructor.args.args[0].arg != "self"
+            or len(constructor.args.defaults) >= len(constructor.args.args)
+            or _reserve_named_stores(constructor, "self")
+            or any(isinstance(node, (ast.Global, ast.Nonlocal)) and "self" in node.names for node in ast.walk(constructor))
+        ):
+            failures.append("field receiver initializer formal changed " + qualified)
+            continue
+        slot = "fields" if qualified == "elspeth.contracts.errors.DeclaredInputFieldAbsentViolation" else "field"
+        writes = [
+            statement
+            for statement in constructor.body
+            if isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Attribute)
+            and isinstance(statement.targets[0].ctx, ast.Store)
+            and isinstance(statement.targets[0].value, ast.Name)
+            and statement.targets[0].value.id == "self"
+            and statement.targets[0].attr == slot
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == slot
+        ]
+        all_writes = [
+            node
+            for node in ast.walk(constructor)
+            if isinstance(node, ast.Attribute) and node.attr == slot and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+        if len(writes) != 1 or all_writes != [writes[0].targets[0]]:
+            failures.append("field receiver store is not one direct constructor assignment " + qualified)
+            continue
+        stores.add((unit.path, id(writes[0].targets[0])))
+    data_unit = indexed.get("src/elspeth/contracts/data.py")
+    annotation_owner = _reserve_node_at(data_unit, "validate_row") if data_unit is not None else None
+    if (
+        not isinstance(annotation_owner, ast.FunctionDef)
+        or annotation_owner not in data_unit.tree.body
+        or not isinstance(annotation_owner.returns, ast.Subscript)
+        or not isinstance(annotation_owner.returns.value, ast.Name)
+        or annotation_owner.returns.value.id != "list"
+        or not isinstance(annotation_owner.returns.slice, ast.Name)
+        or annotation_owner.returns.slice.id != "SchemaValidationError"
+        or _resolver_for_unit(data_unit).qualified_name(annotation_owner.returns.value, use=annotation_owner) != "list"
+    ):
+        failures.append("field receiver eager annotation owner or builtin supplier changed")
+    roots = frozenset(leaf_bases | ancestor_bases) | {
+        "abc.ABC",
+        "abc.ABCMeta",
+        "abc.abstractmethod",
+        "collections.abc.Callable",
+        "builtins.Exception",
+        "builtins.ValueError",
+        "builtins.RuntimeError",
+        "elspeth.contracts.data.validate_row",
+    }
+    return tuple(failures), frozenset(leaf_bases), roots, frozenset(stores)
+
+
+def _reserve_dataclass_field_class_use(node, unit, parents):
+    """Only direct construction, deferred type syntax or exact except types.
+
+    The caller resolves node to one of the finite leaf class objects. This
+    predicate does not infer origin from spelling or annotations.
+    """
+    parent = parents.get(id(node))
+    if isinstance(parent, ast.Call) and parent.func is node:
+        return True
+    if isinstance(parent, ast.ExceptHandler) and parent.type is node:
+        return True
+    if isinstance(parent, ast.Tuple):
+        outer = parents.get(id(parent))
+        if (
+            isinstance(outer, ast.ExceptHandler)
+            and outer.type is parent
+            and node in parent.elts
+            and all(isinstance(value, (ast.Name, ast.Attribute)) for value in parent.elts)
+        ):
+            return True
+    deferred = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in unit.tree.body
+    )
+    if not deferred:
+        # The existing eager builtin-list return annotation retains this
+        # class in validate_row's metadata. That exact function is a protected
+        # origin whose non-call references and annotation reflection refuse.
+        annotation = parents.get(id(node))
+        owner = parents.get(id(annotation)) if annotation is not None else None
+        return (
+            unit.path == "src/elspeth/contracts/data.py"
+            and isinstance(node, ast.Name)
+            and node.id == "SchemaValidationError"
+            and isinstance(annotation, ast.Subscript)
+            and annotation.slice is node
+            and isinstance(annotation.value, ast.Name)
+            and annotation.value.id == "list"
+            and isinstance(owner, ast.FunctionDef)
+            and owner.name == "validate_row"
+            and owner.returns is annotation
+            and owner in unit.tree.body
+            and _resolver_for_unit(unit).qualified_name(annotation.value, use=owner) == "list"
+        )
+    current = node
+    while id(current) in parents:
+        parent = parents[id(current)]
+        if (
+            (isinstance(parent, ast.arg) and parent.annotation is current)
+            or (isinstance(parent, ast.AnnAssign) and parent.annotation is current)
+            or (isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and parent.returns is current)
+        ):
+            return True
+        if not (
+            (isinstance(parent, ast.Subscript) and current in (parent.value, parent.slice))
+            or (isinstance(parent, ast.Tuple) and current in parent.elts)
+            or (isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.BitOr) and current in (parent.left, parent.right))
+        ):
+            return False
+        current = parent
+    return False
+
+
+def _reserve_typing_supplier_mutation_failures(units):
+    """Denial-only typing namespace effects using the original lexical resolver.
+
+    Ordinary constructor/query results are not capability origins. Only actual
+    namespace/class recovery operations retain the input's mutation dependency.
+    """
+    failures = []
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+
+        def canonical_builtin(node, name, use, *, resolver=resolver, unit=unit):
+            qualified = resolver.qualified_name(node, use=use)
+            return qualified == "builtins." + name or (
+                qualified == name
+                and isinstance(node, ast.Name)
+                and not resolver.is_local(node.id, use)
+                and _reserve_composer_receiver.builtin_binding(unit.tree, name)
+                and not any(isinstance(statement, ast.Global) and name in statement.names for statement in ast.walk(unit.tree))
+            )
+
+        def typing_namespace(node, use, seen=frozenset(), *, resolver=resolver, canonical_builtin=canonical_builtin):
+            if id(node) in seen:
+                return False
+            seen = seen | {id(node)}
+            qualified = resolver.qualified_name(node, use=use)
+            if qualified == "typing" or (qualified is not None and qualified.startswith("typing.")):
+                return True
+            resolved = resolver.resolve_value(node, use=use)
+            if resolved is not node:
+                return typing_namespace(resolved, resolved, seen)
+            if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                return any(typing_namespace(value, node, seen) for value in node.elts)
+            if isinstance(node, ast.Dict):
+                return any(typing_namespace(value, node, seen) for value in [*node.keys, *node.values] if value is not None)
+            if isinstance(node, ast.Attribute):
+                return typing_namespace(node.value, use, seen)
+            if isinstance(node, ast.Subscript):
+                if typing_namespace(node.value, use, seen):
+                    return True
+                if any(canonical_builtin(node.value, name, node) for name in ("list", "dict", "tuple", "set", "frozenset")):
+                    parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                    return any(typing_namespace(part, node, seen) for part in parts)
+                return False
+            if isinstance(node, ast.Call):
+                if len(node.args) == 1 and not node.keywords and any(canonical_builtin(node.func, name, node) for name in ("type", "vars")):
+                    return typing_namespace(node.args[0], node, seen)
+                target = resolver.qualified_name(node.func, use=node)
+                if target == "typing.cast" and len(node.args) == 2 and not node.keywords:
+                    return typing_namespace(node.args[1], node, seen)
+                if (
+                    len(node.args) == 1
+                    and not node.keywords
+                    and target in {"typing.get_origin", "typing.get_args", "typing.get_type_hints"}
+                ):
+                    return typing_namespace(node.args[0], node, seen)
+                if len(node.args) in {2, 3} and not node.keywords and canonical_builtin(node.func, "getattr", node):
+                    return typing_namespace(node.args[0], node, seen)
+                if (
+                    len(node.args) == 2
+                    and not node.keywords
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "__getattribute__"
+                    and any(canonical_builtin(node.func.value, name, node) for name in ("object", "type"))
+                ):
+                    return typing_namespace(node.args[0], node, seen)
+            return False
+
+        for node in ast.walk(unit.tree):
+            if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if typing_namespace(node.value, node):
+                    failures.append("typing supplier namespace mutation " + unit.path + ":" + str(node.lineno))
+            elif isinstance(node, ast.Call):
+                if (
+                    len(node.args) >= 2
+                    and any(canonical_builtin(node.func, name, node) for name in ("setattr", "delattr"))
+                    and typing_namespace(node.args[0], node)
+                ):
+                    failures.append("typing supplier reflected mutation " + unit.path + ":" + str(node.lineno))
+                    continue
+                target = resolver.qualified_name(node.func, use=node)
+                # Public canonical typing factories/query functions retain their
+                # existing rules. Private implementation invocation or a method
+                # reached through the namespace has no project configuration grant.
+                if (
+                    target is not None
+                    and target.startswith("typing.")
+                    and (target.count(".") > 1 or target.removeprefix("typing.").startswith("_"))
+                ):
+                    failures.append("typing supplier implementation call is unclosed " + unit.path + ":" + str(node.lineno))
+                safe_query = target in {
+                    "typing.cast",
+                    "typing.get_origin",
+                    "typing.get_args",
+                    "typing.get_type_hints",
+                } or any(
+                    canonical_builtin(node.func, name, node)
+                    for name in (
+                        "type",
+                        "vars",
+                        "getattr",
+                        "isinstance",
+                        "issubclass",
+                    )
+                )
+                if not safe_query and any(
+                    typing_namespace(argument, node) for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
+                ):
+                    failures.append("typing supplier namespace transfer is unclosed " + unit.path + ":" + str(node.lineno))
+    return failures
+
+
+def _reserve_control_options_role_receipt(units):
+    """Only the exact identity-consumed role is nonretained; options stay DATA."""
+    path = "src/elspeth/web/composer/required_controls.py"
+    module = "elspeth.web.composer.required_controls"
+    result = {
+        "failures": [],
+        "owner": None,
+        "uses": set(),
+        "role": "elspeth.contracts.plugin_capabilities.ControlRole",
+        "roots": {module + "._control_options", "builtins.list"},
+        "bindings": {module + "." + name for name in ("_control_options", "ControlRole", "list")},
+    }
+    # Reuse the actual closed enum declaration/import owner, not an annotation.
+    result["failures"].extend(_reserve_control_disclosure_scalar_receipt(units)["failures"])
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("control options role consumer absent or duplicated")
+        return result
+    unit = matches[0]
+    definition = _reserve_node_at(unit, "_control_options")
+    expected = ast.parse(
+        'def _control_options(\n    *,\n    plugin_name: str,\n    alias: str | None,\n    fields: Sequence[str],\n    summaries: Mapping[str, Any],\n    role: ControlRole,\n    disclosure_draft: str,\n) -> dict[str, object]:\n    """Author the inserted control node\'s options from the exemplar machinery."""\n    options: dict[str, object] = {\n        "fields": list(fields),\n        "schema": {"mode": "observed"},\n    }\n    if alias is not None:\n        # The operator-owned control binding stays behind the alias.\n        options["profile"] = alias\n    else:\n        options.update(_direct_control_options(summaries, plugin_name))\n    if role is ControlRole.OUTPUT and _plugin_declares_field(summaries, plugin_name, "source"):\n        options["source"] = "OUTPUT"\n    options[INTERPRETATION_REQUIREMENTS_KEY] = [\n        {\n            "kind": "pipeline_decision",\n            "user_term": ServerStagedRequiredControlUserTerm(REQUIRED_CONTROL_AUTO_WIRED_USER_TERM),\n            "draft": disclosure_draft,\n        }\n    ]\n    return options\n\n'
+    ).body[0]
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, "_control_options", definition)
+    ):
+        result["failures"].append("control options complete role consumer changed")
+    if not _reserve_composer_receiver.builtin_binding(unit.tree, "list") or _reserve_protected_supplier_globals(
+        unit, module, result["bindings"]
+    ):
+        result["failures"].append("control options canonical role binding changed")
+    if result["failures"]:
+        return result
+    # No new argument permissions are given to options helpers or constructors:
+    # the role is never passed to them. Returned option values are not scalarized.
+    parents = {id(child): parent for parent in ast.walk(definition) for child in ast.iter_child_nodes(parent)}
+    role_loads = [
+        node for node in ast.walk(definition) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "role"
+    ]
+    if len(role_loads) != 1:
+        result["failures"].append("control options role has an additional use")
+        return result
+    node = role_loads[0]
+    parent = parents[id(node)]
+    if (
+        not isinstance(parent, ast.Compare)
+        or parent.left is not node
+        or len(parent.ops) != 1
+        or not isinstance(parent.ops[0], ast.Is)
+        or ast.dump(parent.comparators[0], include_attributes=False)
+        != ast.dump(ast.parse("ControlRole.OUTPUT", mode="eval").body, include_attributes=False)
+    ):
+        result["failures"].append("control options role is not the actual identity operand")
+        return result
+    result["uses"].add((path, id(node)))
+    result["owner"] = module + "._control_options"
+    return result
+
+
+def _reserve_control_disclosure_scalar_receipt(units):
+    """Exact enum-to-text consumer, without admitting graph or policy carriers."""
+    path = "src/elspeth/web/composer/required_controls.py"
+    module = "elspeth.web.composer.required_controls"
+    enum_path = "src/elspeth/contracts/plugin_capabilities.py"
+    enum_module = "elspeth.contracts.plugin_capabilities"
+    enum_definitions = {
+        "PluginCapability": 'class PluginCapability(StrEnum):\n    LLM = "llm"\n    PROMPT_SHIELD = "prompt_shield"\n    CONTENT_SAFETY = "content_safety"\n\n',
+        "ControlRole": 'class ControlRole(StrEnum):\n    INPUT = "input"\n    OUTPUT = "output"\n\n',
+    }
+    result = {
+        "failures": [],
+        "owner": None,
+        "parameters": {"capability": enum_module + ".PluginCapability", "role": enum_module + ".ControlRole"},
+        "roots": {module + "._disclosure_draft", "enum.StrEnum"} | {enum_module + "." + name for name in enum_definitions},
+        "bindings": {module + "." + name for name in ("_disclosure_draft", *enum_definitions)}
+        | {enum_module + "." + name for name in (*enum_definitions, "StrEnum")},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    enum_matches = [unit for unit in units if unit.path == enum_path]
+    if len(matches) != 1 or len(enum_matches) != 1:
+        result["failures"].append("control disclosure consumer owner absent or duplicated")
+        return result
+    unit, enum_unit = matches[0], enum_matches[0]
+    definition = _reserve_node_at(unit, "_disclosure_draft")
+    expected = ast.parse(
+        'def _disclosure_draft(\n    *,\n    capability: PluginCapability,\n    control_plugin: str,\n    llm_component_id: str,\n    llm_component_kind: Literal["node", "source"],\n    role: ControlRole,\n    protected_fields: tuple[str, ...] = (),\n    scanned_fields: tuple[str, ...] = (),\n) -> str:\n    """Operator-facing draft for the auto-wired disclosure review card."""\n    edge = "input" if role is ControlRole.INPUT else "output"\n    draft = (\n        f"ELSPETH automatically inserted the deployment-required {capability.value} control "\n        f"\'{control_plugin}\' on the {edge} path of llm {llm_component_kind} \'{llm_component_id}\'. Deployment policy "\n        "makes this control mandatory on every such path; acknowledging records that you "\n        "reviewed the inserted node. Removing it will block the pipeline at the required-control "\n        f"gate unless an operator relaxes the {capability.value} control mode."\n    )\n    if scanned_fields and protected_fields:\n        # Coverage populates scanned_fields only when a control already\n        # provably dominates this edge with the WRONG field scope. The graph\n        # then carries two controls, which is only explicable if the card\n        # names the mismatch that made the second one necessary.\n        draft += (\n            f" An existing upstream control scans only [{\', \'.join(scanned_fields)}] while this "\n            f"node reads [{\', \'.join(protected_fields)}], so a control scoped to the full "\n            "protected set was inserted rather than modifying the existing control."\n        )\n    return draft\n\n'
+    ).body[0]
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, "_disclosure_draft", definition)
+    ):
+        result["failures"].append("control disclosure complete text consumer changed")
+    for name, expected_source in enum_definitions.items():
+        declaration = _reserve_node_at(enum_unit, name)
+        if (
+            not isinstance(declaration, ast.ClassDef)
+            or ast.dump(declaration, include_attributes=False) != ast.dump(ast.parse(expected_source).body[0], include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(enum_unit.tree, name, declaration)
+        ):
+            result["failures"].append("control disclosure exact enum supplier changed " + name)
+    if (
+        not all(_reserve_composer_receiver.imported(unit.tree, name, enum_module, name) for name in enum_definitions)
+        or not _reserve_composer_receiver.imported(enum_unit.tree, "StrEnum", "enum", "StrEnum")
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+        or _reserve_protected_supplier_globals(enum_unit, enum_module, result["bindings"])
+    ):
+        result["failures"].append("control disclosure canonical binding changed")
+    if not result["failures"]:
+        result["owner"] = module + "._disclosure_draft"
+    return result
+
+
+def _reserve_prompt_argument_return_receipt(units):
+    """The actual argument renderer preserves nominal records on both paths."""
+    path = "src/elspeth/web/composer/prompt_guard_rendering.py"
+    module = "elspeth.web.composer.prompt_guard_rendering"
+    name = "json_argument_content_parts"
+    definitions = {
+        name: 'def json_argument_content_parts(serialized: str) -> tuple[PromptGuardContentPart, ...]:\n    """Retain complete decoded argument values in supported wire renderings.\n\n    Tool admission has already parsed this argument object. Accept the common\n    JSON encoder renderings only when reconstruction is byte-identical. Any\n    other formatting remains one complete untrusted string; never normalize\n    or cut provider-authored bytes to obtain admission.\n    """\n    for ensure_ascii in (True, False):\n        for separators in (None, (",", ":")):\n            try:\n                return json_content_parts(serialized, ensure_ascii=ensure_ascii, separators=separators)\n            except AuditIntegrityError:\n                continue\n    return (PromptGuardContentPart(serialized, inspection_text=_json_inspection_text(serialized)),)\n',
+        "_json_inspection_text": _reserve_CALLBACK_BODIES[path, "_json_inspection_text"],
+    }
+    bindings = (
+        name,
+        "_json_inspection_text",
+        "json_content_parts",
+        "PromptGuardContentPart",
+        "AuditIntegrityError",
+        "json",
+        "len",
+        "str",
+        "type",
+    )
+    result = {
+        "failures": [],
+        "owner": None,
+        "returns": set(),
+        "record": "elspeth.contracts.prompt_guard.PromptGuardContentPart",
+        "roots": {module + "." + item for item in (name, "_json_inspection_text", "json_content_parts")}
+        | {"json.JSONDecoder", "builtins.len", "builtins.str", "builtins.type", "elspeth.contracts.errors.AuditIntegrityError"},
+        "bindings": {module + "." + item for item in bindings},
+    }
+    result["failures"].extend(_reserve_prompt_renderer_return_receipt(units)["failures"])
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("prompt argument retaining producer absent or duplicated")
+        return result
+    unit = matches[0]
+    for item, expected_source in definitions.items():
+        definition = _reserve_node_at(unit, item)
+        expected = ast.parse(expected_source).body[0]
+        if (
+            not isinstance(definition, ast.FunctionDef)
+            or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, item, definition)
+        ):
+            result["failures"].append("prompt argument retaining producer complete body changed " + item)
+    immediate = tuple(_reserve_composer_receiver.immediate(unit.tree))
+    imports = [
+        node
+        for node in immediate
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if (alias.asname or alias.name.split(".", 1)[0]) == "json"
+    ]
+    if (
+        len(imports) != 1
+        or not any(alias.name == "json" and alias.asname is None for alias in imports[0].names)
+        or any(
+            (isinstance(node, ast.Name) and node.id == "json" and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "json")
+            or (
+                isinstance(node, ast.ImportFrom)
+                and any(alias.name == "*" or (alias.asname or alias.name) == "json" for alias in node.names)
+            )
+            for node in immediate
+        )
+        or not _reserve_composer_receiver.imported(unit.tree, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError")
+        or not all(_reserve_composer_receiver.builtin_binding(unit.tree, item) for item in ("len", "str", "type"))
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("prompt argument retaining producer supplier changed")
+    if result["failures"]:
+        return result
+    definition = _reserve_node_at(unit, name)
+    result["returns"] = {(path, id(node)) for node in ast.walk(definition) if isinstance(node, ast.Return)}
+    result["owner"] = module + "." + name
+    return result
+
+
+def _reserve_schema_capability_producer_receipt(units):
+    """Close the actual nominal reconstruction; its output still retains enums."""
+    path = "src/elspeth/web/composer/tools/_generation_schema_response.py"
+    module = "elspeth.web.composer.tools._generation_schema_response"
+    record = "elspeth.contracts.plugin_capabilities.CapabilityDeclaration"
+    definitions = {
+        "_bad": 'def _bad() -> FrameworkBugError:\n    return FrameworkBugError("get_plugin_schema producer returned malformed data")\n\n',
+        "_capability": "def _capability(value: object) -> CapabilityDeclaration:\n    if type(value) is not CapabilityDeclaration:\n        raise _bad()\n    if (\n        type(value.capability) is not PluginCapability\n        or (value.control_role is not None and type(value.control_role) is not ControlRole)\n        or type(value.blocks_positive_detection) is not bool\n    ):\n        raise _bad()\n    try:\n        return CapabilityDeclaration(value.capability, value.control_role, value.blocks_positive_detection)\n    except ValueError:\n        raise _bad() from None\n\n",
+    }
+    imports = {
+        "CapabilityDeclaration": "elspeth.contracts.plugin_capabilities",
+        "ControlRole": "elspeth.contracts.plugin_capabilities",
+        "PluginCapability": "elspeth.contracts.plugin_capabilities",
+        "FrameworkBugError": "elspeth.contracts.errors",
+    }
+    builtins = ("type", "bool", "ValueError")
+    result = {
+        "failures": [],
+        "owner": None,
+        "origins": {},
+        "returns": set(),
+        "record": record,
+        "roots": {module + "." + name for name in definitions}
+        | {owner + "." + name for name, owner in imports.items()}
+        | {"builtins." + name for name in builtins},
+        "bindings": {module + "." + name for name in (*definitions, *imports, *builtins)},
+    }
+    result["failures"].extend(_reserve_capability_primitive_dependencies(units)["failures"])
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("schema capability producer absent or duplicated")
+        return result
+    unit = matches[0]
+    for name, expected_source in definitions.items():
+        definition = _reserve_node_at(unit, name)
+        expected = ast.parse(expected_source).body[0]
+        if (
+            not isinstance(definition, ast.FunctionDef)
+            or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, name, definition)
+        ):
+            result["failures"].append("schema capability producer complete body changed " + name)
+    if (
+        not all(_reserve_composer_receiver.imported(unit.tree, name, owner, name) for name, owner in imports.items())
+        or not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtins)
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("schema capability producer supplier changed")
+    if result["failures"]:
+        return result
+    definition = _reserve_node_at(unit, "_capability")
+    # Only loads dominated by the actual exact-type guard have nominal fields.
+    # The complete body has no reassignment, callback or alternate successful
+    # return. The initial type(value) operand is deliberately not reclassified.
+    for statement in definition.body[1:]:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "value":
+                result["origins"][path, id(node)] = ("enum-record", record)
+            if isinstance(node, ast.Return):
+                result["returns"].add((path, id(node)))
+    result["owner"] = module + "._capability"
+    return result
+
+
+def _reserve_prompt_renderer_return_receipt(units):
+    """The checked renderer returns records retaining trust, never callback-free DATA."""
+    path = "src/elspeth/web/composer/prompt_guard_rendering.py"
+    module = "elspeth.web.composer.prompt_guard_rendering"
+    name = "json_content_parts"
+    record = "elspeth.contracts.prompt_guard.PromptGuardContentPart"
+    result = {
+        "failures": [],
+        "owner": None,
+        "origins": {},
+        "returns": set(),
+        "record": record,
+        "roots": {module + "." + name},
+        "bindings": {module + "." + binding for binding in (name, "PromptGuardContentPart", "PromptGuardTrust", "tuple")},
+    }
+    parts = _reserve_prompt_part_enum_record_receipt(units)
+    result["failures"].extend(parts["failures"])
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("prompt renderer retained output owner absent or duplicated")
+        return result
+    unit = matches[0]
+    definition = _reserve_node_at(unit, name)
+    expected = ast.parse(_reserve_CALLBACK_BODIES[path, name]).body[0]
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, name, definition)
+    ):
+        result["failures"].append("prompt renderer retained output complete body changed")
+    if (
+        not all(
+            _reserve_composer_receiver.imported(unit.tree, binding, "elspeth.contracts.prompt_guard", binding)
+            for binding in ("PromptGuardContentPart", "PromptGuardTrust")
+        )
+        or not _reserve_composer_receiver.builtin_binding(unit.tree, "tuple")
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("prompt renderer retained output supplier changed")
+    if result["failures"]:
+        return result
+    parents = {id(child): parent for parent in ast.walk(definition) for child in ast.iter_child_nodes(parent)}
+    render = next(node for node in definition.body if isinstance(node, ast.FunctionDef) and node.name == "render")
+    sequence = ("enum-record-sequence", record)
+    for node in ast.walk(definition):
+        current = parents.get(id(node))
+        while current is not None and not isinstance(current, (ast.FunctionDef, ast.Lambda)):
+            current = parents.get(id(current))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "render" and current in (definition, render):
+            # Full lexical body closes both recursive calls and the actual
+            # exhausted tuple producer. Arbitrary same-named functions fail.
+            result["origins"][path, id(node)] = sequence
+        if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and current in (definition, render):
+            result["returns"].add((path, id(node)))
+        if current is render and isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in {"units", "unit"}:
+            # The outer complete owner validates every partition tuple and
+            # every actual nominal part before render can read these locals.
+            result["origins"][path, id(node)] = sequence if node.id == "units" else ("enum-record", record)
+    result["owner"] = module + "." + name
+    return result
+
+
+def _reserve_capability_primitive_dependencies(units):
+    """The scalar flag requires its actual nominal constructor checks."""
+    path = "src/elspeth/contracts/plugin_capabilities.py"
+    module = "elspeth.contracts.plugin_capabilities"
+    builtins = ("type", "bool", "TypeError")
+    result = {
+        "failures": [],
+        "bindings": {module + "." + name for name in (*builtins, "PluginCapability")},
+        "roots": {"builtins." + name for name in builtins},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("capability primitive owner absent or duplicated")
+        return result
+    unit = matches[0]
+    constructor = _reserve_node_at(unit, "CapabilityDeclaration.__post_init__")
+    expected = ast.parse(
+        'if type(self.capability) is not PluginCapability:\n    raise TypeError("capability declaration requires a PluginCapability")\nif type(self.blocks_positive_detection) is not bool:\n    raise TypeError("capability declaration blocking flag must be a bool")\n'
+    ).body
+    if not isinstance(constructor, ast.FunctionDef) or [ast.dump(node, include_attributes=False) for node in constructor.body[:2]] != [
+        ast.dump(node, include_attributes=False) for node in expected
+    ]:
+        result["failures"].append("capability constructor primitive admission changed")
+    if not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtins) or _reserve_protected_supplier_globals(
+        unit, module, result["bindings"]
+    ):
+        result["failures"].append("capability constructor primitive supplier changed")
+    return result
+
+
+def _reserve_prompt_part_enum_record_receipt(units):
+    """Retain the actual trust enum through the checked immutable part record."""
+    path = "src/elspeth/contracts/prompt_guard.py"
+    module = "elspeth.contracts.prompt_guard"
+    definitions = {
+        "PromptGuardTrust": 'class PromptGuardTrust(Enum):\n    """In-process provenance minted by owned builders, never decoded from JSON."""\n\n    INSTRUCTION = "operator_instruction"\n    REFERENCE = "operator_reference"\n\n',
+        "PromptGuardContentPart": '@dataclass(frozen=True, slots=True)\nclass PromptGuardContentPart:\n    """One complete producer-rendered unit, untrusted by default.\n\n    ``text`` covers exact wire bytes. Owned serializers may separately carry\n    decoded ``inspection_text`` so the detector reads the original words;\n    an absent projection inspects ``text`` directly. Neither grants trust.\n    """\n\n    text: str = field(repr=False)\n    trust: PromptGuardTrust | None = None\n    inspection_text: str | None = field(default=None, repr=False)\n\n    def __post_init__(self) -> None:\n        if (\n            type(self.text) is not str\n            or (self.trust is not None and type(self.trust) is not PromptGuardTrust)\n            or (self.inspection_text is not None and type(self.inspection_text) is not str)\n        ):\n            raise AuditIntegrityError("Prompt guard content part lacks exact owned provenance")\n\n',
+    }
+    record_name = module + ".PromptGuardContentPart"
+    enum_name = module + ".PromptGuardTrust"
+    result = {
+        "failures": [],
+        "record": None,
+        "fields": {},
+        "roots": {
+            record_name,
+            enum_name,
+            "dataclasses.dataclass",
+            "dataclasses.field",
+            "enum.Enum",
+            "builtins.type",
+            "builtins.str",
+            "elspeth.contracts.errors.AuditIntegrityError",
+        },
+        "bindings": {module + "." + name for name in (*definitions, "dataclass", "field", "Enum", "type", "str", "AuditIntegrityError")},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("prompt part retained enum owner absent or duplicated")
+        return result
+    unit = matches[0]
+    for name, source in definitions.items():
+        node = _reserve_node_at(unit, name)
+        if (
+            not isinstance(node, ast.ClassDef)
+            or ast.dump(node, include_attributes=False) != ast.dump(ast.parse(source).body[0], include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, name, node)
+        ):
+            result["failures"].append("prompt part exact nominal constructor changed " + name)
+    if (
+        not all(_reserve_composer_receiver.imported(unit.tree, name, "dataclasses", name) for name in ("dataclass", "field"))
+        or not _reserve_composer_receiver.imported(unit.tree, "Enum", "enum", "Enum")
+        or not _reserve_composer_receiver.imported(unit.tree, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError")
+        or not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in ("type", "str"))
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("prompt part actual constructor suppliers changed")
+    if result["failures"]:
+        return result
+    result["record"] = record_name
+    result["fields"] = {
+        "text": ("supplier-scalar", "checked prompt content text"),
+        "inspection_text": ("supplier-scalar", "checked optional inspection text"),
+        "trust": ("enum-value", enum_name),
+    }
+    return result
+
+
+def _reserve_mutation_annotation_roles(units):
+    """Five exact retained annotation references, never a scalar/instance grant."""
+    sources = {
+        "src/elspeth/contracts/composer_mutation.py": '"""Request-bound ceilings for automatic Composer mutations."""\n\nfrom dataclasses import dataclass\nfrom typing import Literal\n\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind\n\ntype MutationTrustMode = Literal["auto_commit", "explicit_approve"]\n\n\ndef _valid_trust_mode(value: object) -> bool:\n    return value in ("auto_commit", "explicit_approve")\n\n\n@dataclass(frozen=True, slots=True)\nclass ComposerMutationCeiling:\n    session_id: str\n    request_id: str\n    initial_trust_mode: MutationTrustMode\n\n    def __post_init__(self) -> None:\n        if type(self.session_id) is not str or not self.session_id:\n            raise ValueError("Mutation ceiling requires its session identity")\n        if type(self.request_id) is not str or not self.request_id:\n            raise ValueError("Mutation ceiling requires its logical request identity")\n        if not _valid_trust_mode(self.initial_trust_mode):\n            raise ValueError("Mutation ceiling has an invalid initial trust mode")\n\n    def validate_context(self, context: SessionOperationContext) -> None:\n        if (\n            type(context) is not SessionOperationContext\n            or context.operation_kind is not SessionOperationKind.COMPOSE\n            or context.fence.session_id != self.session_id\n        ):\n            raise AuditIntegrityError("Mutation ceiling differs from current COMPOSE custody")\n\n    def permits_auto(self, current: MutationTrustMode) -> bool:\n        if not _valid_trust_mode(current):\n            raise AuditIntegrityError("Session has an invalid trust mode")\n        return self.initial_trust_mode == "auto_commit" and current == "auto_commit"\n\n\n@dataclass(frozen=True, slots=True)\nclass ComposerMutationRevocation:\n    ceiling: ComposerMutationCeiling\n    current_trust_mode: MutationTrustMode\n\n    def __post_init__(self) -> None:\n        if type(self.ceiling) is not ComposerMutationCeiling:\n            raise TypeError("Mutation revocation requires an owned ceiling")\n        if self.ceiling.permits_auto(self.current_trust_mode):\n            raise ValueError("Allowed mutation cannot be reported as revoked")\n\n\nclass ComposerAutoMutationRefused(RuntimeError):\n    def __init__(self, revocation: ComposerMutationRevocation) -> None:\n        if type(revocation) is not ComposerMutationRevocation:\n            raise TypeError("Mutation refusal requires an owned revocation")\n        self.revocation = revocation\n        super().__init__("Automatic mutation authority is no longer available for this request.")\n',
+        "src/elspeth/web/coordination/composer_mutation_guard.py": '"""Connection-local automatic business authority under the session write lock."""\n\nfrom sqlalchemy import select\nfrom sqlalchemy.engine import Connection\n\nfrom elspeth.contracts.composer_mutation import (\n    ComposerAutoMutationRefused,\n    ComposerMutationCeiling,\n    ComposerMutationRevocation,\n)\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.session_operation import SessionOperationContext\nfrom elspeth.web.sessions.models import sessions_table\n\n\ndef check_auto_mutation_on_connection(\n    conn: Connection,\n    *,\n    context: SessionOperationContext,\n    ceiling: ComposerMutationCeiling,\n) -> ComposerMutationRevocation | None:\n    """Read current mode inside the caller\'s existing locked transaction."""\n    if type(ceiling) is not ComposerMutationCeiling:\n        raise TypeError("Auto mutation requires an owned ceiling")\n    ceiling.validate_context(context)\n    current = conn.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == ceiling.session_id)).scalar_one()\n    if current not in ("auto_commit", "explicit_approve"):\n        raise AuditIntegrityError("Session trust mode is corrupt")\n    return None if ceiling.permits_auto(current) else ComposerMutationRevocation(ceiling, current)\n\n\ndef require_auto_mutation_on_connection(\n    conn: Connection,\n    *,\n    context: SessionOperationContext,\n    ceiling: ComposerMutationCeiling,\n) -> None:\n    refused = check_auto_mutation_on_connection(conn, context=context, ceiling=ceiling)\n    if refused is not None:\n        raise ComposerAutoMutationRefused(refused)\n',
+    }
+    owner_module = "elspeth.contracts.composer_mutation"
+    consumer_module = "elspeth.web.coordination.composer_mutation_guard"
+    classes = ("ComposerMutationCeiling", "ComposerMutationRevocation")
+    result = {
+        "failures": [],
+        "uses": set(),
+        "roots": {owner_module + "." + name for name in classes},
+        "bindings": {
+            *(owner_module + "." + name for name in (*classes, "ComposerAutoMutationRefused", "dataclass", "Literal", "RuntimeError")),
+            *(
+                consumer_module + "." + name
+                for name in (*classes, "check_auto_mutation_on_connection", "require_auto_mutation_on_connection")
+            ),
+        },
+    }
+    found = {}
+    for path, source in sources.items():
+        matches = [unit for unit in units if unit.path == path]
+        if len(matches) != 1:
+            result["failures"].append("mutation annotation owner absent or duplicated " + path)
+            continue
+        unit = matches[0]
+        if ast.dump(unit.tree, include_attributes=False) != ast.dump(ast.parse(source), include_attributes=False):
+            result["failures"].append("mutation annotation complete declaration owner changed " + path)
+            continue
+        module = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+        if _reserve_protected_supplier_globals(unit, module, result["bindings"]):
+            result["failures"].append("mutation annotation supplier global escaped " + path)
+        found[path] = unit
+    if result["failures"]:
+        return result
+    owner = found["src/elspeth/contracts/composer_mutation.py"]
+    consumer = found["src/elspeth/web/coordination/composer_mutation_guard.py"]
+    if (
+        not _reserve_composer_receiver.imported(owner.tree, "dataclass", "dataclasses", "dataclass")
+        or not _reserve_composer_receiver.imported(owner.tree, "Literal", "typing", "Literal")
+        or not _reserve_composer_receiver.builtin_binding(owner.tree, "RuntimeError")
+        or not all(_reserve_composer_receiver.imported(consumer.tree, name, owner_module, name) for name in classes)
+    ):
+        result["failures"].append("mutation annotation actual supplier changed")
+        return result
+    for name in classes:
+        cls = _reserve_node_at(owner, name)
+        if (
+            not isinstance(cls, ast.ClassDef)
+            or cls.bases
+            or cls.keywords
+            or not _reserve_composer_receiver.owned_binding(owner.tree, name, cls)
+        ):
+            result["failures"].append("mutation annotation nominal construction changed " + name)
+    if result["failures"]:
+        return result
+    revocation = _reserve_node_at(owner, "ComposerMutationRevocation")
+    field = next(
+        node
+        for node in revocation.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "ceiling"
+    )
+    refused = _reserve_node_at(owner, "ComposerAutoMutationRefused")
+    initializer = next(node for node in refused.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    argument = next(arg for arg in initializer.args.args if arg.arg == "revocation")
+    result["uses"].update({(owner.path, id(field.annotation)), (owner.path, id(argument.annotation))})
+    for name in ("check_auto_mutation_on_connection", "require_auto_mutation_on_connection"):
+        function = _reserve_node_at(consumer, name)
+        argument = next(arg for arg in function.args.kwonlyargs if arg.arg == "ceiling")
+        result["uses"].add((consumer.path, id(argument.annotation)))
+        if name == "check_auto_mutation_on_connection":
+            result["uses"].add((consumer.path, id(function.returns.left)))
+    return result
+
+
+def _reserve_run_event_mapping_receipt(units):
+    """Only checked event strings are scalar; both original inputs stay metadata."""
+    path = "src/elspeth/web/execution/schemas.py"
+    module = "elspeth.web.execution.schemas"
+    owner_name = "_require_run_event_mapping"
+    typing_names = ("Literal", "get_args", "get_origin")
+    builtin_names = ("type", "str", "dict", "set", "TypeError", "AssertionError")
+    result = {
+        "failures": [],
+        "origins": {},
+        "arguments": set(),
+        "uses": set(),
+        "roots": {module + "." + owner_name, "typing.get_args", "typing.get_origin", *("builtins." + name for name in builtin_names)},
+        "bindings": {module + "." + name for name in (*typing_names, *builtin_names, owner_name, "RunEventType", "RunEvent")},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("run event mapping module absent or duplicated")
+        return result
+    unit = matches[0]
+    definition = _reserve_node_at(unit, owner_name)
+    expected_source = 'def _require_run_event_mapping(annotation: object, mapping: object) -> None:\n    """Check the current event Literal and mapping without hashing retained objects."""\n    if annotation is not RunEventType or get_origin(annotation) is not Literal:\n        raise TypeError("Run event field must retain its current Literal owner")\n    if type(mapping) is not dict:\n        raise TypeError("Run event data mapping must be an exact dict")\n    literal_values: set[str] = set()\n    for value in get_args(annotation):\n        if type(value) is not str:\n            raise TypeError("Run event Literal members must be exact strings")\n        literal_values.add(value)\n    mapping_keys: set[str] = set()\n    for key in mapping:\n        if type(key) is not str:\n            raise TypeError("Run event mapping keys must be exact strings")\n        mapping_keys.add(key)\n    if mapping_keys != literal_values:\n        raise AssertionError(f"_EVENT_TYPE_TO_DATA_TYPE keys {mapping_keys} != event_type Literal values {literal_values}")\n\n'
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(ast.parse(expected_source).body[0], include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, owner_name, definition)
+    ):
+        result["failures"].append("run event complete checked mapping owner changed")
+    if (
+        not all(_reserve_composer_receiver.imported(unit.tree, name, "typing", name) for name in typing_names)
+        or not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtin_names)
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("run event checked mapping suppliers changed")
+    alias_source = 'RunEventType = Literal["progress", "error", "completed", "cancelled", "failed"]'
+    aliases = [
+        node
+        for node in unit.tree.body
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "RunEventType" for target in node.targets)
+    ]
+    stores = [
+        node
+        for node in _reserve_composer_receiver.immediate(unit.tree)
+        if isinstance(node, ast.Name) and node.id == "RunEventType" and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    definitions = [
+        node
+        for node in _reserve_composer_receiver.immediate(unit.tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "RunEventType"
+    ]
+    if (
+        len(aliases) != 1
+        or ast.dump(aliases[0], include_attributes=False) != ast.dump(ast.parse(alias_source).body[0], include_attributes=False)
+        or stores != aliases[0].targets
+        or definitions
+    ):
+        result["failures"].append("run event actual Literal declaration changed")
+    cls = _reserve_node_at(unit, "RunEvent")
+    member_sources = {
+        "event_type": "event_type: RunEventType",
+        "_EVENT_TYPE_TO_DATA_TYPE": '_EVENT_TYPE_TO_DATA_TYPE: ClassVar[dict[str, type[_StrictResponse]]] = {\n    "progress": ProgressData,\n    "error": ErrorData,\n    "completed": CompletedData,\n    "cancelled": CancelledData,\n    "failed": FailedData,\n}\n',
+    }
+    if not isinstance(cls, ast.ClassDef) or not _reserve_composer_receiver.owned_binding(unit.tree, "RunEvent", cls):
+        result["failures"].append("run event actual class binding changed")
+    else:
+        for name, source in member_sources.items():
+            members = [
+                node
+                for node in cls.body
+                if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name
+            ]
+            if len(members) != 1 or ast.dump(members[0], include_attributes=False) != ast.dump(
+                ast.parse(source).body[0], include_attributes=False
+            ):
+                result["failures"].append("run event exact current member changed " + name)
+    call_source = '_require_run_event_mapping(RunEvent.model_fields["event_type"].annotation, RunEvent._EVENT_TYPE_TO_DATA_TYPE)'
+    calls = [
+        node.value
+        for node in unit.tree.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == owner_name
+    ]
+    if len(calls) != 1 or ast.dump(calls[0], include_attributes=False) != ast.dump(
+        ast.parse(call_source, mode="eval").body, include_attributes=False
+    ):
+        result["failures"].append("run event exact current consistency call changed")
+    if result["failures"]:
+        return result
+    for node in ast.walk(definition):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in {"annotation", "mapping"}:
+                result["origins"][path, id(node)] = ("type-metadata", "retained event consistency input")
+            elif node.id in {"literal_values", "mapping_keys"}:
+                # Fresh builtin sets contain only values after exact str checks.
+                result["origins"][path, id(node)] = ("supplier-scalar", "checked event strings")
+            elif node.id in {"Literal", "RunEventType"}:
+                result["uses"].add((path, id(node)))
+    for loop in (node for node in definition.body if isinstance(node, ast.For)):
+        name = loop.target.id
+        for node in ast.walk(loop.body[0]):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name:
+                result["origins"][path, id(node)] = ("type-metadata", "unchecked event consistency member")
+        for statement in loop.body[1:]:
+            for node in ast.walk(statement):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name:
+                    result["origins"][path, id(node)] = ("supplier-scalar", "checked event string")
+    call = calls[0]
+    for argument in call.args:
+        result["origins"][path, id(argument)] = ("type-metadata", "retained event consistency input")
+        result["arguments"].add((path, id(call), id(argument)))
+    for node in ast.walk(call):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "RunEvent":
+            result["uses"].add((path, id(node)))
+    return result
+
+
+def _reserve_environment_annotation_consumer_receipt(units):
+    """Retain normalized type identities; close only the actual identity consumer."""
+    path = "src/elspeth/web/config.py"
+    module = "elspeth.web.config"
+    definitions_source = {
+        "_annotation_scalar_types": 'def _annotation_scalar_types(annotation: Any) -> tuple[type, ...]:\n    """Flatten an annotation while retaining each type by identity, without hashing it."""\n    origin = typing.get_origin(annotation)\n    if origin is typing.Union or origin is types.UnionType:\n        members: list[type] = []\n        for arg in typing.get_args(annotation):\n            for member in _annotation_scalar_types(arg):\n                if not any(member is known for known in members):\n                    members.append(member)\n        return tuple(members)\n    return (annotation,) if isinstance(annotation, type) else ()\n',
+        "_coerce_env_scalar": 'def _coerce_env_scalar(value: str, annotation: Any) -> object:\n    """Coerce a numeric environment string when the target field is int/float.\n\n    Environment values are always strings, but several fields are declared\n    ``strict=True`` and reject string input outright — without coercion those\n    fields are silently un-settable from the environment (the misconfiguration\n    only detonates as a startup crash-loop). Non-numeric targets, unparseable\n    values, and bool-typed fields pass through unchanged so Pydantic reports\n    them against the original input.\n    """\n    scalar_types = _annotation_scalar_types(annotation)\n    if any(scalar is bool for scalar in scalar_types):\n        return value\n    try:\n        if any(scalar is int for scalar in scalar_types) and not any(scalar is float for scalar in scalar_types):\n            return int(value)\n        if any(scalar is float for scalar in scalar_types):\n            return float(value)\n    except ValueError:\n        return value\n    return value\n',
+        "settings_from_env": 'def settings_from_env() -> WebSettings:\n    """Construct :class:`WebSettings` from ``ELSPETH_WEB__*`` variables.\n\n    Collection fields use JSON arrays/objects, the literal ``null`` clears an\n    optional scalar, numeric strings are coerced for strict int/float fields,\n    unknown fields fail with their original environment name, and\n    policy-validation failures never echo raw operator input.\n    """\n    kwargs: dict[str, object] = {}\n    prefix = "ELSPETH_WEB__"\n    for key, value in os.environ.items():\n        if not key.startswith(prefix):\n            continue\n        field_name = key[len(prefix) :].lower()\n        if field_name == "deployment_aws_region":\n            raise RuntimeError("ELSPETH_WEB__DEPLOYMENT_AWS_REGION is reserved; deployment region comes from ambient AWS_REGION")\n        if field_name not in WebSettings.model_fields:\n            raise RuntimeError(f"Unknown ELSPETH_WEB__ setting: {key}")\n        if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS | _OPTIONAL_JSON_OBJECT_FIELDS:\n            try:\n                parsed = json.loads(value)\n            except (json.JSONDecodeError, ValueError):\n                expected = "array" if field_name in _JSON_COLLECTION_FIELDS else "object"\n                raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON {expected}.") from None\n            if field_name in _JSON_COLLECTION_FIELDS:\n                if not isinstance(parsed, list):\n                    raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON array.")\n                kwargs[field_name] = tuple(parsed)\n            else:\n                if parsed is None and field_name in _OPTIONAL_JSON_OBJECT_FIELDS:\n                    kwargs[field_name] = None\n                    continue\n                if not isinstance(parsed, dict):\n                    raise RuntimeError(f"ELSPETH_WEB__{field_name.upper()} must be valid JSON object.")\n                kwargs[field_name] = parsed\n        elif value == "null":\n            kwargs[field_name] = None\n        else:\n            kwargs[field_name] = _coerce_env_scalar(value, WebSettings.model_fields[field_name].annotation)\n\n    aws_region = os.environ.get("AWS_REGION")\n    aws_default_region = os.environ.get("AWS_DEFAULT_REGION")\n    if aws_region is not None and (not aws_region.strip() or not is_well_formed_aws_region(aws_region)):\n        raise RuntimeError("AWS_REGION must be a non-blank well-formed AWS region identifier")\n    if aws_default_region is not None and (not aws_default_region.strip() or not is_well_formed_aws_region(aws_default_region)):\n        raise RuntimeError("AWS_DEFAULT_REGION must be a non-blank well-formed AWS region identifier")\n    if aws_region is not None and aws_default_region is not None and aws_region != aws_default_region:\n        raise RuntimeError("AWS_REGION and AWS_DEFAULT_REGION must agree when both are set")\n    kwargs["deployment_aws_region"] = aws_region if aws_region is not None else aws_default_region\n\n    try:\n        return WebSettings(**kwargs)  # type: ignore[arg-type]\n    except ValidationError as error:\n        policy_fields = {\n            "plugin_allowlist",\n            "power_automate_allowed_origins",\n            "plugin_preferences",\n            "plugin_control_modes",\n            "llm_profiles",\n            "default_llm_profile",\n            "bedrock_guardrail_profiles",\n            "bedrock_guardrail_default_profiles",\n            "aws_s3_source_profiles",\n            "aws_textract_profiles",\n            "azure_search_profiles",\n            "composer_prompt_guard",\n            "composer_advisor_prompt_guard",\n            "composer_prompt_guard_mode",\n        }\n        safe_paths = {\n            str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))\n        }\n        guard_paths = (_OPTIONAL_JSON_OBJECT_FIELDS | {"composer_prompt_guard_mode"}) & safe_paths\n        if guard_paths:\n            rendered_paths = ", ".join(sorted(guard_paths))\n            raise RuntimeError(f"Invalid ELSPETH_WEB__ prompt guard setting at: {rendered_paths}") from None\n        if policy_fields & safe_paths:\n            rendered_paths = ", ".join(sorted(safe_paths))\n            raise RuntimeError(f"Invalid ELSPETH_WEB__ plugin policy setting at: {rendered_paths}") from None\n        raise\n',
+    }
+    builtins = ("type", "isinstance", "tuple", "any", "bool", "int", "float", "ValueError")
+    result = {
+        "failures": [],
+        "normalizer": None,
+        "origins": {},
+        "arguments": set(),
+        "returns": set(),
+        "roots": {
+            *(module + "." + name for name in definitions_source),
+            "typing.get_origin",
+            "typing.get_args",
+            "typing.Union",
+            "types.UnionType",
+            *("builtins." + name for name in builtins),
+        },
+        "bindings": {module + "." + name for name in (*definitions_source, *builtins, "typing", "types", "WebSettings")},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("environment annotation consumer module absent or duplicated")
+        return result
+    unit = matches[0]
+    definitions = {}
+    for name, source in definitions_source.items():
+        definition = _reserve_node_at(unit, name)
+        expected = ast.parse(source).body[0]
+        if (
+            not isinstance(definition, ast.FunctionDef)
+            or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, name, definition)
+        ):
+            result["failures"].append("environment annotation complete owner changed " + name)
+        else:
+            definitions[name] = definition
+    for name in ("typing", "types"):
+        events = []
+        for node in _reserve_composer_receiver.immediate(unit.tree):
+            if isinstance(node, ast.Import):
+                events.extend(
+                    alias.name == name and alias.asname in (None, name)
+                    for alias in node.names
+                    if (alias.asname or alias.name.partition(".")[0]) == name
+                )
+            elif isinstance(node, ast.ImportFrom):
+                events.extend(False for alias in node.names if alias.name == "*" or (alias.asname or alias.name) == name)
+            elif (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))) or (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+            ):
+                events.append(False)
+        if events != [True]:
+            result["failures"].append("environment annotation canonical module binding changed " + name)
+    if not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtins) or _reserve_protected_supplier_globals(
+        unit, module, result["bindings"]
+    ):
+        result["failures"].append("environment annotation primitive supplier changed")
+    settings = _reserve_node_at(unit, "WebSettings")
+    if not isinstance(settings, ast.ClassDef) or not _reserve_composer_receiver.owned_binding(unit.tree, "WebSettings", settings):
+        result["failures"].append("environment annotation current settings binding changed")
+    if result["failures"]:
+        return result
+    normalizer = definitions["_annotation_scalar_types"]
+    consumer = definitions["_coerce_env_scalar"]
+    # All annotation members and the fresh identity sequence remain live type
+    # metadata. No scalar classification is derived from the return annotation.
+    for owner, names in (
+        (normalizer, {"annotation", "origin", "members", "arg", "member", "known"}),
+        (consumer, {"annotation", "scalar_types", "scalar"}),
+    ):
+        for node in ast.walk(owner):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in names:
+                result["origins"][path, id(node)] = ("type-metadata", "retained environment annotation types")
+    for node in ast.walk(normalizer):
+        if isinstance(node, ast.Return):
+            result["returns"].add((path, id(node)))
+            result["origins"][path, id(node.value)] = ("type-metadata", "retained environment annotation types")
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {"_annotation_scalar_types", "tuple"}:
+                for argument in node.args:
+                    result["arguments"].add((path, id(node), id(argument)))
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "members"
+                and node.func.attr == "append"
+            ):
+                # This exact full body creates a fresh builtin list and never
+                # exposes it; append retains the member, it does not invoke it.
+                result["origins"][path, id(node.func)] = ("member", "builtins.list.append")
+                result["arguments"].add((path, id(node), id(node.args[0])))
+    for node in ast.walk(consumer):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_annotation_scalar_types":
+            result["arguments"].add((path, id(node), id(node.args[0])))
+    caller = definitions["settings_from_env"]
+    calls = [
+        node
+        for node in ast.walk(caller)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_coerce_env_scalar"
+    ]
+    # The complete current producer above fixes value's environment source and
+    # the real WebSettings.model_fields[field_name].annotation expression. Only
+    # that second argument receives a metadata-transfer role, not the function.
+    expected_call = ast.parse("_coerce_env_scalar(value, WebSettings.model_fields[field_name].annotation)", mode="eval").body
+    if len(calls) != 1 or ast.dump(calls[0], include_attributes=False) != ast.dump(expected_call, include_attributes=False):
+        result["failures"].append("environment annotation exact current field consumer call changed")
+        result["origins"].clear()
+        result["arguments"].clear()
+        result["returns"].clear()
+        return result
+    result["arguments"].add((path, id(calls[0]), id(calls[0].args[1])))
+    result["normalizer"] = module + "._annotation_scalar_types"
+    return result
+
+
+def _reserve_plugin_lookup_exception_receipt(units):
+    """Actual plain ValueError subclass used only as a direct except operand."""
+    path = "src/elspeth/plugins/infrastructure/manager.py"
+    module = "elspeth.plugins.infrastructure.manager"
+    qualified = module + ".PluginNotFoundError"
+    result = {
+        "failures": [],
+        "exception": None,
+        "roots": {qualified, "builtins.ValueError"},
+        "bindings": {qualified, module + ".ValueError"},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("plugin lookup exception module absent or duplicated")
+        return result
+    unit = matches[0]
+    definition = _reserve_node_at(unit, "PluginNotFoundError")
+    expected = ast.parse(
+        'class PluginNotFoundError(ValueError):\n    """Raised when a plugin name is not found in the registry."""\n'
+    ).body[0]
+    if (
+        not isinstance(definition, ast.ClassDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, "PluginNotFoundError", definition)
+        or not _reserve_composer_receiver.builtin_binding(unit.tree, "ValueError")
+        or _reserve_protected_supplier_globals(unit, module, result["bindings"])
+    ):
+        result["failures"].append("plugin lookup plain exception owner or builtin changed")
+        return result
+    result["exception"] = qualified
+    return result
+
+
+def _reserve_plugin_lookup_exception_role(node, origin, parents, receipt):
+    parent = parents.get(id(node))
+    return (
+        receipt["exception"] is not None
+        and origin == ("object", receipt["exception"])
+        and isinstance(parent, ast.ExceptHandler)
+        and parent.type is node
+    )
+
+
+def _reserve_configuration_annotation_metadata_receipt(units):
+    """Five finite eager type declarations; all recovered metadata stays live."""
+    specifications = {
+        "src/elspeth/contracts/config/alignment.py": {
+            "FIELD_MAPPINGS": "Final[MappingProxyType[str, MappingProxyType[str, str]]]",
+            "SETTINGS_TO_RUNTIME": "Final[MappingProxyType[str, str]]",
+            "RUNTIME_TO_SUBSYSTEM": "Final[MappingProxyType[str, str]]",
+        },
+        "src/elspeth/contracts/config/defaults.py": {
+            "INTERNAL_DEFAULTS": "Final[MappingProxyType[str, MappingProxyType[str, int | float | bool | str]]]",
+            "POLICY_DEFAULTS": "Final[MappingProxyType[str, int | float]]",
+        },
+    }
+    result = {
+        "failures": [],
+        "uses": set(),
+        "roots": {"typing.Final", "types.MappingProxyType", "builtins.str", "builtins.int", "builtins.float", "builtins.bool"},
+        "bindings": set(),
+    }
+    pending = set()
+    for path, declarations in specifications.items():
+        module = path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+        names = {"Final", "MappingProxyType", "str", "int", "float", "bool"}
+        bindings = {module + "." + name for name in names}
+        result["bindings"].update(bindings)
+        matches = [unit for unit in units if unit.path == path]
+        if len(matches) != 1:
+            result["failures"].append("configuration eager annotation module absent or duplicated " + path)
+            continue
+        unit = matches[0]
+        if (
+            not _reserve_composer_receiver.imported(unit.tree, "Final", "typing", "Final")
+            or not _reserve_composer_receiver.imported(unit.tree, "MappingProxyType", "types", "MappingProxyType")
+            or not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in names - {"Final", "MappingProxyType"})
+            or _reserve_protected_supplier_globals(unit, module, bindings)
+        ):
+            result["failures"].append("configuration eager annotation suppliers changed " + path)
+        for name, annotation_source in declarations.items():
+            statements = [
+                statement
+                for statement in unit.tree.body
+                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == name
+            ]
+            expected = ast.parse(annotation_source, mode="eval").body
+            if (
+                len(statements) != 1
+                or statements[0].simple != 1
+                or ast.dump(statements[0].annotation, include_attributes=False) != ast.dump(expected, include_attributes=False)
+            ):
+                result["failures"].append("configuration eager annotation grammar changed " + path + ":" + name)
+                continue
+            for node in ast.walk(statements[0].annotation):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    pending.add((path, id(node)))
+    if not result["failures"]:
+        result["uses"] = pending
+    return result
+
+
+def _reserve_protected_supplier_reflection(module, selector, protected_bindings):
+    """Deny recovery of a protected implicit binding through its module dict."""
+    if not any(binding.rpartition(".")[0] == module for binding in protected_bindings):
+        return False
+    return (
+        not isinstance(selector, ast.Constant)
+        or type(selector.value) is not str
+        or selector.value == "__dict__"
+        or module + "." + selector.value in protected_bindings
+    )
+
+
+def _reserve_protected_supplier_globals(unit, module, protected_bindings):
+    """Global declarations can replace implicit builtins without an import row."""
+    return [
+        (node, name)
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Global)
+        for name in node.names
+        if module + "." + name in protected_bindings
+    ]
+
+
+def _reserve_run_status_literal_metadata_receipt(units):
+    """Exact checked consumer; raw field/annotation objects remain metadata."""
+    path = "src/elspeth/web/execution/schemas.py"
+    module = "elspeth.web.execution.schemas"
+    protocol_path = "src/elspeth/web/sessions/protocol.py"
+    protocol_module = "elspeth.web.sessions.protocol"
+    typing_names = ("get_args", "get_origin", "Literal")
+    builtin_names = ("type", "str", "frozenset", "TypeError")
+    alias_names = ("SessionRunStatus", "TerminalSessionRunStatus")
+    owner_name = "_status_literal_values"
+    result = {
+        "failures": [],
+        "origins": {},
+        "arguments": set(),
+        "uses": set(),
+        "roots": {module + "." + owner_name, "typing.get_args", "typing.get_origin", *("builtins." + name for name in builtin_names)},
+        "bindings": {
+            *(
+                module + "." + name
+                for name in (*typing_names, *builtin_names, *alias_names, owner_name, "RunStatusResponse", "RunResultsResponse")
+            ),
+            *(protocol_module + "." + name for name in (*alias_names, "Literal")),
+            "typing.Literal",
+        },
+    }
+    modules = {}
+    for expected_path in (path, protocol_path):
+        matches = [unit for unit in units if unit.path == expected_path]
+        if len(matches) != 1:
+            result["failures"].append("run status checked consumer module absent or duplicated " + expected_path)
+        else:
+            modules[expected_path] = matches[0]
+    if result["failures"]:
+        return result
+    unit = modules[path]
+    protocol = modules[protocol_path]
+    expected_source = 'def _status_literal_values(annotation: object, expected: object) -> frozenset[str]:\n    """Project the real status field only through its current shared Literal owner."""\n    if annotation is not expected:\n        raise TypeError("Run status field must retain its current shared Literal owner")\n    if get_origin(annotation) is not Literal:\n        raise TypeError("Run status field annotation must be a Literal")\n    names: list[str] = []\n    for value in get_args(annotation):\n        if type(value) is not str:\n            raise TypeError("Run status Literal members must be exact strings")\n        names.append(value)\n    if not names:\n        raise TypeError("Run status Literal must not be empty")\n    return frozenset(names)\n'
+    definition = _reserve_node_at(unit, owner_name)
+    expected = ast.parse(expected_source).body[0]
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, owner_name, definition)
+    ):
+        result["failures"].append("run status exact checked consumer changed")
+    if (
+        not all(_reserve_composer_receiver.imported(unit.tree, name, "typing", name) for name in typing_names)
+        or not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtin_names)
+        or not all(_reserve_composer_receiver.imported(unit.tree, name, protocol_module, name) for name in alias_names)
+        or not _reserve_composer_receiver.imported(protocol.tree, "Literal", "typing", "Literal")
+    ):
+        result["failures"].append("run status checked consumer suppliers changed")
+    for current, current_module in ((unit, module), (protocol, protocol_module)):
+        if _reserve_protected_supplier_globals(current, current_module, result["bindings"]):
+            result["failures"].append("run status checked consumer supplier global escaped " + current_module)
+    alias_sources = {
+        "SessionRunStatus": 'SessionRunStatus = Literal["pending", "running", "completed", "completed_with_failures", "failed", "empty", "cancelled"]',
+        "TerminalSessionRunStatus": 'TerminalSessionRunStatus = Literal["completed", "completed_with_failures", "failed", "empty", "cancelled"]',
+    }
+    for name, source in alias_sources.items():
+        expected_alias = ast.parse(source).body[0]
+        aliases = [
+            statement
+            for statement in protocol.tree.body
+            if isinstance(statement, ast.Assign) and any(isinstance(target, ast.Name) and target.id == name for target in statement.targets)
+        ]
+        stores = [
+            node
+            for node in _reserve_composer_receiver.immediate(protocol.tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id == name
+        ]
+        definitions = [
+            node
+            for node in _reserve_composer_receiver.immediate(protocol.tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+        ]
+        if (
+            len(aliases) != 1
+            or ast.dump(aliases[0], include_attributes=False) != ast.dump(expected_alias, include_attributes=False)
+            or stores != aliases[0].targets
+            or definitions
+        ):
+            result["failures"].append("run status shared Literal declaration changed " + name)
+    calls = []
+    for class_name, alias_name, constant in (
+        ("RunStatusResponse", "SessionRunStatus", "RUN_STATUS_ALL_VALUES"),
+        ("RunResultsResponse", "TerminalSessionRunStatus", "RUN_STATUS_TERMINAL_VALUES"),
+    ):
+        cls = _reserve_node_at(unit, class_name)
+        expected_field = ast.parse("status: " + alias_name).body[0]
+        fields = (
+            [
+                statement
+                for statement in cls.body
+                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == "status"
+            ]
+            if isinstance(cls, ast.ClassDef)
+            else []
+        )
+        if (
+            not isinstance(cls, ast.ClassDef)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, class_name, cls)
+            or len(fields) != 1
+            or ast.dump(fields[0], include_attributes=False) != ast.dump(expected_field, include_attributes=False)
+        ):
+            result["failures"].append("run status actual field declaration changed " + class_name)
+        source = (
+            constant + ": frozenset[str] = _status_literal_values(" + class_name + '.model_fields["status"].annotation, ' + alias_name + ")"
+        )
+        expected_call = ast.parse(source).body[0]
+        statements = [
+            statement
+            for statement in unit.tree.body
+            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == constant
+        ]
+        stores = [
+            node
+            for node in _reserve_composer_receiver.immediate(unit.tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id == constant
+        ]
+        if (
+            len(statements) != 1
+            or ast.dump(statements[0], include_attributes=False) != ast.dump(expected_call, include_attributes=False)
+            or stores != [statements[0].target]
+        ):
+            result["failures"].append("run status exact field consumer call changed " + constant)
+        else:
+            calls.append(statements[0].value)
+    if result["failures"]:
+        return result
+    # No field, map, annotation, alias or callback is scalar at entry. Only the
+    # complete body's checked string append and final immutable set qualify.
+    loop = next(node for node in definition.body if isinstance(node, ast.For))
+    for node in ast.walk(definition):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in {"annotation", "expected"}:
+                result["origins"][path, id(node)] = ("type-metadata", "run status Literal input")
+            elif node.id == "Literal":
+                result["uses"].add((path, id(node)))
+    for node in ast.walk(loop.body[0]):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "value":
+            result["origins"][path, id(node)] = ("type-metadata", "unchecked Literal member")
+    for statement in loop.body[1:]:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "value":
+                result["origins"][path, id(node)] = ("supplier-scalar", "checked status string")
+    result["origins"][path, id(definition.body[-1].value)] = ("supplier-scalar", "checked immutable status strings")
+    for call in calls:
+        result["origins"][path, id(call)] = ("supplier-scalar", "checked immutable status strings")
+        for argument in call.args:
+            result["arguments"].add((path, id(call), id(argument)))
+        # These exact loads remain metadata/class identities; only their use
+        # in the fully checked two-argument transfer is accepted here.
+        for node in ast.walk(call):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in {*alias_names, "RunStatusResponse", "RunResultsResponse"}
+            ):
+                result["uses"].add((path, id(node)))
+    return result
+
+
+def _reserve_payload_schema_key_metadata_receipt(units):
+    """Checked exact-string keys; annotation values retain their old origins."""
+    path = "src/elspeth/contracts/declaration_contracts.py"
+    module = "elspeth.contracts.declaration_contracts"
+    imports = ("get_type_hints", "get_origin", "Required", "NotRequired")
+    builtins = ("type", "str", "set", "frozenset", "TypeError")
+    result = {
+        "failures": [],
+        "origins": {},
+        "roots": {
+            module + "._resolve_typeddict_key_sets",
+            *("typing." + name for name in imports),
+            *("builtins." + name for name in builtins),
+        },
+        "bindings": {module + "." + name for name in (*imports, *builtins, "_resolve_typeddict_key_sets")},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("payload schema key owner module is absent or duplicated")
+        return result
+    unit = matches[0]
+    expected_source = 'def _resolve_typeddict_key_sets(schema: type) -> tuple[frozenset[str], frozenset[str]]:\n    """Return ``(required, optional)`` frozensets for a TypedDict class.\n\n    ``typing.get_type_hints(schema, include_extras=True)`` is authoritative\n    for explicit ``NotRequired[...]`` / ``Required[...]`` wrappers under\n    ``from __future__ import annotations``. For bare inherited keys, the\n    TypedDict metaclass key sets preserve the defining class\'s totality.\n    Combine both signals so wrapper intent wins and inherited bare keys do\n    not get reclassified by the most-derived class\'s ``__total__``.\n    """\n    total_required_default: bool = schema.__total__  # type: ignore[attr-defined]\n    native_required = frozenset(schema.__required_keys__)  # type: ignore[attr-defined]\n    native_optional = frozenset(schema.__optional_keys__)  # type: ignore[attr-defined]\n    hints = get_type_hints(schema, include_extras=True)\n    required: set[str] = set()\n    optional: set[str] = set()\n    for key, annotation in hints.items():\n        if type(key) is not str:\n            raise TypeError("Payload schema annotation keys must be exact strings")\n        origin = get_origin(annotation)\n        if origin is Required:\n            required.add(key)\n        elif origin is NotRequired:\n            optional.add(key)\n        elif key in native_required:\n            required.add(key)\n        elif key in native_optional:\n            optional.add(key)\n        elif total_required_default:\n            required.add(key)\n        else:\n            optional.add(key)\n    return frozenset(required), frozenset(optional)\n'
+    definition = _reserve_node_at(unit, "_resolve_typeddict_key_sets")
+    expected = ast.parse(expected_source).body[0]
+    if (
+        not isinstance(definition, ast.FunctionDef)
+        or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, definition.name, definition)
+    ):
+        result["failures"].append("payload schema exact-string key owner changed")
+    if not all(_reserve_composer_receiver.imported(unit.tree, name, "typing", name) for name in imports):
+        result["failures"].append("payload schema key typing suppliers changed")
+    if not all(_reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtins):
+        result["failures"].append("payload schema key builtin suppliers changed")
+    if _reserve_protected_supplier_globals(unit, module, result["bindings"]):
+        result["failures"].append("payload schema key supplier global declaration escaped")
+    if result["failures"]:
+        return result
+    # Only same-AST key loads after the complete body's dominating refusal
+    # become scalar. Guard inputs and annotation values retain their origins.
+    # The same exact body fixes fresh builtin sets, every add and projection.
+    loop = next(node for node in definition.body if isinstance(node, ast.For))
+    for statement in loop.body[1:]:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "key":
+                result["origins"][path, id(node)] = ("supplier-scalar", "checked payload schema key")
+    return result
+
+
+def _reserve_sensitive_factory_metadata_receipt(units):
+    """One retaining allocation/return; no callback invocation or JSON grant."""
+    path = "src/elspeth/web/composer/redaction.py"
+    module = "elspeth.web.composer.redaction"
+    result = {
+        "failures": [],
+        "returns": set(),
+        "bindings": {
+            module + ".Sensitive",
+            module + "._SensitiveMarker",
+        },
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("retained Sensitive factory module is absent or duplicated")
+        return result
+    unit = matches[0]
+    expected_bodies = {
+        "_SensitiveMarker": 'class _SensitiveMarker:\n    """Annotated metadata marker (spec §4.2.2).\n\n    Carried inside ``Annotated[T, Sensitive()]`` field declarations. The\n    runtime walker uses ``summarizer`` to replace sensitive values with a\n    deterministic placeholder before the value reaches an external\n    consumer.\n    """\n\n    __slots__ = ("summarizer",)\n\n    def __init__(self, summarizer: Callable[[Any], str] | None = None) -> None:\n        self.summarizer = summarizer\n',
+        "Sensitive": 'def Sensitive(*, summarizer: Callable[[Any], str] | None = None) -> _SensitiveMarker:\n    """Field-level annotation requesting redaction (§4.2.2)."""\n    return _SensitiveMarker(summarizer=summarizer)\n',
+    }
+    definitions = {}
+    for name, expected_source in expected_bodies.items():
+        definition = _reserve_node_at(unit, name)
+        expected = ast.parse(expected_source).body[0]
+        if (
+            not isinstance(definition, (ast.FunctionDef, ast.ClassDef))
+            or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+            or not _reserve_composer_receiver.owned_binding(unit.tree, name, definition)
+        ):
+            result["failures"].append("retained Sensitive factory owner changed " + module + "." + name)
+        else:
+            definitions[name] = definition
+    if not any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.module == "__future__"
+        and statement.level == 0
+        and any(alias.name == "annotations" and alias.asname is None for alias in statement.names)
+        for statement in unit.tree.body
+    ):
+        result["failures"].append("retained Sensitive factory postponed annotations changed")
+    if result["failures"]:
+        return result
+    # The complete factory and plain slots-only class above bind the actual
+    # constructor and the sole return. The existing origin resolver keeps the
+    # returned marker, every attribute and its summarizer as retained metadata.
+    # This does not exempt a call, a caller argument, or a member invocation.
+    returned = definitions["Sensitive"].body[-1]
+    result["returns"].add((path, id(returned)))
+    return result
+
+
+def _reserve_approval_binding_metadata_receipt(units):
+    """Close the actual field/name validation loop, not arbitrary dataclasses.
+
+    Source identities returned here belong to the supplied units. The caller
+    must also enforce the canonical class/reference and supplier effects below.
+    No class annotation, source digest or detached AST grants a receiver.
+    """
+    path = "src/elspeth/web/coordination/approval_authority.py"
+    qualified = "elspeth.web.coordination.approval_authority.ApprovalBinding"
+    imports = {"asdict": "dataclasses", "astuple": "dataclasses", "dataclass": "dataclasses", "fields": "dataclasses", "final": "typing"}
+    builtins = ("zip", "type", "str", "ValueError", "dict", "set", "classmethod")
+    result = {
+        "failures": [],
+        "calls": set(),
+        "origins": {},
+        "uses": set(),
+        "roots": {qualified, *(module + "." + name for name, module in imports.items()), *("builtins." + name for name in builtins)},
+        "bindings": {qualified, *(qualified.rsplit(".", 1)[0] + "." + name for name in (*imports, *builtins))},
+    }
+    matches = [unit for unit in units if unit.path == path]
+    if len(matches) != 1:
+        result["failures"].append("approval field consumer source is missing or duplicated")
+        return result
+    unit = matches[0]
+    cls = _reserve_node_at(unit, "ApprovalBinding")
+    expected = ast.parse(
+        '@final\n@dataclass(frozen=True, slots=True)\nclass ApprovalBinding:\n    config_hash: str\n    canonical_version: str\n    runtime_val_manifest_sha256: str\n    openrouter_catalog_sha256: str\n    binding_generation_fingerprint: str\n    policy_hash: str\n\n    def __post_init__(self) -> None:\n        for field, value in zip(fields(self), astuple(self), strict=True):\n            if type(value) is not str or not value.strip():\n                raise ValueError(f"ApprovalBinding.{field.name} must be a nonblank exact string")\n\n    def as_json(self) -> dict[str, str]:\n        return asdict(self)\n\n    @classmethod\n    def from_json(cls, value: dict[str, str]) -> ApprovalBinding:\n        if type(value) is not dict:\n            raise ValueError("binding_json must be an exact object")\n        names = {field.name for field in fields(cls)}\n        if set(value) != names:\n            raise ValueError("binding_json has missing or unknown keys")\n        return cls(**value)\n'
+    ).body[0]
+    if (
+        not isinstance(cls, ast.ClassDef)
+        or ast.dump(cls, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        or not _reserve_composer_receiver.owned_binding(unit.tree, "ApprovalBinding", cls)
+    ):
+        result["failures"].append("approval field consumer complete class changed")
+        return result
+    if not all(_reserve_composer_receiver.imported(unit.tree, name, module, name) for name, module in imports.items()) or not all(
+        _reserve_composer_receiver.builtin_binding(unit.tree, name) for name in builtins
+    ):
+        result["failures"].append("approval field consumer canonical suppliers changed")
+        return result
+    post_init = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "__post_init__")
+    loop = post_init.body[0]
+    # The whole class above fixes strict=True, the two canonical tuple
+    # producers, sole tuple target, exact-string guard and absence of capture,
+    # rebinding, user callbacks, yield, return or retained field storage.
+    result["calls"].add((path, id(loop.iter)))
+    result["origins"][path, id(loop.iter)] = ("type-fields", "dataclasses.Field")
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id == "field":
+                result["origins"][path, id(node)] = ("type-field", "dataclasses.Field")
+            elif node.id == "value" and node in ast.walk(post_init):
+                # This is the astuple data column, not the fields column.
+                # It is not admitted as str until the unchanged runtime guard.
+                result["origins"][path, id(node)] = ("unknown", "approval value")
+    result["uses"].add((path, id(cls.decorator_list[0])))
+    return result
+
+
+def _reserve_approval_binding_class_use(node, unit, parents, origin_of):
+    """Finite nominal construction/type roles; never class/member recovery."""
+    if _reserve_dataclass_field_class_use(node, unit, parents):
+        return True
+    parent = parents.get(id(node))
+    if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == "from_json" and isinstance(parent.ctx, ast.Load):
+        call = parents.get(id(parent))
+        return isinstance(call, ast.Call) and call.func is parent
+    if (
+        isinstance(parent, ast.Compare)
+        and len(parent.ops) == 1
+        and isinstance(parent.ops[0], (ast.Is, ast.IsNot))
+        and len(parent.comparators) == 1
+    ):
+        other = parent.left if parent.comparators[0] is node else parent.comparators[0]
+        return (
+            isinstance(other, ast.Call)
+            and len(other.args) == 1
+            and not other.keywords
+            and origin_of(other.func, other) == ("object", "builtins.type")
+        )
+    return False
+
+
 def _reserve_selected_origin_effect_failures(
     units,
     extra_roots=frozenset(),
@@ -6662,8 +8430,16 @@ def _reserve_selected_origin_effect_failures(
     validated_sorted_key_uses=frozenset(),
     protected_reflection_candidate_sites=None,
     protected_constructed_classes=frozenset(),
+    validated_local_carrier_calls=frozenset(),
     validated_worker_error_carrier_calls=frozenset(),
     validated_retained_failure_calls=frozenset(),
+    protected_supplier_bindings=frozenset(),
+    immutable_supplier_origins=frozenset(),
+    validated_nonretaining_calls=frozenset(),
+    additional_supplier_roots=frozenset(),
+    validated_supplier_uses=frozenset(),
+    validated_supplier_arguments=frozenset(),
+    validated_immediate_lambdas=frozenset(),
 ):
     """Find source-visible effects on the finite coordinator/dispatch roots.
 
@@ -6671,7 +8447,124 @@ def _reserve_selected_origin_effect_failures(
     yet a certificate for local aliases, reflective access, or all selected
     consumers; unsupported relevant forms remain an explicit NO_GO.
     """
-    receiver_members = receiver_members or {}
+    receiver_members = {owner: set(members) for owner, members in (receiver_members or {}).items()}
+    approval_metadata = (
+        _reserve_approval_binding_metadata_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "calls": set(), "origins": {}, "uses": set(), "roots": set(), "bindings": set()}
+    )
+    payload_schema_keys = (
+        _reserve_payload_schema_key_metadata_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "origins": {}, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(payload_schema_keys["bindings"])
+    status_literals = (
+        _reserve_run_status_literal_metadata_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "origins": {}, "arguments": set(), "uses": set(), "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(status_literals["bindings"])
+    configuration_annotations = (
+        _reserve_configuration_annotation_metadata_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "uses": set(), "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(configuration_annotations["bindings"])
+    plugin_lookup_exception = (
+        _reserve_plugin_lookup_exception_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "exception": None, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(plugin_lookup_exception["bindings"])
+    environment_annotations = (
+        _reserve_environment_annotation_consumer_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "normalizer": None, "origins": {}, "arguments": set(), "returns": set(), "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(environment_annotations["bindings"])
+    validated_supplier_arguments = validated_supplier_arguments | frozenset(environment_annotations["arguments"])
+    event_mapping = (
+        _reserve_run_event_mapping_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "origins": {}, "arguments": set(), "uses": set(), "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(event_mapping["bindings"])
+    validated_supplier_arguments = validated_supplier_arguments | frozenset(event_mapping["arguments"])
+    validated_supplier_uses = validated_supplier_uses | frozenset(event_mapping["uses"])
+    mutation_annotations = (
+        _reserve_mutation_annotation_roles(units)
+        if additional_supplier_roots
+        else {"failures": [], "uses": set(), "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(mutation_annotations["bindings"])
+    validated_supplier_uses = validated_supplier_uses | frozenset(mutation_annotations["uses"])
+    prompt_part_record = (
+        _reserve_prompt_part_enum_record_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "record": None, "fields": {}, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(prompt_part_record["bindings"])
+    capability_primitives = (
+        _reserve_capability_primitive_dependencies(units)
+        if additional_supplier_roots
+        else {"failures": [], "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(capability_primitives["bindings"])
+    prompt_renderer = (
+        _reserve_prompt_renderer_return_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "owner": None, "origins": {}, "returns": set(), "record": None, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(prompt_renderer["bindings"])
+    schema_capability = (
+        _reserve_schema_capability_producer_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "owner": None, "origins": {}, "returns": set(), "record": None, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(schema_capability["bindings"])
+    prompt_arguments = (
+        _reserve_prompt_argument_return_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "owner": None, "returns": set(), "record": None, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(prompt_arguments["bindings"])
+    control_disclosure = (
+        _reserve_control_disclosure_scalar_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "owner": None, "parameters": {}, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(control_disclosure["bindings"])
+    control_options = (
+        _reserve_control_options_role_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "owner": None, "uses": set(), "role": None, "roots": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(control_options["bindings"])
+    validated_supplier_uses = validated_supplier_uses | frozenset(configuration_annotations["uses"])
+    validated_supplier_uses = validated_supplier_uses | frozenset(status_literals["uses"])
+    validated_supplier_arguments = validated_supplier_arguments | frozenset(status_literals["arguments"])
+    sensitive_factory = (
+        _reserve_sensitive_factory_metadata_receipt(units)
+        if additional_supplier_roots
+        else {"failures": [], "returns": set(), "bindings": set()}
+    )
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(sensitive_factory["bindings"])
+    approval_class = "elspeth.web.coordination.approval_authority.ApprovalBinding"
+    if additional_supplier_roots:
+        receiver_members.setdefault(approval_class, set()).update({"__post_init__", "as_json", "from_json"})
+    protected_supplier_bindings = protected_supplier_bindings | frozenset(approval_metadata["bindings"])
+    validated_supplier_uses = validated_supplier_uses | frozenset(approval_metadata["uses"])
+    field_receiver_failures = ()
+    field_receiver_leaves = frozenset()
+    field_receiver_origins = frozenset()
+    field_receiver_stores = frozenset()
+    if "dataclasses.field" in extra_roots:
+        field_receiver_failures, field_receiver_leaves, field_receiver_origins, field_receiver_stores = (
+            _reserve_dataclass_field_receiver_shapes(units, include_fields=bool(additional_supplier_roots))
+        )
+        if field_receiver_failures:
+            field_receiver_stores = frozenset()
     recovery_failures, recovery_store_ids, recovery_global_ids = _reserve_recovery_cell_contract(units)
     recovery_cell_names = {"_APPLICATION_FINALIZER_OWNER", "_INSTANCE_DRAINING"}
     recovery_module = "elspeth.web.async_workers"
@@ -6680,63 +8573,140 @@ def _reserve_selected_origin_effect_failures(
         owner, dot, member = qualified.rpartition(".")
         return bool(dot and (member in receiver_members.get(owner, set()) or qualified in captured_callable_origins))
 
-    selected = {
-        "_thread.RLock",
-        "concurrent.futures.Future",
-        "dataclasses.dataclass",
-        "math.isqrt",
-        "elspeth.contracts.errors.AuditIntegrityError",
-        "elspeth.contracts.session_operation.SessionOperationContext",
-        "builtins.sorted",
-        "builtins.tuple",
-        "builtins.staticmethod",
-        "builtins.getattr",
-        "builtins.type",
-        "builtins.int",
-        "builtins.bool",
-        "builtins.dict",
-        "builtins.float",
-        "builtins.list",
-        "builtins.str",
-        "builtins.enumerate",
-        "builtins.isinstance",
-        "builtins.issubclass",
-        "builtins.object",
-        "builtins.vars",
-        "builtins.globals",
-        "builtins.setattr",
-        "builtins.delattr",
-        "typing.cast",
-        "importlib.import_module",
-        "elspeth.web.required_work.RequiredWorkAuthority",
-        "elspeth.web.required_work.RequiredAuthorityKind",
-        "elspeth.web.required_work.RequiredWorkSource",
-        "elspeth.web.required_work.RequiredWorkSubphase",
-        "elspeth.web.required_work.ComposerRequiredStage",
-        "elspeth.web.required_work.SOURCE_MAPPING",
-        "elspeth.web.required_work._source_for_ordinal",
-        "elspeth.web.required_work._uuid",
-        "elspeth.web.required_work.RequiredWorkKey",
-        "elspeth.web.required_work.RequiredWorkTicket",
-        "elspeth.web.required_work.RequiredWorkCoordinator",
-        "elspeth.web.required_work.make_required_work_key",
-        "elspeth.core.payload_store.FilesystemPayloadStore",
-        "elspeth.engine.orchestrator.authority_guard.CallerAuthorityGuard",
-        "elspeth.web.coordination.lifecycle.SessionOperationLease",
-        "elspeth.web.coordination.repository._SessionOperationAuthorityRepository",
-        "elspeth.web.composer.provider_quota.ProviderInvocationOwner",
-        "elspeth.web.execution_lease_cleanup.ExecutionAcquisitionObligation",
-        "elspeth.web.operator_telemetry_dispatch._owned_method",
-        "elspeth.web.operator_telemetry_dispatch._owned_field",
-        "elspeth.web.operator_telemetry_installation.TelemetryInstallation",
-        "elspeth.web.operator_telemetry_installation.PRODUCTION_TELEMETRY_INSTALLATION",
-        "elspeth.plugins.infrastructure.discovery._canonical_module_name",
-        "elspeth.plugins.infrastructure.discovery._bind_canonical_module_to_parent",
-        "elspeth.plugins.infrastructure.discovery._discover_in_file",
-        "elspeth.plugins.infrastructure.discovery.discover_plugins_in_directory",
-        "elspeth.plugins.infrastructure.discovery.discover_all_plugins",
-        "elspeth.plugins.infrastructure.discovery.PLUGIN_SCAN_CONFIG",
-    } | set(extra_roots)
+    selected = (
+        {
+            "_thread.RLock",
+            "concurrent.futures.Future",
+            "dataclasses.dataclass",
+            "math.isqrt",
+            "elspeth.contracts.errors.AuditIntegrityError",
+            "elspeth.contracts.session_operation.SessionOperationContext",
+            "builtins.sorted",
+            "builtins.tuple",
+            "builtins.staticmethod",
+            "builtins.getattr",
+            "builtins.type",
+            "builtins.int",
+            "builtins.bool",
+            "builtins.dict",
+            "builtins.float",
+            "builtins.list",
+            "builtins.str",
+            "builtins.enumerate",
+            "builtins.isinstance",
+            "builtins.issubclass",
+            "builtins.object",
+            "builtins.vars",
+            "builtins.globals",
+            "builtins.setattr",
+            "builtins.delattr",
+            "typing.cast",
+            "importlib.import_module",
+            "elspeth.web.required_work.RequiredWorkAuthority",
+            "elspeth.web.required_work.RequiredAuthorityKind",
+            "elspeth.web.required_work.RequiredWorkSource",
+            "elspeth.web.required_work.RequiredWorkSubphase",
+            "elspeth.web.required_work.ComposerRequiredStage",
+            "elspeth.web.required_work.SOURCE_MAPPING",
+            "elspeth.web.required_work._source_for_ordinal",
+            "elspeth.web.required_work._uuid",
+            "elspeth.web.required_work.RequiredWorkKey",
+            "elspeth.web.required_work.RequiredWorkTicket",
+            "elspeth.web.required_work.RequiredWorkCoordinator",
+            "elspeth.web.required_work.make_required_work_key",
+            "elspeth.core.payload_store.FilesystemPayloadStore",
+            "elspeth.engine.orchestrator.authority_guard.CallerAuthorityGuard",
+            "elspeth.web.coordination.lifecycle.SessionOperationLease",
+            "elspeth.web.coordination.repository._SessionOperationAuthorityRepository",
+            "elspeth.web.composer.provider_quota.ProviderInvocationOwner",
+            "elspeth.web.execution_lease_cleanup.ExecutionAcquisitionObligation",
+            "elspeth.web.operator_telemetry_dispatch._owned_method",
+            "elspeth.web.operator_telemetry_dispatch._owned_field",
+            "elspeth.web.operator_telemetry_installation.TelemetryInstallation",
+            "elspeth.web.operator_telemetry_installation.PRODUCTION_TELEMETRY_INSTALLATION",
+            "elspeth.plugins.infrastructure.discovery._canonical_module_name",
+            "elspeth.plugins.infrastructure.discovery._bind_canonical_module_to_parent",
+            "elspeth.plugins.infrastructure.discovery._discover_in_file",
+            "elspeth.plugins.infrastructure.discovery.discover_plugins_in_directory",
+            "elspeth.plugins.infrastructure.discovery.discover_all_plugins",
+            "elspeth.plugins.infrastructure.discovery.PLUGIN_SCAN_CONFIG",
+        }
+        | set(extra_roots)
+        | set(field_receiver_origins)
+    )
+    # Mutation dependencies are always protected. A newly selected supplier
+    # also needs an actual non-callee use proof; the old selected cohort keeps
+    # all of its existing rules. No root is removed from selected.
+    # These canonical library bindings are additional denial dependencies of
+    # the finite type-alias/route declaration consumers below. They are not
+    # namespace or returned-instance permissions.
+    supplier_role_dependencies = (
+        {
+            "typing.Callable",
+            "collections.abc.Callable",
+            "collections.abc.Awaitable",
+            "fastapi.APIRouter",
+            "fastapi.routing.APIRouter",
+            "enum.EnumType",
+            "enum.EnumMeta",
+            "enum.ReprEnum",
+            "enum.EnumDict",
+            "enum._EnumDict",
+            "typing.get_args",
+            "typing.get_origin",
+            "typing.get_type_hints",
+            "inspect.get_annotations",
+            "dataclasses.fields",
+            "dataclasses.Field",
+            "typing.Union",
+            "types.UnionType",
+            "typing.TypeAliasType",
+            "typing.Annotated",
+            "builtins.set",
+            "builtins.ValueError",
+            "operator.attrgetter",
+            "operator.methodcaller",
+            "elspeth.contracts.runtime_val_manifest._type_identity",
+            "elspeth.contracts.runtime_val_manifest._typing_special_form_name",
+            "elspeth.contracts.tier_registry.FrameworkBugError",
+            "types.ModuleType",
+            "elspeth.web.plugin_policy.coverage.transform_plugin_has_capability",
+            "elspeth.web.plugin_policy.coverage.node_has_capability",
+            "elspeth.web.plugin_policy.coverage.source_has_capability",
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            "elspeth.plugins.infrastructure.manager.PluginNotFoundError",
+            "elspeth.web.composer.redaction._is_union",
+            "elspeth.web.composer.redaction._has_sensitive",
+            "elspeth.web.composer.redaction._count_sensitive",
+            "builtins.any",
+            "elspeth.web.composer.redaction.TraversalNode",
+            "elspeth.web.composer.redaction._SensitiveMarker",
+            "elspeth.web.composer.redaction.Sensitive",
+            "elspeth.web.composer.redaction._normalise",
+            "elspeth.web.composer.redaction._unwrap_annotated",
+            "elspeth.web.composer.redaction.walk_model_schema",
+            "elspeth.web.composer.redaction._walk_type",
+        }
+        if additional_supplier_roots
+        else set()
+    )
+    supplier_role_dependencies |= approval_metadata["roots"] | payload_schema_keys["roots"] | status_literals["roots"]
+    supplier_role_dependencies |= configuration_annotations["roots"]
+    supplier_role_dependencies |= plugin_lookup_exception["roots"]
+    supplier_role_dependencies |= (
+        environment_annotations["roots"]
+        | event_mapping["roots"]
+        | mutation_annotations["roots"]
+        | prompt_part_record["roots"]
+        | capability_primitives["roots"]
+        | prompt_renderer["roots"]
+        | schema_capability["roots"]
+        | prompt_arguments["roots"]
+        | control_disclosure["roots"]
+        | control_options["roots"]
+    )
+    new_supplier_roots = (set(additional_supplier_roots) | supplier_role_dependencies) - selected
+    selected |= set(additional_supplier_roots) | supplier_role_dependencies
     modules = {}
     for unit in units:
         if not unit.path.startswith("src/") or not unit.path.endswith(".py"):
@@ -6747,7 +8717,292 @@ def _reserve_selected_origin_effect_failures(
         if module in modules:
             return ["selected origin module identity is duplicated " + module]
         modules[module] = unit
-    source_bindings = list(recovery_failures)
+    source_bindings = [
+        *recovery_failures,
+        *field_receiver_failures,
+        *approval_metadata["failures"],
+        *sensitive_factory["failures"],
+        *payload_schema_keys["failures"],
+        *status_literals["failures"],
+        *configuration_annotations["failures"],
+        *plugin_lookup_exception["failures"],
+        *environment_annotations["failures"],
+        *event_mapping["failures"],
+        *mutation_annotations["failures"],
+        *prompt_part_record["failures"],
+        *capability_primitives["failures"],
+        *prompt_renderer["failures"],
+        *schema_capability["failures"],
+        *prompt_arguments["failures"],
+        *control_disclosure["failures"],
+        *control_options["failures"],
+    ]
+    if additional_supplier_roots:
+        source_bindings.extend(_reserve_typing_supplier_mutation_failures(units))
+    metadata_scalar_owners = set()
+    metadata_scalar_parameters = {"_is_union": "origin", "_has_sensitive": "metadata", "_count_sensitive": "metadata"}
+    if additional_supplier_roots:
+        metadata_module = "elspeth.web.composer.redaction"
+        metadata_unit = modules.get(metadata_module)
+        metadata_expected_bodies = {
+            "_is_union": "def _is_union(origin: Any) -> bool:\n    return origin is Union or origin is UnionType\n",
+            "_has_sensitive": "def _has_sensitive(metadata: tuple[Any, ...]) -> bool:\n    return any(isinstance(m, _SensitiveMarker) for m in metadata)\n",
+            "_count_sensitive": "def _count_sensitive(metadata: tuple[Any, ...]) -> int:\n    count = 0\n    for m in metadata:\n        if isinstance(m, _SensitiveMarker):\n            count += 1\n    return count\n",
+            "_SensitiveMarker": 'class _SensitiveMarker:\n    """Annotated metadata marker (spec §4.2.2).\n\n    Carried inside ``Annotated[T, Sensitive()]`` field declarations. The\n    runtime walker uses ``summarizer`` to replace sensitive values with a\n    deterministic placeholder before the value reaches an external\n    consumer.\n    """\n\n    __slots__ = ("summarizer",)\n\n    def __init__(self, summarizer: Callable[[Any], str] | None = None) -> None:\n        self.summarizer = summarizer\n',
+        }
+        metadata_definitions = {}
+        metadata_closed = metadata_unit is not None
+        if metadata_unit is not None:
+            for name, expected_source in metadata_expected_bodies.items():
+                definition = _reserve_node_at(metadata_unit, name)
+                expected = ast.parse(expected_source).body[0]
+                if (
+                    not isinstance(definition, (ast.FunctionDef, ast.ClassDef))
+                    or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+                    or not _reserve_composer_receiver.owned_binding(metadata_unit.tree, name, definition)
+                ):
+                    metadata_closed = False
+                    source_bindings.append("retained metadata scalar owner changed " + metadata_module + "." + name)
+                else:
+                    metadata_definitions[name] = definition
+            metadata_closed = metadata_closed and (
+                _reserve_composer_receiver.imported(metadata_unit.tree, "Union", "typing", "Union")
+                and _reserve_composer_receiver.imported(metadata_unit.tree, "UnionType", "types", "UnionType")
+                and _reserve_composer_receiver.builtin_binding(metadata_unit.tree, "isinstance")
+                and _reserve_composer_receiver.builtin_binding(metadata_unit.tree, "any")
+            )
+        if metadata_closed:
+            # Exact comparison/count bodies return bool/int. Marker metadata and
+            # its summarizer are never invoked, returned, or copied to a caller.
+            metadata_scalar_owners.update(metadata_module + "." + name for name in metadata_scalar_parameters)
+            validated_supplier_uses = validated_supplier_uses | frozenset(
+                (metadata_unit.path, id(node))
+                for node in ast.walk(metadata_definitions["_is_union"])
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in {"Union", "UnionType"}
+            )
+        else:
+            source_bindings.append("retained metadata scalar consumer imports or allocation changed " + metadata_module)
+        protected_supplier_bindings = protected_supplier_bindings | frozenset(
+            metadata_module + "." + name
+            for name in (
+                "Union",
+                "UnionType",
+                "isinstance",
+                "any",
+                "_SensitiveMarker",
+                *metadata_scalar_parameters,
+            )
+        )
+    # These two manifest consumers return checked text or a literal-table name.
+    # They do not classify the recursive normalizers/cache or JSON encoder as
+    # nonretaining. Complete executable syntax and actual supplier bindings are
+    # required before the argument receives this narrow scalar role.
+    if additional_supplier_roots:
+        manifest_module = "elspeth.contracts.runtime_val_manifest"
+        manifest_unit = modules.get(manifest_module)
+        manifest_name_bodies = {
+            "_type_identity": 'def _type_identity(cls: type[object]) -> str:\n    module_name: object = cls.__module__\n    qualname: object = cls.__qualname__\n    if type(module_name) is not str or type(qualname) is not str:\n        raise FrameworkBugError(\n            "Runtime-VAL type identity requires string module and qualname; "\n            f"got module={type(module_name).__name__!r}, qualname={type(qualname).__name__!r}"\n        )\n    return f"{module_name}:{qualname}"\n',
+            "_typing_special_form_name": "def _typing_special_form_name(value: object) -> str | None:\n    for module_name in _TYPING_SPECIAL_FORM_MODULES:\n        module = sys.modules[module_name] if module_name in sys.modules else None\n        if not isinstance(module, ModuleType):\n            continue\n        namespace = vars(module)\n        for special_form_name in _TYPING_SPECIAL_FORM_NAMES:\n            if special_form_name not in namespace:\n                continue\n            if namespace[special_form_name] is value:\n                return special_form_name\n    return None\n",
+        }
+        manifest_name_constants = {
+            "_TYPING_SPECIAL_FORM_MODULES": ("typing", "typing_extensions"),
+            "_TYPING_SPECIAL_FORM_NAMES": ("Annotated", "ClassVar", "Literal", "NotRequired", "ReadOnly", "Required", "Union"),
+        }
+        manifest_names_closed = manifest_unit is not None
+        if manifest_unit is not None:
+            for name, expected_source in manifest_name_bodies.items():
+                definition = _reserve_node_at(manifest_unit, name)
+                expected = ast.parse(expected_source).body[0]
+                if (
+                    not isinstance(definition, ast.FunctionDef)
+                    or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+                    or not _reserve_composer_receiver.owned_binding(manifest_unit.tree, name, definition)
+                ):
+                    manifest_names_closed = False
+                    source_bindings.append("retained manifest scalar owner changed " + manifest_module + "." + name)
+            for name, values in manifest_name_constants.items():
+                declarations = [
+                    statement
+                    for statement in manifest_unit.tree.body
+                    if isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                    and statement.targets[0].id == name
+                ]
+                expected_value = ast.Tuple(elts=[ast.Constant(value=value) for value in values], ctx=ast.Load())
+                stores = [
+                    node
+                    for node in ast.walk(manifest_unit.tree)
+                    if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+                ]
+                redeclarations = [
+                    node
+                    for node in ast.walk(manifest_unit.tree)
+                    if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name)
+                    or (isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names)
+                    or (
+                        isinstance(node, (ast.Import, ast.ImportFrom))
+                        and any((alias.asname or alias.name.split(".", 1)[0]) == name for alias in node.names)
+                    )
+                ]
+                if (
+                    len(declarations) != 1
+                    or len(stores) != 1
+                    or stores[0] is not declarations[0].targets[0]
+                    or redeclarations
+                    or ast.dump(declarations[0].value, include_attributes=False) != ast.dump(expected_value, include_attributes=False)
+                ):
+                    manifest_names_closed = False
+                    source_bindings.append("retained manifest scalar literal table changed " + manifest_module + "." + name)
+            sys_events = []
+            for statement in _reserve_composer_receiver.immediate(manifest_unit.tree):
+                if isinstance(statement, ast.Import):
+                    sys_events.extend(statement for alias in statement.names if (alias.asname or alias.name.split(".", 1)[0]) == "sys")
+                elif isinstance(statement, ast.ImportFrom):
+                    sys_events.extend(statement for alias in statement.names if alias.name == "*" or (alias.asname or alias.name) == "sys")
+                elif (isinstance(statement, ast.Name) and statement.id == "sys" and isinstance(statement.ctx, (ast.Store, ast.Del))) or (
+                    isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == "sys"
+                ):
+                    sys_events.append(statement)
+            manifest_names_closed = manifest_names_closed and (
+                len(sys_events) == 1
+                and isinstance(sys_events[0], ast.Import)
+                and [(alias.name, alias.asname) for alias in sys_events[0].names] == [("sys", None)]
+                and _reserve_composer_receiver.imported(manifest_unit.tree, "ModuleType", "types", "ModuleType")
+                and _reserve_composer_receiver.imported(
+                    manifest_unit.tree, "FrameworkBugError", "elspeth.contracts.tier_registry", "FrameworkBugError"
+                )
+                and all(
+                    _reserve_composer_receiver.builtin_binding(manifest_unit.tree, name) for name in ("type", "str", "isinstance", "vars")
+                )
+            )
+        if manifest_names_closed:
+            metadata_scalar_owners.update(manifest_module + "." + name for name in manifest_name_bodies)
+            metadata_scalar_parameters.update({"_type_identity": "cls", "_typing_special_form_name": "value"})
+        else:
+            source_bindings.append("retained manifest scalar suppliers changed " + manifest_module)
+        protected_supplier_bindings = protected_supplier_bindings | frozenset(
+            manifest_module + "." + name
+            for name in (
+                *manifest_name_bodies,
+                *manifest_name_constants,
+                "sys",
+                "ModuleType",
+                "FrameworkBugError",
+                "type",
+                "str",
+                "isinstance",
+                "vars",
+            )
+        )
+    enum_identity_consumers = {}
+    if additional_supplier_roots:
+        capability_module = "elspeth.web.plugin_policy.coverage"
+        capability_unit = modules.get(capability_module)
+        capability_bodies = {
+            "transform_plugin_has_capability": 'def transform_plugin_has_capability(plugin: str | None, capability: PluginCapability) -> bool:\n    """Resolve a transform capability through the nominal plugin registry."""\n    if plugin is None:\n        return False\n    try:\n        plugin_cls = get_shared_plugin_manager().get_transform_by_name(plugin)\n    except PluginNotFoundError:\n        return False\n    return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)\n',
+            "node_has_capability": "def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:\n    return transform_plugin_has_capability(node.plugin, capability)\n",
+            "source_has_capability": 'def source_has_capability(source: SourceSpec, capability: PluginCapability) -> bool:\n    """Resolve source capabilities through the nominal source registry."""\n    if type(source.plugin) is not str:\n        return False\n    try:\n        plugin_cls = get_shared_plugin_manager().get_source_by_name(source.plugin)\n    except PluginNotFoundError:\n        return False\n    return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)\n',
+        }
+        capability_closed = capability_unit is not None
+        if capability_unit is not None:
+            for name, expected_source in capability_bodies.items():
+                definition = _reserve_node_at(capability_unit, name)
+                expected = ast.parse(expected_source).body[0]
+                if (
+                    not isinstance(definition, ast.FunctionDef)
+                    or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+                    or not _reserve_composer_receiver.owned_binding(capability_unit.tree, name, definition)
+                ):
+                    capability_closed = False
+                    source_bindings.append("retained enum identity consumer changed " + capability_module + "." + name)
+            capability_closed = (
+                capability_closed
+                and all(
+                    _reserve_composer_receiver.imported(capability_unit.tree, name, "elspeth.plugins.infrastructure.manager", name)
+                    for name in ("get_shared_plugin_manager", "PluginNotFoundError")
+                )
+                and all(_reserve_composer_receiver.builtin_binding(capability_unit.tree, name) for name in ("any", "type", "str"))
+            )
+        if capability_closed:
+            enum_identity_consumers.update(
+                {
+                    capability_module + ".transform_plugin_has_capability": "plugin",
+                    capability_module + ".node_has_capability": "node",
+                    capability_module + ".source_has_capability": "source",
+                }
+            )
+        else:
+            source_bindings.append("retained enum identity consumer supplier changed " + capability_module)
+        protected_supplier_bindings = protected_supplier_bindings | frozenset(
+            capability_module + "." + name
+            for name in (
+                *capability_bodies,
+                "get_shared_plugin_manager",
+                "PluginNotFoundError",
+                "any",
+                "type",
+                "str",
+            )
+        )
+    metadata_normalizer_owners = set()
+    metadata_normalizer_return_sites = set()
+    metadata_normalizer_internal_calls = set()
+    if additional_supplier_roots and metadata_unit is not None:
+        metadata_normalizer_bodies = {
+            "_unwrap_annotated": 'def _unwrap_annotated(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:\n    """Strip a single Annotated layer; accumulate metadata.\n\n    Returns the inner type plus the combined metadata. ``Annotated`` may\n    nest (``Annotated[Annotated[X, m1], m2]``) so the caller invokes this\n    in a loop until ``get_origin`` no longer reports ``Annotated``.\n    """\n    if get_origin(field_type) is Annotated:\n        args = get_args(field_type)\n        return args[0], metadata + tuple(args[1:])\n    return field_type, metadata\n',
+            "_normalise": 'def _normalise(field_type: Any, metadata: tuple[Any, ...]) -> tuple[Any, tuple[Any, ...]]:\n    """Expose owned aliases and Annotated metadata without granting scalar trust."""\n    aliases: set[TypeAliasType] = set()\n    while isinstance(field_type, TypeAliasType) or get_origin(field_type) is Annotated:\n        if isinstance(field_type, TypeAliasType):\n            if field_type in aliases:\n                raise ValueError("Recursive redaction type alias cannot be inspected")\n            aliases.add(field_type)\n            field_type = field_type.__value__\n        else:\n            field_type, metadata = _unwrap_annotated(field_type, metadata)\n    return field_type, metadata\n',
+        }
+        metadata_normalizer_definitions = {}
+        normalizers_closed = True
+        for name, expected_source in metadata_normalizer_bodies.items():
+            definition = _reserve_node_at(metadata_unit, name)
+            expected = ast.parse(expected_source).body[0]
+            if (
+                not isinstance(definition, ast.FunctionDef)
+                or ast.dump(definition, include_attributes=False) != ast.dump(expected, include_attributes=False)
+                or not _reserve_composer_receiver.owned_binding(metadata_unit.tree, name, definition)
+            ):
+                source_bindings.append("retained metadata normalizer owner changed " + metadata_module + "." + name)
+                normalizers_closed = False
+            else:
+                metadata_normalizer_definitions[name] = definition
+        normalizer_imports = ("get_origin", "get_args", "Annotated", "TypeAliasType")
+        normalizer_builtins = ("set", "tuple", "isinstance", "ValueError")
+        normalizers_closed = (
+            normalizers_closed
+            and all(_reserve_composer_receiver.imported(metadata_unit.tree, name, "typing", name) for name in normalizer_imports)
+            and all(_reserve_composer_receiver.builtin_binding(metadata_unit.tree, name) for name in normalizer_builtins)
+        )
+        protected_supplier_bindings = protected_supplier_bindings | frozenset(
+            metadata_module + "." + name for name in (*normalizer_imports, *normalizer_builtins, *metadata_normalizer_bodies)
+        )
+        if normalizers_closed:
+            metadata_normalizer_owners.update(metadata_module + "." + name for name in metadata_normalizer_bodies)
+            # Full exact bodies contain only canonical typing queries, tuple/set
+            # bookkeeping and the closed sibling normalizer. Return values remain
+            # metadata at every caller; these are not nonretaining call IDs.
+            for definition in metadata_normalizer_definitions.values():
+                for node in ast.walk(definition):
+                    if isinstance(node, ast.Return):
+                        metadata_normalizer_return_sites.add((metadata_unit.path, id(node)))
+                    if isinstance(node, ast.Call):
+                        metadata_normalizer_internal_calls.add((metadata_unit.path, id(node)))
+        else:
+            source_bindings.append("retained metadata normalizer imports changed " + metadata_module)
+    metadata_retaining_owners = (
+        {
+            "elspeth.web.composer.redaction.TraversalNode": "schema-node",
+            "elspeth.web.composer.redaction._SensitiveMarker": "type-metadata",
+            "elspeth.web.composer.redaction.Sensitive": "type-metadata",
+            "elspeth.web.composer.redaction._normalise": "type-metadata",
+            "elspeth.web.composer.redaction._unwrap_annotated": "type-metadata",
+            "elspeth.web.composer.redaction.walk_model_schema": "schema-nodes",
+            "elspeth.web.composer.redaction._walk_type": "schema-nodes",
+        }
+        if additional_supplier_roots
+        else {}
+    )
     for qualified in sorted(selected):
         if qualified in modules or "." not in qualified:
             continue
@@ -6846,7 +9101,380 @@ def _reserve_selected_origin_effect_failures(
             origin_module for (origin_module, _), binding in bindings.items() if binding[0] == "object" and binding[1] in selected
         }
 
+    def legacy_supplier_type_alias(module, statement):
+        if not additional_supplier_roots or not isinstance(statement, ast.Assign):
+            return False
+        if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+            return False
+        recipes = {
+            (
+                "elspeth.composer_mcp.server",
+                "McpRuntimePreflight",
+            ): "McpRuntimePreflight = Callable[[CompositionState], Awaitable[ValidationResult]]",
+            (
+                "elspeth.web.execution.runtime_preflight",
+                "RuntimePreflightEntry",
+            ): "RuntimePreflightEntry = ValidationResult | RuntimePreflightFailure",
+            (
+                "elspeth.web.execution.runtime_preflight",
+                "RuntimePreflightWorker",
+            ): "RuntimePreflightWorker = Callable[[], Awaitable[ValidationResult]]",
+            (
+                "elspeth.web.composer.discovery_cache",
+                "RuntimePreflightCache",
+            ): "RuntimePreflightCache = dict[RuntimePreflightKey, RuntimePreflightEntry]",
+        }
+        name = statement.targets[0].id
+        expected = recipes.get((module, name))
+        source = modules.get(module)
+        if source is None or expected is None or statement not in source.tree.body:
+            return False
+        if ast.dump(statement, include_attributes=False) != ast.dump(ast.parse(expected).body[0], include_attributes=False):
+            return False
+        requirements = (
+            (
+                ("RuntimePreflightKey", "elspeth.web.execution.runtime_preflight", "RuntimePreflightKey"),
+                ("RuntimePreflightEntry", "elspeth.web.execution.runtime_preflight", "RuntimePreflightEntry"),
+            )
+            if name == "RuntimePreflightCache"
+            else (("ValidationResult", "elspeth.web.execution.schemas", "ValidationResult"),)
+        )
+        if not all(_reserve_composer_receiver.imported(source.tree, binding, owner, member) for binding, owner, member in requirements):
+            return False
+        if name in {"McpRuntimePreflight", "RuntimePreflightWorker"} and not all(
+            _reserve_composer_receiver.imported(source.tree, binding, "collections.abc", binding) for binding in ("Callable", "Awaitable")
+        ):
+            return False
+        if name == "McpRuntimePreflight" and not _reserve_composer_receiver.imported(
+            source.tree, "CompositionState", "elspeth.web.composer.state", "CompositionState"
+        ):
+            return False
+        if name == "RuntimePreflightCache" and not _reserve_composer_receiver.builtin_binding(source.tree, "dict"):
+            return False
+        if name == "RuntimePreflightEntry":
+            failure = _reserve_node_at(source, "RuntimePreflightFailure")
+            expected_failure = ast.parse(
+                "@dataclass(frozen=True, slots=True)\nclass RuntimePreflightFailure:\n    original_exc: Exception\n"
+            ).body[0]
+            if (
+                failure is None
+                or ast.dump(failure, include_attributes=False) != ast.dump(expected_failure, include_attributes=False)
+                or not _reserve_composer_receiver.owned_binding(source.tree, "RuntimePreflightFailure", failure)
+                or not _reserve_composer_receiver.imported(source.tree, "dataclass", "dataclasses", "dataclass")
+            ):
+                return False
+        return True
+
+    def supplier_enum_members(qualified):
+        owner_module, _, name = qualified.rpartition(".")
+        source = modules.get(owner_module)
+        cls = _reserve_node_at(source, name) if source is not None else None
+        if not isinstance(cls, ast.ClassDef) or cls.keywords or cls.decorator_list or len(cls.bases) != 1:
+            return None
+        base = cls.bases[0]
+        if not isinstance(base, ast.Name) or not any(
+            _reserve_composer_receiver.imported(source.tree, base.id, "enum", name) for name in ("Enum", "StrEnum")
+        ):
+            return None
+        if not _reserve_composer_receiver.owned_binding(source.tree, cls.name, cls):
+            return None
+        members = set()
+        for statement in cls.body:
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(statement.value.value) is str:
+                continue
+            if not (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+                and not statement.targets[0].id.startswith("_")
+                and isinstance(statement.value, ast.Constant)
+                and type(statement.value.value) in (str, int)
+            ):
+                return None
+            members.add(statement.targets[0].id)
+        return members or None
+
+    # Denial-only retained identities; never extra authority or namespace grants.
+    supplier_enum_classes = {
+        qualified: members for qualified in new_supplier_roots if (members := supplier_enum_members(qualified)) is not None
+    }
+    supplier_data_classes = {
+        qualified
+        for qualified in new_supplier_roots
+        for owner_module, _, name in [qualified.rpartition(".")]
+        if owner_module in modules and isinstance(_reserve_node_at(modules[owner_module], name), ast.ClassDef)
+    }
+    supplier_enum_record_fields = {}
+    enum_record_owner = "elspeth.contracts.plugin_capabilities.CapabilityDeclaration"
+    if enum_record_owner in new_supplier_roots:
+        owner_module, _, name = enum_record_owner.rpartition(".")
+        source = modules.get(owner_module)
+        cls = _reserve_node_at(source, name) if source is not None else None
+        expected = ast.parse(
+            '@dataclass(frozen=True, slots=True, order=True)\nclass CapabilityDeclaration:\n    capability: PluginCapability\n    control_role: ControlRole | None = None\n    blocks_positive_detection: bool = False\n\n    def __post_init__(self) -> None:\n        if type(self.capability) is not PluginCapability:\n            raise TypeError("capability declaration requires a PluginCapability")\n        if type(self.blocks_positive_detection) is not bool:\n            raise TypeError("capability declaration blocking flag must be a bool")\n        expected_role = {\n            PluginCapability.LLM: None,\n            PluginCapability.PROMPT_SHIELD: ControlRole.INPUT,\n            PluginCapability.CONTENT_SAFETY: ControlRole.OUTPUT,\n        }[self.capability]\n        if self.control_role is not expected_role:\n            raise ValueError("capability declaration has an invalid control role")\n        if self.capability is PluginCapability.LLM and self.blocks_positive_detection:\n            raise ValueError("LLM capability cannot claim control blocking")\n'
+        ).body[0]
+        if not (
+            isinstance(cls, ast.ClassDef)
+            and ast.dump(cls, include_attributes=False) == ast.dump(expected, include_attributes=False)
+            and _reserve_composer_receiver.owned_binding(source.tree, name, cls)
+            and _reserve_composer_receiver.imported(source.tree, "dataclass", "dataclasses", "dataclass")
+            and owner_module + ".PluginCapability" in supplier_enum_classes
+            and owner_module + ".ControlRole" in supplier_enum_classes
+        ):
+            unresolved.append("retained enum carrier constructor/field contract changed " + enum_record_owner)
+        else:
+            supplier_enum_record_fields[enum_record_owner] = {
+                "capability": ("enum-value", owner_module + ".PluginCapability"),
+                "control_role": ("enum-value", owner_module + ".ControlRole"),
+                "blocks_positive_detection": ("supplier-scalar", enum_record_owner),
+            }
+
+    if prompt_part_record["record"] is not None:
+        trust_owner = "elspeth.contracts.prompt_guard.PromptGuardTrust"
+        if trust_owner not in supplier_enum_classes:
+            unresolved.append("prompt part actual trust enum supplier is not closed")
+        else:
+            supplier_enum_record_fields[prompt_part_record["record"]] = prompt_part_record["fields"]
+
+    metadata_selectors = {
+        "__annotations__",
+        "__orig_bases__",
+        "__orig_class__",
+        "model_fields",
+        "__pydantic_fields__",
+        "__dataclass_fields__",
+    }
+
+    def metadata_selector(value):
+        return isinstance(value, ast.Constant) and type(value.value) is str and value.value in metadata_selectors
+
+    retained_supplier_kinds = {
+        "enum-value",
+        "enum-sequence",
+        "enum-record",
+        "enum-record-sequence",
+        "enum-compound",
+        "enum-recovered-class",
+        "enum-metadata",
+        "supplier-recovered-class",
+        "supplier-class-metadata",
+        "framework-router",
+        "framework-routes",
+        "framework-route",
+        "framework-model",
+        "retained-supplier-namespace",
+        "type-metadata",
+        "type-fields",
+        "type-field",
+        "schema-node",
+        "schema-nodes",
+        "metadata-query",
+    }
+
+    metadata_dictionary_origin = ("type-metadata", "fresh annotation dictionary")
+    metadata_dictionary_methods = {("type-metadata", "annotation dictionary " + name) for name in ("items", "keys", "values")}
+
+    def retained_supplier_attribute(origin, attribute):
+        if origin is None:
+            return None
+        kind, qualified = origin
+        if kind in {"schema-node", "schema-nodes"}:
+            # Even frozen nodes retain live metadata and callbacks. No field,
+            # including a provider closure, is granted scalar trust by its name.
+            return ("type-metadata", qualified)
+        if kind == "type-field":
+            if attribute in {"name", "init", "repr", "compare", "hash", "kw_only"}:
+                return ("supplier-scalar", qualified)
+            return ("type-metadata", qualified)
+        if kind == "type-metadata":
+            if origin == metadata_dictionary_origin and attribute in {"items", "keys", "values"}:
+                return ("type-metadata", "annotation dictionary " + attribute)
+            # Attribute access on the fresh dictionary or a bound view method
+            # cannot retain its nominal-dictionary marker. Contents/metadata
+            # remain live, including a view's underlying mapping and callbacks.
+            if origin == metadata_dictionary_origin or origin in metadata_dictionary_methods:
+                return ("type-metadata", "retained annotation/type metadata")
+            # Mixed annotation metadata can include arbitrary marker objects;
+            # attribute spelling alone cannot prove a scalar value. The exact
+            # _type_identity consumer checks str before discarding this origin.
+            return origin
+        if kind == "type-fields":
+            return ("type-metadata", qualified)
+        if kind == "object" and attribute in supplier_enum_classes.get(qualified, ()):
+            return ("enum-value", qualified)
+        if kind == "supplier-data-instance":
+            if qualified == approval_class and protected_receiver_method(qualified + "." + attribute):
+                return ("member", qualified + "." + attribute)
+            if attribute == "__class__":
+                return ("supplier-recovered-class", qualified)
+            if attribute in {"__dataclass_fields__", "__annotations__", "model_fields"}:
+                return ("supplier-class-metadata", qualified)
+            return None
+        if kind == "supplier-recovered-class":
+            if attribute in {"__name__", "__qualname__", "__module__"}:
+                return ("supplier-scalar", qualified)
+            return ("supplier-class-metadata", qualified)
+        if kind == "supplier-class-metadata":
+            return origin
+        if kind == "enum-record":
+            if attribute in supplier_enum_record_fields[qualified]:
+                return supplier_enum_record_fields[qualified][attribute]
+            if attribute == "__class__":
+                return ("enum-recovered-class", qualified)
+            return ("enum-metadata", qualified)
+        if kind == "enum-value":
+            if attribute in {"name", "value"}:
+                return ("supplier-scalar", qualified)
+            if attribute == "__class__":
+                return ("enum-recovered-class", qualified)
+            return ("enum-metadata", qualified)
+        if kind == "framework-router":
+            return ("framework-routes", qualified) if attribute == "routes" else None
+        if kind == "framework-route" and attribute == "response_model":
+            return ("framework-model", qualified)
+        if kind in {"enum-recovered-class", "framework-model"} and attribute in {"__name__", "__qualname__", "__module__"}:
+            return ("supplier-scalar", qualified)
+        if kind in retained_supplier_kinds:
+            if attribute == "__dict__":
+                return ("retained-supplier-namespace", qualified)
+            return ("framework-model" if kind.startswith("framework-") else "enum-metadata", qualified)
+        return None
+
+    def retained_supplier_subscript(origin):
+        if origin is None:
+            return None
+        kind, qualified = origin
+        if kind == "schema-nodes":
+            return ("schema-node", qualified)
+        if kind == "schema-node":
+            return ("type-metadata", qualified)
+        if kind == "type-fields":
+            return ("type-field", qualified)
+        if kind == "type-metadata":
+            if origin == metadata_dictionary_origin or origin in metadata_dictionary_methods:
+                return ("type-metadata", "retained annotation/type metadata")
+            return origin
+        if kind == "enum-sequence":
+            return ("enum-value", qualified)
+        if kind == "enum-record-sequence":
+            return ("enum-record", qualified)
+        if kind == "framework-routes":
+            return ("framework-route", qualified)
+        return origin if kind in retained_supplier_kinds else None
+
+    def retained_supplier_container(origins):
+        origins = tuple(origins)
+        metadata = [
+            origin
+            for origin in origins
+            if origin is not None
+            and origin[0]
+            in {
+                "enum-recovered-class",
+                "enum-metadata",
+                "supplier-recovered-class",
+                "supplier-class-metadata",
+                "framework-router",
+                "framework-routes",
+                "framework-route",
+                "framework-model",
+                "retained-supplier-namespace",
+                "type-metadata",
+                "type-fields",
+                "type-field",
+                "schema-node",
+                "schema-nodes",
+                "metadata-query",
+            }
+        ]
+        if metadata:
+            # A container does not freeze or discard its retained leaves. Both
+            # dictionary keys and values reach this function in both resolvers.
+            return ("type-metadata", "retained supplier container")
+        retained = [
+            origin
+            for origin in origins
+            if origin is not None
+            and origin[0]
+            in {
+                "enum-value",
+                "enum-sequence",
+                "enum-record",
+                "enum-record-sequence",
+            }
+        ]
+        if not retained:
+            return None
+        owner = retained[0][1]
+        if any(origin[1] != owner for origin in retained):
+            return ("enum-metadata", "<mixed retained enum values>")
+        return ("enum-record-sequence" if retained[0][0] in {"enum-record", "enum-record-sequence"} else "enum-sequence", owner)
+
     def expression(module, value):
+        if additional_supplier_roots and isinstance(value, ast.Subscript) and metadata_selector(value.slice):
+            return ("type-metadata", "retained metadata namespace key")
+        if module in modules:
+            retained_capability = schema_capability["origins"].get((modules[module].path, id(value)))
+            if retained_capability is not None:
+                return retained_capability
+        if (
+            isinstance(value, ast.Call)
+            and control_disclosure["owner"] is not None
+            and expression(module, value.func) == ("object", control_disclosure["owner"])
+        ):
+            return ("supplier-scalar", control_disclosure["owner"])
+        if (
+            isinstance(value, ast.Call)
+            and prompt_arguments["owner"] is not None
+            and expression(module, value.func) == ("object", prompt_arguments["owner"])
+        ):
+            return ("enum-record-sequence", prompt_arguments["record"])
+        if (
+            isinstance(value, ast.Call)
+            and schema_capability["owner"] is not None
+            and expression(module, value.func) == ("object", schema_capability["owner"])
+        ):
+            return ("enum-record", schema_capability["record"])
+        if module in modules:
+            retained_prompt = prompt_renderer["origins"].get((modules[module].path, id(value)))
+            if retained_prompt is not None:
+                return retained_prompt
+        if (
+            isinstance(value, ast.Call)
+            and prompt_renderer["owner"] is not None
+            and expression(module, value.func) == ("object", prompt_renderer["owner"])
+        ):
+            return ("enum-record-sequence", prompt_renderer["record"])
+        if isinstance(value, ast.Call) and module in modules and (modules[module].path, id(value)) in validated_nonretaining_calls:
+            return None
+        if (
+            isinstance(value, ast.Call)
+            and environment_annotations["normalizer"] is not None
+            and expression(module, value.func) == ("object", environment_annotations["normalizer"])
+        ):
+            return ("type-metadata", "retained environment annotation types")
+        if legacy_supplier_type_alias(module, value):
+            qualified = module + "." + value.targets[0].id
+            selected.add(qualified)
+            return ("lazy-type", qualified)
+        if isinstance(value, ast.TypeAlias) and isinstance(value.name, ast.Name):
+            for child in ast.walk(value.value):
+                if not isinstance(child, (ast.Name, ast.Attribute)):
+                    continue
+                origin = expression(module, child)
+                if origin is not None and (
+                    origin[0] == "lazy-type"
+                    or (
+                        origin[0] in {"object", "pure"}
+                        and origin[1] in new_supplier_roots
+                        and origin[1] not in immutable_supplier_origins
+                        and not origin[1].startswith("builtins.")
+                    )
+                ):
+                    qualified = module + "." + value.name.id
+                    selected.add(qualified)
+                    return ("lazy-type", qualified)
+            return None
         if isinstance(value, ast.Name):
             existing = bindings.get((module, value.id))
             if existing is not None:
@@ -6857,24 +9485,141 @@ def _reserve_selected_origin_effect_failures(
             return ("object", builtin) if builtin in selected else None
         if isinstance(value, ast.Subscript):
             owner = expression(module, value.value)
+            retained = retained_supplier_subscript(owner)
+            if retained is not None:
+                return retained
             if owner == ("object", "elspeth.plugins.infrastructure.discovery.PLUGIN_SCAN_CONFIG"):
                 return ("config-entry", owner[1])
             return None
         if isinstance(value, ast.Attribute):
+            if additional_supplier_roots and value.attr in metadata_selectors:
+                return ("type-metadata", "retained annotation/type metadata")
             base = expression(module, value.value)
             if base is None:
                 return None
+            retained = retained_supplier_attribute(base, value.attr)
+            if retained is not None:
+                return retained
             kind, qualified = base
             target = qualified + "." + value.attr
             if kind == "module" and target in modules:
                 return ("module", target)
             if kind == "module" and target == "importlib.import_module":
                 return ("loader", target)
+            if kind == "module" and bindings.get((qualified, value.attr), (None, None))[0] in {"lazy-type", *retained_supplier_kinds}:
+                return bindings[qualified, value.attr]
             if kind == "module" and target in selected:
                 return ("object", target)
             if kind == "object":
                 return ("member", target)
             return None
+        if isinstance(value, ast.Call):
+            callable_origin = expression(module, value.func)
+            if callable_origin is not None and callable_origin[0] == "metadata-query":
+                return ("type-metadata", "retained metadata query result")
+            if (
+                additional_supplier_roots
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr in {"get", "pop", "__getitem__"}
+                and value.args
+                and metadata_selector(value.args[0])
+            ):
+                return ("type-metadata", "retained metadata namespace query")
+            if (
+                callable_origin == ("object", "operator.attrgetter")
+                and len(value.args) == 1
+                and not value.keywords
+                and metadata_selector(value.args[0])
+            ):
+                return ("metadata-query", "operator.attrgetter")
+            if (
+                callable_origin == ("object", "operator.methodcaller")
+                and len(value.args) == 2
+                and not value.keywords
+                and isinstance(value.args[0], ast.Constant)
+                and value.args[0].value == "__getattribute__"
+                and metadata_selector(value.args[1])
+            ):
+                return ("metadata-query", "operator.methodcaller")
+            if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in metadata_retaining_owners:
+                return (metadata_retaining_owners[callable_origin[1]], callable_origin[1])
+            if (
+                callable_origin is not None
+                and callable_origin[0] == "object"
+                and callable_origin[1] in metadata_scalar_owners
+                and (
+                    (len(value.args) == 1 and not value.keywords)
+                    or (
+                        not value.args
+                        and len(value.keywords) == 1
+                        and value.keywords[0].arg == metadata_scalar_parameters[callable_origin[1].rsplit(".", 1)[-1]]
+                    )
+                )
+            ):
+                return None
+            if (
+                additional_supplier_roots
+                and callable_origin in {("object", "typing.get_type_hints"), ("object", "inspect.get_annotations")}
+                and value.args
+            ):
+                # Both canonical owners return a fresh builtin dict on success;
+                # keys and values retain their original annotation identities.
+                return metadata_dictionary_origin
+            if (
+                callable_origin in metadata_dictionary_methods
+                and isinstance(value.func, ast.Attribute)
+                and expression(module, value.func.value) == metadata_dictionary_origin
+                and not value.args
+                and not value.keywords
+            ):
+                return ("type-metadata", "retained annotation/type metadata")
+            if (
+                additional_supplier_roots
+                and callable_origin == ("object", "dataclasses.fields")
+                and len(value.args) == 1
+                and not value.keywords
+            ):
+                return ("type-fields", "dataclasses.Field")
+            if (
+                callable_origin in {("object", "typing.get_args"), ("object", "typing.get_origin")}
+                and len(value.args) == 1
+                and not value.keywords
+            ):
+                argument = expression(module, value.args[0])
+                if argument is not None and argument[0] in {"type-metadata", "type-field", "lazy-type"}:
+                    return ("type-metadata", "retained annotation/type metadata")
+            if callable_origin in {("object", "fastapi.APIRouter"), ("object", "fastapi.routing.APIRouter")}:
+                return ("framework-router", callable_origin[1])
+            if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_enum_classes:
+                return ("enum-value", callable_origin[1])
+            if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_enum_record_fields:
+                return ("enum-record", callable_origin[1])
+            if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_data_classes:
+                return ("supplier-data-instance", callable_origin[1])
+            if (
+                callable_origin
+                in {
+                    ("object", "builtins.tuple"),
+                    ("object", "builtins.list"),
+                    ("object", "builtins.set"),
+                    ("object", "builtins.frozenset"),
+                }
+                and len(value.args) == 1
+                and not value.keywords
+            ):
+                target = expression(module, value.args[0])
+                if target is not None and target[0] == "object" and target[1] in supplier_enum_classes:
+                    return ("enum-sequence", target[1])
+                if target is not None and target[0] in {"enum-sequence", "enum-record-sequence"}:
+                    return target
+            if callable_origin == ("object", "builtins.type") and len(value.args) == 1 and not value.keywords:
+                target = expression(module, value.args[0])
+                if target is not None and target[0] in {"enum-value", "enum-record"}:
+                    return ("enum-recovered-class", target[1])
+                if target is not None and target[0] == "supplier-data-instance":
+                    return ("supplier-recovered-class", target[1])
+                if target is not None and target[0] in {"type-metadata", "type-field", "type-fields"}:
+                    return ("type-metadata", target[1])
         if isinstance(value, ast.Call) and expression(module, value.func) == ("loader", "importlib.import_module"):
             if len(value.args) == 1 and not value.keywords and isinstance(value.args[0], ast.Constant):
                 target = value.args[0].value
@@ -6883,6 +9628,14 @@ def _reserve_selected_origin_effect_failures(
                         ("module", target) if target in modules or target in selected_module_names() | {"builtins", "importlib"} else None
                     )
             return ("unknown-module", "importlib.import_module")
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+            retained = retained_supplier_container(
+                expression(module, child)
+                for child in ([*value.keys, *value.values] if isinstance(value, ast.Dict) else value.elts)
+                if child is not None
+            )
+            if retained is not None:
+                return retained
         captured = (
             value.elts
             if isinstance(value, (ast.Tuple, ast.List, ast.Set))
@@ -6894,7 +9647,12 @@ def _reserve_selected_origin_effect_failures(
             (origin := expression(module, child)) is not None
             and (
                 (origin[0] == "module" and origin[1] in selected_module_names())
-                or (origin[0] == "object" and origin[1] in selected and not origin[1].startswith("builtins."))
+                or (
+                    origin[0] == "object"
+                    and origin[1] in selected
+                    and origin[1] not in immutable_supplier_origins
+                    and not origin[1].startswith("builtins.")
+                )
                 or origin[1] == "protected-carrier"
             )
             for child in captured
@@ -6928,9 +9686,12 @@ def _reserve_selected_origin_effect_failures(
                     imports.append((module, alias.asname or alias.name, target, alias.name))
             elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 local_bound.add(node.targets[0].id)
-                aliases.append((module, node.targets[0].id, node.value))
+                aliases.append((module, node.targets[0].id, node if legacy_supplier_type_alias(module, node) else node.value))
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 local_bound.add(node.name)
+            elif isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
+                local_bound.add(node.name.id)
+                aliases.append((module, node.name.id, node))
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                 local_bound.add(node.target.id)
                 if node.value is not None:
@@ -6948,11 +9709,15 @@ def _reserve_selected_origin_effect_failures(
             )
             if found is not None and bindings.get((module, bound)) != found:
                 bindings[module, bound] = found
+                if found[0] == "lazy-type":
+                    selected.add(module + "." + bound)
                 changed = True
         for module, bound, value in aliases:
             found = expression(module, value)
             if found is not None and bindings.get((module, bound)) != found:
                 bindings[module, bound] = found
+                if found[0] == "lazy-type":
+                    selected.add(module + "." + bound)
                 changed = True
         if not changed:
             break
@@ -6982,6 +9747,15 @@ def _reserve_selected_origin_effect_failures(
     ):
         unresolved.append("selected telemetry installation singleton lacks exact owned constructor")
 
+    # Implicit builtin dependencies have no imported-binding row. A nested
+    # global declaration can still replace that module lookup, so scan the
+    # exact protected binding cohort independently of inferred origins.
+    for owner_module, owner_unit in modules.items():
+        for node, bound in _reserve_protected_supplier_globals(owner_unit, owner_module, protected_supplier_bindings):
+            reviewed_recovery_global = owner_module == recovery_module and bound in recovery_cell_names and id(node) in recovery_global_ids
+            if not reviewed_recovery_global:
+                unresolved.append("protected supplier global binding escaped " + owner_module + ":" + bound)
+
     for (owner_module, bound), origin in bindings.items():
         owner_unit = modules.get(owner_module)
         if origin[0] == "module" and origin[1] in modules:
@@ -6989,8 +9763,13 @@ def _reserve_selected_origin_effect_failures(
             # package loader, not by a source-level parent assignment.
             continue
         if owner_unit is None or not (
-            (origin[0] == "object" and origin[1] in selected)
+            (origin[0] in {"object", "lazy-type"} and origin[1] in selected)
+            or (
+                (bool(field_receiver_origins) or _reserve_AUDIT_EVIDENCE_SINK in captured_callable_origins)
+                and origin == ("pure", "typing.cast")
+            )
             or (origin == ("instance", singleton_owner))
+            or origin[0] in retained_supplier_kinds
             or (origin[0] == "module" and origin[1] in selected_module_names())
         ):
             continue
@@ -7001,8 +9780,14 @@ def _reserve_selected_origin_effect_failures(
                 (isinstance(node, ast.Import) and any((alias.asname or alias.name.partition(".")[0]) == bound for alias in node.names))
                 or (isinstance(node, ast.ImportFrom) and any((alias.asname or alias.name) == bound for alias in node.names))
                 or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == bound)
+                or (isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name) and node.name.id == bound)
                 or (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == bound for target in node.targets))
-                or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == bound)
+                or (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                    and node.target.id == bound
+                    and (node.value is not None or origin != ("object", "dataclasses.field"))
+                )
             )
         ]
         normal_package_imports = (
@@ -7024,10 +9809,58 @@ def _reserve_selected_origin_effect_failures(
                 if isinstance(events[0], ast.Assign)
                 else [events[0].target]
                 if isinstance(events[0], ast.AnnAssign)
+                else [events[0].name]
+                if isinstance(events[0], ast.TypeAlias)
                 else []
             )
             if isinstance(target, ast.Name) and target.id == bound
         }
+        local_supplier_stores = _reserve_dataclass_field_local_stores(owner_unit, bound, origin)
+        if (
+            origin[0] in retained_supplier_kinds
+            and isinstance(events[0], (ast.Assign, ast.AnnAssign))
+            and owner_module + "." + bound not in selected
+            and owner_module + "." + bound not in protected_supplier_bindings
+        ):
+            # Deleting a direct module-local derived metadata alias discards a
+            # name; it does not mutate the imported/canonical supplier. Keep
+            # its conservative origin in bindings so prior/later source effects
+            # and aliases are still scanned. Import/TypeAlias/owned definitions
+            # and all reassignments retain the original refusal.
+            local_supplier_stores = {
+                *local_supplier_stores,
+                *(
+                    id(target)
+                    for statement in owner_unit.tree.body
+                    if isinstance(statement, ast.Delete)
+                    for target in statement.targets
+                    if isinstance(target, ast.Name) and target.id == bound
+                ),
+            }
+        # The existing HTTP wire member is a class-local slot, not a store to
+        # the module's imported json supplier. Admit this exact declaration;
+        # decorators, annotation expressions and every effect remain scanned.
+        if origin == ("module", "json") and bound == "json" and owner_module == "elspeth.contracts.call_data":
+            cls = _reserve_node_at(owner_unit, "HTTPCallRequest")
+            expected_decorator = ast.parse("dataclass(frozen=True, slots=True)", mode="eval").body
+            expected_field = ast.parse("json: Mapping[str, Any] | None = None").body[0]
+            if (
+                isinstance(cls, ast.ClassDef)
+                and not cls.bases
+                and not cls.keywords
+                and len(cls.decorator_list) == 1
+                and ast.dump(cls.decorator_list[0], include_attributes=False) == ast.dump(expected_decorator, include_attributes=False)
+                and _reserve_composer_receiver.owned_binding(owner_unit.tree, "HTTPCallRequest", cls)
+                and _reserve_composer_receiver.imported(owner_unit.tree, "dataclass", "dataclasses", "dataclass")
+                and not any(isinstance(child, (ast.Global, ast.Nonlocal)) and bound in child.names for child in ast.walk(cls))
+            ):
+                fields = [
+                    statement
+                    for statement in cls.body
+                    if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == bound
+                ]
+                if len(fields) == 1 and ast.dump(fields[0], include_attributes=False) == ast.dump(expected_field, include_attributes=False):
+                    local_supplier_stores = {*local_supplier_stores, id(fields[0].target)}
         for node in ast.walk(owner_unit.tree):
             if isinstance(node, (ast.Global, ast.Nonlocal)) and bound in node.names:
                 reviewed_recovery_global = (
@@ -7045,10 +9878,15 @@ def _reserve_selected_origin_effect_failures(
                     and isinstance(node.ctx, ast.Store)
                     and id(node) in recovery_store_ids
                 )
-                if id(node) not in canonical_stores and not reviewed_recovery_store:
+                if id(node) not in canonical_stores and not reviewed_recovery_store and id(node) not in local_supplier_stores:
                     unresolved.append("selected imported binding rebound " + owner_module + ":" + bound)
 
     selected_modules = selected_module_names()
+    supplier_type_alias_bindings = {(owner_module, bound) for (owner_module, bound), origin in bindings.items() if origin[0] == "lazy-type"}
+    supplier_type_alias_modules = {owner_module for owner_module, _ in supplier_type_alias_bindings}
+    retained_supplier_bindings = {key: origin for key, origin in bindings.items() if origin[0] in retained_supplier_kinds}
+    retained_supplier_modules = {owner_module for owner_module, _ in retained_supplier_bindings}
+    protected_attribute_names |= {q.rsplit(".", 1)[-1] for q in selected if q not in modules and "." in q}
     plugin_call_edges = {
         "elspeth.plugins.infrastructure.discovery._canonical_module_name": (
             "src/elspeth/plugins/infrastructure/discovery.py",
@@ -7101,6 +9939,14 @@ def _reserve_selected_origin_effect_failures(
                 parent, field = parent_fields[id(current)]
                 if isinstance(parent, ast.TypeAlias) and field in {"value", "type_params"}:
                     return "lazy_alias"
+                if isinstance(parent, ast.AnnAssign) and field == "annotation":
+                    owner = parent
+                    while id(owner) in parent_fields:
+                        owner, _ = parent_fields[id(owner)]
+                        if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                            return "unevaluated_local_annotation"
+                        if isinstance(owner, (ast.ClassDef, ast.Module)):
+                            break
                 if postponed_annotations and (
                     (isinstance(parent, (ast.arg, ast.AnnAssign)) and field == "annotation")
                     or (isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "returns")
@@ -7191,8 +10037,14 @@ def _reserve_selected_origin_effect_failures(
                 ancestor = branch
             return False
 
+        field_local_bindings = {
+            bound: _reserve_dataclass_field_local_bindings(unit, bound, origin)
+            for (owner_module, bound), origin in bindings.items()
+            if owner_module == module and origin == ("object", "dataclasses.field")
+        }
+
         @cache
-        def scope_producers(scope):
+        def scope_producers(scope, *, field_local_bindings=field_local_bindings):
             by_name = {}
             for statement in scope.body:
                 direct = {}
@@ -7222,14 +10074,246 @@ def _reserve_selected_origin_effect_failures(
                         isinstance(child, ast.Name)
                         and isinstance(child.ctx, (ast.Store, ast.Del))
                         and id(child) not in direct_target_ids
+                        and field_local_bindings.get(child.id, {}).get(id(child), id(scope)) == id(scope)
                         and None not in by_name.get(child.id, ())
                     ):
                         by_name.setdefault(child.id, []).append(None)
             return by_name
 
+        retained_iteration_stores = {}
+        for retained_store in ast.walk(unit.tree):
+            if isinstance(retained_store, ast.Name) and isinstance(retained_store.ctx, (ast.Store, ast.Del)):
+                retained_scopes = _reserve_dataclass_field_read_scopes(retained_store, retained_store.id, parents)
+                retained_scope = next(retained_scopes, None)
+                if retained_scope is None:
+                    retained_scope = _lexical_scope(retained_store)
+                retained_iteration_stores.setdefault((id(retained_scope), retained_store.id), []).append(retained_store)
+
+        def retained_iteration_element(origin):
+            if origin is not None and origin[0] == "enum-compound":
+                # Unknown nested retention remains unknown; this grants no
+                # element class or field access, only a transfer refusal tag.
+                return origin
+            if origin is not None and origin[0] == "schema-nodes":
+                return ("schema-node", origin[1])
+            if origin is not None and origin[0] == "schema-node":
+                return ("type-metadata", origin[1])
+            if origin is not None and origin[0] == "type-fields":
+                return ("type-field", origin[1])
+            if origin is not None and origin[0] == "type-metadata":
+                if origin == metadata_dictionary_origin or origin in metadata_dictionary_methods:
+                    return ("type-metadata", "retained annotation/type metadata")
+                return origin
+            if origin is not None and origin[0] == "object" and origin[1] in supplier_enum_classes:
+                return ("enum-value", origin[1])
+            if origin is not None and origin[0] == "enum-sequence":
+                return ("enum-value", origin[1])
+            if origin is not None and origin[0] == "enum-record-sequence":
+                return ("enum-record", origin[1])
+            return None
+
+        def retained_iteration_targets(target):
+            # Unpacking retains each component; no positional scalar inference.
+            # Repeated names, starred targets and attribute writes stay refused.
+            if isinstance(target, ast.Name) and isinstance(target.ctx, ast.Store):
+                return (target,)
+            if isinstance(target, (ast.Tuple, ast.List)) and target.elts:
+                children = [retained_iteration_targets(child) for child in target.elts]
+                if any(child is None for child in children):
+                    return None
+                leaves = tuple(leaf for child in children for leaf in child)
+                if len({leaf.id for leaf in leaves}) != len(leaves):
+                    return None
+                return leaves
+            return None
+
+        def retained_iteration_binding(
+            value,
+            use,
+            seen,
+            *,
+            parents=parents,
+            unit=unit,
+            retained_iteration_stores=retained_iteration_stores,
+            retained_iteration_targets=retained_iteration_targets,
+        ):
+            scopes = list(_reserve_dataclass_field_read_scopes(value, value.id, parents))
+            scopes.append(unit.tree)
+            for scope in scopes:
+                key = (id(scope), value.id)
+                if key in seen:
+                    return None
+                if isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    generators = [
+                        generator
+                        for generator in scope.generators
+                        if (targets := retained_iteration_targets(generator.target)) is not None
+                        and any(target.id == value.id for target in targets)
+                    ]
+                    if len(generators) != 1:
+                        return None
+                    return retained_iteration_element(scoped_expression(generators[0].iter, generators[0].iter, seen | {key}))
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    parameters = [arg.arg for arg in (*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs)]
+                    if scope.args.vararg:
+                        parameters.append(scope.args.vararg.arg)
+                    if scope.args.kwarg:
+                        parameters.append(scope.args.kwarg.arg)
+                    if value.id in parameters:
+                        return None
+                if isinstance(scope, ast.Lambda):
+                    if _reserve_named_stores(scope, value.id):
+                        return None
+                    continue
+                stores = retained_iteration_stores.get((id(scope), value.id), ())
+                if not stores:
+                    continue
+                if len(stores) != 1:
+                    return None
+                target = stores[0]
+                loop = parents.get(id(target))
+                while isinstance(loop, (ast.Tuple, ast.List)):
+                    target = loop
+                    loop = parents.get(id(loop))
+                if not (isinstance(loop, ast.For) and loop.target is target and value not in ast.walk(loop.iter)):
+                    return None
+                targets = retained_iteration_targets(loop.target)
+                if targets is None or stores[0] not in targets:
+                    return None
+                return retained_iteration_element(scoped_expression(loop.iter, loop.iter, seen | {key}))
+            return None
+
+        retained_destructure_assignments = {}
+        for retained_assignment in ast.walk(unit.tree):
+            if not isinstance(retained_assignment, ast.Assign):
+                continue
+            for retained_target in retained_assignment.targets:
+                if not isinstance(retained_target, (ast.Tuple, ast.List)):
+                    continue
+                for retained_leaf in ast.walk(retained_target):
+                    if not isinstance(retained_leaf, ast.Name):
+                        continue
+                    scopes = _reserve_dataclass_field_read_scopes(retained_leaf, retained_leaf.id, parents)
+                    scope = next(scopes, None)
+                    if scope is None:
+                        scope = _lexical_scope(retained_leaf)
+                    retained_destructure_assignments.setdefault((id(scope), retained_leaf.id), []).append(retained_assignment)
+
+        def retained_destructure_binding(
+            value, use, seen, *, parents=parents, unit=unit, retained_destructure_assignments=retained_destructure_assignments
+        ):
+            scopes = list(_reserve_dataclass_field_read_scopes(value, value.id, parents))
+            scopes.append(unit.tree)
+            for scope in scopes:
+                key = (id(scope), value.id)
+                if key in seen:
+                    return None
+                assignments = retained_destructure_assignments.get(key, ())
+                for assignment in assignments:
+                    origin = scoped_expression(assignment.value, assignment, seen | {key})
+                    if origin is not None and origin[0] in retained_supplier_kinds:
+                        # Every component is conservatively retained; no positional
+                        # type/name inference or equal-value identity substitution.
+                        return ("type-metadata", "retained destructured metadata")
+                if isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    # read_scopes yields a comprehension only for its own target
+                    # binding, never for the first iterable. The separate retained
+                    # iteration owner resolves that target; it is not an outer
+                    # destructured binding and has no statement body.
+                    return None
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    parameters = (*scope.args.posonlyargs, *scope.args.args, *scope.args.kwonlyargs)
+                    if (
+                        any(argument.arg == value.id for argument in parameters)
+                        or (scope.args.vararg is not None and scope.args.vararg.arg == value.id)
+                        or (scope.args.kwarg is not None and scope.args.kwarg.arg == value.id)
+                    ):
+                        return None
+                if isinstance(scope, ast.Lambda):
+                    # Lambda bodies are expressions. A walrus binds locally;
+                    # otherwise the existing enclosing lexical scope remains
+                    # responsible for this free name.
+                    if _reserve_named_stores(scope, value.id):
+                        return None
+                    continue
+                if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return None
+                if scope_producers(scope).get(value.id, ()):
+                    return None
+            return None
+
         @cache
         def scoped_expression(value, use, seen=frozenset(), module=module, unit=unit, parents=parents):
+            retained_capability = schema_capability["origins"].get((unit.path, id(value)))
+            if retained_capability is not None:
+                return retained_capability
+            retained_prompt = prompt_renderer["origins"].get((unit.path, id(value)))
+            if retained_prompt is not None:
+                return retained_prompt
+            event_origin = event_mapping["origins"].get((unit.path, id(value)))
+            if event_origin is not None:
+                return event_origin
+            environment_origin = environment_annotations["origins"].get((unit.path, id(value)))
+            if environment_origin is not None:
+                return environment_origin
+            checked_status_origin = status_literals["origins"].get((unit.path, id(value)))
+            if checked_status_origin is not None:
+                return checked_status_origin
+            checked_key_origin = payload_schema_keys["origins"].get((unit.path, id(value)))
+            if checked_key_origin is not None:
+                return checked_key_origin
+            approval_origin = approval_metadata["origins"].get((unit.path, id(value)))
+            if approval_origin is not None:
+                return approval_origin
+            if additional_supplier_roots and isinstance(value, ast.Subscript) and metadata_selector(value.slice):
+                return ("type-metadata", "retained metadata namespace key")
             if isinstance(value, ast.Name):
+                retained_destructured_value = retained_destructure_binding(value, use, seen)
+                if retained_destructured_value is not None:
+                    return retained_destructured_value
+                retained_loop_value = retained_iteration_binding(value, use, seen)
+                if retained_loop_value is not None:
+                    return retained_loop_value
+                if expression(module, value) == ("object", "dataclasses.field"):
+                    for field_scope in _reserve_dataclass_field_read_scopes(value, value.id, parents):
+                        if isinstance(field_scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                            return ("unknown", "comprehension-local:" + value.id)
+                        parameters = (
+                            [arg.arg for arg in (*field_scope.args.posonlyargs, *field_scope.args.args, *field_scope.args.kwonlyargs)]
+                            + ([field_scope.args.vararg.arg] if field_scope.args.vararg else [])
+                            + ([field_scope.args.kwarg.arg] if field_scope.args.kwarg else [])
+                        )
+                        if value.id in parameters:
+                            return ("unknown", value.id)
+                        if isinstance(field_scope, ast.Lambda):
+                            if _reserve_named_stores(field_scope, value.id):
+                                return ("unknown", value.id)
+                            continue
+                        key = (id(field_scope), value.id)
+                        if key in seen:
+                            return ("unknown", value.id)
+                        producers = scope_producers(field_scope).get(value.id, [])
+                        if not producers:
+                            continue
+                        if len(producers) != 1 or producers[0] is None or producers[0].lineno >= value.lineno:
+                            return ("unknown", value.id)
+                        producer = producers[0]
+                        if isinstance(producer, ast.Import):
+                            alias = next(a for a in producer.names if (a.asname or a.name.split(".", 1)[0]) == value.id)
+                            target = alias.name if alias.asname else alias.name.split(".", 1)[0]
+                            return ("module", target)
+                        if isinstance(producer, ast.ImportFrom):
+                            alias = next(a for a in producer.names if (a.asname or a.name) == value.id)
+                            target = from_module(module, unit, producer.level, producer.module)
+                            if target is None:
+                                return ("unknown", value.id)
+                            if target + "." + alias.name in modules:
+                                return ("module", target + "." + alias.name)
+                            return bindings.get((target, alias.name), ("unknown", value.id))
+                        if isinstance(producer, (ast.Assign, ast.AnnAssign)) and producer.value is not None:
+                            return scoped_expression(producer.value, producer, seen | {key})
+                        return ("unknown", value.id)
+                    return expression(module, value)
                 scope = use
                 while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                     scope = parents.get(id(scope))
@@ -7271,15 +10355,22 @@ def _reserve_selected_origin_effect_failures(
             if isinstance(value, ast.Attribute):
                 if (unit.path, id(value)) in validated_state_slot_reads or (unit.path, id(value)) in validated_dto_field_reads:
                     return ("instance", "elspeth.web.composer.service.ComposerServiceImpl")
+                if additional_supplier_roots and value.attr in metadata_selectors:
+                    return ("type-metadata", "retained annotation/type metadata")
                 base = scoped_expression(value.value, use, seen)
                 if base is None:
                     return None
+                retained = retained_supplier_attribute(base, value.attr)
+                if retained is not None:
+                    return retained
                 kind, qualified = base
                 target = qualified + "." + value.attr
                 if kind == "module" and target in modules:
                     return ("module", target)
                 if kind == "module" and target == "importlib.import_module":
                     return ("loader", target)
+                if kind == "module" and bindings.get((qualified, value.attr), (None, None))[0] in {"lazy-type", *retained_supplier_kinds}:
+                    return bindings[qualified, value.attr]
                 if kind == "module" and target in selected:
                     return ("object", target)
                 if (
@@ -7299,7 +10390,141 @@ def _reserve_selected_origin_effect_failures(
                     return ("namespace", qualified)
                 return ("unknown", target) if kind == "unknown" else None
             if isinstance(value, ast.Call):
+                if control_disclosure["owner"] is not None and scoped_expression(value.func, use, seen) == (
+                    "object",
+                    control_disclosure["owner"],
+                ):
+                    return ("supplier-scalar", control_disclosure["owner"])
+                if prompt_arguments["owner"] is not None and scoped_expression(value.func, use, seen) == (
+                    "object",
+                    prompt_arguments["owner"],
+                ):
+                    return ("enum-record-sequence", prompt_arguments["record"])
+                if schema_capability["owner"] is not None and scoped_expression(value.func, use, seen) == (
+                    "object",
+                    schema_capability["owner"],
+                ):
+                    return ("enum-record", schema_capability["record"])
+                if prompt_renderer["owner"] is not None and scoped_expression(value.func, use, seen) == (
+                    "object",
+                    prompt_renderer["owner"],
+                ):
+                    return ("enum-record-sequence", prompt_renderer["record"])
+                if (unit.path, id(value)) in validated_nonretaining_calls:
+                    return None
                 callable_origin = scoped_expression(value.func, use, seen)
+                if environment_annotations["normalizer"] is not None and callable_origin == (
+                    "object",
+                    environment_annotations["normalizer"],
+                ):
+                    return ("type-metadata", "retained environment annotation types")
+                if callable_origin is not None and callable_origin[0] == "metadata-query":
+                    return ("type-metadata", "retained metadata query result")
+                if (
+                    additional_supplier_roots
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr in {"get", "pop", "__getitem__"}
+                    and value.args
+                    and metadata_selector(value.args[0])
+                ):
+                    return ("type-metadata", "retained metadata namespace query")
+                if (
+                    callable_origin == ("object", "operator.attrgetter")
+                    and len(value.args) == 1
+                    and not value.keywords
+                    and metadata_selector(value.args[0])
+                ):
+                    return ("metadata-query", "operator.attrgetter")
+                if (
+                    callable_origin == ("object", "operator.methodcaller")
+                    and len(value.args) == 2
+                    and not value.keywords
+                    and isinstance(value.args[0], ast.Constant)
+                    and value.args[0].value == "__getattribute__"
+                    and metadata_selector(value.args[1])
+                ):
+                    return ("metadata-query", "operator.methodcaller")
+                if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in metadata_retaining_owners:
+                    return (metadata_retaining_owners[callable_origin[1]], callable_origin[1])
+                if (
+                    callable_origin is not None
+                    and callable_origin[0] == "object"
+                    and callable_origin[1] in metadata_scalar_owners
+                    and (
+                        (len(value.args) == 1 and not value.keywords)
+                        or (
+                            not value.args
+                            and len(value.keywords) == 1
+                            and value.keywords[0].arg == metadata_scalar_parameters[callable_origin[1].rsplit(".", 1)[-1]]
+                        )
+                    )
+                ):
+                    return None
+                if (
+                    additional_supplier_roots
+                    and callable_origin in {("object", "typing.get_type_hints"), ("object", "inspect.get_annotations")}
+                    and value.args
+                ):
+                    # Both canonical owners return a fresh builtin dict on success;
+                    # keys and values retain their original annotation identities.
+                    return metadata_dictionary_origin
+                if (
+                    callable_origin in metadata_dictionary_methods
+                    and isinstance(value.func, ast.Attribute)
+                    and scoped_expression(value.func.value, use, seen) == metadata_dictionary_origin
+                    and not value.args
+                    and not value.keywords
+                ):
+                    return ("type-metadata", "retained annotation/type metadata")
+                if (
+                    additional_supplier_roots
+                    and callable_origin == ("object", "dataclasses.fields")
+                    and len(value.args) == 1
+                    and not value.keywords
+                ):
+                    return ("type-fields", "dataclasses.Field")
+                if (
+                    callable_origin in {("object", "typing.get_args"), ("object", "typing.get_origin")}
+                    and len(value.args) == 1
+                    and not value.keywords
+                ):
+                    argument = scoped_expression(value.args[0], use, seen)
+                    if argument is not None and argument[0] in {"type-metadata", "type-field", "lazy-type"}:
+                        return ("type-metadata", "retained annotation/type metadata")
+                if callable_origin in {("object", "fastapi.APIRouter"), ("object", "fastapi.routing.APIRouter")}:
+                    return ("framework-router", callable_origin[1])
+                if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_enum_classes:
+                    return ("enum-value", callable_origin[1])
+                if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_enum_record_fields:
+                    return ("enum-record", callable_origin[1])
+                if additional_supplier_roots and callable_origin == ("member", approval_class + ".from_json"):
+                    return ("supplier-data-instance", approval_class)
+                if callable_origin is not None and callable_origin[0] == "object" and callable_origin[1] in supplier_data_classes:
+                    return ("supplier-data-instance", callable_origin[1])
+                if (
+                    callable_origin
+                    in {
+                        ("object", "builtins.tuple"),
+                        ("object", "builtins.list"),
+                        ("object", "builtins.set"),
+                        ("object", "builtins.frozenset"),
+                    }
+                    and len(value.args) == 1
+                    and not value.keywords
+                ):
+                    target = scoped_expression(value.args[0], use, seen)
+                    if target is not None and target[0] == "object" and target[1] in supplier_enum_classes:
+                        return ("enum-sequence", target[1])
+                    if target is not None and target[0] in {"enum-sequence", "enum-record-sequence"}:
+                        return target
+                if callable_origin == ("object", "builtins.type") and len(value.args) == 1 and not value.keywords:
+                    target = scoped_expression(value.args[0], use, seen)
+                    if target is not None and target[0] in {"enum-value", "enum-record"}:
+                        return ("enum-recovered-class", target[1])
+                    if target is not None and target[0] == "supplier-data-instance":
+                        return ("supplier-recovered-class", target[1])
+                    if target is not None and target[0] in {"type-metadata", "type-field", "type-fields"}:
+                        return ("type-metadata", target[1])
                 scalar_value_suppliers = {"uuid.UUID"}
                 constructed_owners = {
                     "elspeth.web.required_work.RequiredWorkAuthority",
@@ -7310,6 +10535,8 @@ def _reserve_selected_origin_effect_failures(
                     "elspeth.web.composer.provider_quota.ProviderInvocationOwner",
                     "elspeth.web.composer.provider_quota.ProviderCallCustody",
                     "elspeth.web.composer.service.ComposerServiceImpl",
+                    "elspeth.web.composer._compose_loop_carriers._ComposeIterationState",
+                    "elspeth.web.composer._compose_loop_carriers._ComposeIterationBindings",
                     "elspeth.web.sessions.composer_app_services.ComposerAppServices",
                     "elspeth.web.coordination.lifecycle.SessionOperationLease",
                     "elspeth.web.execution_lease_cleanup.ExecutionAcquisitionObligation",
@@ -7361,16 +10588,42 @@ def _reserve_selected_origin_effect_failures(
                     return ("unknown-module", "importlib.import_module")
                 if callable_origin == ("object", "builtins.vars") and len(value.args) == 1 and not value.keywords:
                     target = scoped_expression(value.args[0], use, seen)
+                    if target is not None and target[0] in retained_supplier_kinds:
+                        return ("retained-supplier-namespace", target[1])
                     return ("namespace", target[1]) if target is not None and target[0] in {"module", "object"} else ("unknown", "vars")
                 if callable_origin == ("object", "builtins.getattr") and len(value.args) in {2, 3} and not value.keywords:
                     target = scoped_expression(value.args[0], use, seen)
                     selector = value.args[1]
+                    if additional_supplier_roots and isinstance(selector, ast.Constant) and selector.value in metadata_selectors:
+                        return ("type-metadata", "retained annotation/type metadata")
+                    if target is not None and target[0] == "supplier-data-instance":
+                        if isinstance(selector, ast.Constant) and type(selector.value) is str:
+                            return retained_supplier_attribute(target, selector.value)
+                        return ("unknown", "protected-reflection")
+                    if target is not None and target[0] in retained_supplier_kinds:
+                        return ("unknown", "protected-reflection")
                     if target is not None and target[0] == "object" and target[1] in selected:
                         return ("unknown", "protected-reflection")
                     if target is not None and target[0] == "module":
+                        if _reserve_protected_supplier_reflection(target[1], selector, protected_supplier_bindings):
+                            return ("unknown", "protected-reflection")
+                        if target[1] in retained_supplier_modules and (
+                            not isinstance(selector, ast.Constant)
+                            or type(selector.value) is not str
+                            or selector.value == "__dict__"
+                            or (target[1], selector.value) in retained_supplier_bindings
+                        ):
+                            return ("unknown", "protected-reflection")
+                        if target[1] in supplier_type_alias_modules and (
+                            not isinstance(selector, ast.Constant)
+                            or type(selector.value) is not str
+                            or selector.value == "__dict__"
+                            or (target[1], selector.value) in supplier_type_alias_bindings
+                        ):
+                            return ("unknown", "protected-reflection")
                         if isinstance(selector, ast.Constant) and type(selector.value) is str:
                             identity = target[1] + "." + selector.value
-                            return ("object", identity) if identity in selected else None
+                            return ("unknown", "protected-reflection") if identity in selected else None
                         if target[1] in selected_modules and not guarded_export_disjoint(use, selector, target[1]):
                             return ("unknown", "getattr-selector")
                         return None
@@ -7383,6 +10636,7 @@ def _reserve_selected_origin_effect_failures(
                             and origin[1] in selected
                             and not origin[1].startswith("builtins.")
                             and origin[1] not in scalar_value_suppliers
+                            and origin[1] not in immutable_supplier_origins
                         )
                         or (origin[0] == "instance" and origin[1] in selected)
                         or origin == ("unknown", "protected-carrier")
@@ -7390,11 +10644,24 @@ def _reserve_selected_origin_effect_failures(
                     for child in [*value.args, *(keyword.value for keyword in value.keywords)]
                 ):
                     return ("unknown", "protected-carrier")
+            if isinstance(value, (ast.Tuple, ast.List, ast.Set, ast.Dict)):
+                retained = retained_supplier_container(
+                    scoped_expression(child, use, seen)
+                    for child in ([*value.keys, *value.values] if isinstance(value, ast.Dict) else value.elts)
+                    if child is not None
+                )
+                if retained is not None:
+                    return retained
             if isinstance(value, (ast.Tuple, ast.List, ast.Set, ast.Dict)) and any(
                 (origin := scoped_expression(child, use, seen)) is not None
                 and (
                     (origin[0] == "module" and origin[1] in selected_modules)
-                    or (origin[0] == "object" and origin[1] in selected and not origin[1].startswith("builtins."))
+                    or (
+                        origin[0] == "object"
+                        and origin[1] in selected
+                        and origin[1] not in immutable_supplier_origins
+                        and not origin[1].startswith("builtins.")
+                    )
                     or (origin[0] == "instance" and origin[1] in selected)
                     or origin == ("unknown", "protected-carrier")
                 )
@@ -7413,6 +10680,16 @@ def _reserve_selected_origin_effect_failures(
                         return ("module", value.slice.value) if value.slice.value in selected_modules else None
                     return ("unknown-module", "sys.modules")
                 subscript_origin = scoped_expression(value.value, use, seen)
+                if subscript_origin is not None and subscript_origin[0] == "namespace" and subscript_origin[1] in retained_supplier_modules:
+                    if isinstance(value.slice, ast.Constant) and type(value.slice.value) is str:
+                        retained_binding = retained_supplier_bindings.get((subscript_origin[1], value.slice.value))
+                        if retained_binding is not None:
+                            return retained_binding
+                    else:
+                        return ("unknown", "protected-carrier")
+                retained = retained_supplier_subscript(subscript_origin)
+                if retained is not None:
+                    return retained
                 if subscript_origin == ("object", "elspeth.plugins.infrastructure.discovery.PLUGIN_SCAN_CONFIG"):
                     return ("config-entry", subscript_origin[1])
                 if subscript_origin == ("unknown", "protected-carrier"):
@@ -7679,7 +10956,7 @@ def _reserve_selected_origin_effect_failures(
 
         def normal_owned_carrier_call(call, *, parents=parents, unit=unit, module=module):
             """Qualify the two current exception carriers and local list append."""
-            if (unit.path, id(call)) in validated_worker_error_carrier_calls:
+            if (unit.path, id(call)) in validated_worker_error_carrier_calls or (unit.path, id(call)) in validated_local_carrier_calls:
                 return True
             if isinstance(call.func, ast.Attribute) and call.func.attr == "append" and isinstance(call.func.value, ast.Name):
                 scope = call
@@ -7958,7 +11235,1570 @@ def _reserve_selected_origin_effect_failures(
                 and all(canonical_builtin_class(value) for value in comparison.comparators[0].elts)
             )
 
+        def supplier_nominal_class(qualified):
+            external = {
+                "collections.abc.Mapping",
+                "types.MappingProxyType",
+                "pydantic.TypeAdapter",
+                "pydantic.ValidationError",
+                "json.JSONDecoder",
+                "enum.Enum",
+                "enum.StrEnum",
+                "types.UnionType",
+                "typing.TypeAliasType",
+                "types.ModuleType",
+            }
+            if qualified in external:
+                return True
+            owner_module, _, name = qualified.rpartition(".")
+            source = modules.get(owner_module)
+            return source is not None and isinstance(_reserve_node_at(source, name), ast.ClassDef)
+
+        def supplier_declaration(qualified):
+            owner_module, _, name = qualified.rpartition(".")
+            source = modules.get(owner_module)
+            return (source, _reserve_node_at(source, name)) if source is not None else (None, None)
+
+        def supplier_pydantic_member(source, cls, member, seen=frozenset()):
+            if member not in {"model_validate", "model_validate_json", "model_json_schema", "model_construct"}:
+                return False
+            if id(cls) in seen or cls.keywords or len(cls.bases) != 1:
+                return False
+            if any(isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name == member for statement in cls.body):
+                return False
+            base = cls.bases[0]
+            if not isinstance(base, ast.Name):
+                return False
+            if _reserve_composer_receiver.imported(source.tree, base.id, "pydantic", "BaseModel"):
+                return True
+            parent = _reserve_node_at(source, base.id)
+            return (
+                isinstance(parent, ast.ClassDef)
+                and _reserve_composer_receiver.owned_binding(source.tree, base.id, parent)
+                and supplier_pydantic_member(source, parent, member, seen | {id(cls)})
+            )
+
+        def supplier_type_result(
+            value, use, seen=frozenset(), *, parents=parents, scoped_expression=scoped_expression, scope_producers=scope_producers
+        ):
+            if isinstance(value, ast.Call):
+                return scoped_expression(value.func, use) == ("object", "builtins.type") and len(value.args) == 1 and not value.keywords
+            if not isinstance(value, ast.Name) or value.id in seen:
+                return False
+            owner = parents.get(id(use))
+            while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                owner = parents.get(id(owner))
+            if owner is None:
+                return False
+            producers = scope_producers(owner).get(value.id, [])
+            if len(producers) != 1 or not isinstance(producers[0], (ast.Assign, ast.AnnAssign)):
+                return False
+            producer = producers[0]
+            return (
+                producer.value is not None
+                and producer.lineno < use.lineno
+                and supplier_type_result(producer.value, producer, seen | {value.id})
+            )
+
+        def supplier_type_operand(value, *, scoped_expression=scoped_expression):
+            if isinstance(value, (ast.Tuple, ast.Set)):
+                return bool(value.elts) and all(supplier_type_operand(child) for child in value.elts)
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
+                return supplier_type_operand(value.left) and supplier_type_operand(value.right)
+            if (
+                isinstance(value, ast.Call)
+                and len(value.args) == 1
+                and not value.keywords
+                and isinstance(value.args[0], ast.Constant)
+                and value.args[0].value is None
+                and scoped_expression(value.func, value) == ("object", "builtins.type")
+            ):
+                return True
+            return discarded_type_leaf(value)
+
+        def supplier_type_syntax(
+            value,
+            recursive_alias=None,
+            alias_stack=frozenset(),
+            *,
+            scoped_expression=scoped_expression,
+            unit=unit,
+            module=module,
+        ):
+            if isinstance(value, ast.Constant):
+                return value.value is None or value.value is Ellipsis or type(value.value) is str
+            if isinstance(value, (ast.Tuple, ast.List)):
+                return all(supplier_type_syntax(child, recursive_alias, alias_stack) for child in value.elts)
+            if isinstance(value, ast.BinOp) and isinstance(value.op, ast.BitOr):
+                return supplier_type_syntax(value.left, recursive_alias, alias_stack) and supplier_type_syntax(
+                    value.right, recursive_alias, alias_stack
+                )
+            if isinstance(value, ast.Subscript):
+                containers = {
+                    "builtins.list",
+                    "builtins.dict",
+                    "builtins.tuple",
+                    "builtins.set",
+                    "builtins.frozenset",
+                    "typing.Callable",
+                    "collections.abc.Callable",
+                    "typing.Annotated",
+                    "typing.Literal",
+                    "typing.Union",
+                    "typing.Optional",
+                    "collections.abc.Mapping",
+                    "collections.abc.Sequence",
+                    "collections.abc.Awaitable",
+                }
+                base = scoped_expression(value.value, value)
+                canonical_container = base is not None and base[0] == "object" and base[1] in containers
+                if not canonical_container and isinstance(value.value, ast.Name):
+                    # A real imported generic can be outside the selected-root
+                    # cohort. Verify its exact module/name binding; never grant
+                    # an arbitrary bare name or infer a type from an annotation.
+                    canonical_container = any(
+                        _reserve_composer_receiver.imported(unit.tree, value.value.id, owner, name)
+                        for qualified in containers
+                        if not qualified.startswith("builtins.")
+                        for owner, _, name in [qualified.rpartition(".")]
+                    )
+                return canonical_container and supplier_type_syntax(value.slice, recursive_alias, alias_stack)
+            resolved = scoped_expression(value, value)
+            if resolved is not None and resolved[0] == "lazy-type":
+                qualified = resolved[1]
+                if recursive_alias is not None and qualified == recursive_alias:
+                    return True
+                # Follow only actual module-local PEP 695 declarations. Their
+                # complete value grammar is checked recursively and retained
+                # metadata origins are unchanged. Imports/unknown aliases and
+                # generic type parameters do not receive this finite receipt.
+                owner, _, name = qualified.rpartition(".")
+                if owner != module or qualified in alias_stack:
+                    return False
+                declarations = [
+                    statement
+                    for statement in unit.tree.body
+                    if isinstance(statement, ast.TypeAlias) and isinstance(statement.name, ast.Name) and statement.name.id == name
+                ]
+                if len(declarations) != 1 or declarations[0].type_params:
+                    return False
+                declaration = declarations[0]
+                stores = _reserve_named_stores(unit.tree, name)
+                if len(stores) != 1 or stores[0] is not declaration.name:
+                    return False
+                return supplier_type_syntax(declaration.value, qualified, alias_stack | {qualified})
+            # Imported functions (including json.loads) are not type leaves.
+            return discarded_type_leaf(value)
+
+        def discarded_type_leaf(
+            value, *, unit=unit, module=module, parents=parents, scope_producers=scope_producers, scoped_expression=scoped_expression
+        ):
+            # This is a role-only lookup. It adds no selected root, instance
+            # admission or transferable class origin to the effect resolver.
+            origin = scoped_expression(value, value)
+            if origin is not None and origin[0] == "object":
+                return supplier_nominal_class(origin[1]) or origin[1] in {
+                    "typing.Any",
+                    "typing.Never",
+                    "pydantic.JsonValue",
+                    "builtins.str",
+                    "builtins.int",
+                    "builtins.float",
+                    "builtins.bool",
+                    "builtins.bytes",
+                    "builtins.object",
+                    "builtins.dict",
+                    "builtins.list",
+                    "builtins.tuple",
+                    "builtins.set",
+                    "builtins.frozenset",
+                }
+            if not isinstance(value, ast.Name):
+                return False
+            scope = parents.get(id(value))
+            while scope is not None and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                scope = parents.get(id(scope))
+            if scope is not None:
+                args = scope.args
+                parameters = {arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+                parameters.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+                if value.id in parameters or value.id in scope_producers(scope):
+                    return False
+            if value.id in {"str", "int", "float", "bool", "bytes", "object", "dict", "list", "tuple", "set", "frozenset"}:
+                return _reserve_composer_receiver.builtin_binding(unit.tree, value.id)
+            declaration = _reserve_node_at(unit, value.id)
+            if isinstance(declaration, ast.ClassDef):
+                return _reserve_composer_receiver.owned_binding(unit.tree, value.id, declaration)
+            imports = [
+                (statement, alias)
+                for statement in unit.tree.body
+                if isinstance(statement, ast.ImportFrom)
+                for alias in statement.names
+                if (alias.asname or alias.name) == value.id
+            ]
+            if len(imports) != 1:
+                return False
+            statement, alias = imports[0]
+            owner = from_module(module, unit, statement.level, statement.module)
+            if owner is None or not _reserve_composer_receiver.imported(unit.tree, value.id, owner, alias.name):
+                return False
+            if (owner, alias.name) in {
+                ("typing", "Any"),
+                ("typing", "Never"),
+                ("pydantic", "JsonValue"),
+                ("collections.abc", "Mapping"),
+                ("collections.abc", "Sequence"),
+                ("collections.abc", "Set"),
+                ("collections.abc", "Callable"),
+                ("collections.abc", "Awaitable"),
+            }:
+                return True
+            source = modules.get(owner)
+            declaration = _reserve_node_at(source, alias.name) if source is not None else None
+            return isinstance(declaration, ast.ClassDef) and _reserve_composer_receiver.owned_binding(source.tree, alias.name, declaration)
+
+        def discarded_type_syntax(value, *, scoped_expression=scoped_expression):
+            # Only the canonical cast consumer below may discard this complete
+            # expression. No alias, annotation, default or callback gets this
+            # role merely because its source resembles a type expression.
+            if isinstance(value, ast.Constant):
+                return value.value is None or value.value is Ellipsis or type(value.value) is str
+            if isinstance(value, (ast.Tuple, ast.List)):
+                return all(discarded_type_syntax(child) for child in value.elts)
+            if isinstance(value, ast.Subscript):
+                origin = scoped_expression(value.value, value)
+                return (
+                    origin is not None
+                    and origin[0] == "object"
+                    and origin[1]
+                    in {
+                        "builtins.list",
+                        "builtins.dict",
+                        "builtins.tuple",
+                        "builtins.set",
+                        "builtins.frozenset",
+                        "collections.abc.Mapping",
+                        "collections.abc.Sequence",
+                        "collections.abc.Callable",
+                        "collections.abc.Awaitable",
+                        "typing.Callable",
+                        "typing.Optional",
+                        "typing.Union",
+                    }
+                    and discarded_type_syntax(value.slice)
+                )
+            return discarded_type_leaf(value)
+
+        def discarded_supplier_type_role(node, *, parents=parents, scoped_expression=scoped_expression):
+            operand = node
+            while isinstance(parents.get(id(operand)), (ast.Tuple, ast.List, ast.Subscript)):
+                operand = parents[id(operand)]
+            consumer = parents.get(id(operand))
+            return (
+                isinstance(consumer, ast.Call)
+                and len(consumer.args) == 2
+                and not consumer.keywords
+                and consumer.args[0] is operand
+                and scoped_expression(consumer.func, consumer) in {("pure", "typing.cast"), ("object", "typing.cast")}
+                and discarded_type_syntax(operand)
+            )
+
+        def supplier_router_registration(
+            node, qualified, *, unit=unit, parents=parents, scoped_expression=scoped_expression, scope_producers=scope_producers
+        ):
+            # Five actual schema declaration consumers. Identity comes from
+            # the canonical import and unique local/module constructor, never
+            # from the receiver spelling or response_model keyword alone.
+            specifications = {
+                ("src/elspeth/web/catalog/routes.py", "list_sources"): ("/sources", "get", "catalog_router", "PluginSummary", True),
+                ("src/elspeth/web/catalog/routes.py", "list_transforms"): ("/transforms", "get", "catalog_router", "PluginSummary", True),
+                ("src/elspeth/web/catalog/routes.py", "list_sinks"): ("/sinks", "get", "catalog_router", "PluginSummary", True),
+                ("src/elspeth/web/catalog/routes.py", "get_schema"): (
+                    "/{plugin_type}/{name}/schema",
+                    "get",
+                    "catalog_router",
+                    "PluginSchemaInfo",
+                    False,
+                ),
+                ("src/elspeth/web/execution/routes.py", "validate_session_pipeline"): (
+                    "/api/sessions/{session_id}/validate",
+                    "post",
+                    "router",
+                    "ValidationResult",
+                    False,
+                ),
+            }
+            value = node
+            parent = parents.get(id(value))
+            is_list = isinstance(parent, ast.Subscript) and parent.slice is node
+            if is_list:
+                if scoped_expression(parent.value, parent) != ("object", "builtins.list"):
+                    return False
+                value = parent
+            keyword = parents.get(id(value))
+            if not isinstance(keyword, ast.keyword) or keyword.arg != "response_model" or keyword.value is not value:
+                return False
+            call = parents.get(id(keyword))
+            owner = parents.get(id(call))
+            if (
+                not isinstance(call, ast.Call)
+                or not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+                or call not in owner.decorator_list
+            ):
+                return False
+            specification = specifications.get((unit.path, owner.name))
+            if specification is None:
+                return False
+            route, verb, receiver, schema, list_result = specification
+            expected_origin = (
+                "elspeth.web.execution.schemas." if schema == "ValidationResult" else "elspeth.web.catalog.schemas."
+            ) + schema
+            if qualified != expected_origin or is_list != list_result:
+                return False
+            expected = ast.parse(
+                receiver + "." + verb + "(" + repr(route) + ", response_model=" + ("list[" + schema + "]" if list_result else schema) + ")",
+                mode="eval",
+            ).body
+            if ast.dump(call, include_attributes=False) != ast.dump(expected, include_attributes=False):
+                return False
+            if not _reserve_composer_receiver.imported(unit.tree, "APIRouter", "fastapi", "APIRouter"):
+                return False
+            scope = parents.get(id(owner))
+            if receiver == "catalog_router":
+                if not isinstance(scope, ast.Module):
+                    return False
+                producers = [
+                    statement
+                    for statement in scope.body
+                    if isinstance(statement, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == receiver for target in statement.targets)
+                ]
+                tag = "catalog"
+            else:
+                if not isinstance(scope, ast.FunctionDef) or scope.name != "create_execution_router":
+                    return False
+                producers = scope_producers(scope).get(receiver, [])
+                tag = "execution"
+            if len(producers) != 1 or not isinstance(producers[0], ast.Assign) or producers[0].lineno >= owner.lineno:
+                return False
+            expected_constructor = ast.parse(receiver + " = APIRouter(tags=[" + repr(tag) + "])").body[0]
+            if ast.dump(producers[0], include_attributes=False) != ast.dump(expected_constructor, include_attributes=False):
+                return False
+            if scoped_expression(producers[0].value.func, producers[0]) != ("object", "fastapi.APIRouter"):
+                return False
+            # Refuse a substituted registration method before the declaration.
+            # Later route installation is outside this declaration-time role.
+            for earlier in ast.walk(scope):
+                if isinstance(earlier, ast.Name) and earlier.id == receiver and earlier.lineno < owner.lineno:
+                    if isinstance(earlier.ctx, (ast.Store, ast.Del)):
+                        if earlier not in producers[0].targets:
+                            return False
+                    else:
+                        member = parents.get(id(earlier))
+                        registration = parents.get(id(member))
+                        registered = parents.get(id(registration))
+                        if not (
+                            isinstance(member, ast.Attribute)
+                            and member.value is earlier
+                            and member.attr in {"get", "post"}
+                            and isinstance(member.ctx, ast.Load)
+                            and isinstance(registration, ast.Call)
+                            and registration.func is member
+                            and isinstance(registered, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and registration in registered.decorator_list
+                        ):
+                            return False
+                if (
+                    isinstance(earlier, ast.Attribute)
+                    and isinstance(earlier.ctx, (ast.Store, ast.Del))
+                    and isinstance(earlier.value, ast.Name)
+                    and earlier.value.id == receiver
+                    and earlier.lineno < owner.lineno
+                ):
+                    return False
+                if isinstance(earlier, ast.Call) and earlier.lineno < owner.lineno:
+                    target = scoped_expression(earlier.func, earlier)
+                    if (
+                        target in {("object", "builtins.setattr"), ("object", "builtins.delattr"), ("object", "builtins.vars")}
+                        and earlier.args
+                        and isinstance(earlier.args[0], ast.Name)
+                        and earlier.args[0].id == receiver
+                    ):
+                        return False
+            return True
+
+        def supplier_structural_role(node, origin, *, module=module, unit=unit, parents=parents, scoped_expression=scoped_expression):
+            """Non-callee roles with canonical operators, never opaque transfers.
+
+            The original resolver supplies identity and lexical binding. This
+            accepts consuming a type for a boolean/pattern/exception match; it
+            does not admit an instance, a type as authority, or a callback.
+            """
+            qualified = origin[1]
+            parent = parents.get(id(node))
+            if qualified == approval_class:
+                return _reserve_approval_binding_class_use(node, unit, parents, scoped_expression)
+            if _reserve_plugin_lookup_exception_role(node, origin, parents, plugin_lookup_exception):
+                return True
+            if isinstance(parent, ast.Call) and parent.func is node:
+                return True
+            if (
+                isinstance(parent, ast.Compare)
+                and all(isinstance(operator, (ast.Is, ast.IsNot)) for operator in parent.ops)
+                and (parent.left is node or any(operand is node for operand in parent.comparators))
+            ):
+                # Identity comparisons do not call either operand's __eq__ or
+                # retain it in their bool result. Equality and membership do
+                # not receive this role; their overloaded calls stay unclosed.
+                return True
+            scalar_call = parents.get(id(parent)) if isinstance(parent, ast.keyword) else parent
+            if isinstance(scalar_call, ast.Call):
+                scalar_target = scoped_expression(scalar_call.func, scalar_call)
+                if (
+                    scalar_target is not None
+                    and scalar_target[0] == "object"
+                    and scalar_target[1] in metadata_scalar_owners
+                    and (
+                        (len(scalar_call.args) == 1 and scalar_call.args[0] is node and not scalar_call.keywords)
+                        or (
+                            not scalar_call.args
+                            and len(scalar_call.keywords) == 1
+                            and scalar_call.keywords[0].value is node
+                            and scalar_call.keywords[0].arg == metadata_scalar_parameters[scalar_target[1].rsplit(".", 1)[-1]]
+                        )
+                    )
+                ):
+                    return True
+            # PEP 695 aliases are lazy type syntax, like postponed annotations.
+            cursor = node
+            while isinstance(parents.get(id(cursor)), (ast.Tuple, ast.List, ast.Subscript, ast.BinOp)):
+                ancestor = parents[id(cursor)]
+                if isinstance(ancestor, ast.BinOp) and not isinstance(ancestor.op, ast.BitOr):
+                    break
+                cursor = ancestor
+            alias = parents.get(id(cursor))
+            if (
+                isinstance(alias, ast.TypeAlias)
+                and alias.value is cursor
+                and parents.get(id(alias)) is unit.tree
+                and isinstance(alias.name, ast.Name)
+                and supplier_type_syntax(cursor, module + "." + alias.name.id)
+            ):
+                return True
+            if qualified == "elspeth.web.composer.tools.wire_projection._WIRE_TOOL_DEFS":
+                # An indexed table value is DATA; the table itself is not a
+                # transferable callback or namespace. Every mutation is still
+                # walked by the original subscript/attribute effect checks.
+                if isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
+                    return True
+                call = parents.get(id(parent))
+                return (
+                    isinstance(parent, ast.Attribute)
+                    and parent.value is node
+                    and parent.attr == "items"
+                    and isinstance(parent.ctx, ast.Load)
+                    and isinstance(call, ast.Call)
+                    and call.func is parent
+                    and not call.args
+                    and not call.keywords
+                )
+            if isinstance(alias, ast.Assign) and alias.value is cursor and legacy_supplier_type_alias(module, alias):
+                return supplier_nominal_class(qualified) or qualified in {"collections.abc.Callable", "collections.abc.Awaitable"}
+            if discarded_supplier_type_role(node):
+                return True
+            if not supplier_nominal_class(qualified):
+                return False
+            if supplier_router_registration(node, qualified):
+                return True
+            if (
+                isinstance(parent, ast.Call)
+                and len(parent.args) == 1
+                and not parent.keywords
+                and parent.args[0] is node
+                and scoped_expression(parent.func, parent) == ("object", "dataclasses.fields")
+            ):
+                source, cls = supplier_declaration(qualified)
+                if (
+                    source is not None
+                    and isinstance(cls, ast.ClassDef)
+                    and not cls.bases
+                    and not cls.keywords
+                    and len(cls.decorator_list) == 1
+                    and isinstance(cls.decorator_list[0], ast.Call)
+                    and not cls.decorator_list[0].args
+                    and isinstance(cls.decorator_list[0].func, ast.Name)
+                    and all(
+                        keyword.arg is not None and isinstance(keyword.value, ast.Constant) and type(keyword.value.value) is bool
+                        for keyword in cls.decorator_list[0].keywords
+                    )
+                    and _reserve_composer_receiver.imported(source.tree, cls.decorator_list[0].func.id, "dataclasses", "dataclass")
+                    and _reserve_composer_receiver.owned_binding(source.tree, cls.name, cls)
+                ):
+                    return True
+            operand = node
+            while isinstance(parents.get(id(operand)), (ast.Tuple, ast.Set, ast.BinOp)):
+                ancestor = parents[id(operand)]
+                if isinstance(ancestor, ast.BinOp) and not isinstance(ancestor.op, ast.BitOr):
+                    break
+                operand = ancestor
+            consumer = parents.get(id(operand))
+            if (
+                isinstance(consumer, ast.Call)
+                and len(consumer.args) == 2
+                and not consumer.keywords
+                and consumer.args[1] is operand
+                and supplier_type_operand(operand)
+                and scoped_expression(consumer.func, consumer)
+                in {
+                    ("object", "builtins.isinstance"),
+                    ("object", "builtins.issubclass"),
+                }
+            ):
+                return True
+            if (
+                isinstance(consumer, ast.Call)
+                and len(consumer.args) == 2
+                and not consumer.keywords
+                and consumer.args[0] is operand
+                and supplier_type_operand(operand)
+                and scoped_expression(consumer.func, consumer) in {("pure", "typing.cast"), ("object", "typing.cast")}
+            ):
+                return True
+            if (
+                isinstance(consumer, ast.Compare)
+                and len(consumer.ops) == len(consumer.comparators) == 1
+                and consumer.comparators[0] is operand
+                and supplier_type_operand(operand)
+                and supplier_type_result(consumer.left, consumer)
+            ):
+                if isinstance(consumer.ops[0], (ast.Is, ast.IsNot)) and operand is node:
+                    return True
+                if isinstance(consumer.ops[0], (ast.In, ast.NotIn)) and isinstance(operand, (ast.Tuple, ast.Set)):
+                    return True
+            if isinstance(consumer, ast.ExceptHandler) and consumer.type is operand and qualified == "pydantic.ValidationError":
+                return True
+            if (
+                isinstance(parent, ast.MatchClass)
+                and parent.cls is node
+                and not parent.patterns
+                and not parent.kwd_attrs
+                and qualified == "types.MappingProxyType"
+            ):
+                return True
+            enum_members = supplier_enum_members(qualified)
+            if enum_members is not None:
+                if (
+                    isinstance(parent, ast.Attribute)
+                    and parent.value is node
+                    and parent.attr in enum_members
+                    and isinstance(parent.ctx, ast.Load)
+                ):
+                    return True
+                if isinstance(parent, (ast.For, ast.comprehension)) and parent.iter is node:
+                    return True
+                if (
+                    isinstance(parent, ast.Call)
+                    and parent.args == [node]
+                    and not parent.keywords
+                    and scoped_expression(parent.func, parent)
+                    in {
+                        ("object", "builtins.tuple"),
+                        ("object", "builtins.list"),
+                        ("object", "builtins.set"),
+                        ("object", "builtins.frozenset"),
+                    }
+                ):
+                    return True
+            if isinstance(parent, ast.Attribute) and parent.value is node and isinstance(parent.ctx, ast.Load):
+                if parent.attr in {"__name__", "__qualname__", "__module__"}:
+                    return True
+                call = parents.get(id(parent))
+                if not isinstance(call, ast.Call) or call.func is not parent or parent.attr.startswith("_"):
+                    return False
+                source, cls = supplier_declaration(qualified)
+                if isinstance(cls, ast.ClassDef):
+                    methods = [
+                        statement for statement in cls.body if isinstance(statement, ast.FunctionDef) and statement.name == parent.attr
+                    ]
+                    if len(methods) == 1 and all(
+                        isinstance(decorator, ast.Name)
+                        and decorator.id in {"classmethod", "staticmethod"}
+                        and _reserve_composer_receiver.builtin_binding(source.tree, decorator.id)
+                        for decorator in methods[0].decorator_list
+                    ):
+                        return True
+                    if supplier_pydantic_member(source, cls, parent.attr):
+                        return True
+                return qualified == "pydantic.ValidationError" and parent.attr == "from_exception_data"
+            return False
+
+        # One denial-only expression analysis feeds every retaining effect.
+        # Lexical initializers/defaults are followed before an unresolved whole
+        # expression can be mistaken for absence of a protected value.
+        export_raw_bindings = {}
+        export_declarations = {}
+
+        def export_binding_scope(node, name, *, parents=parents, unit=unit):
+            scopes = _reserve_dataclass_field_read_scopes(node, name, parents)
+            scope = next(scopes, None)
+            nearest = _lexical_scope(parents.get(id(node), node))
+            if isinstance(nearest, ast.ClassDef):
+                return nearest
+            return scope if scope is not None else unit.tree
+
+        for export_node in ast.walk(unit.tree):
+            export_names = []
+            if isinstance(export_node, ast.Name) and isinstance(export_node.ctx, (ast.Store, ast.Del)):
+                export_names = [export_node.id]
+            elif isinstance(export_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or (
+                isinstance(export_node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and export_node.name is not None
+            ):
+                export_names = [export_node.name]
+            elif isinstance(export_node, ast.MatchMapping) and export_node.rest is not None:
+                export_names = [export_node.rest]
+            elif isinstance(export_node, (ast.Import, ast.ImportFrom)):
+                export_names = [
+                    alias.asname or (alias.name.split(".", 1)[0] if isinstance(export_node, ast.Import) else alias.name)
+                    for alias in export_node.names
+                ]
+            elif isinstance(export_node, (ast.Global, ast.Nonlocal)):
+                for name in export_node.names:
+                    scope = export_binding_scope(export_node, name)
+                    export_declarations[id(scope), name] = export_node
+            elif isinstance(export_node, ast.arg):
+                owner = parents.get(id(export_node))
+                while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    owner = parents.get(id(owner))
+                if owner is not None:
+                    export_raw_bindings.setdefault((id(owner), export_node.arg), []).append(export_node)
+            for name in export_names:
+                scope = export_binding_scope(export_node, name)
+                export_raw_bindings.setdefault((id(scope), name), []).append(export_node)
+
+        export_bindings = {}
+        for key, producers in export_raw_bindings.items():
+            declaration = export_declarations.get(key)
+            target_key = key
+            if isinstance(declaration, ast.Global):
+                target_key = (id(unit.tree), key[1])
+            elif isinstance(declaration, ast.Nonlocal):
+                for scope in _reserve_dataclass_field_read_scopes(declaration, key[1], parents):
+                    outer_key = (id(scope), key[1])
+                    if outer_key != key and outer_key in export_raw_bindings and outer_key not in export_declarations:
+                        target_key = outer_key
+                        break
+            export_bindings.setdefault(target_key, []).extend(producers)
+
+        retained_enum_kinds = {"enum-value", "enum-record", "enum-sequence", "enum-record-sequence", "enum-compound"}
+
+        @cache
+        def retained_callable_defaults(owner):
+            # Actual positional defaults align with the LAST positional formals;
+            # keyword-only defaults keep their exact paired formal identity.
+            positional = [*owner.args.posonlyargs, *owner.args.args]
+            defaults = owner.args.defaults
+            pairs = list(zip(positional[len(positional) - len(defaults) :], defaults, strict=True))
+            pairs.extend(
+                (arg, default) for arg, default in zip(owner.args.kwonlyargs, owner.args.kw_defaults, strict=True) if default is not None
+            )
+            return tuple(pairs)
+
+        # These completed lexical maps are fixed for this unit/pass. Cache only
+        # this lookup; retention results still depend on seen and read_target.
+        @cache
+        def retained_name_producers(
+            value, *, parents=parents, unit=unit, export_declarations=export_declarations, export_bindings=export_bindings
+        ):
+            scopes = [*_reserve_dataclass_field_read_scopes(value, value.id, parents), unit.tree]
+            for scope in scopes:
+                key = (id(scope), value.id)
+                declaration = export_declarations.get(key)
+                if isinstance(declaration, ast.Global):
+                    return id(unit.tree), export_bindings.get((id(unit.tree), value.id), [])
+                if isinstance(declaration, ast.Nonlocal):
+                    continue
+                if key in export_bindings:
+                    return id(scope), export_bindings[key]
+            return id(unit.tree), []
+
+        retained_context_memo = {
+            "entries": {},
+            "previous_entries": {},
+            "traces": [],
+            "inputs": (module, unit, parents, retained_enum_kinds),
+        }
+
+        def retained_path_contains(identity, seen, *, memo=retained_context_memo):
+            if memo["traces"]:
+                memo["traces"][-1]["footprint"].add(identity)
+            return identity in seen
+
+        def retained_callable_capture(owner, seen=frozenset()):
+            if retained_path_contains(id(owner), seen):
+                return False
+            seen = seen | {id(owner)}
+            if any(retained_enum_state(default, seen)[1] for _, default in retained_callable_defaults(owner)):
+                return True
+            local_scope_ids = {id(node) for node in ast.walk(owner)}
+            bodies = [owner.body] if isinstance(owner, ast.Lambda) else owner.body
+            for body in bodies:
+                for child in ast.walk(body):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                        binding_scope, _producers = retained_name_producers(child)
+                        # Reading an enum's scalar field still captures its real
+                        # outer object in a closure. Locals/formals do not become
+                        # outer captures merely because their spelling matches.
+                        if binding_scope not in local_scope_ids and retained_enum_state(child, seen)[1]:
+                            return True
+            return False
+
+        def retained_enum_state(
+            value,
+            seen=frozenset(),
+            *,
+            read_target=False,
+            module=module,
+            unit=unit,
+            parents=parents,
+            retained_enum_kinds=retained_enum_kinds,
+            memo=retained_context_memo,
+        ):
+            """Direct origin plus conservative retention, never an admission.
+
+            An unknown wrapper/container may retain any of its supplied values.
+            A proved scalar member projection keeps its existing interpretation;
+            a scalar iterator does not erase an outer captured enum record.
+            """
+            entries, traces = memo["entries"], memo["traces"]
+            actual_module, actual_unit, actual_parents, actual_kinds = memo["inputs"]
+            eligible = (
+                module is actual_module
+                and unit is actual_unit
+                and parents is actual_parents
+                and retained_enum_kinds is actual_kinds
+                and type(seen) is frozenset
+                and type(read_target) is bool
+            )
+            if not eligible and traces:
+                traces[-1]["eligible"] = False
+            key = (value, read_target)
+            entry = entries.get(key) if eligible else None
+            if entry is not None:
+                footprint, intersection, result = entry
+                if seen.intersection(footprint) == intersection:
+                    if traces:
+                        traces[-1]["footprint"].update(footprint)
+                    return result
+                previous = memo["previous_entries"].get(key)
+                if previous is not None and previous[0] is entry:
+                    footprint, intersection, result = previous[1]
+                    if seen.intersection(footprint) == intersection:
+                        if traces:
+                            traces[-1]["footprint"].update(footprint)
+                        return result
+            initial_seen = seen
+            trace = {"footprint": set(), "eligible": eligible}
+            traces.append(trace)
+            completed = None
+            try:
+                if value is None or retained_path_contains(id(value), seen):
+                    return (completed := (None, False))
+                seen = seen | {id(value)}
+                if isinstance(value, ast.Name):
+                    if not isinstance(value.ctx, ast.Load) and not read_target:
+                        return (completed := (None, False))
+                    _binding_scope, producers = retained_name_producers(value)
+                    if not producers:
+                        origin = expression(module, value)
+                        return (completed := (origin, origin is not None and origin[0] in retained_enum_kinds))
+                    states = []
+                    for producer in producers:
+                        if isinstance(producer, ast.arg):
+                            # A formal still shadows outer names, but its actual
+                            # eager default is a possible retained supplied value.
+                            origin = scoped_expression(value, value)
+                            retained = origin is not None and origin[0] in retained_enum_kinds
+                            owner = parents.get(id(producer))
+                            while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                                owner = parents.get(id(owner))
+                            if owner is not None:
+                                for formal, default in retained_callable_defaults(owner):
+                                    if formal is producer:
+                                        default_origin, default_retained = retained_enum_state(default, seen)
+                                        if origin is None or origin[0] == "unknown":
+                                            origin = default_origin
+                                        retained = retained or default_retained
+                            states.append((origin, retained))
+                        elif isinstance(producer, ast.Import):
+                            alias = next(alias for alias in producer.names if (alias.asname or alias.name.split(".", 1)[0]) == value.id)
+                            states.append((("module", alias.name if alias.asname else alias.name.split(".", 1)[0]), False))
+                        elif isinstance(producer, ast.ImportFrom):
+                            alias = next(alias for alias in producer.names if (alias.asname or alias.name) == value.id)
+                            target = from_module(module, unit, producer.level, producer.module)
+                            origin = None if target is None else bindings.get((target, alias.name))
+                            if target is not None and target + "." + alias.name in modules:
+                                origin = ("module", target + "." + alias.name)
+                            states.append((origin, origin is not None and origin[0] in retained_enum_kinds))
+                        elif isinstance(producer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            # A module-bound (even unknown) function identity does
+                            # not erase its actual eager defaults. Body effects are
+                            # independently checked; local closures also retain the
+                            # body captures already followed by the lexical walk.
+                            origin = expression(module, value) if parents.get(id(producer)) is unit.tree else None
+                            retained = False
+                            if isinstance(producer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                retained = any(retained_enum_state(default, seen)[1] for _, default in retained_callable_defaults(producer))
+                            if parents.get(id(producer)) is not unit.tree:
+                                retained = retained or (
+                                    retained_callable_capture(producer, seen)
+                                    if isinstance(producer, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                    else retained_enum_state(producer, seen)[1]
+                                )
+                            states.append((origin, retained))
+                        elif isinstance(producer, ast.ExceptHandler):
+                            states.append((None, False))
+                        elif isinstance(producer, (ast.MatchAs, ast.MatchStar, ast.MatchMapping)):
+                            owner = parents.get(id(producer))
+                            while owner is not None and not isinstance(owner, ast.Match):
+                                owner = parents.get(id(owner))
+                            states.append(retained_enum_state(owner.subject, seen) if owner is not None else (None, False))
+                        else:
+                            owner = parents.get(id(producer))
+                            while owner is not None and not isinstance(
+                                owner,
+                                (
+                                    ast.Assign,
+                                    ast.AnnAssign,
+                                    ast.AugAssign,
+                                    ast.NamedExpr,
+                                    ast.For,
+                                    ast.AsyncFor,
+                                    ast.comprehension,
+                                    ast.withitem,
+                                    ast.Module,
+                                    ast.FunctionDef,
+                                    ast.AsyncFunctionDef,
+                                    ast.Lambda,
+                                ),
+                            ):
+                                owner = parents.get(id(owner))
+                            source = None
+                            if isinstance(owner, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                                source = owner.value
+                            elif isinstance(owner, (ast.For, ast.AsyncFor, ast.comprehension)):
+                                source = owner.iter
+                            elif isinstance(owner, ast.withitem):
+                                source = owner.context_expr
+                            origin, retained = retained_enum_state(source, seen)
+                            if isinstance(owner, (ast.For, ast.AsyncFor, ast.comprehension)):
+                                origin = retained_iteration_element(origin)
+                            states.append((origin, retained))
+                    origins = {origin for origin, _ in states}
+                    return (completed := ((next(iter(origins)) if len(origins) == 1 else None), any(retained for _, retained in states)))
+                if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return (completed := (None, retained_callable_capture(value, seen - {id(value)})))
+                if isinstance(value, ast.Lambda):
+                    return (
+                        completed := (
+                            None,
+                            retained_callable_capture(value, seen - {id(value)}) or retained_enum_state(value.body, seen)[1],
+                        )
+                    )
+                if isinstance(value, ast.Attribute):
+                    base, retained = retained_enum_state(value.value, seen)
+                    origin = retained_supplier_attribute(base, value.attr)
+                    if origin is None and base is not None and base[0] == "module":
+                        target = base[1] + "." + value.attr
+                        origin = bindings.get((base[1], value.attr))
+                        if origin is None and target in selected:
+                            origin = ("object", target)
+                        if target in modules:
+                            origin = ("module", target)
+                    if origin is not None and origin[0] == "supplier-scalar":
+                        return (completed := (origin, False))
+                    return (completed := (origin, retained or (origin is not None and origin[0] in retained_enum_kinds)))
+                if isinstance(value, ast.Call):
+                    callee, retained = retained_enum_state(value.func, seen)
+                    origin = None
+                    if callee is not None and callee[0] == "object":
+                        if callee[1] in supplier_enum_classes:
+                            origin = ("enum-value", callee[1])
+                        elif callee[1] in supplier_enum_record_fields:
+                            origin = ("enum-record", callee[1])
+                    if callee == scoped_expression(value.func, value):
+                        actual_origin = scoped_expression(value, value)
+                        if actual_origin is not None:
+                            origin = actual_origin
+                    # The boolean result is scalar; retained_supplier_effect must
+                    # separately close its actual class-check operand transfer.
+                    # type/cast and container conversions retain their inputs.
+                    if (
+                        callee in {("object", "builtins.isinstance"), ("object", "builtins.issubclass")}
+                        and len(value.args) == 2
+                        and not value.keywords
+                    ):
+                        return (completed := (("supplier-scalar", callee[1]), False))
+                    if (
+                        callee == ("object", "builtins.str")
+                        and len(value.args) == 1
+                        and not value.keywords
+                        and (argument_origin := retained_enum_state(value.args[0], seen)[0]) is not None
+                        and argument_origin[0] == "enum-value"
+                    ):
+                        return (completed := (("supplier-scalar", callee[1]), False))
+                    if origin is not None and origin[0] == "supplier-scalar":
+                        return (completed := (origin, False))
+                    return (
+                        completed := (
+                            origin,
+                            retained
+                            or (origin is not None and origin[0] in retained_enum_kinds)
+                            or any(
+                                retained_enum_state(argument, seen)[1]
+                                for argument in (*value.args, *(keyword.value for keyword in value.keywords))
+                            ),
+                        )
+                    )
+                # Includes keys, comprehensions, generator/lambda defaults and bodies,
+                # conditional operands, await/yield, and nested call expressions.
+                # Name targets are ignored above; actual lexical producers determine
+                # whether an element is a captured value or a shadowing local.
+                origin = scoped_expression(value, value) if isinstance(value, ast.expr) else None
+                return (
+                    completed := (
+                        origin,
+                        (origin is not None and origin[0] in retained_enum_kinds)
+                        or any(retained_enum_state(child, seen)[1] for child in ast.iter_child_nodes(value)),
+                    )
+                )
+
+            finally:
+                traces.pop()
+                if completed is None:
+                    trace["eligible"] = False
+                footprint = frozenset(trace["footprint"])
+                if traces:
+                    traces[-1]["footprint"].update(footprint)
+                    if not trace["eligible"]:
+                        traces[-1]["eligible"] = False
+                if completed is not None and trace["eligible"]:
+                    # Recursive evaluation may have published this same key.
+                    # Retain only its latest completed witness, never a history.
+                    displaced = entries.get(key)
+                    entries[key] = (footprint, initial_seen.intersection(footprint), completed)
+                    if displaced is None:
+                        memo["previous_entries"].pop(key, None)
+                    else:
+                        memo["previous_entries"][key] = (entries[key], displaced)
+
+        # Completed empty-path queries only. Recursive calls retain their own
+        # seen paths and never consult this fresh per-unit/pass cache.
+        @cache
+        def retained_empty_root_state(value, *, read_target=False, evaluate=retained_enum_state):
+            return evaluate(value, frozenset(), read_target=read_target)
+
+        def retained_expression(value, use, *, read_target=False, retained_enum_kinds=retained_enum_kinds):
+            """Original direct origin plus a denial-only nested-retention tag.
+
+            The compound tag grants no callable, nominal receiver, constructor,
+            scalar projection or sequence-conversion proof. Every old exact
+            consumer predicate still decides its own permissible input roles.
+            """
+            original = scoped_expression(value, use)
+            direct, retained = retained_empty_root_state(value, read_target=read_target)
+            if retained:
+                if direct is not None and direct[0] in retained_supplier_kinds:
+                    return direct
+                return ("enum-compound", "unclosed nested enum retention")
+            if original is not None and original[0] in retained_enum_kinds:
+                # The lexical walk may prove an actual shadow or scalar member
+                # where the old nearest-function resolver followed an outer name.
+                return direct
+            return original
+
+        def class_check_binding_scope(value, *, parents=parents):
+            """Actual execution namespace, not just the nearest function body."""
+            current = value
+            while id(current) in parents:
+                owner = parents[id(current)]
+                if isinstance(owner, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                    if isinstance(value, ast.Name) and isinstance(value.ctx, (ast.Store, ast.Del)):
+                        # Generator targets are local; walrus targets bind outside.
+                        if any(value in ast.walk(generator.target) for generator in owner.generators):
+                            return owner
+                    elif value not in ast.walk(owner.generators[0].iter):
+                        return owner
+                elif isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if current in owner.body:
+                        return owner
+                elif isinstance(owner, ast.Lambda):
+                    if current is owner.body:
+                        return owner
+                elif isinstance(owner, (ast.TypeAlias, ast.Module)):
+                    return owner
+                current = owner
+            return None
+
+        def class_check_builtin_at(
+            value, expected, *, call, parents=parents, unit=unit, class_check_binding_scope=class_check_binding_scope
+        ):
+            """Denial-only lexical confirmation of an existing builtin identity.
+
+            No assignment alias or unknown class namespace proves a builtin.
+            Plain class bodies use their own namespace; closures skip enclosing
+            classes. Defaults and first comprehension iterables execute outside
+            their newly declared scope. Global/nonlocal declarations remain
+            conservative rather than falling back to a same-spelling builtin.
+            """
+            if isinstance(value, ast.Name):
+                name = value.id
+                module_member = False
+            elif isinstance(value, ast.Attribute) and value.attr == expected and isinstance(value.value, ast.Name):
+                name = value.value.id
+                module_member = True
+            else:
+                return False
+            origin_scope = class_check_binding_scope(value)
+            if origin_scope is None:
+                return False
+            scopes = []
+            scope = origin_scope
+            while scope is not None:
+                if isinstance(scope, ast.TypeAlias):
+                    return False
+                if isinstance(scope, ast.ClassDef):
+                    if scope is origin_scope:
+                        # A custom/inherited metaclass can supply arbitrary
+                        # LOAD_NAME values even without an explicit local store.
+                        if scope.bases or scope.keywords or scope.type_params:
+                            return False
+                        # Other eager calls can recover/mutate the current
+                        # class namespace (including locals/exec aliases).
+                        # This narrow receipt does not close those effects.
+                        if any(
+                            isinstance(event, ast.Call) and event is not call and class_check_binding_scope(event) is scope
+                            for event in ast.walk(scope)
+                        ):
+                            return False
+                        scopes.append(scope)
+                else:
+                    scopes.append(scope)
+                if scope is unit.tree:
+                    break
+                scope = class_check_binding_scope(scope)
+            if not scopes or scopes[-1] is not unit.tree:
+                return False
+            events = {id(scope): [] for scope in scopes}
+            for event in ast.walk(unit.tree):
+                event_scope = None
+                if isinstance(event, (ast.Global, ast.Nonlocal)) and name in event.names:
+                    # These declarations can redirect a store out of the local
+                    # namespace. Do not infer a stable global from its spelling.
+                    return False
+                if isinstance(event, ast.Name) and event.id == name and isinstance(event.ctx, (ast.Store, ast.Del)):
+                    event_scope = class_check_binding_scope(event)
+                elif isinstance(event, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    if name in _reserve_parameter_names(event) and id(event) in events:
+                        events[id(event)].append(None)
+                    if not isinstance(event, ast.Lambda) and event.name == name:
+                        event_scope = class_check_binding_scope(event)
+                elif isinstance(event, ast.ClassDef) and event.name == name:
+                    event_scope = class_check_binding_scope(event)
+                elif isinstance(event, (ast.Import, ast.ImportFrom)):
+                    if any(
+                        alias.name == "*"
+                        or (alias.asname or (alias.name.split(".", 1)[0] if isinstance(event, ast.Import) else alias.name)) == name
+                        for alias in event.names
+                    ):
+                        event_scope = class_check_binding_scope(event)
+                elif (isinstance(event, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and event.name == name) or (
+                    isinstance(event, ast.MatchMapping) and event.rest == name
+                ):
+                    event_scope = class_check_binding_scope(event)
+                elif isinstance(event, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) and event.name == name:
+                    return False
+                if event_scope is not None and id(event_scope) in events:
+                    events[id(event_scope)].append(event)
+            for scope in scopes:
+                bindings_here = events[id(scope)]
+                if not bindings_here:
+                    continue
+                if len(bindings_here) != 1:
+                    return False
+                binding = bindings_here[0]
+                # Only the actual direct canonical import closes an explicit
+                # binding. Unknown assignments, formals and later imports refuse.
+                if binding is None or binding.lineno >= value.lineno:
+                    return False
+                if module_member:
+                    return (
+                        isinstance(binding, ast.Import)
+                        and len(binding.names) == 1
+                        and binding.names[0].name == "builtins"
+                        and (binding.names[0].asname or "builtins") == name
+                    )
+                return (
+                    isinstance(binding, ast.ImportFrom)
+                    and binding.level == 0
+                    and binding.module == "builtins"
+                    and len(binding.names) == 1
+                    and binding.names[0].name == expected
+                    and (binding.names[0].asname or expected) == name
+                )
+            return not module_member and name == expected
+
+        def retained_class_check_closed(
+            node, target, *, scoped_expression=scoped_expression, class_check_builtin_at=class_check_builtin_at
+        ):
+            """Close only the universal builtin recipient, never a custom hook.
+
+            isinstance/issubclass can transfer their first operand to a class-
+            info metaclass hook even though their result is a boolean. Exact
+            builtin object is the existing supported recipient with no such
+            user hook. issubclass additionally needs an actual class object;
+            an arbitrary value can expose a user-defined __bases__ descriptor.
+            """
+            if (
+                len(node.args) != 2
+                or node.keywords
+                or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or scoped_expression(node.args[1], node) != ("object", "builtins.object")
+                or not class_check_builtin_at(node.args[1], "object", call=node)
+                or not class_check_builtin_at(node.func, target[1].rsplit(".", 1)[-1], call=node)
+            ):
+                return False
+            if target == ("object", "builtins.isinstance"):
+                return True
+            subject = scoped_expression(node.args[0], node)
+            return (
+                target == ("object", "builtins.issubclass")
+                and subject is not None
+                and subject[0] in {"object", "enum-recovered-class"}
+                and subject[1] in {*supplier_enum_classes, *supplier_enum_record_fields, "builtins.object", "builtins.type"}
+            )
+
+        def retained_supplier_effect(
+            node,
+            *,
+            retained_expression=retained_expression,
+            retained_iteration_stores=retained_iteration_stores,
+            parents=parents,
+            retained_iteration_targets=retained_iteration_targets,
+            retained_class_check_closed=retained_class_check_closed,
+            retained_enum_kinds=retained_enum_kinds,
+            unit=unit,
+        ):
+            if additional_supplier_roots:
+                field_slots = {"model_fields", "__pydantic_fields__"}
+                # These are integrity dependencies of metadata recovery, not
+                # accepted model receivers or a new nominal class grant.
+                if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.attr in field_slots:
+                    return "retained model field-table slot replaced "
+                if isinstance(node, ast.ClassDef):
+                    for statement in node.body:
+                        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                            if statement.name in field_slots:
+                                return "retained model field-table declaration shadows supplier "
+                        elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                            if any(isinstance(target, ast.Name) and target.id in field_slots for target in targets):
+                                return "retained model field-table declaration shadows supplier "
+                if isinstance(node, ast.Call):
+                    target = retained_expression(node.func, node)
+                    if (
+                        target
+                        in {
+                            ("object", "builtins.setattr"),
+                            ("object", "builtins.delattr"),
+                            ("member", "builtins.object.__setattr__"),
+                            ("member", "builtins.object.__delattr__"),
+                            ("member", "builtins.type.__setattr__"),
+                            ("member", "builtins.type.__delattr__"),
+                        }
+                        and len(node.args) >= 2
+                        and isinstance(node.args[1], ast.Constant)
+                        and type(node.args[1].value) is str
+                        and node.args[1].value in field_slots
+                    ):
+                        return "retained model field-table slot reflected replacement "
+                if (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                    and isinstance(node.slice, ast.Constant)
+                    and type(node.slice.value) is str
+                    and node.slice.value in field_slots
+                ):
+                    namespace = retained_expression(node.value, node)
+                    direct_namespace = (isinstance(node.value, ast.Attribute) and node.value.attr == "__dict__") or (
+                        isinstance(node.value, ast.Call)
+                        and len(node.value.args) == 1
+                        and not node.value.keywords
+                        and retained_expression(node.value.func, node.value) == ("object", "builtins.vars")
+                    )
+                    if direct_namespace or (
+                        namespace is not None
+                        and (namespace[0] in {"namespace", "retained-supplier-namespace"} or namespace == ("unknown", "vars"))
+                    ):
+                        return "retained model field-table namespace replaced "
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                supplied = list(node.decorator_list)
+                if isinstance(node, ast.ClassDef):
+                    supplied.extend(node.bases)
+                    supplied.extend(keyword.value for keyword in node.keywords)
+                if any(
+                    (origin := retained_expression(value, value)) is not None and origin[0] in retained_enum_kinds for value in supplied
+                ):
+                    return "retained enum declaration transfer is unclosed "
+            if isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                receiver = retained_expression(node.value, node)
+                if receiver is not None and receiver[0] in retained_supplier_kinds:
+                    return "retained supplier mutated through unclosed receiver "
+                if isinstance(node, ast.Subscript):
+                    key = retained_expression(node.slice, node)
+                    if key is not None and key[0] in retained_enum_kinds:
+                        return "retained supplier stored as unclosed carrier key "
+            if isinstance(node, ast.AugAssign):
+                retained_values = (retained_expression(node.value, node), retained_expression(node.target, node, read_target=True))
+                if any(origin is not None and origin[0] in retained_supplier_kinds for origin in retained_values):
+                    return "retained supplier augmentation is unclosed "
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and retained_callable_capture(node):
+                # An unclosed callable stores eager defaults/free captures
+                # even without a matching Return; importing it cannot erase
+                # their actual custody. No producer exception is added.
+                return "retained enum callable capture is unclosed "
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                retained_value = retained_expression(node.value, node)
+                if retained_value is not None and retained_value[0] in retained_supplier_kinds:
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    for target in targets:
+                        if any(isinstance(part, (ast.Attribute, ast.Subscript)) for part in ast.walk(target)):
+                            # Unknown object/dict storage does not preserve a
+                            # lexical binding origin. Its later readers cannot
+                            # inherit a nominal/callback grant from this write.
+                            return "retained supplier stored in unclosed carrier "
+                        if _lexical_scope(node) is not None and isinstance(_lexical_scope(node), ast.ClassDef):
+                            return "retained supplier stored in class namespace "
+            if isinstance(node, ast.Lambda) and (unit.path, id(node)) not in validated_immediate_lambdas:
+                captures = [node.body, *node.args.defaults, *(default for default in node.args.kw_defaults if default is not None)]
+                if any(
+                    (origin := retained_expression(capture, capture)) is not None and origin[0] in retained_supplier_kinds
+                    for capture in captures
+                ) or any(
+                    (origin := retained_expression(child, child)) is not None and origin[0] in retained_supplier_kinds
+                    for capture in captures
+                    for child in ast.walk(capture)
+                    if isinstance(child, (ast.Name, ast.Attribute, ast.Subscript, ast.Call))
+                ):
+                    # Lambda bodies have no Return AST. A captured leaf/default
+                    # still retains its metadata even when wrapped in a list,
+                    # comprehension or returned callable. Exact previously
+                    # proved immediate consumers keep their same-node receipt.
+                    return "retained supplier lambda metadata capture is unclosed "
+            if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                element = retained_iteration_element(retained_expression(node.iter, node.iter))
+                if element is not None:
+                    targets = retained_iteration_targets(node.target)
+                    if targets is None:
+                        return "retained supplier iteration target is unclosed "
+                    for target in targets:
+                        scopes = _reserve_dataclass_field_read_scopes(target, target.id, parents)
+                        scope = next(scopes, None)
+                        if scope is None:
+                            scope = _lexical_scope(target)
+                        if isinstance(scope, ast.ClassDef):
+                            return "retained supplier class namespace iteration is unclosed "
+                        stores = retained_iteration_stores.get((id(scope), target.id), ())
+                        if len(stores) != 1 or stores[0] is not target:
+                            return "retained supplier iteration binding is unclosed "
+            if isinstance(node, ast.Call):
+                target = retained_expression(node.func, node)
+                metadata_query_call = target is not None and target[0] == "metadata-query" and len(node.args) == 1 and not node.keywords
+                metadata_dictionary_view_call = (
+                    target in metadata_dictionary_methods
+                    and isinstance(node.func, ast.Attribute)
+                    and retained_expression(node.func.value, node) == metadata_dictionary_origin
+                    and not node.args
+                    and not node.keywords
+                )
+                if (
+                    target is not None
+                    and target[0] in retained_supplier_kinds - {"framework-router"}
+                    and not metadata_query_call
+                    and not metadata_dictionary_view_call
+                ):
+                    return "retained supplier callable recovered "
+                if (
+                    target
+                    in {
+                        ("object", "builtins.setattr"),
+                        ("object", "builtins.delattr"),
+                        ("member", "builtins.object.__setattr__"),
+                        ("member", "builtins.object.__delattr__"),
+                        ("member", "builtins.type.__setattr__"),
+                        ("member", "builtins.type.__delattr__"),
+                    }
+                    and node.args
+                ):
+                    owner = retained_expression(node.args[0], node)
+                    if owner is not None and owner[0] in retained_supplier_kinds:
+                        return "retained supplier reflected replacement "
+                if (
+                    target
+                    in {
+                        ("member", "builtins.object.__getattribute__"),
+                        ("member", "builtins.type.__getattribute__"),
+                    }
+                    and node.args
+                ):
+                    owner = retained_expression(node.args[0], node)
+                    if owner is not None and owner[0] in {*retained_supplier_kinds, "supplier-data-instance"}:
+                        return "retained supplier descriptor recovery "
+                arguments = [*node.args, *(keyword.value for keyword in node.keywords)]
+                if target in {("object", "builtins.isinstance"), ("object", "builtins.issubclass")}:
+                    retained_operands = any(
+                        (origin := retained_expression(argument, node)) is not None and origin[0] in retained_supplier_kinds
+                        for argument in arguments
+                    )
+                    subject = retained_expression(node.args[0], node) if node.args else None
+                    protected_class_subject = (
+                        subject is not None
+                        and subject[0] == "object"
+                        and subject[1] in {*supplier_enum_classes, *supplier_enum_record_fields}
+                    )
+                    if (retained_operands or protected_class_subject) and not retained_class_check_closed(node, target):
+                        return "retained supplier class-check recipient is unclosed "
+                enum_arguments = [
+                    origin
+                    for argument in arguments
+                    if (origin := retained_expression(argument, node)) is not None and origin[0] in retained_enum_kinds
+                ]
+                if enum_arguments:
+                    direct_owner = (
+                        target is not None and target[0] == "object" and target[1] in {*supplier_enum_classes, *supplier_enum_record_fields}
+                    )
+                    inert_consumer = target in {
+                        ("object", "builtins.isinstance"),
+                        ("object", "builtins.issubclass"),
+                        ("object", "builtins.type"),
+                        ("pure", "typing.cast"),
+                        ("object", "typing.cast"),
+                    }
+                    preserving_conversion = (
+                        target
+                        in {
+                            ("object", "builtins.tuple"),
+                            ("object", "builtins.list"),
+                            ("object", "builtins.set"),
+                            ("object", "builtins.frozenset"),
+                        }
+                        and len(node.args) == 1
+                        and not node.keywords
+                        and all(origin[0] in {"enum-sequence", "enum-record-sequence"} for origin in enum_arguments)
+                    )
+                    scalar_projection = (
+                        target == ("object", "builtins.str")
+                        and len(node.args) == 1
+                        and not node.keywords
+                        and enum_arguments[0][0] == "enum-value"
+                    )
+                    identity_argument = None
+                    if target is not None and target[0] == "object" and target[1] in enum_identity_consumers:
+                        receiver_parameter = enum_identity_consumers[target[1]]
+                        if len(node.args) == 2 and not node.keywords:
+                            identity_argument = node.args[1]
+                        elif len(node.args) == 1 and len(node.keywords) == 1 and node.keywords[0].arg == "capability":
+                            identity_argument = node.keywords[0].value
+                        elif (
+                            not node.args
+                            and len(node.keywords) == 2
+                            and {keyword.arg for keyword in node.keywords} == {receiver_parameter, "capability"}
+                        ):
+                            identity_argument = next(keyword.value for keyword in node.keywords if keyword.arg == "capability")
+                    identity_consumer = identity_argument is not None and all(
+                        argument is identity_argument
+                        or (origin := retained_expression(argument, node)) is None
+                        or origin[0] not in retained_enum_kinds
+                        for argument in arguments
+                    )
+                    schema_capability_consumer = (
+                        schema_capability["owner"] is not None
+                        and target == ("object", schema_capability["owner"])
+                        and (
+                            (len(node.args) == 1 and not isinstance(node.args[0], ast.Starred) and not node.keywords)
+                            or (not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "value")
+                        )
+                    )
+                    disclosure_keywords = {keyword.arg for keyword in node.keywords}
+                    disclosure_consumer = (
+                        control_disclosure["owner"] is not None
+                        and target == ("object", control_disclosure["owner"])
+                        and not node.args
+                        and len(disclosure_keywords) == len(node.keywords)
+                        and {"capability", "control_plugin", "llm_component_id", "llm_component_kind", "role"} <= disclosure_keywords
+                        and disclosure_keywords
+                        <= {
+                            "capability",
+                            "control_plugin",
+                            "llm_component_id",
+                            "llm_component_kind",
+                            "role",
+                            "protected_fields",
+                            "scanned_fields",
+                        }
+                        and all(
+                            (origin := retained_expression(keyword.value, node)) is None
+                            or origin[0] not in retained_enum_kinds
+                            or (
+                                keyword.arg in control_disclosure["parameters"]
+                                and origin == ("enum-value", control_disclosure["parameters"][keyword.arg])
+                            )
+                            for keyword in node.keywords
+                        )
+                    )
+                    control_options_consumer = (
+                        control_options["owner"] is not None
+                        and target == ("object", control_options["owner"])
+                        and not node.args
+                        and len(node.keywords) == 6
+                        and {keyword.arg for keyword in node.keywords}
+                        == {"plugin_name", "alias", "fields", "summaries", "role", "disclosure_draft"}
+                        and all(
+                            (origin := retained_expression(keyword.value, node)) is None
+                            or origin[0] not in retained_enum_kinds
+                            or (keyword.arg == "role" and origin == ("enum-value", control_options["role"]))
+                            for keyword in node.keywords
+                        )
+                    )
+                    if not (
+                        direct_owner
+                        or inert_consumer
+                        or preserving_conversion
+                        or scalar_projection
+                        or identity_consumer
+                        or schema_capability_consumer
+                        or disclosure_consumer
+                        or control_options_consumer
+                    ):
+                        return "retained enum value passed to unclosed caller "
+                metadata_scalar_call = (
+                    target is not None
+                    and target[0] == "object"
+                    and target[1] in metadata_scalar_owners
+                    and (
+                        (len(node.args) == 1 and not node.keywords)
+                        or (
+                            not node.args
+                            and len(node.keywords) == 1
+                            and node.keywords[0].arg == metadata_scalar_parameters[target[1].rsplit(".", 1)[-1]]
+                        )
+                    )
+                )
+                metadata_normalizer_call = (
+                    target is not None
+                    and target[0] == "object"
+                    and target[1] in metadata_normalizer_owners
+                    and (
+                        (len(node.args) == 2 and not node.keywords)
+                        or (
+                            not node.args
+                            and len(node.keywords) == 2
+                            and {keyword.arg for keyword in node.keywords} == {"field_type", "metadata"}
+                        )
+                    )
+                )
+                metadata_internal_call = (unit.path, id(node)) in metadata_normalizer_internal_calls or (
+                    unit.path,
+                    id(node),
+                ) in approval_metadata["calls"]
+                if (
+                    not (metadata_scalar_call or metadata_normalizer_call or metadata_internal_call)
+                    and target
+                    not in {
+                        ("object", "builtins.isinstance"),
+                        ("object", "builtins.issubclass"),
+                        ("object", "builtins.type"),
+                        ("pure", "typing.cast"),
+                        ("object", "typing.get_args"),
+                        ("object", "typing.get_origin"),
+                    }
+                    and any(
+                        (unit.path, id(node), id(argument)) not in status_literals["arguments"]
+                        and (unit.path, id(node), id(argument)) not in environment_annotations["arguments"]
+                        and (unit.path, id(node), id(argument)) not in event_mapping["arguments"]
+                        and (origin := retained_expression(argument, node)) is not None
+                        and origin[0]
+                        in {
+                            "enum-recovered-class",
+                            "framework-model",
+                            "enum-metadata",
+                            "retained-supplier-namespace",
+                            "supplier-recovered-class",
+                            "supplier-class-metadata",
+                            "type-metadata",
+                            "type-fields",
+                            "type-field",
+                            "schema-node",
+                            "schema-nodes",
+                            "metadata-query",
+                        }
+                        for argument in arguments
+                    )
+                ):
+                    return "retained supplier metadata transferred "
+            if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
+                origin = retained_expression(node.value, node)
+                if (
+                    origin is not None
+                    and origin[0] in retained_enum_kinds
+                    and (unit.path, id(node)) not in prompt_renderer["returns"]
+                    and (unit.path, id(node)) not in schema_capability["returns"]
+                    and (unit.path, id(node)) not in prompt_arguments["returns"]
+                ):
+                    # A nominal immutable record still retains a live enum
+                    # singleton. Unclosed producer calls must not lose that
+                    # origin merely because their bodies return or yield it.
+                    return "retained enum producer return is unclosed "
+                if (
+                    origin is not None
+                    and origin[0]
+                    in {
+                        "enum-recovered-class",
+                        "framework-model",
+                        "enum-metadata",
+                        "retained-supplier-namespace",
+                        "supplier-recovered-class",
+                        "supplier-class-metadata",
+                        "type-metadata",
+                        "type-fields",
+                        "type-field",
+                        "schema-node",
+                        "schema-nodes",
+                        "metadata-query",
+                    }
+                    and (unit.path, id(node)) not in metadata_normalizer_return_sites
+                    and (unit.path, id(node)) not in sensitive_factory["returns"]
+                    and (unit.path, id(node)) not in environment_annotations["returns"]
+                ):
+                    return "retained supplier metadata escaped "
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                owner = retained_expression(node.value, node)
+                if (
+                    owner is not None
+                    and owner[0] == "namespace"
+                    and owner[1] in retained_supplier_modules
+                    and (
+                        not isinstance(node.slice, ast.Constant)
+                        or type(node.slice.value) is not str
+                        or (owner[1], node.slice.value) in retained_supplier_bindings
+                    )
+                ):
+                    return "retained supplier binding namespace recovery "
+            return None
+
         for node in ast.walk(unit.tree):
+            retained_effect = retained_supplier_effect(node)
+            if retained_effect is not None:
+                unresolved.append(retained_effect + unit.path + ":" + str(node.lineno))
             if (
                 class_recovery_candidate_sites is not None
                 and isinstance(node, ast.Call)
@@ -7967,7 +12807,12 @@ def _reserve_selected_origin_effect_failures(
                 and scoped_expression(node.func, node) == ("object", "builtins.type")
             ):
                 argument = scoped_expression(node.args[0], node)
-                protected_argument = argument is not None and argument[0] == "instance" and argument[1] in selected
+                protected_argument = argument is not None and (
+                    (argument[0] == "instance" and argument[1] in selected)
+                    or (argument[0] == "enum-value" and argument[1] in supplier_enum_classes)
+                    or (argument[0] == "enum-record" and argument[1] in supplier_enum_record_fields)
+                    or (argument[0] == "supplier-data-instance" and argument[1] in supplier_data_classes)
+                )
                 if not protected_argument and isinstance(node.args[0], ast.Name) and node.args[0].id == "self":
                     owner = parents.get(id(node))
                     while owner is not None and not isinstance(owner, ast.ClassDef):
@@ -7975,6 +12820,90 @@ def _reserve_selected_origin_effect_failures(
                     protected_argument = owner is not None and module + "." + owner.name in selected
                 if protected_argument:
                     class_recovery_candidate_sites.append((unit.path, id(node)))
+            if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+                field_origin = scoped_expression(node, node)
+                if (
+                    additional_supplier_roots
+                    and field_origin == ("object", approval_class)
+                    and not _reserve_approval_binding_class_use(node, unit, parents, scoped_expression)
+                ):
+                    unresolved.append("approval field consumer class reference escaped " + unit.path + ":" + str(node.lineno))
+                if field_origin is not None and field_origin[0] == "lazy-type":
+                    consumer = parents.get(id(node))
+                    cast_type_operand = (
+                        isinstance(consumer, ast.Call)
+                        and len(consumer.args) == 2
+                        and not consumer.keywords
+                        and consumer.args[0] is node
+                        and scoped_expression(consumer.func, consumer) in {("pure", "typing.cast"), ("object", "typing.cast")}
+                    )
+                    alias_operand = node
+                    while isinstance(parents.get(id(alias_operand)), (ast.Tuple, ast.List, ast.Subscript, ast.BinOp)):
+                        alias_operand = parents[id(alias_operand)]
+                    alias_owner = parents.get(id(alias_operand))
+                    retained_type_declaration = legacy_supplier_type_alias(module, alias_owner) or (
+                        isinstance(alias_owner, ast.TypeAlias)
+                        and alias_owner.value is alias_operand
+                        and parents.get(id(alias_owner)) is unit.tree
+                        and isinstance(alias_owner.name, ast.Name)
+                        and supplier_type_syntax(alias_operand, module + "." + alias_owner.name.id)
+                    )
+                    if (
+                        protected_load_role(node) not in {"postponed_annotation", "unevaluated_local_annotation"}
+                        and not cast_type_operand
+                        and not retained_type_declaration
+                    ):
+                        unresolved.append("canonical supplier lazy alias escaped " + unit.path + ":" + str(node.lineno))
+                if (
+                    field_origin is not None
+                    and field_origin[0] in {"object", "pure"}
+                    and field_origin[1] in new_supplier_roots
+                    and field_origin[1] not in immutable_supplier_origins
+                    and not field_origin[1].startswith("builtins.")
+                    and protected_load_role(node) not in {"postponed_annotation", "unevaluated_local_annotation"}
+                    and (unit.path, id(node)) not in validated_supplier_uses
+                    and not supplier_structural_role(node, field_origin)
+                ):
+                    unresolved.append(
+                        "canonical supplier first-class role is unproved " + unit.path + ":" + str(node.lineno) + ":" + field_origin[1]
+                    )
+                if field_origin == ("object", "elspeth.contracts.data.validate_row") and field_receiver_origins:
+                    field_consumer = parents.get(id(node))
+                    if not (isinstance(field_consumer, ast.Call) and field_consumer.func is node):
+                        unresolved.append("field receiver annotation owner escaped " + unit.path + ":" + str(node.lineno))
+                if (field_receiver_origins or _reserve_AUDIT_EVIDENCE_SINK in captured_callable_origins) and field_origin in {
+                    ("pure", "typing.cast"),
+                    ("object", "typing.cast"),
+                }:
+                    field_consumer = parents.get(id(node))
+                    if not (isinstance(field_consumer, ast.Call) and field_consumer.func is node):
+                        unresolved.append("field receiver cast supplier reference escaped " + unit.path + ":" + str(node.lineno))
+                if field_origin == ("object", "dataclasses.field"):
+                    field_consumer = parents.get(id(node))
+                    if not (isinstance(field_consumer, ast.Call) and field_consumer.func is node):
+                        unresolved.append("field supplier reference outside direct call " + unit.path + ":" + str(node.lineno))
+                if (
+                    field_origin is not None
+                    and field_origin[0] == "object"
+                    and field_origin[1] in field_receiver_leaves
+                    and not _reserve_dataclass_field_class_use(node, unit, parents)
+                ):
+                    unresolved.append("field receiver class reference escaped " + unit.path + ":" + str(node.lineno))
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr
+                in {
+                    "__class__",
+                    "__mro__",
+                    "__bases__",
+                    "__subclasses__",
+                    "__annotations__",
+                }
+            ):
+                field_origin = scoped_expression(node.value, node)
+                if field_origin is not None and field_origin[0] == "object" and field_origin[1] in field_receiver_origins:
+                    unresolved.append("field receiver allocation reflection " + unit.path + ":" + str(node.lineno))
             if protected_use_nodes is not None and isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
                 origin = scoped_expression(node, node)
                 if origin is not None and (
@@ -8126,6 +13055,7 @@ def _reserve_selected_origin_effect_failures(
                         or (
                             origin[0] in {"object", "module", "config-entry", "member", "instance"}
                             and (origin[1] in selected or origin[1] in selected_modules or protected_receiver_method(origin[1]))
+                            and origin[1] not in immutable_supplier_origins
                             and not origin[1].startswith("builtins.")
                         )
                     )
@@ -8133,6 +13063,8 @@ def _reserve_selected_origin_effect_failures(
                 )
 
                 def captured_lambda_origin(nested, child, *, parents=parents, module=module):
+                    if isinstance(child, ast.Name) and expression(module, child) == ("object", "dataclasses.field"):
+                        return scoped_expression(child, child)
                     if isinstance(child, ast.Name):
                         bound = child.id
                         parameters = {argument.arg for argument in (*nested.args.posonlyargs, *nested.args.args, *nested.args.kwonlyargs)}
@@ -8156,11 +13088,12 @@ def _reserve_selected_origin_effect_failures(
                         or (
                             origin[0] in {"object", "module", "config-entry", "member", "instance"}
                             and (origin[1] in selected or origin[1] in selected_modules or protected_receiver_method(origin[1]))
+                            and origin[1] not in immutable_supplier_origins
                             and not origin[1].startswith("builtins.")
                         )
                     )
                     for nested in ast.walk(node.value)
-                    if isinstance(nested, ast.Lambda)
+                    if isinstance(nested, ast.Lambda) and (unit.path, id(nested)) not in validated_immediate_lambdas
                     for child in ast.walk(nested.body)
                     if isinstance(child, (ast.Name, ast.Attribute))
                 )
@@ -8175,26 +13108,52 @@ def _reserve_selected_origin_effect_failures(
                     unresolved.append("selected capability escaped by return/yield " + unit.path + ":" + str(node.lineno))
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 base = scoped_expression(node.value, node)
-                if base is not None and base[0] == "unknown" and node.attr in protected_attribute_names | _reserve_RESERVE_FAMILY:
+                if (
+                    base is not None
+                    and base[0] == "unknown"
+                    and node.attr in protected_attribute_names | _reserve_RESERVE_FAMILY
+                    and (unit.path, id(node)) not in field_receiver_stores
+                ):
                     unresolved.append("unknown protected attribute receiver " + unit.path + ":" + str(node.lineno))
                 elif base is not None and (
                     base[0] == "unknown-module"
+                    or base[0] in retained_supplier_kinds
+                    or base[1] + "." + node.attr in protected_supplier_bindings
                     or base[1] + "." + node.attr in selected
                     or (base[0] in {"object", "instance"} and base[1] in selected)
+                    or (
+                        (bool(field_receiver_origins) or _reserve_AUDIT_EVIDENCE_SINK in captured_callable_origins)
+                        and base == ("pure", "typing.cast")
+                    )
                     or (base[0] == "member" and protected_receiver_method(base[1]))
                 ):
                     unresolved.append("selected origin attribute replaced " + unit.path + ":" + str(node.lineno))
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+                alias_namespace = scoped_expression(node.value, node)
+                if (
+                    alias_namespace is not None
+                    and alias_namespace[0] == "namespace"
+                    and alias_namespace[1] in supplier_type_alias_modules
+                    and (
+                        not isinstance(node.slice, ast.Constant)
+                        or type(node.slice.value) is not str
+                        or (alias_namespace[1], node.slice.value) in supplier_type_alias_bindings
+                    )
+                ):
+                    unresolved.append("canonical supplier type alias namespace recovery " + unit.path + ":" + str(node.lineno))
             if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 base = scoped_expression(node.value, node)
                 if plugin_namespace(node.value) and (not isinstance(node.slice, ast.Constant) or node.slice.value == "PLUGIN_SCAN_CONFIG"):
                     unresolved.append("selected plugin namespace configuration replaced " + unit.path + ":" + str(node.lineno))
                 if base is not None and (
                     (base[0] in {"object", "unknown-module", "config-entry"} and base[1] in selected)
+                    or base[0] in retained_supplier_kinds
                     or (
                         base[0] == "namespace"
                         and (base[1] in selected_modules or base[1] in selected or protected_receiver_method(base[1]))
                         and (
                             not isinstance(node.slice, ast.Constant)
+                            or base[1] + "." + str(node.slice.value) in protected_supplier_bindings
                             or base[1] + "." + str(node.slice.value) in selected
                             or str(node.slice.value) in receiver_members.get(base[1], set())
                         )
@@ -8207,6 +13166,15 @@ def _reserve_selected_origin_effect_failures(
                     unresolved.append("selected plugin config entry augmented " + unit.path + ":" + str(node.lineno))
             if isinstance(node, ast.Call):
                 target = scoped_expression(node.func, node)
+                if (
+                    target == ("object", "builtins.type")
+                    and len(node.args) == 1
+                    and not node.keywords
+                    and (field_origin := scoped_expression(node.args[0], node)) is not None
+                    and field_origin[0] == "object"
+                    and field_origin[1] in field_receiver_origins
+                ):
+                    unresolved.append("field receiver allocation reflection " + unit.path + ":" + str(node.lineno))
                 if any(
                     guarded_constructed_instance(argument, node) for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                 ) and not normal_owned_carrier_call(node):
@@ -8278,16 +13246,20 @@ def _reserve_selected_origin_effect_failures(
                         unresolved.append("selected plugin binder call origin changed " + unit.path + ":" + str(node.lineno))
                     else:
                         plugin_call_counts[name] += 1
-                protected_owners = {
-                    "elspeth.web.composer.service.ComposerServiceImpl",
-                    "elspeth.web.sessions.composer_app_services.ComposerAppServices",
-                    "elspeth.web.required_work.RequiredWorkAuthority",
-                    "elspeth.web.required_work.RequiredWorkKey",
-                    "elspeth.web.required_work.RequiredWorkTicket",
-                    "elspeth.web.required_work.RequiredWorkCoordinator",
-                    "elspeth.web.execution_lease_cleanup.ExecutionAcquisitionObligation",
-                    "elspeth.web.operator_telemetry_installation.TelemetryInstallation",
-                } | set(receiver_members)
+                protected_owners = (
+                    {
+                        "elspeth.web.composer.service.ComposerServiceImpl",
+                        "elspeth.web.sessions.composer_app_services.ComposerAppServices",
+                        "elspeth.web.required_work.RequiredWorkAuthority",
+                        "elspeth.web.required_work.RequiredWorkKey",
+                        "elspeth.web.required_work.RequiredWorkTicket",
+                        "elspeth.web.required_work.RequiredWorkCoordinator",
+                        "elspeth.web.execution_lease_cleanup.ExecutionAcquisitionObligation",
+                        "elspeth.web.operator_telemetry_installation.TelemetryInstallation",
+                    }
+                    | set(receiver_members)
+                    | set(field_receiver_origins)
+                )
                 reviewed_authority_construction = (
                     target == ("object", "elspeth.web.required_work.RequiredWorkCoordinator")
                     and len(node.args) == 1
@@ -8310,7 +13282,8 @@ def _reserve_selected_origin_effect_failures(
                     }
                     and (unit.path, id(node)) not in validated_retained_failure_calls
                     and any(
-                        (origin := scoped_expression(argument, node)) is not None
+                        (unit.path, id(node), id(argument)) not in validated_supplier_arguments
+                        and (origin := scoped_expression(argument, node)) is not None
                         and (
                             (origin[0] == "module" and origin[1] in selected_modules)
                             or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
@@ -8338,7 +13311,9 @@ def _reserve_selected_origin_effect_failures(
                         *({("pure", "typing.cast")} if reviewed_noop_cast(node) else set()),
                     }
                     and any(
-                        (origin := scoped_expression(argument, node)) is not None and origin in {("object", owner), ("instance", owner)}
+                        (unit.path, id(node), id(argument)) not in validated_supplier_arguments
+                        and (origin := scoped_expression(argument, node)) is not None
+                        and origin in {("object", owner), ("instance", owner)}
                         for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                         for owner in protected_owners
                     )
@@ -8356,8 +13331,19 @@ def _reserve_selected_origin_effect_failures(
                         and not _reserve_safe_canonical_plugin_bind(unit, node)
                         and (
                             receiver[0] == "unknown-module"
+                            or receiver[0] in retained_supplier_kinds
+                            or receiver[1] + "." + str(selector) in protected_supplier_bindings
+                            or (
+                                selector is None
+                                and receiver[0] == "module"
+                                and any(target.rpartition(".")[0] == receiver[1] for target in protected_supplier_bindings)
+                            )
                             or receiver[1] + "." + str(selector) in selected
                             or (receiver[0] in {"object", "instance"} and receiver[1] in selected)
+                            or (
+                                (bool(field_receiver_origins) or _reserve_AUDIT_EVIDENCE_SINK in captured_callable_origins)
+                                and receiver == ("pure", "typing.cast")
+                            )
                             or (receiver[0] == "member" and protected_receiver_method(receiver[1]))
                             or (
                                 receiver[0] == "object"
@@ -8805,9 +13791,12 @@ class _reserve_ProtectedBoundary:
         effect_closed_supplier_sites=(),
         effect_closed_app_calls=(),
         validated_transfer_calls=(),
+        disjoint_compose_state_writes=(),
+        audit_evidence_recoveries=(),
     ):
         self.failures = tuple(failures)
         self.class_recovery_sites = frozenset(class_recovery_sites)
+        self.audit_evidence_recoveries = frozenset(audit_evidence_recoveries)
         self.reflection_sites = frozenset(reflection_sites)
         self.descriptor_sites = frozenset(descriptor_sites)
         self.supplier_sites = frozenset(supplier_sites)
@@ -8818,6 +13807,7 @@ class _reserve_ProtectedBoundary:
         self.effect_closed_supplier_sites = frozenset(effect_closed_supplier_sites)
         self.effect_closed_app_calls = frozenset(effect_closed_app_calls)
         self.validated_transfer_calls = frozenset(validated_transfer_calls)
+        self.disjoint_compose_state_writes = frozenset(disjoint_compose_state_writes)
 
 
 def _reserve_app_state_slot_failures(units, installation):
@@ -9651,8 +14641,8 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     ):
         return ["composer turn function annotations have unreviewed definition effects"], None
     title_task, title = title_tasks[0], titles[0]
-    prefix = outer.body[4:index] + outer.body[index + 1 : 21]
-    if index != 15 or not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
+    prefix = outer.body[4:index] + outer.body[index + 1 : 24]
+    if index != 18 or not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["captured composer receiver interval has an unreviewed effect"], None
     session_service_stores = [
         node
@@ -9668,7 +14658,7 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
     suffix = outer.body[index + 1 : index + 7]
     dispatch = _reserve_composer_receiver.composer_dispatch_calls(suffix[5]) if len(suffix) == 6 else None
     if (
-        index != 15
+        index != 18
         or [type(statement).__name__ for statement in prelude] != ["ImportFrom", "AsyncFunctionDef"]
         or [type(statement).__name__ for statement in suffix] != ["AnnAssign", "AnnAssign", "Assign", "Assign", "If", "Try"]
         or not isinstance(prelude[0], ast.ImportFrom)
@@ -10377,7 +15367,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/repository.py",
             "_SessionOperationAuthorityRepository",
-            "c734b297e373cf22a78aaf97467e783112424e2be58a5195168496043788ab00",
+            "7b63c99fc4109fae3f8d95330be8344897b3a1f289f932da4f0bd98df69b4e67",
         ),
         (
             "src/elspeth/web/coordination/repository.py",
@@ -10814,7 +15804,7 @@ def _reserve_retained_failure_transfer_receipts(units):
     failure = _reserve_node_at(index[service_path], "SessionServiceImpl.fail_composer_async_operation")
     # Keep the independently checked history/cancellation structure even when a
     # caller grammar is deliberately rebound by an adversarial control.
-    prefix = turn.body[36].body[4:15] + turn.body[36].body[16:21]
+    prefix = turn.body[36].body[4:18] + turn.body[36].body[19:24]
     if not _reserve_composer_receiver.receiver_transfer_prefix(prefix):
         return ["retained/private transfer history ownership or cancellation changed"], frozenset()
     expected = {
@@ -10834,8 +15824,1070 @@ def _reserve_retained_failure_transfer_receipts(units):
     return [], frozenset({*((turn_path, id(node)) for node in history), (service_path, id(private[0]))})
 
 
+_reserve_COMPOSE_ITERATION_STATE_SOURCE = """@dataclass(slots=True)
+class _ComposeIterationState:
+    state: CompositionState
+    initial_version: int
+    llm_messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    recorder: BufferingRecorder
+    composition_turns_used: int
+    discovery_turns_used: int
+    mutation_success_seen: bool
+    discovery_cache: dict[str, CachedDiscoveryPayload]
+    last_validation: ValidationSummary | None
+    runtime_preflight_cache: RuntimePreflightCache
+    last_runtime_preflight: ValidationResult | None
+    anti_anchor: AntiAnchorTracker
+    advisor_calls_used: int
+    repair_turns_used: int
+    advisor_checkpoint_passes_used: int
+    advisor_review_state: _AdvisorReviewState
+    persisted_assistant_message_id: str | None
+    persisted_assistant_content: str | None
+    persisted_tool_call_turn: bool
+    failed_turn: FailedTurnMetadata | None
+    current_state_id: str | None
+    advisor_repair_context_introduced: bool
+    pending_advisor_elision_indices: list[int]
+    turn_evidence: TurnEvidence
+"""
+
+
+_reserve_COMPOSE_ITERATION_BINDINGS_SOURCE = """@dataclass(frozen=True, slots=True)
+class _ComposeIterationBindings:
+    message: str
+    session_id: str | None
+    user_id: str | None
+    user_message_id: str | None
+    deadline: float
+    progress: ComposerProgressSink | None
+    plugin_snapshot: PluginAvailabilitySnapshot
+    policy_catalog: PolicyCatalogView
+    mutation_ceiling: ComposerMutationCeiling | None
+    session_operation_context: SessionOperationContext | None
+    completion_gates: CompletionGateFacts | None
+    diagnostics: _ComposeLoopDiagnostics | None
+    required_work: RequiredWorkBinding | None
+    provider_owner: ProviderInvocationOwner | None
+    ingress: CompositionIngressRecord | None
+    chat_ingress_inputs: list[ChatIngressInput] | None
+    actor: str
+    session_scope: str"""
+
+
+def _reserve_compose_iteration_state_receipt(units):
+    """Prove one private carrier transfer, not a general non-self state writer.
+
+    The constructor and retained argument establish the receiver. An annotation
+    is not evidence of its runtime type. All live uses are the actual slot reads
+    and finally stores; the common origin/effect proof separately closes class,
+    import, descriptor, reflection and bound-method replacement/escape.
+    """
+    service_path = "src/elspeth/web/composer/service.py"
+    carrier_path = "src/elspeth/web/composer/_compose_loop_carriers.py"
+    carrier_origin = "elspeth.web.composer._compose_loop_carriers._ComposeIterationState"
+    method_origin = "elspeth.web.composer.service.ComposerServiceImpl._advance_live_compose_iteration"
+    bindings_origin = "elspeth.web.composer._compose_loop_carriers._ComposeIterationBindings"
+    indexed = {unit.path: unit for unit in units}
+    if len(indexed) != len(units) or service_path not in indexed or carrier_path not in indexed:
+        return ["compose iteration source set is missing or duplicated"], {}
+    service, carrier = indexed[service_path], indexed[carrier_path]
+    helper = _reserve_composer_receiver
+    cls = _reserve_node_at(service, "ComposerServiceImpl")
+    loop = _reserve_node_at(service, "ComposerServiceImpl._compose_loop")
+    advance = _reserve_node_at(service, "ComposerServiceImpl._advance_live_compose_iteration")
+    state_cls = _reserve_node_at(carrier, "_ComposeIterationState")
+    bindings_cls = _reserve_node_at(carrier, "_ComposeIterationBindings")
+    failures = []
+
+    def require(condition, detail):
+        if not condition:
+            failures.append("compose iteration " + detail)
+
+    require(helper.plain_class(cls), "service class/lookup changed")
+    require(helper.owned_binding(service.tree, "ComposerServiceImpl", cls), "service class binding changed")
+    require(helper.owned_binding(carrier.tree, "_ComposeIterationState", state_cls), "carrier class binding changed")
+    require(helper.imported(carrier.tree, "dataclass", "dataclasses", "dataclass"), "dataclass supplier changed")
+    require(helper.owned_binding(carrier.tree, "_ComposeIterationBindings", bindings_cls), "bindings class changed")
+    require(
+        helper.imported(
+            service.tree, "_ComposeIterationBindings", "elspeth.web.composer._compose_loop_carriers", "_ComposeIterationBindings"
+        ),
+        "bindings import changed",
+    )
+    expected_bindings = ast.parse(_reserve_COMPOSE_ITERATION_BINDINGS_SOURCE).body[0]
+    require(
+        isinstance(bindings_cls, ast.ClassDef)
+        and ast.dump(bindings_cls, include_attributes=False) == ast.dump(expected_bindings, include_attributes=False),
+        "bindings constructor effects changed",
+    )
+    require(
+        helper.imported(service.tree, "_ComposeIterationState", "elspeth.web.composer._compose_loop_carriers", "_ComposeIterationState"),
+        "carrier import changed",
+    )
+    for unit in (service, carrier):
+        require(
+            any(
+                isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(a.name == "annotations" for a in node.names)
+                for node in unit.tree.body
+            ),
+            "postponed annotation mode changed " + unit.path,
+        )
+    expected_class = ast.parse(_reserve_COMPOSE_ITERATION_STATE_SOURCE).body[0]
+    require(
+        isinstance(state_cls, ast.ClassDef)
+        and ast.dump(state_cls, include_attributes=False) == ast.dump(expected_class, include_attributes=False),
+        "carrier declaration changed",
+    )
+    require(isinstance(loop, ast.AsyncFunctionDef) and isinstance(advance, ast.AsyncFunctionDef), "selected methods changed")
+    if failures:
+        return failures, {}
+    require(not loop.decorator_list and not advance.decorator_list, "selected method decorator changed")
+    for method in (loop, advance):
+        correct_kind, _ = helper.invocation_kind(service.tree, [cls, method], "NATIVE_COROUTINE")
+        require(correct_kind, "selected method invocation kind changed " + method.name)
+        if not method.args.args or method.args.args[0].arg != "self":
+            failures.append("compose iteration service receiver formal changed " + method.name)
+            continue
+        events = helper.lexical_binding_events(method)
+        require(
+            [(kind, node) for name, kind, node in events if name == "self"] == [("PARAMETER", method.args.args[0])],
+            "service receiver rebound " + method.name,
+        )
+    require(
+        helper.parameters(advance) == ["self", "live", "bindings"]
+        and not advance.args.posonlyargs
+        and not advance.args.kwonlyargs
+        and not advance.args.defaults
+        and not advance.args.kw_defaults
+        and advance.args.vararg is None
+        and advance.args.kwarg is None,
+        "advance formal binding changed",
+    )
+    if failures:
+        return failures, {}
+    fields = tuple(statement.target.id for statement in expected_class.body)
+    constructor_text = "iteration_state = _ComposeIterationState(" + ", ".join(field + "=" + field for field in fields) + ")"
+    constructor_expected = ast.parse(constructor_text).body[0]
+    constructor = loop.body[-3] if len(loop.body) >= 3 else None
+    require(
+        isinstance(constructor, ast.Assign)
+        and ast.dump(constructor, include_attributes=False) == ast.dump(constructor_expected, include_attributes=False),
+        "actual constructor or argument binding changed",
+    )
+    bindings_fields = tuple(statement.target.id for statement in expected_bindings.body)
+    bindings_expected = ast.parse(
+        "iteration_bindings = _ComposeIterationBindings(" + ", ".join(field + "=" + field for field in bindings_fields) + ")"
+    ).body[0]
+    bindings_constructor = loop.body[-2] if len(loop.body) >= 2 else None
+    require(
+        isinstance(bindings_constructor, ast.Assign)
+        and ast.dump(bindings_constructor, include_attributes=False) == ast.dump(bindings_expected, include_attributes=False),
+        "intervening bindings construction changed",
+    )
+    expected_dispatch = ast.parse(
+        "while True:\n"
+        "    result = await self._advance_live_compose_iteration(iteration_state, iteration_bindings)\n"
+        "    if result is not None:\n"
+        "        return result\n"
+    ).body[0]
+    dispatch = loop.body[-1] if loop.body else None
+    require(
+        isinstance(dispatch, ast.While)
+        and ast.dump(dispatch, include_attributes=False) == ast.dump(expected_dispatch, include_attributes=False),
+        "retained bound dispatch/order changed",
+    )
+    if failures:
+        return failures, {}
+    call = dispatch.body[0].value.value
+    constructor_target = constructor.targets[0]
+    retained_argument = call.args[0]
+    require(
+        [node for node in ast.walk(loop) if isinstance(node, ast.Name) and node.id == "iteration_bindings"]
+        == [bindings_constructor.targets[0], call.args[1]],
+        "retained bindings escaped or rebound",
+    )
+    require(
+        [node for node in ast.walk(loop) if isinstance(node, ast.Name) and node.id == "iteration_state"]
+        == [constructor_target, retained_argument],
+        "retained carrier binding escaped or rebound",
+    )
+    require(
+        [(kind, node) for name, kind, node in helper.lexical_binding_events(loop) if name == "iteration_state"]
+        == [("STORE_OR_DELETE", constructor_target)],
+        "retained carrier lexical ownership changed",
+    )
+    # Exact field aliases and finally writes close every use of the formal. A
+    # foreign object, alias, nested capture, global/nonlocal or extra call cannot
+    # acquire the one state-write receipt through an otherwise matching name.
+    expected_aliases = ast.parse("\n".join(field + " = live." + field for field in fields)).body
+    require(
+        ast.dump(ast.Module(body=advance.body[: len(fields)], type_ignores=[]), include_attributes=False)
+        == ast.dump(ast.Module(body=expected_aliases, type_ignores=[]), include_attributes=False),
+        "entry aliases changed",
+    )
+    one_iteration = advance.body[-2] if len(advance.body) >= 2 else None
+    expected_for = ast.parse("for _continuation_iteration in (None,):\n    pass\n").body[0]
+    require(
+        isinstance(one_iteration, ast.For)
+        and ast.dump(one_iteration.target, include_attributes=False) == ast.dump(expected_for.target, include_attributes=False)
+        and ast.dump(one_iteration.iter, include_attributes=False) == ast.dump(expected_for.iter, include_attributes=False)
+        and not one_iteration.orelse
+        and len(one_iteration.body) == 1
+        and isinstance(one_iteration.body[0], ast.Try),
+        "single-iteration transfer changed",
+    )
+    if failures:
+        return failures, {}
+    final = one_iteration.body[0].finalbody
+    expected_final = ast.parse("\n".join("live." + field + " = " + field for field in fields)).body
+    require(
+        ast.dump(ast.Module(body=final, type_ignores=[]), include_attributes=False)
+        == ast.dump(ast.Module(body=expected_final, type_ignores=[]), include_attributes=False),
+        "finally copyback changed",
+    )
+    if failures:
+        return failures, {}
+    allowed_live = {id(statement.value.value) for statement in advance.body[: len(fields)]}
+    allowed_live.update(id(statement.targets[0].value) for statement in final)
+    require(
+        {id(node) for node in ast.walk(advance) if isinstance(node, ast.Name) and node.id == "live"} == allowed_live,
+        "formal receiver escaped or rebound",
+    )
+    require(
+        [(kind, node) for name, kind, node in helper.lexical_binding_events(advance) if name == "live"]
+        == [("PARAMETER", advance.args.args[1])],
+        "formal lexical ownership changed",
+    )
+    # Include unreachable/deferred source forms conservatively. Direct method
+    # references have exactly one caller; reflection and canonical object/module
+    # aliases remain obligations of the common origin/effect pass below.
+    references = [
+        (unit.path, id(node))
+        for unit in units
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Attribute) and node.attr == "_advance_live_compose_iteration"
+    ]
+    require(references == [(service_path, id(call.func))], "bound method reference inventory changed")
+    if failures:
+        return failures, {}
+    annotation = advance.args.args[1].annotation
+    bindings_annotation = advance.args.args[2].annotation
+    require(
+        isinstance(bindings_annotation, ast.Name) and bindings_annotation.id == "_ComposeIterationBindings",
+        "bindings declaration annotation changed",
+    )
+    require(isinstance(annotation, ast.Name) and annotation.id == "_ComposeIterationState", "selected declaration annotation changed")
+    if failures:
+        return failures, {}
+    # Source bindings close unmodeled reflective/stack effects in the selected
+    # bodies. They supplement the constructor/argument/use proof above; they do
+    # not authorize a writer, and other module effects remain common obligations.
+    for method, digest in (
+        (loop, "06eb4d3415b5c64fc54b06d1c429d43b04555d1cf74a790a93febe4bda63ed47"),
+        (advance, "3289a087cc1711bedb9ee148f001dee22ddb99900cea8556bdfe10b4ace43e96"),
+    ):
+        source = ast.get_source_segment(service.source, method)
+        require(
+            source is not None and hashlib.sha256(source.encode("utf-8")).hexdigest() == digest,
+            "reviewed method source changed " + method.name,
+        )
+    if failures:
+        return failures, {}
+    return [], {
+        "carrier_origin": carrier_origin,
+        "bindings_origin": bindings_origin,
+        "method_origin": method_origin,
+        "call": (service_path, id(call)),
+        "state_write": (service_path, id(final[0].targets[0])),
+        "class_uses": frozenset(
+            {
+                (service_path, id(constructor.value.func)),
+                (service_path, id(annotation)),
+                (service_path, id(bindings_constructor.value.func)),
+                (service_path, id(bindings_annotation)),
+            }
+        ),
+    }
+
+
+_reserve_BATCH_CARRIER_SOURCES = {
+    "ContinuationBatchState": """@dataclass(slots=True)
+class ContinuationBatchState:
+    state: CompositionState
+    last_validation: ValidationSummary | None
+    last_runtime_preflight: ValidationResult | None
+    advisor_calls_used: int
+    entry_state: CompositionState
+    early_reviewed: bool = False
+    phase: Literal["uninitialized", "call_ready", "call_active", "dispatch_ready", "p4_pending", "p4_result_retained", "complete"] = (
+        "uninitialized"
+    )
+    next_tool_index: int = 0
+    assistant_message_index: int | None = None
+    mixed_abandonment_batch: bool = False
+    provider_model_version: str = ""
+    turn_has_mutation: bool = False
+    turn_has_discovery: bool = False
+    all_cache_hits: bool = True
+    tool_outcomes: list[_ToolOutcome] = field(default_factory=list)
+    plugin_crash: ComposerPluginCrashError | None = None
+    plugin_crash_cause: BaseException | None = None
+    advisor_failure: Exception | None = None
+    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
+    pre_state_id: str | None = None
+    decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    private_authorings_by_call: dict[str, PrivateToolAuthoring] = field(default_factory=dict)
+    proposals_this_turn: int = 0
+    mutation_success_observed: bool = False
+    refused_resources: set[Resource] = field(default_factory=set)
+    promises_by_call: dict[str, frozenset[Resource]] = field(default_factory=dict)
+    current_call: ContinuationCallState | None = None
+    stop_issued_batch: bool = False
+    p4: _PersistOutcome | None = None
+    retained_failure: RetainedBatchFailure | None = None
+    p4_receipt_json: str | None = None
+    p4_input_json: str | None = None
+    p4_verification_failed: bool = False""",
+    "ContinuationCallState": """@dataclass(slots=True)
+class ContinuationCallState:
+    index: int
+    tool_call: _AdmittedToolCall
+    pre_state: CompositionState
+    pre_version: int
+    phase: Literal["unprepared", "prepared", "owner_result_retained", "application_pending", "applied"] = "unprepared"
+    tool_name: str = ""
+    private_raw_arguments: str = ""
+    private_arguments_canonical: str | None = None
+    private_authority_canonical: str | None = None
+    unknown_audit_arguments: dict[str, Any] | None = None
+    wire: _CallWireFacts = field(default_factory=_CallWireFacts)
+    arguments: dict[str, Any] | None = None
+    audit_arguments: Mapping[str, Any] | str | None = None
+    audit: DispatchAudit | None = None
+    effect_key: str | None = None
+    owner_result_kind: Literal["proposal", "persisted_turn", "read", "interpretation"] | None = None
+    owner_result_json: str | None = None
+    memory_result: ToolResult | AdmittedDiscoveryResult | None = None
+    original_creator_id: str | None = None
+    original_creator_epoch: int | None = None
+    completion_json: str | None = None
+    owner_tool_receipt_json: str | None = None
+    advisor_invocation_json: str | None = None""",
+    "_CallWireFacts": '''@dataclass(slots=True)
+class _CallWireFacts:
+    """One tool call's wire facts, filled in as ``run_tool_batch`` learns them.
+
+    Deliberately mutable: it is created at the top of each call's iteration
+    and captured by that iteration's ``_append_tool_outcome`` as a default
+    argument, and decode runs after the closure is defined, so a holder
+    avoids late binding through a loop variable. ``strict_sent`` follows
+    D16 (the ``strict`` key sent for the tool, ``None`` when none was sent)
+    and ``wire_conformant`` is ``None`` exactly where no arguments were
+    decoded.
+    """
+
+    strict_sent: bool | None = None
+    wire_conformant: bool | None = None''',
+}
+
+_reserve_BATCH_ADAPTER_SOURCE = '''async def run_tool_batch(
+    *,
+    call_model: _CallModelOutcome,
+    ctx: ToolBatchContext,
+    acc: BatchAccumulator,
+    llm_messages: list[dict[str, Any]],
+) -> tuple[_DispatchOutcome, int]:
+    """Drive the real legacy batch without continuation storage or restored owners."""
+    batch = ContinuationBatchState(
+        acc.state, acc.last_validation, acc.last_runtime_preflight, acc.advisor_calls_used, entry_state=acc.state
+    )
+    await _initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)
+    calls = call_model.completion.tool_batch.calls
+    while batch.next_tool_index < len(calls) and not batch.stop_issued_batch:
+        call = ContinuationCallState(batch.next_tool_index, calls[batch.next_tool_index], batch.state, batch.state.version)
+        batch.current_call = call
+        batch.phase = "call_active"
+        prepared = await _prepare_continuation_call_live(call_model=call_model, ctx=ctx, llm_messages=llm_messages, batch=batch, call=call)
+        if prepared == "stop":
+            break
+        if prepared == "prepared":
+            await _execute_continuation_call_live(
+                call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call
+            )
+        batch.next_tool_index += 1
+        batch.current_call = None
+        batch.phase = "call_ready"
+    batch.phase = "dispatch_ready"
+    return _finish_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, batch=batch)'''
+
+_reserve_BATCH_APPEND_SOURCE = """def _append_continuation_tool_outcome(
+    batch: ContinuationBatchState,
+    call: ContinuationCallState,
+    *,
+    response: Any,
+    error_class: str | None,
+    error_category: ToolArgumentErrorCategory | None,
+    error_message: str | None,
+    post_version: int,
+) -> None:
+    if error_class is not None or (isinstance(response, ToolResult) and not response.success):
+        batch.refused_resources.update(unavailable_resources(batch.promises_by_call[call.tool_call.id], call.pre_state))
+    batch.tool_outcomes.append(
+        _ToolOutcome(
+            call=call.tool_call,
+            response=response,
+            error_class=error_class,
+            error_category=error_category,
+            error_message=error_message,
+            pre_version=call.pre_version,
+            post_version=post_version,
+            strict_sent=call.wire.strict_sent,
+            wire_conformant=call.wire.wire_conformant,
+        )
+    )"""
+
+_reserve_BATCH_FORWARD_SOURCE = "def _append_tool_outcome(\n    *,\n    response: Any,\n    error_class: str | None,\n    error_category: ToolArgumentErrorCategory | None,\n    error_message: str | None,\n    post_version: int,\n    _batch: ContinuationBatchState = batch,\n    _call: ContinuationCallState = call,\n) -> None:\n    _append_continuation_tool_outcome(\n        _batch,\n        _call,\n        response=response,\n        error_class=error_class,\n        error_category=error_category,\n        error_message=error_message,\n        post_version=post_version,\n    )"
+
+_reserve_BATCH_HELPER_SOURCE_SHA256 = {
+    "_initialize_continuation_batch_live": "5c7f83c17040d1879e229d4d78a154b8decd65bfec84508814a5416b1e6a33cd",
+    "_append_continuation_tool_outcome": "55c932802c1fddcb5e7528caf267da6d762f7f8262d7b10a3de1697836fed8ab",
+    "_prepare_continuation_call_live": "162c835a368414b74312029c07f0ce939d3451290682d4487382f51d920812bb",
+    "_execute_continuation_call_live": "fa55d9405acb02014671ec6474cd1fc62e4b0c4c142844fefd39d668230d7c60",
+    "_finish_continuation_batch_live": "cf65f88ca2b6f35a2901ff6bf64c7ac55b9ae2db533c86c2ed2be33811dabf2a",
+    "run_tool_batch": "3e83918fbd76fee553994ebe8eb5754a28f5feb9ea9eda9d7f2a7e137da9e0c3",
+}
+
+
+_reserve_BATCH_DATA_BODY_SHA256 = {
+    "RestoredBatchData": "946d0d5fa11663f241b6e573f900fde571dd3937b9200dd7feb035b7665f7665",
+    "RestoredPreparedBatchData": "a936b775ccf192e2ff2cd65575d1a432203f3e057ab2a9f948e966e9572be273",
+    "_fail": "a27ce096047d2ae619e47a5bfb37b8d0a4c962644124088721a796541dd2f6af",
+    "_safe": "31ade9699d478caa899616967e4fb245462ecf2d2bc95300ed7e7d6586db735f",
+    "_argument_text": "9c3289488ea8d9407017f8fbd26e73dd629fd07f71e1ae8afae2381fe85895d1",
+    "_joint": "ab758f96f095204b7219147759728fdb5cc9ffa0fe8527fc610372555de4566d",
+    "_members": "ae056ad7981d0e83d57db7c73f9eab78b9df29ab20e4aaad000723dad3c16697",
+    "_constructor_shape": "3ecab4acb20974e7a40cfd9a5ef13782205126c9d38746aefa1eb6efdc3729be",
+    "_construct": "ab4c68aee87391101b229bf80af1e0d87c50b7638159de93cf5b5229bdbc6708",
+    "_encode": "d97430959a42397df283195f7825ee1a1fb71531c2389d0c78d22230d13b08ef",
+    "_decode_graph": "ca48730cf1f3ed11ee573b6ac4514293db66920b572c8a8b6a4602a5e9051204",
+    "_decode": "6aba78f67fdc36059c3cfa6d7dd1dbca59b51615720b7c10a66f4875238fd747",
+    "encode_coupled_batch_data": "d0789b1938f32954f7fbd66a27dab762eccadd8024ee9ae55a365ff34ba38e1f",
+    "decode_coupled_batch_data": "2dc4f545c519ac72b9ae51e4906f795010fbada0ffea35d44e21d7df68577e79",
+    "encode_coupled_batch_chunk": "94b6d12c44d222e6a2e538bb1a89cfcef9df2fa79531f0cd0791afc3aaf8e005",
+    "decode_coupled_batch_chunk": "99dc82b3b3f1ffbd7acab1abdc2d5a852ccd972171ddbc3c14bc1ecd47ca5810",
+    "_check_prepared": "f3b3bc95c2f8d43afc2a7949393ac12b862bcd40fc510bad516fc380387b0c5c",
+    "encode_prepared_batch_data": "476fc5dd5e26287c7de3c9e22f9c0e0247781cbd6ec5fd306e7baab0a8e81c19",
+    "encode_restored_prepared_batch_data": "ca69a828c2ebda74933cc4a0205f8044020e00ad56207dbe52b9e855d05898e9",
+    "decode_prepared_batch_data": "81b17d7ed9a0cc3f4b33f43a195ad8ffa48c9a7ad5b92ec9a24a506aa052136f",
+    "readmit_prepared_batch_audit": "0cfd54771b1b8f5234497dff8d76aa895b934134fdffa948c51f13ec49f8f2ca",
+}
+
+
+# Finite executable suppliers, not permitted reference/call sites. The common
+# effect pass owns canonical supplier mutation and alias/reflection refusal;
+# shadow targets separately cover names that have no local source producer.
+_reserve_BATCH_DATA_IMPORT_SOURCE = "from __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom types import MappingProxyType\nfrom typing import Any, NoReturn\n\nfrom pydantic import TypeAdapter\nfrom pydantic import ValidationError as ModelValidationError\n\nfrom elspeth.contracts.composer_audit import PrivateToolAuthoring, ToolArgumentErrorCategory\nfrom elspeth.contracts.composer_llm_audit import ToolContractDialect\nfrom elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation\nfrom elspeth.contracts.enums import AuditCharacteristic\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.freeze import FrozenJsonArray\nfrom elspeth.contracts.hashing import canonical_json\nfrom elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority\nfrom elspeth.contracts.provider_rejection import SafeRequestRejection\nfrom elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSchemaInfo, PluginSecretRequirement, PluginSummary\nfrom elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome\nfrom elspeth.web.composer.audit import DispatchAudit\nfrom elspeth.web.composer.authority_hashing import composer_authority_canonical_json\nfrom elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, bounded_json_loads\nfrom elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk\nfrom elspeth.web.composer.continuation_dispatch_audit import (\n    PortableDispatchAudit,\n    capture_dispatch_audit,\n    decode_dispatch_audit,\n    encode_dispatch_audit,\n    re_admit_dispatch_audit,\n)\nfrom elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials\nfrom elspeth.web.composer.continuation_tool_batch import (\n    RetainedBatchFailure,\n    _decode_validation,\n    _read_json_value,\n    _state_from_tool_json,\n    _validation_json,\n    encode_tool_result_value,\n)\nfrom elspeth.web.composer.discovery_response import admit_discovery_result\nfrom elspeth.web.composer.pipeline_custody import inline_custody_audit_projection\nfrom elspeth.web.composer.state import CompositionState, ValidationSummary\nfrom elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts\nfrom elspeth.web.composer.tools._common import ToolResult\nfrom elspeth.web.composer.tools._registry import response_contract_for\nfrom elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments\nfrom elspeth.web.credential_guard import require_no_credential_material\nfrom elspeth.web.execution.schemas import (\n    SemanticEdgeContractResponse,\n    ValidationCheck,\n    ValidationError,\n    ValidationReadiness,\n    ValidationReadinessBlocker,\n    ValidationResult,\n    ValidationWarning,\n)"
+_reserve_BATCH_DATA_BUILTINS = (
+    "type",
+    "tuple",
+    "dict",
+    "list",
+    "set",
+    "frozenset",
+    "len",
+    "id",
+    "any",
+    "enumerate",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "sorted",
+    "min",
+    "TypeError",
+    "ValueError",
+    "KeyError",
+)
+
+
+def _reserve_continuation_batch_data_receipt(units, classes):
+    """Close finite DATA references and constructors on the caller's AST only.
+
+    The complete ordered field projection/factory and exact reference roles are
+    necessary. Body pins supplement these facts; no module-wide use allowance
+    or additional live state store follows from this receipt.
+    """
+    path = "src/elspeth/web/composer/continuation_batch_data.py"
+    module = "elspeth.web.composer.continuation_batch_data"
+    sources = [unit for unit in units if unit.path == path]
+    if len(sources) != 1:
+        return ["continuation batch DATA source is missing or duplicated"], {}
+    unit = sources[0]
+    helper = _reserve_composer_receiver
+    failures = []
+
+    def require(condition, detail):
+        if not condition:
+            failures.append("continuation batch DATA " + detail)
+
+    def same(left, source):
+        return ast.dump(left, include_attributes=False) == ast.dump(ast.parse(source, mode="eval").body, include_attributes=False)
+
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    require(helper.imported(unit.tree, "dataclass", "dataclasses", "dataclass"), "DATA dataclass supplier changed")
+    for name in classes:
+        require(helper.imported(unit.tree, name, "elspeth.web.composer.tool_batch", name), "carrier supplier changed " + name)
+    require(
+        any(
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in unit.tree.body
+        ),
+        "postponed annotation mode changed",
+    )
+    expected_imports = ast.parse(_reserve_BATCH_DATA_IMPORT_SOURCE).body
+    actual_imports = [node for node in unit.tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    require(
+        [ast.dump(node, include_attributes=False) for node in actual_imports]
+        == [ast.dump(node, include_attributes=False) for node in expected_imports],
+        "complete import supplier declarations changed",
+    )
+    supplier_origins = {"builtins." + name for name in _reserve_BATCH_DATA_BUILTINS}
+    shadow_names = set(_reserve_BATCH_DATA_BUILTINS)
+    for statement in expected_imports:
+        if statement.module == "__future__":
+            continue
+        for alias in statement.names:
+            binding = alias.asname or alias.name
+            require(helper.imported(unit.tree, binding, statement.module, alias.name), "import supplier binding changed " + binding)
+            shadow_names.add(binding)
+            # These two names occur only in postponed annotations. Their import
+            # declarations are exact, but they are not executable capabilities.
+            if statement.module != "typing":
+                supplier_origins.add(statement.module + "." + alias.name)
+    # Both local imports belong to actual body-bound definitions. Verify the
+    # exact source declaration and same-AST owner before protecting each root.
+    local_imports = [node for node in ast.walk(unit.tree) if isinstance(node, (ast.Import, ast.ImportFrom)) and node not in actual_imports]
+    local_suppliers = (
+        (
+            "_argument_text",
+            "from elspeth.contracts.json_parser import parse_json_strict",
+            "elspeth.contracts.json_parser.parse_json_strict",
+        ),
+        (
+            "_check_prepared",
+            "from elspeth.web.composer.continuation_dispatch_audit import _binding",
+            "elspeth.web.composer.continuation_dispatch_audit._binding",
+        ),
+    )
+    require(len(local_imports) == len(local_suppliers), "local supplier cohort changed")
+    for owner_name, import_source, origin in local_suppliers:
+        expected = ast.dump(ast.parse(import_source).body[0], include_attributes=False)
+        matches = [
+            node
+            for node in local_imports
+            if ast.dump(node, include_attributes=False) == expected and _owner_function(node) is _reserve_node_at(unit, owner_name)
+        ]
+        require(len(matches) == 1, "local supplier changed " + owner_name)
+        supplier_origins.add(origin)
+    for name in _reserve_BATCH_DATA_BUILTINS:
+        require(helper.builtin_binding(unit.tree, name), "builtin binding changed " + name)
+    # This actual supplier is an immutable integer DATA value. Keep its
+    # canonical binding in all mutation checks; only its value is disjoint
+    # from a callable/module capability. No annotation supplies this fact.
+    scalar_path = "src/elspeth/web/composer/bounded_json.py"
+    scalar_units = [source for source in units if source.path == scalar_path]
+    scalar_origin = "elspeth.web.composer.bounded_json.JSON_MAX_TOTAL_UTF8_BYTES"
+    scalar = _reserve_node_at(scalar_units[0], "JSON_MAX_TOTAL_UTF8_BYTES") if len(scalar_units) == 1 else None
+    require(
+        isinstance(scalar, ast.AnnAssign)
+        and isinstance(scalar.value, ast.Constant)
+        and type(scalar.value.value) is int
+        and scalar.value.value == 1_048_576
+        and isinstance(scalar.target, ast.Name)
+        and scalar.target.id == "JSON_MAX_TOTAL_UTF8_BYTES",
+        "immutable byte-limit supplier changed",
+    )
+    for name, value in (("_MAX_NODES", 100_000), ("_MAX_DEPTH", 128)):
+        declaration = _reserve_node_at(unit, name)
+        require(
+            declaration is not None
+            and ast.dump(declaration, include_attributes=False)
+            == ast.dump(ast.parse(name + " = " + str(value)).body[0], include_attributes=False),
+            "graph bound changed " + name,
+        )
+        stores = [
+            node
+            for node in helper.immediate(unit.tree)
+            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+        require(isinstance(declaration, ast.Assign) and stores == declaration.targets, "graph bound rebound " + name)
+        require(
+            not any(
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any(alias.name == "*" or (alias.asname or alias.name.split(".")[0]) == name for alias in node.names)
+                for node in helper.immediate(unit.tree)
+            ),
+            "graph bound import changed " + name,
+        )
+        shadow_names.add(name)
+    require(
+        not any(isinstance(node, (ast.Global, ast.Nonlocal)) and set(node.names) & shadow_names for node in ast.walk(unit.tree)),
+        "supplier scope escaped",
+    )
+    definitions = {}
+    for name in _reserve_BATCH_DATA_BODY_SHA256:
+        declaration = _reserve_node_at(unit, name)
+        require(isinstance(declaration, (ast.FunctionDef, ast.ClassDef)), "declaration changed " + name)
+        require(helper.owned_binding(unit.tree, name, declaration), "definition binding changed " + name)
+        if isinstance(declaration, ast.FunctionDef):
+            require(not declaration.decorator_list, "graph function decorator changed " + name)
+        elif isinstance(declaration, ast.ClassDef):
+            require(
+                not declaration.bases
+                and not declaration.keywords
+                and len(declaration.decorator_list) == 1
+                and same(declaration.decorator_list[0], "dataclass(frozen=True, slots=True)"),
+                "DATA class decorator changed " + name,
+            )
+        if isinstance(declaration, (ast.FunctionDef, ast.ClassDef)):
+            definitions[name] = declaration
+    registry = _reserve_node_at(unit, "_FIELDS")
+    require(
+        isinstance(registry, ast.Assign)
+        and len(registry.targets) == 1
+        and isinstance(registry.targets[0], ast.Name)
+        and registry.targets[0].id == "_FIELDS"
+        and isinstance(registry.value, ast.Dict),
+        "ordered registry declaration changed",
+    )
+    if failures:
+        return failures, {}
+    registry_stores = [
+        node
+        for node in helper.immediate(unit.tree)
+        if isinstance(node, ast.Name) and node.id == "_FIELDS" and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    require(registry_stores == [registry.targets[0]], "ordered registry binding changed")
+    require(
+        not any(
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and any(alias.name == "*" or (alias.asname or alias.name.split(".")[0]) == "_FIELDS" for alias in node.names)
+            for node in helper.immediate(unit.tree)
+        ),
+        "ordered registry import changed",
+    )
+    require(
+        not any(
+            isinstance(node, (ast.Global, ast.Nonlocal))
+            and set(node.names) & (set(classes) | set(definitions) | {"_FIELDS", "type", "tuple"})
+            for node in ast.walk(unit.tree)
+        ),
+        "selected binding scope escaped",
+    )
+    members = definitions["_members"]
+    constructor = definitions["_construct"]
+    require(isinstance(members, ast.FunctionDef) and isinstance(constructor, ast.FunctionDef), "factory kind changed")
+    if failures:
+        return failures, {}
+    body = helper.body(constructor)
+    expected_gate = ast.parse(
+        'if kind not in _FIELDS or tuple(members) != _FIELDS[kind]:\n    _fail("batch graph lost complete ordered nominal members")\n'
+    ).body[0]
+    require(
+        bool(body) and ast.dump(body[0], include_attributes=False) == ast.dump(expected_gate, include_attributes=False),
+        "complete ordered member gate changed",
+    )
+    constructor_calls = set()
+    for name, declaration in classes.items():
+        fields = tuple(node.target.id for node in declaration.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name))
+        entries = [
+            value
+            for key, value in zip(registry.value.keys, registry.value.values, strict=True)
+            if isinstance(key, ast.Constant) and key.value == name
+        ]
+        require(
+            len(entries) == 1
+            and isinstance(entries[0], ast.Tuple)
+            and all(isinstance(item, ast.Constant) and isinstance(item.value, str) for item in entries[0].elts)
+            and tuple(item.value for item in entries[0].elts) == fields,
+            "complete ordered registry fields changed " + name,
+        )
+        projections = [node for node in members.body if isinstance(node, ast.If) and same(node.test, "type(value) is " + name)]
+        require(len(projections) == 1, "nominal projection branch changed " + name)
+        if len(projections) == 1:
+            projection = projections[0]
+            expected = ast.parse(
+                "return " + repr(name) + ", {" + ", ".join(repr(field) + ": value." + field for field in fields) + "}"
+            ).body[0]
+            require(
+                not projection.orelse
+                and len(projection.body) == 1
+                and ast.dump(projection.body[0], include_attributes=False) == ast.dump(expected, include_attributes=False),
+                "complete direct field projection changed " + name,
+            )
+        branches = [node for node in body[1:] if isinstance(node, ast.If) and same(node.test, "kind == " + repr(name))]
+        require(len(branches) == 1, "nominal constructor branch changed " + name)
+        if len(branches) == 1:
+            branch = branches[0]
+            require(
+                not branch.orelse
+                and len(branch.body) == 1
+                and isinstance(branch.body[0], ast.Return)
+                and isinstance(branch.body[0].value, ast.Call)
+                and same(branch.body[0].value, name + "(**members)"),
+                "exact constructor transfer changed " + name,
+            )
+            if len(branch.body) == 1 and isinstance(branch.body[0], ast.Return) and isinstance(branch.body[0].value, ast.Call):
+                constructor_calls.add((path, id(branch.body[0].value)))
+    # Match only exact owner/parent/expression roles, never all names in a module.
+    expected_roles = {
+        ("RestoredBatchData", "annotation", "ContinuationBatchState"),
+        ("RestoredPreparedBatchData", "annotation", "ContinuationBatchState"),
+        ("encode_coupled_batch_data", "annotation", "ContinuationBatchState"),
+        ("encode_coupled_batch_chunk", "annotation", "ContinuationBatchState"),
+        ("encode_prepared_batch_data", "annotation", "ContinuationBatchState"),
+        ("_joint", "compare", "type(data.batch) is not ContinuationBatchState"),
+        ("_joint", "compare", "type(batch.current_call) is not ContinuationCallState"),
+        ("_members", "compare", "type(value) is ContinuationCallState"),
+        ("_members", "compare", "type(value) is _CallWireFacts"),
+        ("_members", "compare", "type(value) is ContinuationBatchState"),
+        ("_encode.visit", "compare", "type(value) is ContinuationCallState"),
+        ("_check_prepared", "compare", "type(call) is not ContinuationCallState"),
+        ("_check_prepared", "compare", "type(call.wire) is not _CallWireFacts"),
+        ("encode_prepared_batch_data", "compare", "type(batch) is not ContinuationBatchState"),
+        ("encode_prepared_batch_data", "compare", "type(batch.current_call) is not ContinuationCallState"),
+        ("encode_restored_prepared_batch_data", "compare", "type(value.batch.current_call) is not ContinuationCallState"),
+        ("readmit_prepared_batch_audit", "compare", "type(call) is not ContinuationCallState"),
+        ("_construct", "constructor", "ContinuationCallState(**members)"),
+        ("_construct", "constructor", "_CallWireFacts(**members)"),
+        ("_construct", "constructor", "ContinuationBatchState(**members)"),
+    }
+    seen_roles = set()
+    owned_uses = set()
+    for node in ast.walk(unit.tree):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load) or node.id not in classes:
+            continue
+        parent = parents.get(id(node))
+        scope = parent
+        parts = []
+        while scope is not None:
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                parts.append(scope.name)
+            scope = parents.get(id(scope))
+        owner = ".".join(reversed(parts))
+        matches = []
+        for expected_owner, role, expression in expected_roles:
+            if owner != expected_owner:
+                continue
+            if role == "annotation":
+                valid = node.id == expression and (
+                    (isinstance(parent, ast.arg) and parent.arg == "batch" and parent.annotation is node)
+                    or (
+                        isinstance(parent, ast.AnnAssign)
+                        and isinstance(parent.target, ast.Name)
+                        and parent.target.id == "batch"
+                        and parent.annotation is node
+                        and parent.value is None
+                    )
+                )
+            elif role == "compare":
+                valid = isinstance(parent, ast.Compare) and len(parent.comparators) == 1
+                valid = valid and parent.comparators[0] is node and same(parent, expression)
+            else:
+                valid = isinstance(parent, ast.Call) and parent.func is node and (path, id(parent)) in constructor_calls
+                valid = valid and same(parent, expression)
+            if valid:
+                matches.append((expected_owner, role, expression))
+        require(len(matches) == 1 and matches[0] not in seen_roles, "reference role changed " + owner + ":" + node.id)
+        if len(matches) == 1:
+            seen_roles.add(matches[0])
+            owned_uses.add((path, id(node)))
+    require(seen_roles == expected_roles, "reference role inventory changed")
+    # The actual admitted graph construction/roundtrip path is supplementary
+    # closed source, not permission to add unmodeled constructors or references.
+    for name, digest in _reserve_BATCH_DATA_BODY_SHA256.items():
+        source = ast.get_source_segment(unit.source, definitions[name])
+        require(source is not None and hashlib.sha256(source.encode()).hexdigest() == digest, "reviewed graph body changed " + name)
+    if failures:
+        return failures, {}
+    return [], {
+        "owned_uses": frozenset(owned_uses),
+        "calls": frozenset(constructor_calls),
+        "origins": frozenset(module + "." + name for name in (*definitions, "_FIELDS", "_MAX_NODES", "_MAX_DEPTH"))
+        | frozenset(supplier_origins),
+        "supplier_bindings": frozenset(module + "." + name for name in shadow_names),
+        "supplier_origins": frozenset(supplier_origins),
+        "owned_origins": frozenset(module + "." + name for name in (*definitions, "_FIELDS", "_MAX_NODES", "_MAX_DEPTH")),
+        "immutable_supplier_origins": frozenset({scalar_origin}),
+    }
+
+
+def _reserve_continuation_batch_state_receipt(units):
+    """Close the actual live adapter and its three plain-carrier state stores.
+
+    Constructor/default, retained-local, formal, closure and reference facts are
+    required together. Source body bindings only supplement those facts. The
+    joined common origin/effect pass still owns cross-module mutation/reflection;
+    this local result alone never grants a disjoint state writer.
+    """
+    path = "src/elspeth/web/composer/tool_batch.py"
+    module = "elspeth.web.composer.tool_batch"
+    indexed = {unit.path: unit for unit in units}
+    if len(indexed) != len(units) or path not in indexed:
+        return ["continuation batch source set is missing or duplicated"], {}
+    unit = indexed[path]
+    helper = _reserve_composer_receiver
+    failures = []
+
+    def require(condition, detail):
+        if not condition:
+            failures.append("continuation batch " + detail)
+
+    def same(left, right):
+        return ast.dump(left, include_attributes=False) == ast.dump(right, include_attributes=False)
+
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    require(helper.imported(unit.tree, "dataclass", "dataclasses", "dataclass"), "dataclass supplier changed")
+    require(helper.imported(unit.tree, "field", "dataclasses", "field"), "field supplier changed")
+    require(
+        any(
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module == "__future__"
+            and any(alias.name == "annotations" for alias in node.names)
+            for node in unit.tree.body
+        ),
+        "postponed annotation mode changed",
+    )
+    for name in ("list", "dict", "set"):
+        require(helper.builtin_binding(unit.tree, name), "default factory builtin changed " + name)
+    classes = {}
+    fields = {}
+    for name, source in _reserve_BATCH_CARRIER_SOURCES.items():
+        declaration = _reserve_node_at(unit, name)
+        expected = ast.parse(source).body[0]
+        require(isinstance(declaration, ast.ClassDef) and same(declaration, expected), "carrier/default declaration changed " + name)
+        require(helper.owned_binding(unit.tree, name, declaration), "carrier binding changed " + name)
+        if isinstance(declaration, ast.ClassDef):
+            classes[name] = declaration
+            fields[name] = {
+                node.target.id for node in declaration.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+            }
+    definitions = {}
+    signatures = {
+        "run_tool_batch": ("call_model", "ctx", "acc", "llm_messages"),
+        "_initialize_continuation_batch_live": ("call_model", "ctx", "acc", "llm_messages", "batch"),
+        "_prepare_continuation_call_live": ("call_model", "ctx", "llm_messages", "batch", "call"),
+        "_execute_continuation_call_live": ("call_model", "ctx", "acc", "llm_messages", "batch", "call"),
+        "_finish_continuation_batch_live": ("call_model", "ctx", "acc", "batch"),
+        "_append_continuation_tool_outcome": (
+            "batch",
+            "call",
+            "response",
+            "error_class",
+            "error_category",
+            "error_message",
+            "post_version",
+        ),
+    }
+    ordinary = {"_finish_continuation_batch_live", "_append_continuation_tool_outcome"}
+    for name, parameters in signatures.items():
+        declaration = _reserve_node_at(unit, name)
+        expected_kind = ast.FunctionDef if name in ordinary else ast.AsyncFunctionDef
+        require(isinstance(declaration, expected_kind), "selected function kind changed " + name)
+        require(helper.owned_binding(unit.tree, name, declaration), "selected function binding changed " + name)
+        if not isinstance(declaration, expected_kind):
+            continue
+        definitions[name] = declaration
+        args = declaration.args
+        positional = ["batch", "call"] if name == "_append_continuation_tool_outcome" else []
+        require(
+            not declaration.decorator_list
+            and not args.posonlyargs
+            and [arg.arg for arg in args.args] == positional
+            and tuple(helper.parameters(declaration)) == parameters
+            and not args.defaults
+            and all(value is None for value in args.kw_defaults)
+            and args.vararg is None
+            and args.kwarg is None,
+            "selected formal/default binding changed " + name,
+        )
+        correct_kind, _ = helper.invocation_kind(unit.tree, [declaration], "ORDINARY_FUNCTION" if name in ordinary else "NATIVE_COROUTINE")
+        require(correct_kind, "selected invocation kind changed " + name)
+    if failures:
+        return failures, {}
+
+    adapter = definitions["run_tool_batch"]
+    expected_adapter = ast.parse(_reserve_BATCH_ADAPTER_SOURCE).body[0]
+    require(same(adapter, expected_adapter), "actual adapter constructor/argument/order changed")
+    append = definitions["_append_continuation_tool_outcome"]
+    require(same(append, ast.parse(_reserve_BATCH_APPEND_SOURCE).body[0]), "actual outcome append transfer changed")
+    execute = definitions["_execute_continuation_call_live"]
+    forwarders = [node for node in execute.body if isinstance(node, ast.FunctionDef) and node.name == "_append_tool_outcome"]
+    require(
+        len(forwarders) == 1 and same(forwarders[0], ast.parse(_reserve_BATCH_FORWARD_SOURCE).body[0]),
+        "actual captured carrier transfer changed",
+    )
+    if failures:
+        return failures, {}
+    forwarder = forwarders[0]
+    captured_defaults = {id(value) for value in forwarder.args.kw_defaults if isinstance(value, ast.Name) and value.id in {"batch", "call"}}
+    forward_call = forwarder.body[0].value
+    require(
+        isinstance(forward_call, ast.Call) and ast.unparse(forward_call.func) == "_append_continuation_tool_outcome",
+        "actual captured outcome caller changed",
+    )
+    # Every carrier formal has exactly its parameter binding, and every use is a
+    # declared plain field or the one exact reviewed closure default. This proves
+    # a runtime transfer; the annotation is neither queried nor trusted here.
+    for name, declaration in definitions.items():
+        if name == "run_tool_batch":
+            continue
+        parameters = {arg.arg: arg for arg in (*declaration.args.args, *declaration.args.kwonlyargs)}
+        for local, class_name in (("batch", "ContinuationBatchState"), ("call", "ContinuationCallState")):
+            if local not in parameters:
+                continue
+            require(
+                [(kind, node) for bound, kind, node in helper.lexical_binding_events(declaration) if bound == local]
+                == [("PARAMETER", parameters[local])],
+                "formal receiver rebound " + name + ":" + local,
+            )
+            require(
+                not any(isinstance(node, (ast.Global, ast.Nonlocal)) and local in node.names for node in ast.walk(declaration)),
+                "formal receiver scope escaped " + name + ":" + local,
+            )
+            for node in helper.runtime_walk(declaration):
+                if not isinstance(node, ast.Name) or node.id != local:
+                    continue
+                parent = parents.get(id(node))
+                field_use = isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in fields[class_name]
+                capture = declaration is execute and id(node) in captured_defaults
+                require(isinstance(node.ctx, ast.Load) and (field_use or capture), "formal receiver escaped " + name + ":" + local)
+    # The local closure cannot be returned, aliased, rebound, or called with an
+    # overriding default. Its body is the ordinary direct append shown above.
+    require(
+        [(kind, node) for bound, kind, node in helper.lexical_binding_events(execute) if bound == "_append_tool_outcome"]
+        == [("DEFINITION", forwarder)],
+        "captured outcome closure rebound",
+    )
+    for node in ast.walk(execute):
+        if isinstance(node, ast.Name) and node.id == "_append_tool_outcome":
+            parent = parents.get(id(node))
+            require(
+                isinstance(node.ctx, ast.Load)
+                and isinstance(parent, ast.Call)
+                and parent.func is node
+                and not parent.args
+                and all(keyword.arg is not None and keyword.arg not in {"_batch", "_call"} for keyword in parent.keywords),
+                "captured outcome closure escaped or overridden",
+            )
+    # Adapter equality binds its exact constructor arguments and call order; the
+    # following whole-source inventory excludes a second/foreign native caller.
+    expected_calls = [
+        node
+        for node in ast.walk(adapter)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in definitions
+        and node.func.id != "run_tool_batch"
+    ] + [forward_call]
+    expected_references = {(path, id(node.func)) for node in expected_calls}
+    helper_names = set(definitions) - {"run_tool_batch"}
+    actual_references = {
+        (source.path, id(node))
+        for source in units
+        for node in ast.walk(source.tree)
+        if (isinstance(node, ast.Name) and node.id in helper_names) or (isinstance(node, ast.Attribute) and node.attr in helper_names)
+    }
+    require(actual_references == expected_references, "native helper reference inventory changed")
+    stores = []
+    for name in ("_initialize_continuation_batch_live", "_prepare_continuation_call_live", "_execute_continuation_call_live"):
+        declaration = definitions[name]
+        candidates = [
+            node
+            for node in ast.walk(declaration)
+            if isinstance(node, ast.Attribute) and node.attr == "state" and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+        require(len(candidates) == 1, "state store set changed " + name)
+        if len(candidates) != 1:
+            continue
+        target = candidates[0]
+        statement = parents.get(id(target))
+        require(
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and statement.targets[0] is target
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "batch"
+            and isinstance(statement.value, ast.Name)
+            and statement.value.id == "state",
+            "state copyback changed " + name,
+        )
+        if name == "_initialize_continuation_batch_live":
+            require(statement in declaration.body, "initializer copyback scope changed")
+        else:
+            outer = parents.get(id(statement))
+            require(
+                isinstance(outer, ast.Try) and outer in declaration.body and statement in outer.finalbody,
+                "finally copyback scope changed " + name,
+            )
+        stores.append((path, id(target)))
+    if failures:
+        return failures, {}
+    # Full reviewed helper bodies supplement structural closure of receiver uses
+    # and dispatch order, including unmodeled reflective/stack effects. They do
+    # not themselves grant a state writer. Pin formatted actual source segments.
+    for name, digest in _reserve_BATCH_HELPER_SOURCE_SHA256.items():
+        source = ast.get_source_segment(unit.source, definitions[name])
+        require(source is not None and hashlib.sha256(source.encode("utf-8")).hexdigest() == digest, "reviewed helper body changed " + name)
+    if failures:
+        return failures, {}
+    data_failures, data = _reserve_continuation_batch_data_receipt(units, classes)
+    if data_failures:
+        return data_failures, {}
+    selected_classes = set(classes)
+    selected_functions = set(definitions) - {"run_tool_batch"}
+    owned_uses = frozenset(
+        (path, id(node))
+        for declaration in (*classes.values(), *definitions.values())
+        for node in ast.walk(declaration)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in selected_classes | selected_functions
+    )
+    # Field(default_factory=_CallWireFacts) is the only additional constructor
+    # supplier transfer. Exact declarations and actual import bindings above
+    # close it; do not treat arbitrary field factories as pure.
+    factory_calls = [
+        node.value
+        for node in classes["ContinuationCallState"].body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "wire"
+    ]
+    return [], {
+        "class_origins": frozenset(module + "." + name for name in selected_classes),
+        "function_origins": frozenset(module + "." + name for name in definitions),
+        "reference_origins": frozenset(module + "." + name for name in selected_classes | selected_functions),
+        "owned_uses": owned_uses | data["owned_uses"],
+        "data_calls": data["calls"],
+        "data_origins": data["origins"],
+        "data_owned_origins": data["owned_origins"],
+        "data_supplier_origins": data["supplier_origins"],
+        "data_supplier_bindings": data["supplier_bindings"],
+        "data_immutable_supplier_origins": data["immutable_supplier_origins"],
+        "calls": frozenset((path, id(node)) for node in expected_calls),
+        "factory_calls": frozenset((path, id(node)) for node in factory_calls),
+        "state_writes": frozenset(stores),
+    }
+
+
 def _reserve_supported_boundary(units):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
+    iteration_failures, iteration = _reserve_compose_iteration_state_receipt(units)
+    batch_failures, batch = _reserve_continuation_batch_state_receipt(units)
+    audit_failures, audit_recoveries, audit_sink_uses = _reserve_audit_evidence_recovery_receipt(units)
     family = _reserve_family_contracts.__dict__
     roles = _reserve_dependency_roles.__dict__
     family_failures, _ = _reserve_family_contracts.family_local_contracts(units)
@@ -10856,6 +16908,9 @@ def _reserve_supported_boundary(units):
     child_failures, child_receipt = _reserve_proposal_child_transfers.proposal_child_local_contracts(units)
     terminal_failures, terminal_receipt = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
     failures = [
+        *iteration_failures,
+        *batch_failures,
+        *audit_failures,
         *family_failures,
         *supplier_failures,
         *mint_failures,
@@ -11367,13 +17422,30 @@ def _reserve_supported_boundary(units):
         "elspeth.contracts.sink_effects.SinkEffectReservationRequest",
         "elspeth.web.required_work.RequiredWorkSource",
         "elspeth.web.required_work.make_required_work_key",
+        "elspeth.web.sessions.converters.state_record_from_row",
+        "elspeth.web.sessions.chat_message_decoder.chat_message_record_from_row",
+        "elspeth.web.sessions.converters.chat_message_record_from_row",
+        "elspeth.web.sessions.state_decoder.state_record_from_row",
     }
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(
+        {
+            iteration["carrier_origin"],
+            iteration["bindings_origin"],
+            iteration["method_origin"],
+            "elspeth.web.composer.service.ComposerServiceImpl._compose_loop",
+        }
+    )
     origins.update(sink_receipt["read_dependency_origins"])
-    guarded_classes = set()
-    guarded_functions = set(sink_receipt["read_dependency_origins"])
+    origins.update(batch["class_origins"] | batch["function_origins"] | batch["data_owned_origins"] | {"dataclasses.field", "builtins.set"})
+    guarded_classes = {iteration["carrier_origin"], iteration["bindings_origin"], *batch["class_origins"]}
+    guarded_functions = set(sink_receipt["read_dependency_origins"]) | set(batch["function_origins"])
+    guarded_functions.add("elspeth.web.sessions.converters.state_record_from_row")
+    guarded_functions.add("elspeth.web.sessions.chat_message_decoder.chat_message_record_from_row")
+    guarded_functions.add("elspeth.web.sessions.converters.chat_message_record_from_row")
+    guarded_functions.add("elspeth.web.sessions.state_decoder.state_record_from_row")
     for path, guard in _reserve_full_source_guards().items():
         if not guard["protected_exports"]:
             continue
@@ -11401,7 +17473,13 @@ def _reserve_supported_boundary(units):
         for record in typed["records"]:
             if record["origin_index_seed"] if "origin_index_seed" in record else record["origin_seed"]:
                 origins.update(record["identity"] + "." + member for member in record.get("executed_selected_members", []))
-    receivers.setdefault("elspeth.web.composer.service.ComposerServiceImpl", set()).add("compose")
+    receivers.setdefault("elspeth.web.composer.service.ComposerServiceImpl", set()).update(
+        {"compose", "_compose_loop", "_advance_live_compose_iteration"}
+    )
+    receivers.setdefault(iteration["carrier_origin"], set())
+    receivers.setdefault(iteration["bindings_origin"], set())
+    for origin in batch["class_origins"]:
+        receivers.setdefault(origin, set())
     receivers.setdefault("elspeth.core.landscape.factory.RecorderFactory", set()).add("execution")
     receivers["elspeth.core.landscape.factory.RecorderFactory"].add("payload_store")
     receivers.setdefault("elspeth.core.landscape.execution_repository.ExecutionRepository", set()).add("sink_effects")
@@ -11427,9 +17505,22 @@ def _reserve_supported_boundary(units):
             mint["custody_constructor_call"],
             *mint["owner_constructor_calls"],
             *receiver_nodes,
+            iteration["call"],
+            *batch["calls"],
+            *batch["factory_calls"],
             (dto_units[0].path, id(dto_return)),
         }
     )
+    callback_failures, callbacks = _reserve_batch_data_callback_consumers(units)
+    yaml_failures, yaml_adapter = _reserve_yaml_serializer_adapter(units)
+    if callback_failures or yaml_failures:
+        return _reserve_ProtectedBoundary((*callback_failures, *yaml_failures), (), (), (), ())
+    origins.update(yaml_adapter["origins"])
+    for owner, members in callbacks["receiver_members"].items():
+        receivers.setdefault(owner, set()).update(members)
+    receivers.setdefault(yaml_adapter["class_origin"], set()).add("generate_yaml")
+    origins.update(_reserve_AUDIT_EVIDENCE_ORIGINS)
+    captured_callable_origins = frozenset(captured_callable_origins) | {_reserve_AUDIT_EVIDENCE_SINK}
     class_recovery_candidates = []
     protected_uses = []
     reflection_candidates = []
@@ -11448,11 +17539,43 @@ def _reserve_supported_boundary(units):
         protected_use_nodes=protected_uses,
         protected_reflection_candidate_sites=reflection_candidates,
         protected_constructed_classes=frozenset(guarded_classes),
+        protected_supplier_bindings=batch["data_supplier_bindings"] | callbacks["supplier_bindings"] | yaml_adapter["supplier_bindings"],
+        immutable_supplier_origins=batch["data_immutable_supplier_origins"] | callbacks["immutable_supplier_origins"],
+        validated_nonretaining_calls=callbacks["calls"],
+        additional_supplier_roots=batch["data_supplier_origins"] | callbacks["origins"],
+        validated_supplier_uses=callbacks["uses"] | batch["owned_uses"] | yaml_adapter["uses"],
+        validated_supplier_arguments=callbacks["argument_calls"],
+        validated_immediate_lambdas=callbacks["immediate_lambdas"],
+        validated_local_carrier_calls=frozenset({iteration["call"], *batch["calls"], *batch["data_calls"]}),
         validated_worker_error_carrier_calls=frozenset(error_carrier_calls | normal_carrier_calls),
         validated_retained_failure_calls=retained_calls,
     )
+    origin_failures.extend(_reserve_batch_callback_use_failures(units, callbacks, protected_uses))
+    origin_failures.extend(_reserve_yaml_serializer_use_failures(yaml_adapter, protected_uses))
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)
+    iteration_class_uses = frozenset(
+        (path, node_id)
+        for path, node_id, origin, *_ in protected_uses
+        if origin in {("object", iteration["carrier_origin"]), ("object", iteration["bindings_origin"])}
+    )
+    if iteration_class_uses != iteration["class_uses"] or not {iteration["call"], iteration["state_write"]} <= actual_nodes:
+        return _reserve_ProtectedBoundary(("compose iteration constructor references or same-AST receipt changed",), (), (), (), ())
+    batch_uses = frozenset(
+        (path, node_id) for path, node_id, origin, *_ in protected_uses if origin[0] == "object" and origin[1] in batch["reference_origins"]
+    )
+    if (
+        batch_uses != batch["owned_uses"]
+        or not (batch["calls"] | batch["factory_calls"] | batch["state_writes"] | batch["data_calls"]) <= actual_nodes
+    ):
+        return _reserve_ProtectedBoundary(("continuation batch references or same-AST receipt changed",), (), (), (), ())
+    actual_audit_sink_uses = frozenset(
+        (path, node_id)
+        for path, node_id, origin, *_ in protected_uses
+        if origin in {("member", _reserve_AUDIT_EVIDENCE_SINK), ("object", _reserve_AUDIT_EVIDENCE_SINK)}
+    )
+    if actual_audit_sink_uses != audit_sink_uses or not audit_recoveries <= (set(class_recovery_candidates) & actual_nodes):
+        return _reserve_ProtectedBoundary(("audit evidence recovery supplier references or same-AST join changed",), (), (), (), ())
     if authority_diagnostic_recovery not in class_recovery_candidates:
         return _reserve_ProtectedBoundary(
             ("authority diagnostic recovery is outside selected origins",), (), (), (), (), qualified_owner_stores
@@ -11483,6 +17606,8 @@ def _reserve_supported_boundary(units):
         (integrity_supplier,),
         (registration_call,),
         route_calls | six_calls,
+        (iteration["state_write"], *batch["state_writes"]),
+        audit_evidence_recoveries=audit_recoveries,
     )
 
 
@@ -11630,6 +17755,8 @@ class _reserve_ReserveProof:
             for symbol in symbols:
                 if "." not in symbol and isinstance(_reserve_node_at(self.indexed[path], symbol), (ast.FunctionDef, ast.AsyncFunctionDef)):
                     supplier_functions.add(module + "." + symbol)
+        supplier_functions.add("elspeth.web.sessions.converters.state_record_from_row")
+        supplier_functions.add("elspeth.web.sessions.converters.chat_message_record_from_row")
         closed_namespace_modules = {key.split(":", 1)[0] for key in writer_recipes if key.endswith(":__closed_namespace_readers__")}
         private_namespace_helpers = {}
         for path in closed_namespace_modules | {"src/elspeth/web/operator_telemetry_dispatch.py"}:
@@ -11982,7 +18109,7 @@ class _reserve_ReserveProof:
                     return selected_instance_classes(expression.body, expression) | selected_instance_classes(expression.orelse, expression)
                 if isinstance(expression, ast.Call):
                     constructor = r.qualified_name(expression.func, use=expression)
-                    if constructor in protected_owned_classes:
+                    if constructor in protected_owned_classes or constructor in frozen_qualified:
                         return {constructor}
                     selected_replay = "elspeth.web.sessions.composer_operations.ComposerOperationError"
                     if constructor == selected_replay + ".model_validate_json" and selected_replay in protected_owned_classes:
@@ -12826,7 +18953,9 @@ class _reserve_ReserveProof:
                     )
                     if unit.path != object_path and not reviewed_cancel_consumer:
                         failures.append("selected mutable supplier object escape " + unit.path)
-                if isinstance(n, (ast.Name, ast.Attribute, ast.Call)) and recovered_selected_classes(n, n) & protected_owned_classes.keys():
+                if isinstance(n, (ast.Name, ast.Attribute, ast.Call)) and recovered_selected_classes(n, n) & (
+                    protected_owned_classes.keys() | frozen_qualified
+                ):
                     parent = getattr(n, "_landscape_parent", None)
                     nominal_compare = (
                         isinstance(parent, ast.Compare)
@@ -12854,7 +18983,7 @@ class _reserve_ReserveProof:
                         and parent.attr == "__name__"
                         and isinstance(parent.ctx, ast.Load)
                     )
-                    if not (nominal_compare or inert_read or name_read):
+                    if not (nominal_compare or inert_read or name_read or (unit.path, id(n)) in self.boundary.audit_evidence_recoveries):
                         failures.append("unresolved selected class recovery effect/escape " + unit.path)
                 if (
                     isinstance(n, (ast.Name, ast.Attribute))
@@ -12954,10 +19083,14 @@ class _reserve_ReserveProof:
                     if n.attr == "state":
                         assignment = getattr(n, "_landscape_parent", None)
                         if (
-                            not isinstance(assignment, (ast.Assign, ast.AnnAssign))
-                            or not isinstance(assignment.value, ast.Constant)
-                            or type(assignment.value.value) is not str
-                        ) and not self_field:
+                            (
+                                not isinstance(assignment, (ast.Assign, ast.AnnAssign))
+                                or not isinstance(assignment.value, ast.Constant)
+                                or type(assignment.value.value) is not str
+                            )
+                            and not self_field
+                            and (unit.path, id(n)) not in self.boundary.disjoint_compose_state_writes
+                        ):
                             failures.append("unclosed installation record state writer " + unit.path)
                 if (
                     isinstance(n, ast.Name)
@@ -28084,3 +34217,2168 @@ def test_required_work_reserve_proposal_namespace_ignores_unrelated_parent_metad
         assert not _reserve_safe_canonical_plugin_bind(changed_binder, changed_call)
     finally:
         shared_context._landscape_parent = original_parent
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        (
+            "iteration_bindings = _ComposeIterationBindings(",
+            "iteration_bindings = foreign_constructor(",
+            "intervening bindings construction changed",
+        ),
+        (
+            "iteration_state = _ComposeIterationState(",
+            "iteration_state = foreign_constructor(",
+            "actual constructor or argument binding changed",
+        ),
+        (
+            "self._advance_live_compose_iteration(iteration_state, iteration_bindings)",
+            "self._advance_live_compose_iteration(iteration_bindings, iteration_state)",
+            "retained bound dispatch/order changed",
+        ),
+        (
+            "self._advance_live_compose_iteration(iteration_state, iteration_bindings)",
+            "foreign_receiver._advance_live_compose_iteration(iteration_state, iteration_bindings)",
+            "retained bound dispatch/order changed",
+        ),
+        (
+            "        while True:\n            result = await self._advance_live_compose_iteration",
+            "        iteration_state = foreign_carrier\n        while True:\n            result = await self._advance_live_compose_iteration",
+            "actual constructor or argument binding changed",
+        ),
+        (
+            "        state = live.state\n",
+            "        live = foreign_carrier\n        state = live.state\n",
+            "entry aliases changed",
+        ),
+        (
+            "                live.state = state\n",
+            "                bindings.state = state\n",
+            "finally copyback changed",
+        ),
+        (
+            "        state = live.state\n",
+            "        state = live.state\n        escaped = live\n",
+            "entry aliases changed",
+        ),
+        (
+            "        for _continuation_iteration in (None,):\n",
+            "        leak(locals())\n        for _continuation_iteration in (None,):\n",
+            "reviewed method source changed",
+        ),
+        (
+            "    _ComposeIterationState,\n",
+            "    _ComposeIterationBindings as _ComposeIterationState,\n",
+            "carrier import changed",
+        ),
+    ],
+)
+def test_compose_iteration_state_receipt_refuses_changed_actual_transfer(before, after, refusal):
+    units = _production_units()
+    normal_failures, normal = _reserve_compose_iteration_state_receipt(units)
+    assert not normal_failures, normal_failures
+    assert normal["state_write"][0] == "src/elspeth/web/composer/service.py"
+    path = "src/elspeth/web/composer/service.py"
+    service = next(unit for unit in units if unit.path == path)
+    assert service.source.count(before) == 1
+    changed = _parse_source(path, service.source.replace(before, after))
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    failures, receipt = _reserve_compose_iteration_state_receipt(changed_units)
+    assert any(refusal in failure for failure in failures), failures
+    assert not receipt
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("addition", "refusal"),
+    [
+        (
+            "from elspeth.web.composer._compose_loop_carriers import _ComposeIterationState as ChangedCarrier\n"
+            "ChangedCarrier.__new__ = staticmethod(lambda *args, **kwargs: None)\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.web.composer.service import ComposerServiceImpl as ChangedComposer\n"
+            "setattr(ChangedComposer, '_advance_live_compose_iteration', lambda *args: None)\n",
+            "selected origin reflected replacement",
+        ),
+        (
+            "from elspeth.web.composer.service import ComposerServiceImpl as ChangedComposer\n"
+            "EscapedAdvance = getattr(ChangedComposer, '_advance_live_compose_iteration')\n",
+            "selected owner reflection is unproved",
+        ),
+        (
+            "from elspeth.web.composer._compose_loop_carriers import _ComposeIterationState as ChangedCarrier\n"
+            "UnreviewedCarrierAlias = ChangedCarrier\n",
+            "compose iteration constructor references or same-AST receipt changed",
+        ),
+    ],
+)
+def test_compose_iteration_state_receipt_refuses_external_origin_effects(addition, refusal):
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    source = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, source.source + "\n" + addition)
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    # The local transfer remains normal; refusal must come from the whole-source
+    # origin/effect or class-reference closure, not an unrelated local shape.
+    local_failures, local_receipt = _reserve_compose_iteration_state_receipt(changed_units)
+    assert not local_failures, local_failures
+    assert local_receipt
+    boundary = _reserve_supported_boundary(changed_units)
+    assert any(refusal in failure for failure in boundary.failures), boundary.failures
+    assert not boundary.disjoint_compose_state_writes
+
+
+@pytest.mark.landscape_long_run
+def test_compose_iteration_receipt_does_not_admit_an_unrelated_state_write():
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    source = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, source.source + "\ndef unreviewed_state_write(subject, next_state):\n    subject.state = next_state\n")
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    proof = _reserve_ReserveProof(changed_units)
+    assert proof.failures == ["unclosed installation record state writer " + path], proof.failures
+
+
+@pytest.mark.landscape_long_run
+def test_compose_iteration_state_receipt_belongs_to_the_actual_source_ast():
+    units = _production_units()
+    boundary = _reserve_supported_boundary(units)
+    assert not boundary.failures, boundary.failures
+    service = next(unit for unit in units if unit.path == "src/elspeth/web/composer/service.py")
+    owner = _reserve_node_at(service, "ComposerServiceImpl._advance_live_compose_iteration")
+    stores = [
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Store)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "live"
+        and node.attr == "state"
+    ]
+    assert len(stores) == 1
+    batch_failures, batch = _reserve_continuation_batch_state_receipt(units)
+    assert not batch_failures, batch_failures
+    assert boundary.disjoint_compose_state_writes == {(service.path, id(stores[0])), *batch["state_writes"]}
+    detached = _parse_source(service.path, service.source)
+    detached_owner = _reserve_node_at(detached, "ComposerServiceImpl._advance_live_compose_iteration")
+    detached_store = next(
+        node
+        for node in ast.walk(detached_owner)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store) and node.attr == "state"
+    )
+    assert (service.path, id(detached_store)) not in boundary.disjoint_compose_state_writes
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        (
+            "@dataclass(slots=True)\nclass _ComposeIterationState:",
+            "@dataclass(slots=False)\nclass _ComposeIterationState:",
+            "carrier declaration changed",
+        ),
+        (
+            "@dataclass(frozen=True, slots=True)\nclass _ComposeIterationBindings:",
+            "@dataclass(frozen=False, slots=True)\nclass _ComposeIterationBindings:",
+            "bindings constructor effects changed",
+        ),
+    ],
+)
+def test_compose_iteration_state_receipt_refuses_changed_carrier_declaration(before, after, refusal):
+    units = _production_units()
+    normal_failures, normal = _reserve_compose_iteration_state_receipt(units)
+    assert not normal_failures, normal_failures
+    assert normal
+    path = "src/elspeth/web/composer/_compose_loop_carriers.py"
+    carrier = next(unit for unit in units if unit.path == path)
+    assert carrier.source.count(before) == 1
+    changed = _parse_source(path, carrier.source.replace(before, after))
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    failures, receipt = _reserve_compose_iteration_state_receipt(changed_units)
+    assert any(refusal in failure for failure in failures), failures
+    assert not receipt
+
+
+def test_compose_iteration_state_receipt_refuses_second_foreign_caller():
+    units = _production_units()
+    normal_failures, normal = _reserve_compose_iteration_state_receipt(units)
+    assert not normal_failures, normal_failures
+    assert normal
+    path = "src/elspeth/web/execution/service.py"
+    source = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(
+        path,
+        source.source + "\nasync def unreviewed_compose_dispatch(service, foreign_live, bindings):\n"
+        "    return await service._advance_live_compose_iteration(foreign_live, bindings)\n",
+    )
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    failures, receipt = _reserve_compose_iteration_state_receipt(changed_units)
+    assert failures == ["compose iteration bound method reference inventory changed"], failures
+    assert not receipt
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        (
+            "batch = ContinuationBatchState(\n",
+            "batch = foreign_constructor(\n",
+            "actual adapter constructor/argument/order changed",
+        ),
+        (
+            "call = ContinuationCallState(batch.next_tool_index, calls[batch.next_tool_index], batch.state, batch.state.version)",
+            "call = foreign_constructor(batch.next_tool_index, calls[batch.next_tool_index], batch.state, batch.state.version)",
+            "actual adapter constructor/argument/order changed",
+        ),
+        (
+            "await _initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)",
+            "await _initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=foreign_batch)",
+            "actual adapter constructor/argument/order changed",
+        ),
+        (
+            "    calls = call_model.completion.tool_batch.calls\n",
+            "    batch = foreign_batch\n    calls = call_model.completion.tool_batch.calls\n",
+            "actual adapter constructor/argument/order changed",
+        ),
+        (
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n',
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n    batch = foreign_batch\n',
+            "formal receiver rebound",
+        ),
+        (
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n',
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n    escaped = batch\n',
+            "formal receiver escaped",
+        ),
+        (
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n',
+            '    """Retain the real preparation boundary; early refusals remain outcomes."""\n    leak(locals())\n',
+            "reviewed helper body changed",
+        ),
+        (
+            "        _batch: ContinuationBatchState = batch,\n",
+            "        _batch: ContinuationBatchState = foreign_batch,\n",
+            "actual captured carrier transfer changed",
+        ),
+        (
+            "from dataclasses import dataclass, field, replace\n",
+            "from dataclasses import dataclass, replace as field, replace\n",
+            "field supplier changed",
+        ),
+        (
+            "@dataclass(slots=True)\nclass ContinuationBatchState:",
+            "@dataclass(slots=False)\nclass ContinuationBatchState:",
+            "carrier/default declaration changed",
+        ),
+        (
+            "wire: _CallWireFacts = field(default_factory=_CallWireFacts)",
+            "wire: _CallWireFacts = field(default_factory=foreign_factory)",
+            "carrier/default declaration changed",
+        ),
+        (
+            "class _CallWireFacts:\n",
+            "class _CallWireFacts:\n    def __post_init__(self):\n        foreign_effect()\n",
+            "carrier/default declaration changed",
+        ),
+        (
+            "    calls = call_model.completion.tool_batch.calls\n",
+            "    leak(batch)\n    calls = call_model.completion.tool_batch.calls\n",
+            "actual adapter constructor/argument/order changed",
+        ),
+        (
+            "response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version",
+            "response=blocked, error_class=None, error_category=None, error_message=None, post_version=state.version, _batch=foreign_batch",
+            "captured outcome closure escaped or overridden",
+        ),
+        (
+            "    batch.stop_issued_batch = batch.stop_issued_batch or not ran_to_end\n",
+            "    batch.stop_issued_batch = batch.stop_issued_batch or not ran_to_end\n    escaped = _append_tool_outcome\n",
+            "captured outcome closure escaped or overridden",
+        ),
+        (
+            "    batch.state = state\n    batch.last_validation = last_validation\n",
+            "    batch.state = foreign_state\n    batch.last_validation = last_validation\n",
+            "state copyback changed",
+        ),
+        (
+            "    outcome_ids = {outcome.call.id for outcome in tool_outcomes}\n",
+            "    outcome_ids = foreign_projection(tool_outcomes)\n",
+            "reviewed helper body changed",
+        ),
+    ],
+)
+def test_continuation_batch_state_receipt_refuses_changed_actual_transfer(before, after, refusal):
+    units = _production_units()
+    normal_failures, normal = _reserve_continuation_batch_state_receipt(units)
+    assert not normal_failures, normal_failures
+    assert len(normal["state_writes"]) == 3
+    path = "src/elspeth/web/composer/tool_batch.py"
+    source = next(unit for unit in units if unit.path == path)
+    assert source.source.count(before) == 1
+    changed = _parse_source(path, source.source.replace(before, after))
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    failures, receipt = _reserve_continuation_batch_state_receipt(changed_units)
+    assert any(refusal in failure for failure in failures), failures
+    assert not receipt
+
+
+def test_continuation_batch_state_receipt_refuses_second_foreign_caller():
+    units = _production_units()
+    normal_failures, normal = _reserve_continuation_batch_state_receipt(units)
+    assert not normal_failures, normal_failures
+    assert len(normal["calls"]) == 5
+    path = "src/elspeth/web/execution/service.py"
+    source = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(
+        path,
+        source.source + "\nasync def unreviewed_batch_transfer(other):\n"
+        "    from elspeth.web.composer.tool_batch import _prepare_continuation_call_live\n"
+        "    return await _prepare_continuation_call_live(batch=other)\n",
+    )
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    failures, receipt = _reserve_continuation_batch_state_receipt(changed_units)
+    assert failures == ["continuation batch native helper reference inventory changed"], failures
+    assert not receipt
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("addition", "refusal"),
+    [
+        (
+            "from elspeth.web.composer.tool_batch import ContinuationBatchState as ChangedBatch\n"
+            "ChangedBatch.__new__ = staticmethod(lambda *args, **kwargs: None)\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.web.composer.tool_batch import ContinuationCallState as ChangedCall\n"
+            "setattr(ChangedCall, '__setattr__', lambda *args: None)\n",
+            "selected origin reflected replacement",
+        ),
+        (
+            "from elspeth.web.composer.tool_batch import ContinuationBatchState as ChangedBatch\nUnreviewedBatchAlias = ChangedBatch\n",
+            "continuation batch references or same-AST receipt changed",
+        ),
+        (
+            "import elspeth.web.composer.tool_batch as ChangedModule\n"
+            "setattr(ChangedModule, '_execute_continuation_call_live', lambda *args: None)\n",
+            "selected origin reflected replacement",
+        ),
+        (
+            "import elspeth.web.composer.tool_batch as ChangedModule\n"
+            "EscapedExecute = getattr(ChangedModule, '_execute_continuation_call_live')\n",
+            "selected owner reflection is unproved",
+        ),
+        (
+            "from elspeth.web.composer.tool_batch import _CallWireFacts as ChangedWire\n"
+            "ChangedWire.__new__ = staticmethod(lambda *args, **kwargs: None)\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.web.composer.tool_batch import _CallWireFacts as ChangedWire\n"
+            "setattr(ChangedWire, '__setattr__', lambda *args: None)\n",
+            "selected origin reflected replacement",
+        ),
+        (
+            "import dataclasses as ChangedDataclasses\nChangedDataclasses.field = lambda **kwargs: None\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from dataclasses import field as ChangedField\nChangedField.__code__ = foreign_code\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from dataclasses import field as ChangedField\ndef replace_field():\n"
+            "    global ChangedField\n    ChangedField = lambda **kwargs: None\n",
+            "selected imported binding scope escaped",
+        ),
+        (
+            "import dataclasses as ChangedDataclasses\ndef replace_field():\n"
+            "    field = ChangedDataclasses.field\n    field.__code__ = foreign_code\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.web.composer.tool_batch import _execute_continuation_call_live as ChangedExecute\n"
+            "ChangedExecute.__code__ = foreign_code\n",
+            "selected origin attribute replaced",
+        ),
+    ],
+)
+def test_continuation_batch_state_receipt_refuses_external_origin_effects(addition, refusal):
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    source = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, source.source + "\n" + addition)
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    local_failures, local_receipt = _reserve_continuation_batch_state_receipt(changed_units)
+    assert not local_failures, local_failures
+    assert len(local_receipt["state_writes"]) == 3
+    boundary = _reserve_supported_boundary(changed_units)
+    assert any(refusal in failure for failure in boundary.failures), boundary.failures
+    assert not boundary.disjoint_compose_state_writes
+
+
+@pytest.mark.landscape_long_run
+def test_continuation_batch_state_receipt_belongs_to_the_actual_source_ast():
+    units = _production_units()
+    local_failures, receipt = _reserve_continuation_batch_state_receipt(units)
+    assert not local_failures, local_failures
+    boundary = _reserve_supported_boundary(units)
+    assert not boundary.failures, boundary.failures
+    path = "src/elspeth/web/composer/tool_batch.py"
+    unit = next(unit for unit in units if unit.path == path)
+    actual = {
+        (path, id(node))
+        for name in ("_initialize_continuation_batch_live", "_prepare_continuation_call_live", "_execute_continuation_call_live")
+        for node in ast.walk(_reserve_node_at(unit, name))
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.ctx, ast.Store)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "batch"
+        and node.attr == "state"
+    }
+    assert len(actual) == 3
+    assert receipt["state_writes"] == actual
+    assert {site for site in boundary.disjoint_compose_state_writes if site[0] == path} == actual
+    detached = _parse_source(path, unit.source)
+    detached_failures, detached_receipt = _reserve_continuation_batch_state_receipt(
+        tuple(detached if source.path == path else source for source in units)
+    )
+    assert not detached_failures, detached_failures
+    assert len(detached_receipt["state_writes"]) == 3
+    assert not detached_receipt["state_writes"] & boundary.disjoint_compose_state_writes
+
+
+@pytest.mark.landscape_long_run
+def test_continuation_batch_receipt_does_not_admit_an_unrelated_state_write():
+    units = _production_units()
+    path = "src/elspeth/web/execution/service.py"
+    unit = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, unit.source + "\ndef unreviewed_batch_state(subject, next_state):\n    subject.state = next_state\n")
+    changed_units = tuple(changed if source.path == path else source for source in units)
+    proof = _reserve_ReserveProof(changed_units)
+    assert proof.failures == ["unclosed installation record state writer " + path], proof.failures
+
+
+@pytest.mark.parametrize("bound", ("field", "ImportedField"))
+@pytest.mark.parametrize(
+    "body",
+    (
+        "def local(items):\n    field = None\n    return field\n",
+        "def local(items):\n    for field in items:\n        consume(field)\n",
+        "async def local(items):\n    async for field in items:\n        consume(field)\n",
+        "def local(items):\n    return {field.name: field for field in items}\n",
+        "values = [field for field in items]\n",
+        "values = (field for field in items)\n",
+        "def local(items):\n    return [(field := item) for item in items]\n",
+        "def outer():\n    def inner(value=(field := None)):\n        return value\n    return field\n",
+    ),
+)
+def test_dataclass_field_supplier_receipt_admits_only_actual_local_store_nodes(bound, body):
+    source = "from dataclasses import field as " + bound + "\n" + body.replace("field", bound)
+    unit = _parse_source("src/elspeth/field_supplier_local_probe.py", source)
+    actual = {
+        id(node) for node in ast.walk(unit.tree) if isinstance(node, ast.Name) and node.id == bound and isinstance(node.ctx, ast.Store)
+    }
+    assert actual
+    receipt = _reserve_dataclass_field_local_stores(unit, bound, ("object", "dataclasses.field"))
+    assert receipt == actual
+    assert not _reserve_dataclass_field_local_stores(unit, bound, ("object", "foreign.field"))
+    assert not _reserve_dataclass_field_local_stores(unit, "unrelated_name", ("object", "dataclasses.field"))
+    detached = _parse_source(unit.path, source)
+    assert not receipt & _reserve_dataclass_field_local_stores(detached, bound, ("object", "dataclasses.field"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "field = foreign\n",
+        "for field in values:\n    consume(field)\n",
+        "def local(value=(field := foreign)):\n    pass\n",
+        "@(field := decorator)\ndef local():\n    pass\n",
+        "values = [(field := item) for item in items]\n",
+        "value = (lambda arg=(field := foreign): arg)\n",
+        "def local():\n    global field\n    field = foreign\n",
+        "def outer(field):\n    def inner():\n        nonlocal field\n        field = foreign\n",
+        "class Local:\n    field = foreign\n",
+        "def local():\n    del field\n",
+    ),
+)
+def test_dataclass_field_supplier_receipt_refuses_enclosing_or_unproved_scope_stores(body):
+    unit = _parse_source("src/elspeth/field_supplier_scope_probe.py", "from dataclasses import field\n" + body)
+    assert any(
+        isinstance(node, ast.Name) and node.id == "field" and isinstance(node.ctx, (ast.Store, ast.Del)) for node in ast.walk(unit.tree)
+    )
+    assert not _reserve_dataclass_field_local_stores(unit, "field", ("object", "dataclasses.field"))
+
+
+def test_dataclass_field_supplier_receipt_covers_actual_audit_comprehension_without_detached_grant():
+    path = "src/elspeth/contracts/composer_llm_audit.py"
+    unit = _parse_source(path, (_repo_root() / path).read_text())
+    targets = {
+        id(node)
+        for comprehension in ast.walk(unit.tree)
+        if isinstance(comprehension, ast.comprehension)
+        for node in ast.walk(comprehension.target)
+        if isinstance(node, ast.Name) and node.id == "field" and isinstance(node.ctx, ast.Store)
+    }
+    assert targets
+    receipt = _reserve_dataclass_field_local_stores(unit, "field", ("object", "dataclasses.field"))
+    assert targets <= receipt
+    assert receipt <= {id(node) for node in ast.walk(unit.tree)}
+    assert not _reserve_dataclass_field_local_stores(unit, "field", ("object", "dataclasses.dataclass"))
+
+
+def test_dataclass_field_first_comprehension_iterable_does_not_receive_a_local_store_receipt():
+    unit = _parse_source(
+        "src/elspeth/field_supplier_iterable_probe.py",
+        "from dataclasses import field\nvalues = [item for item in field]\n",
+    )
+    loads = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Name) and node.id == "field"]
+    assert len(loads) == 1 and isinstance(loads[0].ctx, ast.Load)
+    assert not _reserve_dataclass_field_local_stores(unit, "field", ("object", "dataclasses.field"))
+
+
+def test_dataclass_field_receiver_shapes_bind_actual_constructor_stores():
+    units = _production_units()
+    failures, leaves, roots, stores = _reserve_dataclass_field_receiver_shapes(units)
+    assert not failures, failures
+    assert len(leaves) == 5
+    assert "elspeth.contracts.audit_evidence.AuditEvidenceBase" in roots
+    assert len(stores) == 5
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert stores <= actual
+    path = "src/elspeth/contracts/data.py"
+    original = next(unit for unit in units if unit.path == path)
+    detached = _parse_source(path, original.source)
+    detached_failures, detached_leaves, detached_roots, detached_stores = _reserve_dataclass_field_receiver_shapes(
+        tuple(detached if unit.path == path else unit for unit in units)
+    )
+    assert not detached_failures, detached_failures
+    assert detached_leaves == leaves
+    assert detached_roots == roots
+    assert {site for site in stores if site[0] == path}.isdisjoint(detached_stores)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        ("class SchemaValidationError:", "class SchemaValidationError(metaclass=ForeignMeta):", "allocation header changed"),
+        ("class SchemaValidationError:", "@foreign_decorator\nclass SchemaValidationError:", "allocation header changed"),
+        (
+            "    def __init__(self, field: str, message: str, value: Any = None) -> None:",
+            "    @staticmethod\n    def __init__(self, field: str, message: str, value: Any = None) -> None:",
+            "initializer formal changed",
+        ),
+        (
+            "from dataclasses import dataclass",
+            "from dataclasses import dataclass\nlist = ForeignList",
+            "eager annotation owner or builtin supplier changed",
+        ),
+        (
+            "class SchemaValidationError:",
+            "class SchemaValidationError:\n    @property\n    def field(self):\n        return foreign_value\n",
+            "allocation or descriptor override",
+        ),
+        ("        self.field = field", "        import dataclasses as self\n        self.field = field", "initializer formal changed"),
+        ("        self.field = field", "        (self := other)\n        self.field = field", "initializer formal changed"),
+        (
+            "        self.field = field",
+            "        match other:\n            case self:\n                pass\n        self.field = field",
+            "initializer formal changed",
+        ),
+        (
+            "        self.field = field",
+            "        def rebind():\n            nonlocal self\n            self = other\n        self.field = field",
+            "initializer formal changed",
+        ),
+        ("        self.field = field", "        self.field = field\n        other.field = field", "one direct constructor assignment"),
+        (
+            "class SchemaValidationError:",
+            "class SchemaValidationError:\n    def __new__(cls, *args, **kwargs):\n        return foreign_receiver\n",
+            "allocation or descriptor override",
+        ),
+    ],
+)
+def test_dataclass_field_receiver_shapes_refuse_changed_actual_constructor(before, after, refusal):
+    units = _production_units()
+    normal_failures, _, _, normal_stores = _reserve_dataclass_field_receiver_shapes(units)
+    assert not normal_failures, normal_failures
+    assert len(normal_stores) == 5
+    path = "src/elspeth/contracts/data.py"
+    source = next(unit for unit in units if unit.path == path)
+    assert source.source.count(before) == 1
+    changed = _parse_source(path, source.source.replace(before, after))
+    failures, _, _, _ = _reserve_dataclass_field_receiver_shapes(tuple(changed if unit.path == path else unit for unit in units))
+    assert any(refusal in failure for failure in failures), failures
+
+
+def test_dataclass_field_receiver_shapes_retain_actual_ancestor_wrapper():
+    units = _production_units()
+    normal_failures, _, _, normal_stores = _reserve_dataclass_field_receiver_shapes(units)
+    assert not normal_failures, normal_failures
+    assert len(normal_stores) == 5
+    path = "src/elspeth/contracts/audit_evidence.py"
+    source = next(unit for unit in units if unit.path == path)
+    before = "original_init(self, *args, **inner_kwargs)"
+    assert source.source.count(before) == 1
+    changed = _parse_source(path, source.source.replace(before, "original_init(other, *args, **inner_kwargs)"))
+    failures, _, _, _ = _reserve_dataclass_field_receiver_shapes(tuple(changed if unit.path == path else unit for unit in units))
+    assert any("initializer wrapper" in failure for failure in failures), failures
+
+
+@pytest.mark.parametrize(
+    ("source", "allowed"),
+    [
+        ("value = Error(field='x', message='bad')", True),
+        ("def f(value: Error):\n    pass", False),
+        ("from __future__ import annotations\ndef f(value: Error):\n    pass", True),
+        ("from __future__ import annotations\ndef f(value: list[Error]):\n    pass", True),
+        ("def f(value: mutate(Error)):\n    pass", False),
+        ("from __future__ import annotations\ndef f(value: mutate(Error)):\n    pass", False),
+        ("try:\n    work()\nexcept Error:\n    pass", True),
+        ("try:\n    work()\nexcept (ValueError, Error):\n    pass", True),
+        ("try:\n    work()\nexcept mutate(Error):\n    pass", False),
+        ("saved = Error", False),
+        ("Error.__init__(foreign, 'x', 'bad')", False),
+        ("class Derived(Error):\n    pass", False),
+    ],
+)
+def test_dataclass_field_class_reference_requires_exact_supported_context(source, allowed):
+    unit = _parse_source("src/elspeth/field_reference_probe.py", source + "\n")
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    uses = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Name) and node.id == "Error" and isinstance(node.ctx, ast.Load)]
+    assert len(uses) == 1
+    assert _reserve_dataclass_field_class_use(uses[0], unit, parents) is allowed
+    detached = _parse_source(unit.path, unit.source)
+    detached_parents = {id(child): parent for parent in ast.walk(detached.tree) for child in ast.iter_child_nodes(parent)}
+    assert not _reserve_dataclass_field_class_use(uses[0], unit, detached_parents)
+
+
+@pytest.mark.landscape_long_run
+def test_dataclass_field_common_origin_preserves_global_supplier_after_comprehension():
+    units = _production_units()
+    path = "src/elspeth/field_origin_probe.py"
+    positive = _parse_source(
+        path,
+        "from dataclasses import field\n"
+        "def ordinary(items):\n"
+        "    projected = [field for field in items]\n"
+        "    return field(default=projected)\n",
+    )
+    failures = _reserve_selected_origin_effect_failures((*units, positive), frozenset({"dataclasses.field"}))
+    assert not failures, failures
+    changed = _parse_source(path, positive.source.replace("    return field(default=projected)", "    field.__code__ = replacement"))
+    failures = _reserve_selected_origin_effect_failures((*units, changed), frozenset({"dataclasses.field"}))
+    assert any("selected origin attribute replaced " + path in failure for failure in failures), failures
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("addition", "refusal"),
+    [
+        (
+            "from dataclasses import field\n"
+            "def mutate():\n"
+            "    def nested():\n"
+            "        field = 'ordinary local'\n"
+            "    field.__code__ = replacement\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "import dataclasses\nfrom dataclasses import field\n"
+            "def mutate():\n"
+            "    if (field := dataclasses.field):\n"
+            "        field.__code__ = replacement\n",
+            "field supplier reference outside direct call",
+        ),
+        (
+            "import dataclasses\n"
+            "from elspeth.contracts.data import SchemaValidationError as Error\n"
+            "Error.__init__(dataclasses, replacement, 'bad')\n",
+            "field receiver class reference escaped",
+        ),
+        (
+            "import dataclasses\n"
+            "from elspeth.contracts.data import SchemaValidationError as Error\n"
+            "saved = Error('x', 'bad').__init__.__func__\n"
+            "saved(dataclasses, replacement, 'bad')\n",
+            "selected module capability passed to unreviewed caller",
+        ),
+        (
+            "from elspeth.contracts.data import SchemaValidationError as Error\nError.__new__ = staticmethod(lambda *args: foreign)\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.contracts.data import SchemaValidationError as Error\nsaved = getattr(Error, '__init__')\n",
+            "selected owner reflection is unproved",
+        ),
+        (
+            "from abc import ABC\ntype(ABC).__call__ = replacement\n",
+            "field receiver allocation reflection",
+        ),
+        (
+            "from abc import ABCMeta\nABCMeta.__call__ = replacement\n",
+            "selected origin attribute replaced",
+        ),
+        (
+            "from elspeth.contracts.data import validate_row\nsaved = validate_row.__annotations__['return']\n",
+            "field receiver annotation owner escaped",
+        ),
+        (
+            "def unrelated(subject, replacement):\n    subject.field = replacement\n",
+            "unknown protected attribute receiver",
+        ),
+    ],
+)
+def test_dataclass_field_common_origin_refuses_real_supplier_or_receiver_escape(addition, refusal):
+    units = _production_units()
+    changed = _parse_source("src/elspeth/field_origin_probe.py", addition)
+    failures = _reserve_selected_origin_effect_failures((*units, changed), frozenset({"dataclasses.field"}))
+    assert any(refusal in failure for failure in failures), failures
+    assert not any("selected imported binding rebound" in failure for failure in failures), failures
+
+
+def test_dataclass_field_actual_eager_list_annotation_has_protected_owner():
+    unit = next(source for source in _production_units() if source.path == "src/elspeth/contracts/data.py")
+    failures, _, roots, _ = _reserve_dataclass_field_receiver_shapes(_production_units())
+    assert not failures, failures
+    assert "elspeth.contracts.data.validate_row" in roots
+    function = _reserve_node_at(unit, "validate_row")
+    node = function.returns.slice
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    assert _reserve_dataclass_field_class_use(node, unit, parents)
+    changed = _parse_source(unit.path, unit.source.replace("list[SchemaValidationError]", "foreign[SchemaValidationError]"))
+    changed_function = _reserve_node_at(changed, "validate_row")
+    changed_parents = {id(child): parent for parent in ast.walk(changed.tree) for child in ast.iter_child_nodes(parent)}
+    assert not _reserve_dataclass_field_class_use(changed_function.returns.slice, changed, changed_parents)
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("local_import", "factory"),
+    [
+        ("from dataclasses import field", "field"),
+        ("import dataclasses as field", "field.field"),
+    ],
+)
+def test_dataclass_field_common_origin_preserves_local_import_supplier(local_import, factory):
+    units = _production_units()
+    path = "src/elspeth/field_local_import_probe.py"
+    positive = _parse_source(
+        path,
+        f"from dataclasses import field\ndef ordinary():\n    {local_import}\n    return {factory}(default=None)\n",
+    )
+    failures = _reserve_selected_origin_effect_failures((*units, positive), frozenset({"dataclasses.field"}))
+    assert not failures, failures
+    before = f"    return {factory}(default=None)"
+    assert positive.source.count(before) == 1
+    changed = _parse_source(path, positive.source.replace(before, f"    {factory}.__code__ = replacement"))
+    failures = _reserve_selected_origin_effect_failures((*units, changed), frozenset({"dataclasses.field"}))
+    assert any("selected origin attribute replaced " + path in failure for failure in failures), failures
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("mutation", "refusal"),
+    [
+        ("cast.__code__ = replacement", "selected origin attribute replaced"),
+        ("setattr(cast, '__code__', replacement)", "selected origin reflected replacement"),
+        ("delattr(cast, '__annotations__')", "selected origin reflected replacement"),
+        ("saved = cast", "field receiver cast supplier reference escaped"),
+        ("saved = cast.__globals__", "field receiver cast supplier reference escaped"),
+        ("consume(cast)", "field receiver cast supplier reference escaped"),
+        ("def later(saved=cast):\n    return saved", "field receiver cast supplier reference escaped"),
+        ("cast = replacement", "selected imported binding"),
+        ("del cast", "selected imported binding rebound"),
+    ],
+)
+def test_dataclass_field_receiver_cast_supplier_preserves_call_and_refuses_mutation(mutation, refusal):
+    units = _production_units()
+    path = "src/elspeth/field_cast_supplier_probe.py"
+    positive = _parse_source(path, "from typing import cast\nvalue = cast(str, 'owned')\n")
+    failures = _reserve_selected_origin_effect_failures((*units, positive), frozenset({"dataclasses.field"}))
+    assert not failures, failures
+    changed = _parse_source(path, positive.source + mutation + "\n")
+    failures = _reserve_selected_origin_effect_failures((*units, changed), frozenset({"dataclasses.field"}))
+    assert any(refusal + " " in failure and (path in failure or "elspeth.field_cast_supplier_probe" in failure) for failure in failures), (
+        failures
+    )
+
+
+@pytest.mark.parametrize("source", ["field: str", "class Record:\n    field: str"])
+def test_dataclass_field_annotation_only_target_is_same_ast_nonwrite(source):
+    unit = _parse_source("src/elspeth/field_annotation_probe.py", "from dataclasses import field\n" + source + "\n")
+    annotation = next(node for node in ast.walk(unit.tree) if isinstance(node, ast.AnnAssign))
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    received = _reserve_dataclass_field_local_bindings(unit, "field", ("object", "dataclasses.field"))
+    assert received == {id(annotation.target): id(parents[id(annotation)])}
+    assert not _reserve_dataclass_field_local_bindings(unit, "field", ("object", "foreign.field"))
+    detached = _parse_source(unit.path, unit.source)
+    assert id(annotation.target) not in _reserve_dataclass_field_local_stores(detached, "field", ("object", "dataclasses.field"))
+    valued = _parse_source(unit.path, unit.source.replace("field: str", "field: str = replacement"))
+    assert not _reserve_dataclass_field_local_stores(valued, "field", ("object", "dataclasses.field"))
+
+
+def test_dataclass_field_function_annotation_still_declares_its_local_binding():
+    unit = _parse_source(
+        "src/elspeth/field_annotation_probe.py", "from dataclasses import field\ndef ordinary():\n    field: str\n    return field\n"
+    )
+    function = next(node for node in unit.tree.body if isinstance(node, ast.FunctionDef))
+    target = function.body[0].target
+    received = _reserve_dataclass_field_local_bindings(unit, "field", ("object", "dataclasses.field"))
+    assert received == {id(target): id(function)}
+
+
+def test_dataclass_field_actual_annotation_targets_are_not_supplier_value_writes():
+    units = {unit.path: unit for unit in _production_units()}
+    for path, owner_name in (
+        ("src/elspeth/web/composer/redaction.py", "_CoalesceUnionTypeDetailShadowModel"),
+        ("src/elspeth/web/composer/state.py", "CoalesceUnionTypeDetailDict"),
+        ("src/elspeth/web/composer/state.py", "CoalesceUnionTypeDetail"),
+        ("src/elspeth/web/composer/tools/_common.py", "_FileSinkRepairOptions"),
+    ):
+        unit = units[path]
+        owner = _reserve_node_at(unit, owner_name)
+        declarations = [
+            node
+            for node in owner.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "field"
+        ]
+        assert len(declarations) == 1 and declarations[0].value is None
+        received = _reserve_dataclass_field_local_bindings(unit, "field", ("object", "dataclasses.field"))
+        assert received[id(declarations[0].target)] == id(owner)
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    "mutation,refusal",
+    [
+        ("field: capture(field)", "field supplier reference outside direct call"),
+        ("field: str\nfield.__code__ = replacement", "selected origin attribute replaced"),
+        ("field: str = replacement", "selected imported binding has no unique source producer"),
+    ],
+)
+def test_dataclass_field_annotation_receipt_preserves_expression_and_value_effect_refusal(mutation, refusal):
+    units = _production_units()
+    path = "src/elspeth/field_annotation_effect_probe.py"
+    positive = _parse_source(
+        path, "from dataclasses import field\nfield: str\nclass Record:\n    field: str\nvalue = field(default=None)\n"
+    )
+    failures = _reserve_selected_origin_effect_failures((*units, positive), frozenset({"dataclasses.field"}))
+    assert not failures, failures
+    changed = _parse_source(path, "from dataclasses import field\n" + mutation + "\n")
+    failures = _reserve_selected_origin_effect_failures((*units, changed), frozenset({"dataclasses.field"}))
+    assert any(refusal in failure for failure in failures), failures
+
+
+def test_audit_evidence_recovery_receipt_is_exact_and_same_ast():
+    path = _reserve_AUDIT_EVIDENCE_PATH
+    source = (_repo_root() / path).read_text()
+    unit = _parse_source(path, source)
+    failures, sites, uses = _reserve_audit_evidence_recovery_receipt((unit,))
+    assert not failures, failures
+    assert len(sites) == len(uses) == 2
+    nodes = {(path, id(node)): node for node in ast.walk(unit.tree)}
+    parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+    assert sites <= nodes.keys() and uses <= nodes.keys()
+    for site in sites:
+        call = nodes[site]
+        assert ast.unparse(call) == "type(self)"
+        parent = parents[id(call)]
+        assert isinstance(parent, ast.Call) and parent.args == [call]
+        assert (path, id(parent.func)) in uses
+    detached = _parse_source(path, source)
+    detached_failures, detached_sites, detached_uses = _reserve_audit_evidence_recovery_receipt((detached,))
+    assert not detached_failures, detached_failures
+    assert not sites & detached_sites and not uses & detached_uses
+    foreign = _parse_source("src/elspeth/audit_recovery_foreign.py", source)
+    for units in ((), (foreign,), (unit, detached)):
+        failures, denied_sites, denied_uses = _reserve_audit_evidence_recovery_receipt(units)
+        assert failures and not denied_sites and not denied_uses
+    # A same-path, same-source-string Unit with an altered actual AST must fail.
+    sink = _reserve_node_at(detached, "AuditEvidenceBase._raise_if_abstract")
+    sink.body.append(ast.Return(value=ast.Name(id="cls", ctx=ast.Load())))
+    failures, denied_sites, denied_uses = _reserve_audit_evidence_recovery_receipt((detached,))
+    assert failures and not denied_sites and not denied_uses
+    commented = _parse_source(path, "# harmless formatting comment\n" + source)
+    assert not _reserve_audit_evidence_recovery_receipt((commented,))[0]
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("        abstract_methods = cast", "        consume(cls)\n        abstract_methods = cast"),
+        ("        abstract_methods = cast", "        cls.__init__ = replacement\n        abstract_methods = cast"),
+        (
+            "        abstract_methods = cast",
+            "        global recovered_class\n        recovered_class = cls\n        abstract_methods = cast",
+        ),
+        ("        abstract_methods = cast", "        return cls\n        abstract_methods = cast"),
+        ("    @staticmethod\n    def _raise_if_abstract", "    @foreign_wrapper\n    def _raise_if_abstract"),
+        ("            AuditEvidenceBase._raise_if_abstract(type(self))", "            AuditEvidenceBase._raise_if_abstract(type(other))"),
+        (
+            "            AuditEvidenceBase._raise_if_abstract(type(self))",
+            "            self = other\n            AuditEvidenceBase._raise_if_abstract(type(self))",
+        ),
+        (
+            "            AuditEvidenceBase._raise_if_abstract(type(self))",
+            "            consume(type(self))\n            AuditEvidenceBase._raise_if_abstract(type(self))",
+        ),
+        (
+            "        AuditEvidenceBase._raise_if_abstract(type(self))\n        super().__init__",
+            "        saved = type(self)\n        AuditEvidenceBase._raise_if_abstract(saved)\n        super().__init__",
+        ),
+        ("original_init(self, *args, **inner_kwargs)", "original_init(other, *args, **inner_kwargs)"),
+        ("from typing import Any, cast", "from foreign import Any, cast"),
+        ("from abc import ABC, abstractmethod", "from foreign import ABC, abstractmethod"),
+        ("class AuditEvidenceBase(ABC):", "class AuditEvidenceBase(ABC, metaclass=foreign_meta):"),
+    ],
+)
+def test_audit_evidence_recovery_receipt_refuses_changed_sink_caller_and_supplier(before, after):
+    path = _reserve_AUDIT_EVIDENCE_PATH
+    source = (_repo_root() / path).read_text()
+    normal = _parse_source(path, source)
+    assert not _reserve_audit_evidence_recovery_receipt((normal,))[0]
+    assert source.count(before) == 1
+    changed = _parse_source(path, source.replace(before, after))
+    failures, sites, uses = _reserve_audit_evidence_recovery_receipt((changed,))
+    assert failures and not sites and not uses
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "AuditEvidenceBase._raise_if_abstract = replacement",
+        "setattr(AuditEvidenceBase, '_raise_if_abstract', replacement)",
+        "delattr(AuditEvidenceBase, '_raise_if_abstract')",
+        "AuditEvidenceBase._raise_if_abstract.__code__ = replacement",
+        "descriptor = vars(AuditEvidenceBase)['_raise_if_abstract']\ndescriptor.__func__.__code__ = replacement",
+        "saved = AuditEvidenceBase._raise_if_abstract",
+        "consume(AuditEvidenceBase._raise_if_abstract)",
+        "def replay(check=AuditEvidenceBase._raise_if_abstract):\n    return check",
+        "AuditEvidenceBase._raise_if_abstract(type(foreign))",
+        "cast.__code__ = replacement",
+        "setattr(cast, '__code__', replacement)",
+        "typing.cast = replacement",
+        "builtins.type = replacement",
+        "builtins.staticmethod = replacement",
+        "builtins.frozenset = replacement",
+        "abc.ABCMeta.__call__ = replacement",
+        "abc.ABC.__new__ = replacement",
+    ],
+)
+def test_audit_evidence_recovery_boundary_refuses_external_mutation_and_capture(mutation):
+    units = _production_units()
+    path = "src/elspeth/audit_recovery_supplier_probe.py"
+    header = (
+        "import abc\nimport builtins\nimport typing\nfrom typing import cast\n"
+        "from elspeth.contracts.audit_evidence import AuditEvidenceBase\n"
+    )
+    positive = _parse_source(path, header)
+    normal = _reserve_supported_boundary((*units, positive))
+    assert not normal.failures, normal.failures
+    assert len(normal.audit_evidence_recoveries) == 2
+    changed = _parse_source(path, header + mutation + "\n")
+    refused = _reserve_supported_boundary((*units, changed))
+    assert refused.failures, mutation
+    assert any(path in failure or "audit evidence recovery supplier references" in failure for failure in refused.failures), (
+        refused.failures
+    )
+    assert not refused.audit_evidence_recoveries
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def write(other, state):\n    other.state = state\n",
+        "from elspeth.contracts.session_operation import SessionOperationContext\n"
+        "value = SessionOperationContext(None, None)\nrecovered = type(value)\nconsume(recovered)\n",
+    ],
+    ids=["unrelated-state-writer", "foreign-class-recovery"],
+)
+def test_audit_evidence_recovery_complete_proof_preserves_unrelated_refusals(source):
+    units = _production_units()
+    normal = _reserve_ReserveProof(units)
+    assert not normal.failures, normal.failures
+    assert len(normal.boundary.audit_evidence_recoveries) == 2
+    path = "src/elspeth/audit_recovery_unrelated_probe.py"
+    probe = _parse_source(path, source)
+    refused = _reserve_ReserveProof((*units, probe))
+    assert refused.failures, source
+    assert any(path in failure for failure in refused.failures), refused.failures
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("mutation", "diagnostic"),
+    [
+        ("audit.cast = replacement", "external selected supplier module binding replacement"),
+        ("audit.type = replacement", "external selected supplier module binding replacement"),
+        ("setattr(audit, 'cast', replacement)", "protected supplier module namespace escape"),
+    ],
+    ids=["module-cast-replacement", "module-type-shadow", "reflected-module-cast-replacement"],
+)
+def test_audit_evidence_recovery_complete_proof_refuses_module_alias_mutation(mutation, diagnostic):
+    units = _production_units()
+    path = "src/elspeth/audit_recovery_module_alias_probe.py"
+    header = "import elspeth.contracts.audit_evidence as audit\n"
+    positive = _parse_source(path, header)
+    normal = _reserve_ReserveProof((*units, positive))
+    assert not normal.failures, normal.failures
+    assert len(normal.boundary.audit_evidence_recoveries) == 2
+    changed = _parse_source(path, header + mutation + "\n")
+    refused = _reserve_ReserveProof((*units, changed))
+    assert refused.failures, mutation
+    assert diagnostic + " " + path in refused.failures, refused.failures
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("effect", "diagnostic"),
+    [
+        (
+            "escaped = getattr(SelectedModule, '_execute_continuation_call_live')\n",
+            "selected owner reflection is unproved ",
+        ),
+        (
+            "escaped = getattr(SelectedModule, '_execute_continuation_call_live', None)\n",
+            "selected owner reflection is unproved ",
+        ),
+        (
+            "recovered = type(instance)\nconsume(recovered)\n",
+            "constructed selected class recovered outside nominal comparison ",
+        ),
+        (
+            "recovered = instance.__class__\nrecovered.__new__ = replacement\n",
+            "constructed selected class recovered outside nominal comparison ",
+        ),
+    ],
+    ids=["module-getattr", "module-getattr-default", "frozen-type-escape", "frozen-class-mutation"],
+)
+def test_selected_module_reflection_and_frozen_recovery_preserve_nominal_comparison(effect, diagnostic):
+    units = _production_units()
+    path = "src/elspeth/selected_reflection_recovery_probe.py"
+    header = (
+        "import elspeth.web.composer.tool_batch as SelectedModule\n"
+        "from elspeth.contracts.session_operation import SessionOperationContext as SelectedContext\n"
+        "instance = SelectedContext(None, None)\n"
+    )
+    # Source-only probe: no constructor is executed. Exact nominal comparison
+    # remains permitted, while exporting the recovered class is not.
+    positive = _parse_source(path, header + "assert type(instance) is SelectedContext\n")
+    normal = _reserve_ReserveProof((*units, positive))
+    assert not normal.failures, normal.failures
+    assert len(normal.boundary.audit_evidence_recoveries) == 2
+    changed = _parse_source(path, header + effect)
+    refused = _reserve_ReserveProof((*units, changed))
+    assert any(diagnostic + path in failure for failure in refused.failures), (effect, refused.failures)
+
+
+@pytest.mark.landscape_long_run
+def test_continuation_batch_data_receipt_closes_only_original_ast_nodes():
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    failures, receipt = _reserve_continuation_batch_state_receipt(units)
+    assert not failures, failures
+    assert len(receipt["calls"]) == 5
+    assert len(receipt["state_writes"]) == 3
+    path = "src/elspeth/web/composer/continuation_batch_data.py"
+    original = next(unit for unit in units if unit.path == path)
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert len(receipt["data_calls"]) == 3
+    assert receipt["data_calls"] <= actual
+    uses = {site for site in receipt["owned_uses"] if site[0] == path}
+    assert len(uses) == 20 and uses <= actual
+    missing = next(iter(receipt["data_calls"]))
+    assert not receipt["data_calls"] <= actual - {missing}
+    detached = _parse_source(path, original.source)
+    other_failures, other = _reserve_continuation_batch_state_receipt(tuple(detached if unit.path == path else unit for unit in units))
+    assert not other_failures, other_failures
+    assert len(other["data_calls"]) == 3
+    assert not other["data_calls"] & actual
+    assert not {site for site in other["owned_uses"] if site[0] == path} & actual
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        (
+            "from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts",
+            "from foreign_owner import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts",
+            "carrier supplier changed",
+        ),
+        ("def _members(value: Any)", "type = foreign_type\n\ndef _members(value: Any)", "builtin binding changed"),
+        ("    batch: ContinuationBatchState\n", "    batch: ContinuationBatchState = ContinuationBatchState\n", "reference role changed"),
+        ("type(data.batch) is not ContinuationBatchState", "type(data.batch) is ContinuationBatchState", "reference role changed"),
+        ('"index": value.index,', '"index": value.phase,', "complete direct field projection changed"),
+        ("if kind not in _FIELDS or tuple(members) != _FIELDS[kind]:", "if kind not in _FIELDS:", "complete ordered member gate changed"),
+        ("return ContinuationCallState(**members)", "return ContinuationCallState(**dict(members))", "exact constructor transfer changed"),
+        ("    if len(restored) != len(nodes):", "    if False:", "reviewed graph body changed _decode_graph"),
+    ],
+)
+def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, after, refusal):
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    path = "src/elspeth/web/composer/continuation_batch_data.py"
+    original = next(unit for unit in units if unit.path == path)
+    assert before in original.source
+    changed = _parse_source(path, original.source.replace(before, after, 1))
+    failures, receipt = _reserve_continuation_batch_state_receipt(tuple(changed if unit.path == path else unit for unit in units))
+    assert any(refusal in failure for failure in failures), failures
+    assert not receipt
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    "addition",
+    [
+        "from elspeth.web.composer.continuation_batch_data import _construct as ForeignFactory\nForeignFactory.__code__ = foreign_code\n",
+        "import elspeth.web.composer.continuation_batch_data as ChangedData\nsetattr(ChangedData, '_members', foreign_projection)\n",
+        "from elspeth.web.composer.continuation_batch_data import _FIELDS as ChangedFields\nChangedFields['ContinuationCallState'] = ()\n",
+        "from elspeth.web.composer.tool_batch import ContinuationBatchState as ForeignBatch\ndef escape_batch():\n    return ForeignBatch\n",
+        "def extra_state_store(subject, value):\n    subject.state = value\n",
+    ],
+)
+def test_continuation_batch_data_receipt_keeps_foreign_effects_unproved(addition):
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    path = "src/elspeth/web/execution/service.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, original.source + "\n" + addition)
+    proof = _reserve_ReserveProof(tuple(changed if unit.path == path else unit for unit in units))
+    assert proof.failures
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    "addition",
+    [
+        "import elspeth.web.composer.continuation_batch_data as data\ndata.tuple = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndata.id = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndel data.tuple\n",
+        "import elspeth.web.composer.continuation_batch_data as data\nsetattr(data, 'tuple', replacement)\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndelattr(data, 'id')\n",
+        "import elspeth.web.composer.continuation_batch_data as data\nsetattr(data, chosen_name, replacement)\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndata.ModelValidationError = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndata.TypeAdapter = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndata._MAX_DEPTH = 1000000000\n",
+        "import elspeth.web.composer.continuation_batch_data as data\nalias = data\nalias.id = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\ndata.__dict__['tuple'] = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\nvars(data)['tuple'] = replacement\n",
+        "import elspeth.web.composer.continuation_batch_data as data\nchange(data)\n",
+        "import builtins as primitives\nprimitives.id = replacement\n",
+        "from elspeth.contracts.json_parser import parse_json_strict as parser\nparser.__code__ = replacement\n",
+        "from elspeth.web.composer.continuation_result_credentials import require_retained_result_credentials as check\ncheck.__code__ = replacement\n",
+        "from elspeth.web.execution.schemas import ValidationCheck as Check\nsetattr(Check, 'model_validate', replacement)\n",
+    ],
+    ids=[
+        "tuple-shadow",
+        "id-shadow",
+        "tuple-delete",
+        "tuple-setattr",
+        "id-delattr",
+        "dynamic-selector",
+        "exception-alias-shadow",
+        "adapter-shadow",
+        "bound-shadow",
+        "module-alias",
+        "namespace",
+        "vars-namespace",
+        "module-callback",
+        "builtin-id",
+        "local-parser",
+        "credential-supplier",
+        "nominal-constructor",
+    ],
+)
+def test_continuation_batch_data_supplier_closure_refuses_external_effect(addition):
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    failures, receipt = _reserve_continuation_batch_state_receipt(units)
+    assert not failures, failures
+    assert len(receipt["calls"]) == 5
+    assert len(receipt["factory_calls"]) == 1
+    assert len(receipt["state_writes"]) == 3
+    assert len(receipt["data_calls"]) == 3
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert (receipt["calls"] | receipt["factory_calls"] | receipt["state_writes"] | receipt["data_calls"]) <= actual
+    path = "src/elspeth/web/execution/service.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(path, original.source + "\n" + addition)
+    proof = _reserve_ReserveProof(tuple(changed if unit.path == path else unit for unit in units))
+    assert proof.failures, addition
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize(
+    ("before", "after", "refusal"),
+    [
+        ("from pydantic import TypeAdapter", "from foreign_supplier import TypeAdapter", "complete import supplier declarations changed"),
+        ("_MAX_NODES = 100_000", "_MAX_NODES = 100_000\nTypeAdapter = replacement", "import supplier binding changed TypeAdapter"),
+        ("_MAX_NODES = 100_000", "_MAX_NODES = 100_001", "graph bound changed _MAX_NODES"),
+        ("_MAX_NODES = 100_000", "_MAX_NODES = 100_000\nid = replacement", "builtin binding changed id"),
+        ("_MAX_NODES = 100_000", "_MAX_NODES = 100_000\nmin = lambda *values: 1", "builtin binding changed min"),
+    ],
+    ids=["import-owner", "import-rebinding", "graph-bound", "builtin-rebinding", "min-rebinding"],
+)
+def test_continuation_batch_data_supplier_closure_refuses_local_change(before, after, refusal):
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    path = "src/elspeth/web/composer/continuation_batch_data.py"
+    original = next(unit for unit in units if unit.path == path)
+    assert original.source.count(before) == 1
+    changed = _parse_source(path, original.source.replace(before, after, 1))
+    failures, receipt = _reserve_continuation_batch_state_receipt(tuple(changed if unit.path == path else unit for unit in units))
+    assert any(refusal in failure for failure in failures), failures
+    assert not receipt
+
+
+@pytest.mark.landscape_long_run
+@pytest.mark.parametrize("replacement", ["True", "1_048_577", "make_bound()"], ids=["bool", "changed-limit", "callable-value"])
+def test_continuation_batch_data_immutable_supplier_requires_actual_integer(replacement):
+    units = _production_units()
+    normal = _reserve_run(units)
+    assert not normal["global_failures"], normal["global_failures"]
+    assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
+    failures, receipt = _reserve_continuation_batch_state_receipt(units)
+    assert not failures, failures
+    assert receipt["data_immutable_supplier_origins"] == frozenset({"elspeth.web.composer.bounded_json.JSON_MAX_TOTAL_UTF8_BYTES"})
+    path = "src/elspeth/web/composer/bounded_json.py"
+    original = next(unit for unit in units if unit.path == path)
+    before = "JSON_MAX_TOTAL_UTF8_BYTES: Final[int] = 1_048_576"
+    assert original.source.count(before) == 1
+    changed = _parse_source(path, original.source.replace(before, "JSON_MAX_TOTAL_UTF8_BYTES: Final[int] = " + replacement, 1))
+    failures, receipt = _reserve_continuation_batch_state_receipt(tuple(changed if unit.path == path else unit for unit in units))
+    assert any("immutable byte-limit supplier changed" in failure for failure in failures), failures
+    assert not receipt
+
+
+# Complete literal reviewed consumer bodies; parsed only by the ordinary guard at execution.
+_reserve_CALLBACK_BODIES = {
+    (
+        "src/elspeth/web/composer/continuation_audit_buffer.py",
+        "encode_recorder_snapshot",
+    ): 'def encode_recorder_snapshot(snapshot: RecorderSnapshot) -> PrivateChunk:\n    if type(snapshot) is not RecorderSnapshot:\n        raise TypeError("audit buffer requires its owned snapshot")\n    snapshot.validate_links_and_cursors()\n    projected = _BUFFER_CODEC.dump_python(\n        snapshot,\n        mode="json",\n        warnings="error",\n        fallback=owned_json,\n    )\n    return encode_private_chunk(\n        codec="composer.audit-buffer.v1",\n        canonical=canonical_json(projected),\n    )\n',
+    (
+        "src/elspeth/web/composer/continuation_audit_buffer.py",
+        "decode_recorder_snapshot",
+    ): 'def decode_recorder_snapshot(chunk: PrivateChunk) -> RecorderSnapshot:\n    if type(chunk) is not PrivateChunk or chunk.reference.codec != "composer.audit-buffer.v1":\n        raise AuditIntegrityError("audit buffer has the wrong codec")\n    verify_private_chunk(chunk.reference, chunk.canonical)\n    value, error = parse_json_strict(chunk.canonical)\n    if error is not None:\n        raise AuditIntegrityError("audit buffer is not strict JSON")\n    try:\n        snapshot = _BUFFER_CODEC.validate_json(\n            canonical_json(value),\n            strict=True,\n            extra="forbid",\n        )\n    except ValidationError as exc:\n        raise AuditIntegrityError("audit buffer violates its owned codec") from exc\n    snapshot.validate_links_and_cursors()\n    if encode_recorder_snapshot(snapshot).canonical != chunk.canonical:\n        raise AuditIntegrityError("audit buffer omitted or normalized a retained field")\n    return snapshot\n',
+    (
+        "src/elspeth/web/composer/continuation_provider_outcomes.py",
+        "encode_physical_audit_call",
+    ): 'def encode_physical_audit_call(call: ComposerLLMCall) -> str:\n    if type(call) is not ComposerLLMCall:\n        raise TypeError("physical audit retention requires its complete actual nominal record")\n    projected = _PHYSICAL_AUDIT.dump_python(call, mode="json", warnings="error", fallback=owned_json)\n    return canonical_json(owned_json(projected))\n',
+    (
+        "src/elspeth/web/composer/continuation_provider_outcomes.py",
+        "decode_physical_audit_call",
+    ): 'def decode_physical_audit_call(canonical: str) -> ComposerLLMCall:\n    if type(canonical) is not str:\n        raise AuditIntegrityError("physical audit lost its complete canonical JSON")\n    value, error = parse_json_strict(canonical)\n    if error is not None or type(value) is not dict:\n        raise AuditIntegrityError("physical audit is not one strict JSON object")\n    try:\n        call = _PHYSICAL_AUDIT.validate_json(canonical, strict=True, extra="forbid")\n    except (ValidationError, ValueError, TypeError) as exc:\n        raise AuditIntegrityError("physical audit violates its owned complete contract") from exc\n    if type(call) is not ComposerLLMCall or encode_physical_audit_call(call) != canonical:\n        raise AuditIntegrityError("physical audit omitted, changed or normalized retained fields")\n    return call\n',
+    (
+        "src/elspeth/web/composer/continuation_tool_batch.py",
+        "_dump_owned",
+    ): 'def _dump_owned[T](adapter: TypeAdapter[T], value: T) -> str:\n    return canonical_json(owned_json(adapter.dump_python(value, mode="json", warnings="error", fallback=owned_json)))\n',
+    (
+        "src/elspeth/web/composer/continuation_tool_batch.py",
+        "_decode_owned",
+    ): 'def _decode_owned[T](adapter: TypeAdapter[T], encoded: str) -> T:\n    _read_json_value(encoded)\n    try:\n        result = adapter.validate_json(encoded, strict=True)\n    except (ValidationError, TypeError, ValueError) as error:\n        raise AuditIntegrityError("tool continuation member violates its owned contract") from error\n    if _dump_owned(adapter, result) != encoded:\n        raise AuditIntegrityError("tool continuation member lost or normalized fields")\n    return result\n',
+    (
+        "src/elspeth/web/composer/continuation_tool_batch.py",
+        "_validation_json",
+    ): 'def _validation_json(value: ValidationSummary) -> str:\n    if type(value) is not ValidationSummary:\n        raise TypeError("tool validation requires its nominal summary")\n    payload = _VALIDATION.dump_python(value, mode="json", warnings="error", fallback=owned_json)\n    # These owned fields are sets, unlike all ordered errors/edges/hints.\n    # Their wire order cannot depend on the encoder process\'s hash seed.\n    for contract in payload["semantic_contracts"]:\n        requirement = contract["requirement"]\n        for field in ("accepted_content_kinds", "accepted_text_framings", "accepted_value_types"):\n            requirement[field] = sorted(requirement[field])\n    return canonical_json(owned_json(payload))\n',
+    (
+        "src/elspeth/web/composer/continuation_tool_batch.py",
+        "_decode_validation",
+    ): 'def _decode_validation(encoded: str) -> ValidationSummary:\n    _read_json_value(encoded)\n    try:\n        result = _VALIDATION.validate_json(encoded, strict=True)\n    except (ValidationError, TypeError, ValueError) as error:\n        raise AuditIntegrityError("tool continuation validation violates its owned contract") from error\n    if _validation_json(result) != encoded:\n        raise AuditIntegrityError("tool continuation validation lost or normalized fields")\n    return result\n',
+    (
+        "src/elspeth/web/composer/continuation_bootstrap.py",
+        "_canonical_adapter_json",
+    ): 'def _canonical_adapter_json[T](adapter: TypeAdapter[T], value: T) -> str:\n    try:\n        payload = adapter.dump_python(value, mode="json", warnings="error", fallback=owned_json)\n    except PydanticSerializationError as error:\n        raise AuditIntegrityError("bootstrap owned value cannot be retained as JSON") from error\n    return canonical_json(owned_json(payload))\n',
+    (
+        "src/elspeth/web/composer/continuation_bootstrap.py",
+        "_canonical_adapter",
+    ): 'def _canonical_adapter[T](adapter: TypeAdapter[T], encoded: str) -> T:\n    try:\n        value = adapter.validate_json(encoded, strict=True)\n    except (ValidationError, TypeError, ValueError) as error:\n        raise AuditIntegrityError("bootstrap retained value violates its owned contract") from error\n    if _canonical_adapter_json(adapter, value) != encoded:\n        raise AuditIntegrityError("bootstrap owned value lost or changed a field")\n    return value\n',
+    (
+        "src/elspeth/web/composer/continuation_codec.py",
+        "owned_json",
+    ): 'def owned_json(value: object) -> JsonValue:\n    if value is None or type(value) in (str, bool, int):\n        return cast(JsonValue, value)\n    if type(value) is float:\n        if not math.isfinite(value):\n            raise AuditIntegrityError("continuation value is not finite JSON")\n        return value\n    if isinstance(value, Mapping):\n        if any(type(key) is not str for key in value):\n            raise AuditIntegrityError("continuation object has a non-string key")\n        return {cast(str, key): owned_json(child) for key, child in value.items()}\n    if isinstance(value, (tuple, list)):\n        return [owned_json(child) for child in value]\n    raise AuditIntegrityError("continuation value is outside the owned JSON algebra")\n',
+    (
+        "src/elspeth/web/composer/prompt_guard_rendering.py",
+        "_json_inspection_text",
+    ): 'def _json_inspection_text(serialized: str) -> str:\n    """Decode string bodies, retaining token boundaries, members and number spelling."""\n    decoder = json.JSONDecoder()\n    pieces: list[str] = []\n    offset = 0\n    while offset < len(serialized):\n        start = serialized.find(\'"\', offset)\n        if start < 0:\n            pieces.append(serialized[offset:])\n            break\n        pieces.append(serialized[offset:start])\n        value, offset = decoder.raw_decode(serialized, start)\n        if type(value) is not str:\n            raise AuditIntegrityError("Prompt producer string token has no exact decoded text")\n        pieces.append(\'"\' + value + \'"\')\n    return "".join(pieces)\n',
+    (
+        "src/elspeth/web/composer/prompt_guard_rendering.py",
+        "json_content_parts",
+    ): 'def json_content_parts(\n    serialized: str,\n    *,\n    reference_paths: frozenset[JsonPath] = frozenset(),\n    ensure_ascii: bool = True,\n    sort_keys: bool = False,\n    indent: int | None = None,\n    separators: tuple[str, str] | None = None,\n    string_parts: Mapping[JsonPath, tuple[PromptGuardContentPart, ...]] | None = None,\n    encoder: Callable[[JsonValue], str] | None = None,\n    decoder: Callable[[str], JsonValue] = json.loads,\n) -> tuple[PromptGuardContentPart, ...]:\n    """Retain complete scalar tokens and exact original serializer bytes.\n\n    Callers supply their own serialized JSON and explicit paths whose values\n    they obtained from the current registered catalog. No key or decoded value\n    grants trust. A formatting mismatch is an owned producer error.\n    """\n    value = decoder(serialized)\n    partitions = {} if string_parts is None else dict(string_parts)\n    for path, units in partitions.items():\n        if type(path) is not tuple or type(units) is not tuple or any(type(unit) is not PromptGuardContentPart for unit in units):\n            raise AuditIntegrityError("Prompt producer string partition lacks owned semantic units")\n        if any(path[: len(reference)] == reference or reference[: len(path)] == path for reference in reference_paths):\n            raise AuditIntegrityError("Prompt producer string partition overlaps a reference value")\n        if any(other != path and (path[: len(other)] == other or other[: len(path)] == path) for other in partitions):\n            raise AuditIntegrityError("Prompt producer string partitions overlap")\n    visited: set[JsonPath] = set()\n    item_separator, key_separator = separators if separators is not None else ((",", ": ") if indent is not None else (", ", ": "))\n\n    def encode(item: JsonValue) -> str:\n        if encoder is not None:\n            return encoder(item)\n        return json.dumps(item, ensure_ascii=ensure_ascii, sort_keys=sort_keys, indent=indent, separators=separators)\n\n    def render(item: JsonValue, path: JsonPath, depth: int) -> Iterator[PromptGuardContentPart]:\n        encoded = encode(item)\n        if indent is not None:\n            encoded = encoded.replace("\\n", "\\n" + " " * (indent * depth))\n        if path in partitions:\n            units = partitions[path]\n            if type(item) is not str or "".join(unit.text for unit in units) != item:\n                raise AuditIntegrityError("Prompt producer string partition does not cover its complete value")\n            visited.add(path)\n            yield PromptGuardContentPart(\'"\')\n            for unit in units:\n                yield PromptGuardContentPart(\n                    encode(unit.text)[1:-1],\n                    unit.trust,\n                    inspection_text=unit.inspection_text if unit.inspection_text is not None else unit.text,\n                )\n            yield PromptGuardContentPart(\'"\')\n        elif path in reference_paths:\n            yield PromptGuardContentPart(encoded, PromptGuardTrust.REFERENCE)\n        elif (\n            isinstance(item, dict | list)\n            and len(encoded) <= _COMPLETE_CONTAINER_CHARACTERS\n            and not any(reference[: len(path)] == path for reference in (*reference_paths, *partitions))\n        ):\n            yield PromptGuardContentPart(encoded, inspection_text=_json_inspection_text(encoded))\n        elif isinstance(item, dict | list) and item:\n            is_object = isinstance(item, dict)\n            yield PromptGuardContentPart("{" if is_object else "[")\n            entries: Iterable[tuple[str | int, JsonValue]] = (\n                (sorted(item.items()) if sort_keys and encoder is None else item.items()) if isinstance(item, dict) else enumerate(item)\n            )\n            for index, (key, child) in enumerate(entries):\n                if index:\n                    yield PromptGuardContentPart(item_separator)\n                if indent is not None:\n                    yield PromptGuardContentPart("\\n" + " " * (indent * (depth + 1)))\n                if is_object:\n                    yield PromptGuardContentPart(json.dumps(key, ensure_ascii=ensure_ascii) + key_separator, inspection_text=str(key))\n                yield from render(child, (*path, key), depth + 1)\n            if indent is not None:\n                yield PromptGuardContentPart("\\n" + " " * (indent * depth))\n            yield PromptGuardContentPart("}" if is_object else "]")\n        else:\n            yield PromptGuardContentPart(encoded, inspection_text=item if type(item) is str else None)\n\n    parts = tuple(render(value, (), 0))\n    if visited != set(partitions) or "".join(part.text for part in parts) != serialized:\n        raise AuditIntegrityError("Prompt producer JSON partition changed its exact wire serialization")\n    return parts\n',
+    (
+        "src/elspeth/core/canonical.py",
+        "_normalize_for_canonical",
+    ): 'def _normalize_for_canonical(data: Any) -> Any:\n    """Recursively normalize a data structure for canonical JSON.\n\n    Converts pandas/numpy types to JSON-safe primitives.\n    Handles PipelineRow by converting to dict.\n\n    Args:\n        data: Any data structure (dict, list, primitive, PipelineRow)\n\n    Returns:\n        Normalized data structure with only JSON-safe types\n\n    Raises:\n        ValueError: If data contains NaN, Infinity, or other non-serializable values\n    """\n    # Handle PipelineRow - convert to dict before processing\n    if isinstance(data, PipelineRow):\n        data = data.to_dict()\n\n    if isinstance(data, Mapping):\n        if _CANONICAL_TYPE_KEY in data:\n            entries = [\n                {\n                    "key": _normalize_for_canonical(key),\n                    "value": _normalize_for_canonical(value),\n                }\n                for key, value in data.items()\n            ]\n            return {\n                _CANONICAL_TYPE_KEY: _CANONICAL_MAPPING_TAG,\n                "entries": sorted(entries, key=lambda entry: _primitive_canonical_json(entry["key"])),\n            }\n        return {k: _normalize_for_canonical(v) for k, v in data.items()}\n    if isinstance(data, list | tuple):\n        return [_normalize_for_canonical(v) for v in data]\n    return _normalize_value(data)\n',
+    (
+        "src/elspeth/contracts/hashing.py",
+        "canonical_json",
+    ): 'def canonical_json(obj: Any) -> str:\n    """Produce canonical JSON per RFC 8785/JCS.\n\n    Handles JSON-safe primitives and their frozen equivalents\n    (``MappingProxyType`` → ``dict``, ``tuple`` → ``list``).\n    For data containing pandas/numpy types or PipelineRow, use\n    ``elspeth.core.canonical.canonical_json()`` instead.\n\n    Args:\n        obj: JSON-safe data structure, optionally containing frozen containers\n\n    Returns:\n        Canonical JSON string (deterministic key order, no whitespace)\n\n    Raises:\n        ValueError: If data contains NaN or Infinity\n        TypeError: If data contains frozenset or other non-serializable types\n    """\n    normalized = _normalize_frozen_and_reject_non_finite(obj)\n    result: bytes = rfc8785.dumps(normalized)\n    return result.decode("utf-8")\n\n\n# The largest magnitude an integer may have in canonical JSON: rfc8785 refuses\n# any int beyond it (IntegerDomainError), so it never writes one.\n',
+    (
+        "src/elspeth/contracts/hashing.py",
+        "_normalize_frozen_and_reject_non_finite",
+    ): 'def _normalize_frozen_and_reject_non_finite(obj: Any) -> Any:\n    """Normalize frozen containers and reject non-finite floats.\n\n    Single recursive traversal that:\n    - Converts any ``Mapping`` (including ``MappingProxyType``) → ``dict``\n    - Converts ``tuple`` → ``list``\n    - Rejects ``frozenset`` with ``TypeError`` (no canonical JSON ordering)\n    - Rejects NaN/Infinity with ``ValueError``\n    - Returns the normalized structure ready for ``rfc8785.dumps()``\n    """\n    if isinstance(obj, float):\n        if math.isnan(obj):\n            raise ValueError(f"Cannot canonicalize NaN. Use None for missing values, not NaN. Got: {obj!r}")\n        if math.isinf(obj):\n            raise ValueError(f"Cannot canonicalize Infinity. Use None for missing values, not Infinity. Got: {obj!r}")\n        return obj\n    if isinstance(obj, frozenset):\n        # Type only, never the set\'s repr: its members can be row values, and\n        # this text reaches audit records through every hashing seam.\n        raise TypeError("frozenset is not JSON-serializable and has no canonical ordering. Use list or tuple for ordered collections.")\n    # Mapping ABC covers both dict and MappingProxyType. The dict\n    # comprehension normalizes MappingProxyType → dict for rfc8785.\n    if isinstance(obj, Mapping):\n        return {k: _normalize_frozen_and_reject_non_finite(v) for k, v in obj.items()}\n    if isinstance(obj, (list, tuple)):\n        return [_normalize_frozen_and_reject_non_finite(item) for item in obj]\n    return obj\n',
+}
+
+_reserve_CALLBACK_BODIES.update(
+    {
+        (
+            "src/elspeth/contracts/prompt_guard.py",
+            "PromptGuardTrust",
+        ): 'class PromptGuardTrust(Enum):\n    """In-process provenance minted by owned builders, never decoded from JSON."""\n\n    INSTRUCTION = "operator_instruction"\n    REFERENCE = "operator_reference"\n',
+        (
+            "src/elspeth/contracts/prompt_guard.py",
+            "PromptGuardContentPart",
+        ): '@dataclass(frozen=True, slots=True)\nclass PromptGuardContentPart:\n    """One complete producer-rendered unit, untrusted by default.\n\n    ``text`` covers exact wire bytes. Owned serializers may separately carry\n    decoded ``inspection_text`` so the detector reads the original words;\n    an absent projection inspects ``text`` directly. Neither grants trust.\n    """\n\n    text: str = field(repr=False)\n    trust: PromptGuardTrust | None = None\n    inspection_text: str | None = field(default=None, repr=False)\n\n    def __post_init__(self) -> None:\n        if (\n            type(self.text) is not str\n            or (self.trust is not None and type(self.trust) is not PromptGuardTrust)\n            or (self.inspection_text is not None and type(self.inspection_text) is not str)\n        ):\n            raise AuditIntegrityError("Prompt guard content part lacks exact owned provenance")\n',
+    }
+)
+
+# Append literal-bodies.py.txt immediately before this snippet in the existing guard.
+# No source execution, import, or additional runner is introduced.
+_reserve_CALLBACK_PREFIX = "src/elspeth/web/composer/"
+_reserve_CALLBACK_ADAPTERS = {
+    "continuation_audit_buffer.py": {"_BUFFER_CODEC": "RecorderSnapshot"},
+    "continuation_provider_outcomes.py": {"_PHYSICAL_AUDIT": "ComposerLLMCall"},
+    "continuation_tool_batch.py": {
+        "_VALIDATION": "ValidationSummary",
+        "_RUNTIME": "ValidationResult",
+        "_GUIDANCE": "ValidationGuidance",
+        "_SCHEMAS": "dict[str, dict[str, JsonValue]]",
+        "_APPLIED": "AppliedComponentEcho",
+    },
+    "continuation_bootstrap.py": {
+        "_RECOVERY": "GraphRecoveryContext",
+        "_GATES": "CompletionGateFacts",
+        "_RETAINED": "RetainedOperationContext",
+    },
+    "continuation_prepared_p4.py": {
+        "_P4_VALUE": "PreparedP4Value",
+        "_P4_ROWS": "tuple[_RetainedP4Row, ...]",
+        "_P4_CEILING": "ComposerMutationCeiling",
+        "_P4_REVOCATION": "ComposerMutationRevocation",
+        "_P4_REJECTIONS": "tuple[RejectionRecord, ...]",
+        "_P4_WITHHELD": "tuple[WithheldReply, ...]",
+        "_P4_INVOCATIONS": "tuple[ComposerToolInvocation, ...]",
+        "_P4_AUTHORINGS": "tuple[PrivateToolAuthoring, ...]",
+    },
+}
+# Binding names are actual definitions/imports, not a structural TypeAdapter annotation.
+_reserve_CALLBACK_SCHEMA_IMPORTS = {
+    "ComposerLLMCall": ("elspeth.contracts.composer_llm_audit", "ComposerLLMCall"),
+    "ValidationSummary": ("elspeth.web.composer.state", "ValidationSummary"),
+    "ValidationResult": ("elspeth.web.execution.schemas", "ValidationResult"),
+    "ValidationGuidance": ("elspeth.web.composer.tool_result_envelope", "ValidationGuidance"),
+    "JsonValue": ("pydantic", "JsonValue"),
+    "AppliedComponentEcho": ("elspeth.web.composer.tools._common", "AppliedComponentEcho"),
+    "GraphRecoveryContext": ("elspeth.web.composer.graph_recovery", "GraphRecoveryContext"),
+    "CompletionGateFacts": ("elspeth.web.execution.completion_gates", "CompletionGateFacts"),
+    "RetainedOperationContext": ("elspeth.web.composer.protocol", "RetainedOperationContext"),
+    "ComposerMutationCeiling": ("elspeth.contracts.composer_mutation", "ComposerMutationCeiling"),
+    "ComposerMutationRevocation": ("elspeth.contracts.composer_mutation", "ComposerMutationRevocation"),
+    "RejectionRecord": ("elspeth.web.sessions._persist_payload", "RejectionRecord"),
+    "WithheldReply": ("elspeth.web.composer.withheld_replies", "WithheldReply"),
+    "ComposerToolInvocation": ("elspeth.contracts.composer_audit", "ComposerToolInvocation"),
+    "PrivateToolAuthoring": ("elspeth.contracts.composer_audit", "PrivateToolAuthoring"),
+}
+_reserve_CALLBACK_FORMALS = {
+    "continuation_tool_batch.py": ("_dump_owned", "_decode_owned"),
+    "continuation_bootstrap.py": ("_canonical_adapter_json", "_canonical_adapter"),
+}
+# Actual complete caller expressions and lexical owners, with no additional callers.
+_reserve_CALLBACK_FORWARDING = (
+    ("continuation_tool_batch.py", "_decode_owned", "_dump_owned(adapter, result)"),
+    ("continuation_tool_batch.py", "encode_tool_result_value", "_dump_owned(_RUNTIME, result.runtime_preflight)"),
+    ("continuation_tool_batch.py", "decode_tool_result_value", "_decode_owned(_RUNTIME, admitted.runtime_preflight_json)"),
+    ("continuation_tool_batch.py", "decode_tool_result_value", "_decode_owned(_SCHEMAS, admitted.plugin_schemas_json)"),
+    ("continuation_tool_batch.py", "decode_tool_result_value", "_decode_owned(_GUIDANCE, admitted.validation_guidance_json)"),
+    ("continuation_tool_batch.py", "decode_tool_result_value", "_decode_owned(_APPLIED, admitted.applied_component_json)"),
+    ("continuation_bootstrap.py", "_canonical_adapter", "_canonical_adapter_json(adapter, value)"),
+    ("continuation_bootstrap.py", "bootstrap_values", "_canonical_adapter(_RECOVERY, snapshot.recovery_context_json)"),
+    ("continuation_bootstrap.py", "bootstrap_values", "_canonical_adapter(_GATES, snapshot.completion_gates_json)"),
+    ("continuation_bootstrap.py", "bootstrap_values", "_canonical_adapter(_RETAINED, snapshot.retained_context_json)"),
+    ("continuation_bootstrap.py", "capture_continuation_bootstrap", "_canonical_adapter_json(_RECOVERY, recovery_context)"),
+    ("continuation_bootstrap.py", "capture_continuation_bootstrap", "_canonical_adapter_json(_GATES, completion_gates)"),
+    ("continuation_bootstrap.py", "capture_continuation_bootstrap", "_canonical_adapter_json(_RETAINED, retained_context)"),
+    ("continuation_prepared_p4.py", "_p4_rows_json", "_dump_owned(_P4_ROWS, tuple(retained))"),
+    ("continuation_prepared_p4.py", "_p4_rows", "_decode_owned(_P4_ROWS, encoded)"),
+    (
+        "continuation_prepared_p4.py",
+        "prepared_p4_members",
+        '_decode_owned(_P4_VALUE, canonical_json(value.model_dump(mode="json", warnings="error")))',
+    ),
+    ("continuation_prepared_p4.py", "prepared_p4_members", '_decode_owned(_P4_INVOCATIONS, canonical_json(audit["invocations"]))'),
+    ("continuation_prepared_p4.py", "prepared_p4_members", '_decode_owned(_P4_AUTHORINGS, canonical_json(audit["authorings"]))'),
+    ("continuation_prepared_p4.py", "prepared_p4_members", "_decode_owned(_P4_CEILING, value.mutation_ceiling_json)"),
+    ("continuation_prepared_p4.py", "prepared_p4_members", "_decode_owned(_P4_REVOCATION, value.authority_revocation_json)"),
+    ("continuation_prepared_p4.py", "prepared_p4_members", "_decode_owned(_P4_REJECTIONS, value.rejection_records_json)"),
+    ("continuation_prepared_p4.py", "prepared_p4_members", "_decode_owned(_P4_WITHHELD, value.withheld_replies_json)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_CEILING, mutation_ceiling)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_REVOCATION, authority_revocation)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_REJECTIONS, rejection_records)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_WITHHELD, withheld_replies)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_INVOCATIONS, invocations)"),
+    ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_AUTHORINGS, authorings)"),
+    ("continuation_prepared_p4.py", "decode_prepared_p4", "_decode_owned(_P4_VALUE, encoded)"),
+)
+_reserve_CALLBACK_PROMPT_CALLS = (
+    (
+        "_feedback_content_parts",
+        'json_content_parts(canonical_json(feedback), reference_paths=references, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
+    ),
+    (
+        "_plan_pipeline_inner",
+        'json_content_parts(canonical_json(provider_request), ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
+    ),
+    (
+        "_plan_pipeline_inner._engage_escape_hatch",
+        'json_content_parts(request_text, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
+    ),
+    (
+        "_plan_pipeline_inner",
+        'json_content_parts(not_alone_feedback, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
+    ),
+    (
+        "_plan_pipeline_inner",
+        'json_content_parts(argument_feedback_json, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
+    ),
+)
+
+
+def _reserve_batch_data_callback_consumers(units):
+    """Finite actual serializer/prompt calls; never a callable/namespace waiver.
+
+    Permissions carry the input AST objects only. Whole-source origin/effect
+    closure and _reserve_batch_callback_use_failures must consume this receipt
+    before any normal boundary certificate exists.
+    """
+    helper = _reserve_composer_receiver
+    indexed = {unit.path: unit for unit in units}
+    failures = []
+    calls, argument_calls, uses, immediate_lambdas = set(), set(), set(), set()
+    observed_uses = set()
+    origins, supplier_bindings, formal_origins, adapter_origins = set(), set(), set(), set()
+    definitions, parents = {}, {}
+
+    def require(ok, reason):
+        if not ok:
+            failures.append("batch callback consumer " + reason)
+
+    def dump(node):
+        return ast.dump(node, include_attributes=False)
+
+    def module(path):
+        return path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+
+    def source(path):
+        require(path in indexed, "source missing " + path)
+        if path not in indexed:
+            return None
+        unit = indexed[path]
+        if path not in parents:
+            parents[path] = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+        return unit
+
+    def owner(path, node):
+        cursor = parents[path].get(id(node))
+        parts = []
+        while cursor is not None:
+            if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                parts.append(cursor.name)
+            cursor = parents[path].get(id(cursor))
+        return ".".join(reversed(parts))
+
+    def unshadowed(path, node, binding, *, formal=None):
+        cursor = parents[path].get(id(node))
+        while cursor is not None:
+            if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                if isinstance(cursor, ast.Lambda):
+                    parameters = [*cursor.args.posonlyargs, *cursor.args.args, *cursor.args.kwonlyargs]
+                    parameters += [arg for arg in (cursor.args.vararg, cursor.args.kwarg) if arg is not None]
+                    events = [("PARAMETER", arg) for arg in parameters if arg.arg == binding]
+                    events += [
+                        ("STORE", child)
+                        for child in ast.walk(cursor.body)
+                        if isinstance(child, ast.Name) and child.id == binding and isinstance(child.ctx, (ast.Store, ast.Del))
+                    ]
+                else:
+                    events = [(kind, event) for name, kind, event in helper.lexical_binding_events(cursor) if name == binding]
+                if formal is not None and cursor is formal:
+                    return len(events) == 1 and events[0][0] == "PARAMETER"
+                if events:
+                    return False
+            if isinstance(cursor, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) and any(
+                isinstance(child, ast.Name) and child.id == binding and isinstance(child.ctx, ast.Store)
+                for generator in cursor.generators
+                for child in ast.walk(generator.target)
+            ):
+                return False
+            cursor = parents[path].get(id(cursor))
+        return formal is None
+
+    def imported(path, binding, supplier, member):
+        unit = source(path)
+        if unit is None:
+            return
+        require(helper.imported(unit.tree, binding, supplier, member), "canonical import changed " + path + ":" + binding)
+        origins.add(supplier + "." + member)
+        supplier_bindings.add(module(path) + "." + binding)
+
+    def builtin(path, binding):
+        unit = source(path)
+        if unit is not None:
+            require(helper.builtin_binding(unit.tree, binding), "builtin changed " + path + ":" + binding)
+            origins.add("builtins." + binding)
+            supplier_bindings.add(module(path) + "." + binding)
+
+    def expression(path, owning, text):
+        unit = source(path)
+        if unit is None:
+            return None
+        expected = dump(ast.parse(text, mode="eval").body)
+        matches = [
+            node for node in ast.walk(unit.tree) if isinstance(node, ast.Call) and owner(path, node) == owning and dump(node) == expected
+        ]
+        require(len(matches) == 1, "exact call changed " + path + ":" + owning + ":" + text)
+        return matches[0] if len(matches) == 1 else None
+
+    require(len(indexed) == len(units), "source set duplicated")
+    for (path, name), text in _reserve_CALLBACK_BODIES.items():
+        unit = source(path)
+        if unit is None:
+            continue
+        definition = _reserve_node_at(unit, name)
+        expected = ast.parse(text).body
+        require(
+            len(expected) == 1 and definition is not None and dump(definition) == dump(expected[0]),
+            "complete consumer body changed " + path + ":" + name,
+        )
+        require(
+            definition is not None and helper.owned_binding(unit.tree, name, definition), "consumer binding changed " + path + ":" + name
+        )
+        if definition is not None:
+            definitions[path, name] = definition
+            origins.add(module(path) + "." + name)
+            supplier_bindings.add(module(path) + "." + name)
+    if failures:
+        return failures, {}
+
+    for filename, adapters in _reserve_CALLBACK_ADAPTERS.items():
+        path = _reserve_CALLBACK_PREFIX + filename
+        unit = source(path)
+        if unit is None:
+            continue
+        imported(path, "TypeAdapter", "pydantic", "TypeAdapter")
+        for name, schema in adapters.items():
+            declaration = _reserve_node_at(unit, name)
+            expected = ast.parse(name + " = TypeAdapter(" + schema + ")").body[0]
+            require(declaration is not None and dump(declaration) == dump(expected), "actual adapter declaration changed " + name)
+            if declaration is None or not isinstance(declaration, ast.Assign):
+                continue
+            expected_stores = {id(target) for target in declaration.targets}
+            require(
+                {
+                    id(node)
+                    for node in helper.immediate(unit.tree)
+                    if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+                }
+                == expected_stores,
+                "adapter rebound " + name,
+            )
+            qualified = module(path) + "." + name
+            origins.add(qualified)
+            supplier_bindings.add(qualified)
+            adapter_origins.add(qualified)
+            calls.add((path, id(declaration.value)))
+            uses.add((path, id(declaration.value.func)))
+            uses.update((path, id(node)) for node in ast.walk(declaration.value.args[0]) if isinstance(node, ast.Name))
+            for schema_name in {node.id for node in ast.walk(expected.value.args[0]) if isinstance(node, ast.Name)}:
+                if schema_name in {"str", "dict", "tuple"}:
+                    builtin(path, schema_name)
+                elif schema_name in _reserve_CALLBACK_SCHEMA_IMPORTS:
+                    imported(path, schema_name, *_reserve_CALLBACK_SCHEMA_IMPORTS[schema_name])
+                else:
+                    owned = _reserve_node_at(unit, schema_name)
+                    require(
+                        isinstance(owned, ast.ClassDef) and helper.owned_binding(unit.tree, schema_name, owned),
+                        "owned adapter schema changed " + schema_name,
+                    )
+                    origins.add(module(path) + "." + schema_name)
+                    supplier_bindings.add(module(path) + "." + schema_name)
+
+    for filename, names in _reserve_CALLBACK_FORMALS.items():
+        path = _reserve_CALLBACK_PREFIX + filename
+        for name in names:
+            formal_origins.add(module(path) + "." + name)
+            definition = definitions[path, name]
+            require([arg.arg for arg in definition.args.args][:1] == ["adapter"], "adapter formal changed " + name)
+            require(
+                [
+                    (kind, node.arg if isinstance(node, ast.arg) else None)
+                    for binding, kind, node in helper.lexical_binding_events(definition)
+                    if binding == "adapter"
+                ]
+                == [("PARAMETER", "adapter")],
+                "adapter formal rebound " + name,
+            )
+
+    for filename in (
+        "continuation_audit_buffer.py",
+        "continuation_provider_outcomes.py",
+        "continuation_tool_batch.py",
+        "continuation_bootstrap.py",
+    ):
+        path = _reserve_CALLBACK_PREFIX + filename
+        imported(path, "owned_json", "elspeth.web.composer.continuation_codec", "owned_json")
+        imported(path, "canonical_json", "elspeth.contracts.hashing", "canonical_json")
+
+    codec_path = _reserve_CALLBACK_PREFIX + "continuation_codec.py"
+    imported(codec_path, "Mapping", "collections.abc", "Mapping")
+    imported(codec_path, "cast", "typing", "cast")
+    for binding in ("type", "str", "bool", "int", "float", "isinstance", "any", "tuple", "list"):
+        builtin(codec_path, binding)
+    hashing_path = "src/elspeth/contracts/hashing.py"
+    imported(hashing_path, "Mapping", "collections.abc", "Mapping")
+    for binding in ("isinstance", "float", "frozenset", "list", "tuple", "ValueError", "TypeError"):
+        builtin(hashing_path, binding)
+    for path, binding, imported_module, members in (
+        (codec_path, "math", "math", ("isfinite",)),
+        (hashing_path, "math", "math", ("isnan", "isinf")),
+        (hashing_path, "rfc8785", "rfc8785", ("dumps",)),
+    ):
+        unit = source(path)
+        declarations = [
+            node
+            for node in helper.immediate(unit.tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            and any((alias.asname or alias.name.split(".")[0]) == binding or alias.name == "*" for alias in node.names)
+        ]
+        require(
+            len(declarations) == 1
+            and isinstance(declarations[0], ast.Import)
+            and [(alias.name, alias.asname) for alias in declarations[0].names] == [(imported_module, None)],
+            "callback module supplier changed " + path + ":" + binding,
+        )
+        require(
+            not any(
+                (isinstance(node, ast.Name) and node.id == binding and isinstance(node.ctx, (ast.Store, ast.Del)))
+                or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == binding)
+                for node in helper.immediate(unit.tree)
+            ),
+            "callback module supplier rebound " + path + ":" + binding,
+        )
+        supplier_bindings.add(module(path) + "." + binding)
+        origins.update(imported_module + "." + member for member in members)
+
+    # Exact actual dump/validate receivers inside complete body-bound owners.
+    for (path, name), definition in definitions.items():
+        filename = path.rpartition("/")[2]
+        adapters = _reserve_CALLBACK_ADAPTERS.get(filename, {})
+        for node in ast.walk(definition):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
+                continue
+            receiver = node.func.value
+            if receiver.id not in adapters and not (receiver.id == "adapter" and name in _reserve_CALLBACK_FORMALS.get(filename, ())):
+                continue
+            require(node.func.attr in {"dump_python", "validate_json"}, "adapter method is not a closed serialization operation")
+            require(
+                unshadowed(path, receiver, receiver.id, formal=definition if receiver.id == "adapter" else None),
+                "adapter receiver shadowed " + name,
+            )
+            calls.add((path, id(node)))
+            uses.update({(path, id(receiver)), (path, id(node.func))})
+            if receiver.id != "adapter":
+                observed_uses.update({(path, id(receiver)), (path, id(node.func))})
+            fallback = [keyword.value for keyword in node.keywords if keyword.arg == "fallback"]
+            if fallback:
+                require(
+                    len(fallback) == 1
+                    and isinstance(fallback[0], ast.Name)
+                    and fallback[0].id == "owned_json"
+                    and unshadowed(path, fallback[0], "owned_json"),
+                    "fallback supplier changed " + name,
+                )
+                argument_calls.add((path, id(node), id(fallback[0])))
+                uses.add((path, id(fallback[0])))
+                observed_uses.add((path, id(fallback[0])))
+
+    for filename, owning, text in _reserve_CALLBACK_FORWARDING:
+        path = _reserve_CALLBACK_PREFIX + filename
+        call = expression(path, owning, text)
+        if call is None:
+            continue
+        if filename == "continuation_prepared_p4.py":
+            imported(path, call.func.id, "elspeth.web.composer.continuation_tool_batch", call.func.id)
+        require(unshadowed(path, call.func, call.func.id), "forwarded helper shadowed " + owning)
+        parameter = call.args[0]
+        definition = definitions.get((path, owning)) if parameter.id == "adapter" else None
+        require(unshadowed(path, parameter, parameter.id, formal=definition), "forwarded adapter shadowed " + owning)
+        require(
+            (parameter.id == "adapter" and definition is not None) or parameter.id in _reserve_CALLBACK_ADAPTERS[filename],
+            "forwarded adapter has no actual constructor",
+        )
+        calls.add((path, id(call)))
+        argument_calls.add((path, id(call), id(parameter)))
+        uses.update({(path, id(parameter)), (path, id(call.func))})
+        observed_uses.add((path, id(call.func)))
+        if parameter.id != "adapter":
+            observed_uses.add((path, id(parameter)))
+
+    prompt_path = _reserve_CALLBACK_PREFIX + "pipeline_planner.py"
+    imported(prompt_path, "json_content_parts", "elspeth.web.composer.prompt_guard_rendering", "json_content_parts")
+    imported(prompt_path, "_primitive_canonical_json", "elspeth.contracts.hashing", "canonical_json")
+    imported(prompt_path, "canonical_json_loads", "elspeth.contracts.hashing", "canonical_json_loads")
+    for owning, text in _reserve_CALLBACK_PROMPT_CALLS:
+        call = expression(prompt_path, owning, text)
+        if call is None:
+            continue
+        require(unshadowed(prompt_path, call.func, "json_content_parts"), "prompt receiver shadowed " + owning)
+        for keyword in call.keywords:
+            if keyword.arg in {"encoder", "decoder"}:
+                require(
+                    isinstance(keyword.value, ast.Name) and unshadowed(prompt_path, keyword.value, keyword.value.id),
+                    "prompt callback shadowed " + owning,
+                )
+                argument_calls.add((prompt_path, id(call), id(keyword.value)))
+                uses.add((prompt_path, id(keyword.value)))
+                observed_uses.add((prompt_path, id(keyword.value)))
+        calls.add((prompt_path, id(call)))
+
+    # Actual synchronous local closure: tuple exhausts render before returning;
+    # no callback is placed in a PromptGuardContentPart or a returned closure.
+    renderer_path = _reserve_CALLBACK_PREFIX + "prompt_guard_rendering.py"
+    imported(renderer_path, "PromptGuardContentPart", "elspeth.contracts.prompt_guard", "PromptGuardContentPart")
+    imported(renderer_path, "PromptGuardTrust", "elspeth.contracts.prompt_guard", "PromptGuardTrust")
+    for binding in ("tuple", "dict", "list", "set", "str", "int", "type", "isinstance", "any", "len", "sorted", "enumerate", "frozenset"):
+        builtin(renderer_path, binding)
+    renderer = source(renderer_path)
+    json_imports = [
+        node
+        for node in helper.immediate(renderer.tree)
+        if isinstance(node, ast.Import) and any(alias.name == "json" and alias.asname is None for alias in node.names)
+    ]
+    require(
+        len(json_imports) == 1
+        and not any(
+            (isinstance(node, ast.Name) and node.id == "json" and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "json")
+            or (
+                isinstance(node, ast.ImportFrom)
+                and any(alias.name == "*" or (alias.asname or alias.name) == "json" for alias in node.names)
+            )
+            for node in helper.immediate(renderer.tree)
+        ),
+        "prompt JSON module binding changed",
+    )
+    supplier_bindings.add(module(renderer_path) + ".json")
+    origins.update({"json.dumps", "json.loads", "json.JSONDecoder"})
+    declaration = _reserve_node_at(renderer, "_COMPLETE_CONTAINER_CHARACTERS")
+    require(
+        declaration is not None and dump(declaration) == dump(ast.parse("_COMPLETE_CONTAINER_CHARACTERS = 2048").body[0]),
+        "prompt container bound changed",
+    )
+    origins.add(module(renderer_path) + "._COMPLETE_CONTAINER_CHARACTERS")
+    supplier_bindings.add(module(renderer_path) + "._COMPLETE_CONTAINER_CHARACTERS")
+
+    part_path = "src/elspeth/contracts/prompt_guard.py"
+    imported(part_path, "dataclass", "dataclasses", "dataclass")
+    imported(part_path, "field", "dataclasses", "field")
+    imported(part_path, "Enum", "enum", "Enum")
+    imported(part_path, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError")
+    for binding in ("type", "str"):
+        builtin(part_path, binding)
+
+    # These are exact roles in already complete-body-checked owners. No
+    # class-base/default/member category is admitted outside these input nodes.
+    definition_uses = set()
+    immutable_supplier_origins = set()
+    trust = definitions[part_path, "PromptGuardTrust"]
+    require(
+        isinstance(trust, ast.ClassDef)
+        and len(trust.bases) == 1
+        and isinstance(trust.bases[0], ast.Name)
+        and trust.bases[0].id == "Enum"
+        and unshadowed(part_path, trust.bases[0], "Enum"),
+        "owned trust enum base changed",
+    )
+    if isinstance(trust, ast.ClassDef) and len(trust.bases) == 1:
+        definition_uses.add((part_path, id(trust.bases[0])))
+
+    rendering = definitions[renderer_path, "json_content_parts"]
+    defaults = [
+        (argument.arg, value)
+        for argument, value in zip(rendering.args.kwonlyargs, rendering.args.kw_defaults, strict=True)
+        if argument.arg == "decoder"
+    ]
+    require(
+        len(defaults) == 1
+        and isinstance(defaults[0][1], ast.Attribute)
+        and dump(defaults[0][1]) == dump(ast.parse("json.loads", mode="eval").body),
+        "owned renderer decoder default changed",
+    )
+    if len(defaults) == 1 and isinstance(defaults[0][1], ast.Attribute):
+        default = defaults[0][1]
+        require(unshadowed(renderer_path, default, "json"), "owned renderer decoder default shadowed")
+        definition_uses.update({(renderer_path, id(default)), (renderer_path, id(default.value))})
+
+    member_reads = [
+        node
+        for node in ast.walk(rendering)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "PromptGuardTrust"
+    ]
+    require(
+        len(member_reads) == 1
+        and dump(member_reads[0]) == dump(ast.parse("PromptGuardTrust.REFERENCE", mode="eval").body)
+        and owner(renderer_path, member_reads[0]) == "json_content_parts.render"
+        and unshadowed(renderer_path, member_reads[0], "PromptGuardTrust"),
+        "owned renderer trust member role changed",
+    )
+    if len(member_reads) == 1:
+        definition_uses.update({(renderer_path, id(member_reads[0])), (renderer_path, id(member_reads[0].value))})
+
+    part = definitions[part_path, "PromptGuardContentPart"]
+    nominal = [
+        node
+        for node in ast.walk(part)
+        if isinstance(node, ast.Compare) and dump(node) == dump(ast.parse("type(self.trust) is not PromptGuardTrust", mode="eval").body)
+    ]
+    require(
+        len(nominal) == 1
+        and owner(part_path, nominal[0]) == "PromptGuardContentPart.__post_init__"
+        and unshadowed(part_path, nominal[0], "type")
+        and unshadowed(part_path, nominal[0], "PromptGuardTrust"),
+        "owned trust nominal comparison changed",
+    )
+    if len(nominal) == 1:
+        definition_uses.add((part_path, id(nominal[0].comparators[0])))
+
+    # Constant identity is proved at its declaration and sole exact numeric
+    # consumer. Its value is never a callable capability, but rebinding still
+    # reaches the complete origin/namespace denial traversal.
+    bound_name = "_COMPLETE_CONTAINER_CHARACTERS"
+    require(
+        isinstance(declaration, ast.Assign) and len(declaration.targets) == 1 and isinstance(declaration.targets[0], ast.Name),
+        "prompt container declaration changed",
+    )
+    if isinstance(declaration, ast.Assign) and len(declaration.targets) == 1:
+        stores = [
+            node
+            for node in helper.immediate(renderer.tree)
+            if isinstance(node, ast.Name) and node.id == bound_name and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+        require(len(stores) == 1 and stores[0] is declaration.targets[0], "prompt container bound rebound")
+    require(
+        not any(
+            (isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == bound_name)
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any(alias.name == "*" or (alias.asname or alias.name.split(".")[0]) == bound_name for alias in node.names)
+            )
+            for node in helper.immediate(renderer.tree)
+        ),
+        "prompt container bound import/definition changed",
+    )
+    bound_comparisons = [
+        node
+        for node in ast.walk(rendering)
+        if isinstance(node, ast.Compare)
+        and dump(node) == dump(ast.parse("len(encoded) <= _COMPLETE_CONTAINER_CHARACTERS", mode="eval").body)
+    ]
+    require(
+        len(bound_comparisons) == 1
+        and owner(renderer_path, bound_comparisons[0]) == "json_content_parts.render"
+        and unshadowed(renderer_path, bound_comparisons[0], bound_name),
+        "prompt numeric bound role changed",
+    )
+    if len(bound_comparisons) == 1:
+        definition_uses.add((renderer_path, id(bound_comparisons[0].comparators[0])))
+    immutable_supplier_origins.add(module(renderer_path) + "." + bound_name)
+    uses.update(definition_uses)
+
+    canonical_path = "src/elspeth/core/canonical.py"
+    imported(canonical_path, "_primitive_canonical_json", "elspeth.contracts.hashing", "canonical_json")
+    builtin(canonical_path, "sorted")
+    call = expression(
+        canonical_path, "_normalize_for_canonical", 'sorted(entries, key=lambda entry: _primitive_canonical_json(entry["key"]))'
+    )
+    if call is not None:
+        callback = call.keywords[0].value
+        require(
+            isinstance(callback, ast.Lambda)
+            and unshadowed(canonical_path, call.func, "sorted")
+            and unshadowed(canonical_path, callback.body.func, "_primitive_canonical_json"),
+            "immediate canonical sort supplier changed",
+        )
+        calls.add((canonical_path, id(call)))
+        argument_calls.add((canonical_path, id(call), id(callback)))
+        immediate_lambdas.add((canonical_path, id(callback)))
+        uses.add((canonical_path, id(callback.body.func)))
+    if failures:
+        return failures, {}
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    require(
+        (calls | uses | immediate_lambdas) <= actual
+        and all((path, call_id) in actual and (path, arg_id) in actual for path, call_id, arg_id in argument_calls),
+        "receipt is detached from the input AST",
+    )
+    if failures:
+        return failures, {}
+    return [], {
+        "calls": frozenset(calls),
+        "argument_calls": frozenset(argument_calls),
+        "uses": frozenset(uses),
+        "immediate_lambdas": frozenset(immediate_lambdas),
+        "origins": frozenset(origins),
+        "supplier_bindings": frozenset(supplier_bindings),
+        "formal_origins": frozenset(formal_origins),
+        "adapter_origins": frozenset(adapter_origins),
+        "observed_uses": frozenset(observed_uses),
+        "definition_uses": frozenset(definition_uses),
+        "immutable_supplier_origins": frozenset(immutable_supplier_origins),
+        "receiver_members": {origin: {"dump_python", "validate_json"} for origin in adapter_origins | {"pydantic.TypeAdapter"}},
+        "callback_origins": frozenset(
+            {
+                "elspeth.web.composer.continuation_codec.owned_json",
+                "elspeth.contracts.hashing.canonical_json",
+                "elspeth.contracts.hashing.canonical_json_loads",
+            }
+        ),
+    }
+
+
+def _reserve_batch_callback_use_failures(units, receipt, protected_uses):
+    """Complete original-resolver reference join; aliases do not escape the set.
+
+    Run after the original pass with all receipt origins present. A local
+    receipt alone is not a normal certificate. Member roots must be observed
+    with their adapter receiver origin (see integration hooks).
+    """
+    failures = []
+    actual = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    parents = {unit.path: {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)} for unit in units}
+    observed = set()
+    for path, node_id, origin, *_ in protected_uses:
+        if origin[0] not in {"object", "member", "instance"}:
+            continue
+        qualified = origin[1]
+        adapter = qualified in receipt["adapter_origins"] or qualified.rpartition(".")[0] in receipt["adapter_origins"]
+        if qualified not in receipt["formal_origins"] | receipt["callback_origins"] and not adapter:
+            continue
+        key = path, node_id
+        observed.add(key)
+        node = actual.get(key)
+        if node is None:
+            failures.append("batch callback consumer reference detached from actual AST")
+            continue
+        parent = parents[path].get(node_id)
+        if key in receipt["uses"]:
+            continue
+        if qualified in receipt["callback_origins"] and isinstance(parent, ast.Call) and parent.func is node:
+            # A call invokes the supplier; it does not transfer its callable.
+            continue
+        # No generic direct-call allowance for the four adapter-formal helpers:
+        # every caller and actual adapter parameter must belong to the closed graph.
+        failures.append("batch callback consumer unproved supplier role " + path + ":" + str(node.lineno) + ":" + qualified)
+    # Formal receivers deliberately retain unknown origin. Every canonical
+    # global receiver/callback/helper in this set must actually be observed.
+    if not receipt["observed_uses"] <= observed:
+        failures.append("batch callback consumer original resolver omitted an admitted supplier use")
+    return failures
+
+
+_reserve_YAML_SERIALIZER_SOURCE = '"""Stateless Composer YAML serialization dependency for runtime consumers."""\n\nfrom __future__ import annotations\n\nfrom elspeth.web.composer.state import CompositionState\n\n\nclass ComposerYamlSerializer:\n    """Expose canonical serialization without retaining a module or callback."""\n\n    __slots__ = ()\n\n    def generate_yaml(self, state: CompositionState) -> str:\n        # Resolve the canonical function at the call, as the existing module\n        # dependency did. The adapter stores neither it nor the module.\n        from elspeth.web.composer.yaml_generator import generate_yaml\n\n        return generate_yaml(state)\n'
+_reserve_YAML_SERIALIZER_CALLS = (
+    (
+        "src/elspeth/web/app.py",
+        "_service_lifespan",
+        "ExecutionServiceImpl(\n            loop=loop,\n            broadcaster=broadcaster,\n            settings=settings,\n            session_service=session_service,\n            yaml_generator=ComposerYamlSerializer(),\n            telemetry=app.state.sessions_telemetry,\n            blob_service=app.state.blob_service,\n            secret_service=app.state.scoped_secret_resolver,\n            plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,\n            operator_profile_registry=app.state.operator_profile_registry,\n            web_plugin_policy=app.state.web_plugin_policy,\n            catalog=app.state.catalog_service,\n            principal_is_active=app.state.principal_is_active,\n            execution_lease_release_registry=app.state.execution_lease_release_registry,\n        )",
+    ),
+    (
+        "src/elspeth/web/app.py",
+        "_create_app._session_runtime_preflight",
+        "validate_pipeline(\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=app.state.scoped_secret_resolver,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=blob_get_content,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=app.state.operator_profile_registry,\n            catalog=app.state.catalog_service,\n        )",
+    ),
+    (
+        "src/elspeth/composer_mcp/server.py",
+        "_build_stdio_server.stdio_runtime_preflight",
+        "run_sync_in_worker(\n            validate_pipeline,\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=None,\n            catalog=catalog,\n            secret_service=None,\n            session_id=session_id,\n        )",
+    ),
+    (
+        "src/elspeth/web/composer/composer_preflight.py",
+        "ComposerPreflight.runtime_preflight",
+        "validate_pipeline(\n            state,\n            self._settings,\n            ComposerYamlSerializer(),\n            secret_service=self._secret_service,\n            secret_wiring_policy=self._secret_wiring_policy,\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=_blob_get_content,\n            allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=self._operator_profile_registry,\n            catalog=self._catalog,\n        )",
+    ),
+    (
+        "src/elspeth/web/sessions/routes/_helpers.py",
+        "_runtime_preflight_for_state",
+        "run_sync_in_worker(\n            validate_pipeline,\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=secret_service,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=str(session_id),\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=profile_registry,\n            catalog=catalog,\n        )",
+    ),
+)
+_reserve_YAML_CANONICAL_BODY = 'def generate_yaml(state: CompositionState) -> str:\n    """Convert a CompositionState to deterministic ELSPETH pipeline YAML.\n\n    The output is deterministic: same state produces byte-identical YAML.\n    YAML serialization is a thin wrapper around ``generate_pipeline_dict()``\n    so there is only one mapping from composer state to runtime/YAML shape.\n\n    Args:\n        state: The pipeline composition state to serialize.\n\n    Returns:\n        YAML string representing the pipeline configuration.\n    """\n    doc = generate_pipeline_dict(state)\n\n    # sort_keys=False preserves insertion order: sources → queues → transforms\n    # → gates → row_unions → aggregations → coalesce → collectors → scopes →\n    # sinks.\n    return yaml.dump(doc, default_flow_style=False, sort_keys=False)'
+
+
+def _reserve_yaml_serializer_adapter(units):
+    """Bind the stateless adapter, actual call sites and canonical delegate.
+
+    This receipt admits no module/instance transfer or runtime authority. The
+    canonical origin pass still visits every operand, supplier and write.
+    """
+    helper = _reserve_composer_receiver
+    indexed = {unit.path: unit for unit in units}
+    path = "src/elspeth/web/composer/yaml_serializer.py"
+    module = "elspeth.web.composer.yaml_serializer"
+    class_origin = module + ".ComposerYamlSerializer"
+    failures, uses, calls, supplier_bindings = [], set(), set(), set()
+
+    def require(ok, reason):
+        if not ok:
+            failures.append("nominal YAML serializer " + reason)
+
+    def dump(node):
+        return ast.dump(node, include_attributes=False)
+
+    require(len(indexed) == len(units) and path in indexed, "source missing or duplicated")
+    if failures:
+        return failures, {}
+    unit = indexed[path]
+    require(dump(unit.tree) == dump(ast.parse(_reserve_YAML_SERIALIZER_SOURCE)), "complete adapter declaration changed")
+    cls = _reserve_node_at(unit, "ComposerYamlSerializer")
+    require(isinstance(cls, ast.ClassDef) and helper.owned_binding(unit.tree, "ComposerYamlSerializer", cls), "class binding changed")
+    require(helper.imported(unit.tree, "CompositionState", "elspeth.web.composer.state", "CompositionState"), "state supplier changed")
+    require(helper.builtin_binding(unit.tree, "object"), "default allocation supplier changed")
+    supplier_bindings.update({module + ".ComposerYamlSerializer", module + ".CompositionState", module + ".object"})
+    if failures:
+        return failures, {}
+    origins = {class_origin, class_origin + ".generate_yaml", "builtins.object", "elspeth.web.composer.state.CompositionState"}
+    canonical_path = "src/elspeth/web/composer/yaml_generator.py"
+    require(canonical_path in indexed, "canonical source missing")
+    if canonical_path not in indexed:
+        return failures, {}
+    canonical = indexed[canonical_path]
+    function = _reserve_node_at(canonical, "generate_yaml")
+    require(
+        function is not None and dump(function) == dump(ast.parse(_reserve_YAML_CANONICAL_BODY).body[0]),
+        "canonical delegation body changed",
+    )
+    require(function is not None and helper.owned_binding(canonical.tree, "generate_yaml", function), "canonical function binding changed")
+    lowering = _reserve_node_at(canonical, "generate_pipeline_dict")
+    require(
+        lowering is not None and helper.owned_binding(canonical.tree, "generate_pipeline_dict", lowering),
+        "canonical lowering binding changed",
+    )
+    yaml_imports = [
+        node
+        for node in helper.immediate(canonical.tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and any((alias.asname or alias.name.split(".")[0]) == "yaml" or alias.name == "*" for alias in node.names)
+    ]
+    require(
+        len(yaml_imports) == 1 and dump(yaml_imports[0]) == dump(ast.parse("import yaml").body[0]), "canonical YAML library import changed"
+    )
+    require(
+        not any(
+            (isinstance(node, ast.Name) and node.id == "yaml" and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "yaml")
+            for node in helper.immediate(canonical.tree)
+        ),
+        "canonical YAML library rebound",
+    )
+    origins.update(
+        {"elspeth.web.composer.yaml_generator.generate_yaml", "elspeth.web.composer.yaml_generator.generate_pipeline_dict", "yaml.dump"}
+    )
+    supplier_bindings.update(
+        {
+            "elspeth.web.composer.yaml_generator.yaml",
+            "elspeth.web.composer.yaml_generator.generate_yaml",
+            "elspeth.web.composer.yaml_generator.generate_pipeline_dict",
+        }
+    )
+    for call_path, expected_owner, text in _reserve_YAML_SERIALIZER_CALLS:
+        require(call_path in indexed, "call source missing " + call_path)
+        if call_path not in indexed:
+            continue
+        source = indexed[call_path]
+        parents = {id(child): parent for parent in ast.walk(source.tree) for child in ast.iter_child_nodes(parent)}
+
+        def owner(node, *, parents=parents):
+            names = []
+            cursor = parents.get(id(node))
+            while cursor is not None:
+                if isinstance(cursor, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    names.append(cursor.name)
+                cursor = parents.get(id(cursor))
+            return ".".join(reversed(names))
+
+        expected = dump(ast.parse(text, mode="eval").body)
+        matches = [
+            node
+            for node in ast.walk(source.tree)
+            if isinstance(node, ast.Call) and owner(node) == expected_owner and dump(node) == expected
+        ]
+        require(len(matches) == 1, "actual consumer call changed " + call_path + ":" + expected_owner)
+        require(
+            helper.imported(source.tree, "ComposerYamlSerializer", module, "ComposerYamlSerializer"),
+            "constructor import changed " + call_path,
+        )
+        supplier_bindings.add(call_path.removeprefix("src/").removesuffix(".py").replace("/", ".") + ".ComposerYamlSerializer")
+        if len(matches) != 1:
+            continue
+        constructors = [
+            node
+            for node in ast.walk(matches[0])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ComposerYamlSerializer"
+        ]
+        require(
+            len(constructors) == 1 and not constructors[0].args and not constructors[0].keywords,
+            "empty nominal construction changed " + call_path,
+        )
+        if len(constructors) != 1:
+            continue
+        constructor = constructors[0]
+        cursor = parents.get(id(constructor))
+        while cursor is not None:
+            if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                require(
+                    not any(name == "ComposerYamlSerializer" for name, _, _ in helper.lexical_binding_events(cursor)),
+                    "constructor shadowed " + call_path,
+                )
+            elif isinstance(cursor, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                require(False, "constructor moved into opaque lexical binder " + call_path)
+            cursor = parents.get(id(cursor))
+        calls.add((call_path, id(constructor)))
+        uses.add((call_path, id(constructor.func)))
+    actual = {(source.path, id(node)) for source in units for node in ast.walk(source.tree)}
+    require(len(calls) == len(_reserve_YAML_SERIALIZER_CALLS) and calls | uses <= actual, "same-AST constructor cohort changed")
+    if failures:
+        return failures, {}
+    return [], {
+        "class_origin": class_origin,
+        "origins": frozenset(origins),
+        "supplier_bindings": frozenset(supplier_bindings),
+        "uses": frozenset(uses),
+        "calls": frozenset(calls),
+    }
+
+
+def _reserve_yaml_serializer_use_failures(receipt, protected_uses):
+    actual = frozenset((path, node_id) for path, node_id, origin, *_ in protected_uses if origin == ("object", receipt["class_origin"]))
+    if actual != receipt["uses"]:
+        return ["nominal YAML serializer constructor references or same-AST join changed"]
+    return []

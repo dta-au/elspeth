@@ -445,10 +445,10 @@ class ComposerAsyncWorker:
         failure = None
         if current.cancel_requested_at is not None:
             failure = request_cancelled_error(request_id=current.request_id)
-        elif restore_utc(current.deadline_at) <= now:
+        elif restore_utc(current.legacy_deadline_at) <= now:
             failure = deadline_expired_error(
                 request_id=current.request_id,
-                timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
+                timeout_seconds=(restore_utc(current.legacy_deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
         if failure is not None:
             await _owned(
@@ -757,7 +757,7 @@ class ComposerAsyncWorker:
             raise BaseExceptionGroup("Composer setup retained original cancellations", settlement.deferred_cancellations)
         if record is None or current is None or record.request_json is None:
             raise AuditIntegrityError("Started composer operation has no admitted request")
-        budget = max(0.0, (restore_utc(record.deadline_at) - now).total_seconds())
+        budget = max(0.0, (restore_utc(record.legacy_deadline_at) - now).total_seconds())
         if budget <= 0:
             if setup_ticket is not None:
                 setup_ticket.complete_owned()
@@ -944,7 +944,7 @@ class ComposerAsyncWorker:
                     owner.cancel(COMPOSER_CANCEL_REQUESTED)
                     return
                 remaining = anchor.remaining_seconds(monotonic_now=time.monotonic())
-                if restore_utc(current.deadline_at) <= now or remaining <= 0:
+                if restore_utc(current.legacy_deadline_at) <= now or remaining <= 0:
                     raise ComposerTurnDeadlineExpired(
                         session_id=running.claim.session_id,
                         operation_id=running.claim.operation_id,
@@ -1399,23 +1399,23 @@ class ComposerAsyncWorker:
         if reduction is not None and reduction.category_rank <= 51:
             return reduction.project(
                 request_id=current.request_id,
-                timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
+                timeout_seconds=(restore_utc(current.legacy_deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
         if _authoritative_failure(exc):
             return project_composer_operation_error(exc, request_id=current.request_id, diagnostic_id=diagnostic_id)
         if current.cancel_requested_at is not None:
             return request_cancelled_error(request_id=current.request_id)
-        if restore_utc(current.deadline_at) <= now or any(isinstance(leaf, ComposerTurnDeadlineExpired) for leaf in leaves):
+        if restore_utc(current.legacy_deadline_at) <= now or any(isinstance(leaf, ComposerTurnDeadlineExpired) for leaf in leaves):
             return deadline_expired_error(
                 request_id=current.request_id,
-                timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
+                timeout_seconds=(restore_utc(current.legacy_deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
         if any(isinstance(leaf, (asyncio.CancelledError, SessionOperationFenceLost, ComposerOperationFenceLost)) for leaf in leaves):
             return worker_lost_error(request_id=current.request_id)
         if reduction is not None:
             return reduction.project(
                 request_id=current.request_id,
-                timeout_seconds=(restore_utc(current.deadline_at) - restore_utc(current.created_at)).total_seconds(),
+                timeout_seconds=(restore_utc(current.legacy_deadline_at) - restore_utc(current.created_at)).total_seconds(),
             )
         return project_composer_operation_error(exc, request_id=current.request_id, diagnostic_id=diagnostic_id)
 
@@ -1429,7 +1429,7 @@ class ComposerAsyncWorker:
                 if record.cancel_requested_at is not None
                 else deadline_expired_error(
                     request_id=record.request_id,
-                    timeout_seconds=(restore_utc(record.deadline_at) - restore_utc(record.created_at)).total_seconds(),
+                    timeout_seconds=(restore_utc(record.legacy_deadline_at) - restore_utc(record.created_at)).total_seconds(),
                 )
             )
             try:

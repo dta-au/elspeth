@@ -2094,6 +2094,7 @@ def _execute_set_pipeline(
         max_blob_storage_per_session_bytes=context.max_blob_storage_per_session_bytes,
         session_operation_context=context.session_operation_context,
         session_operation_authority=context.session_operation_authority,
+        auto_mutation=context.mutation_ceiling,
     )
     if quota_error is not None:
         return _candidate_rejection_result(state, quota_error, error_code="BLOB_QUOTA_EXCEEDED", rejected_component="source")

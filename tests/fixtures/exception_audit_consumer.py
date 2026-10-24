@@ -19,6 +19,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedToolFunction,
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.turn_audit import persist_turn_audit
 from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.test_composer_exception_handlers import _AUDIT_INTEGRITY_DETAIL, _audit_request, _settings
@@ -56,6 +57,9 @@ def exercise_audit_failed_turn() -> None:
             ):
                 await persist_turn_audit(
                     sessions_service=sessions,
+                    mutation_ceiling=None,
+                    authority_revocation=None,
+                    base_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
                     redaction_telemetry=NoopRedactionTelemetry(),
                     tool_outcomes=(),
                     decoded_args_by_call_id={},

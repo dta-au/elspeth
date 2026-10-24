@@ -507,12 +507,16 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(
 
     monkeypatch.setattr(ProviderCallCustody, "admit", admission)
     monkeypatch.setattr(litellm, "acompletion", complete)
+    # Only the deliberately blocked admission cases need a real shared deadline.
+    # Clean/count-only cases must reach the guarded SDK after current SQL-backed
+    # preparation; a 0.2-second setup deadline is not their conformance oracle.
+    deadline = asyncio.get_running_loop().time() + 0.2 if scenario in {"blocked-first", "blocked-retry"} else None
     with structlog.testing.capture_logs() as events, prompt_guard_user_scope(""):
         verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="early",
             state=simple_state,
             recorder=None,
-            deadline=asyncio.get_running_loop().time() + 0.2,
+            deadline=deadline,
             **fenced,
         )
     expected_calls = 0 if scenario == "blocked-first" else 1

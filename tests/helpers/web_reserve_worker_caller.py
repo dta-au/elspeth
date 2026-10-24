@@ -24,8 +24,8 @@ REVIEWED_GRAMMARS = {
     "ComposerAsyncWorker.__init__": "97e2ea8a5b6b2833eff8c5cb5df2fa99380efed05c2110f25f8dfa7571fa30b4",
     "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
     "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
-    "_create_app": "f624a505cbaa8c873b85d959194456c829c2d780ccbfca30bc84134aa197823e",
+    "ComposerAsyncWorker._run_started_under_lease": "a2897fd9340d2b0fac5ae8d83a1e5af1c692f3c69bc79850835b558448b995b5",
+    "_create_app": "cdd9a13db9d3bd1de87bab8a645f48bacf2bca3c0a97215fe3255b202bac486f",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
@@ -89,9 +89,48 @@ def canonical(value):
     return value
 
 
+_YAML_ADAPTER_PREFLIGHT_CALL = "validate_pipeline(\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=app.state.scoped_secret_resolver,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=blob_get_content,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=app.state.operator_profile_registry,\n            catalog=app.state.catalog_service,\n        )"
+
+
+def adapter_grammar_projection(node):
+    """Project only the reviewed adapter operand onto the previous grammar.
+
+    All receipts and compiler metadata still use the original input tree. This
+    disposable comparison copy preserves every other node. The complete
+    nominal-adapter receipt separately owns the class, import and lexical uses.
+    """
+    if not isinstance(node, ast.FunctionDef) or node.name != "_create_app":
+        return node
+    constructors = [child for child in ast.walk(node) if isinstance(child, ast.Call) and chain(child.func) == ("ComposerYamlSerializer",)]
+    if not constructors:
+        # Historical source remains a valid worker-only grammar; the combined
+        # adapter receipt independently requires the actual new production tuple.
+        return node
+    clone = copy.deepcopy(node)
+    functions = [child for child in clone.body if isinstance(child, ast.FunctionDef) and child.name == "_session_runtime_preflight"]
+    if len(functions) != 1:
+        raise ValueError("nominal YAML preflight owner is not unique")
+    expected = ast.dump(ast.parse(_YAML_ADAPTER_PREFLIGHT_CALL, mode="eval").body, include_attributes=False)
+    returns = [
+        child
+        for child in functions[0].body
+        if isinstance(child, ast.Return)
+        and isinstance(child.value, ast.Call)
+        and ast.dump(child.value, include_attributes=False) == expected
+    ]
+    if len(constructors) != 1 or len(returns) != 1:
+        raise ValueError("nominal YAML preflight argument delta is not exact")
+    call = returns[0].value
+    if len(call.args) != 3 or not isinstance(call.args[2], ast.Call) or call.args[2].args or call.args[2].keywords:
+        raise ValueError("nominal YAML constructor acquired an argument")
+    call.args[2] = ast.copy_location(ast.Name(id="yaml_generator_module", ctx=ast.Load()), call.args[2])
+    return clone
+
+
 def grammar(node, *, prefix=None):
     clone = copy.copy(node)
     clone.body = list(node.body if prefix is None else prefix)
+    clone = adapter_grammar_projection(clone)
     if (
         clone.body
         and isinstance(clone.body[0], ast.Expr)

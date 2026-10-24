@@ -43,15 +43,79 @@ def private_evidence_for_test_turn(kwargs: dict[str, Any]) -> tuple:
     )
 
 
+def mutation_inputs_for_test_turn(service, kwargs):
+    """Prepare explicit synthetic storage authority from actual seeded rows."""
+    from dataclasses import replace
+
+    from sqlalchemy import select
+
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+    from elspeth.core.canonical import canonical_json
+    from elspeth.web.composer.redaction import redact_tool_call_response
+    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+    from elspeth.web.composer.state import CompositionState, PipelineMetadata
+    from elspeth.web.composer.tools._common import _failure_result
+    from elspeth.web.sessions.converters import state_from_record
+    from elspeth.web.sessions.models import composition_states_table, sessions_table
+
+    result = dict(kwargs)
+    if "mutation_ceiling" in result and "revoked_tool_rows" in result:
+        return result
+    sid = str(result["session_id"])
+    context = result["session_operation_context"]
+    with service._engine.connect() as connection:
+        mode = connection.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == sid)).scalar_one()
+        parent = result["expected_current_state_id"]
+        previous = (
+            connection.execute(
+                select(composition_states_table).where(
+                    composition_states_table.c.id == parent, composition_states_table.c.session_id == sid
+                )
+            ).one_or_none()
+            if parent is not None
+            else None
+        )
+    if "mutation_ceiling" not in result:
+        result["mutation_ceiling"] = ComposerMutationCeiling(sid, "storage-fixture:" + context.fence.operation_id, mode)
+    if "revoked_tool_rows" not in result:
+        rows = result["redacted_tool_rows"]
+        if not any(row.composition_state_payload is not None for row in rows):
+            result["revoked_tool_rows"] = rows
+            return result
+        base = (
+            state_from_record(service._row_to_state_record(previous))
+            if previous is not None
+            else CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+        )
+        alternative = []
+        for row in rows:
+            if row.composition_state_payload is None:
+                alternative.append(row)
+                continue
+            failure = _failure_result(
+                base, "Automatic mutation authority was revoked.", error_code="auto_mutation_revoked", with_state_validation=False
+            )
+            # Legacy synthetic SQL inputs can use unregistered tool names.
+            # Project only this alternative through the common graph schema;
+            # retain their real original call and private evidence identities.
+            content = canonical_json(redact_tool_call_response("set_pipeline", failure.to_dict(), telemetry=NoopRedactionTelemetry()))
+            event = row.visible_event.with_display_result(content) if row.visible_event is not None else None
+            alternative.append(replace(row, content=content, composition_state_payload=None, visible_event=event))
+        result["revoked_tool_rows"] = tuple(alternative)
+    return result
+
+
 class FencedSessionServiceHarness(SessionServiceImpl):
     _contexts_by_engine: weakref.WeakKeyDictionary[Any, dict[UUID, SessionOperationContext]] = weakref.WeakKeyDictionary()
 
     def persist_compose_turn(self, **kwargs):
+        kwargs = mutation_inputs_for_test_turn(self, kwargs)
         if "private_tool_evidence" not in kwargs:
             kwargs["private_tool_evidence"] = private_evidence_for_test_turn(kwargs)
         return super().persist_compose_turn(**kwargs)
 
     async def persist_compose_turn_async(self, **kwargs):
+        kwargs = mutation_inputs_for_test_turn(self, kwargs)
         if "private_tool_evidence" not in kwargs:
             kwargs["private_tool_evidence"] = private_evidence_for_test_turn(kwargs)
         return await super().persist_compose_turn_async(**kwargs)

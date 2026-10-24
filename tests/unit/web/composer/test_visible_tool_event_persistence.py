@@ -77,6 +77,7 @@ def _kwargs(session, context):
         result_canonical=canonical_json(json.loads(selected)),
         raw_arguments=original,
     )
+    rows = (RedactedToolRow("visible-call", display_result, None, companion),)
     return (
         {
             "session_id": str(session.id),
@@ -85,7 +86,8 @@ def _kwargs(session, context):
             "redacted_assistant_tool_calls": (
                 {"id": "visible-call", "type": "function", "function": {"name": "create_blob", "arguments": display_arguments}},
             ),
-            "redacted_tool_rows": (RedactedToolRow("visible-call", display_result, None, companion),),
+            "redacted_tool_rows": rows,
+            "revoked_tool_rows": rows,
             "private_tool_evidence": (private,),
             "parent_composition_state_id": None,
             "expected_current_state_id": None,
@@ -154,6 +156,7 @@ async def test_companion_mismatch_refuses_before_any_rows_are_written(visible_wr
     row = kwargs["redacted_tool_rows"][0]
     replacement = row.visible_event.operation_epoch + 1 if field == "operation_epoch" else "different-value"
     kwargs["redacted_tool_rows"] = (replace(row, visible_event=replace(row.visible_event, **{field: replacement})),)
+    kwargs["revoked_tool_rows"] = kwargs["redacted_tool_rows"]
     with pytest.raises(AuditIntegrityError):
         await service.persist_compose_turn_async(**kwargs)
     assert await service.get_messages(session.id, limit=None) == []
@@ -307,6 +310,7 @@ async def test_historical_hash_valid_inline_evidence_is_private_readable_but_ref
         {"id": "visible-call", "type": "function", "function": {"name": "set_pipeline", "arguments": "{}"}},
     )
     kwargs["redacted_tool_rows"] = (RedactedToolRow("visible-call", "{}", None, safe),)
+    kwargs["revoked_tool_rows"] = kwargs["redacted_tool_rows"]
     kwargs["private_tool_evidence"] = (
         build_private_tool_evidence(
             session_id=str(session.id),
@@ -488,65 +492,6 @@ async def test_actual_fork_retains_source_binding_as_explicit_gap_not_child_auth
     value = AdvisorTranscriptOwner(request=current.content, history=history).snapshot().provider_json
     assert "unavailable_original_session_or_operation_binding" in value
     assert "DURABLE_TAIL_CANARY" not in value
-
-
-@pytest.mark.asyncio
-async def test_actual_planner_tools_and_public_call_gaps_survive_joined_cohort_reload(visible_writer, tmp_path, tool_context):
-    from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
-    from elspeth.web.composer.planning_application import PlanningApplication
-    from tests.unit.web.composer.test_llm_call_audit_summary import _PlannerAuditHost
-    from tests.unit.web.composer.test_pipeline_planner import _custody, _inline_pipeline, _plan, _response, _ScriptedCompletion
-
-    service, session, authority, holder = visible_writer
-    context = holder["context"]
-    intent = "Build a generic inline pipeline."
-    human = await service.add_message(session.id, "user", intent, writer_principal="route_user_message", session_operation_context=context)
-    recorder = BufferingRecorder()
-    completion = _ScriptedCompletion(
-        _response(("list_sources", {})),
-        _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})),
-    )
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        recorder=recorder,
-        intent=intent,
-        originating_message=PlannerOriginatingMessage(
-            session_id=str(session.id), message_id=str(human.id), user_id="alice", content=intent
-        ),
-        custody_config=replace(
-            _custody(tmp_path), session_engine=service._engine, session_operation_context=context, session_operation_authority=authority
-        ),
-    )
-    assert len(recorder.visible_tool_events) == 1
-    invocation, companion = recorder.visible_tool_events[0]
-    assert invocation is recorder.invocations[0]
-    await PlanningApplication._persist_pipeline_planner_audit(
-        _PlannerAuditHost(service),
-        session_id=session.id,
-        current_state_id=None,
-        llm_calls=recorder.llm_calls,
-        planner_attempts=recorder.planner_attempts,
-        invocations=recorder.invocations,
-        withheld_replies=recorder.withheld_replies,
-        private_candidates=recorder.private_candidates,
-        session_operation_context=context,
-        visible_tool_events=recorder.visible_tool_events,
-    )
-    rows, value = await _history(service, session, context)
-    tools = [event for event in value["events"] if event.get("history_availability") == "ordinary_visible_event_secret_redacted"]
-    assert len(tools) == 1
-    restored = tools[0]
-    assert restored["content"] == json.loads(companion.payload_json)["selected_result"]
-    assert restored["legacy_invocations"][0]["received_arguments"] == json.loads(companion.payload_json)["received_arguments"]
-    gaps = [event["visible_response_coverage_gap"] for event in value["events"] if "visible_response_coverage_gap" in event]
-    assert len(gaps) == len(recorder.llm_calls) == 2
-    assert {gap["provider_call_id"] for gap in gaps} == {call.call_id for call in recorder.llm_calls}
-    assert all(gap["operation_provenance"] == "write_time_COMPOSE_attested" for gap in gaps)
-    assert all("no response bytes" in gap["reason"] for gap in gaps)
-    assert all(message["role"] not in {"tool", "audit"} for message in _composer_chat_history(rows))
 
 
 @pytest.mark.asyncio

@@ -452,8 +452,9 @@ def _composition_state_rows(sessions_service: SessionServiceImpl, *, session_id:
 
 
 @contextlib.contextmanager
-def _force_commit_failure(engine: Engine) -> Iterator[None]:
+def _force_commit_failure(engine: Engine, service: ComposerServiceImpl) -> Iterator[None]:
     original_do_commit = engine.dialect.do_commit
+    original_persist = service._persist_turn_audit
     fired = False
 
     def _fail_once(dbapi_conn: object) -> None:
@@ -463,11 +464,18 @@ def _force_commit_failure(engine: Engine) -> Iterator[None]:
             raise sqlite3.OperationalError("simulated COMMIT failure (CL-PP characterization)")
         original_do_commit(dbapi_conn)
 
-    engine.dialect.do_commit = _fail_once
-    try:
+    async def _persist_with_failed_commit(**kwargs: Any) -> Any:
+        engine.dialect.do_commit = _fail_once
+        try:
+            return await original_persist(**kwargs)
+        finally:
+            engine.dialect.do_commit = original_do_commit
+
+    # Input inspection now performs a fenced liveness transaction. Fail the
+    # actual P4 commit, rather than whichever transaction happens first.
+    with patch.object(service, "_persist_turn_audit", new=_persist_with_failed_commit):
         yield
-    finally:
-        engine.dialect.do_commit = original_do_commit
+    assert fired, "the actual turn persistence commit was not reached"
 
 
 def _write_scenario_csv(path: Path) -> None:
@@ -652,7 +660,7 @@ async def test_cl_pp_10a_commit_failure_without_plugin_crash_raises_audit_integr
 
     async with acquire_compose_context(sessions_service, session_id) as compose_context:
         with (
-            _force_commit_failure(sessions_service._engine),
+            _force_commit_failure(sessions_service._engine, service),
             pytest.raises(AuditIntegrityError) as exc_info,
         ):
             await _run_one_turn_for_characterization(
@@ -722,7 +730,7 @@ async def test_cl_pp_10b_commit_failure_during_plugin_crash_preserves_plugin_err
 
     async with acquire_compose_context(sessions_service, session_id) as compose_context:
         with (
-            _force_commit_failure(sessions_service._engine),
+            _force_commit_failure(sessions_service._engine, service),
             capture_logs() as cap_logs,
             pytest.raises(ComposerPluginCrashError) as exc_info,
         ):

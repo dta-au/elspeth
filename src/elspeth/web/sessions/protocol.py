@@ -46,6 +46,7 @@ from elspeth.contracts.composer_interpretation import (
     validate_surface_provenance,
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex
@@ -70,6 +71,8 @@ from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationB
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy
+    from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -78,8 +81,9 @@ if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
     from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
-    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, RejectionRecord
     from elspeth.web.sessions.composer_operations import (
         ComposerOperationAssistantWrite,
         ComposerOperationClaim,
@@ -87,6 +91,8 @@ if TYPE_CHECKING:
         ComposerOperationRecord,
         ComposerOperationRunning,
     )
+    from elspeth.web.sessions.continuation import ContinuationOwnerCommit, StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.graph_recovery import (
         CompositionGraphRead,
         CompositionStateHead,
@@ -2436,6 +2442,30 @@ class SessionOperationAuthority(Protocol):
     part of the public authority surface.
     """
 
+    def recover_composer_segment(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+    ) -> bool:
+        """Recover one unavailable continuation owner under actual SQL liveness."""
+        ...
+
+    def start_composer_segment(
+        self,
+        claim: ComposerOperationClaim,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+        segment_policy: ContinuationSegmentPolicy | None = None,
+    ) -> SessionOperationContext:
+        """Start one current admitted continuation claim under its actual SQL fence."""
+        ...
+
     def start_composer_async_operation(
         self,
         claim: ComposerOperationClaim,
@@ -2498,6 +2528,8 @@ class SessionOperationAuthority(Protocol):
         self,
         context: SessionOperationContext,
         mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> T: ...
 
     def release(self, context: SessionOperationContext) -> None: ...
@@ -3169,7 +3201,8 @@ class SessionServiceProtocol(Protocol):
         session_operation_context: SessionOperationContext,
         running: ComposerOperationRunning,
         required_work: RequiredWorkTicket | None = None,
-    ) -> MessageIngressFresh:
+        continuation: StoredContinuationSnapshot | None = None,
+    ) -> MessageIngressFresh | ContinuationIngressCheckpoint:
         """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
@@ -3568,6 +3601,33 @@ class SessionServiceProtocol(Protocol):
         """Atomically replace exact pending suffixes with closed outcomes."""
         ...
 
+    async def persist_continuation_compose_turn(
+        self,
+        *,
+        session_id: str,
+        assistant_content: str,
+        raw_content: str | None = None,
+        redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
+        redacted_tool_rows: tuple[RedactedToolRow, ...],
+        revoked_tool_rows: tuple[RedactedToolRow, ...],
+        mutation_ceiling: ComposerMutationCeiling | None = None,
+        authority_revocation: ComposerMutationRevocation | None = None,
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
+        rejection_records: tuple[RejectionRecord, ...] = (),
+        parent_composition_state_id: str | None,
+        expected_current_state_id: str | None,
+        writer_principal: ChatMessageWriterPrincipal,
+        plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
+        continuation: ContinuationOwnerCommit,
+        continuation_prepared: PreparedP4Value,
+        continuation_env_ref_names: frozenset[str] = frozenset(),
+        required_work: RequiredWorkTicket,
+    ) -> RequiredSQLFinishOnce[AuditOutcome]:
+        """Complete actual continuation P4 SQL outcome before deferred cancellation."""
+        ...
+
     async def persist_compose_turn_async(
         self,
         *,
@@ -3576,6 +3636,9 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
+        revoked_tool_rows: tuple[Any, ...],
+        mutation_ceiling: ComposerMutationCeiling | None = None,
+        authority_revocation: ComposerMutationRevocation | None = None,
         private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
         private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
         rejection_records: tuple[Any, ...] = (),

@@ -1,0 +1,19 @@
+"""The same actual cohort/current-read/rollback assertions on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_family_cohort import (
+    test_complete_family_wire_check_survives_batching_after_real_positive as test_complete_family_wire_check_survives_batching_after_real_positive,
+)
+from tests.unit.web.sessions.test_continuation_family_cohort import (
+    test_final_actual_current_read_refuses_stop_inside_the_same_transaction_after_positive as test_final_actual_current_read_refuses_stop_inside_the_same_transaction_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_family_cohort import (
+    test_real_complete_shelf_uses_one_locked_family_window_without_changing_wire_or_rows as test_real_complete_shelf_uses_one_locked_family_window_without_changing_wire_or_rows,
+)
+from tests.unit.web.sessions.test_continuation_family_cohort import (
+    test_repeated_actual_recipe_has_distinct_messages_and_no_cross_call_source_cache as test_repeated_actual_recipe_has_distinct_messages_and_no_cross_call_source_cache,
+)
+
+pytestmark = pytest.mark.testcontainer

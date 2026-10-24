@@ -27,7 +27,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Final, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue
@@ -39,6 +39,7 @@ from elspeth.contracts.blobs_inline import is_widened_blob_ref
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_content import ComposerContentScope, MaterializedCompleteValue
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.emitted_option import emitted_option_values, env_placeholders_in
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -3678,6 +3679,11 @@ class ReviewedSourceAuthority:
         freeze_fields(self, "reviewed_sources", "verified_blob_paths")
 
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy
+    from elspeth.web.sessions.continuation_owner_results import ContinuationReadObservations
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     """Immutable per-call context threaded through every ``execute_tool``
@@ -3792,7 +3798,13 @@ class ToolContext:
     tool_arguments_hash: str | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
+    # Selected only for approval-governed automatic execution; historical
+    # request restriction, never a replacement for current operation custody.
+    mutation_ceiling: ComposerMutationCeiling | None = None
     _interpretation_requirements_are_internal: bool = False
+    # Current continuation reads opt in as one coupled policy/observation pair.
+    attachment_inspection_policy: AttachmentInspectionPolicy | None = None
+    continuation_read_observations: ContinuationReadObservations | None = None
 
 
 def _current_composition_content_scope(state: CompositionState, context: ToolContext) -> ComposerContentScope:

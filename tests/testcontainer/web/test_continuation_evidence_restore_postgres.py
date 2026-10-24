@@ -1,0 +1,22 @@
+"""Same actual current SQL evidence-read oracles on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_evidence_restore import (
+    test_actual_admission_cancellation_preserves_one_original_and_submits_nothing as test_actual_admission_cancellation_preserves_one_original_and_submits_nothing,
+)
+from tests.unit.web.sessions.test_continuation_evidence_restore import (
+    test_actual_current_read_restores_full_graph_without_writes as test_actual_current_read_restores_full_graph_without_writes,
+)
+from tests.unit.web.sessions.test_continuation_evidence_restore import (
+    test_coherent_sql_bytes_corruption_is_owned_refusal_after_positive as test_coherent_sql_bytes_corruption_is_owned_refusal_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_evidence_restore import (
+    test_ordinary_evidence_restore_does_not_inherit_owed_p4_allowances as test_ordinary_evidence_restore_does_not_inherit_owed_p4_allowances,
+)
+from tests.unit.web.sessions.test_continuation_evidence_restore import (
+    test_same_checkpoint_cursor_substituted_root_refuses_after_positive as test_same_checkpoint_cursor_substituted_root_refuses_after_positive,
+)
+
+pytestmark = pytest.mark.testcontainer

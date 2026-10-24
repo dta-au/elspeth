@@ -6931,6 +6931,49 @@ async def test_senior_handoff_gets_owned_visible_chronology_and_whole_request_on
 
 
 @pytest.mark.asyncio
+async def test_direct_planner_response_object_retains_served_endpoint(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        ModelResponse(
+            id="direct-served-endpoint",
+            model="provider/planner-v1",
+            provider="DeepInfra",
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15, cost=0.01),
+            choices=[
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "direct-served-proposal",
+                                "type": "function",
+                                "function": {
+                                    "name": "emit_pipeline_proposal",
+                                    "arguments": json.dumps({"pipeline": _pipeline(tmp_path)}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        )
+    )
+    recorder = BufferingRecorder()
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    assert len(completion.requests) == 1 and completion._responses == []
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.SUCCESS
+    assert call.provider_cost == 0.01
+    assert call.provider_served == "DeepInfra"
+    assert call.provider_request_id == "direct-served-endpoint"
+
+
+@pytest.mark.asyncio
 async def test_planner_omits_endpoint_kwargs_when_unset(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -9282,9 +9325,29 @@ async def test_aid_supplied_reads_in_one_turn_deliver_results_without_hatch(
     assert len(completion.requests) == 2
     # Not the hatch: the follow-up turn stays on the planner model.
     assert completion.requests[1]["model"] == "anthropic/claude-planner"
-    tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    follow_up_messages = completion.requests[1]["messages"]
+    (assistant_message,) = [message for message in follow_up_messages if message["role"] == "assistant"]
+    admitted_calls = assistant_message["tool_calls"]
+    assert [call["function"]["name"] for call in admitted_calls] == ["list_models", "get_expression_grammar"]
+    call_ids = [call["id"] for call in admitted_calls]
+    assert len(set(call_ids)) == 2
+    tool_messages = [message for message in follow_up_messages if message["role"] == "tool"]
+    assert [message["tool_call_id"] for message in tool_messages] == call_ids
+    tool_results = [json.loads(message["content"]) for message in tool_messages]
     assert [result["success"] for result in tool_results] == [True, True]
-    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_models", "get_expression_grammar"]
+
+    # Discovery tasks may finish in either order; each audit must retain its call.
+    assert len(recorder.invocations) == 2
+    invocations_by_id = {invocation.tool_call_id: invocation for invocation in recorder.invocations}
+    assert len(invocations_by_id) == 2
+    assert set(invocations_by_id) == set(call_ids)
+    for call, result in zip(admitted_calls, tool_results, strict=True):
+        invocation = invocations_by_id[call["id"]]
+        assert invocation.tool_name == call["function"]["name"]
+        assert json.loads(invocation.arguments_canonical) == json.loads(call["function"]["arguments"]) == {}
+        assert invocation.status.value == "success"
+        assert invocation.result_canonical is not None
+        assert json.loads(invocation.result_canonical) == result
 
 
 @pytest.mark.asyncio

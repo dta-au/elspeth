@@ -127,6 +127,10 @@ class RequiredWorkSource(IntEnum):
     PROPOSAL_REJECTION_PROJECTION = 52
     RETAINED_OPERATION_READ_SQL = 53
     RETAINED_OPERATION_READ_PROJECTION = 54
+    CONTINUATION_STATE_SQL = 55
+    CONTINUATION_STATE_PROJECTION = 56
+    CONTINUATION_READ_SQL = 57
+    CONTINUATION_READ_PROJECTION = 58
 
 
 SOURCE_MAPPING = MappingProxyType(
@@ -219,6 +223,16 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.PROPOSAL_REJECTION_PROJECTION: (ComposerRequiredStage.PIPELINE_PUBLICATION, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.RETAINED_OPERATION_READ_SQL: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.RETAINED_OPERATION_READ_PROJECTION: (ComposerRequiredStage.REQUIRED_TURN_AUDIT, RequiredWorkSubphase.PROJECTION),
+        RequiredWorkSource.CONTINUATION_STATE_SQL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_STATE_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_READ_SQL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.SQL_READBACK),
+        RequiredWorkSource.CONTINUATION_READ_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
     }
 )
 
@@ -1045,6 +1059,22 @@ class RequiredWorkCoordinator:
                     or projection_ticket._projection_started
                 ):
                     raise AuditIntegrityError("Failure publication cannot reuse launched projection work")
+
+    def validate_continuation_sql_outcome[T](
+        self,
+        *,
+        ticket: RequiredWorkTicket,
+        expected_source: RequiredWorkSource,
+        actual_outcome: RequiredSQLFinishOnce[T],
+    ) -> None:
+        if type(expected_source) is not RequiredWorkSource or expected_source not in (
+            RequiredWorkSource.CONTINUATION_STATE_SQL,
+            RequiredWorkSource.CONTINUATION_READ_SQL,
+        ):
+            raise AuditIntegrityError("Continuation SQL outcome has an unsupported source")
+        with self._lock:
+            self._registered(ticket, expected_source)
+            self._verify_sql_outcome(ticket, actual_outcome)
 
     def validate_joined_lifecycle_sql_outcome[T](
         self,

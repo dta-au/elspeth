@@ -10,8 +10,10 @@ import pytest
 
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerDeclined
-from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
+from elspeth.web.composer.request_history import (
+    authoritative_conversation_context as _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.tools import ToolContext
 from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion, _text_response
 

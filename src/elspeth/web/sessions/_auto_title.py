@@ -30,7 +30,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import UUID
 
 import httpx
@@ -40,21 +40,33 @@ from opentelemetry import metrics
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust, detach_prompt_guard_messages
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, safe_response_model, token_usage_from_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount
+from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import ProviderCallCustody, provider_call_scope, required_provider_audit_scope
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
+from elspeth.web.sessions.auto_title_outcome import _AutoTitleCapture
 from elspeth.web.validation import _redact_sensitive_content, _warn_pii_shaped_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
     from elspeth.web.sessions.protocol import SessionServiceProtocol
+
+
+class _ContinuationTitleGatewayKwargs(TypedDict, total=False):
+    continuation_input_sha256: str
+
+
+class _ContinuationTitleAuditKwargs(TypedDict, total=False):
+    private_request: PrivateProviderContext
 
 
 _AUTO_TITLE_SYSTEM_PROMPT = (
@@ -369,40 +381,27 @@ async def _join_auto_title_custody_task[T](
         raise
 
 
-async def maybe_auto_title_session(
+@dataclass(frozen=True, slots=True)
+class PreparedAutoTitleRequest:
+    """Original ephemeral request, including its shared audit/message identity.
+
+    Transport credentials and trusted prompt objects stay process local. This
+    value is neither a durable descriptor nor a dispatch/current-owner grant.
+    """
+
+    kwargs: dict[str, Any]
+    audit_messages: list[dict[str, str | PromptGuardTrust]]
+
+
+def prepare_auto_title_request(
     *,
-    service: SessionServiceProtocol,
-    session_id: UUID,
     user_message: str,
     model: str,
     temperature: float | None,
     seed: int | None,
-    session_operation_context: SessionOperationContext,
-    prompt_guard_mount: PromptGuardMount | None,
-    prompt_guard_mode: PromptGuardMode,
     api_base: str | None = None,
     api_key: str | None = None,
-    provider_custody: ProviderCallCustody | None = None,
-) -> None:
-    """Generate and persist an auto-title for ``session_id``.
-
-    One-shot LLM completion (no tools, operator-set sampling).
-    Provider errors and timeouts are recorded on operational telemetry and
-    return without poisoning the chat response. Cancellation propagates.
-    Programmer bugs and DB write failures propagate to the caller awaiting
-    the task; swallowing those would hide regressions in the auto-title path.
-
-    ``api_base``/``api_key`` are the PRIMARY-role endpoint affordance (Phase
-    3 Task 2) — auto-title always uses the primary composer role, never the
-    advisor's. Both default to ``None`` so an unconfigured deployment sends
-    the exact same kwargs as before this affordance existed.
-    """
-    if not user_message.strip():
-        return
-    if session_operation_context.fence.session_id != str(session_id):
-        raise AuditIntegrityError("Auto-title session authority targets a different session")
-    if provider_custody is None:
-        raise AuditIntegrityError("Auto-title requires real fenced prompt-guard custody before model admission")
+) -> PreparedAutoTitleRequest:
     audit_messages: list[dict[str, str | PromptGuardTrust]] = [
         {"role": "system", "content": _AUTO_TITLE_SYSTEM_PROMPT, PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION},
         {"role": "user", "content": _build_auto_title_user_content(user_message)},
@@ -421,6 +420,54 @@ async def maybe_auto_title_session(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
+    return PreparedAutoTitleRequest(kwargs, audit_messages)
+
+
+async def maybe_auto_title_session(
+    *,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    user_message: str,
+    model: str,
+    temperature: float | None,
+    seed: int | None,
+    session_operation_context: SessionOperationContext,
+    prompt_guard_mount: PromptGuardMount | None,
+    prompt_guard_mode: PromptGuardMode,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    provider_custody: ProviderCallCustody | None = None,
+    _outcome: _AutoTitleCapture | None = None,
+) -> None:
+    """Generate and persist an auto-title for ``session_id``.
+
+    One-shot LLM completion (no tools, operator-set sampling).
+    Provider errors and timeouts are recorded on operational telemetry and
+    return without poisoning the chat response. Cancellation propagates.
+    Programmer bugs and DB write failures propagate to the caller awaiting
+    the task; swallowing those would hide regressions in the auto-title path.
+
+    ``api_base``/``api_key`` are the PRIMARY-role endpoint affordance (Phase
+    3 Task 2) — auto-title always uses the primary composer role, never the
+    advisor's. Both default to ``None`` so an unconfigured deployment sends
+    the exact same kwargs as before this affordance existed.
+    """
+    if _outcome is not None:
+        if type(_outcome) is not _AutoTitleCapture or _outcome.claimed:
+            raise AuditIntegrityError("Title observation requires its one fresh actual invocation capture")
+        _outcome.claimed = True
+    if not user_message.strip():
+        if _outcome is not None:
+            _outcome.disposition = "empty_request"
+        return
+    if session_operation_context.fence.session_id != str(session_id):
+        raise AuditIntegrityError("Auto-title session authority targets a different session")
+    if provider_custody is None:
+        raise AuditIntegrityError("Auto-title requires real fenced prompt-guard custody before model admission")
+    prepared = prepare_auto_title_request(
+        user_message=user_message, model=model, temperature=temperature, seed=seed, api_base=api_base, api_key=api_key
+    )
+    audit_messages, kwargs = prepared.audit_messages, prepared.kwargs
     await _maybe_auto_title_session_required(
         service=service,
         session_id=session_id,
@@ -434,6 +481,7 @@ async def maybe_auto_title_session(
         prompt_guard_mount=prompt_guard_mount,
         prompt_guard_mode=prompt_guard_mode,
         user_message=user_message,
+        _outcome=_outcome,
     )
 
 
@@ -451,6 +499,7 @@ async def _maybe_auto_title_session_required(
     prompt_guard_mount: PromptGuardMount | None,
     prompt_guard_mode: PromptGuardMode,
     user_message: str,
+    _outcome: _AutoTitleCapture | None = None,
 ) -> None:
     if (
         type(provider_custody) is not ProviderCallCustody
@@ -470,10 +519,21 @@ async def _maybe_auto_title_session_required(
     error_class: str | None = None
     error_message: str | None = None
     admitted: _AdmittedAutoTitleCompletion | None = None
+    full_completion: _AdmittedLLMCompletion | None = None
+    durable_audit: _ContinuationTitleAuditKwargs = {}
     try:
         async with provider_call_scope(provider_custody):
             try:
                 try:
+                    durable_input: _ContinuationTitleGatewayKwargs = {}
+                    if provider_custody.continuation_title is not None:
+                        from elspeth.web.sessions.continuation_title_provider import _descriptor
+
+                        durable_input["continuation_input_sha256"] = _descriptor(provider_custody.continuation_title.input).input_sha256
+                        # The actual detached, marker-free request snapshot,
+                        # before the gateway await. Physical receipt remains
+                        # the original explicit custody/SDK/audit fact.
+                        durable_audit["private_request"] = capture_provider_context(messages=wire_messages, tools=None)
                     response = await provider_gateway._litellm_acompletion(
                         provider_custody=provider_custody,
                         prompt_guard_mount=prompt_guard_mount,
@@ -481,13 +541,30 @@ async def _maybe_auto_title_session_required(
                         prompt_guard_role="composer",
                         prompt_guard_user_prompt=user_message,
                         prompt_guard_trusted_message_indexes=trusted_indexes,
+                        **durable_input,
                         **wire_kwargs,
                     )
+                    if _outcome is not None:
+                        _outcome.response = response
                 except httpx.TransportError as exc:
                     # Only the physical await establishes provider transport
                     # weather. HTTP-shaped parser faults remain first party.
                     raise _AutoTitleProviderTransportError from exc
                 admitted = _admit_auto_title_completion(response)
+                if provider_custody.continuation_title is not None:
+                    from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
+
+                    try:
+                        full_completion = provider_gateway._admit_composer_llm_completion(response, pricing_model=model)
+                        provider_gateway._require_no_credential_material_in_completion(
+                            full_completion, surface="composer_auto_title_response"
+                        )
+                        if full_completion.tool_batch.calls:
+                            raise _MalformedAutoTitleResponseError("TITLE returned an unsupported tool batch")
+                    except _MalformedLLMResponseError as error:
+                        raise _MalformedAutoTitleResponseError("TITLE response lost its complete provider metadata") from error
+                if _outcome is not None:
+                    _outcome.admitted = admitted
                 status = ComposerLLMCallStatus.SUCCESS
             except asyncio.CancelledError as exc:
                 status = ComposerLLMCallStatus.CANCELLED
@@ -511,6 +588,8 @@ async def _maybe_auto_title_session_required(
             finally:
                 with required_provider_audit_scope(provider_custody):
                     if status is not None and provider_custody.needs_terminal_audit():
+                        if _outcome is not None:
+                            _outcome.attempt = provider_custody.attempt
                         call = build_llm_call_record(
                             model_requested=model,
                             messages=wire_messages,
@@ -524,22 +603,48 @@ async def _maybe_auto_title_session_required(
                             error_class=error_class,
                             error_message=error_message,
                             provider_custody=provider_custody,
+                            **durable_audit,
                         )
                         provider_custody.retain_audit(call)
+                        if _outcome is not None:
+                            _outcome.audit_call = call
+                        if (
+                            provider_custody.continuation_title is not None
+                            and full_completion is not None
+                            and status is ComposerLLMCallStatus.SUCCESS
+                        ):
+                            await provider_custody.retain_continuation_title(full_completion)
     except ChargeableAdmissionRefused as exc:
         if exc.decision.refusal_reason is None:
             raise AuditIntegrityError("Refused auto-title admission has no refusal reason") from exc
         _AUTO_TITLE_ADMISSION_REFUSED_COUNTER.add(1, {"reason": exc.decision.refusal_reason.value})
+        if _outcome is not None:
+            _outcome.disposition = "admission_refused"
+            _outcome.handled_error = exc
         return
     except (OpenAIError, _AutoTitleProviderTransportError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         _record_auto_title_failure(exc)
+        if _outcome is not None:
+            _outcome.disposition = "provider_failure"
+            _outcome.handled_error = exc
+        return
+    if provider_custody.continuation_title is not None:
+        # Durable TITLE ends after original accounting. Title/ready publication
+        # is a separate owner and cannot run through the warm SQL suffix.
         return
     if admitted is None or admitted.content is None:
+        if _outcome is not None:
+            _outcome.disposition = "empty_response"
         return
     candidate = _admit_title_candidate(admitted.content)
     if isinstance(candidate, _RejectedTitle):
         _record_auto_title_rejection(candidate.rejection_class, admitted.finish_reason)
+        if _outcome is not None:
+            _outcome.disposition = "rejected"
+            _outcome.rejection_class = candidate.rejection_class
         return
+    if _outcome is not None:
+        _outcome.candidate = candidate
     sql, projection = provider_custody.required_work.reserve_pair(
         RequiredWorkSource.TITLE_ACCOUNTING_SQL, RequiredWorkSource.TITLE_ACCOUNTING_PROJECTION
     )
@@ -553,4 +658,7 @@ async def _maybe_auto_title_session_required(
         raise
     projection.begin_projection()
     projection.complete_owned()
+    if _outcome is not None:
+        _outcome.disposition = "updated"
+        _outcome.title_record = _
     provider_custody.raise_deferred_cancellations(cancellations)

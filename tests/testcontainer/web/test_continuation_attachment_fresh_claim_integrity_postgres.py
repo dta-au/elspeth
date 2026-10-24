@@ -1,0 +1,16 @@
+"""Actual serial PostgreSQL counterparts of the closed-phase/fresh-claim cases."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_attachment_application import (
+    test_complete_attachment_application_data_refuses_one_coherent_changed_owner_after_positive as test_complete_attachment_application_data_refuses_one_coherent_changed_owner_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_attachment_fresh_claim_integrity import (
+    test_fresh_claim_preserves_prior_p4_proofs_after_complete_attachment_positive as test_fresh_claim_preserves_prior_p4_proofs_after_complete_attachment_positive,
+)
+from tests.unit.web.sessions.test_continuation_attachment_fresh_claim_integrity import (
+    test_fresh_claim_refuses_current_attachment_event_or_cache_loss_after_complete_positive as test_fresh_claim_refuses_current_attachment_event_or_cache_loss_after_complete_positive,
+)
+
+pytestmark = pytest.mark.testcontainer

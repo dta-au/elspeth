@@ -68,6 +68,40 @@ def test_to_dict_serializes_enum_and_datetimes() -> None:
     assert payload["declared_tool_names"] == ["set_source"]
 
 
+@pytest.mark.parametrize("limit", (None, 16384))
+@pytest.mark.parametrize("policy_hash", (None, "a" * 64))
+@pytest.mark.parametrize("ordinal", (None, 1))
+def test_common_completion_limit_and_planner_evidence_presence_matrix(
+    limit: int | None,
+    policy_hash: str | None,
+    ordinal: int | None,
+) -> None:
+    fields = {
+        "max_completion_tokens_requested": limit,
+        "planner_policy_hash": policy_hash,
+        "planner_call_ordinal": ordinal,
+    }
+    planner_present = policy_hash is not None or ordinal is not None
+    if planner_present and (limit is None or policy_hash is None or ordinal is None):
+        with pytest.raises(ValueError, match="planner request evidence fields must be supplied together"):
+            _make_call(**fields)
+    else:
+        call = _make_call(**fields)
+        payload = call.to_dict()
+        assert payload["max_completion_tokens_requested"] == limit
+        assert payload["planner_policy_hash"] == policy_hash
+        assert payload["planner_call_ordinal"] == ordinal
+
+
+@pytest.mark.parametrize(
+    ("limit", "failure"),
+    ((True, TypeError), (False, TypeError), (0, ValueError), (-1, ValueError), (1.5, TypeError)),
+)
+def test_common_completion_limit_retains_exact_positive_integer_validation(limit: object, failure: type[Exception]) -> None:
+    with pytest.raises(failure, match="max_completion_tokens_requested"):
+        _make_call(max_completion_tokens_requested=limit)
+
+
 @pytest.mark.parametrize(
     ("declared_tool_names", "exc_type", "match"),
     [

@@ -369,10 +369,11 @@ class WebSettings(BaseModel):
     composer_max_discovery_turns: int = Field(..., ge=1)
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Canonical full-pipeline planner budgets. These are independent of the
-    # ordinary incremental compose loop because the planner accounts for exact
-    # request bytes, physical provider attempts, requested completion tokens,
-    # and post-call provider cost.
+    # Direct planner policy and legacy eligible Web v1 compatibility bounds.
+    # Common v1 preserves physical calls, exact request bytes, completion and
+    # post-call cost; v2 has no legacy planner policy. The repair value is
+    # facade compatibility only: default 2 does not control common repair;
+    # a nondefault value refuses eligible v1 admission before provider work.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
     composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
@@ -1594,12 +1595,17 @@ def configured_auth_settings(settings: WebSettings) -> Mapping[str, bool]:
     }
 
 
-def _annotation_scalar_types(annotation: Any) -> set[type]:
-    """Flatten an annotation (including ``X | None`` unions) to its scalar types."""
+def _annotation_scalar_types(annotation: Any) -> tuple[type, ...]:
+    """Flatten an annotation while retaining each type by identity, without hashing it."""
     origin = typing.get_origin(annotation)
-    if origin in (typing.Union, types.UnionType):
-        return {member for arg in typing.get_args(annotation) for member in _annotation_scalar_types(arg)}
-    return {annotation} if isinstance(annotation, type) else set()
+    if origin is typing.Union or origin is types.UnionType:
+        members: list[type] = []
+        for arg in typing.get_args(annotation):
+            for member in _annotation_scalar_types(arg):
+                if not any(member is known for known in members):
+                    members.append(member)
+        return tuple(members)
+    return (annotation,) if isinstance(annotation, type) else ()
 
 
 def _coerce_env_scalar(value: str, annotation: Any) -> object:
@@ -1613,12 +1619,12 @@ def _coerce_env_scalar(value: str, annotation: Any) -> object:
     them against the original input.
     """
     scalar_types = _annotation_scalar_types(annotation)
-    if bool in scalar_types:
+    if any(scalar is bool for scalar in scalar_types):
         return value
     try:
-        if int in scalar_types and float not in scalar_types:
+        if any(scalar is int for scalar in scalar_types) and not any(scalar is float for scalar in scalar_types):
             return int(value)
-        if float in scalar_types:
+        if any(scalar is float for scalar in scalar_types):
             return float(value)
     except ValueError:
         return value

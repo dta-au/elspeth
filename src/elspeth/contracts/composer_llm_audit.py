@@ -315,7 +315,11 @@ class ComposerLLMCall:
             self.planner_policy_hash,
             self.planner_call_ordinal,
         )
-        if any(value is not None for value in planner_evidence) and not all(value is not None for value in planner_evidence):
+        # Common callers retain the actual completion allowance independently.
+        # A planner-specific identity still requires its complete evidence bundle.
+        if (self.planner_policy_hash is not None or self.planner_call_ordinal is not None) and not all(
+            value is not None for value in planner_evidence
+        ):
             raise ValueError("planner request evidence fields must be supplied together")
         _require_optional_finite_number(self.temperature, "temperature")
         if self.temperature is not None:

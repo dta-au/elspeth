@@ -16,8 +16,8 @@ APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 GRAMMARS = {
-    "_create_app": "16627e75bdca4a3c8a2d2938ca1c29eac4812d3261c7aeb28cff1272c5ce8a3b",
-    "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
+    "_create_app": "3f72a8f4514643ccf272e3f9f453791d32facf708d10ed19162e857e2c491d28",
+    "ComposerAsyncWorker._run_started_under_lease": "a2897fd9340d2b0fac5ae8d83a1e5af1c692f3c69bc79850835b558448b995b5",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
@@ -68,9 +68,48 @@ def canonical(value):
     return value
 
 
+_YAML_ADAPTER_PREFLIGHT_CALL = "validate_pipeline(\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=app.state.scoped_secret_resolver,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=blob_get_content,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=app.state.operator_profile_registry,\n            catalog=app.state.catalog_service,\n        )"
+
+
+def adapter_grammar_projection(node):
+    """Project only the reviewed adapter operand onto the previous grammar.
+
+    All receipts and compiler metadata still use the original input tree. This
+    disposable comparison copy preserves every other node. The complete
+    nominal-adapter receipt separately owns the class, import and lexical uses.
+    """
+    if not isinstance(node, ast.FunctionDef) or node.name != "_create_app":
+        return node
+    constructors = [child for child in ast.walk(node) if isinstance(child, ast.Call) and chain(child.func) == ("ComposerYamlSerializer",)]
+    if not constructors:
+        # Historical source remains a valid worker-only grammar; the combined
+        # adapter receipt independently requires the actual new production tuple.
+        return node
+    clone = copy.deepcopy(node)
+    functions = [child for child in clone.body if isinstance(child, ast.FunctionDef) and child.name == "_session_runtime_preflight"]
+    if len(functions) != 1:
+        raise ValueError("nominal YAML preflight owner is not unique")
+    expected = ast.dump(ast.parse(_YAML_ADAPTER_PREFLIGHT_CALL, mode="eval").body, include_attributes=False)
+    returns = [
+        child
+        for child in functions[0].body
+        if isinstance(child, ast.Return)
+        and isinstance(child.value, ast.Call)
+        and ast.dump(child.value, include_attributes=False) == expected
+    ]
+    if len(constructors) != 1 or len(returns) != 1:
+        raise ValueError("nominal YAML preflight argument delta is not exact")
+    call = returns[0].value
+    if len(call.args) != 3 or not isinstance(call.args[2], ast.Call) or call.args[2].args or call.args[2].keywords:
+        raise ValueError("nominal YAML constructor acquired an argument")
+    call.args[2] = ast.copy_location(ast.Name(id="yaml_generator_module", ctx=ast.Load()), call.args[2])
+    return clone
+
+
 def grammar(node):
     clone = copy.copy(node)
     clone.body = list(node.body)
+    clone = adapter_grammar_projection(clone)
     if (
         clone.body
         and isinstance(clone.body[0], ast.Expr)

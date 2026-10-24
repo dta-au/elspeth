@@ -32,6 +32,7 @@ from elspeth.web.composer.pipeline_proposal import (
     is_owned_composition_state_authority,
     owned_composition_state_review_arguments,
 )
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource, capture_provider_audit_source
 from elspeth.web.composer.redaction import (
     MANIFEST,
     redact_arg_error_response,
@@ -114,18 +115,12 @@ def private_failure_evidence(
     status: str,
     context: SessionOperationContext,
 ) -> ComposerDiagnosticEvidence:
-    if type(facts) is not PrivateFailureFacts:
-        raise AuditIntegrityError("private failure facts are not nominal")
-    return build_private_tool_evidence(
-        session_id=context.fence.session_id,
-        operation_id=context.fence.operation_id,
-        operation_epoch=context.fence.operation_epoch,
+    return private_failure_evidence_for_source(
+        facts,
+        identity=identity,
         tool_call_id=tool_call_id,
-        evidence_id=identity,
-        tool_name="composer_failure",
         status=status,
-        arguments_canonical=None,
-        result_canonical=facts.canonical,
+        source=capture_provider_audit_source(context),
     )
 
 
@@ -135,6 +130,46 @@ def private_diagnostic_drafts(
     context: SessionOperationContext,
     composition_state_id: str | None = None,
 ) -> tuple[AuditMessageDraft, ...]:
+    return private_diagnostic_drafts_for_source(
+        record,
+        source=capture_provider_audit_source(context),
+        composition_state_id=composition_state_id,
+    )
+
+
+def private_failure_evidence_for_source(
+    facts: PrivateFailureFacts,
+    *,
+    identity: str,
+    tool_call_id: str,
+    status: str,
+    source: ProviderAuditSource,
+) -> ComposerDiagnosticEvidence:
+    if type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("private diagnostic source is not nominal DATA")
+    if type(facts) is not PrivateFailureFacts:
+        raise AuditIntegrityError("private failure facts are not nominal")
+    return build_private_tool_evidence(
+        session_id=source.session_id,
+        operation_id=source.operation_id,
+        operation_epoch=source.operation_epoch,
+        tool_call_id=tool_call_id,
+        evidence_id=identity,
+        tool_name="composer_failure",
+        status=status,
+        arguments_canonical=None,
+        result_canonical=facts.canonical,
+    )
+
+
+def private_diagnostic_drafts_for_source(
+    record: ComposerToolInvocation | ComposerLLMCall,
+    *,
+    source: ProviderAuditSource,
+    composition_state_id: str | None = None,
+) -> tuple[AuditMessageDraft, ...]:
+    if type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("private diagnostic source is not nominal DATA")
     evidence: list[ComposerDiagnosticEvidence] = []
     if type(record) is ComposerToolInvocation:
         identity = diagnostic_evidence_identity("tool-failure", record.tool_call_id)
@@ -148,9 +183,9 @@ def private_diagnostic_drafts(
             request = record.private_request
             evidence.append(
                 ComposerDiagnosticEvidence(
-                    session_id=context.fence.session_id,
-                    operation_id=context.fence.operation_id,
-                    operation_epoch=context.fence.operation_epoch,
+                    session_id=source.session_id,
+                    operation_id=source.operation_id,
+                    operation_epoch=source.operation_epoch,
                     tool_call_id=call_id,
                     evidence_id=diagnostic_evidence_identity("provider-request", call_id),
                     tool_name="composer_provider_context",
@@ -170,9 +205,9 @@ def private_diagnostic_drafts(
         retained_arguments_remaining = 1024 * 1024
         for receipt in record.private_diagnostics:
             item = build_private_tool_evidence(
-                session_id=context.fence.session_id,
-                operation_id=context.fence.operation_id,
-                operation_epoch=context.fence.operation_epoch,
+                session_id=source.session_id,
+                operation_id=source.operation_id,
+                operation_epoch=source.operation_epoch,
                 tool_call_id=receipt.tool_call_id,
                 evidence_id=receipt.evidence_id,
                 tool_name=receipt.tool_name,
@@ -187,9 +222,9 @@ def private_diagnostic_drafts(
                     facts = json.loads(receipt.result_canonical)
                     facts["argument_disposition"] = "canonical_bounds"
                     item = build_private_tool_evidence(
-                        session_id=context.fence.session_id,
-                        operation_id=context.fence.operation_id,
-                        operation_epoch=context.fence.operation_epoch,
+                        session_id=source.session_id,
+                        operation_id=source.operation_id,
+                        operation_epoch=source.operation_epoch,
                         tool_call_id=receipt.tool_call_id,
                         evidence_id=receipt.evidence_id,
                         tool_name=receipt.tool_name,
@@ -205,7 +240,9 @@ def private_diagnostic_drafts(
         raise AuditIntegrityError("private diagnostic owner is not nominal")
     if record.private_failure is not None:
         evidence.append(
-            private_failure_evidence(record.private_failure, identity=identity, tool_call_id=call_id, status=status, context=context)
+            private_failure_evidence_for_source(
+                record.private_failure, identity=identity, tool_call_id=call_id, status=status, source=source
+            )
         )
     return tuple(
         AuditMessageDraft(

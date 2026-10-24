@@ -10,14 +10,26 @@ import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast, final, get_args
+from typing import TYPE_CHECKING, Any, Literal, cast, final, get_args
 from uuid import UUID
 
 from pydantic import JsonValue
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
-from elspeth.contracts.prompt_guard import PromptGuardContentPart
+from elspeth.contracts.prompt_guard import (
+    PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_THINKING_PARTS_KEY,
+    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+    PROMPT_GUARD_TRUST_KEY,
+    PromptGuardContentPart,
+)
+from elspeth.web.composer.continuation_message_shelf import (
+    MessageShelfSnapshot,
+    RetainedObservedMessage,
+    RetainedTranscriptHistory,
+    encode_transcript_object_json,
+)
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
@@ -30,6 +42,9 @@ from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND, 
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.validation import _redact_sensitive_content
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 
 type TranscriptBlobReader = Callable[[str], tuple[Mapping[str, Any], bytes] | None]
 
@@ -830,3 +845,141 @@ class AdvisorTranscriptOwner:
                     "status": "confirmed_in_successful_prepared_request",
                     "provider_call_id": provider_call_id,
                 }
+
+    def snapshot_for_continuation(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        materialization: CurrentContinuationMessageProducers | None = None,
+    ) -> MessageShelfSnapshot:
+        shelf: list[Mapping[str, Any]] = []
+
+        def intern(message: Mapping[str, Any]) -> int:
+            for index, existing in enumerate(shelf):
+                if existing is message:
+                    return index
+            shelf.append(message)
+            return len(shelf) - 1
+
+        current = tuple(intern(message) for message in messages)
+        excluded = tuple(intern(message) for message in self._excluded)
+        observed = tuple(
+            RetainedObservedMessage(
+                message_index=intern(entry.message),
+                event_json=encode_transcript_object_json(entry.event),
+                pending_adoption=entry.pending_adoption,
+            )
+            for entry in self._observed
+        )
+        forbidden = frozenset(
+            {
+                PROMPT_GUARD_TRUST_KEY,
+                PROMPT_GUARD_CONTENT_PARTS_KEY,
+                PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
+                PROMPT_GUARD_THINKING_PARTS_KEY,
+            }
+        )
+        from elspeth.web.composer.continuation_prompt_recipes import ContinuationMessageRecipe
+
+        recipes: tuple[ContinuationMessageRecipe | None, ...]
+        if materialization is None:
+            if any(forbidden.intersection(message) for message in shelf):
+                raise AuditIntegrityError(
+                    "Continuation requires current producer materialization for guard-bearing messages; "
+                    "retain this request and reacquire the owned producer before resuming."
+                )
+            messages_json = tuple(encode_transcript_object_json(message) for message in shelf)
+            recipes = ()
+        else:
+            from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+
+            if type(materialization) is not CurrentContinuationMessageProducers:
+                raise AuditIntegrityError("transcript capture requires its actual current producer owner")
+            captured = tuple(materialization.capture_message(message) for message in shelf)
+            messages_json = tuple(item[0] for item in captured)
+            recipes = tuple(item[1] for item in captured)
+        history = self._history
+        return MessageShelfSnapshot(
+            request=self.request,
+            history=RetainedTranscriptHistory(
+                session_id=history.session_id,
+                actor_user_id=history.actor_user_id,
+                request_id=history.request_id,
+                request_hash=history.request_hash,
+                events_json=history.events_json,
+            )
+            if history is not None
+            else None,
+            messages_json=messages_json,
+            producer_recipes=recipes,
+            current_indexes=current,
+            excluded_indexes=excluded,
+            observed=observed,
+        )
+
+    @classmethod
+    def for_continuation(
+        cls,
+        snapshot: MessageShelfSnapshot,
+        *,
+        session_id: str,
+        actor_user_id: str,
+        request_id: str,
+        request: str,
+        materialization: CurrentContinuationMessageProducers | None = None,
+    ) -> tuple[AdvisorTranscriptOwner, list[dict[str, Any]]]:
+        history = cls._continuation_history(
+            snapshot, session_id=session_id, actor_user_id=actor_user_id, request_id=request_id, request=request
+        )
+        if materialization is None:
+            if any(recipe is not None for recipe in snapshot.producer_recipes):
+                raise AuditIntegrityError("retained producers require current selected materialization")
+            shelf = [json.loads(text) for text in snapshot.messages_json]
+        else:
+            from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+
+            if type(materialization) is not CurrentContinuationMessageProducers:
+                raise AuditIntegrityError("transcript restore requires its actual current producer owner")
+            shelf = materialization.restore_shelf(snapshot)
+        return cls._from_continuation_shelf(snapshot, request=request, history=history, shelf=shelf)
+
+    @classmethod
+    def _continuation_history(
+        cls, snapshot: MessageShelfSnapshot, *, session_id: str, actor_user_id: str, request_id: str, request: str
+    ) -> AdvisorTranscriptHistory | None:
+        if type(snapshot) is not MessageShelfSnapshot or snapshot.request != request:
+            raise AuditIntegrityError("transcript shelf belongs to another request")
+        history = None
+        if snapshot.history is not None:
+            retained = snapshot.history
+            history = AdvisorTranscriptHistory(
+                retained.session_id,
+                retained.actor_user_id,
+                retained.request_id,
+                retained.request_hash,
+                retained.events_json,
+            )
+            history.validate_for(
+                session_id=session_id,
+                actor_user_id=actor_user_id,
+                request_id=request_id,
+                request=request,
+            )
+        return history
+
+    @classmethod
+    def _from_continuation_shelf(
+        cls, snapshot: MessageShelfSnapshot, *, request: str, history: AdvisorTranscriptHistory | None, shelf: list[dict[str, Any]]
+    ) -> tuple[AdvisorTranscriptOwner, list[dict[str, Any]]]:
+        """Shared object assembly only; no saved-wire/current admission."""
+        owner = cls(request=request, history=history)
+        owner._excluded = [shelf[index] for index in snapshot.excluded_indexes]
+        owner._observed = [
+            _ObservedMessage(
+                shelf[entry.message_index],
+                json.loads(entry.event_json),
+                entry.pending_adoption,
+            )
+            for entry in snapshot.observed
+        ]
+        return owner, [shelf[index] for index in snapshot.current_indexes]

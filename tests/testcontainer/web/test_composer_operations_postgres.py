@@ -33,6 +33,39 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     test_concurrent_same_id_is_one_immutable_admission as test_concurrent_same_id_is_one_immutable_admission,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_current_attempt_must_match_immutable_history as test_continuation_history_current_attempt_must_match_immutable_history,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_live_sql_identity_allows_mutation_without_changes as test_continuation_history_live_sql_identity_allows_mutation_without_changes,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_missing_segment_is_refused_by_actual_foreign_key as test_continuation_history_missing_segment_is_refused_by_actual_foreign_key,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_owed_p4_scope_cannot_escape_exact_active_transaction as test_continuation_history_owed_p4_scope_cannot_escape_exact_active_transaction,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_owed_p4_scope_predicate_has_exact_nominal_positive_control as test_continuation_history_owed_p4_scope_predicate_has_exact_nominal_positive_control,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_owed_scope_construction_requires_active_root_transaction as test_continuation_history_owed_scope_construction_requires_active_root_transaction,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_owed_scope_preserves_savepoints_within_same_root as test_continuation_history_owed_scope_preserves_savepoints_within_same_root,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_owed_scope_refuses_root_transaction_replacement as test_continuation_history_owed_scope_refuses_root_transaction_replacement,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_rejects_independent_sql_identity_and_liveness_substitutions as test_continuation_history_rejects_independent_sql_identity_and_liveness_substitutions,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_stop_and_deadline_are_transaction_local_controls as test_continuation_history_stop_and_deadline_are_transaction_local_controls,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_continuation_history_unknown_sync_and_noncompose_preserve_prior_behavior as test_continuation_history_unknown_sync_and_noncompose_preserve_prior_behavior,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
     test_direct_sql_child_cancel_waits_for_actual_thread_completion as test_direct_sql_child_cancel_waits_for_actual_thread_completion,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
@@ -73,6 +106,12 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_independent_process_admission_converges_on_one_action as test_independent_process_admission_converges_on_one_action,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_known_historical_fence_cannot_fall_back_to_sync_compose as test_known_historical_fence_cannot_fall_back_to_sync_compose,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_malformed_v2_base_refuses_before_fresh_admission_writes as test_malformed_v2_base_refuses_before_fresh_admission_writes,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls as test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls,
@@ -130,6 +169,63 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     test_unchanged_state_retries_once_after_actual_sql_completion as test_unchanged_state_retries_once_after_actual_sql_completion,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v1_running_claim_token_change_is_refused_without_row_changes as test_v1_running_claim_token_change_is_refused_without_row_changes,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v1_terminal_settlement_clears_claim_token_and_preserves_attribution as test_v1_terminal_settlement_clears_claim_token_and_preserves_attribution,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v1_terminal_settlement_refuses_attribution_substitution as test_v1_terminal_settlement_refuses_attribution_substitution,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle as test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_child_sql_failure_rolls_back_whole_bundle_and_charge as test_v2_admission_child_sql_failure_rolls_back_whole_bundle_and_charge,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_configuration_refusals_preserve_default_v1 as test_v2_admission_configuration_refusals_preserve_default_v1,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_current_principal_and_base_refusals_before_new_writes as test_v2_admission_current_principal_and_base_refusals_before_new_writes,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_rows as test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_rows,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_default_v1_never_consults_continuation_seed as test_v2_admission_default_v1_never_consults_continuation_seed,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_state as test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_state,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_expired_quota_maintenance_is_separate_from_new_admission as test_v2_admission_expired_quota_maintenance_is_separate_from_new_admission,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress as test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_fresh_disabled_refuses_exact_body_without_new_rows as test_v2_admission_fresh_disabled_refuses_exact_body_without_new_rows,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_keeps_legacy_worker_budget_validation as test_v2_admission_keeps_legacy_worker_budget_validation,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_missing_server_policy_refuses_without_mutation as test_v2_admission_missing_server_policy_refuses_without_mutation,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_policy_constructor_is_nominal as test_v2_admission_policy_constructor_is_nominal,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_real_concurrency_has_one_atomic_fresh_winner as test_v2_admission_real_concurrency_has_one_atomic_fresh_winner,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_recompose_joins_actual_original_user as test_v2_admission_recompose_joins_actual_original_user,
+)
+from tests.unit.web.coordination.test_composer_operation_authority import (
+    test_v2_admission_refuses_corrupt_or_substituted_seed_before_writes as test_v2_admission_refuses_corrupt_or_substituted_seed_before_writes,
 )
 from tests.unit.web.coordination.test_graph_recovery_persistence import (
     test_explicit_restore_uses_parked_identity_across_turns as test_explicit_restore_uses_parked_identity_across_turns,

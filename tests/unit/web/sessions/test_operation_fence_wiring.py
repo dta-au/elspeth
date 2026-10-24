@@ -439,13 +439,202 @@ def test_pending_interpretation_validator_rejects_any_non_exact_input_carrier() 
     assert not hasattr(__import__("elspeth.web.sessions.pending_interpretation", fromlist=["x"]), "_forbidden_validation_dependency")
 
 
+def _batch_session_authority_sources() -> dict[str, str]:
+    return {
+        "batch": inspect.getsource(tool_batch.run_tool_batch),
+        "execution": inspect.getsource(tool_batch._execute_continuation_call_live),
+        "dispatch": inspect.getsource(SessionToolOwner._dispatch_session_aware_tool),
+        "kwargs": inspect.getsource(SessionToolOwner._build_session_aware_kwargs),
+    }
+
+
+def _assert_batch_session_authority(sources: Mapping[str, str]) -> None:
+    """Follow the actual driver, one-call suffix and session-owned writers."""
+    owners = {name: ast.parse(textwrap.dedent(source)).body[0] for name, source in sources.items()}
+    batch, execution, dispatch, kwargs = (owners[name] for name in ("batch", "execution", "dispatch", "kwargs"))
+    assert isinstance(batch, ast.AsyncFunctionDef) and batch.name == "run_tool_batch"
+    assert isinstance(execution, ast.AsyncFunctionDef) and execution.name == "_execute_continuation_call_live"
+    assert isinstance(dispatch, ast.AsyncFunctionDef) and dispatch.name == "_dispatch_session_aware_tool"
+    assert isinstance(kwargs, ast.FunctionDef) and kwargs.name == "_build_session_aware_kwargs"
+    # Bind the complete small driver, including reachable preparation, execution
+    # and projection of the same ctx/acc/batch/call. A decoy call is insufficient.
+    expected_batch = ast.parse(
+        '''async def run_tool_batch(
+    *,
+    call_model: _CallModelOutcome,
+    ctx: ToolBatchContext,
+    acc: BatchAccumulator,
+    llm_messages: list[dict[str, Any]],
+) -> tuple[_DispatchOutcome, int]:
+    """Drive the real legacy batch without continuation storage or restored owners."""
+    batch = ContinuationBatchState(
+        acc.state, acc.last_validation, acc.last_runtime_preflight, acc.advisor_calls_used, entry_state=acc.state
+    )
+    await _initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)
+    calls = call_model.completion.tool_batch.calls
+    while batch.next_tool_index < len(calls) and not batch.stop_issued_batch:
+        call = ContinuationCallState(batch.next_tool_index, calls[batch.next_tool_index], batch.state, batch.state.version)
+        batch.current_call = call
+        batch.phase = "call_active"
+        prepared = await _prepare_continuation_call_live(call_model=call_model, ctx=ctx, llm_messages=llm_messages, batch=batch, call=call)
+        if prepared == "stop":
+            break
+        if prepared == "prepared":
+            await _execute_continuation_call_live(
+                call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call
+            )
+        batch.next_tool_index += 1
+        batch.current_call = None
+        batch.phase = "call_ready"
+    batch.phase = "dispatch_ready"
+    return _finish_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, batch=batch)
+'''
+    ).body[0]
+    assert _stable_ast_bytes(batch) == _stable_ast_bytes(expected_batch)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "ctx" and isinstance(node.ctx, (ast.Store, ast.Del)) for node in ast.walk(execution)
+    )
+    # The real call is directly in the prepared suffix's actual single-call
+    # loop, not an arbitrary ast.walk match in an unreachable nested branch.
+    execution_tries = [statement for statement in execution.body if isinstance(statement, ast.Try)]
+    assert len(execution_tries) == 1 and len(execution_tries[0].body) == 1
+    loop = execution_tries[0].body[0]
+    assert isinstance(loop, ast.For) and ast.unparse(loop.iter) == "(call.tool_call,)"
+    branches = [
+        statement
+        for statement in loop.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "is_session_aware_tool(tool_name)"
+    ]
+    assert len(branches) == 1 and not branches[0].orelse
+    transfers = [
+        node
+        for node in ast.walk(execution)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "ctx.session_tools._dispatch_session_aware_tool"
+    ]
+    assert len(transfers) == 1
+    tries = [statement for statement in branches[0].body if isinstance(statement, ast.Try) and transfers[0] in ast.walk(statement)]
+    assert len(tries) == 1 and len(tries[0].body) == 1
+    expected_transfer = ast.parse(
+        """session_aware_outcome = await _await_started_tool_stage(
+    ctx.session_tools._dispatch_session_aware_tool(
+        tool_name=tool_name, tool_call_id=tool_call.id, arguments=arguments,
+        state=state, audit=audit, recorder=recorder, session_id=session_id,
+        session_operation_context=ctx.session_operation_context, current_state_id=current_state_id,
+        composer_model_version=provider_model_version, llm_messages=llm_messages,
+        anti_anchor=anti_anchor, policy_catalog=ctx.policy_catalog, review_preflight=review_preflight,
+    ),
+    audit=audit, recorder=recorder,
+)"""
+    ).body[0]
+    assert _stable_ast_bytes(tries[0].body[0]) == _stable_ast_bytes(expected_transfer)
+
+    forwards = [
+        statement
+        for statement in dispatch.body
+        if isinstance(statement, ast.Assign) and [ast.unparse(target) for target in statement.targets] == ["kwargs"]
+    ]
+    assert len(forwards) == 1
+    expected_kwargs = ast.parse(
+        """kwargs = self._build_session_aware_kwargs(
+    tool_name=tool_name, arguments=arguments, state=state, session_id=session_id,
+    current_state_id=current_state_id, tool_call_id=tool_call_id,
+    composer_model_version=composer_model_version, session_operation_context=session_operation_context,
+)"""
+    ).body[0]
+    assert _stable_ast_bytes(forwards[0]) == _stable_ast_bytes(expected_kwargs)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "session_operation_context" and isinstance(node.ctx, (ast.Store, ast.Del))
+        for owner in (dispatch, kwargs)
+        for node in ast.walk(owner)
+    )
+    handler_calls = [node for node in ast.walk(dispatch) if isinstance(node, ast.Call) and ast.unparse(node.func) == "handler"]
+    assert len(handler_calls) == 1 and not handler_calls[0].args
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in handler_calls[0].keywords] == [(None, "kwargs")]
+    review_branches = [
+        statement
+        for statement in kwargs.body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "tool_name == 'request_interpretation_review'"
+    ]
+    assert len(review_branches) == 1
+    pending = [
+        statement
+        for statement in review_branches[0].body
+        if isinstance(statement, ast.Assign) and [ast.unparse(target) for target in statement.targets] == ["create_pending"]
+    ]
+    expected_pending = ast.parse(
+        """create_pending = functools.partial(
+    sessions_service.create_pending_interpretation_event,
+    session_operation_context=session_operation_context,
+)"""
+    ).body[0]
+    assert len(pending) == 1 and _stable_ast_bytes(pending[0]) == _stable_ast_bytes(expected_pending)
+    pending_guards = [
+        statement
+        for statement in review_branches[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "type(session_operation_context) is not SessionOperationContext"
+    ]
+    expected_pending_guard = ast.parse(
+        """if type(session_operation_context) is not SessionOperationContext:
+    raise AuditIntegrityError("request_interpretation_review requires the compose loop's exact session operation authority")
+"""
+    ).body[0]
+    assert len(pending_guards) == 1 and _stable_ast_bytes(pending_guards[0]) == _stable_ast_bytes(expected_pending_guard)
+    assert review_branches[0].body.index(pending_guards[0]) < review_branches[0].body.index(pending[0])
+    returned = review_branches[0].body[-1]
+    assert isinstance(returned, ast.Return) and isinstance(returned.value, ast.Dict)
+    assert [
+        ast.unparse(value)
+        for key, value in zip(returned.value.keys, returned.value.values, strict=True)
+        if isinstance(key, ast.Constant) and key.value == "create_pending_interpretation_event"
+    ] == ["create_pending"]
+
+    handlers = [
+        handler
+        for statement in dispatch.body
+        if isinstance(statement, ast.Try)
+        for handler in statement.handlers
+        if handler.type is not None and ast.unparse(handler.type) == "ToolArgumentError"
+    ]
+    assert len(handlers) == 1
+    caps = [
+        statement
+        for statement in handlers[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "cap_type is not None"
+    ]
+    assert len(caps) == 1
+    writes = [
+        statement
+        for statement in caps[0].body
+        if isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Await)
+        and isinstance(statement.value.value, ast.Call)
+        and ast.unparse(statement.value.value.func) == "sessions_service.record_auto_interpreted_no_surfaces_event"
+    ]
+    assert len(writes) == 1
+    rate_guards = [
+        statement
+        for statement in caps[0].body
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "type(session_operation_context) is not SessionOperationContext"
+    ]
+    expected_rate_guard = ast.parse(
+        """if type(session_operation_context) is not SessionOperationContext:
+    raise AuditIntegrityError("Rate-cap interpretation persistence requires exact COMPOSE authority") from None
+"""
+    ).body[0]
+    assert len(rate_guards) == 1 and _stable_ast_bytes(rate_guards[0]) == _stable_ast_bytes(expected_rate_guard)
+    assert caps[0].body.index(rate_guards[0]) < caps[0].body.index(writes[0])
+    assert [
+        (keyword.arg, ast.unparse(keyword.value))
+        for keyword in writes[0].value.value.keywords
+        if keyword.arg == "session_operation_context"
+    ] == [("session_operation_context", "session_operation_context")]
+
+
 def test_pending_interpretation_callers_forward_existing_authority() -> None:
     from elspeth.web.composer import service as composer_service
-    from elspeth.web.composer import tool_batch
     from elspeth.web.sessions.routes.composer import state as composer_state
 
-    batch_source = inspect.getsource(tool_batch.run_tool_batch)
-    assert "session_operation_context=ctx.session_operation_context" in batch_source
+    _assert_batch_session_authority(_batch_session_authority_sources())
     composer_source = inspect.getsource(composer_service.ComposerServiceImpl)
     assert "session_operation_context=session_operation_context" in composer_source
     state_source = inspect.getsource(composer_state)
@@ -475,10 +664,50 @@ def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
 
 
 def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
-    batch_source = textwrap.dedent(inspect.getsource(tool_batch.run_tool_batch))
-    assert "session_operation_context=ctx.session_operation_context" in batch_source
-    dispatch_source = textwrap.dedent(inspect.getsource(SessionToolOwner._dispatch_session_aware_tool))
-    assert "session_operation_context=session_operation_context" in dispatch_source
+    _assert_batch_session_authority(_batch_session_authority_sources())
+
+
+@pytest.mark.parametrize(
+    "owner,before,after",
+    [
+        ("batch", 'if prepared == "prepared":', "if False:"),
+        (
+            "batch",
+            "call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call",
+            "call_model=call_model, ctx=other_ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call",
+        ),
+        ("execution", "if is_session_aware_tool(tool_name):", "if False:"),
+        (
+            "execution",
+            "session_id=session_id,\n                            session_operation_context=ctx.session_operation_context,\n"
+            "                            current_state_id=current_state_id,",
+            "session_id=session_id,\n                            session_operation_context=other_context,\n"
+            "                            current_state_id=current_state_id,",
+        ),
+        (
+            "dispatch",
+            "composer_model_version=composer_model_version,\n            session_operation_context=session_operation_context,",
+            "composer_model_version=composer_model_version,\n            session_operation_context=other_context,",
+        ),
+        (
+            "dispatch",
+            "session_id=UUID(session_id),\n                    session_operation_context=session_operation_context,",
+            "session_id=UUID(session_id),\n                    session_operation_context=other_context,",
+        ),
+        ("dispatch", "await handler(**kwargs)", "await handler(**other_kwargs)"),
+        ("dispatch", "if type(session_operation_context) is not SessionOperationContext:", "if False:"),
+        ("kwargs", "session_operation_context=session_operation_context,", "session_operation_context=other_context,"),
+        ("kwargs", "if type(session_operation_context) is not SessionOperationContext:", "if False:"),
+        ("kwargs", '"create_pending_interpretation_event": create_pending', '"create_pending_interpretation_event": foreign_writer'),
+    ],
+)
+def test_batch_session_authority_rejects_foreign_context_or_unreached_transfer(owner: str, before: str, after: str) -> None:
+    sources = _batch_session_authority_sources()
+    _assert_batch_session_authority(sources)
+    assert sources[owner].count(before) == 1
+    sources[owner] = sources[owner].replace(before, after)
+    with pytest.raises(AssertionError):
+        _assert_batch_session_authority(sources)
 
 
 def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None:
@@ -578,14 +807,45 @@ def _assert_auto_title_ownership(public_source: str, helper_source: str) -> None
     # Bind the reviewed wrapper, helper preamble, outer prefix before provider
     # invocation, and invocation prefix through the joined title suspension.
     # Semantic locators close earlier-return gaps without pinning list offsets.
+    # The current ordinary caller binds its real common cost budget and freezes
+    # the initial preference-derived mutation ceiling before either provider.
+    # Validate those complete contiguous statements, then retain the original
+    # prefix pin rather than accepting an opaque replacement digest.
+    composer_assignments = [
+        statement
+        for statement in main_try.body
+        if isinstance(statement, ast.Assign) and [ast.unparse(target) for target in statement.targets] == ["composer"]
+    ]
+    assert len(composer_assignments) == 1
+    composer_index = main_try.body.index(composer_assignments[0])
+    expected_preparation = ast.parse(
+        """provider_owner.bind_cost_budget(
+    capture_common_provider_cost(
+        session_id=str(session.id),
+        request_id=str(turn_user_message_id),
+        lifecycle_version=1,
+        initially_empty=state is not None and state_is_structurally_empty(state),
+        settings=settings,
+    )
+)
+initial_preferences = await service.get_composer_preferences(turn.session_id)
+mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)
+"""
+    ).body
+    assert composer_index >= len(expected_preparation)
+    preparation_start = composer_index - len(expected_preparation)
+    actual_preparation = main_try.body[preparation_start:composer_index]
+    assert _stable_ast_bytes(ast.Module(body=actual_preparation, type_ignores=[])) == _stable_ast_bytes(
+        ast.Module(body=expected_preparation, type_ignores=[])
+    )
+    assert composer_index < main_try.body.index(invocation_try)
+    retained_prefix = main_try.body[:preparation_start] + main_try.body[composer_index : main_try.body.index(invocation_try)]
     assert hashlib.sha256(_stable_ast_bytes(public)).hexdigest() == "fe4e8e57be8fd03171e86ac2516422ce4f5d2dc7e75e282ada139fb06980ce0c"
     assert hashlib.sha256(_stable_ast_bytes(ast.Module(body=helper.body[:-1], type_ignores=[]))).hexdigest() == (
         "6a2ffff4fd20ec97d98e2d0bb0dc81c457af97405daf4734eea8e37ffc3cadc1"
     )
     assert (
-        hashlib.sha256(
-            _stable_ast_bytes(ast.Module(body=main_try.body[: main_try.body.index(invocation_try)], type_ignores=[]))
-        ).hexdigest()
+        hashlib.sha256(_stable_ast_bytes(ast.Module(body=retained_prefix, type_ignores=[]))).hexdigest()
         == "e00d6b374471ab72519e2d17e8af9b0f7df4384e2d4d6473c35d6e3cd53ffe1b"
     )
     assert (
@@ -600,6 +860,29 @@ def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
     _assert_auto_title_ownership(inspect.getsource(run_composer_turn), inspect.getsource(_run_composer_turn))
     title_source = textwrap.dedent(inspect.getsource(_auto_title.maybe_auto_title_session))
     assert "session_operation_context=session_operation_context" in title_source
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("provider_owner.bind_cost_budget(", "other_owner.bind_cost_budget("),
+        ("lifecycle_version=1,", "lifecycle_version=2,"),
+        ("initially_empty=state is not None and state_is_structurally_empty(state),", "initially_empty=True,"),
+        (
+            "initial_preferences = await service.get_composer_preferences(turn.session_id)",
+            "initial_preferences = service.get_composer_preferences(turn.session_id)",
+        ),
+        ("service.get_composer_preferences(turn.session_id)", "service.get_composer_preferences(other_session_id)"),
+        ("initial_preferences.trust_mode)", "other_preferences.trust_mode)"),
+    ],
+)
+def test_auto_title_prefix_requires_original_cost_and_preference_preparation(before: str, after: str) -> None:
+    public_source = inspect.getsource(run_composer_turn)
+    helper_source = inspect.getsource(_run_composer_turn)
+    _assert_auto_title_ownership(public_source, helper_source)
+    assert helper_source.count(before) == 1
+    with pytest.raises(AssertionError):
+        _assert_auto_title_ownership(public_source, helper_source.replace(before, after))
 
 
 @pytest.mark.parametrize(

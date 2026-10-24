@@ -10,11 +10,13 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select, update
 
+from elspeth.contracts.composer_content import ContentPublication
 from elspeth.web.composer.availability import ComposerAvailability
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
 from elspeth.web.composer.protocol import ComposerResult, ComposerService, GraphRecoveryResponse
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.sessions.content_publication import storage_content_hash
 from elspeth.web.sessions.graph_recovery import checkpoint_data
 from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.schemas import MessageWithStateResponse
@@ -57,7 +59,12 @@ async def test_malformed_head_reaches_recovery_and_commits_chat_without_validati
     assert response.state.id != str(initial.id)
     assert response.state.version == initial.version + 1
     assert response.state.is_valid is False
-    assert response.state.composer_meta is None
+    assert response.state.composer_meta is not None
+    assert set(response.state.composer_meta) == {"content_publication"}
+    publication_payload = response.state.composer_meta["content_publication"]
+    publication = ContentPublication.from_payload(publication_payload)
+    assert publication.to_payload() == publication_payload
+    assert publication_payload["applicability"] == "requires_current_inspection"
     composer.compose.assert_not_called()
     composer.compose_recovery.assert_awaited_once()
     assert composer.compose_recovery.await_args.kwargs["recovery_context"].malformed_head
@@ -65,7 +72,20 @@ async def test_malformed_head_reaches_recovery_and_commits_chat_without_validati
         original = conn.execute(
             select(composition_states_table.c.nodes).where(composition_states_table.c.id == str(initial.id))
         ).scalar_one()
+        new_row = conn.execute(
+            select(composition_states_table).where(
+                composition_states_table.c.id == response.state.id,
+                composition_states_table.c.session_id == str(session.id),
+            )
+        ).one()
     assert original == {"invalid": "not a state envelope"}
+    stored = service._row_to_state_record(new_row)
+    assert str(stored.id) == response.state.id
+    assert stored.session_id == session.id
+    assert stored.version == response.state.version
+    assert publication == ContentPublication(stored.session_id, stored.id, stored.version, storage_content_hash(stored))
+    assert new_row.composer_meta["data"] == response.state.composer_meta
+    assert new_row.provenance == "graph_recovery"
     messages = await service.get_messages(session.id, limit=None)
     assert len([row for row in messages if str(row.id) == response.message.id]) == 1
     assert len([row for row in messages if str(row.id) == response.recovery_notice.id]) == 1

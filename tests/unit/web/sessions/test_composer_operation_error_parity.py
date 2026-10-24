@@ -11,9 +11,12 @@ from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException
 from structlog.testing import capture_logs
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
+from elspeth.web.composer.protocol import ComposerMutationAuthorityRevoked
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error
@@ -299,3 +302,50 @@ def test_generation_group_priority_is_order_independent_and_retains_original_gro
     assert projected.error_type == ("audit_integrity_error" if audit else "database_unavailable")
     assert group.exceptions is original_leaves and generation in group.exceptions
     assert "PRIVATE" not in projected.model_dump_json()
+
+
+def mutation_error():
+    return ComposerMutationAuthorityRevoked(
+        revocation=ComposerMutationRevocation(
+            ComposerMutationCeiling("11111111-1111-4111-8111-111111111111", "request", "auto_commit"),
+            "explicit_approve",
+        ),
+        llm_calls=(),
+        failed_turn=None,
+        state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        initial_version=1,
+    )
+
+
+def test_mutation_revocation_projects_same_safe_http_outcome():
+    error = mutation_error()
+    nominal = project_composer_operation_error(error, request_id="request")
+    route = project_composer_operation_error(HTTPException(status_code=409, detail=error.to_payload()), request_id="request")
+    assert nominal.http_status == route.http_status == 409
+    assert nominal.failure_code == route.failure_code == "http_error"
+    assert nominal.error_type == route.error_type == "composer_mutation_authority_revoked"
+    assert nominal.body == route.body == {"detail": error.to_payload()}
+    assert error.partial_state is None
+    assert "proposal" not in json.dumps(nominal.body)
+
+
+def test_audit_failure_still_outranks_mutation_revocation():
+    error = mutation_error()
+    original = AuditIntegrityError("PRIVATE original audit failure")
+    projected = project_composer_operation_error(ExceptionGroup("original pair", [error, original]), request_id="request")
+    assert projected.error_type == "audit_integrity_error"
+    assert projected.http_status == 500
+    assert "PRIVATE" not in projected.model_dump_json()
+
+
+def test_mutation_refusal_roundtrips_actual_durable_error_codec():
+    from elspeth.web.sessions.composer_operations import ComposerOperationError, composer_operation_result_hash
+
+    projected = project_composer_operation_error(mutation_error(), request_id="request")
+    encoded = projected.model_dump_json()
+    recovered = ComposerOperationError.model_validate_json(encoded, strict=True)
+    assert recovered == projected
+    assert composer_operation_result_hash(encoded) == composer_operation_result_hash(recovered.model_dump_json())
+    assert recovered.http_status == 409 and recovered.error_type == "composer_mutation_authority_revoked"
+    assert set(recovered.body["detail"]) == {"error_type", "detail", "request_id", "initial_trust_mode", "current_trust_mode"}
+    assert recovered.body["detail"]["request_id"] == "request"

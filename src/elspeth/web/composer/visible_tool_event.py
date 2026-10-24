@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Final, final
+from typing import Any, Final, Literal, TypedDict, final
 
 from pydantic import JsonValue
 
@@ -23,12 +23,25 @@ from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource, capture_provider_audit_source
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.validation import _redact_sensitive_content
 
 VISIBLE_TOOL_EVENT_KIND: Final = "composer_visible_tool_event"
 VISIBLE_TOOL_EVENT_SCHEMA: Final = "composer.visible-tool-event.v1"
 VISIBLE_RESPONSE_GAP_KIND: Final = "composer_visible_response_gap"
+
+
+class VisibleResponseGapWire(TypedDict):
+    _kind: Literal["composer_visible_response_gap"]
+    schema: Literal["composer.visible-response-gap.v1"]
+    session_id: str
+    operation_id: str
+    operation_epoch: int
+    provider_call_id: str | None
+    status: str
+    public_call_hash: str
+    reason: str
 
 
 def _hash(text: str) -> str:
@@ -212,6 +225,13 @@ class VisibleToolEvent:
             raise AuditIntegrityError("Visible tool event parent can be assigned only by its new P4 row")
         return replace(self, parent_assistant_id=assistant_id)
 
+    def with_display_result(self, display_result: str) -> VisibleToolEvent:
+        if self.parent_assistant_id is not None:
+            raise AuditIntegrityError("Only an unpersisted visible event may select its display")
+        if type(display_result) is not str:
+            raise TypeError("Visible display must be serialized text")
+        return replace(self, display_result_hash=_hash(display_result))
+
     def to_envelope(self) -> dict[str, Any]:
         return {"_kind": VISIBLE_TOOL_EVENT_KIND, "schema": VISIBLE_TOOL_EVENT_SCHEMA, **asdict(self)}
 
@@ -285,7 +305,7 @@ def visible_response_gap(
     call: ComposerLLMCall,
     context: SessionOperationContext,
     public_call: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> VisibleResponseGapWire:
     """Persist record-scoped missing bytes without claiming operation coverage."""
     if (
         type(call) is not ComposerLLMCall
@@ -293,12 +313,23 @@ def visible_response_gap(
         or context.operation_kind is not SessionOperationKind.COMPOSE
     ):
         raise AuditIntegrityError("Visible response coverage requires actual COMPOSE call custody")
+    return visible_response_gap_for_source(call, capture_provider_audit_source(context), public_call)
+
+
+def visible_response_gap_for_source(
+    call: ComposerLLMCall,
+    source: ProviderAuditSource,
+    public_call: Mapping[str, Any],
+) -> VisibleResponseGapWire:
+    """Project original source labels as DATA, without writer authority."""
+    if type(call) is not ComposerLLMCall or type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("Visible response source projection requires nominal DATA")
     return {
         "_kind": VISIBLE_RESPONSE_GAP_KIND,
         "schema": "composer.visible-response-gap.v1",
-        "session_id": context.fence.session_id,
-        "operation_id": context.fence.operation_id,
-        "operation_epoch": context.fence.operation_epoch,
+        "session_id": source.session_id,
+        "operation_id": source.operation_id,
+        "operation_epoch": source.operation_epoch,
         "provider_call_id": call.call_id,
         "status": call.status.value,
         "public_call_hash": _hash(json.dumps(deep_thaw(public_call), ensure_ascii=False, sort_keys=True)),

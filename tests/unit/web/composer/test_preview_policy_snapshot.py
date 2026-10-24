@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.blobs.protocol import BlobRecord
@@ -104,6 +105,7 @@ async def _preview(
     registry: OperatorProfileRegistry,
     catalog: CatalogService,
     operation_context: SessionOperationContext | None = None,
+    mutation_ceiling: ComposerMutationCeiling | None = None,
 ) -> _DispatchOutcome:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
 
@@ -113,6 +115,7 @@ async def _preview(
     )
     outcome, _advisor_calls = await service._dispatch_tool_batch(
         call_model=_CallModelOutcome(completion=completion),
+        mutation_ceiling=mutation_ceiling,
         state=state,
         last_validation=None,
         last_runtime_preflight=None,
@@ -315,7 +318,9 @@ async def test_preview_reads_uploaded_reference_table_with_operation_context(
         return result
 
     monkeypatch.setattr(preflight_module, "validate_pipeline", validate)
-    await _preview(service, state, admitted, service._preflight.new_cache(), registry, catalog, context)
+    preferences = await service._require_sessions_service().get_composer_preferences(session_id)
+    mutation_ceiling = ComposerMutationCeiling(str(session_id), str(uuid4()), preferences.trust_mode)
+    await _preview(service, state, admitted, service._preflight.new_cache(), registry, catalog, context, mutation_ceiling)
     assert len(results) == 1
     assert results[0].is_valid, results[0].errors
     assert reads == [context]

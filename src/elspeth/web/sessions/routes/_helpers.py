@@ -95,6 +95,7 @@ from elspeth.web.composer.protocol import (
     ComposerService,
     ComposerServiceError,
 )
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.composer.provider_telemetry import (
@@ -112,6 +113,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
@@ -1951,7 +1953,7 @@ async def _runtime_preflight_for_state(
             validate_pipeline,
             state,
             settings,
-            yaml_generator,
+            ComposerYamlSerializer(),
             secret_service=secret_service,
             secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),
             user_id=user_id,
@@ -3061,6 +3063,11 @@ PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
 # ``failure_code -> (http_status, safe static detail)``. The detail text is
 # provider-safe (no exception message, no provider content).
 _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
+    "configuration_unsupported": (
+        503,
+        "The configured legacy planner repair budget is not supported by the common composer. "
+        "Use the compatibility default of 2 or the direct planner library with its explicit repair policy.",
+    ),
     "cost_unavailable": (
         503,
         "The composer could not determine the model cost. Ask an administrator to configure or correct model pricing before trying again.",
@@ -3087,7 +3094,7 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
 }
 
 
-def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
+def planner_failure_is_policy_blocked(exc: PipelinePlannerError | CommonProviderCostRefused) -> bool:
     """Return whether a planner failure was a categorical deployment-policy refusal.
 
     This predicate is evaluated before mapping a planner error code because a
@@ -3111,6 +3118,7 @@ def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
 # that vocabulary is a frontend/contract change rather than an attribution fix. It therefore
 # still reads ``provider_unavailable`` — a known residual, not an oversight.
 _FREEFORM_PLANNER_PROGRESS_REASONS: Final[dict[str, ComposerProgressReason]] = {
+    "REPAIR_POLICY_UNSUPPORTED": "service_setup_failed",
     "COST_UNAVAILABLE": "service_setup_failed",
     "REPAIR_EXHAUSTED": "planner_repair_exhausted",
     "COMPOSITION_EXHAUSTED": "convergence_composition_budget",
@@ -3127,7 +3135,7 @@ def freeform_planner_progress_reason(planner_code: str) -> ComposerProgressReaso
     return "provider_unavailable"
 
 
-def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
+def _freeform_planner_failure_code(exc: PipelinePlannerError | CommonProviderCostRefused) -> str:
     """Map a ``PipelinePlannerError.code`` to a closed freeform failure code.
 
     Use closed, provider-safe codes for the HTTP response.
@@ -3138,6 +3146,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
         return "provider_unavailable"
+    if exc.code == "REPAIR_POLICY_UNSUPPORTED":
+        return "configuration_unsupported"
     if exc.code == "COST_UNAVAILABLE":
         return "cost_unavailable"
     if exc.code == "REPAIR_EXHAUSTED":
@@ -3150,7 +3160,7 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
 
 
 async def _handle_planner_failure(
-    exc: PipelinePlannerError,
+    exc: PipelinePlannerError | CommonProviderCostRefused,
     service: SessionServiceProtocol,
     session_id: UUID,
     llm_composition_state_id: UUID | None,
@@ -3166,12 +3176,10 @@ async def _handle_planner_failure(
     ``(status, body)`` the route raises. Shared by ``send_message`` and
     ``recompose`` so the two freeform routes cannot drift on planner-failure UX.
 
-    The planner's LLM-call audit evidence is already durable — ``plan_pipeline``
-    stamps it onto the escaping exception via ``attach_llm_calls`` and
-    ``_plan_and_stage_empty_pipeline`` persists it before re-raise (which also
-    sets ``llm_calls_durable``) — so this MUST NOT re-persist it. The
-    disposition row is a distinct ``_kind`` and carries only the closed code, no
-    provider content, usage, or model metadata.
+    The caller must complete required LLM sidecar persistence before this
+    separate disposition. The direct planner facade already drains its own
+    calls; common provider policy refusal uses the turn owner's required drain.
+    An empty call tuple is valid only when no covered SDK attempt occurred.
     """
     failure_code = _freeform_planner_failure_code(exc)
     status_code, detail = _FREEFORM_PLANNER_FAILURE_HTTP[failure_code]

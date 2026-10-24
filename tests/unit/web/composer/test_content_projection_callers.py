@@ -10,17 +10,210 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardDecision
+from elspeth.web.composer import provider_gateway
+from elspeth.web.composer import service as service_module
+from elspeth.web.composer._compose_loop_carriers import _AdvisorCallSuccess, _AdvisorFirstPartyFailure
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
-from elspeth.web.composer.state import PipelineMetadata
+from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.state import NodeSpec, PipelineMetadata
+from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.composer.turn_effects import TurnEvidence
-from tests.unit.web.composer._helpers import _empty_state
+from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.secrets.server_store import ServerSecretStore
+from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
+from elspeth.web.secrets.user_store import UserSecretStore
+from tests.unit.web.composer._helpers import _empty_state, _make_settings, _mock_catalog
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.composer.test_prompt_guard_wiring import _Client, _guarded_service
 
 pytest_plugins = ("tests.unit.web.composer.test_prompt_guard_wiring",)
+
+
+@pytest.fixture
+def actor_secrets(invocation, monkeypatch):
+    engine, sessions, _owner, _coordinator = invocation
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "caller-test-fingerprint-key")
+    store = UserSecretStore(engine=engine, master_key="caller-test-master-key-at-least-32-characters")
+    store.set_secret("AZURE_API_KEY", value="not-to-be-projected", user_id="alice", auth_provider_type="local")
+    resolver = ScopedSecretResolver(WebSecretService(store, ServerSecretStore(allowlist=())), "local")
+    listed = []
+    list_refs = resolver.list_refs
+
+    def record_names(actor):
+        listed.append(actor)
+        return list_refs(actor)
+
+    def refuse_value_resolution(*_args, **_kwargs):
+        raise AssertionError("Prompt construction must list reference names without resolving values")
+
+    monkeypatch.setattr(resolver, "list_refs", record_names)
+    monkeypatch.setattr(resolver, "resolve", refuse_value_resolution)
+    monkeypatch.setattr(resolver, "resolve_scoped", refuse_value_resolution)
+    client = _Client(PromptGuardDecision("allow", "clean"))
+    monkeypatch.setattr(provider_gateway, "build_prompt_guard_mount", lambda _settings: PromptGuardMount(client))
+    monkeypatch.setattr(service_module, "build_prompt_guard_mount", lambda _settings: PromptGuardMount(client))
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(),
+        settings=_make_settings(composer_prompt_guard_mode="required"),
+        sessions_service=sessions,
+        session_engine=engine,
+        secret_service=resolver,
+    )
+    return service, store, listed, client
+
+
+def _graph_with_credential(value):
+    return _empty_state().with_node(
+        NodeSpec.from_dict(
+            {
+                "id": "review",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "rows",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": {"api_key": value},
+            }
+        )
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["manual", "early", "end", "format_retry"])
+@pytest.mark.parametrize("credential", ["${AZURE_API_KEY}", "${UNKNOWN_API_KEY}", "literal-credential-value"])
+async def test_advisor_current_actor_reference_names_are_listed_without_values(invocation, actor_secrets, monkeypatch, entry, credential):
+    _engine, sessions, owner, coordinator = invocation
+    operation = coordinator.authority.context
+    service, _store, listed, client = actor_secrets
+    state = _graph_with_credential(credential)
+    before = state.to_dict()
+    publication_review = None
+    if entry in {"end", "format_retry"} and credential == "${AZURE_API_KEY}":
+        user_row = await sessions.add_message(
+            UUID(operation.fence.session_id),
+            "user",
+            "Review the configured graph.",
+            writer_principal="route_user_message",
+            session_operation_context=operation,
+        )
+        evidence = TurnEvidence(
+            session_id=operation.fence.session_id,
+            session_operation_context=operation,
+            request_id=str(user_row.id),
+            request="Review the configured graph.",
+            initial_state_id=None,
+            initial_state=state,
+            actor_user_id="alice",
+        )
+        publication_review = evidence.review_candidate(
+            candidate="The current graph can be inspected.",
+            request="Review the configured graph.",
+            current_state=state,
+        )
+    calls = []
+    reply_payload = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
+    if entry in {"end", "format_retry"}:
+        reply_payload["publication_verdict"] = "WITHHOLD"
+        reply_payload["findings"] = "The current graph is visible; publication still requires additional evidence."
+    reply = json.dumps(reply_payload)
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        content = "not JSON" if entry == "format_retry" and len(calls) == 1 else reply
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": content}}],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    recorder = BufferingRecorder()
+
+    async def review():
+        if entry == "manual":
+            return await service._advisor_checkpoint._call_advisor_for_tool(
+                RequestAdvisorHintArgumentsModel(
+                    trigger="proactive_security_safety",
+                    problem_summary="Review the configured graph.",
+                    recent_errors=[],
+                    attempted_actions=[],
+                ),
+                recorder=recorder,
+                provider_owner=owner,
+                current_state=state,
+                session_id=operation.fence.session_id,
+                session_operation_context=operation,
+            )
+        return await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="early" if entry == "early" else "end",
+            state=state,
+            recorder=recorder,
+            provider_owner=owner,
+            session_id=operation.fence.session_id,
+            session_operation_context=operation,
+            publication_review=publication_review,
+        )
+
+    with prompt_guard_user_scope("Review the configured graph."):
+        if credential == "${AZURE_API_KEY}":
+            result = await review()
+            if entry == "manual":
+                assert isinstance(result, _AdvisorCallSuccess)
+            else:
+                assert result.ok
+            assert len(calls) == (2 if entry == "format_retry" else 1)
+            assert len(client.requests) == len(calls) == len(recorder.llm_calls)
+            assert listed and set(listed) == {"alice"}
+            assert len(listed) == len(calls)
+            assert "not-to-be-projected" not in str(calls)
+        else:
+            if entry == "manual":
+                result = await review()
+                assert isinstance(result, _AdvisorFirstPartyFailure)
+                assert isinstance(result.original_exc, CredentialMaterialRefused)
+            else:
+                with pytest.raises(CredentialMaterialRefused):
+                    await review()
+            assert calls == client.requests == [] and recorder.llm_calls == ()
+    assert state.to_dict() == before
+    coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_advisor_retry_reloads_reference_inventory_before_another_sdk_call(invocation, actor_secrets, monkeypatch):
+    engine, _sessions, owner, coordinator = invocation
+    operation = coordinator.authority.context
+    service, store, listed, client = actor_secrets
+    state = _graph_with_credential("${AZURE_API_KEY}")
+    calls = []
+
+    async def completion(**kwargs):
+        calls.append(kwargs)
+        assert store.delete_secret("AZURE_API_KEY", user_id="alice", auth_provider_type="local")
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": "not JSON"}}],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope("Review the configured graph."), pytest.raises(CredentialMaterialRefused):
+        await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase="early",
+            state=state,
+            recorder=recorder,
+            provider_owner=owner,
+            session_id=operation.fence.session_id,
+            session_operation_context=operation,
+        )
+    assert listed == ["alice", "alice"]
+    assert len(calls) == len(client.requests) == len(recorder.llm_calls) == 1
+    assert len(_checks(engine)) == 1
+    coordinator.assert_completed()
 
 
 def test_primary_view_uses_real_session_and_current_graph(invocation, monkeypatch):

@@ -15,6 +15,7 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.protocol import ComposerMutationAuthorityRevoked
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
@@ -194,6 +195,9 @@ def project_composer_operation_error(
     if len(leaves) != 1:
         return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
+    if isinstance(leaf, ComposerMutationAuthorityRevoked):
+        mutation_payload: dict[str, JsonValue] = {**leaf.to_payload()}
+        return _http_error(409, {"detail": mutation_payload}, "composer_mutation_authority_revoked")
     if isinstance(leaf, PromptGuardRefused):
         payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
         return _http_error(leaf.http_status, payload, str(payload["error_type"]))

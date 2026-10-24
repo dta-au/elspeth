@@ -57,16 +57,16 @@ def _required_guard_settings(tmp_path, monkeypatch):
     return settings, requests
 
 
-def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt):
+def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt, expected_count=1):
     checks = _checks(engine)
-    assert len(checks) == 1
-    check = checks[0]
-    assert check["operation_id"] == context.fence.operation_id
-    assert check["operation_epoch"] == context.fence.operation_epoch
-    assert check["role"] == role
-    assert check["adapter"] == "azure_prompt_shields"
-    assert check["mode"] == "required"
-    assert (check["disposition"], check["reason"]) == ("allow", "clean")
+    assert len(checks) == expected_count
+    for check in checks:
+        assert check["operation_id"] == context.fence.operation_id
+        assert check["operation_epoch"] == context.fence.operation_epoch
+        assert check["role"] == role
+        assert check["adapter"] == "azure_prompt_shields"
+        assert check["mode"] == "required"
+        assert (check["disposition"], check["reason"]) == ("allow", "clean")
     assert requests
     assert all(json.loads(request.content)["userPrompt"] == user_prompt for request in requests)
 

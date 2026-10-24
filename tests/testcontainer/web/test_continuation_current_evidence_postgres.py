@@ -1,0 +1,22 @@
+"""Actual serial PostgreSQL current-message/evidence bridge proofs."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_current_evidence import (
+    test_current_graph_preserves_original_worker_error_identity as test_current_graph_preserves_original_worker_error_identity,
+)
+from tests.unit.web.sessions.test_continuation_current_evidence import (
+    test_current_graph_refuses_a_different_nominal_materialization_binding_after_positive as test_current_graph_refuses_a_different_nominal_materialization_binding_after_positive,
+)
+from tests.unit.web.sessions.test_continuation_current_evidence import (
+    test_current_graph_refuses_stop_after_actual_reconstruction as test_current_graph_refuses_stop_after_actual_reconstruction,
+)
+from tests.unit.web.sessions.test_continuation_current_evidence import (
+    test_current_materialization_restores_one_complete_evidence_shelf as test_current_materialization_restores_one_complete_evidence_shelf,
+)
+from tests.unit.web.sessions.test_continuation_current_evidence import (
+    test_started_graph_worker_cancellation_is_delivered_after_completion as test_started_graph_worker_cancellation_is_delivered_after_completion,
+)
+
+pytestmark = pytest.mark.testcontainer
