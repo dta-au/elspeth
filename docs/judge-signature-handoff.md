@@ -150,11 +150,13 @@ Registered in `.mcp.json` as `elspeth-judge`, launched as
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
 `PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra. All six tools
 fail closed when the HMAC key is present in the environment. `stage_preview` is
-the only tool that calls a judge, and it judges through the Codex transport.
-That transport is disabled (see the note under "Judging runs on the Codex CLI
-harness"), so `stage_preview` refuses with "the codex-cli judge transport is
-disabled". It reaches neither the worker nor a local Codex CLI. Other judge
-calls go through the protected judge supervisor (ADR-052).
+the only tool that calls a judge. It judges through the `agent` transport via
+the protected judge supervisor (ADR-052). It never uses `codex-cli`, which is
+disabled (see the note under "Judging runs on the Codex CLI harness"). Until
+the supervisor is installed it refuses with "protected judge supervisor
+admission is unavailable or invalid", with no local fallback. The
+`stage_status` command it renders for the operator uses
+`--judge-transport agent`.
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
@@ -162,7 +164,7 @@ calls go through the protected judge supervisor (ADR-052).
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle and emit its priced operator command. Args: `bundle_id` (required), `stale_key` (optional exact orphan key; selects one action and zero judge calls). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
-| `stage_preview` | yes | yes (Codex transport; **disabled**: refuses with "the codex-cli judge transport is disabled") | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
+| `stage_preview` | yes | yes (read-only `agent` judge via the protected supervisor; **unavailable until installed**) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries

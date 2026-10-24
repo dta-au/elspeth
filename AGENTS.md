@@ -410,10 +410,10 @@ post-release operator work. Until then the signer findings stay open. Key-free
 staging through the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`) still
 prepares a worklist for that operator step, which re-derives every binding from
 the live tree. Every judge call needs the installed judge supervisor and refuses
-without it; there is no local Codex/SDK fallback. That covers `reaudit`,
-`check-judge-quality` and `justify --dry-run`. The `codex-cli` judge transport
-is disabled, because its native shell could read the worker's provider
-credentials. `stage_preview`, which uses it, therefore refuses; judge with
+without it; there is no local Codex/SDK fallback. That covers `stage_preview`,
+`reaudit`, `check-judge-quality` and `justify --dry-run`. The `codex-cli` judge
+transport is disabled, because its native shell could read the worker's
+provider credentials. `stage_preview` and the operator command it renders use
 `agent`. Judging runs with read-only judge tool access, and every rationale is
 secret-scrubbed. Background is in
 the `judge-signature-workflow` skill and

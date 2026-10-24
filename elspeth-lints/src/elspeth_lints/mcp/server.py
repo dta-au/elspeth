@@ -228,7 +228,9 @@ def _sign_bundle_command_text(
         "--owner",
         '"$USER"',
         "--judge-transport",
-        "codex-cli",
+        # codex-cli is disabled: its native shell could read the judge worker's
+        # provider home. The agent transport is realpath-confined to /evidence.
+        "agent",
         "--judge-tools",
         "readonly",
     ]
@@ -775,11 +777,11 @@ def _verdict_str(verdict: JudgeVerdict) -> str:
 
 
 def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
-    """Populate each ``new_judgment`` action with a NON-authoritative Codex verdict.
+    """Populate each ``new_judgment`` action with a NON-authoritative agent-judge verdict.
 
     [O1] ordering: ``_assert_no_hmac_key_in_env()`` is the first line, BEFORE the
-    lazy judge import -- so a key-present call fails closed even when the Codex
-    CLI is absent. ``ActionPreview.authoritative`` is
+    lazy judge import -- so a key-present call fails closed even when the judge
+    runtime is absent. ``ActionPreview.authoritative`` is
     structurally ``False``; the bundle stays signature-free. BLOCKED previews are
     surfaced so the agent can fix code/rationale before the operator step.
     """
@@ -838,11 +840,13 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             similar_entries=similar_entries,
         )
         try:
-            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_CODEX_CLI, tool_scope=tool_scope)
+            # The agent transport, not codex-cli: codex is refused because its native
+            # shell could read the worker's provider credentials.
+            response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_AGENT, tool_scope=tool_scope)
         except (ModuleNotFoundError, judge_mod.JudgeConfigurationError) as exc:
             # Convert the optional external-runtime failure to the MCP server's
             # clean ImportError outcome rather than a protocol traceback.
-            raise ImportError(f"stage_preview Codex judge unavailable: {exc}") from exc
+            raise ImportError(f"stage_preview judge unavailable: {exc}") from exc
         verdict = _verdict_str(response.verdict)
         preview = ActionPreview(
             verdict=verdict,
@@ -1012,10 +1016,11 @@ _TOOLS.update(
         ),
         "stage_preview": _ToolSpec(
             description=(
-                "Fully verify the sign bundle, run the read-only Codex CLI judge over each "
+                "Fully verify the sign bundle, run the read-only agent judge (through the protected "
+                "judge supervisor) over each "
                 "new_judgment action, reverify before overwrite, and record a NON-authoritative "
                 "preview verdict (never signs; stale bundles receive no judge call). "
-                "Requires an installed + authenticated Codex CLI and the [mcp] extra."
+                "Requires the installed judge supervisor and the [mcp] extra."
             ),
             input_schema={
                 "type": "object",

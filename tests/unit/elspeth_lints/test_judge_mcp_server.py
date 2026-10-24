@@ -31,7 +31,7 @@ from elspeth_lints.core.allowlist import (
     JudgeVerdict,
     compute_judge_metadata_signature,
 )
-from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI
+from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_AGENT, TRANSPORT_CODEX_CLI
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.mcp import server as judge_server
@@ -341,7 +341,9 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "sign-bundle" in payload["sign_bundle_command"]
     assert str(written) in payload["sign_bundle_command"]
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in payload["sign_bundle_command"]
-    assert "--judge-transport codex-cli" in payload["sign_bundle_command"]
+    # codex-cli is disabled (its native shell could read the worker's provider home).
+    assert "--judge-transport agent" in payload["sign_bundle_command"]
+    assert "codex-cli" not in payload["sign_bundle_command"]
     assert "--judge-tools readonly" in payload["sign_bundle_command"]
     assert "--dry-run" in payload["sign_bundle_command"]
 
@@ -972,8 +974,8 @@ def _fake_response(verdict: JudgeVerdict, rationale: str) -> SimpleNamespace:
     return SimpleNamespace(
         verdict=verdict,
         judge_rationale=rationale,
-        model_id="codex-preview-model",
-        judge_transport=TRANSPORT_CODEX_CLI,
+        model_id="agent-preview-model",
+        judge_transport=TRANSPORT_AGENT,
     )
 
 
@@ -1006,7 +1008,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     # Read-only agent posture (defense-in-depth): the patched judge was reached
     # via the agent transport with exactly the read-only tool scope.
     assert mock_scope.called
-    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_CODEX_CLI
+    assert mock_call.call_args.kwargs["transport"] == TRANSPORT_AGENT
     assert mock_call.call_args.kwargs["tool_scope"] is sentinel_scope
 
     bundle = read_bundle(staged_dir / f"{bundle_id}.json")
@@ -1014,7 +1016,7 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     assert previews and all(p is not None for p in previews)
     assert all(p.authoritative is False for p in previews)
     assert all(p.verdict == "ACCEPTED" for p in previews)
-    assert all(p.transport == TRANSPORT_CODEX_CLI for p in previews)
+    assert all(p.transport == TRANSPORT_AGENT for p in previews)
     # Bundle still serializes no signature.
     text = (staged_dir / f"{bundle_id}.json").read_text(encoding="utf-8")
     assert "judge_metadata_signature" not in text
@@ -1112,19 +1114,41 @@ def test_stage_preview_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
 
 
-def test_stage_preview_refuses_the_disabled_codex_transport_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """stage_preview judges through codex-cli, which is refused before any worker or local transport."""
-    ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
-    worker = create_autospec(judge_rpc.call_worker, spec_set=True, side_effect=AssertionError("codex request reached the worker"))
+def test_stage_preview_judges_through_the_agent_worker_and_never_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Key-free preview keeps working under the confinement: agent transport, via the worker."""
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    observed = judge._TransportResult(
+        json.dumps({"verdict": "ACCEPTED", "rationale": "boundary is genuine", "confidence": 0.9, "should_use_decorator": None}),
+        "agent-served",
+        10,
+        None,
+    )
+    worker = create_autospec(judge_rpc.call_worker, spec_set=True, return_value=observed)
     monkeypatch.setattr(judge_rpc, "call_worker", worker)
-    local = create_autospec(judge._TRANSPORTS[TRANSPORT_CODEX_CLI], spec_set=True, side_effect=AssertionError("local fallback"))
-    monkeypatch.setitem(judge._TRANSPORTS, TRANSPORT_CODEX_CLI, local)
+    codex = create_autospec(judge._TRANSPORTS[TRANSPORT_CODEX_CLI], spec_set=True, side_effect=AssertionError("codex transport used"))
+    monkeypatch.setitem(judge._TRANSPORTS, TRANSPORT_CODEX_CLI, codex)
+    with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
+    assert outcome.is_error is False, outcome.text
+    worker.assert_called_once()
+    assert worker.call_args.kwargs["transport"] == TRANSPORT_AGENT
+    codex.assert_not_called()
+    previews = [a.preview for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.kind == "justify"]
+    assert previews and all(p is not None and p.transport == TRANSPORT_AGENT for p in previews)
+
+
+def test_stage_preview_without_installed_supervisor_refuses_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supervisor absent: the real agent route refuses at admission; no local transport runs."""
+    ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    monkeypatch.setattr(judge_rpc, "ADMISSION_PATH", tmp_path / "absent-judge-workers.json")
+    for transport in (TRANSPORT_AGENT, TRANSPORT_CODEX_CLI):
+        local = create_autospec(judge._TRANSPORTS[transport], spec_set=True, side_effect=AssertionError(f"local {transport} fallback"))
+        monkeypatch.setitem(judge._TRANSPORTS, transport, local)
     with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
         outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
     assert outcome.is_error is True
-    assert "codex-cli judge transport is disabled" in outcome.text
-    worker.assert_not_called()
-    local.assert_not_called()
+    assert "protected judge supervisor admission is unavailable or invalid" in outcome.text
+    assert "codex" not in outcome.text.lower()
 
 
 def test_stage_preview_still_fails_closed_with_judge_agent_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
