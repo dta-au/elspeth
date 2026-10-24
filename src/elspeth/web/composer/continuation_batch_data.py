@@ -260,9 +260,9 @@ def _joint(
         _safe([outcome.error_class, outcome.error_message], env_ref_names)
         response = outcome.response
         if type(response) is ToolResult:
-            previous = result_tools.setdefault(id(response), outcome.call.function.name)
-            if previous != outcome.call.function.name:
+            if id(response) in result_tools and result_tools[id(response)] != outcome.call.function.name:
                 _fail("one retained ToolResult cannot have two selected tool contracts")
+            result_tools[id(response)] = outcome.call.function.name
             # Select the actual nominal response owner before projecting JSON;
             # ToolResult.to_dict() may still contain PluginSchemaInfo/models.
             envelope = (
@@ -1507,9 +1507,9 @@ def _check_memory_completion(
         nominal = result
     else:
         _fail("memory completion lost its actual nominal result")
-    previous = result_tools.setdefault(id(nominal), tool_name)
-    if previous != tool_name:
+    if id(nominal) in result_tools and result_tools[id(nominal)] != tool_name:
         _fail("one retained ToolResult cannot have two selected tool contracts")
+    result_tools[id(nominal)] = tool_name
     receipt = decode_retained_tool_receipt(call.owner_tool_receipt_json, env_ref_names=env_ref_names)
     if receipt.effect_key != f"memory:{call.tool_call.id}":
         _fail("memory completion receipt belongs to another effect")
