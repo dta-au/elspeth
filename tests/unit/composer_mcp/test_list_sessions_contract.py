@@ -288,3 +288,34 @@ async def test_tc020_refused_list_extra_withholds_raw_arguments(tmp_path: Path, 
     assert synthetic not in (tmp_path / f"{sid}.json").read_text()
     assert (await _call(server, "list_sessions", {})).isError is False
     verify_events_sidecar_integrity(events_sidecar_path(tmp_path, sid))
+
+
+@pytest.mark.asyncio
+async def test_tc018_listing_admission_is_per_entry_and_not_bounded_by_listing_width(tmp_path: Path) -> None:
+    """TC-018 red-team F1: admitting the whole listing hit the detector's width and node bounds.
+
+    A listing wider than the detector's ``max_width`` (512) or ``max_nodes``
+    (4096) was refused as a "credential" although every name was benign.
+    Each entry is admitted on its own, so a large benign listing succeeds and
+    one recognized name still refuses the listing whole.
+    """
+    manager = SessionManager(tmp_path)
+    _, template = manager.new_session(name="benign")
+    count = 1030  # above max_width (512) and, at four nodes per entry, above max_nodes (4096)
+    ids = [f"{index:012x}" for index in range(count)]
+    for sid in ids:
+        manager.save(sid, template)
+    server = _server(tmp_path)
+    listed = await _call(server, "list_sessions", {})
+    assert listed.isError is False
+    assert [entry["session_id"] for entry in _payload(listed)["data"]["sessions"]] == sorted(ids)
+
+    synthetic = "sk-" + "c" * 24
+    poisoned = tmp_path / f"{ids[-1]}.json"
+    disk = json.loads(poisoned.read_text())
+    disk["metadata"]["name"] = synthetic
+    poisoned.write_text(json.dumps(disk))
+    refused = await _call(server, "list_sessions", {})
+    assert refused.isError is True
+    assert isinstance(refused.content[0], TextContent)
+    assert synthetic not in refused.content[0].text

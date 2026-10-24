@@ -598,9 +598,13 @@ def _dispatch_session_tool(
 
     if tool_name == "list_sessions":
         sessions = manager.list_sessions()
-        # TC-018: listed names are read from saved files. Admit the whole
-        # listing before it reaches the response or audit; refuse fail-closed.
-        require_no_credential_material(sessions, surface="composer_mcp_session_listing")
+        # TC-018: listed names are read from saved files. Admit every entry
+        # before the listing reaches the response or audit, and refuse the
+        # whole listing fail-closed on any recognized value. Entries are
+        # admitted one at a time: one scan of the whole list would hit the
+        # detector's width and node bounds and refuse a large benign listing.
+        for listed_session in sessions:
+            require_no_credential_material(listed_session, surface="composer_mcp_session_listing")
         return {
             "success": True,
             "data": {"sessions": sessions},
