@@ -62,13 +62,14 @@ ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
-### Canonical scripts: worktree cleanup, branch safety, full-suite gate
+### Canonical scripts: worktree cleanup, branch safety, full-suite gate, work at risk
 
-Three scripts under `scripts/` are the canonical way to do the tasks agents
+Four scripts under `scripts/` are the canonical way to do the tasks agents
 otherwise improvise by hand (the header of each one cites the transcript
-measurement and the incident behind every rule it enforces). All three are
-**dry-run by default** and print the exact commands they would run; nothing
-changes without `--execute`. Prefer them over retyping the underlying git and
+measurement and the incident behind every rule it enforces). The three that
+can act are **dry-run by default** and print the exact commands they would
+run; nothing changes without `--execute`. `work-at-risk.sh` only reads.
+Prefer them over retyping the underlying git and
 pytest incantations, and fix the script when a rule is wrong rather than
 working around it.
 
@@ -102,6 +103,13 @@ working around it.
   `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
   suites are on the box. From an agent shell use `--execute --detach` and poll
   the printed `.done` path. The suite is never piped through `tail`.
+- `scripts/work-at-risk.sh [--count-all]` reports, for every registered
+  worktree, the hours since the oldest uncommitted or untracked file, the
+  hours since the last commit, the `src/elspeth` copies under gitignored paths
+  (which `git status` cannot see), and the size of `.claude/lanes/`. It WARNs
+  on uncommitted work older than 12 h, on any ignored source copy, and on
+  lanes over 10 GB, and shows DIRTY even when a tree is IN-USE. Exit 1 on any
+  WARN. Run it at session start and before any handover.
 
 ## Gotchas
 
@@ -236,6 +244,12 @@ working around it.
 - Coordination and lane state go under `.claude/lanes/<run>/` — the
   `lane-manager` convention, already gitignored and already named in Commit
   Hygiene as never-stage.
+- `.claude/lanes/<run>/` holds notes and logs only. Never put a source tree
+  or a `.db` copy there; name the store's path instead. Delete a lane
+  directory 14 days after its branch merges or is abandoned.
+- Source under a gitignored path is a defect, not lane state. Work lives on
+  a branch in a worktree (2026-10-24: two trees went 62 h and 66 h without a
+  commit while 1,287 gitignored copies of `src/elspeth` held the work).
 - A durable deliverable (a review, an inventory, a design note, an evidence
   bundle) goes to a tracked path under `docs/`. Confirm it with
   `git check-ignore -v <path>` before writing: no output means the path is
@@ -260,6 +274,9 @@ working around it.
   output. `scripts/branch-safety-check.sh` checks the staged set for exactly
   those paths, for user-home paths, and for credential-shaped strings; run it
   before every commit, rebase or push.
+- Commit work in progress at every agent stop and at least every 4 h of
+  edits. Rewriting those commits before merge is fine; losing the work is
+  not. `scripts/work-at-risk.sh` shows what is still uncommitted.
 - Run the lint gate (ruff) locally before pushing; do not rely on CI to
   surface unused imports or formatting.
 
