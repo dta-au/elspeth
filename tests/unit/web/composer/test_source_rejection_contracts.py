@@ -22,6 +22,7 @@ from elspeth.web.composer.audit import BufferingRecorder, ComposerToolFailure
 from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
@@ -746,7 +747,7 @@ async def test_source_outer_fault_keeps_distinct_integrity_and_completed_outcome
             {"id": "source_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     recorder = BufferingRecorder()
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)

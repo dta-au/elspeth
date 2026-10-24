@@ -17,6 +17,7 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
@@ -518,7 +519,7 @@ async def test_discovery_outer_fault_preserves_prior_success_and_completed_refus
             {"id": "discovery_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)
     with pytest.raises(ComposerPluginCrashError) as caught:
