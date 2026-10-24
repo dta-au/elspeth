@@ -15,6 +15,7 @@ from mcp.types import CallToolRequest, CallToolRequestParams, ListToolsRequest, 
 from elspeth.composer_mcp.audit import JsonlEventRecorder, verify_events_sidecar_integrity
 from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionManager
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.credential_guard import (
@@ -326,13 +327,18 @@ async def test_contaminated_old_state_blocks_loading_a_clean_target(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("already_active", [False, True], ids=["pre-resolution", "active-session"])
-async def test_tc020_refused_extra_argument_survives_immediate_or_buffered_audit(tmp_path: Path, already_active: bool) -> None:
-    """KNOWN_NONCONFORMANCE: guard precedes schema but follows raw capture."""
+async def test_tc020_refused_extra_argument_is_withheld_from_immediate_or_buffered_audit(tmp_path: Path, already_active: bool) -> None:
+    """TC-020 (#327): refused arguments reach audit only as a value-free stand-in.
+
+    Formerly KNOWN_NONCONFORMANCE: the raw canonical arguments were captured
+    before credential admission and recorded after it refused.
+    """
     write_session(tmp_path)
     synthetic = "sk-" + "a" * 24
     args = {"session_id": TARGET, "extra": synthetic}
-    with pytest.raises(CredentialMaterialRefused):
-        require_no_credential_material_for_tool("load_session", args, surface="synthetic-positive-control")
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool("load_session", args, surface="composer_mcp_tool_arguments")
+    withheld = {"_arguments_withheld": caught.value.to_payload()}
     require_no_credential_material_for_tool("load_session", {"session_id": TARGET, "extra": "benign"}, surface="synthetic-negative-control")
     server = local_server(tmp_path)
     if already_active:
@@ -346,8 +352,12 @@ async def test_tc020_refused_extra_argument_survives_immediate_or_buffered_audit
     else:
         await payload(server, "load_session", {"session_id": TARGET})
         sid = TARGET
-    retained = [row for row in rows(tmp_path, sid) if json.loads(row["arguments_canonical"]) == args]
-    assert len(retained) == 1 and retained[0]["status"] == "plugin_crash"
+    refused_rows = [row for row in rows(tmp_path, sid) if row["tool_name"] == "load_session" and row["status"] == "plugin_crash"]
+    assert len(refused_rows) == 1
+    assert refused_rows[0]["error_class"] == "CredentialMaterialRefused"
+    assert json.loads(refused_rows[0]["arguments_canonical"]) == withheld
+    assert refused_rows[0]["arguments_hash"] == stable_hash(withheld) != stable_hash(args)
+    assert synthetic not in (tmp_path / f"{sid}.events.jsonl").read_text()
     assert synthetic not in (tmp_path / f"{TARGET}.json").read_text()
 
 

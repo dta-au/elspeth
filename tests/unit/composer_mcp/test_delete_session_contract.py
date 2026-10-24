@@ -17,6 +17,7 @@ from elspeth.composer_mcp import session as session_module
 from elspeth.composer_mcp.audit import JsonlEventRecorder, verify_events_sidecar_integrity
 from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionManager, SessionNotFoundError
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.credential_guard import (
@@ -301,14 +302,19 @@ async def test_disk_recognized_content_is_not_read_while_current_state_is_guarde
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True], ids=["buffered", "immediate"])
-async def test_tc020_refused_extra_argument_retained_without_target_deletion(tmp_path: Path, active: bool) -> None:
-    """KNOWN_NONCONFORMANCE TC020: business refusal is not safe raw-audit retention."""
+async def test_tc020_refused_extra_argument_withheld_without_target_deletion(tmp_path: Path, active: bool) -> None:
+    """TC-020 (#327): a refused delete keeps the target and withholds the raw arguments.
+
+    Formerly KNOWN_NONCONFORMANCE: the business refusal was right but the raw
+    canonical arguments were retained in the audit row.
+    """
     target = write_target(tmp_path)
     before = target.read_bytes()
     synthetic = "sk-" + "a" * 24
     arguments = {"session_id": TARGET, "extra": synthetic}
-    with pytest.raises(CredentialMaterialRefused):
-        require_no_credential_material_for_tool("delete_session", arguments, surface="synthetic-positive")
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool("delete_session", arguments, surface="composer_mcp_tool_arguments")
+    withheld = {"_arguments_withheld": caught.value.to_payload()}
     require_no_credential_material_for_tool("delete_session", {"session_id": TARGET, "extra": "benign"}, surface="synthetic-negative")
     server = local_server(tmp_path)
     if active:
@@ -321,8 +327,12 @@ async def test_tc020_refused_extra_argument_retained_without_target_deletion(tmp
         assert not list(tmp_path.glob("*.events.jsonl"))
         current = await payload(server, "new_session", {"name": "Resolution"})
         sid = current["data"]["session_id"]
-    retained = [event for event in rows(tmp_path, sid) if json.loads(event["arguments_canonical"]) == arguments]
-    assert len(retained) == 1 and retained[0]["status"] == "plugin_crash"
+    refused_rows = [event for event in rows(tmp_path, sid) if event["tool_name"] == "delete_session"]
+    assert len(refused_rows) == 1 and refused_rows[0]["status"] == "plugin_crash"
+    assert refused_rows[0]["error_class"] == "CredentialMaterialRefused"
+    assert json.loads(refused_rows[0]["arguments_canonical"]) == withheld
+    assert refused_rows[0]["arguments_hash"] == stable_hash(withheld) != stable_hash(arguments)
+    assert synthetic not in (tmp_path / f"{sid}.events.jsonl").read_text()
     assert (await payload(server, "get_pipeline_state", {}))["state"] == current["state"]
 
 

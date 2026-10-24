@@ -17,6 +17,7 @@ from elspeth.composer_mcp import session as session_module
 from elspeth.composer_mcp.audit import JsonlEventRecorder, verify_events_sidecar_integrity
 from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionManager
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_for_tool
 from elspeth.web.dependencies import create_catalog_service
@@ -220,11 +221,17 @@ async def test_audit_failure_after_create_leaves_file_and_active_state_retry_add
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True], ids=["pre-resolution", "active-session"])
-async def test_tc020_refused_synthetic_control_is_retained_in_audit_arguments(tmp_path: Path, active: bool) -> None:
-    """KNOWN_NONCONFORMANCE TC-020 characterization, not a security PASS."""
+async def test_tc020_refused_synthetic_control_is_withheld_from_audit_arguments(tmp_path: Path, active: bool) -> None:
+    """TC-020 (#327): refused arguments reach audit only as a value-free stand-in.
+
+    Formerly KNOWN_NONCONFORMANCE: the raw canonical name was captured before
+    credential admission and recorded after it refused. Not a security PASS
+    for real credentials; synthetic values only.
+    """
     synthetic = "sk-" + "a" * 24
-    with pytest.raises(CredentialMaterialRefused):
-        require_no_credential_material_for_tool("new_session", {"name": synthetic}, surface="synthetic-control")
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool("new_session", {"name": synthetic}, surface="composer_mcp_tool_arguments")
+    withheld = {"_arguments_withheld": caught.value.to_payload()}
     require_no_credential_material_for_tool("new_session", {"name": "benign-label"}, surface="synthetic-negative-control")
     server = local_server(tmp_path)
     if active:
@@ -241,9 +248,13 @@ async def test_tc020_refused_synthetic_control_is_retained_in_audit_arguments(tm
     else:
         assert (tmp_path / f"{session_id}.json").read_bytes() == before
     audit = rows(tmp_path, session_id)
-    refused_rows = [row for row in audit if json.loads(row["arguments_canonical"]) == {"name": synthetic}]
+    refused_rows = [row for row in audit if row["status"] == "plugin_crash"]
     assert len(refused_rows) == 1
-    assert refused_rows[0]["status"] == "plugin_crash"
+    assert refused_rows[0]["tool_name"] == "new_session"
+    assert refused_rows[0]["error_class"] == "CredentialMaterialRefused"
+    assert json.loads(refused_rows[0]["arguments_canonical"]) == withheld
+    assert refused_rows[0]["arguments_hash"] == stable_hash(withheld) != stable_hash({"name": synthetic})
+    assert synthetic not in (tmp_path / f"{session_id}.events.jsonl").read_text()
     assert synthetic not in (tmp_path / f"{session_id}.json").read_text()
     assert (await payload(server, "get_pipeline_state", {}))["state"] == clean["state"]
 

@@ -251,12 +251,17 @@ async def test_tc018_disk_name_is_admitted_before_list_response_and_audit(tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True], ids=["buffered", "active"])
-async def test_tc020_refused_list_extra_retains_raw_arguments(tmp_path: Path, active: bool) -> None:
-    """KNOWN_NONCONFORMANCE: admission refusal does not sanitize audit args."""
+async def test_tc020_refused_list_extra_withholds_raw_arguments(tmp_path: Path, active: bool) -> None:
+    """TC-020 (#327): refused arguments reach audit only as a value-free stand-in.
+
+    Formerly KNOWN_NONCONFORMANCE: admission refused but the audit row kept
+    the raw canonical arguments.
+    """
     synthetic = "sk-" + "b" * 24
     arguments = {"extra": synthetic}
-    with pytest.raises(CredentialMaterialRefused):
-        require_no_credential_material_for_tool("list_sessions", arguments, surface="synthetic-positive")
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        require_no_credential_material_for_tool("list_sessions", arguments, surface="composer_mcp_tool_arguments")
+    withheld = {"_arguments_withheld": caught.value.to_payload()}
     require_no_credential_material_for_tool("list_sessions", {"extra": "benign"}, surface="synthetic-negative")
     server = _server(tmp_path)
     if active:
@@ -276,7 +281,9 @@ async def test_tc020_refused_list_extra_retains_raw_arguments(tmp_path: Path, ac
     assert len(rows) == 1
     assert rows[0]["status"] == "plugin_crash"
     assert rows[0]["error_class"] == rows[0]["error_message"] == "CredentialMaterialRefused"
-    assert rows[0]["arguments_canonical"] == canonical_json(arguments)
+    assert rows[0]["arguments_canonical"] == canonical_json(withheld)
+    assert rows[0]["arguments_hash"] == stable_hash(withheld) != stable_hash(arguments)
+    assert synthetic not in events_sidecar_path(tmp_path, sid).read_text()
     assert rows[0]["result_canonical"] is None
     assert synthetic not in (tmp_path / f"{sid}.json").read_text()
     assert (await _call(server, "list_sessions", {})).isError is False

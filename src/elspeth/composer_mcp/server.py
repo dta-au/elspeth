@@ -68,6 +68,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_yaml,
 )
 from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
     require_no_credential_material,
     require_no_credential_material_for_tool,
     require_no_credential_material_in_state,
@@ -826,6 +827,28 @@ def create_server(
             error_message = type(exc).__name__
 
         try:
+            # TC-020: admit the caller's arguments before anything else uses
+            # them. On refusal, replace the captured canonical arguments and
+            # their hash with a value-free stand-in before the finally block
+            # records them, so the refused value reaches neither the active
+            # sidecar nor the pre-resolution buffer. The refusal payload is
+            # candidate-free by construction (fixed detail, category, surface,
+            # detector version): no argument key or value is retained.
+            # _dispatch_tool repeats this guard for its direct callers.
+            try:
+                require_no_credential_material_for_tool(
+                    name, arguments, surface="composer_mcp_tool_arguments", credential_state=state_ref[0]
+                )
+            except CredentialMaterialRefused as refusal:
+                withheld_arguments = {"_arguments_withheld": refusal.to_payload()}
+                arguments_canonical = canonical_json(withheld_arguments)
+                arguments_hash = stable_hash(withheld_arguments)
+                _capture_plugin_crash(refusal)
+                raise
+            except Exception as exc:
+                _capture_plugin_crash(exc)
+                raise
+
             if canonicalization_failed is not None:
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
                 return _argument_error_result(canonicalization_failed, ToolArgumentErrorCategory.CANONICALIZATION)
