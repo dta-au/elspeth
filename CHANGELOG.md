@@ -4,6 +4,65 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
+## Unreleased (0.8.10)
+
+- **Cooperative shutdown preserves unstarted work.** Intake and work claims
+  honor shutdown at their next safe boundary. Explicit framework shutdown
+  during startup or readiness records `INTERRUPTED`. Resume cancellation
+  preserves checkpointed progress, and incomplete sources remain refused.
+- **Source capture observes cancellation between advances.** Partial snapshots
+  are not published. A snapshot whose publication has already completed remains
+  available for resume, including when the original input is unavailable.
+  Source and audit failures retain their existing failure precedence.
+- **Rejected sparse rows do not grow the accepted schema.** JSON, S3, Azure Blob
+  and Dataverse sources validate a row before publishing its schema growth.
+- **Fresh sink members use the configured write path.** Unfinished members with
+  no durable `COMMIT` history take their configured first-write path. Prior
+  `COMMIT` attempts, including ambiguous or unexpected whole-effect attempts,
+  retain conservative recovery. Nested coalesce merges continue through the
+  nearest enclosing bound scope, including a collector scope, during execution
+  and cold resume.
+- **Unusable LLM text retains its actual classification and audit outcome.**
+  Azure, Bedrock and Gateway require affirmative response evidence for a policy
+  refusal. Output-budget exhaustion, unsupported tool calls and other unusable
+  responses retain client-error classifications. Live SDK responses rejected
+  for null or required nonempty text record `ERROR` before error telemetry.
+  Generic SDK clients retain their existing blank-string compatibility.
+  Gateway profiles requiring the `usage` capability now require at least one
+  valid reported token count; partial usage and explicit zero remain valid.
+- **Lint and test evidence preserves its subject.** AST fingerprints use one
+  representation across Python 3.12 and 3.13. Boundary evidence is associated
+  with the asserted subject, and SQLite ownership checks follow the writer's
+  captured dialect and connection bindings. Partial-failure audit tests require
+  exact lineage for every fixture token. Frozen historical catalogs retain their
+  bytes and profile pins while maintained v3 checks current runtime policy.
+- **Payload purge remains offline-only.** CLI help, API documentation and the
+  maintenance guides state the stop-writers prerequisite and the requirement for
+  one Landscape reference domain per payload namespace. Shared-store purge across
+  independent databases is unsupported. A restored database requires an isolated
+  payload copy. The command does not acquire maintenance exclusion.
+
+Framework retry-shutdown diagnostics now use `RetryShutdownRequestedError`, an
+`InterruptedError` subtype. Persisted pre-attempt `exception_type` values change
+from `InterruptedError` to `RetryShutdownRequestedError`; the shutdown reason and
+message are unchanged. Ordinary plugin-raised `InterruptedError` keeps its
+existing failure behavior.
+
+Replay remains conservative. Previously recorded Azure/Bedrock blank-text
+`SUCCESS` calls retain their recorded outcome when copied, then fail text
+admission. Newly recorded unusable SDK `ERROR` responses use the existing replay
+refusal instead of dispatching a provider request. Gateway replay of historical
+null or blank responses, or newly rejected required usage, can refuse with
+`AuditIntegrityError` when the corrected semantic result differs from the recorded
+call. History is not rewritten.
+
+Existing Python 3.13 AST identities remain compatible with the canonical form.
+Older Python 3.12 identities require reinspection where they differ; moved lint
+bindings also require operator review. This change does not refresh signatures.
+
+These engine notes describe source changes. Combined-release qualification,
+operator signature clearance, publication and deployment remain separate.
+
 ## 0.8.9 - 2026-10-21
 
 This release combines the Composer work developed under 0.8.7, Azure Container

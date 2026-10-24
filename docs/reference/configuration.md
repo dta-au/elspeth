@@ -1807,6 +1807,11 @@ at boot rather than per row. Gateway error codes (`invalid_request`,
 `upstream_unauthorized`, and the rest) map to definite retryable or
 non-retryable outcomes instead of being inferred from an HTTP status.
 
+When `usage` is required, each completion must report at least one valid
+supported token count. Partial usage, including cache or reasoning counts,
+and explicitly reported zero counts are accepted; absent or entirely malformed
+usage fails admission. Optional missing usage remains unknown.
+
 Before pointing a pipeline at any endpoint you do not operate, read
 [Custom LLM Endpoints](environment-variables.md#custom-llm-endpoints) — it
 sets out what ELSPETH can and cannot tell you about the endpoint you chose.

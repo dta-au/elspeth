@@ -2,6 +2,9 @@
 
 import re
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web import key_derivation
@@ -56,6 +59,34 @@ def test_replica_schema_cutover_belongs_to_0_8_1() -> None:
     assert "then install 0.8.1" in release_0_8_1
     assert "`SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_0_8_0
     assert "`SQLITE_SCHEMA_EPOCH` advances from 29 to 38" in release_0_8_0
+
+
+def test_historical_release_epoch_is_independent_of_future_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_replica_schema_cutover_belongs_to_0_8_1()
+    monkeypatch.setattr(f"{__name__}.SQLITE_SCHEMA_EPOCH", SQLITE_SCHEMA_EPOCH + 1)
+    test_replica_schema_cutover_belongs_to_0_8_1()
+
+
+def test_current_runbook_still_requires_current_epoch(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_current_cutover_and_verification_use_live_schema_epochs()
+    monkeypatch.setattr(f"{__name__}.SQLITE_SCHEMA_EPOCH", SQLITE_SCHEMA_EPOCH + 1)
+    with pytest.raises(AssertionError):
+        test_current_cutover_and_verification_use_live_schema_epochs()
+
+
+def test_historical_prose_mutation_is_still_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = Path.read_text
+    marker = "`SQLITE_SCHEMA_EPOCH` advances from 38 to 49"
+    changelog = Path("CHANGELOG.md").resolve()
+    assert original(changelog).count(marker) == 1
+
+    def changed(path: Path, *args: Any, **kwargs: Any) -> str:
+        text = original(path, *args, **kwargs)
+        return text.replace(marker, "`SQLITE_SCHEMA_EPOCH` advances from 38 to 50") if path.resolve() == changelog else text
+
+    monkeypatch.setattr(Path, "read_text", changed)
+    with pytest.raises(AssertionError):
+        test_replica_schema_cutover_belongs_to_0_8_1()
 
 
 def test_key_derivation_docstring_cites_a_runbook_section_that_exists() -> None:
