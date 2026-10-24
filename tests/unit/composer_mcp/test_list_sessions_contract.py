@@ -210,8 +210,14 @@ async def test_ordinary_extra_is_schema_error_and_paired_valid_list_still_works(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True], ids=["buffered", "active"])
-async def test_tc018_disk_name_reaches_list_response_and_audit(tmp_path: Path, active: bool) -> None:
-    """KNOWN_NONCONFORMANCE: parsed file metadata lacks new-value admission."""
+async def test_tc018_disk_name_is_admitted_before_list_response_and_audit(tmp_path: Path, active: bool) -> None:
+    """TC-018 (#327): listed disk metadata passes credential admission first.
+
+    Formerly KNOWN_NONCONFORMANCE: a recognized synthetic name in a saved
+    file reached the listing response and its audit row. The listing now
+    refuses whole, fail-closed, and neither the response nor any audit row
+    carries the disk value. No real credential.
+    """
     synthetic = "sk-" + "a" * 24
     with pytest.raises(CredentialMaterialRefused):
         require_no_credential_material_for_tool("new_session", {"name": synthetic}, surface="synthetic-positive")
@@ -227,19 +233,19 @@ async def test_tc018_disk_name_reaches_list_response_and_audit(tmp_path: Path, a
     if active:
         sid = await _new(server)
     response = await _call(server, "list_sessions", {})
-    assert response.isError is False
-    payload = _payload(response)
-    assert {"session_id": "aaaaaaaaaaaa", "name": synthetic, "version": 1} in payload["data"]["sessions"]
-    assert synthetic not in json.dumps(payload["state"])
+    assert response.isError is True
+    assert isinstance(response.content[0], TextContent)
+    assert synthetic not in response.content[0].text
     assert path.read_bytes() == before
     if not active:
         assert not list(tmp_path.glob("*.events.jsonl"))
         sid = await _new(server)
-    row = next(row for row in _rows(tmp_path, sid) if row["tool_name"] == "list_sessions")
-    assert row["status"] == "success"
-    assert row["result_canonical"] == canonical_json(payload)
-    assert synthetic in row["result_canonical"]
-    assert row["result_hash"] == stable_hash(payload)
+    list_rows = [row for row in _rows(tmp_path, sid) if row["tool_name"] == "list_sessions"]
+    assert len(list_rows) == 1
+    assert list_rows[0]["status"] == "plugin_crash"
+    assert list_rows[0]["error_class"] == list_rows[0]["error_message"] == "CredentialMaterialRefused"
+    assert list_rows[0]["result_canonical"] is None and list_rows[0]["result_hash"] is None
+    assert synthetic not in events_sidecar_path(tmp_path, sid).read_text()
     verify_events_sidecar_integrity(events_sidecar_path(tmp_path, sid))
 
 

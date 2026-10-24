@@ -262,7 +262,11 @@ async def test_nonactive_delete_does_not_parse_target_or_erase_sidecar(tmp_path:
 
 @pytest.mark.asyncio
 async def test_disk_recognized_content_is_not_read_while_current_state_is_guarded(tmp_path: Path) -> None:
-    """DS-C4: safe deletion has no disk-content egress; TC018 load only setup."""
+    """DS-C4: safe deletion has no disk-content egress.
+
+    Since TC-018 the server refuses a contaminated load, so the old-state
+    guard that blocks deletion is exercised at the dispatcher instead.
+    """
     synthetic = "sk-" + "a" * 24
     dirty = state(synthetic)
     with pytest.raises(CredentialMaterialRefused):
@@ -276,14 +280,23 @@ async def test_disk_recognized_content_is_not_read_while_current_state_is_guarde
     assert deleted["success"] is True and synthetic not in json.dumps(deleted)
     assert not target.exists() and synthetic not in (tmp_path / f"{sid}.events.jsonl").read_text()
     target = write_target(tmp_path, dirty)
-    contaminated = local_server(tmp_path)
-    loaded = await payload(contaminated, "load_session", {"session_id": TARGET})  # Existing TC018 setup, not a conformance claim.
-    assert loaded["state"]["metadata"]["name"] == synthetic
+    fresh = local_server(tmp_path)
+    refused_load = await call(fresh, "load_session", {"session_id": TARGET})
+    assert refused_load.isError is True and synthetic not in refused_load.content[0].text
     before = target.read_bytes()
-    refused = await call(contaminated, "delete_session", {"session_id": TARGET})
-    assert refused.isError is True and synthetic not in refused.content[0].text
+    checkout_ref: list[Any] = [None]
+    with pytest.raises(CredentialMaterialRefused):
+        _dispatch_tool(
+            "delete_session",
+            {"session_id": TARGET},
+            dirty,
+            create_catalog_service(),
+            tmp_path,
+            session_manager=SessionManager(tmp_path),
+            session_checkout_ref=checkout_ref,
+        )
     assert target.read_bytes() == before
-    assert rows(tmp_path, TARGET)[-1]["error_class"] == "CredentialMaterialRefused"
+    assert not (tmp_path / f"{TARGET}.events.jsonl").exists()
 
 
 @pytest.mark.asyncio

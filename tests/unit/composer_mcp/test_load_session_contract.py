@@ -231,8 +231,18 @@ async def test_corrupt_file_is_crash_not_notfound_and_preserves_old_baseline(tmp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("recognized", [False, True], ids=["benign-control", "tc018-recognized"])
-async def test_tc018_loaded_metadata_egress_precedes_new_state_guard(tmp_path: Path, recognized: bool) -> None:
-    """Benign PASS / existing TC018 nonconformance; no real credential."""
+@pytest.mark.parametrize("already_active", [False, True], ids=["pre-resolution", "active-session"])
+async def test_tc018_loaded_state_is_admitted_before_adoption_response_and_audit(
+    tmp_path: Path, recognized: bool, already_active: bool
+) -> None:
+    """TC-018 (#327): disk-derived state passes credential admission before it is used.
+
+    Formerly KNOWN_NONCONFORMANCE: a recognized synthetic value in a saved
+    file was adopted, returned and audited, and only the next call's
+    old-state guard refused. A refused load must now leave the working
+    graph, diff baseline, checkout and audit scope as they were, and no
+    response or audit row may carry the disk value. No real credential.
+    """
     name = "sk-" + "a" * 24 if recognized else "benign-label"
     state = disk_state(name)
     if recognized:
@@ -242,37 +252,76 @@ async def test_tc018_loaded_metadata_egress_precedes_new_state_guard(tmp_path: P
         require_no_credential_material_in_state(state, surface="synthetic-negative-control")
     before = write_session(tmp_path, state)
     server = local_server(tmp_path)
-    loaded = await payload(server, "load_session", {"session_id": TARGET})
-    assert loaded["success"] is True and loaded["state"]["metadata"]["name"] == name
+    if already_active:
+        active = await payload(server, "new_session", {"name": "Retained"})
+        active_id = active["data"]["session_id"]
+        edited = await payload(server, "set_metadata", {"patch": {"name": "Unsaved"}})
+        diff_before = await payload(server, "diff_pipeline", {})
+    response = await call(server, "load_session", {"session_id": TARGET})
     assert (tmp_path / f"{TARGET}.json").read_bytes() == before
-    event = rows(tmp_path, TARGET)[-1]
-    assert event["status"] == "success" and json.loads(event["result_canonical"])["state"]["metadata"]["name"] == name
-    subsequent = await call(server, "get_pipeline_state", {})
-    if recognized:
-        assert subsequent.isError is True and name not in subsequent.content[0].text
-        assert rows(tmp_path, TARGET)[-1]["error_class"] == "CredentialMaterialRefused"
+    if not recognized:
+        assert response.isError is False
+        loaded = json.loads(response.content[0].text)
+        assert loaded["success"] is True and loaded["state"]["metadata"]["name"] == name
+        event = rows(tmp_path, TARGET)[-1]
+        assert event["status"] == "success" and json.loads(event["result_canonical"])["state"]["metadata"]["name"] == name
+        assert (await payload(server, "get_pipeline_state", {}))["state"] == loaded["state"]
+        return
+    assert response.isError is True and name not in response.content[0].text
+    assert not (tmp_path / f"{TARGET}.events.jsonl").exists()
+    if already_active:
+        assert (await payload(server, "get_pipeline_state", {}))["state"] == edited["state"]
+        assert await payload(server, "diff_pipeline", {}) == diff_before
+        assert (await payload(server, "save_session", {"session_id": active_id}))["success"] is True
+        audit_sid = active_id
     else:
-        assert subsequent.isError is False and json.loads(subsequent.content[0].text)["state"] == loaded["state"]
+        assert list(tmp_path.glob("*.events.jsonl")) == []
+        later = await payload(server, "new_session", {"name": "Later resolution"})
+        audit_sid = later["data"]["session_id"]
+    audit_rows = rows(tmp_path, audit_sid)
+    refused_rows = [row for row in audit_rows if row["tool_name"] == "load_session"]
+    assert len(refused_rows) == 1
+    assert refused_rows[0]["status"] == "plugin_crash"
+    assert refused_rows[0]["error_class"] == refused_rows[0]["error_message"] == "CredentialMaterialRefused"
+    assert refused_rows[0]["result_canonical"] is None and refused_rows[0]["version_after"] is None
+    assert name not in (tmp_path / f"{audit_sid}.events.jsonl").read_text()
+    verify_events_sidecar_integrity(tmp_path / f"{audit_sid}.events.jsonl")
 
 
 @pytest.mark.asyncio
 async def test_contaminated_old_state_blocks_loading_a_clean_target(tmp_path: Path) -> None:
-    """LS-C4 boundary: old-state guard refuses even an attempted clean load."""
+    """LS-C4 boundary: old-state guard refuses even an attempted clean load.
+
+    Since TC-018 the server refuses a contaminated load, so a contaminated
+    working state is no longer reachable through MCP calls. The old-state
+    guard remains as defence in depth and is exercised at the dispatcher.
+    """
     synthetic = "sk-" + "a" * 24
     write_session(tmp_path, disk_state(synthetic))
     clean_id = "b123456789cd"
     SessionManager(tmp_path).save(clean_id, disk_state("Clean"))
     clean_bytes = (tmp_path / f"{clean_id}.json").read_bytes()
     server = local_server(tmp_path)
-    assert (await payload(server, "load_session", {"session_id": TARGET}))["success"] is True
-    refused = await call(server, "load_session", {"session_id": clean_id})
-    assert refused.isError is True and synthetic not in refused.content[0].text
+    refused_dirty = await call(server, "load_session", {"session_id": TARGET})
+    assert refused_dirty.isError is True and synthetic not in refused_dirty.content[0].text
+    loaded_clean = await payload(server, "load_session", {"session_id": clean_id})
+    assert loaded_clean["state"]["metadata"]["name"] == "Clean"
     assert (tmp_path / f"{clean_id}.json").read_bytes() == clean_bytes
-    assert not (tmp_path / f"{clean_id}.events.jsonl").exists()
-    assert rows(tmp_path, TARGET)[-1]["error_class"] == "CredentialMaterialRefused"
-    assert (await call(server, "get_pipeline_state", {})).isError is True
-    fresh = local_server(tmp_path)
-    assert (await payload(fresh, "load_session", {"session_id": clean_id}))["state"]["metadata"]["name"] == "Clean"
+
+    manager = SessionManager(tmp_path)
+    checkout_ref: list[Any] = [None]
+    with pytest.raises(CredentialMaterialRefused):
+        _dispatch_tool(
+            "load_session",
+            {"session_id": clean_id},
+            disk_state(synthetic),
+            create_catalog_service(),
+            tmp_path,
+            session_manager=manager,
+            session_checkout_ref=checkout_ref,
+        )
+    assert checkout_ref == [None]
+    assert (tmp_path / f"{clean_id}.json").read_bytes() == clean_bytes
 
 
 @pytest.mark.asyncio

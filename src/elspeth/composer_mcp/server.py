@@ -67,7 +67,11 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
-from elspeth.web.credential_guard import require_no_credential_material_for_tool, require_no_credential_material_in_state
+from elspeth.web.credential_guard import (
+    require_no_credential_material,
+    require_no_credential_material_for_tool,
+    require_no_credential_material_in_state,
+)
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -580,6 +584,10 @@ def _dispatch_session_tool(
                 "error": f"Session not found: {session_id}",
                 "state": state.to_dict(),
             }
+        # TC-018: the saved file is input this dispatch did not admit. Refuse
+        # recognized credential material before the loaded state is adopted,
+        # returned or audited; the caller's checkout, state and baseline stay.
+        require_no_credential_material_in_state(checkout.state, surface="composer_mcp_loaded_state")
         active_checkout_ref[0] = checkout
         return {
             "success": True,
@@ -589,6 +597,9 @@ def _dispatch_session_tool(
 
     if tool_name == "list_sessions":
         sessions = manager.list_sessions()
+        # TC-018: listed names are read from saved files. Admit the whole
+        # listing before it reaches the response or audit; refuse fail-closed.
+        require_no_credential_material(sessions, surface="composer_mcp_session_listing")
         return {
             "success": True,
             "data": {"sessions": sessions},

@@ -587,6 +587,8 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
 
 _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/composer_mcp/server.py:_dispatch_tool": "mcp_dispatch",
+    # TC-018: a saved session file is admitted before load adopts it.
+    "src/elspeth/composer_mcp/server.py:_dispatch_session_tool": "mcp_loaded_state",
     "src/elspeth/web/composer/graph_recovery.py:qualify_editable_checkpoint": "recovery_checkpoint",
     "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose": "provider_serialization",
     "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state": "provider_disclosure",
