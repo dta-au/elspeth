@@ -231,8 +231,9 @@ def freeze_inputs(root: Path, *, ignored: frozenset[str] = frozenset()) -> Froze
 
 
 def _materialize(frozen: FrozenInputs, target: Path) -> None:
-    # Validation is shared with the external supervisor. It permits only internal
-    # lexical symlinks and verifies every declared digest and resource bound.
+    # Validation is shared with the external supervisor. It permits only symlinks
+    # whose filesystem resolution stays inside the snapshot, and verifies every
+    # declared digest and resource bound.
     from elspeth_lints.core.baseline_rpc import validate_files
 
     records = validate_files(list(frozen.files))

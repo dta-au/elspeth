@@ -12,7 +12,6 @@ import hashlib
 import json
 import math
 import os
-import posixpath
 import socket
 import stat
 import struct
@@ -196,27 +195,45 @@ def validate_files(value: object) -> list[dict[str, str]]:
                 raise JudgeContractError("maintenance symlink target is invalid") from exc
             if not target or target.startswith("/") or "\\" in target or "\x00" in target:
                 raise JudgeContractError("maintenance symlink target is unsafe")
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
-            if target == "." or target == ".." or target.startswith("../"):
-                raise JudgeContractError("maintenance symlink escapes or cycles its snapshot")
-            logical_path(target)
             links[path] = target
     if set(by_path) & directories:
         raise JudgeContractError("maintenance file conflicts with a parent directory")
 
-    def resolved(target: str, active: frozenset[str]) -> str:
-        parts = PurePosixPath(target).parts
-        for count in range(1, len(parts) + 1):
-            prefix = "/".join(parts[:count])
-            if prefix in links:
-                if prefix in active or len(active) >= 40:
-                    raise JudgeContractError("maintenance symlink cycle is unsupported")
-                replacement = posixpath.join(links[prefix], *parts[count:])
-                return resolved(replacement, active | {prefix})
-        return target
+    def resolved(link: str) -> str:
+        # Resolve as the filesystem does: walk from the link's parent and follow
+        # a census link as soon as a prefix names one, so a later ".." climbs from
+        # the followed target. Lexical normalisation would collapse "d/.." first
+        # and miss an escape through a link to a shallower directory.
+        follows = 0
 
-    for path, target in links.items():
-        final = resolved(target, frozenset({path}))
+        def walk(origin: str) -> list[str]:
+            nonlocal follows
+            follows += 1
+            if follows > 40:
+                raise JudgeContractError("maintenance symlink cycle is unsupported")
+            stack = list(PurePosixPath(origin).parent.parts)
+            for part in links[origin].split("/"):
+                if part in {"", "."}:
+                    continue
+                if stack and "/".join(stack) not in directories:
+                    raise JudgeContractError("maintenance symlink has an unavailable target")
+                if part == "..":
+                    if not stack:
+                        raise JudgeContractError("maintenance symlink escapes or cycles its snapshot")
+                    stack.pop()
+                    continue
+                stack.append(part)
+                if "/".join(stack) in links:
+                    stack = walk("/".join(stack))
+            return stack
+
+        final = walk(link)
+        if not final:
+            raise JudgeContractError("maintenance symlink escapes or cycles its snapshot")
+        return logical_path("/".join(final))
+
+    for path in links:
+        final = resolved(path)
         if final not in by_path and final not in directories:
             raise JudgeContractError("maintenance symlink has an unavailable target")
         if path.startswith(final + "/"):

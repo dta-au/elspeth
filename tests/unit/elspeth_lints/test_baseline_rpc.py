@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -54,6 +56,66 @@ def test_snapshot_refuses_unsafe_and_reserved_paths(path: str) -> None:
 def test_snapshot_refuses_external_missing_or_cyclic_symlinks(target: bytes) -> None:
     with pytest.raises(JudgeContractError):
         rpc.validate_files(records([record("loop", target, "120000")]))
+
+
+def _up_link_census(escape_target: bytes) -> list[dict[str, str]]:
+    # p/q/d points at the SHALLOWER directory a, so ".." taken after following
+    # it climbs from a, not from p/q.
+    return records(
+        [
+            record("a/keep.txt", b"k"),
+            record("p/q/d", b"../../a", "120000"),
+            record("p/q/e", escape_target, "120000"),
+            record("p/x", b"lexical"),
+            record("x", b"inside"),
+        ]
+    )
+
+
+def test_snapshot_refuses_up_link_that_climbs_through_a_shallower_symlink() -> None:
+    # Lexically "p/q/d/../../x" is the in-census p/x; the filesystem follows d
+    # to a first, so the link resolves to <root>/../x.
+    with pytest.raises(JudgeContractError, match="escapes"):
+        rpc.validate_files(_up_link_census(b"d/../../x"))
+
+
+def test_snapshot_refuses_plain_up_link_out_of_the_root() -> None:
+    with pytest.raises(JudgeContractError, match="escapes"):
+        rpc.validate_files(_up_link_census(b"../../../x"))
+
+
+@pytest.mark.parametrize("target", [b"d/keep.txt", b"d/../x", b"../x"])
+def test_snapshot_accepts_up_links_that_resolve_inside_the_root(target: bytes) -> None:
+    # d/../x is root/a/../x = root/x on disk (not the lexical p/q/x).
+    files = _up_link_census(target)
+    assert rpc.validate_files(files) == files
+
+
+@pytest.mark.parametrize(
+    "links",
+    [
+        [record("a", b"b/..", "120000"), record("b", b"a/..", "120000")],
+        [record("a", b"b/c", "120000"), record("b", b"a/c", "120000")],
+    ],
+)
+def test_snapshot_refuses_symlink_cycles_through_parent_links(links: list[dict[str, str]]) -> None:
+    with pytest.raises(JudgeContractError):
+        rpc.validate_files(records(links))
+
+
+def test_refused_up_link_census_really_escapes_when_materialised(tmp_path: Path) -> None:
+    # Negative control for the refusal above: on a real filesystem the same
+    # layout reads the file one level above the snapshot root.
+    root = tmp_path / "root"
+    (root / "a").mkdir(parents=True)
+    (root / "p" / "q").mkdir(parents=True)
+    (root / "p" / "x").write_text("lexical", encoding="utf-8")
+    (tmp_path / "x").write_text("OUTSIDE-ROOT", encoding="utf-8")
+    os.symlink("../../a", root / "p" / "q" / "d")
+    os.symlink("d/../../x", root / "p" / "q" / "e")
+    assert (root / "p" / "q" / "e").read_text(encoding="utf-8") == "OUTSIDE-ROOT"
+    with pytest.raises(JudgeContractError, match="escapes"):
+        rpc.validate_files(_up_link_census(b"d/../../x"))
 
 
 def test_snapshot_refuses_duplicate_parent_conflict_and_content_mismatch() -> None:
