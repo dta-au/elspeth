@@ -69,7 +69,9 @@ def _diagnostic_graph(arguments):
     prefix = "Diagnostic graph view; complete-value references are not reviewed content.\n"
     summary = arguments["schema_excerpt"]
     assert summary.startswith(prefix)
-    view = json.loads(summary[len(prefix) :])
+    # The display is one JSON document; U-22's complete-review section follows it.
+    view, end = json.JSONDecoder().raw_decode(summary, len(prefix))
+    assert summary[end:] == "" or summary[end:].startswith("\nComplete values behind each complete_value_ref above")
     assert view["schema_version"] == "composer.bounded-view.v1"
     return view
 
@@ -84,8 +86,12 @@ def _complete_values(arguments, state):
     assert tuple(item.reference for item in values) == manifest.values
     for item in values:
         assert item.reference.utf8_bytes == len(json.dumps(item.to_value(), ensure_ascii=False, separators=(",", ":")).encode())
-    with pytest.raises(AdvisorGraphCoverageUnavailable):
-        AdvisorCheckpointOwner._require_complete_graph_summary(summary)
+    # U-22 F1: the producer itself carries the same complete values, in manifest
+    # order, and renders each whole into the review excerpt; coverage is exact.
+    assert summary.complete_values == values
+    for item in values:
+        assert json.dumps(item.to_value(), ensure_ascii=False) in arguments["schema_excerpt"]
+    AdvisorCheckpointOwner._require_complete_graph_summary(summary)
     assert all(part.trust is None for part in summary.values)
     return {item.reference.path: item.to_value() for item in values}
 
@@ -549,8 +555,10 @@ def test_configured_prompts_are_complete_required_evidence_beyond_optional_allow
     arguments = _checkpoint_arguments(phase=phase, state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     assert len(prompt) > 1000 and len(system) > 1000 and len(prompt) + len(system) > 16000
-    assert prompt not in message and system not in message
-    assert "OPTIONAL_COMMENTARY" not in message
+    # U-22 F1: complete values beyond the display threshold are required review
+    # evidence, retained beyond the optional allowance (allowance=1 here).
+    assert prompt in message and system in message
+    assert state.metadata.description in message
     values = _complete_values(arguments, state)
     assert values[("nodes", 0, "options", "prompt_template")] == prompt
     assert values[("nodes", 0, "options", "system_prompt")] == system
@@ -560,7 +568,10 @@ def test_configured_prompts_are_complete_required_evidence_beyond_optional_allow
     assert "".join(part.text for part in parts) == message
     assert all(part.trust is None for part in parts)
     inspection = "\n".join(part.inspection_text or part.text for part in parts)
-    assert prompt not in inspection and system not in inspection
+    assert prompt in inspection and system in inspection
+    # Each complete value is one indivisible inspection unit, never sliced.
+    assert any(prompt in (part.inspection_text or part.text) for part in parts)
+    assert any(system in (part.inspection_text or part.text) for part in parts)
 
 
 def test_all_authored_semantic_options_keep_values_and_named_source_identity() -> None:
@@ -609,7 +620,7 @@ def test_nested_llm_queries_keep_complete_semantics_and_effective_interpolation(
     state = replace(state, nodes=(replace(_node(0), plugin="llm", options={"options": nested}),))
     arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
-    assert template not in message and system not in message
+    assert template in message and system in message  # U-22 F1: complete values are reviewed
     assert '"record":"field_11"' in message or "'record': 'field_11'" in message
     values = _complete_values(arguments, state)
     assert values[("nodes", 0, "options", "options", "queries", "review", "template")] == template
@@ -660,11 +671,11 @@ def test_multi_query_templates_and_additional_query_semantics_survive(query_shap
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
     arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
-    assert template not in message
+    assert template in message  # U-22 F1: complete values are reviewed
     assert "QUERY_OPTION_CANARY" in message
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == message
-    assert template not in "\n".join(part.inspection_text or part.text for part in parts)
+    assert any(template in (part.inspection_text or part.text) for part in parts)
     query_path = ("nodes", 0, "options", "queries", "review" if query_shape == "mapping" else 0, "template")
     assert _complete_values(arguments, state)[query_path] == template
 
@@ -827,15 +838,31 @@ def test_special_option_interpretation_retains_complete_authored_values(surface:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_unresolved_complete_values_never_dispatch_or_publish_a_clean_pass(invocation, monkeypatch, phase):
+    """Incomplete coverage withholds before dispatch (U-22: coverage, not presence, decides).
+
+    A long value is now resolved and reviewed (F1). If resolution covers less
+    than the manifest, the checkpoint must still withhold with zero provider
+    calls and no clean pass, rather than review unseen bytes.
+    """
+    from elspeth.web.composer import advisor_context
+
     engine, sessions, provider_owner, coordinator = invocation
     context = coordinator.authority.context
     owner = _owner(sessions=sessions)
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"prompt_template": "x" * 4000 + " EXACT_TAIL"}),))
     request = "Review the complete current graph."
     review = await _publication_review(sessions, context, state, request)
+    resolve = advisor_context.materialize_advisor_complete_values
+
+    def drop_last_value(*args, **kwargs):
+        values = resolve(*args, **kwargs)
+        assert values, "the fixture must reference at least one complete value"
+        return values[:-1]
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", drop_last_value)
 
     async def forbidden_sdk(**_kwargs):
-        raise AssertionError("A diagnostic reference is not complete reviewed evidence")
+        raise AssertionError("Incomplete complete-value coverage is not reviewed evidence")
 
     monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
     recorder = BufferingRecorder()

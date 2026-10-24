@@ -367,10 +367,17 @@ class AdvisorSummaryParts:
     configured_source_reference_spans: tuple[_AdvisorConfiguredSourceReferenceSpan, ...] = ()
     content_manifest: CompleteValueManifest | None = None
     content_hash_spans: tuple[_AdvisorContentHashSpan, ...] = ()
+    complete_values: tuple[MaterializedCompleteValue, ...] = ()
 
     def __post_init__(self) -> None:
         if self.content_manifest is not None and type(self.content_manifest) is not CompleteValueManifest:
             raise InvariantError("Advisor content references require an owned manifest")
+        if type(self.complete_values) is not tuple or any(type(value) is not MaterializedCompleteValue for value in self.complete_values):
+            raise InvariantError("Advisor complete values require owned materializations")
+        if self.complete_values and (
+            self.content_manifest is None or tuple(value.reference for value in self.complete_values) != self.content_manifest.values
+        ):
+            raise InvariantError("Advisor complete values must cover their manifest exactly and in order")
         if type(self.values) is not tuple or any(
             type(value) is not PromptGuardContentPart or value.trust is not None for value in self.values
         ):
@@ -492,12 +499,17 @@ def fit_advisor_checkpoint_summary(
     content_scope: ComposerContentScope,
     env_ref_names: frozenset[str] = frozenset(),
 ) -> AdvisorSummaryParts:
-    """Share Composer's bounded diagnostic graph without clipping any value.
+    """Share Composer's bounded diagnostic graph plus every complete value it references.
 
-    A manifest containing references is incomplete review evidence. The caller
-    must resolve the complete values before its actual audited review request
-    and fresh inspection; CLEAN cannot certify hidden graph bytes. The display
-    budget cannot authorize truncation or substitute for final request limits.
+    The display replaces long scalars with complete-value references. Review
+    needs the bytes behind them, so this producer re-resolves every manifest
+    value from the current credential-screened projection and appends them as
+    a separate complete-review section, in manifest order, labelled by owned
+    path. Values remain authored, untrusted parts under the normal redaction
+    policy; resolution grants no inspection, detector or publication
+    permission. Re-run per attempt, so each attempt resolves afresh. The
+    display budget cannot authorize truncation or substitute for final
+    request limits.
     """
     if type(char_cap) is not int or char_cap < 0:
         raise InvariantError("Advisor display requires a nonnegative owned budget")
@@ -549,7 +561,40 @@ def fit_advisor_checkpoint_summary(
         offset += len(part.text)
     if len(uuid_spans) + len(hash_spans) != len(partitions):
         raise InvariantError("Advisor identity partitions did not retain their exact producer positions")
-    return AdvisorSummaryParts(parts, tuple(uuid_spans), content_manifest=view.manifest, content_hash_spans=tuple(hash_spans))
+    display = AdvisorSummaryParts(parts, tuple(uuid_spans), content_manifest=view.manifest, content_hash_spans=tuple(hash_spans))
+    if not view.manifest.values:
+        return display
+    values = materialize_advisor_complete_values(
+        display,
+        state,
+        content_scope=content_scope,
+        reference_ids=tuple(reference.reference_id for reference in view.manifest.values),
+        env_ref_names=env_ref_names,
+    )
+    if tuple(value.reference for value in values) != view.manifest.values:
+        # Incomplete selected coverage is a specific preparation refusal; the
+        # checkpoint withholds before dispatch rather than review unseen bytes.
+        raise AdvisorGraphCoverageUnavailable("Advisor complete values lack exact resolved coverage")
+    # Appended after the identity spans were fixed, so display offsets stay
+    # exact. Path segments and values are authored text: equal strings here
+    # acquire no identity exemption and stay under the normal policy.
+    section: list[PromptGuardContentPart] = [
+        PromptGuardContentPart(
+            "\nComplete values behind each complete_value_ref above, in manifest order. They are part of the authored graph under review:"
+        )
+    ]
+    for value in values:
+        section.append(PromptGuardContentPart("\n- at path "))
+        section.extend(json_content_parts(json.dumps(list(value.reference.path), ensure_ascii=False), ensure_ascii=False))
+        section.append(PromptGuardContentPart(": "))
+        section.extend(json_content_parts(json.dumps(value.to_value(), ensure_ascii=False), ensure_ascii=False))
+    return AdvisorSummaryParts(
+        (*parts, *section),
+        tuple(uuid_spans),
+        content_manifest=view.manifest,
+        content_hash_spans=tuple(hash_spans),
+        complete_values=values,
+    )
 
 
 def materialize_advisor_complete_values(

@@ -117,6 +117,13 @@ from elspeth_lints.core.ast_walker import iter_python_files
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 
 
+def _display_view(excerpt: str) -> dict:
+    """Parse the bounded display document; U-22's complete-review section may follow it."""
+    view, end = json.JSONDecoder().raw_decode(excerpt, excerpt.index("\n") + 1)
+    assert excerpt[end:] == "" or excerpt[end:].startswith("\nComplete values behind each complete_value_ref above")
+    return view
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reason_code", ["invalid_request", "context_length_exceeded", None, "PRIVATE_UNKNOWN_CODE"])
 async def test_rejected_review_retains_safe_reason_through_sdk_gate_and_wire(
@@ -1375,7 +1382,7 @@ async def test_run_advisor_checkpoint_end_returns_verdict(make_service, simple_s
     # actually evaluate the pipeline, not just see node ids.
     excerpt = args["schema_excerpt"]
     assert "rate" in excerpt  # node id
-    displayed = json.loads(excerpt.split("\n", 1)[1])
+    displayed = _display_view(excerpt)
     assert displayed["content_manifest"]["values"] == []
     assert displayed["data"]["nodes"][0]["options"]["required_input_fields"] == ["url"]
     assert displayed["data"]["nodes"][0]["options"]["model"] == "gpt-5.5"
@@ -5501,7 +5508,7 @@ def test_checkpoint_retention_evidence_preserves_choices_and_untrusted_wire(make
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == original
     assert all(part.trust is None for part in parts)
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     displayed_options = displayed["data"]["outputs"][0]["options"]
     for key in ("require_all_rows", "include_audit_context", "include_error_reason", "include_disposition_reason"):
         if choice is None:
@@ -5726,7 +5733,7 @@ def test_summary_with_many_large_prompts_keeps_every_complete_prompt():
     args = service._advisor_checkpoint._build_checkpoint_arguments(phase="end", state=state, content_scope=_content_scope(state))
     optional_chars = advisor_checkpoint_summary_chars(args)
     assert optional_chars < char_cap, f"{optional_chars} >= {char_cap}; no headroom"
-    displayed = json.loads(args["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(args["schema_excerpt"])
     assert displayed["content_manifest"]["values"] == []
     assert [node["options"]["prompt_template"] for node in displayed["data"]["nodes"]] == [big_prompt] * len(nodes)
 
@@ -6191,7 +6198,7 @@ def test_checkpoint_keeps_schema_fields_beyond_eight_for_review(make_service, si
     )
     prompt = build_advisor_user_message(arguments)
 
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["data"]["nodes"][-1]["options"]["schema"] == schema
     assert all(f"field_{index:03d}" in prompt for index in range(field_count))
     assert "additional_fields_withheld" not in arguments["schema_excerpt"]
@@ -6853,10 +6860,9 @@ def _pathological_multi_query_state(simple_state: CompositionState, node_count: 
 
 
 def test_checkpoint_retains_graph_structure_and_refuses_unresolved_values(make_service, simple_state):
-    """Large diagnostic graphs retain every node, without certifying hidden bytes."""
+    """Large diagnostic graphs retain every node and resolve every referenced value (U-22 F1)."""
     from elspeth.web.composer.advisor_context import (
         ADVISOR_CHARS_PER_TOKEN,
-        AdvisorGraphCoverageUnavailable,
         summarize_pipeline_for_advisor,
     )
 
@@ -6870,20 +6876,22 @@ def test_checkpoint_retains_graph_structure_and_refuses_unresolved_values(make_s
         arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state, content_scope=_content_scope(state))
         excerpt = arguments["schema_excerpt"]
         assert len(excerpt) > char_cap
-        displayed = json.loads(excerpt.split("\n", 1)[1])
+        displayed = _display_view(excerpt)
         assert displayed["schema_version"] == "composer.bounded-view.v1"
         manifest = displayed["content_manifest"]
         assert manifest["composition_content_hash"] == composition_content_hash(state)
         assert manifest["session_id"] == str(_content_scope(state).session_id)
         assert [reference["path"] for reference in manifest["values"]] == [["metadata", "description"]]
         assert displayed["data"]["metadata"]["description"]["complete_value_ref"] == manifest["values"][0]["reference_id"]
-        assert state.metadata.description not in excerpt
+        # The display keeps its reference; the complete-review section carries the bytes.
+        assert state.metadata.description in excerpt
         assert [node["id"] for node in displayed["data"]["nodes"]] == [node.id for node in state.nodes]
         for authored, diagnostic in zip(state.to_dict()["nodes"], displayed["data"]["nodes"], strict=True):
             if authored["id"].startswith("node_"):
                 assert diagnostic["options"]["queries"] == authored["options"]["queries"]
-        with pytest.raises(AdvisorGraphCoverageUnavailable, match="explicit resolved coverage"):
-            service._advisor_checkpoint._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
+        summary = arguments["_elspeth_advisor_summary_parts"]
+        assert tuple(value.reference for value in summary.complete_values) == summary.content_manifest.values
+        service._advisor_checkpoint._require_complete_graph_summary(summary)
         assert "optional_prose_units_withheld=" not in excerpt
         assert "additional_evidence_lines_withheld" not in excerpt
 
@@ -6896,7 +6904,7 @@ def test_checkpoint_small_graph_is_complete_and_identical_between_phases(make_se
     for phase in ("early", "end"):
         arguments = service._advisor_checkpoint._build_checkpoint_arguments(phase=phase, state=state, content_scope=_content_scope(state))
         excerpts.append(arguments["schema_excerpt"])
-        displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+        displayed = _display_view(arguments["schema_excerpt"])
         assert displayed["data"]["nodes"] == state.to_dict()["nodes"]
         assert displayed["content_manifest"]["values"] == []
         service._advisor_checkpoint._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
@@ -6920,7 +6928,7 @@ def test_checkpoint_evidence_identity_hashes_the_unbounded_summary(make_service,
 
     assert f"Current evidence identity: {stable_hash({'advisor_evidence': full_summary})}." in arguments["problem_summary"]
     assert arguments["schema_excerpt"] != full_summary
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["content_manifest"]["composition_content_hash"] == composition_content_hash(state)
     assert displayed["content_manifest"]["values"]
 
@@ -7038,7 +7046,7 @@ async def test_actual_checkpoint_dispatch_and_retry_preserve_complete_diagnostic
     cap = service._advisor_checkpoint._settings.composer_advisor_max_prompt_tokens * 4
     arguments = service._advisor_checkpoint._build_checkpoint_arguments(**build_kwargs)
     assert len(arguments["schema_excerpt"]) > cap
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["content_manifest"]["values"] == []
     assert displayed["data"]["nodes"] == state.to_dict()["nodes"]
     if first in {"schema", "contract"}:
@@ -7071,6 +7079,11 @@ async def test_actual_checkpoint_dispatch_and_retry_preserve_complete_diagnostic
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_checkpoint_with_unresolved_graph_value_never_dispatches(make_service, simple_state, monkeypatch, physical_advisor, phase):
+    """Incomplete coverage withholds with zero provider calls (U-22: coverage, not presence, decides)."""
+    from elspeth.web.composer import advisor_context
+
+    resolve = advisor_context.materialize_advisor_complete_values
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", lambda *a, **k: resolve(*a, **k)[:-1])
     service = make_service()
     state = _pathological_multi_query_state(simple_state)
     fenced = physical_advisor.bind(service, review_state=state if phase == "end" else None)
@@ -7636,7 +7649,7 @@ def test_budgeted_end_retains_mandatory_context_and_tail_graph_facts(make_servic
     assert "user_message" not in arguments
     assert review.current_request_text() == request and arguments["publication_review"] is review
     prompt = build_advisor_user_message(arguments)
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["data"]["nodes"][-1]["id"] == "late_reviewed_node"
     assert displayed["data"]["nodes"][-1]["options"]["model"] == "late_model_canary"
     assert displayed["data"]["outputs"][0]["options"]["schema"]["fields"] == ["late_sink_field_canary: str"]

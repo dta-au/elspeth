@@ -94,7 +94,10 @@ def test_composer_and_advisor_use_the_same_current_graph_manifest(graph, tool_co
     view = build_composition_content_view(graph, content_scope=scope)
     summary = fit_advisor_checkpoint_summary(graph, {}, 0, content_scope=scope)
     assert summary.content_manifest == view.manifest
-    assert graph.nodes[0].options["prompt"] not in "".join(part.text for part in summary.values)
+    # U-22 F1: the Advisor reviews the complete value; the primary context (below)
+    # keeps the bounded view and reads complete values only through its tool.
+    assert graph.nodes[0].options["prompt"] in "".join(part.text for part in summary.values)
+    assert tuple(value.reference for value in summary.complete_values) == view.manifest.values
     assert "Diagnostic graph view" in summary.values[0].text
     assert all(part.trust is None for part in summary.values)
     references = tuple(reference.reference_id for reference in view.manifest.values)

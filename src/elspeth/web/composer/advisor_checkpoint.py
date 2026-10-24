@@ -923,8 +923,10 @@ class AdvisorCheckpointOwner:
     def _require_complete_graph_summary(summary: _advisor_context.AdvisorSummaryParts) -> None:
         if type(summary) is not _advisor_context.AdvisorSummaryParts or summary.content_manifest is None:
             raise AuditIntegrityError("Advisor graph review lost its current content manifest")
-        if summary.content_manifest.values:
-            raise _advisor_context.AdvisorGraphCoverageUnavailable("Advisor complete values require explicit resolved coverage")
+        # Coverage, not presence, decides: every referenced value must be resolved
+        # into the review request. A nonempty manifest no longer suppresses review.
+        if tuple(value.reference for value in summary.complete_values) != summary.content_manifest.values:
+            raise _advisor_context.AdvisorGraphCoverageUnavailable("Advisor complete values lack exact resolved coverage")
 
     def _advisor_blocked_result(
         self,

@@ -34,6 +34,14 @@ from tests.unit.web.composer.test_prompt_guard_wiring import _guarded_service
 
 pytest_plugins = ("tests.unit.web.composer.test_prompt_guard_wiring",)
 
+
+def _display_view(excerpt: str) -> dict:
+    """Parse the bounded display document; U-22's complete-review section may follow it."""
+    view, end = json.JSONDecoder().raw_decode(excerpt, excerpt.index("\n") + 1)
+    assert excerpt[end:] == "" or excerpt[end:].startswith("\nComplete values behind each complete_value_ref above")
+    return view
+
+
 _USER = "Preserve the neutral record fields."
 
 
@@ -119,18 +127,6 @@ def _selected_complete_value_message(invocation, state, path):
         "content": serialized,
         guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(admitted, serialized),
     }
-
-
-def _selected_advisor_transcript(invocation, state, paths):
-    from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
-
-    transcript = AdvisorTranscriptOwner(request=_USER)
-    transcript.begin_messages([])
-    for index, path in enumerate(paths):
-        message = _selected_complete_value_message(invocation, state, path)
-        message["tool_call_id"] = f"selected-complete-value-{index}"
-        transcript.observe_messages([message])
-    return transcript.snapshot()
 
 
 async def _inspect(azure, messages, *, user=_USER, role="composer"):
@@ -240,7 +236,7 @@ async def test_patched_large_scalar_survives_storage_and_short_followup_without_
     evidence = guard_contracts.detach_prompt_guard_evidence(messages)
     graph_parts = evidence.content_parts[-2]
     assert graph_parts is not None and "".join(part.text for part in graph_parts) == messages[-2]["content"]
-    view = json.loads(messages[-2]["content"].split("\n", 1)[1])["current_state"]
+    view = _display_view(messages[-2]["content"])["current_state"]
     assert expression not in messages[-2]["content"]
     assert [reference["path"] for reference in view["content_manifest"]["values"]] == [
         ["nodes", 0, "options", "operations", 0, "expression"]
@@ -550,18 +546,17 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
     arguments = advisor._build_checkpoint_arguments(
         phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
     )
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["data"]["nodes"][0]["options"]["required_input_fields"] == options["required_input_fields"]
     if shape == "interpolated_fields":
-        from elspeth.web.composer.advisor_context import AdvisorGraphCoverageUnavailable
-
-        with pytest.raises(AdvisorGraphCoverageUnavailable):
-            advisor._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
-        arguments["advisor_transcript"] = _selected_advisor_transcript(
-            invocation,
-            state,
-            (("nodes", 0, "options", "queries", "q0", "template"), ("nodes", 0, "options", "queries", "q1", "template")),
-        )
+        # U-22 F1: the summary itself resolves both long query templates with
+        # exact coverage; no transcript workaround is needed to inspect them.
+        summary = arguments["_elspeth_advisor_summary_parts"]
+        assert [value.reference.path for value in summary.complete_values] == [
+            ("nodes", 0, "options", "queries", "q0", "template"),
+            ("nodes", 0, "options", "queries", "q1", "template"),
+        ]
+        advisor._require_complete_graph_summary(summary)
     else:
         assert displayed["content_manifest"]["values"] == []
         assert displayed["data"]["nodes"][0]["options"] == state.to_dict()["nodes"][0]["options"]
@@ -650,7 +645,7 @@ async def test_real_advisor_inspects_decoded_prompt_words_on_unchanged_wire(invo
     arguments = advisor._build_checkpoint_arguments(
         phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
     )
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert displayed["data"]["nodes"][0]["options"] == state.to_dict()["nodes"][0]["options"]
     assert displayed["content_manifest"]["values"] == []
     original = build_advisor_user_message(arguments)
@@ -792,20 +787,28 @@ async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(i
     arguments = advisor._build_checkpoint_arguments(
         phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
     )
-    displayed = json.loads(arguments["schema_excerpt"].split("\n", 1)[1])
+    displayed = _display_view(arguments["schema_excerpt"])
     assert [reference["path"] for reference in displayed["content_manifest"]["values"]] == [["metadata", "description"]]
-    assert "x" * 10_001 not in arguments["schema_excerpt"]
+    # U-22 F1: the complete value is now in the review request as ONE
+    # indivisible unit. Beyond the 10,000-character inspection limit the final
+    # guard refuses it (unsupported, HTTP 422) before any SDK call; it is never
+    # sliced to fit, and resolution is no inspection permission.
+    assert "x" * 10_001 in arguments["schema_excerpt"]
     owner = invocation[2]
     context = owner.required_work.coordinator.authority.context
-    verdict = await advisor._run_advisor_checkpoint(
-        phase=phase,
-        state=state,
-        session_id=context.fence.session_id,
-        session_operation_context=context,
-        provider_owner=owner,
-        recorder=BufferingRecorder(),
-    )
-    assert not verdict.ok and verdict.failure_class == "unavailable"
+    no_sdk = _ScriptedCompletion(_text_response("This response must never be requested."))
+    monkeypatch.setattr(litellm, "acompletion", no_sdk)
+    with prompt_guard_user_scope(_USER), pytest.raises(prompt_guard.PromptGuardRefused) as checkpoint_refused:
+        await advisor._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            session_id=context.fence.session_id,
+            session_operation_context=context,
+            provider_owner=owner,
+            recorder=BufferingRecorder(),
+        )
+    assert checkpoint_refused.value.http_status == 422 and checkpoint_refused.value.disposition == "unavailable"
+    assert sent == [] and no_sdk.requests == []
     selected = _selected_complete_value_message(invocation, state, ("metadata", "description"))
     complete_value = json.loads(selected["content"])["data"]["value"]
     assert complete_value == state.metadata.description
