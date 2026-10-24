@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -12,9 +13,11 @@ import pytest
 
 def _assemble(tmp_path: Path, wheel: Path) -> subprocess.CompletedProcess[str]:
     script = Path(__file__).resolve().parents[3] / "elspeth-lints/operator-runtime/package_runtime.py"
+    # Isolation (-I -S), not the interpreter's path, keeps the editable install
+    # off sys.path; CI images ship CPython outside /usr/bin.
     return subprocess.run(
         [
-            "/usr/bin/python3.12",
+            sys.executable,
             "-I",
             "-S",
             str(script),

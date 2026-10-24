@@ -9,6 +9,7 @@ import runpy
 import stat
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -150,7 +151,9 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 fd = os.memfd_create('forged-test', os.MFD_ALLOW_SEALING)
 os.write(fd, open(sys.argv[2], 'rb').read())
-fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_SEAL | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE)
+# Linux uapi F_ADD_SEALS with F_SEAL_SEAL|SHRINK|GROW|WRITE. Some CPython
+# builds (python-build-standalone) omit these fcntl names.
+fcntl.fcntl(fd, 1033, 0x1 | 0x2 | 0x4 | 0x8)
 os.dup2(fd, 3)
 try:
     module._admit_native_runtime()
@@ -159,8 +162,10 @@ except module.OperatorRuntimeUnavailableError:
     raise SystemExit(78)
 raise SystemExit(1)
 """
+    # Any isolated interpreter suffices: admission refuses on the module path
+    # before it compares /proc/self/exe, and CI ships CPython outside /usr/bin.
     result = subprocess.run(
-        ["/usr/bin/python3.12", "-I", "-S", "-B", "-c", program, str(module), str(packet)],
+        [sys.executable, "-I", "-S", "-B", "-c", program, str(module), str(packet)],
         env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
         capture_output=True,
         text=True,
