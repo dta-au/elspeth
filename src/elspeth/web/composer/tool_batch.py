@@ -2937,15 +2937,15 @@ async def _execute_continuation_call_live(
                     # row has been published.
                     first_party_exc = advisor_outcome.original_exc
                     if isinstance(first_party_exc, CommonProviderCostRefused):
-                        refusal_payload = {
+                        cost_refusal_payload = {
                             "success": False,
                             "status": "PROVIDER_POLICY_REFUSED",
                             "code": first_party_exc.code,
                             "outbound_call_made": first_party_exc.call_id is not None,
                         }
-                        recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                        recorder.record(finish_success(audit, result_payload=cost_refusal_payload, version_after=state.version))
                         _append_tool_outcome(
-                            response=refusal_payload,
+                            response=cost_refusal_payload,
                             error_class=None,
                             error_category=None,
                             error_message=None,

@@ -3233,6 +3233,9 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     "advisor_error_payload": ("status", "error", "error_class", "budget_used", "budget_remaining"),
     "request_rejection_payload": ("status", "error", "error_class", "budget_used", "budget_remaining", "request_rejection"),
     "refusal_payload": ("success", "outbound_call_made", "error_type", "detail", "audit_id"),
+    # Adjudicated 0.8.10: CommonProviderCostRefused is a refusal, not a provider error; its
+    # outbound_call_made says whether the refused call reached the provider. Exact keys.
+    "cost_refusal_payload": ("success", "status", "code", "outbound_call_made"),
     "success_payload": (
         "status",
         "guidance",
