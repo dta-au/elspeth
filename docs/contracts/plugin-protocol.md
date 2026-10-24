@@ -1125,6 +1125,15 @@ The `content_hash` field is REQUIRED and proves what was written. Hash computati
 
 #### Recoverable publication lifecycle
 
+Whole-effect adapters use the sequence below. Member-managed adapters commit
+each accepted, unfinished member directly when it has no durable COMMIT
+history. An existing plan or a new lease generation alone does not imply an
+earlier publication.
+Any COMMIT for that member retains recovery handling, regardless of attempt
+state, generation or request hash. A matching returned COMMIT can be reused
+without another external call.
+Unexpected whole-effect COMMIT history also retains existing recovery handling.
+
 ```
 __init__(config)
     │
@@ -1161,8 +1170,11 @@ close()                     ← Release resources
 
 The durable sequence is `RESERVED -> PREPARED -> IN_FLIGHT -> FINALIZED`.
 Every inspect, commit, and reconcile call records intent before external I/O.
-After a response-lost commit or expired-lease takeover, recovery reuses the
-stored plan and reconciles before it may commit.
+Recovery reuses the stored plan. An uncertain earlier publication requires
+reconciliation before another commit; UNKNOWN stops speculative publication.
+First member publication invokes the configured write/upsert even when the
+target already has equal content. This does not add remote compare-and-swap
+protection or change whole-effect predecessor checks.
 
 #### Effect identity and target authority
 

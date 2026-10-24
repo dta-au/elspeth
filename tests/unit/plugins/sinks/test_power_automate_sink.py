@@ -105,7 +105,7 @@ def _prepared(count: int = 2) -> tuple[PowerAutomateSink, SinkEffectPipelineMemb
     return sink, effect_input, plan, ctx
 
 
-def test_status_precedes_initial_write_and_uses_only_selected_data() -> None:
+def test_explicit_not_applied_recovery_writes_only_selected_data() -> None:
     sink, effect_input, plan, ctx = _prepared()
     flow = _Flow()
     ctx = replace(ctx, http_post=flow)

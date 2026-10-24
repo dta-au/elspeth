@@ -51,9 +51,22 @@ this prevents a later generation from overtaking uncertain earlier work.
 Inspection and reconciliation answer different questions. `inspect_effect`
 runs before a plan exists and describes the current target so preparation can
 bind the correct predecessor. An adapter may explicitly return
-`NO_INSPECTION_REQUIRED` when target inspection is unnecessary. After a plan
-exists, `reconcile_effect` asks whether that exact plan was applied and returns
-one of three closed results:
+`NO_INSPECTION_REQUIRED` when target inspection is unnecessary. Whole-effect
+adapters use reconciliation after planning. For member-managed adapters, an
+accepted, unfinished member with no COMMIT history makes its first configured
+write directly, even with a restored plan or a new lease generation. An older
+read-only reconciliation record alone does not establish an earlier engine
+publication: an initial UNKNOWN or returned APPLIED result without COMMIT
+history does not block that first write while the member is not FINALIZED
+(a recorded UNKNOWN never finalizes it).
+An already FINALIZED member retains its durable result without a new write.
+Existing run-admission and fencing requirements still apply.
+
+Once a member has any COMMIT history, recovery uses recorded results or
+reconciliation. Attempt state, generation and request hash do not establish
+freshness. Unexpected whole-effect COMMIT history also retains recovery
+handling. Reconciliation asks whether the exact stored plan was applied and
+returns one of three closed results:
 
 - `NOT_APPLIED`: exact absence is proven. The coordinator may commit once.
 - `APPLIED_WITH_EXACT_DESCRIPTOR`: exact application is proven. The
@@ -61,7 +74,9 @@ one of three closed results:
 - `UNKNOWN`: neither exact absence nor exact application can be proven. The
   coordinator stops. This is an operator boundary, not a retry hint.
 
-There is no safe speculative commit after `UNKNOWN`.
+For an uncertain earlier member publication, or any whole-effect reconciliation,
+there is no safe speculative commit after `UNKNOWN`. A recorded UNKNOWN result
+is not automatically reinspected merely because the remote target later changes.
 
 ## Diagnose
 
@@ -90,20 +105,22 @@ There is no safe speculative commit after `UNKNOWN`.
 | Observed condition | Safe action |
 |---|---|
 | `RESERVED` | Resume normally. The adapter reuses a durable returned inspection or performs inspection, then persists the plan. |
-| `PREPARED`, no live lease | Resume normally. The coordinator acquires the lease and reconciles before any commit. |
+| `PREPARED`, no live lease | Resume normally. The coordinator acquires the lease; member-managed publication uses the COMMIT-history boundary above, while whole-effect publication retains reconciliation. |
 | `IN_FLIGHT`, lease live | Leave it alone. A second worker must not steal a live generation. |
 | `IN_FLIGHT`, lease expired | Resume through the coordinator. Lease takeover increments the generation and gives the new worker recovery authority. Since 0.8.0 the takeover is leader-fenced *before* it reads lease state (`sink_effect_lifecycle.py:511-525`), so "the new worker" is necessarily the run's new **leader**; a follower is refused with `RunLeadershipLostError` whatever the lease says. Sink effects are leader-only work by design — ADR-030 D2 puts the sink-write phase among the roles belonging to a single elected leader — so the fence makes an existing rule enforceable rather than narrowing who may recover. "Expired" is judged on the Landscape database's clock, not the operator's host. |
 | A commit returned and its result is durable | Resume normally. The coordinator reuses the returned result and finalizes without another commit. |
 | Commit outcome is `response-lost` | Reconcile the exact stored plan. Continue only from the closed result below. |
 | Reconcile says `NOT_APPLIED` | The coordinator may make the one planned commit and finalize its exact result. |
-| Reconcile says `APPLIED_WITH_EXACT_DESCRIPTOR` | Finalize from the exact descriptor; do not commit again. |
-| Reconcile says `UNKNOWN` | Keep the effect and its successor blocked. Escalate with the target evidence; do not commit or manually finalize. |
+| Reconcile says `APPLIED_WITH_EXACT_DESCRIPTOR` | After a COMMIT, or for a whole-effect adapter, finalize from the exact descriptor; do not commit again. |
+| Accepted, unfinished member has only old read-only RECONCILE history (including returned APPLIED), with no COMMIT | Resume through the normally admitted coordinator for the first configured write. A member already FINALIZED retains its durable result without a new write. |
+| Reconcile says `UNKNOWN` | After a COMMIT, or for a whole-effect adapter, keep the effect and its successor blocked. Escalate with the target evidence; do not commit or manually finalize. |
 | `FINALIZED` | Reuse the durable finalization. Scheduler repair may close remaining pending-sink work without re-publication. |
 
 Lease takeover is a fencing operation, not permission to guess. The new owner
-must use the persisted plan, close abandoned attempts under the new generation,
-and reconcile before it can publish. A stale owner cannot finalize after its
-lease or generation is lost.
+must use the persisted plan and close abandoned attempts under the new
+generation. A member without COMMIT history may make its first publication;
+an uncertain earlier publication requires recovery before another commit.
+A stale owner cannot finalize after its lease or generation is lost.
 
 ## Target-specific checks
 
@@ -151,8 +168,13 @@ preflight failure; it is not a reason to fall back to legacy writes.
 
 These adapters reconcile durable member sub-effects. Recovery is per member;
 one uncertain member must not cause already proven members to be submitted
-again. Chroma recovery also preserves the adapter's documented skip/error
-outcomes rather than upgrading them to accepted publication.
+again. Fresh accepted members invoke the configured upsert even when the target
+already has equal content; this does not provide remote compare-and-swap
+protection. Chroma's recoverable member publication requires
+`on_duplicate=overwrite`; unsupported skip/error modes remain refused at
+preflight. A divergent target after an uncertain COMMIT remains UNKNOWN.
+Power Automate uses the same member-history boundary with its
+[delivery-ID protocol](../reference/power-automate.md).
 
 ### Audit exports
 
