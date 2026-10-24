@@ -2546,6 +2546,7 @@ class TestComposerMultiTurnToolCalls:
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
+        from elspeth.contracts.composer_content import CompleteValueManifest
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 
         catalog = _mock_catalog()
@@ -2624,7 +2625,12 @@ class TestComposerMultiTurnToolCalls:
         assert any("set_metadata" in item for item in second_arguments["attempted_actions"])
         assert "review pass 2" in second_arguments["problem_summary"].lower()
         assert "assess the current evidence independently" in second_arguments["problem_summary"].lower()
-        assert "Pipeline: Repaired" in second_arguments["schema_excerpt"]
+        graph_view = json.loads(second_arguments["schema_excerpt"].split("\n", 1)[1])
+        assert graph_view["schema_version"] == "composer.bounded-view.v1"
+        assert graph_view["data"]["metadata"]["name"] == "Repaired"
+        graph_manifest = CompleteValueManifest.from_payload(graph_view["content_manifest"])
+        assert graph_manifest.scope.session_id == UUID(session_id)
+        assert graph_manifest.values == ()
         stored = await service._require_sessions_service().get_messages(UUID(session_id), limit=None)
         passes = [
             row.tool_calls[0]["pass"]
@@ -4387,11 +4393,12 @@ class TestBuildMessages:
         """_build_messages must return a new list on every call."""
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
-        msgs1 = service._build_messages([], state, "Hello")
-        msgs2 = service._build_messages([], state, "Hello")
+        with fenced_operation_context(service._session_engine, session_id) as operation:
+            msgs1 = service._build_messages([], state, "Hello", session_id=session_id, session_operation_context=operation)
+            msgs2 = service._build_messages([], state, "Hello", session_id=session_id, session_operation_context=operation)
 
         assert msgs1 is not msgs2  # different list objects
         assert msgs1 == msgs2  # same content
@@ -4416,7 +4423,7 @@ class TestBuildMessages:
         """
         catalog = _mock_catalog()
         settings = _make_settings()
-        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        service, session_id = _composer_service_with_session(catalog, settings)
         state = _empty_state()
 
         secret_path = "/var/lib/elspeth/users/alice/skills/secret-deployment.md"
@@ -4425,10 +4432,11 @@ class TestBuildMessages:
             raise PermissionError(13, "Permission denied", secret_path)
 
         with (
+            fenced_operation_context(service._session_engine, session_id) as operation,
             patch("elspeth.web.composer.service.build_messages", side_effect=_raise_oserror),
             pytest.raises(ComposerServiceError) as excinfo,
         ):
-            service._build_messages([], state, "Hi")
+            service._build_messages([], state, "Hi", session_id=session_id, session_operation_context=operation)
 
         body = str(excinfo.value)
         # The filename MUST NOT appear in the wrapper message. Test
@@ -5004,7 +5012,7 @@ class TestComposeTimeout:
                 message="provider secret", llm_provider="test", model="test/advisor"
             )
         )
-        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         physical_calls = 0
@@ -5016,9 +5024,17 @@ class TestComposeTimeout:
                 on_provider_dispatch()
             raise sdk_error
 
-        with patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=fail):
+        with (
+            fenced_operation_context(service._session_engine, session_id) as operation,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=fail),
+        ):
             verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(
-                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+                service._advisor_checkpoint,
+                phase="end",
+                state=_empty_state(),
+                session_id=session_id,
+                session_operation_context=operation,
+                recorder=None,
             )
 
         assert physical_calls == expected_attempts
@@ -5032,17 +5048,23 @@ class TestComposeTimeout:
 
     @pytest.mark.asyncio
     async def test_end_advisor_first_party_same_named_failure_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.persist_advisor_checkpoint_pass", checkpoint_persist)
         impostor_class = type("ServiceUnavailableError", (Exception,), {})
         impostor = impostor_class("first-party defect")
         with (
+            fenced_operation_context(service._session_engine, session_id) as operation,
             patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=impostor) as advisor,
             pytest.raises(impostor_class) as raised,
         ):
             await _REAL_RUN_ADVISOR_CHECKPOINT(
-                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+                service._advisor_checkpoint,
+                phase="end",
+                state=_empty_state(),
+                session_id=session_id,
+                session_operation_context=operation,
+                recorder=None,
             )
 
         assert raised.value is impostor
@@ -5052,13 +5074,21 @@ class TestComposeTimeout:
     @pytest.mark.asyncio
     async def test_end_advisor_generic_api_error_with_outage_name_reports_unavailable(self) -> None:
         """A provider API failure establishes unavailability, without response evidence."""
-        service, _ = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
         named_generic_api_error = type("ServiceUnavailableError", (LiteLLMAPIError,), {})
         failure = named_generic_api_error(status_code=503, message="provider secret", llm_provider="test", model="test/advisor")
 
-        with patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=failure):
+        with (
+            fenced_operation_context(service._session_engine, session_id) as operation,
+            patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", side_effect=failure),
+        ):
             verdict = await _REAL_RUN_ADVISOR_CHECKPOINT(
-                service._advisor_checkpoint, phase="end", state=_empty_state(), session_id=None, recorder=None
+                service._advisor_checkpoint,
+                phase="end",
+                state=_empty_state(),
+                session_id=session_id,
+                session_operation_context=operation,
+                recorder=None,
             )
 
         assert verdict.failure_class == "unavailable"

@@ -74,8 +74,8 @@ def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: A
 
     assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.NONE)
     assert request.to_litellm_kwargs()["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
-    assert request.tool_count == 45
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 45)
+    assert request.tool_count == 46
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 46)
 
 
 def test_planner_request_sends_the_planner_tool_list_with_the_planner_token_cap(settings_factory: Any) -> None:
@@ -102,7 +102,7 @@ def test_strict_counts_are_computed_from_the_sent_tools(settings_factory: Any) -
         surface="loop_tools", role="planner", model="gpt-5.5", kwargs={**request.to_litellm_kwargs(), "tools": tools}
     )
 
-    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (1, 1, 43)
+    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (1, 1, 44)
 
 
 # --- stamped routes (S1 T8) -------------------------------------------------------
@@ -114,14 +114,14 @@ def test_loop_request_on_a_forwarding_route_sends_the_stamped_loop_list(settings
     request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "loop_tools")
 
     assert request.to_litellm_kwargs()["tools"] == composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT)
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (35, 10, 0)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (36, 10, 0)
 
 
 def test_planner_request_on_a_forwarding_route_sends_the_stamped_planner_list(settings_factory: Any) -> None:
     request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "planner_tools")
 
     assert request.to_litellm_kwargs()["tools"] == planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (22, 1, 0)
+    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (23, 1, 0)
 
 
 def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -> None:
@@ -134,7 +134,7 @@ def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -
         surface="loop_tools", role="planner", model=_OPENROUTER_PLANNER, kwargs={**request.to_litellm_kwargs(), "tools": tools}
     )
 
-    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (34, 11, 0)
+    assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (35, 11, 0)
 
 
 def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory: Any) -> None:
@@ -210,13 +210,13 @@ def test_probe_env_defaults_to_the_process_environment_the_service_resolves_agai
 
     assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
     loop, planner = requests[0], requests[1]
-    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 45)
-    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 23)
+    assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 46)
+    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 24)
 
     contrast = bp.build_composer_probe_requests(settings, env={})
     assert [request.surface for request in contrast] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-    assert contrast[0].strict_true_count == 35
-    assert contrast[1].strict_true_count == 22
+    assert contrast[0].strict_true_count == 36
+    assert contrast[1].strict_true_count == 23
 
 
 def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_factory: Any) -> None:

@@ -761,13 +761,14 @@ class TestToolRegistry:
         What this test DOES pin, and what would actually go red:
 
         1. The forbidden set exists as named data, not a comment.
-        2. Its contents name exactly the three stateful discovery tools
-           (``diff_pipeline``, ``get_pipeline_state``, ``preview_pipeline``).
+        2. Its contents name exactly the four stateful discovery tools
+           (``diff_pipeline``, ``get_complete_pipeline_value``,
+           ``get_pipeline_state``, ``preview_pipeline``).
            This is the load-bearing line: a new DISCOVERY-kind declaration
            that omits ``cacheable=True`` lands in the complement and fails
            here, forcing a deliberate classification instead of a silent
            default; a declaration that sets ``cacheable=True`` on one of the
-           three named tools removes it from the complement and fails here
+           four named tools removes it from the complement and fails here
            too.
 
         Neither import-time guard reaches this set.
@@ -780,7 +781,7 @@ class TestToolRegistry:
         from the other side. Item 2 above, together with the ``not in
         cacheable`` assertions in
         ``test_tool_declarations.py::test_cacheable_subset_is_correct``, is
-        the ONLY thing keeping the three stateful tools out of the cache.
+        the ONLY thing keeping the four stateful tools out of the cache.
 
         Replaces the prior subtraction-shape assertion which mirrored
         the opt-OUT pattern the production code deliberately moved away
@@ -793,9 +794,12 @@ class TestToolRegistry:
         # 1. the forbidden set exists as named data.
         assert isinstance(_SESSION_MUTABLE_DISCOVERY_TOOL_NAMES, frozenset)
 
-        # 2. the forbidden set names exactly the three stateful tools. A
-        # fourth, or a reclassification of one of these, must land here.
-        assert frozenset({"diff_pipeline", "get_pipeline_state", "preview_pipeline"}) == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        # 2. the forbidden set names exactly the four stateful tools. A
+        # fifth, or a reclassification of one of these, must land here.
+        assert (
+            frozenset({"diff_pipeline", "get_complete_pipeline_value", "get_pipeline_state", "preview_pipeline"})
+            == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        )
 
     def test_cacheable_is_subset_of_discovery(self) -> None:
         from elspeth.web.composer.tools import (

@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from uuid import UUID
 
 import litellm
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY, PromptGuardToolArgumentParts, detach_prompt_guard_messages
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
 from elspeth.web.composer.pipeline_planner import _assistant_tool_calls_message, _parse_response_tool_calls
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts
 from elspeth.web.composer.prompts import build_messages
@@ -110,16 +113,26 @@ async def test_public_urls_keep_json_token_boundaries(authority, tmp_path, tool_
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
+            current_state=state,
             provider_current_state=state.to_dict(),
             model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
         )
         assert len(completion.requests) == 1
+        payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+        assert payload["current_state"]["data"] == state.to_dict()
         assert canonical_json(state.to_dict()) in completion.requests[0]["messages"][-1]["content"]
     else:
         if surface == "freeform_state":
             catalog = create_catalog_service()
             snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-            messages = build_messages([], state, _USER, PolicyCatalogView.for_trained_operator(catalog, snapshot), plugin_snapshot=snapshot)
+            messages = build_messages(
+                [],
+                state,
+                _USER,
+                PolicyCatalogView.for_trained_operator(catalog, snapshot),
+                plugin_snapshot=snapshot,
+                content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+            )
         else:
             messages = _tool_messages(options)
         expected_wire, _trusted = detach_prompt_guard_messages(messages)

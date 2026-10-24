@@ -322,7 +322,7 @@ def test_planner_list_stamps_discovery_and_recovery_strict_and_proposal_non_stri
         "restore_parked_graph",
         _TERMINAL,
     ]
-    assert [tool["function"]["strict"] for tool in tools] == [True] * 22 + [False]
+    assert [tool["function"]["strict"] for tool in tools] == [True] * 23 + [False]
 
 
 @pytest.mark.parametrize(

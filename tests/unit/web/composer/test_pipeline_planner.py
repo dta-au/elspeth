@@ -265,6 +265,19 @@ _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES = 3840
 # The system message and tools are unchanged. Price only this measured 188 B,
 # preserving the finite tripwire and exact-boundary / +1-byte overflow control.
 _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES = 188
+# TC-003/TC-007 selector and recovery-limit guidance (0.8.10 U-04, carried
+# from 23be93a17): controlled initial requests measured 135,730 -> 136,041 B
+# (live and reduced catalog). Only the wire_secret_ref target_id and recovery
+# argument descriptions grew. Price only this measured 311 B.
+_SECRET_SELECTOR_RECOVERY_GUIDANCE_CANONICAL_BYTES = 311
+# Bounded graph/value discovery (0.8.10 U-08, carried from 9f321eb8d): the
+# get_complete_pipeline_value tool and its teaching measured 136,041 ->
+# 137,011 B. Price only this measured 970 B.
+_BOUNDED_GRAPH_DISCOVERY_CANONICAL_BYTES = 970
+# Secret inventory readiness wording (0.8.10, 53264dd87): measured
+# 137,011 -> 137,265 B. Price only this measured 254 B. All three keep the
+# exact-boundary and +1-byte overflow controls and add no working reserve.
+_SECRET_INVENTORY_READINESS_CANONICAL_BYTES = 254
 _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
     + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
@@ -276,6 +289,9 @@ _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
     + _QUALIFICATION_SCAFFOLD_CANONICAL_BYTES
     + _INFORMATION_BOUNDARY_DISCOVERY_CANONICAL_BYTES
     + _SEMANTIC_REVIEW_GUIDANCE_CANONICAL_BYTES
+    + _SECRET_SELECTOR_RECOVERY_GUIDANCE_CANONICAL_BYTES
+    + _BOUNDED_GRAPH_DISCOVERY_CANONICAL_BYTES
+    + _SECRET_INVENTORY_READINESS_CANONICAL_BYTES
 )
 
 
@@ -928,6 +944,7 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
         "diff_pipeline",
         "explain_validation_error",
         "get_audit_info",
+        "get_complete_pipeline_value",
         "get_expression_grammar",
         "get_pipeline_state",
         "get_plugin_assistance",
@@ -2389,6 +2406,7 @@ _DISCOVERY_TEST_ARGUMENTS: Mapping[str, Mapping[str, Any]] = {
     "explain_validation_error": {"error_text": "no_source_configured"},
     "get_audit_info": {},
     "get_expression_grammar": {},
+    "get_complete_pipeline_value": {"reference_id": "0" * 64},
     "get_pipeline_state": {},
     "get_plugin_assistance": {"plugin_type": "source", "plugin_name": "csv"},
     "get_plugin_schema": {"plugin_type": "source", "name": "csv"},

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from uuid import UUID
 
 import httpx
 import litellm
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
@@ -20,6 +22,7 @@ from elspeth.contracts.prompt_guard import (
     detach_prompt_guard_evidence,
 )
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
@@ -232,7 +235,14 @@ async def test_actual_json_producers_send_decoded_cjk_to_azure(authority, monkey
             metadata=PipelineMetadata(),
             version=1,
         )
-        messages = build_messages([], state, _USER, PolicyCatalogView.for_trained_operator(catalog, snapshot), plugin_snapshot=snapshot)
+        messages = build_messages(
+            [],
+            state,
+            _USER,
+            PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+        )
     else:
         response = _response(("emit_pipeline_proposal", {"pipeline": {"nodes": [{"prompt_template": original_text}]}}))
         message, calls = _parse_response_tool_calls(
@@ -267,19 +277,36 @@ async def test_actual_json_producers_send_decoded_cjk_to_azure(authority, monkey
 @pytest.mark.parametrize("state_payload", [{"small": 0.00005}, {"\U0001f600": "astral", "\ue000": "private-use"}, {"double": 1e20}])
 async def test_actual_planner_preserves_canonical_number_and_key_wire(tmp_path, tool_context, monkeypatch, state_payload):
     from elspeth.core.canonical import canonical_json
+    from elspeth.web.composer.state import NodeSpec
+    from tests.unit.web.composer._helpers import _empty_state
     from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
 
     gateway, inspected = _gateway(monkeypatch)
+    state = _empty_state().with_node(
+        NodeSpec.from_dict(
+            {
+                "id": "review",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "out",
+                "on_error": "discard",
+                "options": state_payload,
+            }
+        )
+    )
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
     await _plan(
         tmp_path=tmp_path,
         tool_context=tool_context,
         completion=completion,
-        provider_current_state=state_payload,
+        current_state=state,
+        provider_current_state=state.to_dict(),
         model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
     )
     assert len(completion.requests) == 1 and inspected
     payload = completion.requests[0]["messages"][-1]["content"]
+    assert json.loads(payload)["current_state"]["data"]["nodes"][0]["options"] == state_payload
     assert canonical_json(state_payload) in payload
 
 

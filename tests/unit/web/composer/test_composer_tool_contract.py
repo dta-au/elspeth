@@ -118,10 +118,10 @@ def test_each_route_resolves_from_its_own_model_and_endpoint(
 @pytest.mark.parametrize(
     ("overrides", "dialect", "strict_true"),
     [
-        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 35),
+        ({"composer_model": _OPENROUTER_PLANNER}, _STRICT, 36),
         ({"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": "off"}, _NONE, 0),
         ({}, _NONE, 0),
-        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 35),
+        ({"composer_strict_tools": "forward_to_endpoint"}, _STRICT, 36),
     ],
     ids=["openrouter", "openrouter_off", "defaults", "forward_hosted_openai"],
 )
@@ -135,7 +135,7 @@ def test_service_resolves_its_dialects_and_summary_from_settings(
     assert summary.contract == resolve_composer_tool_contract(settings, env={})
     assert service._planner_dialect is summary.contract.planner.dialect is dialect
     assert service._hatch_dialect is summary.contract.hatch.dialect
-    assert (summary.loop_strict_tool_count, summary.loop_tool_count) == (strict_true, 45)
+    assert (summary.loop_strict_tool_count, summary.loop_tool_count) == (strict_true, 46)
     sent = composer_loop_tool_definitions(service._planner_dialect)
     assert sum(1 for tool in sent if "strict" in tool["function"] and tool["function"]["strict"] is True) == strict_true
 
@@ -153,8 +153,8 @@ def test_resolution_event_carries_closed_values_and_counts_only() -> None:
         "hatch_transport": "forwarding",
         "hatch_dialect": "openai_strict",
         "hatch_diagnostic": None,
-        "loop_strict_tool_count": 35,
-        "loop_tool_count": 45,
+        "loop_strict_tool_count": 36,
+        "loop_tool_count": 46,
     }
 
 

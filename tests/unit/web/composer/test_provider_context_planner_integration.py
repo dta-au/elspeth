@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.prompt_guard import detach_prompt_guard_evidence
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -25,6 +26,7 @@ from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolContext
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.required_work import (
@@ -50,20 +52,42 @@ def test_rendered_prompt_parts_are_exact_and_capture_bounds_are_honest(large: bo
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    messages = build_messages([], state, "Inspect the current wording.", policy, plugin_snapshot=snapshot)
+    if large:
+        before = state.to_dict()
+        with pytest.raises(CredentialMaterialRefused) as refused:
+            build_messages(
+                [],
+                state,
+                "Inspect the current wording.",
+                policy,
+                plugin_snapshot=snapshot,
+                content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+            )
+        assert refused.value.surface == "composer_bounded_content_projection"
+        assert state.to_dict() == before
+        # Independent diagnostic capture must also report unavailable for these
+        # complete bytes, rather than retaining a clipped graph or fake view.
+        captured = capture_provider_context(messages=[{"role": "user", "content": canonical_json(before)}], tools=None)
+        assert captured.disposition == "unavailable" and captured.reasons == ("bounds",)
+        assert captured.canonical is None
+        return
+    messages = build_messages(
+        [],
+        state,
+        "Inspect the current wording.",
+        policy,
+        plugin_snapshot=snapshot,
+        content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+    )
     content = next(row["content"] for row in messages if row["content"].startswith(STATE_CONTEXT_PREFIX))
-    options = json.loads(content.split("\n", 1)[1])["current_state"]["nodes"][0]["options"]
+    options = json.loads(content.split("\n", 1)[1])["current_state"]["data"]["nodes"][0]["options"]
     assert options["prompt_template_parts"][0]["text"] == prefix + "Classify "
     assert options["prompt_template"].startswith(prefix + "Classify support categories")
     wire_messages = detach_prompt_guard_evidence(messages).messages
     assert wire_messages == [{"role": row["role"], "content": row["content"]} for row in messages]
     captured = capture_provider_context(messages=wire_messages, tools=None)
-    if large:
-        assert captured.disposition == "unavailable" and captured.reasons == ("bounds",)
-        assert captured.canonical is None
-    else:
-        assert captured.disposition == "retained"
-        assert json.loads(captured.canonical)["messages"] == wire_messages
+    assert captured.disposition == "retained"
+    assert json.loads(captured.canonical)["messages"] == wire_messages
     # Diagnostic capture bounds do not assert refusal at a provider entrance.
 
 
@@ -101,7 +125,7 @@ async def test_nonempty_compose_sends_current_amended_parts_through_real_provide
         for row in completion.requests[0]["messages"]
         if isinstance(row["content"], str) and row["content"].startswith(STATE_CONTEXT_PREFIX)
     )
-    visible = json.loads(state_message.split("\n", 1)[1])["current_state"]
+    visible = json.loads(state_message.split("\n", 1)[1])["current_state"]["data"]
     options = visible["nodes"][0]["options"]
     assert options["prompt_template_parts"] == before["nodes"][0]["options"]["prompt_template_parts"]
     assert options["prompt_template"] == before["nodes"][0]["options"]["prompt_template"]
@@ -182,7 +206,7 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
         assert [row["role"] for row in wire["messages"]] == ["system", "user", "user"]
         payload = json.loads(wire["messages"][2]["content"])
         assert payload["intent"] == user_request
-        options = payload["current_state"]["nodes"][0]["options"]
+        options = payload["current_state"]["data"]["nodes"][0]["options"]
         assert options["prompt_template_parts"] == before["nodes"][0]["options"]["prompt_template_parts"]
         assert options["prompt_template"] == before["nodes"][0]["options"]["prompt_template"]
         category = next(row for row in options["interpretation_requirements"] if row["id"] == "category")
@@ -193,12 +217,12 @@ async def test_application_projection_boundary_preserves_parts_and_complete_byte
             for row in options["interpretation_requirements"]
         )
         assert "approved_prompt_artifact_hash" not in options
-        assert all("source_authoring" not in row["options"] for row in payload["current_state"]["sources"].values())
+        assert all("source_authoring" not in row["options"] for row in payload["current_state"]["data"]["sources"].values())
         assert len(recorder.llm_calls) == 1
         actual_size = len(canonical_json({"messages": wire["messages"], "tools": wire["tools"]}).encode("utf-8"))
         without_parts = deepcopy(wire["messages"])
         smaller_payload = json.loads(without_parts[2]["content"])
-        del smaller_payload["current_state"]["nodes"][0]["options"]["prompt_template_parts"]
+        del smaller_payload["current_state"]["data"]["nodes"][0]["options"]["prompt_template_parts"]
         without_parts[2]["content"] = canonical_json(smaller_payload)
         smaller_size = len(canonical_json({"messages": without_parts, "tools": wire["tools"]}).encode("utf-8"))
         assert smaller_size < actual_size - 1
@@ -233,8 +257,10 @@ def test_normal_context_retains_prompt_parts_and_existing_blob_path_redaction() 
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
     before = state.to_dict()
-    context = build_context_string(state, policy, plugin_snapshot=snapshot)
-    current = json.loads(context.split("\n", 1)[1])["current_state"]
+    context = build_context_string(
+        state, policy, plugin_snapshot=snapshot, content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state))
+    )
+    current = json.loads(context.split("\n", 1)[1])["current_state"]["data"]
     assert "PRIVATE-STORAGE-CANARY" not in context
     assert current["sources"]["source"]["options"]["blob_ref"] == "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
     assert current["nodes"][0]["options"]["prompt_template_parts"] == before["nodes"][0]["options"]["prompt_template_parts"]
@@ -253,11 +279,13 @@ def _current_state() -> CompositionState:
 
 
 @pytest.mark.asyncio
-async def test_public_plan_freezes_original_nested_context_before_first_provider_call(tmp_path: Path, tool_context: ToolContext) -> None:
+async def test_public_plan_keeps_authoritative_graph_despite_nested_provider_context_mutation(
+    tmp_path: Path, tool_context: ToolContext
+) -> None:
     state = _current_state()
     context = state.to_dict()
     context["version"] = 37
-    expected = deepcopy(context)
+    expected = deepcopy(state.to_dict())
     source_rows = context["sources"]
     assert isinstance(source_rows, dict)
     source = next(iter(source_rows.values()))
@@ -287,7 +315,8 @@ async def test_public_plan_freezes_original_nested_context_before_first_provider
     assert len(completion.requests) == 2
     assert [row["role"] for row in completion.requests[0]["messages"]] == ["system", "user", "user"]
     initial = json.loads(completion.requests[0]["messages"][2]["content"])
-    assert initial["current_state"] == expected
+    assert initial["current_state"]["data"] == expected
+    assert initial["current_state"]["content_manifest"]["composition_content_hash"] == composition_content_hash(state)
     tool_payload = next(json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool")
     assert "PRIVATE-MUTATED" not in json.dumps(tool_payload)
     assert tool_payload["version"] == state.version == 4

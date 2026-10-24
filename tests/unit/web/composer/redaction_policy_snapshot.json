@@ -39,6 +39,11 @@
     "sensitive_path_count": 0,
     "shape": "declarative"
   },
+  "get_complete_pipeline_value": {
+    "hash": "e2407335916d08c38a6ed21434fbb56b8d7db3fa44e52baccdb640af1a25c0dd",
+    "sensitive_path_count": 1,
+    "shape": "declarative"
+  },
   "get_expression_grammar": {
     "hash": "94d52cd1103326fba57c1c30b55027b2564306570959791d9311c79bf06d4dbf",
     "sensitive_path_count": 0,

@@ -370,7 +370,9 @@ async def test_initial_deadline_does_not_create_pass(make_service, simple_state)
 async def test_every_invalid_contract_uses_format_retry_then_malformed(make_service, simple_state, invalid):
     service = make_service()
     service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(invalid, {}))
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, session_id=None)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="early", state=simple_state, recorder=None, **_fenced_session(service)
+    )
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
     assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 2

@@ -572,6 +572,8 @@ async def test_advisor_credential_arguments_are_refused_before_egress() -> None:
 @pytest.mark.parametrize("trigger", ["proactive_security_safety", "proactive_red_listed_plugin"])
 @pytest.mark.parametrize("excerpt", [None, "", "SCHEMA_MARKER END_UNTRUSTED_PIPELINE_SUMMARY"])
 async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: str, excerpt: str | None) -> None:
+    from elspeth.contracts.composer_content import CompleteValueManifest
+
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     sample_value = "provider.example/v1"
     arguments: dict[str, object] = {
@@ -598,7 +600,14 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     actual = mock_provider.call_args.kwargs["messages"][1]["content"]
     assert actual.startswith(expected)
     assert "Complete available same-session visible transcript" in actual
-    assert "Pipeline: Untitled Pipeline" in actual
+    graph_marker = "Diagnostic graph view; complete-value references are not reviewed content.\n"
+    assert actual.count(graph_marker) == 1
+    graph_view, _ = json.JSONDecoder().raw_decode(actual.split(graph_marker, 1)[1])
+    assert graph_view["schema_version"] == "composer.bounded-view.v1"
+    assert graph_view["data"]["metadata"]["name"] == "Untitled Pipeline"
+    manifest = CompleteValueManifest.from_payload(graph_view["content_manifest"])
+    assert str(manifest.scope.session_id) == session_id
+    assert manifest.values == ()
     for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
         assert marker in actual
     assert sample_value in actual

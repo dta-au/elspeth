@@ -3385,13 +3385,18 @@ async def test_step2_audit_integrity_error_carries_failed_turn_metadata(
 
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     _patch_auto_commit_preferences(monkeypatch, sessions_service)
-    # Phase 5b Task 5 follow-on: skip the F-5c skill_markdown_history
-    # upsert so the next-commit-OperationalError listener catches the
-    # persist_compose_turn_async commit (the test's actual target), not
-    # the audit-archive upsert that fires once per service instance.
+    # Arm the failure at actual turn persistence, after input/fence admission.
     composer_service_with_real_sessions._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
-    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)  # before injection: acquiring is a write
-    inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
+    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)
+    original_persist = composer_service_with_real_sessions._persist_turn_audit
+    persist_entries: list[bool] = []
+
+    async def _fail_turn_commit(**kwargs: Any) -> Any:
+        persist_entries.append(True)
+        inject_commit_OperationalError(sessions_service._engine)
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(composer_service_with_real_sessions, "_persist_turn_audit", _fail_turn_commit)
 
     with pytest.raises(AuditIntegrityError) as excinfo:
         await _run_one_turn(
@@ -3405,6 +3410,7 @@ async def test_step2_audit_integrity_error_carries_failed_turn_metadata(
     assert excinfo.value.failed_turn.assistant_message_id is None
     assert excinfo.value.failed_turn.tool_calls_attempted == 2
     assert excinfo.value.failed_turn.tool_responses_persisted == 0
+    assert persist_entries == [True]
 
 
 @pytest.mark.asyncio
@@ -3425,13 +3431,13 @@ async def test_plugin_crash_unwind_commit_failure_remains_unpersisted_and_retain
     original_persist = composer_service_with_real_sessions._persist_turn_audit  # type: ignore[attr-defined]
 
     async def _capture_persist_outcome(**kwargs: Any) -> Any:
+        inject_commit_OperationalError(sessions_service._engine)
         outcome = await original_persist(**kwargs)
         persisted_flags.append(outcome.persisted_tool_call_turn)
         return outcome
 
     monkeypatch.setattr(composer_service_with_real_sessions, "_persist_turn_audit", _capture_persist_outcome)
-    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)  # before injection: acquiring is a write
-    inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
+    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)
 
     with pytest.raises(ComposerPluginCrashError) as excinfo:
         await _run_one_turn(

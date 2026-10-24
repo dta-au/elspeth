@@ -72,6 +72,8 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "collector_on_success_dangling",
         "collector_plugin_not_batch_aware",
         "collector_scope_policy_invalid",
+        "complete_value_unavailable",
+        "complete_value_unsupported",
         "connection_sink_name_overlap",
         "contract_config_invalid",
         "credential_material_rejected",
