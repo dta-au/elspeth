@@ -17,6 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import ComposeFrame
+from elspeth.web.composer.continuation_attachment_history import empty_attachment_history, encode_attachment_history
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
@@ -75,8 +76,12 @@ async def stored_evidence(store):
     # retained; no placeholder module or fake decoder is called or installed.
     opaque = {
         name: encode_private_chunk(codec="composer.messages.v1", canonical=canonical_json({"unconsumed_test_input": name}))
-        for name in ("bootstrap", "iteration", "caches", "attachments")
+        for name in ("bootstrap", "iteration", "caches")
     }
+    # Evidence restore reproves attachment applications through the real
+    # attachment-history decoder, so this value is inside the owner: it is the
+    # same empty history a fresh composition initialization writes.
+    attachments = encode_attachment_history(empty_attachment_history(session_id=str(sid), operation_id=record.operation_id))
     current_messages = encode_private_chunk(
         codec="composer.messages.v1",
         canonical=canonical_json(
@@ -95,7 +100,7 @@ async def stored_evidence(store):
         audit_buffer=audit.reference,
         transcript=transcript.reference,
         caches=opaque["caches"].reference,
-        attachment_admissions=opaque["attachments"].reference,
+        attachment_admissions=attachments.reference,
         initial_version=1,
         current_state_id=None,
         slice_sequence=running.claim.segment_sequence,
@@ -134,7 +139,7 @@ async def stored_evidence(store):
             .where(jobs.c.session_id == str(sid), jobs.c.operation_id == record.operation_id)
             .values(user_message_id=owner.request_id, ingress_phase="committed")
         )
-        for chunk in (evidence, state, transcript, audit, current_messages, *opaque.values()):
+        for chunk in (evidence, state, transcript, audit, current_messages, attachments, *opaque.values()):
             put_chunk(
                 conn,
                 session_id=str(sid),
