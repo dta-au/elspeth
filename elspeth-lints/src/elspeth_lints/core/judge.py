@@ -65,6 +65,15 @@ DEFAULT_JUDGE_MAX_TOKENS: int = 1024
 TRANSPORT_OPENROUTER: str = "openrouter"
 TRANSPORT_AGENT: str = "claude_agent_sdk"
 TRANSPORT_CODEX_CLI: str = "codex_cli"
+# Codex CLI's native shell cannot be shown to be fully disabled, and the
+# worker's HOME/CODEX_HOME hold provider credentials, so a prompt injection in
+# candidate source could read them. Refused until provider authentication is
+# brokered by a process outside model and tool authority.
+CODEX_CLI_TRANSPORT_DISABLED: str = (
+    "the codex-cli judge transport is disabled: Codex CLI's native shell cannot be shown to be "
+    "fully disabled, and the judge worker's provider home holds credentials. Use --judge-transport "
+    "agent until provider authentication is brokered outside model and tool authority."
+)
 
 # Per-transport default model. CRITICAL: DEFAULT_JUDGE_MODEL is an OpenRouter
 # *routing slug* ("anthropic/claude-opus-4-7" — the vendor prefix is required
@@ -2434,6 +2443,9 @@ def call_judge(
         else:
             model_id = DEFAULT_JUDGE_MODEL
 
+    if transport_impl is None and transport == TRANSPORT_CODEX_CLI:
+        raise JudgeConfigurationError(CODEX_CLI_TRANSPORT_DISABLED)
+
     if transport_impl is not None:
         from elspeth_lints.core.operator_runtime import current_operator_runtime
 
@@ -2451,7 +2463,13 @@ def call_judge(
 
     parsed = _parse_judge_payload(result.raw_text)
     verdict = _verdict_from_string(parsed["verdict"])
-    rationale = _required_str_field(parsed, "rationale")
+    # Defence in depth for every transport and tool mode: a rationale is
+    # printed, staged and persisted, so credential-shaped text never leaves
+    # here. Scrubbing after the call cannot undo an upstream disclosure; the
+    # transports must still deny the model any read of the provider home.
+    from elspeth_lints.core.source_excerpt import scrub_secrets
+
+    rationale = scrub_secrets(_required_str_field(parsed, "rationale")).text
     confidence = _required_confidence_field(parsed, "confidence")
     should_use_decorator = _optional_str_field(parsed, "should_use_decorator")
 

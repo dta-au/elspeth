@@ -18,7 +18,8 @@ import pytest
 from elspeth_lints.core import judge, judge_rpc, judge_supervisor, judge_worker
 
 
-@pytest.mark.parametrize("transport", [judge.TRANSPORT_OPENROUTER, judge.TRANSPORT_AGENT, judge.TRANSPORT_CODEX_CLI])
+# codex_cli is refused before dispatch (test_judge_provider_home_isolation.py).
+@pytest.mark.parametrize("transport", [judge.TRANSPORT_OPENROUTER, judge.TRANSPORT_AGENT])
 def test_every_production_transport_uses_worker_client(monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
     observed = judge._TransportResult(
         json.dumps({"verdict": "ACCEPTED", "rationale": "Verified external boundary", "confidence": 0.9, "should_use_decorator": None}),
@@ -39,7 +40,8 @@ def test_every_production_transport_uses_worker_client(monkeypatch: pytest.Monke
     assert response.policy_hash == judge.JUDGE_POLICY_HASH
 
 
-@pytest.mark.parametrize("transport", [judge.TRANSPORT_OPENROUTER, judge.TRANSPORT_AGENT, judge.TRANSPORT_CODEX_CLI])
+# codex_cli is refused before dispatch (test_judge_provider_home_isolation.py).
+@pytest.mark.parametrize("transport", [judge.TRANSPORT_OPENROUTER, judge.TRANSPORT_AGENT])
 def test_missing_supervisor_never_falls_back(monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
     worker = create_autospec(
         judge_rpc.call_worker, spec_set=True, side_effect=judge.JudgeConfigurationError("protected worker unavailable")

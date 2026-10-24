@@ -17,6 +17,8 @@ from typing import Any
 
 from elspeth_lints.core.judge import (
     _TRANSPORTS,
+    CODEX_CLI_TRANSPORT_DISABLED,
+    TRANSPORT_CODEX_CLI,
     AgentToolScope,
     JudgeConfigurationError,
     JudgeContractError,
@@ -60,6 +62,10 @@ def require_worker_execution() -> None:
 
 
 def _admit_profile(request: dict[str, Any]) -> None:
+    # Refuse before the profile or provider home is read, so a codex request
+    # never loads credentials into a process whose model has a native shell.
+    if request["transport"] == TRANSPORT_CODEX_CLI:
+        raise JudgeConfigurationError(CODEX_CLI_TRANSPORT_DISABLED)
     from elspeth_lints.core.operator_runtime import validate_protected_path
 
     validate_protected_path(PROFILE_PATH)

@@ -1112,16 +1112,18 @@ def test_stage_preview_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
 
 
-def test_stage_preview_without_installed_supervisor_refuses_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Key absent, supervisor absent: the real call_judge route refuses; no local transport runs."""
+def test_stage_preview_refuses_the_disabled_codex_transport_with_no_local_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """stage_preview judges through codex-cli, which is refused before any worker or local transport."""
     ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
-    monkeypatch.setattr(judge_rpc, "ADMISSION_PATH", tmp_path / "absent-judge-workers.json")
+    worker = create_autospec(judge_rpc.call_worker, spec_set=True, side_effect=AssertionError("codex request reached the worker"))
+    monkeypatch.setattr(judge_rpc, "call_worker", worker)
     local = create_autospec(judge._TRANSPORTS[TRANSPORT_CODEX_CLI], spec_set=True, side_effect=AssertionError("local fallback"))
     monkeypatch.setitem(judge._TRANSPORTS, TRANSPORT_CODEX_CLI, local)
     with patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()):
         outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
     assert outcome.is_error is True
-    assert "protected judge supervisor admission is unavailable or invalid" in outcome.text
+    assert "codex-cli judge transport is disabled" in outcome.text
+    worker.assert_not_called()
     local.assert_not_called()
 
 
