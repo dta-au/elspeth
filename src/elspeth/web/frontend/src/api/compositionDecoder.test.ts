@@ -14,7 +14,12 @@ describe("composition state decoder", () => {
   });
 
   it("accepts an older server response without claiming a checksum", () => {
-    expect(decodeCompositionState(Object.values(fixture.states)[0]).composition_content_hash).toBeUndefined();
+    // The golden is regenerated from the current server, so it carries the
+    // checksum. A pre-0.8.10 server omits the key entirely; build that body.
+    const older: Record<string, unknown> = { ...Object.values(fixture.states)[0] };
+    delete older.composition_content_hash;
+    expect("composition_content_hash" in older).toBe(false);
+    expect(decodeCompositionState(older).composition_content_hash).toBeUndefined();
   });
 
   it("preserves the null-metadata read contract without claiming a checksum", () => {
