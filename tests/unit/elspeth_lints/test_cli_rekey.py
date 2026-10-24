@@ -212,6 +212,9 @@ def _rekey_bundle(
     bundle_id: str = "rekey-under-test",
 ) -> Path:
     repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    # Isolate the fixture before HEAD discovery can find an enclosing checkout.
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     if (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],

@@ -210,6 +210,8 @@ def _context(root: Path, allowlist_dir: Path, staged_dir: Path) -> Any:
     resolved_root = root.resolve()
     resolved_allowlist = allowlist_dir.resolve()
     repo = Path(os.path.commonpath((resolved_root, resolved_allowlist)))
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     if (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
@@ -224,6 +226,28 @@ def _context(root: Path, allowlist_dir: Path, staged_dir: Path) -> Any:
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
     return judge_server._ServerContext(root=resolved_root, allowlist_dir=resolved_allowlist, staged_dir=staged_dir.resolve())
+
+
+def test_context_keeps_fixture_git_ownership_inside_a_parent_checkout(tmp_path: Path) -> None:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "outer@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Outer Fixture"], check=True)
+    (tmp_path / "outer.txt").write_text("Preserve the parent repository.\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "outer.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "parent"], check=True)
+    parent_index = (tmp_path / ".git" / "index").read_bytes()
+    child = tmp_path / "child"
+    child.mkdir()
+    root = _build_root(child)
+    allowlist = _build_allowlist_dir(child)
+    _write_source(root, "plugins/widget.py", "owned child")
+
+    context = _context(root, allowlist, child / "staged")
+
+    observed_root = subprocess.check_output(["git", "-C", str(child), "rev-parse", "--show-toplevel"], text=True).strip()
+    assert Path(observed_root) == child
+    assert (tmp_path / ".git" / "index").read_bytes() == parent_index
+    assert _scan_and_read(context, "nested-checkout").source_dirty is False
 
 
 # --------------------------------------------------------------------------- #
