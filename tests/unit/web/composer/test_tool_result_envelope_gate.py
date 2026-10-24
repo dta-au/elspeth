@@ -70,6 +70,11 @@ FENCE_PATH = Path(__file__).with_name("tool_result_envelope_fence.json")
 COMPOSER = WEB_SRC / "composer"
 COMMON = COMPOSER / "tools" / "_common.py"
 TOOL_BATCH = COMPOSER / "tool_batch.py"
+# The function in tool_batch.py that authors the batch's per-call payloads: the proposal and
+# prevalidation-rejection data and the advisor Mapping responses. ``run_tool_batch`` drives each
+# call through it; test_run_tool_batch_dispatches_through_the_payload_owner pins that, so a
+# future move of the payloads refuses here instead of leaving every walker reading nothing.
+BATCH_PAYLOAD_OWNER = "_execute_continuation_call_live"
 SESSION_TOOL = COMPOSER / "session_tool.py"
 TOOLS_DIR = COMPOSER / "tools"
 SHARED = "*"  # the ``tool`` column for surfaces every tool ships
@@ -92,13 +97,18 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
     ("_common.py", "_merged_component_rejection_result"): (
         "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
     ),
-    ("tool_batch.py", "run_tool_batch"): "two _FAILURE_DATA_HELPERS rows: the proposal payload and the rejection payload",
+    ("tool_batch.py", BATCH_PAYLOAD_OWNER): "two _FAILURE_DATA_HELPERS rows: the proposal payload and the rejection payload",
     ("session_tool.py", "_dispatch_session_aware_tool"): (
         "review-blocked payload walked by _tool_data_sites over session_tool.py in shipped_keys; attributed to request_interpretation_review"
     ),
     ("discovery_cache.py", "result_from_cached_discovery_payload"): (
         "re-envelopes a cached discovery result's own data under the current state; adds no key, and every key it "
         "carries was censused at the tool that produced it"
+    ),
+    ("continuation_tool_batch.py", "decode_tool_result_value"): (
+        "restores a retained ToolResult from continuation storage; its data is the stored producer payload, "
+        "parsed back (plugin-schema data to its producer type) with no key added, so the producer that built it "
+        "remains the census authority"
     ),
     ("discovery_response.py", "to_tool_result"): (
         "re-envelopes the declaration-selected producer encoding for legacy consumers; adds no data key, "
@@ -1879,8 +1889,8 @@ def _plugin_schema_sites() -> Iterator[ShippedKey]:
 # an owned TypedDict, which is the form that leaves no local for a later store to travel through.
 _FAILURE_DATA_HELPERS: tuple[tuple[Path, str, str | None, str | None], ...] = (
     (COMMON, "_build_credential_wiring_contract_failure", None, "replace"),
-    (TOOL_BATCH, "run_tool_batch", None, "ToolResult"),  # inline data=_ProposalPayload(...)
-    (TOOL_BATCH, "run_tool_batch", "feedback_data", None),
+    (TOOL_BATCH, BATCH_PAYLOAD_OWNER, None, "ToolResult"),  # inline data=_ProposalPayload(...)
+    (TOOL_BATCH, BATCH_PAYLOAD_OWNER, "feedback_data", None),
 )
 
 
@@ -2664,11 +2674,24 @@ def test_credential_builder_payload_is_censused_at_its_actual_owner() -> None:
     assert rows and all(row.surface == "failure-data" and row.tool == SHARED for row in rows)
 
 
+def test_run_tool_batch_dispatches_through_the_payload_owner() -> None:
+    """The batch entry point reaches the payloads every tool_batch walker reads.
+
+    The walkers read ``BATCH_PAYLOAD_OWNER``, not ``run_tool_batch``, because the
+    continuation rewrite moved per-call dispatch out of the entry point. If the
+    entry point stopped driving calls through that owner, the walkers would be
+    censusing a function no batch runs.
+    """
+    fn = _function(_parse(TOOL_BATCH), "run_tool_batch")
+    dispatches = [node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == BATCH_PAYLOAD_OWNER]
+    assert len(dispatches) == 1, f"run_tool_batch calls {BATCH_PAYLOAD_OWNER} {len(dispatches)} times; expected exactly one dispatch"
+
+
 def test_failure_data_helpers_keep_constructor_ownership_distinct() -> None:
     assert _FAILURE_DATA_HELPERS == (
         (COMMON, "_build_credential_wiring_contract_failure", None, "replace"),
-        (TOOL_BATCH, "run_tool_batch", None, "ToolResult"),
-        (TOOL_BATCH, "run_tool_batch", "feedback_data", None),
+        (TOOL_BATCH, BATCH_PAYLOAD_OWNER, None, "ToolResult"),
+        (TOOL_BATCH, BATCH_PAYLOAD_OWNER, "feedback_data", None),
     )
     # The real batch already contains replace(data=feedback_data). Reading it
     # as an inline proposal would hit the strict unreadable-Name refusal;
@@ -3365,14 +3388,14 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
 
     That is a scope hole this gate cannot close by itself — the keys would need
     a teach-or-fence ruling each — but silence about it is what let it sit at
-    zero rows. The payloads are derived from ``run_tool_batch`` (every
+    zero rows. The payloads are derived from ``BATCH_PAYLOAD_OWNER`` (every
     ``_append_tool_outcome(response=<local>)`` whose local is bound to a dict
     literal, which is exactly the Mapping arm ``service.py`` dispatches on) and
     compared to the recorded shapes, so a new advisor payload or a new key on
     one refuses here until it is adjudicated.
     """
     tree = _parse(TOOL_BATCH)
-    fn = _function(tree, "run_tool_batch")
+    fn = _function(tree, BATCH_PAYLOAD_OWNER)
     responses = {
         kw.value.id
         for node in ast.walk(fn)
@@ -3415,7 +3438,7 @@ def test_advisor_request_rejection_mapping_rejects_post_literal_mutation(monkeyp
         tree = original(path)
         if path != TOOL_BATCH:
             return tree
-        fn = _function(tree, "run_tool_batch")
+        fn = _function(tree, BATCH_PAYLOAD_OWNER)
         for node in ast.walk(fn):
             if not isinstance(node, ast.If):
                 continue
@@ -3456,7 +3479,7 @@ def test_advisor_mapping_guard_unpack_rejects_changed_producer_and_authority(mon
     def changed_source(path: Path) -> ast.Module:
         tree = original(path)
         if path == TOOL_BATCH:
-            fn = _function(tree, "run_tool_batch")
+            fn = _function(tree, BATCH_PAYLOAD_OWNER)
             payload = _initial_dict_assign(fn, "refusal_payload", "guard refusal probe")
             expansion = next(value for key, value in zip(payload.keys, payload.values, strict=True) if key is None)
             assert isinstance(expansion, ast.Call) and isinstance(expansion.func, ast.Attribute)
@@ -3563,7 +3586,7 @@ def test_advisor_mapping_guard_unpack_rejects_shadow_bindings(monkeypatch: pytes
     def changed_source(path: Path) -> ast.Module:
         tree = original(path)
         if path == TOOL_BATCH:
-            fn = _function(tree, "run_tool_batch")
+            fn = _function(tree, BATCH_PAYLOAD_OWNER)
             if location == "tool-module":
                 tree.body.extend(ast.parse(replacement).body)
             elif location == "relative-import":
@@ -3639,7 +3662,7 @@ def test_advisor_mapping_guard_unpack_rejects_aliased_namespace_primitives(monke
         test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censused()
 
 
-# The APPROVAL_REQUIRED proposal payload, in the order run_tool_batch authors it. ``success`` is
+# The APPROVAL_REQUIRED proposal payload, in the order BATCH_PAYLOAD_OWNER authors it. ``success`` is
 # deliberately absent: the envelope's own ``success`` already says it and ``status`` is the
 # discriminator a reader keys on (F1 on elspeth-e405ad7cd2).
 _PROPOSAL_PAYLOAD_KEYS: tuple[str, ...] = ("status", "proposal_id", "tool_name", "summary", "message")
@@ -3683,13 +3706,15 @@ def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
     matrix cannot drift apart.
     """
     tree = _parse(TOOL_BATCH)
-    fn = _function(tree, "run_tool_batch")
+    fn = _function(tree, BATCH_PAYLOAD_OWNER)
     site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
     payload_type = tool_batch._ProposalPayload
     assert typing.is_typeddict(payload_type)
     type_name = payload_type.__name__
     mentions = [node for node in ast.walk(fn) if isinstance(node, ast.Name) and node.id == type_name]
-    assert len(mentions) == 1, f"{site}: {type_name} is named {len(mentions)} times in run_tool_batch; the payload is built once, inline"
+    assert len(mentions) == 1, (
+        f"{site}: {type_name} is named {len(mentions)} times in {BATCH_PAYLOAD_OWNER}; the payload is built once, inline"
+    )
     constructions = [node for node in ast.walk(fn) if isinstance(node, ast.Call) and _call_name(node) == type_name]
     assert len(constructions) == 1, f"{site}: expected exactly one {type_name}(...), got {len(constructions)}"
     construction = constructions[0]
@@ -3710,7 +3735,7 @@ def test_approval_required_proposal_payload_ships_exactly_its_keys() -> None:
     assert census == [f"data.{key}" for key in _PROPOSAL_PAYLOAD_KEYS]
 
 
-# The status fields merged onto the PREVALIDATION_REJECTED payload, in the order run_tool_batch
+# The status fields merged onto the PREVALIDATION_REJECTED payload, in the order BATCH_PAYLOAD_OWNER
 # authors them. ``success`` is absent for the same reason it is absent from the proposal payload,
 # and ``applied_version`` is gone because the result now carries the unapplied state on its
 # envelope (SYS-R3-3), leaving ``candidate_version`` as the only fact the envelope lacks.
@@ -3718,7 +3743,7 @@ _PREVALIDATION_REJECTED_KEYS: tuple[str, ...] = ("status", "applied", "candidate
 
 
 def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
-    """Exact-key pin on the OTHER payload in ``run_tool_batch`` (red-team RED-R3-2, mutant G6).
+    """Exact-key pin on the OTHER payload in ``BATCH_PAYLOAD_OWNER`` (red-team RED-R3-2, mutant G6).
 
     The proposal payload eleven lines below was pinned; this one was not, and
     ``"success": True`` added to its merge SURVIVED the envelope gate and a wide
@@ -3746,7 +3771,7 @@ def test_prevalidation_rejected_payload_ships_exactly_its_status_keys() -> None:
     exactly these four, and never a fifth".
     """
     tree = _parse(TOOL_BATCH)
-    fn = _function(tree, "run_tool_batch")
+    fn = _function(tree, BATCH_PAYLOAD_OWNER)
     site = f"{_display(TOOL_BATCH)}:{fn.lineno}"
     payload_type = tool_batch._PrevalidationRejectedStatus
     assert typing.is_typeddict(payload_type)
@@ -3806,13 +3831,13 @@ def test_prevalidation_rejected_result_states_the_unapplied_envelope_on_every_fi
     needs a candidate whose version differs and only the harness builds one.
     """
     tree = _parse(TOOL_BATCH)
-    fn = _function(tree, "run_tool_batch")
+    fn = _function(tree, BATCH_PAYLOAD_OWNER)
     replaces = [
         node
         for node in ast.walk(fn)
         if isinstance(node, ast.Call) and _call_name(node) == "replace" and any(kw.arg == "data" for kw in node.keywords)
     ]
-    assert len(replaces) == 1, "premise: run_tool_batch re-datas exactly one result"
+    assert len(replaces) == 1, f"premise: {BATCH_PAYLOAD_OWNER} re-datas exactly one result"
     restated = {kw.arg: kw.value for kw in replaces[0].keywords}
     assert set(restated) == {"data", "updated_state", "prior_validation", "affected_nodes"}, (
         "the rejected result must restate every envelope field that describes a change, and nothing else"
