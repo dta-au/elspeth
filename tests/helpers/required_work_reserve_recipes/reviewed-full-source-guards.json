@@ -5,7 +5,7 @@
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],
-    "sha256": "41162a50c431ccf80467fddd3d538ba99b62db0f7ae002cfc625aead95eb3d56"
+    "sha256": "65f502b47064498200884d1015521b386bdeffb8148f5530a709f3094b6de851"
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
@@ -21,7 +21,7 @@
   },
   "src/elspeth/web/required_work.py": {
     "protected_exports": [],
-    "sha256": "6d8c2a2b42ace71ba919aa33a63fe6da59910181511fd0545747f9f5a2e60669"
+    "sha256": "89b424a876c255f5c71b5dc775e4fb6710d6807045a7e1210979d6e58e7e7b6e"
   },
   "src/elspeth/web/sessions/composer_operation_errors.py": {
     "protected_exports": [
@@ -58,10 +58,10 @@
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
-    "sha256": "f4c20707249d0de53c10c718d94ef140c9b761f57409d793d1a88426dcbee517"
+    "sha256": "30f257a87e405eef36645cf2fd55e284d05c8cf32d1296128bb9a4192ca421e8"
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "0c1337e2a60a44e851ccd43c36897510d3402f014e53819009c9c0e790a5f451"
+    "sha256": "3566fac324c3934739a288742c3608ccd3a1f805ad43de4af6669912d98eca11"
   }
 }
