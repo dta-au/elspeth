@@ -311,9 +311,11 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
 def get_tool_definitions() -> list[dict[str, Any]]:
     """Return JSON Schema tool definitions for the LLM.
 
-    Returns 42 tools: 12 discovery + 14 mutation + 11 blob tools (5 discovery,
+    Returns 43 tools: 12 discovery + 14 mutation + 12 blob tools (6 discovery,
     6 mutation) + 3 secret tools (2 discovery, 1 mutation) + 1 advisor tool +
-    1 session-aware interpretation-review tool.
+    1 session-aware interpretation-review tool. The breakdown is measured
+    against the live registry by
+    ``tests/unit/web/composer/test_tool_definitions_documented_count.py``.
     ``request_advisor_hint`` is always part of the LLM-visible list —
     advisor is mandatory — see ``service.composer_loop_tool_definitions``.
 
