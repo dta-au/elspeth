@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -2518,11 +2519,23 @@ class TestInspectSourceTool:
         from elspeth.web.blobs.service import blob_pre_update_sidecar
 
         original = self.content_bytes
+
+        def leave_crash_journal() -> None:
+            if journal == "pre_update_sidecar":
+                blob_pre_update_sidecar(self.storage_path).write_bytes(original)
+                self.storage_path.write_bytes(b"replacement,never,committed\n1,2,3\n")
+            else:
+                self.storage_path.rename(self.storage_path.with_name(f".{self.blob_id}.delete-{'0' * 32}"))
+
+        # Fixture control: the existing fenced reader recovers this exact
+        # crash state. It repairs storage, so the state is re-created below.
+        leave_crash_journal()
         if journal == "pre_update_sidecar":
-            blob_pre_update_sidecar(self.storage_path).write_bytes(original)
-            self.storage_path.write_bytes(b"replacement,never,committed\n1,2,3\n")
+            assert self.storage_path.read_bytes() != original
         else:
-            self.storage_path.rename(self.storage_path.with_name(f".{self.blob_id}.delete-{'0' * 32}"))
+            assert not self.storage_path.exists()
+        assert self._read_through_shared_reader() == original
+        leave_crash_journal()
 
         with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
             result = self._inspect(blob_authority, blob_operation_context)
@@ -2533,7 +2546,6 @@ class TestInspectSourceTool:
         assert result.data["redacted_identity"]["byte_size"] == str(len(original))
         assert self.storage_path.read_bytes() == original
         assert result.updated_state.version == _empty_state().version
-        assert self._read_through_shared_reader() == original
 
     def test_inspect_source_rejects_stale_context_before_storage(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """TC-006 (#327): a released operation context reaches no storage.
@@ -2628,6 +2640,120 @@ class TestInspectSourceTool:
         assert len(requested) >= 3, "a multi-chunk file must be streamed in several reads"
         assert all(0 < size <= _STREAM_CHUNK_BYTES for size in requested), requested
         assert result.data["byte_range_inspected"][1] <= 8 * 1024
+
+    def _fail_storage_open(self, monkeypatch: pytest.MonkeyPatch, errno_code: int) -> None:
+        import os
+
+        original_open = Path.open
+
+        def failing_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if path == self.storage_path and mode == "rb":
+                raise OSError(errno_code, os.strerror(errno_code), str(path))
+            return original_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", failing_open)
+
+    def _assert_repairable_missing_storage(self, result: Any) -> None:
+        assert result.success is False
+        message = result.validation.errors[0].message
+        assert message == f"Blob storage file missing for '{self.blob_id}'."
+        assert str(self.storage_path) not in message
+        assert result.updated_state.version == _empty_state().version
+
+    def test_inspect_source_missing_backing_file_is_repairable_without_its_path(self) -> None:
+        """TC-006 §5.3: already-missing storage stays repairable and does not expose the path."""
+        self.storage_path.unlink()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = self._inspect(blob_authority, blob_operation_context)
+        self._assert_repairable_missing_storage(result)
+
+    @pytest.mark.parametrize("errno_code", [pytest.param(errno.ENOENT, id="ENOENT"), pytest.param(errno.ESTALE, id="ESTALE")])
+    def test_inspect_source_raced_storage_loss_is_a_repairable_miss(self, monkeypatch: pytest.MonkeyPatch, errno_code: int) -> None:
+        """TC-006 §5.3: ENOENT/ESTALE during the open are classified as missing storage."""
+        self._fail_storage_open(monkeypatch, errno_code)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = self._inspect(blob_authority, blob_operation_context)
+        self._assert_repairable_missing_storage(result)
+
+    @pytest.mark.parametrize("errno_code", [pytest.param(errno.EACCES, id="EACCES"), pytest.param(errno.EIO, id="EIO")])
+    def test_inspect_source_other_io_faults_propagate(self, monkeypatch: pytest.MonkeyPatch, errno_code: int) -> None:
+        """TC-006 §5.3: a genuine I/O fault is neither a repairable miss nor facts."""
+        self._fail_storage_open(monkeypatch, errno_code)
+        with (
+            pytest.raises(OSError) as raised,
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
+            self._inspect(blob_authority, blob_operation_context)
+        assert raised.value.errno == errno_code
+
+    def test_inspect_source_foreign_session_blob_is_not_found(self) -> None:
+        """TC-006 §5.3: another session's blob is 'not found', with none of its metadata."""
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from elspeth.web.sessions.models import sessions_table
+
+        foreign_session, foreign_blob = str(uuid4()), str(uuid4())
+        now = datetime.now(UTC)
+        with self.engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=foreign_session, user_id="test-user", auth_provider_type="local", title="Other", created_at=now, updated_at=now
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=foreign_blob,
+                    session_id=foreign_session,
+                    filename="foreign-secret-name.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(self.content_bytes),
+                    content_hash=self.content_hash_hex,
+                    storage_path=str(self.storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": foreign_blob},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+        assert result.success is False
+        message = result.validation.errors[0].message
+        assert message == f"Blob '{foreign_blob}' not found."
+        assert "foreign-secret-name" not in message
+
+    def test_inspect_source_rejects_a_dispatcher_context_for_another_session(self) -> None:
+        """TC-006 §5.3: a context owned by another session is a dispatcher fault, not a model error."""
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions.models import sessions_table
+
+        other_session = str(uuid4())
+        now = datetime.now(UTC)
+        with self.engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=other_session, user_id="test-user", auth_provider_type="local", title="Other", created_at=now, updated_at=now
+                )
+            )
+        with (
+            pytest.raises(AuditIntegrityError, match="does not match the requested store"),
+            _blob_operation(self.engine, other_session) as (blob_authority, blob_operation_context),
+        ):
+            self._inspect(blob_authority, blob_operation_context)
 
     def test_non_uuid_blob_id_rejected_before_lookup(self) -> None:
         """LLM placeholder identifiers must fail at the blob-id boundary."""
