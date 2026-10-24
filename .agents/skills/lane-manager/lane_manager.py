@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""lane-manager mechanism: crash-durable lane state, red→green→suite verification, gated serial merge.
+"""lane-manager mechanism: crash-durable lane state, red→green verification, gated serial merge.
 
-The orchestrating agent (see SKILL.md) does the spawning, the list-live call
-and the nudges; this module owns everything that must survive the
-orchestrator dying and must never depend on a worker's word:
+The dispatching agent (see SKILL.md) does the spawning, the list-live call
+and the nudges; this module owns everything that must survive that session
+dying and must never depend on a worker's word:
 
-* the per-lane directory ``.lanes/<lane-id>/`` holding ``plan.md`` (what the
+* the per-lane directory ``<lanes-dir>/<lane-id>/`` holding ``plan.md`` (what the
   lane must do), ``status.json`` (state: pending|running|verified|failed|merged,
   heartbeat, attempts, evidence) and ``report.md`` (written by the worker);
   every write is an atomic replace, so a kill leaves the old or the new file;
 * ``resume``: reads every ``status.json``, decides liveness from the heartbeat
   and worktree activity, and re-dispatches ONLY lanes killed mid-flight;
-* ``verify``: a lane advances to ``verified`` only when its test is RED on the
-  base without the fix, GREEN on the merged tree, and the full suite passes on
-  that same merged tree — all measured in throwaway worktrees, never in a
-  worker's working directory;
+* ``verify``: a lane advances to ``verified`` only when its branch has commits
+  ahead of the base, its test is RED on the base without the fix, and GREEN on
+  the merged tree — measured in throwaway worktrees, never in a worker's
+  working directory. The full suite is not run per lane: run
+  ``scripts/full-suite-gate.sh`` once on the final merged tree;
 * ``merge``: serial and gated — a verification is bound to the base and branch
   SHAs it measured; if either moved, the merge is refused until re-verified.
 
@@ -221,13 +222,12 @@ class LaneStatus:
 
 @dataclass
 class Run:
-    """The run manifest ``.lanes/<run-id>.run.json``: base ref, suite command, lane ids, merges."""
+    """The run manifest ``<lanes-dir>/<run-id>.run.json``: base ref, lane ids, merges."""
 
     lanes_dir: Path
     run_id: str
     repo: str
     base_ref: str
-    suite_command: str
     created_at: str
     lane_ids: list[str]
     merges: list[dict[str, object]] = field(default_factory=list)
@@ -252,7 +252,6 @@ class Run:
             run_id=str(raw["run_id"]),
             repo=str(raw["repo"]),
             base_ref=str(raw["base_ref"]),
-            suite_command=str(raw["suite_command"]),
             created_at=str(raw["created_at"]),
             lane_ids=[str(x) for x in raw["lane_ids"]],
             merges=list(raw.get("merges", [])),
@@ -291,12 +290,10 @@ def render_plan(run: Run, lane: LaneStatus) -> str:
         f"## Files a correct fix must change\n\n{files}\n\n"
         f"## Test files the lane must add or change\n\n{tests}\n\n"
         f"## Test command (must be RED before the fix, GREEN after)\n\n```\n{lane.expected.test_command}\n```\n\n"
-        f"## Full suite (must pass on the merged tree)\n\n```\n{run.suite_command}\n```\n\n"
         "## Definition of done\n\n"
         "1. The failing test is committed FIRST and `verify` proves it fails on the base without the fix.\n"
         "2. The fix is committed; the test command exits 0 on the merged tree.\n"
-        "3. The full suite exits 0 on the merged tree.\n"
-        f"4. Findings are written to `{lane.report_path}`; the worker returns one line.\n"
+        f"3. Findings are written to `{lane.report_path}`; the worker returns one line.\n"
     )
 
 
@@ -329,10 +326,9 @@ def init_run(
     run_id: str,
     repo: Path,
     base_ref: str,
-    suite_command: str,
     tickets: list[dict[str, object]],
 ) -> Run:
-    """Create ``.lanes/<run-id>.run.json`` and ``.lanes/<lane-id>/{plan.md,status.json}`` per ticket.
+    """Create ``<lanes-dir>/<run-id>.run.json`` and ``<lanes-dir>/<lane-id>/{plan.md,status.json}`` per ticket.
 
     Each ticket is ``{ticket, title, files, test_files, test_command[, description, branch, worktree]}``.
     Lane id, branch and worktree derive from the ticket id so a re-dispatch targets the same place.
@@ -344,7 +340,6 @@ def init_run(
         run_id=run_id,
         repo=str(repo),
         base_ref=base_ref,
-        suite_command=suite_command,
         created_at=stamp(),
         lane_ids=[],
     )
@@ -552,7 +547,7 @@ def resume(run: Run, *, window: int = DEFAULT_WINDOW_SECONDS, listed: set[str], 
     return plan
 
 
-# ---------------------------------------------------------------- verify: red → green → suite
+# ---------------------------------------------------------------- verify: commits ahead → red → green
 
 
 @dataclass
@@ -574,9 +569,6 @@ class Verification:
     red_output_tail: str
     green_exit_code: int | None
     green_output_tail: str
-    suite_command: str
-    suite_exit_code: int | None
-    suite_output_tail: str
     verified: bool
     reasons: list[str]
     red_failures: list[dict[str, object]] = field(default_factory=list)  # what pytest recorded in the RED run
@@ -635,8 +627,8 @@ def _read_red_report(path: Path) -> list[dict[str, object]]:
     return records
 
 
-def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: int = 7200) -> Verification:
-    """RED on base (test files only) → GREEN on merged tree → full suite on merged tree. All three or nothing."""
+def verify(run: Run, lane_id: str, *, test_timeout: int = 1800) -> Verification:
+    """Commits ahead of base → RED on base (test files only) → GREEN on merged tree. All or nothing."""
     lane = run.lane(lane_id)
     if lane.state == STATE_MERGED:
         raise ValueError(f"{lane_id} is merged; nothing to verify")
@@ -671,8 +663,6 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
     red_failures: list[dict[str, object]] = []
     green_rc: int | None = None
     green_tail = ""
-    suite_rc: int | None = None
-    suite_tail = ""
     if not reasons and branch_sha is not None:
         with _temp_worktree(repo, base_sha, "lane-red-") as red_tree:
             checkout = _git(red_tree, "checkout", branch_sha, "--", *lane.expected.test_files)
@@ -709,10 +699,6 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
                 green_rc, green_tail = _run_command(lane.expected.test_command, tree, test_timeout)
                 if green_rc != 0:
                     reasons.append(f"test command exited {green_rc} on the merged tree (expected 0)")
-                else:
-                    suite_rc, suite_tail = _run_command(run.suite_command, tree, suite_timeout)
-                    if suite_rc != 0:
-                        reasons.append(f"full suite exited {suite_rc} on the merged tree (expected 0)")
 
     verification = Verification(
         checked_at=stamp(),
@@ -731,9 +717,6 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
         green_exit_code=green_rc,
         red_failures=red_failures,
         green_output_tail=green_tail,
-        suite_command=run.suite_command,
-        suite_exit_code=suite_rc,
-        suite_output_tail=suite_tail,
         verified=not reasons,
         reasons=reasons,
     )
@@ -896,8 +879,7 @@ def render_report(run: Run) -> str:
                 v = lane.verifications[-1]
                 lines.append(
                     f"  - verification {v['checked_at']}: base `{str(v['base_sha'])[:12]}` branch `{str(v['branch_sha'] or '')[:12]}` "
-                    f"red={v['red_exit_code']} green={v['green_exit_code']} suite={v['suite_exit_code']} → "
-                    + ("verified" if v["verified"] else "; ".join(v["reasons"]))
+                    f"red={v['red_exit_code']} green={v['green_exit_code']} → " + ("verified" if v["verified"] else "; ".join(v["reasons"]))
                 )
             if lane.merge_sha:
                 lines.append(f"  - merged as `{lane.merge_sha[:12]}` at {lane.merged_at}")
@@ -917,7 +899,11 @@ def render_report(run: Run) -> str:
         lines.append("_nothing verified to merge_")
     for index, lane in enumerate(ordered, start=1):
         lines.append(f"{index}. `{lane.branch}` ({lane.ticket}) — `lane_manager.py merge --lane {lane.lane_id}`")
-    lines += ["", "Merge serially: after each merge the base moves, so re-verify the next lane before merging it."]
+    lines += [
+        "",
+        "Merge serially: after each merge the base moves, so re-verify the next lane before merging it.",
+        "After the last merge, run scripts/full-suite-gate.sh once on the merged tree.",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -934,7 +920,6 @@ def _cmd_init(args: argparse.Namespace) -> int:
         run_id=args.run_id,
         repo=Path(args.repo).resolve(),
         base_ref=args.base_ref,
-        suite_command=args.suite_command,
         tickets=tickets,
     )
     print(json.dumps({"run_id": run.run_id, "lanes": run.lane_ids, "manifest": str(run.manifest_path)}, indent=2))
@@ -976,7 +961,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 def _cmd_verify(args: argparse.Namespace) -> int:
     run, _ = run_for_lane(Path(args.lanes_dir), args.lane)
-    result = verify(run, args.lane, test_timeout=args.test_timeout, suite_timeout=args.suite_timeout)
+    result = verify(run, args.lane, test_timeout=args.test_timeout)
     print(json.dumps(result.as_dict(), indent=2))
     return 0 if result.verified else 1
 
@@ -1015,14 +1000,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def lanes_dir(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--lanes-dir", default=".lanes", help="directory holding <lane-id>/ and <run-id>.run.json")
+        p.add_argument("--lanes-dir", default=".claude/lanes", help="directory holding <lane-id>/ and <run-id>.run.json")
 
-    p = sub.add_parser("init", help="create the run manifest and one .lanes/<lane-id>/ per ticket")
+    p = sub.add_parser("init", help="create the run manifest and one <lanes-dir>/<lane-id>/ per ticket")
     lanes_dir(p)
     p.add_argument("--run-id", required=True)
     p.add_argument("--repo", default=".")
     p.add_argument("--base-ref", required=True)
-    p.add_argument("--suite-command", required=True, help="full-suite command that must pass on every merged tree")
     p.add_argument(
         "--tickets", required=True, help="JSON list of {ticket,title,files,test_files,test_command[,description,branch,worktree]}"
     )
@@ -1062,11 +1046,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--redispatch", action="store_true")
     p.set_defaults(func=_cmd_resume)
 
-    p = sub.add_parser("verify", help="red on base → green on merged tree → full suite; exit 1 unless verified")
+    p = sub.add_parser("verify", help="commits ahead → red on base → green on merged tree; exit 1 unless verified")
     lanes_dir(p)
     p.add_argument("--lane", required=True)
     p.add_argument("--test-timeout", type=int, default=1800)
-    p.add_argument("--suite-timeout", type=int, default=7200)
     p.set_defaults(func=_cmd_verify)
 
     p = sub.add_parser("merge", help="gated --no-ff merge of a verified lane into base; exit 1 if refused")

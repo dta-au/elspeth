@@ -292,11 +292,9 @@ working around it.
 - Confirm the target version and branch before editing docs, changelogs or
   release notes. Which release a change belongs to is a decision to check,
   not an inference from the current checkout.
-- This is not a budget cap. Wide dispatch and deep analysis are standing
-  policy for the maintainer's own agents
-  ([docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
-  authorization); this section constrains what you hand back, not what you
-  spend getting there.
+- This section constrains what you hand back. How much to dispatch is set by
+  [docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
+  authorization: in proportion to risk, with a cap on evidence per unit.
 
 ## Project delivery posture
 

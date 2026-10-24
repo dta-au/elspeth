@@ -8,6 +8,25 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-10-24 — work lives in commits; lane directories are notes only; the orchestrator and red-team trigger are gone**
+  (docs/maintainer/lane-process-review-2026-10-24.md, adopted by the maintainer the same day)
+  Two agent trees went about 62 h and 66 h without a commit while their source sat in gitignored snapshot directories:
+  1,287 full copies of `src/elspeth`, about 215 GB, invisible to `git status`. `worktree-cleanup.sh` showed one of them
+  only as IN-USE, because it ranks IN-USE above DIRTY. `scripts/work-at-risk.sh` is the new read-only check: run it at
+  session start and before a handover. It WARNs on uncommitted work older than 12 h, on any gitignored
+  `src/elspeth/__init__.py`, and on `.claude/lanes/` over 10 GB, and it shows DIRTY even when a tree is in use. Two
+  traps hit while building it. An interactive `find` in the agent shell can be a parallel `bfs` substituted by the
+  harness, so time a script's probes with `/usr/bin/find` (23 s, not 4 s, over 4.4 M lane files). Also, `git ls-files
+  --others --ignored --directory` can list a directory and its children together, so walking every entry double-counts.
+  The rules: commit WIP at every agent stop and at least every 4 h of edits; never put source or `.db` copies under
+  `.claude/lanes/<run>/`; delete lane directories 14 days after the branch merges or is abandoned. Retired at the same
+  time: the lane orchestrator skill and `/resume-lanes`, the red-team post-commit trigger and reverted-guard detector
+  (the charter `.claude/agents/red-team.md` stays), and lane-manager's per-lane full-suite run. lane-manager state now
+  lives under `.claude/lanes/<run-id>/`, not `.lanes/`. The dispatch grant in `docs/maintainer/toolchain.md` is now
+  proportional to risk, with a cap on evidence per unit.
+  See [AGENTS.md: Subagent Reporting](../../AGENTS.md#subagent-reporting),
+  [Commit Hygiene](../../AGENTS.md#commit-hygiene) and
+  [ADR-043](../architecture/adr/043-project-tooling.md).
 - **2026-10-18 — State-engine v1/v2 catalogs retain frozen historical identity**
   Current plugin inventory, runtime vocabulary and supported-profile amendments
   belong to maintained v3. Keep v1/v2 catalog bytes, vocabulary and historical
