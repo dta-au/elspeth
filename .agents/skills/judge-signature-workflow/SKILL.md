@@ -41,6 +41,15 @@ The signature is a **symmetric HMAC** — any holder of
 
 ## Judging transport policy (updated 2026-07-27)
 
+> **2026-10-24: `--judge-transport codex-cli` is disabled.** Inside the judge
+> worker, Codex's native shell could read the provider home (`HOME`/`CODEX_HOME`
+> hold provider credentials), and Codex CLI cannot be shown to disable that
+> shell completely. `call_judge` and the worker both refuse it ("the codex-cli
+> judge transport is disabled") until provider authentication is brokered
+> outside model and tool authority. Use `--judge-transport agent`: its readonly
+> tools are realpath-confined to the evidence snapshot, and blinded mode has no
+> tools. The Codex text below is historical until then.
+
 All judging — including the final signature verdict in the operator step — runs
 on the **Codex CLI harness with read-only tool access**:
 `--judge-transport codex-cli --judge-tools readonly`. The Codex child
@@ -77,8 +86,8 @@ empty. Key-free SDK judging remains available; this guard does not establish
 process isolation or erase keys previously loaded in memory. Key-bearing SDK
 signing requires a protected worker and SDK artifact qualification, which are
 still pending. Real signing remains disabled pending on-prem migration and
-operator-boundary qualification. Use `codex-cli` for the
-normal signing workflow. Do not recommend blinded OpenRouter runs except as a
+operator-boundary qualification. While `codex-cli` is disabled (see the note
+above), use `agent` for the signing workflow. Do not recommend blinded OpenRouter runs except as a
 deliberate fallback.
 
 ## Agent side — stage a bundle (key-free MCP: `mcp__elspeth-judge__*`)
@@ -124,12 +133,12 @@ bundles must be re-staged.
    question 7): an unverifiable one is BLOCK-PENDING, a contradicted one is
    BLOCKED. The mirror error is worse than a block: a suppression justified
    by "X already checks this" where X is not reached deletes the only gate.
-4. **`stage_preview`** (needs the installed, admitted judge supervisor; see
-   ADR-052. It is **unavailable** until that runtime is installed. Every
-   judge call, including this preview, `reaudit`, `check-judge-quality` and
-   `justify --dry-run`, refuses with "protected judge supervisor admission is
-   unavailable or invalid", and there is no local Codex/SDK fallback. Skip
-   this step and leave the action for the operator.) — run the read-only Codex judge over each `new_judgment`
+4. **`stage_preview`** (**unavailable**. It judges through the Codex
+   transport, which is disabled, so it refuses with "the codex-cli judge
+   transport is disabled". Every other judge call (`reaudit`,
+   `check-judge-quality`, `justify --dry-run`) needs the installed, admitted
+   judge supervisor (ADR-052) and has no local Codex/SDK fallback. Skip this
+   step and leave the action for the operator.) — run the read-only Codex judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);
    surfaces BLOCKED reasons so you can fix the code or rationale *before* the
    operator spends a real judge call. The previewed request carries the same

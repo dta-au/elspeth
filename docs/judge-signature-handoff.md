@@ -48,6 +48,18 @@ not a grant.
 
 ## Judging runs on the Codex CLI harness with tool access (updated 2026-07-27)
 
+> **2026-10-24: `--judge-transport codex-cli` is disabled.** In the installed
+> judge worker, Codex's native shell could read the provider home: `HOME` and
+> `CODEX_HOME` point at `/provider`, which holds provider credentials. Codex
+> CLI cannot be shown to disable that shell completely. `call_judge` refuses
+> the transport before any worker call, and the worker refuses it before it
+> reads its profile or provider home. Both say "the codex-cli judge transport
+> is disabled". The refusal stays until provider authentication is brokered
+> outside model and tool authority. Use `--judge-transport agent`: readonly
+> tools are realpath-confined to the `/evidence` snapshot, and blinded mode
+> allows no tools. Every judge rationale is now secret-scrubbed in every mode.
+> The Codex description below is historical until then.
+
 All judging — including the **final signature verdict** — runs via the agentic
 harness (`--judge-transport codex-cli`) with read-only tool access
 (`--judge-tools readonly`). The judge may Read/Grep/Glob throughout the entire
@@ -96,7 +108,8 @@ What this does NOT change:
   excerpt goes through) before it is printed or persisted.
 - `--judge-tools readonly` accepts `--judge-transport codex-cli` and the legacy
   Claude Agent SDK spelling `agent`; the OpenRouter path has no tool loop and
-  is rejected. `codex-cli` is the normal signing transport.
+  is rejected. `codex-cli` was the normal signing transport; while it is
+  disabled (note above), use `agent`.
 
 Blinded mode (`--judge-tools none`) remains available and byte-identical to the
 historical behavior; entries signed before 2026-07-09 were produced under it.
@@ -137,10 +150,11 @@ Registered in `.mcp.json` as `elspeth-judge`, launched as
 config/cicd/enforce_tier_model --staged-dir .elspeth/staged-reviews` (with
 `PYTHONPATH=.../elspeth-lints/src`). It needs the `[mcp]` extra. All six tools
 fail closed when the HMAC key is present in the environment. `stage_preview` is
-the only tool that calls a judge. Like every judge call it now goes through the
-protected judge supervisor (ADR-052). Until that runtime is installed it
-refuses with "protected judge supervisor admission is unavailable or invalid",
-and an installed Codex CLI is not used as a fallback.
+the only tool that calls a judge, and it judges through the Codex transport.
+That transport is disabled (see the note under "Judging runs on the Codex CLI
+harness"), so `stage_preview` refuses with "the codex-cli judge transport is
+disabled". It reaches neither the worker nor a local Codex CLI. Other judge
+calls go through the protected judge supervisor (ADR-052).
 
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
@@ -148,7 +162,7 @@ and an installed Codex CLI is not used as a fallback.
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle and emit its priced operator command. Args: `bundle_id` (required), `stale_key` (optional exact orphan key; selects one action and zero judge calls). |
 | `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
-| `stage_preview` | yes | yes (read-only judge via the protected supervisor; **unavailable until installed**) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
+| `stage_preview` | yes | yes (Codex transport; **disabled**: refuses with "the codex-cli judge transport is disabled") | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs the installed judge supervisor plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
@@ -374,8 +388,8 @@ Flags:
 | `--resume` | none | Resume the printed transaction directory after re-verifying bundle bytes, source/bindings, active bytes, journaled effects, and prior signatures. |
 | `--rotation-log` | `.elspeth/rotations.log` | Rotation audit JSONL finalized only with coherent publish. |
 | `--format` | `text` | Per-entry justify output (`text`/`json`). |
-| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is the required normal signing choice; `agent` is the legacy Claude SDK path). |
-| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `codex-cli` for signing. |
+| `--judge-transport` | `openrouter` | Provider that produces the verdict (`codex-cli` is disabled; see the note under "Judging runs on the Codex CLI harness". Use `agent`, the Claude SDK path). |
+| `--judge-tools` | `none` | Judge tool configuration; use `readonly` with `agent` for signing while `codex-cli` is disabled. |
 
 Override-token environment (only when `--operator-override` is passed):
 `ELSPETH_JUDGE_OVERRIDE_TOKEN` + `ELSPETH_JUDGE_OVERRIDE_TOKEN_SHA256`.
