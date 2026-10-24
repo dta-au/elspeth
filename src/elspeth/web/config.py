@@ -49,6 +49,7 @@ from elspeth.web.auth.urls import (
 from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
 from elspeth.web.composer.strict_transport import StrictToolsSetting
+from elspeth.web.continuation_settings import ContinuationActionBoundsSettings
 from elspeth.web.plugin_policy.profiles import (
     AWSS3SourceProfileSettings,
     AWSTextractProfileSettings,
@@ -404,6 +405,16 @@ class WebSettings(BaseModel):
     composer_async_scan_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     composer_async_poll_after_ms: int = Field(default=1000, ge=100, le=60_000)
     composer_async_drain_seconds: float = Field(default=10.0, gt=0, le=120)
+    # Composer Continuation (V2). Admission is default-off; a missing
+    # Composer-Operation-Version still means V1 whatever this says. The values
+    # bind only at admission and are retained per operation (design §4).
+    composer_continuation_enabled: bool = False
+    # Upper bounds keep every derived deadline representable as a timedelta.
+    composer_continuation_segment_nominal_seconds: float = Field(default=420.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_watermark_seconds: float = Field(default=120.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_quantum_seconds: float = Field(default=180.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_settlement_reserve_seconds: float = Field(default=25.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_action_bounds: ContinuationActionBoundsSettings = Field(default_factory=ContinuationActionBoundsSettings)
 
     @property
     def composer_sync_timeout_seconds(self) -> float:
@@ -1284,6 +1295,13 @@ class WebSettings(BaseModel):
         object.__setattr__(self, "sso_userinfo_endpoint", validated.userinfo_endpoint)
 
     @model_validator(mode="after")
+    def _validate_continuation_segment_policy(self) -> WebSettings:
+        """Refuse at startup what ``ContinuationSegmentPolicy`` would refuse at admission."""
+        if self.composer_continuation_watermark_seconds >= self.composer_continuation_segment_nominal_seconds:
+            raise ValueError("composer_continuation_watermark_seconds must be smaller than composer_continuation_segment_nominal_seconds")
+        return self
+
+    @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
         """Keep a positive transport-safe budget for synchronous consumers.
 
@@ -1542,7 +1560,14 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
-    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
+    {
+        "plugin_preferences",
+        "plugin_control_modes",
+        "llm_profiles",
+        "bedrock_guardrail_default_profiles",
+        "execution_rate_limit",
+        "composer_continuation_action_bounds",
+    }
 )
 _OPTIONAL_JSON_OBJECT_FIELDS: frozenset[str] = frozenset({"composer_prompt_guard", "composer_advisor_prompt_guard"})
 

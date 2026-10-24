@@ -86,6 +86,7 @@ from elspeth.web.auth.sso import SsoAuthProvider, SsoDiscoveryFailed
 from elspeth.web.blobs.routes import create_blobs_router
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.routes import catalog_router
+from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools.wire_projection import loop_tool_count, strict_capable_tool_count
@@ -2317,6 +2318,9 @@ def _create_app(
         session_engine,
         owner_instance_id=session_service.session_operation_owner_instance_id,
         claim_lease_seconds=settings.composer_async_claim_lease_seconds,
+        # None while V2 admission is disabled (the default): the authority then
+        # refuses every V2 admission. Each admitted operation retains its copy.
+        continuation_policy=continuation_policy_from_settings(settings),
     )
     app.state.composer_async_operation_authority = composer_async_authority
     app.state.composer_async_worker = ComposerAsyncWorker(

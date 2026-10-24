@@ -51,8 +51,10 @@ def test_non_strict_json_is_refused(encoded):
 
 def test_complete_policy_retains_all_stage_allowances_and_is_immutable():
     policy = minimal_continuation_policy()
-    assert policy.actions.primary.total == 136.0
-    assert policy.actions.read.total == 7.0
+    primary, read = policy.actions.primary, policy.actions.read
+    assert primary.total == primary.preparation + primary.guard + primary.quota + primary.physical + primary.retention
+    assert read.guard is None and read.quota is None
+    assert read.total == read.preparation + read.physical + read.retention
     with pytest.raises(ValidationError):
         policy.actions.primary.physical = 500.0
 
@@ -72,5 +74,9 @@ def test_finite_action_and_segment_bounds_cannot_overflow_segment_sizing(reserve
 
 
 def test_json_exponent_overflow_has_the_owned_refusal_type():
+    policy = minimal_continuation_policy()
+    # A complete, correctly versioned payload whose one numeric value overflows.
+    encoded = policy.model_dump_json().replace('"reserve":25.0', '"reserve":1e999')
+    assert '"reserve":1e999' in encoded
     with pytest.raises(AuditIntegrityError, match="complete owned contract"):
-        decode_continuation_policy('{"segment":1e999}', minimal_continuation_policy().policy_hash)
+        decode_continuation_policy(encoded, policy.policy_hash)

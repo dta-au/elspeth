@@ -7,7 +7,7 @@ custody. Current security and capability admission still run at every use.
 from __future__ import annotations
 
 import math
-from typing import Annotated, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -16,6 +16,11 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.json_parser import parse_json_strict
 
 PositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+# The persisted policy's version tag. A later shape is a NEW frozen model with a
+# new tag; this v1 model is never edited once admitted operations retain it.
+CONTINUATION_POLICY_SCHEMA_VERSION: Final = "composer.continuation.policy.v1"
+_KNOWN_POLICY_SCHEMA_VERSIONS: Final = frozenset({CONTINUATION_POLICY_SCHEMA_VERSION})
 
 
 class ContinuationActionPolicy(BaseModel):
@@ -71,6 +76,7 @@ class ContinuationActionBounds(BaseModel):
 
 class ContinuationAdmissionPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal["composer.continuation.policy.v1"] = CONTINUATION_POLICY_SCHEMA_VERSION
     segment: ContinuationSegmentPolicy
     actions: ContinuationActionBounds
 
@@ -98,6 +104,13 @@ def decode_continuation_policy(encoded: str, expected_hash: str) -> Continuation
     value, error = parse_json_strict(encoded)
     if error is not None:
         raise AuditIntegrityError("continuation policy is not strict JSON")
+    # The version is read from the persisted bytes, never defaulted: a payload
+    # without its tag, or with an unknown one, is not this owned contract.
+    if type(value) is not dict or "schema_version" not in value:
+        raise AuditIntegrityError("continuation policy lost its schema version")
+    version = value["schema_version"]
+    if type(version) is not str or version not in _KNOWN_POLICY_SCHEMA_VERSIONS:
+        raise AuditIntegrityError("continuation policy has an unknown schema version")
     try:
         policy = ContinuationAdmissionPolicy.model_validate_json(canonical_json(value))
     except ValueError as exc:
