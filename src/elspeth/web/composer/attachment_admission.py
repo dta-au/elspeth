@@ -60,6 +60,13 @@ class AttachmentReadAdmission:
     policy_fingerprint: str
 
 
+def require_attachment_size_within_policy(size_bytes: int, policy: AttachmentInspectionPolicy) -> None:
+    if size_bytes > policy.max_bytes:
+        raise AttachmentInspectionRefused(
+            f"Attachment exceeds the {policy.max_bytes}-byte complete-original inspection policy; no content was returned."
+        )
+
+
 def inspect_attachment_original(
     *,
     session_id: str,
@@ -75,10 +82,7 @@ def inspect_attachment_original(
     actual_hash = hashlib.sha256(raw).hexdigest()
     if type(verified_hash) is not str or not hmac.compare_digest(actual_hash, verified_hash):
         raise AuditIntegrityError("Attachment inspection does not match verified bytes")
-    if len(raw) > policy.max_bytes:
-        raise AttachmentInspectionRefused(
-            f"Attachment exceeds the {policy.max_bytes}-byte complete-original inspection policy; no content was returned."
-        )
+    require_attachment_size_within_policy(len(raw), policy)
     content = raw.decode("utf-8")
     require_no_credential_material(
         content,

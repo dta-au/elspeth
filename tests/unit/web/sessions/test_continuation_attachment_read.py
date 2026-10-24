@@ -1,9 +1,11 @@
 """Actual current inventory, SQL custody, original-byte inspection and discovery."""
 
 import asyncio
+import io
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
 from threading import Event
 from uuid import uuid4
 
@@ -15,6 +17,7 @@ from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_attachment_read as reader
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_selection import load_selected_continuation
+from elspeth.web.composer.redaction import READ_ATTACHMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import blobs
@@ -162,6 +165,80 @@ async def test_original_tail_structured_secret_and_utf8_refuse_without_receipt(o
     assert actual.retained.attachment_inspections == ()
     assert len(actual.retained.blob_versions) == 1
     assert re_admit_read_owner_result(actual.retained)["success"] is False
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+class _CountingReader(io.BufferedReader):
+    """Records every byte count a read takes from the spied blob file."""
+
+    def __init__(self, raw, reads):
+        super().__init__(raw)
+        self._reads = reads
+
+    def read(self, size=-1):
+        data = super().read(size)
+        self._reads.append(len(data))
+        return data
+
+
+def _spy_blob_reads(monkeypatch, path):
+    """Count bytes read from ``path`` through ``Path.open``, which ``read_bytes`` also uses."""
+    reads = []
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        if self != path:
+            return real_open(self, *args, **kwargs)
+        return _CountingReader(io.FileIO(self, "r"), reads)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    return reads
+
+
+@pytest.mark.asyncio
+async def test_in_range_attachment_reads_its_complete_recorded_original(operation_store, monkeypatch):
+    raw = b"x" * (READ_ATTACHMENT_MAX_UTF8_BYTES // 2)
+    kwargs, path, _actors = await read_case(operation_store, raw)
+    reads = _spy_blob_reads(monkeypatch, path)
+    actual = await reader.read_current_attachment(**kwargs)
+    assert actual.result.success
+    assert sum(reads) == len(raw)
+    assert actual.retained.attachment_inspections[0].size_bytes == len(raw)
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_oversized_recorded_attachment_refuses_before_any_file_read(operation_store, monkeypatch):
+    raw = b"x" * (READ_ATTACHMENT_MAX_UTF8_BYTES + 1)
+    kwargs, path, _actors = await read_case(operation_store, raw)
+    reads = _spy_blob_reads(monkeypatch, path)
+    actual = await reader.read_current_attachment(**kwargs)
+    assert not actual.result.success
+    assert actual.result.validation.errors[0].message == (
+        "The complete attachment was refused by the current inspection policy; no content was returned."
+    )
+    assert reads == []
+    assert actual.retained.attachment_inspections == ()
+    assert len(actual.retained.blob_versions) == 1
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure(operation_store, monkeypatch):
+    limit = READ_ATTACHMENT_MAX_UTF8_BYTES
+    raw = b"x" * (limit * 2)
+    kwargs, path, _actors = await read_case(operation_store, raw)
+    engine = operation_store[0]
+    with engine.begin() as conn:
+        conn.execute(
+            update(blobs_table)
+            .where(blobs_table.c.id == kwargs["arguments"]["blob_id"])
+            .values(size_bytes=limit, content_hash=sha256(raw[:limit]).hexdigest())
+        )
+    reads = _spy_blob_reads(monkeypatch, path)
+    with pytest.raises(AuditIntegrityError, match="recorded size"):
+        await reader.read_current_attachment(**kwargs)
+    assert sum(reads) <= limit + 1
     kwargs["required_work"].coordinator.assert_completed()
 
 

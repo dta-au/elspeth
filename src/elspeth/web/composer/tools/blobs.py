@@ -70,7 +70,12 @@ from elspeth.web.blobs.service import (
     sanitize_filename,
 )
 from elspeth.web.composer._attachment_response import READ_ATTACHMENT_RESPONSE_CONTRACT
-from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy, AttachmentInspectionRefused, inspect_attachment_original
+from elspeth.web.composer.attachment_admission import (
+    AttachmentInspectionPolicy,
+    AttachmentInspectionRefused,
+    inspect_attachment_original,
+    require_attachment_size_within_policy,
+)
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     READ_ATTACHMENT_MAX_UTF8_BYTES,
@@ -1904,6 +1909,21 @@ def _verify_blob_content_integrity(blob: BlobToolRecord, data: bytes) -> None:
     _verify_blob_content_hash(blob, content_hash(data))
 
 
+def _read_bounded_attachment_original(blob: BlobToolRecord, policy: AttachmentInspectionPolicy) -> bytes:
+    """Read a continuation attachment without materialising more than its policy admits.
+
+    The recorded size decides an oversized refusal before any file read. The
+    bounded read then proves the row and the disk agree on the complete
+    original; a disagreement is an integrity failure, not a size refusal.
+    """
+    require_attachment_size_within_policy(blob["size_bytes"], policy)
+    with Path(blob["storage_path"]).open("rb") as handle:
+        data = handle.read(policy.max_bytes + 1)
+    if len(data) != blob["size_bytes"]:
+        raise AuditIntegrityError(f"Tier 1: blob {blob['id']} recorded size differs from its stored bytes")
+    return data
+
+
 def _verify_blob_content_hash(blob: BlobToolRecord, actual_hash: str) -> None:
     """Verify a precomputed SHA-256 digest against a blob row."""
     blob_id = blob["id"]
@@ -1977,7 +1997,10 @@ def _locked_read_ready_blob(
             if record["status"] != "ready":
                 return record, None
             try:
-                data = Path(row.storage_path).read_bytes()
+                if attachment_inspection_policy is None:
+                    data = Path(row.storage_path).read_bytes()
+                else:
+                    data = _read_bounded_attachment_original(record, attachment_inspection_policy)
             except FileNotFoundError:
                 return record, None
             _verify_blob_content_integrity(record, data)
