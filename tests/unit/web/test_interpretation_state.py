@@ -3886,3 +3886,45 @@ def test_reconcile_still_raises_on_a_genuinely_drifted_multi_query_review() -> N
 
     with pytest.raises(ValueError, match="hash drifted"):
         _reconcile_multi_query(previous, proposed)
+
+
+def _mapper_node(options: dict[str, object]) -> NodeSpec:
+    return _state_with_cleanup_node(options).nodes[0]
+
+
+def test_mapper_projection_absent_options_mirror_field_mapper_config_defaults() -> None:
+    """The observation boundary's R1 arm: absent keys read as the owned config's defaults.
+
+    ``_mapper_projection`` reads untyped ``NodeSpec.options`` with
+    ``.get("mapping", {})`` / ``.get("select_only", False)``. Those defaults are
+    honest only while they equal ``FieldMapperConfig``'s own defaults, so this pins
+    both the projection and the config it mirrors.
+    """
+    from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+    from elspeth.web.interpretation_state import _mapper_projection, _MapperProjection
+
+    defaults = FieldMapperConfig.model_fields
+    assert defaults["mapping"].default_factory is dict
+    assert defaults["select_only"].default is False
+    assert _mapper_projection(_mapper_node({})) == _MapperProjection(entries=(), select_only=False)
+    assert _mapper_projection(_mapper_node({"mapping": {"a": "b"}})) == _MapperProjection(entries=(("a", "b"),), select_only=False)
+    assert _mapper_projection(_mapper_node({"select_only": True})) == _MapperProjection(entries=(), select_only=True)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        pytest.param({"mapping": ["a", "b"]}, id="mapping-not-a-mapping"),
+        pytest.param({"mapping": None}, id="mapping-null"),
+        pytest.param({"select_only": "true"}, id="select-only-not-bool"),
+        pytest.param({"select_only": 1}, id="select-only-int"),
+        pytest.param({"mapping": {"a": 1}}, id="non-string-target"),
+        pytest.param({"mapping": {" ": "b"}}, id="blank-source"),
+        pytest.param({"mapping": {"a": "  "}}, id="blank-target"),
+    ],
+)
+def test_mapper_projection_malformed_options_observe_nothing(options: dict[str, object]) -> None:
+    """Malformed authored options return None (non-raising), never a coerced projection."""
+    from elspeth.web.interpretation_state import _mapper_projection
+
+    assert _mapper_projection(_mapper_node(options)) is None
