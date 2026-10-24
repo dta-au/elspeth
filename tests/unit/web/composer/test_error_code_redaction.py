@@ -118,6 +118,9 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
         ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
+        # Forwarded only after explain_validation_code resolved it as an exact
+        # catalogue key; the catalogue is a subset of the registry (pinned below).
+        ("composer/tools/generation.py", "_execute_explain_validation_error", "error_text"),
         # Source-proof completion retains detector-owned blocking codes (the
         # _blocking_diagnostic closed set is pinned below) and existing
         # state.validate() entries, whose producers this census already scans.
@@ -128,6 +131,11 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("sessions/routes/_helpers.py", "_message_response", "projected.rejection.error_code"),
         # Not a producer: the redaction allowlist entry for the field itself.
         ("composer/redaction.py", "<module>", "REGISTERED_ERROR_CODES"),
+        # Not producers: the continuation codec serialises an existing
+        # ValidationError's own code, and the P4 receipt hashes a persisted
+        # rejection row's stored code. Each code was censused where it was made.
+        ("composer/continuation_batch_data.py", "_members", "value.error_code"),
+        ("sessions/continuation_p4.py", "_rejection_row_hash", "row.error_code"),
         # --- Outside web/composer ---
         # Plugin-policy findings: the finding's own (censused) code, and the
         # PluginUnavailableReason members the registry holds.
