@@ -473,8 +473,9 @@ Controls: template CPU, memory, time and output limits in bounded workers
 (§ 4.6); graph nesting limits (`src/elspeth/core/config.py`,
 `src/elspeth/core/dag/bound_regions.py`); per-composition planner and advisor
 limits, bounded retries and a required per-user Composer rate limit [EV-504];
-and a declared 10 MiB API request-body ceiling
-(`src/elspeth/web/app.py`) [EV-408].
+and a global 10 MiB HTTP request-body ceiling on declared and actually
+received bytes, with one 30-second body-read deadline before downstream
+dispatch (`src/elspeth/web/app.py`) [EV-408].
 
 Risk references: see controlled risk register `R-007` and `R-014`.
 
