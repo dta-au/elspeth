@@ -118,6 +118,39 @@ def test_refused_up_link_census_really_escapes_when_materialised(tmp_path: Path)
         rpc.validate_files(_up_link_census(b"d/../../x"))
 
 
+def test_snapshot_refuses_a_link_that_steps_through_a_regular_file(tmp_path: Path) -> None:
+    # The kernel fails "x/../y" with ENOTDIR when x is a file; lexically it is y.
+    files = records([record("x", b"file"), record("y", b"target"), record("e", b"x/../y", "120000")])
+    with pytest.raises(JudgeContractError, match="unavailable target"):
+        rpc.validate_files(files)
+    (tmp_path / "x").write_bytes(b"file")
+    (tmp_path / "y").write_bytes(b"target")
+    os.symlink("x/../y", tmp_path / "e")
+    with pytest.raises(NotADirectoryError):
+        (tmp_path / "e").read_bytes()
+
+
+def _link_chain(length: int) -> list[dict[str, str]]:
+    links = [record(f"l{index:02d}", f"l{index + 1:02d}".encode(), "120000") for index in range(length - 1)]
+    return records([*links, record(f"l{length - 1:02d}", b"f", "120000"), record("f", b"end")])
+
+
+def test_snapshot_follow_budget_matches_the_kernel_symlink_limit(tmp_path: Path) -> None:
+    # Linux allows 40 follows in one lookup; the 41st is ELOOP.
+    assert rpc.validate_files(_link_chain(40)) == _link_chain(40)
+    with pytest.raises(JudgeContractError, match="cycle is unsupported"):
+        rpc.validate_files(_link_chain(41))
+    for length in (40, 41):
+        root = tmp_path / str(length)
+        root.mkdir()
+        (root / "f").write_bytes(b"end")
+        for index in range(length):
+            os.symlink(f"l{index + 1:02d}" if index < length - 1 else "f", root / f"l{index:02d}")
+    assert (tmp_path / "40" / "l00").read_bytes() == b"end"
+    with pytest.raises(OSError, match="Too many levels of symbolic links"):
+        (tmp_path / "41" / "l00").read_bytes()
+
+
 def test_snapshot_refuses_duplicate_parent_conflict_and_content_mismatch() -> None:
     cases = [records([record("a", b"x"), record("a", b"x")]), records([record("a", b"x"), record("a/b", b"x")])]
     corrupted = records()
