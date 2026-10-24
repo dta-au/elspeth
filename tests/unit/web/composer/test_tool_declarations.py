@@ -1125,7 +1125,15 @@ class TestStep3SecretTierMigration:
                         "enum": ["source", "node", "output"],
                         "description": "Which component to wire the secret into.",
                     },
-                    "target_id": {"type": "string", "description": "Node ID or output name (required for node/output targets)."},
+                    "target_id": {
+                        "type": "string",
+                        "description": (
+                            "Raw source name (for example, 'left'), node ID, or output name. "
+                            "A selector value is required for node/output targets and for source targets when multiple sources "
+                            "are configured. For a sole source, an unspecified selector defaults to that source; follow the wire "
+                            "schema's requiredness and nullability. Do not prefix a source name with 'source:'."
+                        ),
+                    },
                     "option_key": {"type": "string", "description": "Config option key to set (e.g. 'api_key')."},
                 },
                 "required": ["name", "target", "option_key"],
