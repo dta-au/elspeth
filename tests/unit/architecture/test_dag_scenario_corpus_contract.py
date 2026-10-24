@@ -979,7 +979,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 2026-10-20: d82dc0df8 refreshed three ValueTransform source_file_hash values
 # in union-collision-fail. Canonical case comparison against 03594a269 confirms
 # every other field is unchanged; restoring those values reproduces the old pin.
-EXPECTED_CASE_REGISTRY_SHA256 = "69b81fc4685a5fe70c2deabb8c6d68e2332905e5cf11241d4e99e6547d3118f1"
+# 0.8.9 source admission: the JSON source provenance literal advances to
+# 3f3ae45367ec0636. Reversing that token restores every prior manifest byte;
+# the canonical loader combines it with the candidate's eight 0.8.9 runtime
+# version fields to derive this registry digest from the updated cases.
+# Rescued 0.8.9 consolidation: value_transform's three source-provenance tokens
+# follow its current expression-helper implementation. Canonical case semantics,
+# the reopen-resume projection and frozen oracles remain unchanged.
+# 0.8.10 carry-forward: retain b003e0cd's segmented ValueTransform assistance
+# source and its three 7d4ce6833cb24ca0 provenance tokens, together with the
+# sparse-admission JSON source provenance above. No other manifest bytes change.
+EXPECTED_CASE_REGISTRY_SHA256 = "a3334588fc67913b5539316408987f8fab02f73780db663330f821ec1e59820b"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
