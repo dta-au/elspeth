@@ -14,12 +14,13 @@ PostgreSQL store (``workload.bicep:70,73``).
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from threading import Barrier
+from threading import Barrier, Event
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -198,6 +199,89 @@ def test_concurrent_appends_under_one_fence_both_publish_distinct_versions(postg
     rows = _stored_rows(postgres_engine, session_id)
     assert [row["version"] for row in rows] == [1, 2]
     assert {row["id"] for row in rows} == {str(outcome.id) for outcome in outcomes}
+    _assert_publications_bind_their_own_rows(outcomes, rows)
+
+
+def _ungranted_advisory_waiters(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return int(conn.exec_driver_sql("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted").scalar_one())
+
+
+def _a_holds_while_b_arrives(
+    engine: Engine, repository: PostgresSessionOperationRepository, context: SessionOperationContext
+) -> tuple[bool, list[CompositionStateRecord]]:
+    """Writer A holds its mutate transaction open until PostgreSQL reports a new
+    ungranted advisory lock (writer B waiting), or a deadline passes; then both
+    publish. Returns whether B was observed waiting on the advisory lock."""
+    baseline_waiters = _ungranted_advisory_waiters(engine)
+    a_inside = Event()
+    observed_waiter = Event()
+
+    def writer_a() -> CompositionStateRecord:
+        creation = _creation("writer-a")
+
+        def append_after_b_arrives(transaction: Any) -> CompositionStateRecord:
+            a_inside.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if _ungranted_advisory_waiters(engine) > baseline_waiters:
+                    observed_waiter.set()
+                    break
+                time.sleep(0.05)
+            return transaction.composition_states.append_state(creation)
+
+        return repository.mutate(context, append_after_b_arrives)
+
+    def writer_b() -> CompositionStateRecord:
+        assert a_inside.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
+        return _append(repository, context, _creation("writer-b"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(writer_a), pool.submit(writer_b)]
+        outcomes = [future.result(timeout=_BARRIER_TIMEOUT_SECONDS * 2) for future in futures]
+    return observed_waiter.is_set(), outcomes
+
+
+def test_second_writer_blocks_on_the_session_lock_while_the_first_publishes(postgres_engine: Engine) -> None:
+    """Non-vacuous concurrency: writer A holds its locked transaction open until
+    PostgreSQL itself reports writer B waiting on the session advisory lock,
+    and only then publishes. A sequential interleaving cannot satisfy the wait
+    observation. Both must still publish distinct, whole versions."""
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    owner = f"replica-{uuid4()}"
+    session_id = _session(repository, owner=owner)
+    observed, outcomes = _a_holds_while_b_arrives(postgres_engine, repository, _compose(repository, session_id, owner=owner))
+
+    assert observed, "writer B never waited on the session advisory lock: the race was not concurrent"
+    rows = _stored_rows(postgres_engine, session_id)
+    assert [row["version"] for row in rows] == [1, 2]
+    assert rows[0]["id"] == str(outcomes[0].id)  # A held the lock, so A allocated version 1
+    _assert_publications_bind_their_own_rows(outcomes, rows)
+
+
+def test_control_without_advisory_lock_b_never_waits_on_it_but_row_locks_still_serialise(
+    postgres_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation control for the wait proof: remove only the advisory lock. B can
+    no longer be observed waiting on it, so the proof's wait assertion goes red.
+    The session-row FOR UPDATE and fence-row CAS still serialise the two
+    writers (measured defence in depth), so versions remain distinct."""
+    repository = PostgresSessionOperationRepository(postgres_engine)
+    owner = f"replica-{uuid4()}"
+    session_id = _session(repository, owner=owner)
+    context = _compose(repository, session_id, owner=owner)
+
+    @contextmanager
+    def unlocked_transaction(_session_id: str):
+        with postgres_engine.begin() as conn:
+            yield conn
+
+    monkeypatch.setattr(repository, "_locked_transaction", unlocked_transaction)
+    observed, outcomes = _a_holds_while_b_arrives(postgres_engine, repository, context)
+
+    assert not observed
+    rows = _stored_rows(postgres_engine, session_id)
+    assert [row["version"] for row in rows] == [1, 2]
     _assert_publications_bind_their_own_rows(outcomes, rows)
 
 
