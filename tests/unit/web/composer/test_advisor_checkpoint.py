@@ -40,6 +40,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardClient, PromptGuardDecision, PromptGuardRequest
+from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import provider_gateway
@@ -86,6 +87,7 @@ from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
     completion_gate_fingerprint,
@@ -7666,3 +7668,75 @@ async def test_reviewed_explanation_keeps_prior_graph_completion_withheld(make_s
     assert outcome.result.message == "Here are your options."
     assert outcome.result.runtime_preflight.readiness.completion_ready is False
     assert outcome.result.runtime_preflight.readiness.execution_ready is True
+
+
+class _NamedReferenceInventory:
+    """Secret inventory metadata only; a value request fails the test."""
+
+    def __init__(self, *names: str) -> None:
+        self._names = names
+        self.listed_for: list[str] = []
+
+    def list_refs(self, user_id: str) -> list[SecretInventoryItem]:
+        self.listed_for.append(user_id)
+        return [SecretInventoryItem(name=name, scope="user", available=True) for name in self._names]
+
+    def has_ref(self, user_id: str, name: str) -> bool:
+        return name in self._names
+
+    def resolve(self, user_id: str, name: str) -> ResolvedSecret | None:
+        raise AssertionError("The advisor must never request a credential value")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_advisor_admits_env_references_named_in_the_session_owners_inventory(
+    make_service, simple_state, physical_advisor, monkeypatch, phase
+):
+    """U-08 red-team F2: the advisor binds the same env-reference allowlist as compose entry.
+
+    A ``${NAME}`` reference under a credential field is admitted at compose
+    entry when NAME is in the user's inventory. The advisor checkpoint must
+    apply the same allowlist and make its provider call, not refuse the graph
+    as credential material.
+    """
+    inventory = _NamedReferenceInventory("MY_KEY")
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(), settings=_make_settings(composer_prompt_guard_mode="debug-when-unconfigured"), secret_service=inventory
+    )
+    state = simple_state.with_node(
+        _llm_node("classify_env", prompt_template="Classify {{ row.text }}.", options_extra={"api_key": "${MY_KEY}"})
+    )
+    require_no_credential_material_in_state(state, surface="composer_state_before_provider", env_ref_names=frozenset({"MY_KEY"}))
+    reply = _checkpoint_reply(publication_verdict="ADMIT") if phase == "end" else _checkpoint_reply()
+    calls = _install_budget_advisor_transport(monkeypatch, [reply])
+    arguments = physical_advisor.bind(service, review_state=state if phase == "end" else None, request="classify it")
+    with prompt_guard_user_scope("classify it"):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            recorder=make_recorder(),
+            **({"user_message": "classify it"} if phase == "end" else {}),
+            **arguments,
+        )
+    assert len(calls) == 1
+    assert verdict.ok is True
+    assert set(inventory.listed_for) == {"alice"}
+
+
+@pytest.mark.asyncio
+async def test_advisor_still_refuses_env_reference_absent_from_the_inventory(make_service, simple_state, physical_advisor, monkeypatch):
+    """Control for the test above: the allowlist is the inventory, not a bypass."""
+    service = ComposerServiceImpl.for_trained_operator(
+        catalog=_mock_catalog(),
+        settings=_make_settings(composer_prompt_guard_mode="debug-when-unconfigured"),
+        secret_service=_NamedReferenceInventory("OTHER_KEY"),
+    )
+    state = simple_state.with_node(
+        _llm_node("classify_env", prompt_template="Classify {{ row.text }}.", options_extra={"api_key": "${MY_KEY}"})
+    )
+    calls = _install_budget_advisor_transport(monkeypatch, [_checkpoint_reply(publication_verdict="ADMIT")])
+    arguments = physical_advisor.bind(service)
+    with prompt_guard_user_scope("classify it"), pytest.raises(CredentialMaterialRefused):
+        await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=state, recorder=make_recorder(), **arguments)
+    assert calls == []

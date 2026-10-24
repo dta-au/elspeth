@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from uuid import UUID
 
 from openai import OpenAIError
 from pydantic import ValidationError as PydanticValidationError
@@ -26,6 +27,7 @@ from elspeth.contracts.prompt_guard import (
     detach_prompt_guard_evidence,
 )
 from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
@@ -244,6 +246,7 @@ class AdvisorCheckpointOwner:
         sessions_service: SessionServiceProtocol | None,
         chargeable_admission: ComposerChargeableAdmission,
         prompt_guard_mount: PromptGuardMount | None = None,
+        secret_service: WebSecretResolver | None = None,
     ) -> None:
         self._settings = settings
         self._composer_skill_text = composer_skill_text
@@ -251,6 +254,7 @@ class AdvisorCheckpointOwner:
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
         self._sessions_service = sessions_service
         self._chargeable_admission = chargeable_admission
+        self._secret_service = secret_service
         self._prompt_guard_mount = (
             prompt_guard_mount if prompt_guard_mount is not None else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         )
@@ -259,6 +263,13 @@ class AdvisorCheckpointOwner:
         if self._sessions_service is None:
             raise RuntimeError("sessions_service not wired")
         return self._sessions_service
+
+    async def _current_env_ref_names(self, session_id: str) -> frozenset[str]:
+        """List names for the already-fenced session owner, never secret values."""
+        if self._secret_service is None:
+            return frozenset()
+        session = await self._require_sessions_service().get_session(UUID(session_id))
+        return frozenset(item.name for item in self._secret_service.list_refs(session.user_id))
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.
@@ -367,6 +378,7 @@ class AdvisorCheckpointOwner:
                     internal_request,
                     self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
                     content_scope=content_scope,
+                    env_ref_names=await self._current_env_ref_names(session_id),
                 )
                 self._require_complete_graph_summary(summary)
                 internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
@@ -750,6 +762,7 @@ class AdvisorCheckpointOwner:
         phase: AdvisorCheckpointPhase,
         state: CompositionState,
         content_scope: ComposerContentScope,
+        env_ref_names: frozenset[str] = frozenset(),
         user_message: str | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
@@ -791,7 +804,9 @@ class AdvisorCheckpointOwner:
             }
             if advisor_transcript is not None:
                 early_arguments["advisor_transcript"] = advisor_transcript
-            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap, content_scope=content_scope)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+                state, early_arguments, char_cap, content_scope=content_scope, env_ref_names=env_ref_names
+            )
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
@@ -866,7 +881,9 @@ class AdvisorCheckpointOwner:
             end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
-        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap, content_scope=content_scope)
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+            state, end_arguments, char_cap, content_scope=content_scope, env_ref_names=env_ref_names
+        )
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
@@ -1368,6 +1385,7 @@ class AdvisorCheckpointOwner:
                 phase=phase,
                 state=state,
                 content_scope=content_scope,
+                env_ref_names=await self._current_env_ref_names(session_id),
                 user_message=user_message,
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
@@ -1407,7 +1425,11 @@ class AdvisorCheckpointOwner:
                         session_operation_authority=self._require_sessions_service().session_operation_authority,
                     )
                     summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
-                        state, call_arguments, char_cap, content_scope=content_scope
+                        state,
+                        call_arguments,
+                        char_cap,
+                        content_scope=content_scope,
+                        env_ref_names=await self._current_env_ref_names(session_id),
                     )
                     self._require_complete_graph_summary(summary_parts)
                 except _advisor_context.AdvisorGraphCoverageUnavailable:
