@@ -941,7 +941,8 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   trusting a result; `elspeth_lints` lives in a separate source root.
 - Do not use `git stash`; use a worktree or a commit. This is a convention, not
   an enforced gate — nothing blocks it. (The old `.git/hooks/pre-stash` never
-  ran: git has no `pre-stash` hook. Removed 2026-09-02.)
+  ran: git has no `pre-stash` hook. The claim was dropped 2026-09-02 and the
+  file removed 2026-10-24.)
 - `.agents/skills/**/*.py` is production code to every whole-tree test gate
   but is not under the `--root src/elspeth` tier gate; ruff `T20` is ignored
   there, as under `scripts/`. `.claude/skills/` holds compatibility symlinks

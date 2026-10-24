@@ -439,23 +439,23 @@ Open or accepted findings from these reviews belong in the controlled
 
 ### 4.3 Adversarial review tooling
 
-The tracked charter, trigger and reverted-guard detector form the repository's
-adversarial review tooling [EV-624].
+The tracked red-team charter is the repository's adversarial review tooling
+[EV-624].
 
 - **Red-team agent.** `.claude/agents/red-team.md` (tracked) is an agent
   charter whose task is to disprove that a change works: tests that pass for
   the wrong reason, fixes reverted while their tests survive, path and
   normalisation escapes, exit-code conflation, gates that fail open, and
-  surviving mutants ([scripts/red_team/README.md](../../scripts/red_team/README.md)).
-- **Trigger.** `scripts/red_team/trigger.py` maps a commit's changed paths
-  onto security seams (authentication, secrets, security, policy gates, state
-  machines, CI/CD) and launches two or three reviewers with different attack
-  angles. An opt-in post-commit hook runs it.
-- **Reverted-guard detector.** `scripts/red_team/meta_check.py` finds recent
-  commits whose added production lines have gone while their added test lines
-  remain — the sign of a silently reverted fix.
-- Findings are kept locally for the maintainer to triage; automated review
-  never publishes issues.
+  surviving mutants.
+- The agent is spawned on demand for a commit or diff, with an attack angle.
+  Review effort follows risk: it is used on the Composer authoring-path
+  chokepoints named in [AGENTS.md](../../AGENTS.md#composer-invariants-non-negotiable).
+- The automatic seam trigger, its post-commit hook and the reverted-guard
+  detector were retired on 2026-10-24 ([ADR-043](../architecture/adr/043-project-tooling.md)).
+  The hook had been a no-op and the trigger had run twice. No automatic
+  adversarial review runs on commit.
+- Findings are kept locally for the maintainer to triage; review never
+  publishes issues.
 
 ### 4.4 Deployment record — independent review
 
@@ -479,7 +479,7 @@ independent human review and testing ([14](14-security-testing.md)).
 | Defensive code that hides errors instead of surfacing them | Trust-tier model with judge-reviewed, operator-signed exceptions (§ 2.4); masquerade gate on attribute probes; `validation_theatre` rule; [ADR-032 validate by trust domain](../architecture/adr/032-validate-by-trust-domain.md) [EV-609] [EV-610] |
 | A change that is green locally but breaks a whole-tree property | Whole-tree gates pin exact site sets, output bytes and plugin source hashes ([CONTRIBUTING.md](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)) |
 | Tests that pass for the wrong reason | Red-team agent charter (§ 4.3); anti-inert gate design (§ 2.3); positive and negative controls required for every measurement (§ 3.4) [EV-609] [EV-622] [EV-624] |
-| A fix silently reverted | Reverted-guard detector (§ 4.3) [EV-624] |
+| A fix silently reverted | Red-team charter attack on reverted guards, when the agent is run (§ 4.3); no automatic detector [EV-624] |
 | A gate weakened or a suppression approved by the agent itself | Tests that pin workflows (§ 2.5); redaction direction label gate; signing key never held by CI or agents (§ 2.4) [EV-610] [EV-613] [EV-617] |
 | Overclaimed results in reports or commits | Exit-code-only reporting rule; claims must show the measuring command's output ([AGENTS.md § Claims must be measured](../../AGENTS.md#claims-must-be-measured)) [EV-622] |
 | The LLM path in the product being replaced by server-side shortcuts | Composer invariants (§ 4.1) |

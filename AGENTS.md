@@ -208,8 +208,9 @@ working around it.
   to a false positive; do not bypass the hook with `--no-verify`.
 - Do not use `git stash` — use a worktree or a commit instead. This is a
   convention, not an enforced gate: nothing blocks it. (A `.git/hooks/pre-stash`
-  once claimed to, but git has no such hook, so it never ran; it was removed
-  2026-09-02 along with the claim that it worked. Blocking a stash would need a
+  once claimed to, but git has no such hook, so it never ran. The claim was
+  dropped 2026-09-02; the file itself lingered in the main checkout until
+  2026-10-24. Blocking a stash would need a
   `reference-transaction` hook rejecting `refs/stash`, which is deliberately not
   installed — that hook fires on every ref update in the repo.)
 - Never commit a `/home/<user>` or `/Users/<user>` path in a tracked file:
