@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import codecs
 import csv
-import hashlib
 import io
 import json
 from collections.abc import Iterator, Mapping, Sequence
@@ -26,6 +25,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
+from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError, BlobStateError
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -35,6 +35,7 @@ from elspeth.web.composer.redaction import (
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
 )
+from elspeth.web.composer.source_inspection import _MAX_BYTES as _INSPECT_SOURCE_MAX_BYTES
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_RESPONSE_CONTRACT,
     delimiter_for_filename,
@@ -87,10 +88,10 @@ from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _blob_id_uuid_validation_error,
     _blob_row_to_tool_dict,
+    _fenced_blob_reader,
     _locked_read_ready_blob,
     _PreparedBlobCreate,
     _sync_get_blob,
-    _verify_blob_content_hash,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -108,8 +109,6 @@ from elspeth.web.provider_config_policy import (
 )
 from elspeth.web.sessions.models import blobs_table
 
-_INSPECT_SOURCE_MAX_BYTES = 8 * 1024
-_BLOB_HASH_CHUNK_BYTES = 1024 * 1024
 _INLINE_CSV_HEADER_READ_BYTES = 64 * 1024
 _CSV_FIELD_MAX_CHARS = 64 * 1024
 _CSV_MAX_COLUMNS = 4096
@@ -1782,22 +1781,6 @@ def _is_header_only_csv(content: str) -> tuple[str, ...] | None:
     return header
 
 
-def _read_inspection_prefix_and_hash(path: Path) -> tuple[bytes, str]:
-    """Read the bounded inspection prefix while hashing the full file."""
-    digest = hashlib.sha256()
-    prefix = bytearray()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(_BLOB_HASH_CHUNK_BYTES)
-            if not chunk:
-                break
-            digest.update(chunk)
-            remaining = _INSPECT_SOURCE_MAX_BYTES - len(prefix)
-            if remaining > 0:
-                prefix.extend(chunk[:remaining])
-    return bytes(prefix), digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class _InlineCsvSourceRefusal:
     error_code: Literal["inline_source_csv_inspection_failed", "inline_source_comparison_incomplete", "inline_source_content_conflict"]
@@ -1886,11 +1869,14 @@ def _execute_inspect_source(
 ) -> ToolResult:
     """Inspect a blob-backed source and return bounded structural facts.
 
-    Mirrors the lifecycle and integrity guards of ``_execute_get_blob_content``
-    (only ``ready`` blobs are readable; SHA-256 verified; UnicodeDecodeError
-    surfaced as tool-failure) but returns ``SourceInspectionFacts`` rather
-    than raw content. Inspects at most an 8 KiB prefix and parses at most
-    100 rows; streams the full file to verify its integrity hash.
+    Reads through the blob service's shared fenced reader, the same custody,
+    deletion and storage-version recovery and post-read metadata comparison
+    as every content read. It streams the whole file to verify its hash and
+    keeps only an 8 KiB prefix, then parses at most 100 rows. It returns
+    ``SourceInspectionFacts`` rather than raw content.
+
+    Not-found, non-ready and already-missing storage are repairable tool
+    failures. Integrity, fence and other I/O faults propagate.
 
     Never returns raw row content — only summary facts (headers, inferred
     types, URL candidates, warnings, redacted identity).
@@ -1912,31 +1898,31 @@ def _execute_inspect_source(
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(context.session_engine, blob_id, context.session_id)
-    if blob is None:
+    service, operation = _fenced_blob_reader(
+        context.session_engine,
+        context.session_id,
+        data_dir=context.data_dir,
+        session_operation_context=context.session_operation_context,
+        session_operation_authority=context.session_operation_authority,
+    )
+    try:
+        verified = service.read_blob_content_prefix_verified_sync(UUID(blob_id), operation, prefix_bytes=_INSPECT_SOURCE_MAX_BYTES)
+    except BlobNotFoundError:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
-
-    blob_status = blob["status"]
-    if blob_status != "ready":
-        return _failure_result(
-            state,
-            f"Blob '{blob_id}' is not readable — status is '{blob_status}', expected 'ready'.",
-        )
-
-    storage_path = Path(blob["storage_path"])
-    if not storage_path.exists():
+    except BlobStateError as exc:
+        return _failure_result(state, str(exc))
+    except BlobContentMissingError:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
 
-    data, actual_hash = _read_inspection_prefix_and_hash(storage_path)
-    _verify_blob_content_hash(blob, actual_hash)
-
+    record = verified.record
+    data = verified.prefix
     facts = inspect_blob_content(
         content=data,
-        filename=blob["filename"],
-        mime_type=blob["mime_type"],
-        blob_id=UUID(blob_id),
-        content_hash=blob["content_hash"],
-        total_size_bytes=blob["size_bytes"],
+        filename=record.filename,
+        mime_type=record.mime_type,
+        blob_id=record.id,
+        content_hash=verified.verified_content_hash,
+        total_size_bytes=verified.total_size_bytes,
     )
     if validated.encoding is not None:
         if facts.source_kind != "csv":
@@ -1951,13 +1937,13 @@ def _execute_inspect_source(
             return _failure_result(state, "CSV inspection requires a supported text encoding.")
         facts = inspect_csv_source_content(
             content=data,
-            filename=blob["filename"],
-            mime_type=blob["mime_type"],
-            delimiter=delimiter_for_filename(blob["filename"]) or ",",
+            filename=record.filename,
+            mime_type=record.mime_type,
+            delimiter=delimiter_for_filename(record.filename) or ",",
             skip_rows=0,
-            blob_id=UUID(blob_id),
-            content_hash=blob["content_hash"],
-            total_size_bytes=blob["size_bytes"],
+            blob_id=record.id,
+            content_hash=verified.verified_content_hash,
+            total_size_bytes=verified.total_size_bytes,
             encoding=encoding,
         )
         facts = replace(

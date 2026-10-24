@@ -1956,6 +1956,30 @@ def _blob_record_to_tool_dict(record: BlobRecord) -> BlobToolRecord:
     }
 
 
+def _fenced_blob_reader(
+    session_engine: Engine,
+    session_id: str,
+    *,
+    data_dir: str | None,
+    session_operation_context: SessionOperationContext | None,
+    session_operation_authority: SessionOperationAuthority | None,
+) -> tuple[BlobServiceImpl, SessionOperationContext]:
+    """Bind the dispatcher-owned storage root, context and authority to one blob service.
+
+    Content reads go through the service's custody, recovery and fenced
+    metadata bracket. A missing root, an unowned context or a context for
+    another session is a dispatcher fault, not a model argument error.
+    """
+    if data_dir is None:
+        raise AuditIntegrityError("Blob content reads require the service storage root")
+    if type(session_operation_context) is not SessionOperationContext or session_operation_authority is None:
+        raise AuditIntegrityError("Blob reads require the actual session operation context and authority")
+    if session_operation_context.fence.session_id != session_id:
+        raise AuditIntegrityError("Blob read context does not match the requested store")
+    service = BlobServiceImpl(session_engine, Path(data_dir), session_operation_authority=session_operation_authority)
+    return service, session_operation_context
+
+
 def _locked_read_ready_blob(
     session_engine: Engine,
     session_id: str,
@@ -1968,12 +1992,13 @@ def _locked_read_ready_blob(
     continuation_read_observations: ContinuationReadObservations | None = None,
 ) -> tuple[BlobToolRecord | None, bytes | None]:
     """Observe one version through the API's exact custody and recovery path."""
-    if data_dir is None:
-        raise AuditIntegrityError("Blob content reads require the service storage root")
-    if type(session_operation_context) is not SessionOperationContext or session_operation_authority is None:
-        raise AuditIntegrityError("Blob reads require the actual session operation context and authority")
-    if session_operation_context.fence.session_id != session_id:
-        raise AuditIntegrityError("Blob read context does not match the requested store")
+    service, operation = _fenced_blob_reader(
+        session_engine,
+        session_id,
+        data_dir=data_dir,
+        session_operation_context=session_operation_context,
+        session_operation_authority=session_operation_authority,
+    )
     from elspeth.web.sessions.continuation_owner_results import ContinuationReadObservations
 
     if (attachment_inspection_policy is None) != (continuation_read_observations is None):
@@ -1983,12 +2008,6 @@ def _locked_read_ready_blob(
         or type(continuation_read_observations) is not ContinuationReadObservations
     ):
         raise AuditIntegrityError("Continuation attachment read has an unowned inspection pair")
-    authority, operation = session_operation_authority, session_operation_context
-    service = BlobServiceImpl(
-        session_engine,
-        Path(data_dir),
-        session_operation_authority=authority,
-    )
     try:
         with service._locked_blob_row_for_read(blob_id, operation) as row:
             record = _blob_record_to_tool_dict(row)

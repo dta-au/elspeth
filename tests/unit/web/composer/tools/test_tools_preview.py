@@ -2481,6 +2481,154 @@ class TestInspectSourceTool:
                 session_operation_context=blob_operation_context,
             )
 
+    def _inspect(self, authority: Any, context: SessionOperationContext, **arguments: Any) -> Any:
+        return execute_tool(
+            "inspect_source",
+            {"blob_id": self.blob_id, **arguments},
+            _empty_state(),
+            _mock_catalog(),
+            data_dir=str(self.data_dir),
+            session_engine=self.engine,
+            session_id=self.session_id,
+            session_operation_authority=authority,
+            session_operation_context=context,
+        )
+
+    def _read_through_shared_reader(self) -> bytes:
+        """Fixture control: the existing fenced reader recovers this storage state."""
+        from uuid import UUID
+
+        from elspeth.web.blobs.service import BlobServiceImpl
+
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            service = BlobServiceImpl(self.engine, self.data_dir, session_operation_authority=blob_authority)
+            _record, data = service.read_blob_content_sync(UUID(self.blob_id), blob_operation_context)
+        return data
+
+    @pytest.mark.parametrize("journal", ["pre_update_sidecar", "delete_tombstone"])
+    def test_inspect_source_recovers_committed_version(self, journal: str) -> None:
+        """TC-006 (#327): inspection reads through the shared custody and recovery path.
+
+        The committed row describes the original bytes. A crash left either
+        newer bytes in place with the original in the pre-update sidecar, or
+        the canonical file missing with one matching delete tombstone. The
+        shared reader restores the committed version; inspection must report
+        facts for that version rather than corruption or missing storage.
+        """
+        from elspeth.web.blobs.service import blob_pre_update_sidecar
+
+        original = self.content_bytes
+        if journal == "pre_update_sidecar":
+            blob_pre_update_sidecar(self.storage_path).write_bytes(original)
+            self.storage_path.write_bytes(b"replacement,never,committed\n1,2,3\n")
+        else:
+            self.storage_path.rename(self.storage_path.with_name(f".{self.blob_id}.delete-{'0' * 32}"))
+
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = self._inspect(blob_authority, blob_operation_context)
+
+        assert result.success is True, result.validation.errors
+        assert result.data["source_kind"] == "csv"
+        assert list(result.data["observed_headers"]) == ["order_id", "customer", "price"]
+        assert result.data["redacted_identity"]["byte_size"] == str(len(original))
+        assert self.storage_path.read_bytes() == original
+        assert result.updated_state.version == _empty_state().version
+        assert self._read_through_shared_reader() == original
+
+    def test_inspect_source_rejects_stale_context_before_storage(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TC-006 (#327): a released operation context reaches no storage.
+
+        A valid live context reads the READY file (positive control). The same
+        context, once released, must raise ``SessionOperationFenceLost``
+        before the target file is opened.
+        """
+        from elspeth.web.coordination.contracts import SessionOperationFenceLost
+
+        opened: list[Path] = []
+        original_open = Path.open
+
+        def _recording_open(path: Path, *args: Any, **kwargs: Any) -> Any:
+            if path == self.storage_path:
+                opened.append(path)
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", _recording_open)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            live = self._inspect(blob_authority, blob_operation_context)
+        assert live.success is True
+        assert opened, "positive control must reach the storage file"
+
+        opened.clear()
+        with pytest.raises(SessionOperationFenceLost):
+            self._inspect(blob_authority, blob_operation_context)
+        assert opened == []
+
+    def test_inspect_source_streams_a_long_file_to_eof_and_detects_tail_corruption(self) -> None:
+        """Retention: long-file success, then a tail-only byte change beyond the prefix fails integrity."""
+        from elspeth.web.blobs.protocol import BlobIntegrityError
+        from elspeth.web.blobs.service import _STREAM_CHUNK_BYTES
+
+        row = b"O-1,Alice,49.95\n"
+        long_content = b"order_id,customer,price\n" + row * ((_STREAM_CHUNK_BYTES * 2) // len(row) + 1)
+        assert len(long_content) > _STREAM_CHUNK_BYTES * 2 > 8 * 1024
+        self._replace_blob_content(long_content)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            intact = self._inspect(blob_authority, blob_operation_context)
+        assert intact.success is True
+        assert list(intact.data["observed_headers"]) == ["order_id", "customer", "price"]
+        assert intact.data["redacted_identity"]["byte_size"] == str(len(long_content))
+
+        tampered = bytearray(long_content)
+        tampered[-2] = ord("6") if tampered[-2] != ord("6") else ord("7")
+        self.storage_path.write_bytes(bytes(tampered))
+        assert len(tampered) == len(long_content) and bytes(tampered[: 8 * 1024]) == long_content[: 8 * 1024]
+        with (
+            pytest.raises(BlobIntegrityError),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
+            self._inspect(blob_authority, blob_operation_context)
+
+    def test_inspect_source_reads_storage_only_in_bounded_chunks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Retention: every read of the storage handle is a positive, chunk-bounded request.
+
+        Blocking ``Path.read_bytes`` alone cannot catch an unbounded
+        ``handle.read()``, so the real handle's requests are observed.
+        """
+        from elspeth.web.blobs.service import _STREAM_CHUNK_BYTES
+
+        row = b"O-1,Alice,49.95\n"
+        self._replace_blob_content(b"order_id,customer,price\n" + row * ((_STREAM_CHUNK_BYTES * 2) // len(row)))
+        requested: list[int] = []
+        original_open = Path.open
+
+        class _RecordingHandle:
+            def __init__(self, handle: Any) -> None:
+                self._handle = handle
+
+            def __enter__(self) -> _RecordingHandle:
+                return self
+
+            def __exit__(self, *exc_info: object) -> None:
+                self._handle.close()
+
+            def read(self, size: int = -1) -> bytes:
+                requested.append(size)
+                chunk: bytes = self._handle.read(size)
+                return chunk
+
+        def _recording_open(path: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            handle = original_open(path, mode, *args, **kwargs)
+            return _RecordingHandle(handle) if path == self.storage_path and mode == "rb" else handle
+
+        monkeypatch.setattr(Path, "open", _recording_open)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = self._inspect(blob_authority, blob_operation_context)
+
+        assert result.success is True
+        assert len(requested) >= 3, "a multi-chunk file must be streamed in several reads"
+        assert all(0 < size <= _STREAM_CHUNK_BYTES for size in requested), requested
+        assert result.data["byte_range_inspected"][1] <= 8 * 1024
+
     def test_non_uuid_blob_id_rejected_before_lookup(self) -> None:
         """LLM placeholder identifiers must fail at the blob-id boundary."""
         with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
