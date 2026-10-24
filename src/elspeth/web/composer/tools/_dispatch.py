@@ -311,7 +311,7 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
 def get_tool_definitions() -> list[dict[str, Any]]:
     """Return JSON Schema tool definitions for the LLM.
 
-    Returns 43 tools: 12 discovery + 14 mutation + 12 blob tools (6 discovery,
+    Returns 44 tools: 13 discovery + 14 mutation + 12 blob tools (6 discovery,
     6 mutation) + 3 secret tools (2 discovery, 1 mutation) + 1 advisor tool +
     1 session-aware interpretation-review tool. The breakdown is measured
     against the live registry by
