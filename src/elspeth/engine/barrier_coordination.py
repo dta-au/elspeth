@@ -10,8 +10,8 @@ prose. The two coordinators own that ordering behind one boundary:
 - ``BarrierIntakeCoordinator`` — the ADR-030 §E.2/§E.3/§E.3a/§E.5
   journal-first intake pass: adopt intake-pending BLOCKED arrivals, feed
   executor memory with backdated accept timing, replay durable branch
-  losses, and evaluate aggregation triggers from the same intake step as
-  the triggering arrival's adoption. Each adopted row resolves to a typed
+  losses, and evaluate aggregation readiness before intake and after each
+  adoption. Each adopted row resolves to a typed
   ``BarrierIntakeDisposition`` (held / terminal / pending-sink /
   ready-continuation / flush-fired).
 - ``BarrierRecoveryCoordinator`` — the F1 resume restore: rebuild
@@ -249,8 +249,8 @@ class BarrierIntakeCoordinator:
     Owns the ordered adoption sequence the executors' docstrings used to
     delegate to caller convention: batch membership opens BEFORE the fenced
     adoption verb, executor memory is fed ONLY on the adopted=True arm with
-    backdated accept timing, and aggregation triggers are evaluated from the
-    SAME intake step as the triggering arrival's adoption.
+    backdated accept timing. Aggregation readiness is observed before intake
+    and after each adopted arrival.
     """
 
     def __init__(
@@ -335,15 +335,11 @@ class BarrierIntakeCoordinator:
         self._complete_collector_fire = complete_collector_fire
         self._route_collector_release = route_collector_release
         self._merged_continuation_cursor = merged_continuation_cursor
-        # META-31: a resumed processor's collector restore installs any
-        # roster that is already complete as PARKED (WS4 fix-round #2/#3);
-        # only a PluginContext-bearing sweep AFTER that restore can close
-        # it, and the first intake pass is the earliest such point. Owed
-        # until every swept outcome has been DISPOSED (22ce94253 review
-        # I-1): the executor closes those groups durably before returning
-        # them, so an outcome it has handed over is held below until its
-        # own disposition succeeds — clearing the flag on the executor
-        # call alone lost every outcome after a raising disposition.
+        # Restore parks complete rosters for a PluginContext-bearing sweep.
+        # This flag tracks that initial sweep; executor pending closes also
+        # make fresh cancellation-deferred groups eligible. Outcomes handed
+        # over by the executor remain held below until disposition succeeds,
+        # independently of the restore flag (22ce94253 review I-1).
         self._collector_restore_sweep_owed: bool = resume_checkpoint_id is not None and collector_executor is not None
         self._undisposed_sweep_outcomes: list[CollectorOutcome] = []
         # spec §6.3 (Task 8): parked closer FAIL verdicts awaiting settlement,
@@ -423,16 +419,15 @@ class BarrierIntakeCoordinator:
         EOF loop via ``RowProcessor.run_barrier_intake``). Steps, in design
         order:
 
-        1. arrival intake — every intake-pending BLOCKED barrier row
+        1. pre-intake readiness — close accepted aggregation batches whose
+           triggers are already ready before adopting another arrival;
+        2. arrival intake — every intake-pending BLOCKED barrier row
            (``barrier_adopted_epoch IS NULL``) is adopted via the fenced
            backdated adoption verb and fed into executor memory; coalesce
            adoption runs the executor accept, surfacing merge fires, group
            failures and late-arrival releases (§E.3a) here;
-        2. per-adoption aggregation trigger evaluation — count/condition
-           triggers fire from the SAME intake step as the triggering
-           arrival's adoption (the §E.2 replacement for the deleted in-claim
-           flush arm; batch composition is preserved because the check runs
-           after EACH adoption, exactly like the old accept-then-check);
+           aggregation readiness is evaluated after each adoption, so its
+           accepted result is settled before the next arrival;
         3. branch-loss replay (§E.5) — unadopted durable losses are marked
            (journal-first) and replayed through ``notify_branch_lost``
            before the next trigger evaluation; at N=1 this is a structural
@@ -442,13 +437,26 @@ class BarrierIntakeCoordinator:
         results/child_items reproduces the pre-extraction append ordering.
         """
         dispositions: list[BarrierIntakeDisposition] = []
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return self._finish_intake_pass(dispositions)
         if (
             not self._aggregation_settings
             and self._coalesce_executor is None
             and self._row_union_executor is None
             and self._collector_executor is None
         ):
-            return BarrierIntakePassOutcome(dispositions=())
+            return self._finish_intake_pass(dispositions)
+
+        # Close an accepted batch whose trigger is already ready before
+        # adopting another arrival. This includes restored/cancelled batches
+        # and TIMEOUT/CONDITION readiness observed between intake passes:
+        # a delayed pending arrival belongs to the next batch.
+        for configured_node_id in self._aggregation_settings:
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return self._finish_intake_pass(dispositions)
+            ready_disposition = self._fire_ready_aggregation(NodeID(configured_node_id), ctx)
+            if ready_disposition is not None:
+                dispositions.append(ready_disposition)
 
         # ADR-030 §E.2 intake scan shape: only intake-pending rows
         # (barrier_adopted_epoch IS NULL).  The SQL predicate avoids
@@ -461,6 +469,8 @@ class BarrierIntakeCoordinator:
             aggregation_keys = {str(node_id) for node_id in self._aggregation_settings}
             collector_names = {str(name) for name in self._collector_node_ids}
             for row in pending_rows:
+                if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                    return self._finish_intake_pass(dispositions)
                 if row.barrier_key in aggregation_keys:
                     disposition = self._adopt_aggregation_row(row, ctx)
                 elif row.barrier_key in coalesce_keys:
@@ -483,9 +493,18 @@ class BarrierIntakeCoordinator:
                 if disposition is not None:
                     dispositions.append(disposition)
 
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return self._finish_intake_pass(dispositions)
         dispositions.extend(self._replay_group_losses(ctx))
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return self._finish_intake_pass(dispositions)
         dispositions.extend(self._flush_restored_collector_groups(ctx))
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return self._finish_intake_pass(dispositions)
         self._close_pending_empty_collector_groups(ctx)
+        return self._finish_intake_pass(dispositions)
+
+    def _finish_intake_pass(self, dispositions: Sequence[BarrierIntakeDisposition]) -> BarrierIntakePassOutcome:
         # spec §6.3 (Task 8) — escalation runs AFTER durable-loss replay, in
         # the SAME intake step: a note staged into the ledger THIS pass is
         # picked up by the NEXT pass's replay above (one-pass-per-drain-cycle
@@ -510,6 +529,8 @@ class BarrierIntakeCoordinator:
             opener_node_ids=tuple(self._require_all_collector_openers),
         )
         for group_id, opener_node_id in pending:
+            if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return
             self._collector_executor.notify_empty_group(self._require_all_collector_openers[opener_node_id], group_id, ctx)
 
     def _adopt_aggregation_row(self, row: TokenWorkItem, ctx: PluginContext) -> BarrierIntakeDisposition | None:
@@ -542,13 +563,20 @@ class BarrierIntakeCoordinator:
             # this leader's own pass). MUST NOT re-feed memory (§C.4 row 6a).
             return None
         self._aggregation_executor.accept_adopted_row(node_id, token, accept_time=arrived_monotonic)
+        disposition = self._fire_ready_aggregation(node_id, ctx)
+        return disposition if disposition is not None else BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
 
-        # Step 2: per-adoption trigger evaluation — the §E.2 home of the old
-        # in-claim count/condition flush decision (accept-then-check), so
-        # batch composition is byte-identical to the in-claim era.
+    def _fire_ready_aggregation(self, node_id: NodeID, ctx: PluginContext) -> BarrierIntakeDisposition | None:
+        """Run one admitted trigger, including a restored adoption awaiting fire."""
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return None
+
+        # Shared readiness evaluation for the pre-pass and post-adoption
+        # check. Time-based conditions latch when observed; the pre-pass
+        # observes them before another durable arrival is adopted.
         should_flush, trigger_type = self._aggregation_executor.check_flush_status(node_id)
         if not should_flush:
-            return BarrierIntakeDisposition(kind=BarrierIntakeDispositionKind.HELD)
+            return None
         transform = self._nav.resolve_plugin_for_node(node_id)
         # Nominal (negative) dispatch — elspeth-8783933d99: reject the closed
         # container's known non-transform shapes (structural None, GateSettings)
@@ -570,6 +598,8 @@ class BarrierIntakeCoordinator:
                 f"Aggregation node {node_id!r} fired a {trigger_type} trigger at intake but transform "
                 f"{transform.name!r} is not batch-aware. DAG/config inconsistency."
             )
+        if ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return None
         flush_results, flush_child_items = self._flush_batch(
             node_id,
             transform,
@@ -888,7 +918,7 @@ class BarrierIntakeCoordinator:
         return self._dispose_collector_outcome(outcome, scope_row_id=row.row_id)
 
     def _flush_restored_collector_groups(self, ctx: PluginContext) -> list[BarrierIntakeDisposition]:
-        """META-31: the post-restore flush sweep, once per resume, after the restore.
+        """Close restored or cooperatively deferred complete collector rosters.
 
         ``CollectorExecutor.flush_restored_complete_groups(ctx)`` closes
         every group the restore parked with an already-complete roster —
@@ -918,8 +948,9 @@ class BarrierIntakeCoordinator:
         groups DURABLY by the time they are returned, so each outcome is
         held in ``_undisposed_sweep_outcomes`` and dropped only after its
         own disposition succeeds; a raising disposition propagates with the
-        failed outcome and every later one still held, the sweep stays owed,
-        and the next intake pass resumes disposing from the held list
+        failed outcome and every later one still held. The held list keeps
+        the next intake eligible even for a fresh run whose restore-owed
+        flag is False. The next pass resumes disposing from that list
         without calling the executor again (it returned normally, so it
         holds nothing). The owed flag clears only once the list is empty.
         Clearing it on the executor call alone turned a lease loss inside
@@ -928,7 +959,13 @@ class BarrierIntakeCoordinator:
         with no retry and no later resume able to see them (a closed group
         is not restored as pending).
         """
-        if not self._collector_restore_sweep_owed or self._collector_executor is None:
+        if self._collector_executor is None:
+            return []
+        if (
+            not self._collector_restore_sweep_owed
+            and not self._undisposed_sweep_outcomes
+            and not self._collector_executor.has_pending_group_closes()
+        ):
             return []
         if not self._undisposed_sweep_outcomes:
             self._undisposed_sweep_outcomes.extend(self._collector_executor.flush_restored_complete_groups(ctx))
@@ -940,7 +977,8 @@ class BarrierIntakeCoordinator:
             del self._undisposed_sweep_outcomes[0]
             if disposition is not None:
                 dispositions.append(disposition)
-        self._collector_restore_sweep_owed = False
+        if ctx.shutdown_event is None or not ctx.shutdown_event.is_set():
+            self._collector_restore_sweep_owed = False
         return dispositions
 
     def _unterminalized(self, tokens: Sequence[TokenInfo]) -> tuple[TokenInfo, ...]:
@@ -1225,13 +1263,21 @@ class BarrierIntakeCoordinator:
         losses = self._scheduler.list_unadopted_group_losses(run_id=self._run_id)
         if not losses:
             return dispositions
+        if ctx is not None and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+            return dispositions
         coordination_token = self._require_coordination_token()
-        self._scheduler.adopt_group_losses(
-            loss_ids=[loss.loss_id for loss in losses],
-            coordination_token=coordination_token,
-        )
         collector_names = {str(name) for name in self._collector_node_ids}
         for loss in losses:
+            if ctx is not None and ctx.shutdown_event is not None and ctx.shutdown_event.is_set():
+                return dispositions
+            # Mark only the loss this iteration will notify. Once the mark
+            # commits, finish that notification even if shutdown arrived in
+            # the transaction; collector close defers its fresh plugin arm.
+            # Later losses remain eligible for ordinary intake replay.
+            self._scheduler.adopt_group_losses(
+                loss_ids=[loss.loss_id],
+                coordination_token=coordination_token,
+            )
             row_id = self._row_id_for_loss(loss)
             if loss.closer_name in collector_names:
                 if self._collector_executor is None:

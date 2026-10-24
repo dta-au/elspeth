@@ -946,7 +946,11 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # Power Automate: measured against the release parent of 05af04770. One arrival:
 # PowerAutomateSource._reject_candidate -> ctx.record_validation_error. The remaining
 # 286 caller identities are unchanged (no departures or moves).
-_EXPECTED_CALL_COUNT = 287
+# Graceful cancellation: one new fenced caller preserves an unstarted claim
+# without inventing a terminal token outcome. Measured against cb078ab46:
+# SchedulerDrainCoordinator._preserve_unstarted_claim -> self._scheduler.mark_failed#1.
+# No other production caller arrived, departed, or moved.
+_EXPECTED_CALL_COUNT = 288
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -963,7 +967,8 @@ _EXPECTED_CALL_COUNT = 287
 # a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
 # QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
 # and departures named at _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "584288fd1e0aae2ff9dc879b809b169e3ef5cd06c062e603d3a762d1a79da2fc"
+# Graceful cancellation: 584288fd… -> fd10a6dd…, the one arrival above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "fd10a6dd22fe4d16788680616a2a40c03cf3889b96f608d52985d5dd7f338654"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,

@@ -128,6 +128,7 @@ class TokenTraversalEngine:
         *,
         attempt_offset: int,
         row_union_name: RowUnionName | None = None,
+        allow_unstarted_shutdown: bool = False,
     ) -> _TransformOutcome:
         """Handle a single transform node: execute with retry, route errors, handle multi-row.
 
@@ -157,6 +158,7 @@ class TokenTraversalEngine:
                 token=current_token,
                 ctx=ctx,
                 attempt_offset=attempt_offset,
+                allow_unstarted_shutdown=allow_unstarted_shutdown,
             )
             # Emit TransformCompleted telemetry AFTER Landscape recording succeeds
             # (Landscape recording happens inside _execute_transform_with_retry)
@@ -1142,6 +1144,11 @@ class TokenTraversalEngine:
         node_id: NodeID | None = current_node_id
         max_inner_iterations = len(self._processor._node_to_next) + 1
         inner_iterations = 0
+        # A transform-local zero attempts is insufficient: an earlier gate or
+        # transform in this claim may already have produced effects. Only the
+        # first executable ordinary transform may preserve the original claim
+        # as unstarted. Structural traversal and lease checks do not revoke it.
+        claim_unstarted = ctx.work_item is not None
         while node_id is not None:
             inner_iterations += 1
             if inner_iterations > max_inner_iterations:
@@ -1198,6 +1205,7 @@ class TokenTraversalEngine:
             # every implementation missing the new member and the dispatch
             # raise fired mid-traversal (ef5e6e593).
             if isinstance(plugin, GateSettings):
+                claim_unstarted = False
                 # NOTE: child_items is mutated inside (fork paths, coalesce notifications).
                 gate_outcome = self.handle_gate_node(
                     plugin,
@@ -1279,7 +1287,9 @@ class TokenTraversalEngine:
                     last_on_success_sink,
                     attempt_offset=attempt_offset,
                     row_union_name=row_union_name,
+                    allow_unstarted_shutdown=claim_unstarted,
                 )
+                claim_unstarted = False
                 if isinstance(transform_outcome, _TransformTerminal):
                     return transform_outcome.result, child_items
                 current_token = transform_outcome.updated_token
