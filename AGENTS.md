@@ -236,6 +236,24 @@ working around it.
 - `scripts/full-suite-gate.sh --execute --detach` does all of the above for
   you (per-stage logs, recorded exit codes, a frozen-tree check); read its
   `summary.txt`, not its terminal output.
+- Every commit that lands on a release or integration branch must keep green
+  tests green. No landed commit may turn a passing test red; that is what
+  `git bisect` treats as a regression. Fixes made one after another, even in
+  one shared test file, may land as separate commits, as long as failures
+  only decrease. Compare consecutive commits over sets of (test id, failure
+  signature) pairs, where the signature is the exception type plus the first
+  line of its message. Do not compare counts, which change as tests are added:
+  (a) each commit's failing pairs are a subset of the previous commit's, and
+      any pair that is new under an existing id is explained;
+  (b) every test id a commit introduces passes at that commit, because a
+      subset check alone cannot see a failing-first test added ahead of its
+      fix.
+  Where a signature embeds data that changes between runs (a `tmp_path`, a
+  uuid, a digest, a timestamp), normalise only that part, narrowly, and state
+  the rule. A broad normalisation disarms the check while it still appears to
+  run. Squash or reorder a commit that adds a red test before its fix or
+  carries a planted mutation. After resolving a cherry-pick conflict by hand,
+  re-check this on the receiving branch.
 
 ## Subagent Reporting
 
