@@ -99,7 +99,7 @@ def mutation_inputs_for_test_turn(service, kwargs):
             # Project only this alternative through the common graph schema;
             # retain their real original call and private evidence identities.
             content = canonical_json(redact_tool_call_response("set_pipeline", failure.to_dict(), telemetry=NoopRedactionTelemetry()))
-            event = row.visible_event.with_display_result(content) if row.visible_event is not None else None
+            event = row.visible_event.with_authority_revocation(content) if row.visible_event is not None else None
             alternative.append(replace(row, content=content, composition_state_payload=None, visible_event=event))
         result["revoked_tool_rows"] = tuple(alternative)
     return result

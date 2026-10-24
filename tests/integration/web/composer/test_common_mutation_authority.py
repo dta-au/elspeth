@@ -21,6 +21,9 @@ from elspeth.contracts.blobs import BlobDeletionPlan, BlobRecord, BlobReplacemen
 from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer import tool_batch as tool_batch_module
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner
+from elspeth.web.composer.continuation_codec import PrivateChunk
+from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerMutationAuthorityRevoked
 from elspeth.web.sessions.models import (
@@ -464,6 +467,8 @@ def run_authority_case(
     client, engine, sessions = _build_app(tmp_path, monkeypatch, sdk)
     composer = client.app.state.composer_service
     sid = client.post("/api/sessions", json={"title": "Authority race"}).json()["id"]
+    if observed is not None:
+        observed.update(sessions=sessions, sid=sid)
     pipeline = _pipeline(tmp_path, sid)
     if inline:
         pipeline["source"] = {
@@ -768,9 +773,23 @@ def test_same_authority_for_existing_graph_and_recompose(
         assert tool["composition_state_id"] is None
 
 
+def _revoked_graph_history_event(provider_json):
+    [event] = [item for item in json.loads(provider_json)["events"] if item.get("tool_call_id") == "authority-set-pipeline-1"]
+    return event
+
+
+def _assert_revoked_graph_replays_as_refusal(event):
+    replayed = json.loads(event["content"])
+    assert replayed["success"] is False
+    assert [item["error_code"] for item in replayed["validation"]["errors"]] == ["auto_mutation_revoked"]
+    assert event["selected_result_retained"] is False
+    assert "selected_result_authority_revoked" in event["visible_event_availability"]
+
+
 def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monkeypatch):
+    observed = {}
     settled, states, proposals, chat, phases, primary, physical = run_authority_case(
-        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4"
+        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", observed=observed
     )
     assert states == [] and proposals == []
     status, body = settled.error()
@@ -789,6 +808,28 @@ def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monke
         len([row for row in chat if row["role"] == "audit" and row["tool_calls"] and row["tool_calls"][0].get("_kind") == "llm_call_audit"])
         == 2
     )
+    # A later Advisor rebuilds history from these rows; the revoked graph must
+    # replay as the recorded refusal, never as the success the model first saw.
+    sessions, sid = observed["sessions"], observed["sid"]
+    user = next(row for row in chat if row["role"] == "user")
+    history = AdvisorTranscriptHistory.from_records(
+        session_id=sid,
+        actor_user_id="alice",
+        current_request_id=str(user["id"]),
+        request=user["content"],
+        records=asyncio.run(sessions.get_messages(UUID(sid))),
+    )
+    owner = AdvisorTranscriptOwner(request=user["content"], history=history)
+    _assert_revoked_graph_replays_as_refusal(_revoked_graph_history_event(owner.snapshot().provider_json))
+    chunk = encode_message_shelf(owner.snapshot_for_continuation([]))
+    cold, _ = AdvisorTranscriptOwner.for_continuation(
+        decode_message_shelf(PrivateChunk(chunk.reference, chunk.canonical)),
+        session_id=sid,
+        actor_user_id="alice",
+        request_id=str(user["id"]),
+        request=user["content"],
+    )
+    _assert_revoked_graph_replays_as_refusal(_revoked_graph_history_event(cold.snapshot().provider_json))
 
 
 def test_graph_commit_precedes_later_preference_revocation(tmp_path, monkeypatch):
@@ -1346,7 +1387,7 @@ def test_sticky_refusal_selects_entire_mixed_cohort_and_preserves_prior_checkpoi
             assert payload["success"] is False and payload["version"] == batches[1][0].version
             assert payload["validation"]["errors"][0]["error_code"] == "auto_mutation_revoked"
             assert alternative.composition_state_payload is None
-            assert alternative.visible_event == original.visible_event.with_display_result(alternative.content)
+            assert alternative.visible_event == original.visible_event.with_authority_revocation(alternative.content)
         assert VisibleToolEvent.from_envelope(saved["tool_calls"][0]) == alternative.visible_event.with_parent(parent["id"])
     expected_private = {evidence.tool_call_id: evidence for evidence in inputs["private_tool_evidence"]}
     actual_private = {

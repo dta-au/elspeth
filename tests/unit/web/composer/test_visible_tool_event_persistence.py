@@ -13,7 +13,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner
 from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
-from elspeth.web.composer.visible_tool_event import VisibleToolEvent
+from elspeth.web.composer.visible_tool_event import SELECTED_RESULT_AUTHORITY_REVOKED, VisibleToolEvent
 from elspeth.web.sessions._persist_payload import RedactedToolRow
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.routes._helpers import _composer_chat_history, _message_response
@@ -177,6 +177,65 @@ async def test_visible_companion_rolls_back_with_its_actual_tool_cohort(visible_
     with pytest.raises(AuditIntegrityError, match="controlled sibling"):
         await service.persist_compose_turn_async(**kwargs)
     assert await service.get_messages(session.id, limit=None) == []
+
+
+def test_authority_revocation_replaces_selected_result_and_rebinds_payload():
+    from tests.unit.web.composer.test_turn_effects import CONTEXT
+
+    selected, refusal = json.dumps({"success": True, "data": "saved"}), json.dumps({"success": False})
+    event = VisibleToolEvent.capture(
+        context=CONTEXT,
+        request_id="request",
+        tool_call_id="call",
+        tool_name="set_pipeline",
+        received_arguments="{}",
+        effective_arguments="{}",
+        selected_result=selected,
+        display_arguments="{}",
+        display_result=selected,
+    )
+    revoked = VisibleToolEvent.from_envelope(event.with_authority_revocation(refusal).to_envelope())
+    payload = json.loads(revoked.payload_json)
+    assert payload == {
+        "received_arguments": "{}",
+        "effective_arguments": "{}",
+        "selected_result": None,
+        "availability_gaps": [SELECTED_RESULT_AUTHORITY_REVOKED],
+    }
+    revoked.validate_recorded_link(
+        session_id=CONTEXT.fence.session_id,
+        operation_id=CONTEXT.fence.operation_id,
+        tool_call_id="call",
+        tool_name="set_pipeline",
+        display_arguments="{}",
+        display_result=refusal,
+    )
+    with pytest.raises(AuditIntegrityError):
+        event.with_parent("assistant").with_authority_revocation(refusal)
+
+
+@pytest.mark.asyncio
+async def test_history_refuses_revoked_visible_event_that_still_selects_a_result(visible_writer):
+    service, session, _authority, holder = visible_writer
+    context = holder["context"]
+    kwargs, _original, _effective, selected = _kwargs(session, context)
+    row = kwargs["redacted_tool_rows"][0]
+    payload = json.loads(row.visible_event.payload_json)
+    payload["availability_gaps"].append(SELECTED_RESULT_AUTHORITY_REVOKED)
+    contradictory = json.dumps(payload, ensure_ascii=False)
+    assert json.loads(contradictory)["selected_result"] == selected
+    kwargs["redacted_tool_rows"] = (
+        replace(
+            row,
+            visible_event=replace(
+                row.visible_event, payload_json=contradictory, payload_hash=hashlib.sha256(contradictory.encode()).hexdigest()
+            ),
+        ),
+    )
+    kwargs["revoked_tool_rows"] = kwargs["redacted_tool_rows"]
+    await service.persist_compose_turn_async(**kwargs)
+    with pytest.raises(AuditIntegrityError, match="revoked"):
+        await _history(service, session, context)
 
 
 def test_capture_redacts_whole_assignment_and_has_no_authored_uuid_key_exemption():

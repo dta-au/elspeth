@@ -30,6 +30,7 @@ from elspeth.web.validation import _redact_sensitive_content
 VISIBLE_TOOL_EVENT_KIND: Final = "composer_visible_tool_event"
 VISIBLE_TOOL_EVENT_SCHEMA: Final = "composer.visible-tool-event.v1"
 VISIBLE_RESPONSE_GAP_KIND: Final = "composer_visible_response_gap"
+SELECTED_RESULT_AUTHORITY_REVOKED: Final = "selected_result_authority_revoked"
 
 
 class VisibleResponseGapWire(TypedDict):
@@ -225,12 +226,21 @@ class VisibleToolEvent:
             raise AuditIntegrityError("Visible tool event parent can be assigned only by its new P4 row")
         return replace(self, parent_assistant_id=assistant_id)
 
-    def with_display_result(self, display_result: str) -> VisibleToolEvent:
+    def with_authority_revocation(self, display_result: str) -> VisibleToolEvent:
+        """Record that P4 refused the selected result after the model saw it.
+
+        The refusal becomes the event's outcome; the superseded candidate is
+        not retained as replayable visible evidence.
+        """
         if self.parent_assistant_id is not None:
             raise AuditIntegrityError("Only an unpersisted visible event may select its display")
         if type(display_result) is not str:
             raise TypeError("Visible display must be serialized text")
-        return replace(self, display_result_hash=_hash(display_result))
+        content = json.loads(self.payload_json)
+        content["selected_result"] = None
+        content["availability_gaps"] = [*content["availability_gaps"], SELECTED_RESULT_AUTHORITY_REVOKED]
+        payload = json.dumps(content, ensure_ascii=False)
+        return replace(self, display_result_hash=_hash(display_result), payload_json=payload, payload_hash=_hash(payload))
 
     def to_envelope(self) -> dict[str, Any]:
         return {"_kind": VISIBLE_TOOL_EVENT_KIND, "schema": VISIBLE_TOOL_EVENT_SCHEMA, **asdict(self)}

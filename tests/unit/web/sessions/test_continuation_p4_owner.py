@@ -143,7 +143,7 @@ def completed_cut(
     rows = (row,)
     refusal = canonical_json({"success": False, "error": "automatic mutation refused"})
     revoked = (
-        (replace(row, content=refusal, composition_state_payload=None, visible_event=visible.with_display_result(refusal)),)
+        (replace(row, content=refusal, composition_state_payload=None, visible_event=visible.with_authority_revocation(refusal)),)
         if graph
         else rows
     )

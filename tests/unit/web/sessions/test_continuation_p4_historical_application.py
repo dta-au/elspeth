@@ -194,7 +194,7 @@ async def test_actual_application_refuses_changed_owned_input_without_partial_pr
         elif change == "visible":
             snapshot = args["recorder"].snapshot_for_continuation(drained=args["drained"])
             link = snapshot.visible_tool_events[0]
-            changed = replace(link, event=link.event.with_display_result("different visible history"))
+            changed = replace(link, event=link.event.with_authority_revocation("different visible history"))
             args["recorder"], _ = BufferingRecorder.for_continuation(replace(snapshot, visible_tool_events=(changed,)))
         elif change == "cursor":
             args["drained"] = replace(args["drained"], invocations=0)

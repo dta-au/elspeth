@@ -2005,7 +2005,7 @@ class SessionServiceImpl:
                 or ((original.visible_event is None) != (alternative.visible_event is None))
                 or (
                     original.visible_event is not None
-                    and alternative.visible_event != original.visible_event.with_display_result(alternative.content)
+                    and alternative.visible_event != original.visible_event.with_authority_revocation(alternative.content)
                 )
             ):
                 raise AuditIntegrityError("Refusal alternate changed candidate evidence or retained graph authority")

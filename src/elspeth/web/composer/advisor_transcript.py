@@ -33,6 +33,7 @@ from elspeth.web.composer.continuation_message_shelf import (
 from elspeth.web.composer.control_messages import replay_composer_control_message
 from elspeth.web.composer.prompt_guard_rendering import JsonPath, _json_inspection_text, json_content_parts
 from elspeth.web.composer.visible_tool_event import (
+    SELECTED_RESULT_AUTHORITY_REVOKED,
     VISIBLE_RESPONSE_GAP_KIND,
     VISIBLE_TOOL_EVENT_KIND,
     VisibleToolEvent,
@@ -399,6 +400,8 @@ class AdvisorTranscriptHistory:
                         )
                         linked.pop("effective_arguments_ref", None)
                         linked["argument_provenance"] = "ordinary_received_and_effective_event"
+                        if SELECTED_RESULT_AUTHORITY_REVOKED in payload["availability_gaps"] and payload["selected_result"] is not None:
+                            raise AuditIntegrityError("Visible tool event replays a selected result that authority revoked")
                         if payload["selected_result"] is not None:
                             event["content"] = payload["selected_result"]
                             event.pop("content_ref", None)

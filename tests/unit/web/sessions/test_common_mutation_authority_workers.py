@@ -129,7 +129,7 @@ def p4_input(sid, running, ticket):
         ),
         "redacted_tool_rows": (row,),
         "revoked_tool_rows": (
-            replace(row, content=refusal, composition_state_payload=None, visible_event=visible.with_display_result(refusal)),
+            replace(row, content=refusal, composition_state_payload=None, visible_event=visible.with_authority_revocation(refusal)),
         ),
         "parent_composition_state_id": None,
         "expected_current_state_id": None,

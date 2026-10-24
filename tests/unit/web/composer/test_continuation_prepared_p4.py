@@ -151,7 +151,7 @@ def prepared_input(*, graph=True, output_url=None, env_ref_names=frozenset(), ra
     if graph:
         first = rows[0]
         refused = canonical_json({"success": False, "error": "mutation authority revoked"})
-        revoked = (RedactedToolRow(first.tool_call_id, refused, None, first.visible_event.with_display_result(refused)), rows[1])
+        revoked = (RedactedToolRow(first.tool_call_id, refused, None, first.visible_event.with_authority_revocation(refused)), rows[1])
     else:
         revoked = rows
     value = capture_prepared_p4(

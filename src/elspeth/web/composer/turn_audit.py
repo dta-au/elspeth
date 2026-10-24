@@ -242,7 +242,9 @@ def _revoked_graph_rows(
             failure_status=None,
         )
         result.append(
-            replace(row, content=display, composition_state_payload=None, visible_event=row.visible_event.with_display_result(display))
+            replace(
+                row, content=display, composition_state_payload=None, visible_event=row.visible_event.with_authority_revocation(display)
+            )
         )
     return tuple(result)
 

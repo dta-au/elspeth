@@ -307,7 +307,7 @@ def prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str]
             alternate.tool_call_id != row.tool_call_id
             or alternate.composition_state_payload is not None
             or ((row.visible_event is None) != (alternate.visible_event is None))
-            or (row.visible_event is not None and alternate.visible_event != row.visible_event.with_display_result(alternate.content))
+            or (row.visible_event is not None and alternate.visible_event != row.visible_event.with_authority_revocation(alternate.content))
         ):
             raise AuditIntegrityError("retained P4 refusal kept graph authority or changed evidence")
     ceiling = None if value.mutation_ceiling_json is None else _decode_owned(_P4_CEILING, value.mutation_ceiling_json)
