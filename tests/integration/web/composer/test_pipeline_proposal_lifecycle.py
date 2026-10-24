@@ -60,6 +60,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.content_publication import split_content_publication
 from tests.helpers.session_fences import acquire_operation_context, fenced_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -445,7 +446,9 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
 
     assert settled.proposal.status == "committed"
     assert settled.proposal.committed_state_id == settled.state.id
-    assert settled.state.composer_meta == final_meta
+    publication, preserved = split_content_publication(settled.state)
+    assert preserved == final_meta
+    assert publication.state_id == settled.state.id
     events = await service.list_proposal_events(session_id)
     assert [event.event_type for event in events] == ["proposal.created", "proposal.accepted"]
     terminal = events[-1].payload

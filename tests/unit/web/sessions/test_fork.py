@@ -52,6 +52,7 @@ from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
+from tests.helpers.content_publication import split_content_publication
 from tests.helpers.session_fences import create_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -934,7 +935,11 @@ class TestForkSession:
             auth_provider_type="local",
         )
         assert copied_state is not None
-        assert copied_state.composer_meta == {"repair_turns_used": 2}
+        publication, preserved = split_content_publication(copied_state)
+        assert preserved == {"repair_turns_used": 2}
+        # The fork re-binds applicability to the child row, never the parent's.
+        assert publication.session_id == copied_state.session_id != session.id
+        assert publication.state_id == copied_state.id != state.id
 
 
 # ── Route-level tests ───────────────────────────────────────────────────
