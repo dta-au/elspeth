@@ -45,6 +45,7 @@ from elspeth_lints.core.allowlist import (
     verify_entry_binding_against_finding,
 )
 from elspeth_lints.core.allowlist import PerFileRule as PerFileRule
+from elspeth_lints.core.ast_dump import stable_ast_dump
 from elspeth_lints.core.ast_walker import iter_own_scope, iter_python_files
 from elspeth_lints.core.boundary_aliases import (
     argument_names,
@@ -780,10 +781,10 @@ class TierModelVisitor(ast.NodeVisitor):
         The fingerprint is based on:
         - rule_id (ensures distinctness across rules)
         - AST path (field/index path from root, stable across formatting)
-        - AST dump without line/column attributes
+        - Canonical Python 3.13 AST shape without line/column attributes
         """
         ast_path = "/".join(self.path_stack)
-        node_dump = ast.dump(node, include_attributes=False, annotate_fields=True)
+        node_dump = stable_ast_dump(node, annotate_fields=True)
         payload = f"{rule_id}|{ast_path}|{node_dump}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
