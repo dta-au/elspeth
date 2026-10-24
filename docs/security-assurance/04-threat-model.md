@@ -122,6 +122,12 @@ whether `/metrics` or an MCP server is exposed. Operator-authored YAML run
 through the CLI is not a sandbox: it can deliberately read files, call
 networks, use credentials and send data to sinks.
 
+Code the operator installs is operator-controlled too: ELSPETH plugins and
+compatibility-gateway adapters. Anyone can author such code, but it runs only
+because the operator wrote it or deliberately copied it into the deployment,
+much like loading a kernel module. It executes with the authority of the
+process that loads it, and neither ELSPETH nor the gateway sandboxes it.
+
 ### 3.4 Developer-controlled
 
 Plugin code shipped in the package, frontend build output, tests, fixtures,
@@ -561,9 +567,23 @@ operator-pinned OAuth/upstream origin. Strict bearer parsing and constant-time
 comparison, closed configuration, bounded schemas/bodies, forbidden authority
 headers, no redirects, metadata-only logs and fixed error envelopes constrain
 the wire path. The gateway has no end-user or tenant identity: bearer theft or
-an exposed listener grants use of its configured upstream authority. Adapter
-code executes inside the secret-bearing process, so returned-plan validation
-is not code containment [EV-022].
+an exposed listener grants use of its configured upstream authority.
+
+Adapter code executes inside the secret-bearing process, so returned-plan
+validation is not code containment [EV-022]. This is by design: the adapter is
+operator-installed trusted code (§3.3), in the same category as a plugin. The
+gateway is a published reference that agencies adapt and that is held
+compatible with GovAI; the agency that writes or installs the adapter owns the
+gateway's credentials and runs the gateway, so there is no less-trusted party
+for an in-process boundary to defend against. A malicious adapter is
+equivalent to a malicious operator, and a compromised adapter dependency is
+equivalent to a compromised dependency in the operator's own gateway image.
+Mitigation is therefore operator review of the adapter and its dependency
+closure, pinned digest-verified installation, and supply-chain admission of
+the derived image. An organisation that needs adapter code isolated from the
+credentials runs it as a separate, credential-free service; the gateway does
+not provide that isolation. The trust model is stated for adapter authors in
+the gateway README ("Adapter trust model").
 
 Risk references: activate `R-022` for bearer/listener exposure; `R-023` covers
 adapter/runtime compromise. Supply-chain risk `R-015` remains separately
@@ -638,7 +658,7 @@ controlled register.
 | T-033 | T, R, I | Filesystem actor coherently tampers with Composer MCP state or evidence | 4.15 | Composition and local event evidence (C, I) | CAS, atomic replacement and byte/hash consistency checks | Deployment | High — coherent state/hash rewriting or shared writers defeats the application checks | `R-020` if applicable |
 | T-034 | T, I, E | Tampered YAML, environment or template executes with CLI operator authority | 4.13 | Host files, secrets, network and sink targets (C, I) | Safe/strict parsing, targeted guards, explicit execution, graph/replay/effect preflight | Deployment | Critical — substituted configuration can exercise the operator account's full intended runtime authority | `R-021` if applicable |
 | T-035 | S, I, D, E | Gateway bearer stolen or listener exposed | 4.16 | Upstream model authority, prompts and service capacity (C, A) | Strict constant-time bearer check, bounded API and deployment ingress/rate controls | Deployment | High — one static bearer authorises use without end-user/tenant attribution | `R-022` if applicable |
-| T-036 | T, I, E | Gateway adapter/runtime compromised | 4.16 | Gateway credentials, prompts and responses (C, I) | Fixed-origin/bounded wire validation, supply-chain admission and non-root image | Residual | Critical — adapter code already executes inside the credential-bearing process | `R-023` |
+| T-036 | T, I, E | Gateway adapter/runtime compromised | 4.16 | Gateway credentials, prompts and responses (C, I) | By design the adapter is operator-installed trusted code (§3.3, §4.16): operator review of the adapter and its dependency closure, pinned digest-verified installation, supply-chain admission of the derived image, fixed-origin/bounded wire validation and non-root image | Deployment | High — a compromised adapter is equivalent to a compromise of the operator's own gateway image; recalibrated from Critical because the adapter author and the credential owner are the same party (§6 basis) | `R-023` |
 | T-037 | T, I, D, E | Crafted PDF exploits native PDFium worker | 4.17 | Service account, pipeline data and runtime (C, I, A) | Spawn/recycle, bounds, Linux rlimits, timeout/kill, temporary-output containment and measured renderer identity | Residual | Critical — process isolation does not contain native code with inherited service-account authority | `R-024` |
 
 ### 5.1 STRIDE coverage by surface
