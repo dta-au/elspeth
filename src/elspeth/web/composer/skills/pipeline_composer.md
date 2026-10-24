@@ -378,11 +378,22 @@ values or tool arguments.
 ## Reading a tool result
 
 <!-- taught:begin envelope * success; envelope * version; envelope * affected_nodes; envelope * data; envelope * validation -->
-Every tool returns one JSON object with the same framing: `success` is the
+Ordinary tools return one JSON object with the same framing: `success` is the
 outcome; `version` is the state version after the call; `affected_nodes`
 lists the component ids the call touched; `data` is the tool-specific
 payload each tool's own description names. `validation` is always present.
 <!-- taught:end -->
+
+Some tools answer differently. `request_advisor_hint` returns a flat object
+keyed by `status`: `SUCCESS` means the advisor answered and its `guidance` is
+advice; any other status means no advice was produced. It carries no
+`version`, `affected_nodes` or `validation`, so it never shows that the draft
+changed or validated. `handoff_to_user` and `restore_parked_graph` end the
+turn: you receive no tool result, and the server reports the actual outcome.
+When your request instruction offers a proposal terminal, a rejected proposal
+returns `success` false and `validation` errors to repair before resubmitting,
+with no `version` or `data`; an accepted proposal ends planning without a tool
+result.
 
 Use `read_attachment` when you need the complete supplied UTF-8 instructions,
 requirements or reference text. It returns one attachment's exact full text in
