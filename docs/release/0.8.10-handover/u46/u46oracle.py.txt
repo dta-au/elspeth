@@ -1,0 +1,27 @@
+"""U-46 oracle: run the gate's _reserve_selected_origin_effect_failures over all units except excluded paths; dump JSON."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+
+def main() -> None:
+    tree = Path(sys.argv[1]).resolve()
+    out = Path(sys.argv[2])
+    excluded = [needle for needle in sys.argv[3].split(",") if needle]
+    spec = importlib.util.spec_from_file_location("u46_tool", tree / "scripts" / "fencing_inventory.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    gate = tool.load_gate(tree)
+    units = tuple(unit for unit in gate._production_units() if not any(needle in unit.path for needle in excluded))
+    started = time.process_time()
+    failures = list(gate._reserve_selected_origin_effect_failures(units))
+    out.write_text(json.dumps({"tree": str(tree), "units": len(units), "excluded": excluded, "cpu_s": time.process_time() - started, "failures": failures}, indent=1))
+
+
+if __name__ == "__main__":
+    main()

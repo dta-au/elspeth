@@ -1,0 +1,132 @@
+"""Re-derive U-17 dossier bindings on the current tree (report or --write)."""
+import ast, hashlib, json, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+from tool_contracts import symbol_facts, digest, guidance_matches, GuidanceBinding
+from elspeth_lints.core.ast_dump import stable_ast_dump
+WRITE = "--write" in sys.argv
+REV = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+TREE = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+D = "docs/reference/composer-advisor-tools"
+RENAMES = {
+ "test_tc020_refused_synthetic_control_is_retained_in_audit_arguments": "test_tc020_refused_synthetic_control_is_withheld_from_audit_arguments",
+ "test_tc019_missing_load_preserves_graph_and_checkout_but_resets_diff": "test_tc019_missing_load_preserves_graph_checkout_and_diff_baseline",
+ "test_tc018_loaded_metadata_egress_precedes_new_state_guard": "test_tc018_loaded_state_is_admitted_before_adoption_response_and_audit",
+ "test_tc020_refused_extra_argument_survives_immediate_or_buffered_audit": "test_tc020_refused_extra_argument_is_withheld_from_immediate_or_buffered_audit",
+ "test_tc018_disk_name_reaches_list_response_and_audit": "test_tc018_disk_name_is_admitted_before_list_response_and_audit",
+ "test_tc020_refused_list_extra_retains_raw_arguments": "test_tc020_refused_list_extra_withholds_raw_arguments",
+ "test_tc020_refused_extra_argument_retained_without_target_deletion": "test_tc020_refused_extra_argument_withheld_without_target_deletion",
+}
+def rn(s):
+    for a, b in RENAMES.items():
+        s = s.replace(a, b)
+    return s
+problems, changes = [], []
+def blob(path):
+    return subprocess.check_output(["git", "rev-parse", f"{REV}:{path}"], text=True).strip()
+def source(path):
+    return subprocess.check_output(["git", "show", f"{REV}:{path}"])
+def node_for(tree, q):
+    out = []
+    def v(n, par):
+        for c in ast.iter_child_nodes(n):
+            cp = par
+            if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                cp = par + (c.name,)
+                if ".".join(cp) == q: out.append(c)
+            elif isinstance(c, (ast.Assign, ast.AnnAssign)):
+                ts = c.targets if isinstance(c, ast.Assign) else [c.target]
+                if any(isinstance(t, ast.Name) and ".".join(par + (t.id,)) == q for t in ts): out.append(c)
+            v(c, cp)
+    v(tree, ()); return out
+def rebind_entry(e, label):
+    e2 = dict(e)
+    if e.get("qualname"): e2["qualname"] = rn(e["qualname"])
+    if "id" in e: e2["id"] = rn(e["id"])
+    if "qualified_symbol" in e: e2["qualified_symbol"] = rn(e["qualified_symbol"])
+    path = e["path"]
+    q = e2.get("qualname") if "qualname" in e2 else e2.get("qualified_symbol")
+    try:
+        src = source(path)
+    except subprocess.CalledProcessError:
+        problems.append(f"{label}: path gone {path}"); return e
+    try:
+        sig, sem = symbol_facts(src, q)
+    except ValueError as exc:
+        problems.append(f"{label}: {path}:{q} {exc}"); return e
+    if "git_blob" in e2: e2["git_blob"] = blob(path)
+    e2["file_sha256"] = digest(src)
+    if "signature" in e2: e2["signature"] = sig
+    e2["semantic_sha256"] = sem
+    if "body_sha256" in e2 or "line_hint" in e2:
+        if q:
+            n = node_for(ast.parse(src, type_comments=True), q)[0]
+            if "line_hint" in e2: e2["line_hint"] = n.lineno
+            if "body_sha256" in e2:
+                e2["body_sha256"] = digest(stable_ast_dump(ast.Module(body=n.body, type_ignores=[])).encode()) if hasattr(n, "body") and isinstance(n.body, list) else None
+    if "expectations" in e2 and q:
+        n = node_for(ast.parse(src), q)[0]
+        exp = []
+        for x in ast.walk(n):
+            if isinstance(x, ast.Assert): exp.append({"kind": "assert", "source": ast.get_source_segment(src.decode(), x)})
+            elif isinstance(x, ast.Call) and ast.unparse(x.func) == "pytest.raises": exp.append({"kind": "raises", "source": ast.get_source_segment(src.decode(), x)})
+        e2["expectations"] = exp
+    if e2 != e: changes.append(f"{label}: {path}:{q}")
+    return e2
+def rebind_guidance(g, label):
+    g2 = dict(g)
+    try:
+        text = source(g["path"]).decode()
+    except subprocess.CalledProcessError:
+        problems.append(f"{label}: guidance path gone {g['path']}"); return g
+    gb = GuidanceBinding(id=g.get("id", "x"), path=g["path"], heading_context=g["heading_context"], paragraph=g["paragraph"], text_sha256=g["text_sha256"], line_hint=g["line_hint"], git_blob=g["git_blob"])
+    try:
+        line = guidance_matches(text, gb)
+    except ValueError as exc:
+        problems.append(f"{label}: guidance {g['path']} {g['heading_context'][-1]!r} {exc}"); return g
+    g2["line_hint"] = line; g2["git_blob"] = blob(g["path"])
+    if "file_sha256" in g2: g2["file_sha256"] = digest(text.encode())
+    if g2 != g: changes.append(f"{label}: guidance {g['path']}")
+    return g2
+def tests_assertions(path, names):
+    src = source(path).decode(); tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    a, r = {}, {}
+    for k in names:
+        n = fns[k]
+        a[k] = [{"line_hint": x.lineno, "assertion": ast.unparse(x)} for x in ast.walk(n) if isinstance(x, ast.Assert)]
+        r[k] = [{"line_hint": x.lineno, "expectation": ast.unparse(x)} for x in ast.walk(n) if isinstance(x, ast.Call) and ast.unparse(x.func) == "pytest.raises"]
+    return a, r
+for name in ["wire_secret_ref", "mcp_new_session", "mcp_load_session", "mcp_list_sessions", "mcp_delete_session"]:
+    for kind in ("binding", "conformance"):
+        p = f"{D}/{name}.{kind}.json"
+        try:
+            d = json.load(open(p))
+        except FileNotFoundError:
+            continue
+        label = f"{name}.{kind}"
+        for key in ("source_bindings", "test_bindings", "test_and_helper_bindings", "test_symbol_bindings", "helper_fixture_bindings"):
+            if key in d and isinstance(d[key], list):
+                d[key] = [rebind_entry(e, f"{label}.{key}") if isinstance(e, dict) and "path" in e else e for e in d[key]]
+        for key in ("guidance", "guidance_bindings"):
+            if key in d:
+                d[key] = [rebind_guidance(g, f"{label}.{key}") for g in d[key]]
+        if "assertions" in d and "test_bindings" in d:
+            tpath = next(e["path"] for e in d["test_bindings"] if e["path"].startswith("tests/") and e.get("qualname") is None)
+            names = [rn(k) for k in d["assertions"]]
+            a, r = tests_assertions(tpath, [k for k in names if k.startswith("test_")])
+            d["assertions"] = {rn(k): (a[rn(k)] if rn(k) in a else v) for k, v in d["assertions"].items()}
+            d["raises_expectations"] = {rn(k): (r[rn(k)] if rn(k) in r else v) for k, v in d["raises_expectations"].items()}
+        for key in ("active_cases",):
+            if key in d:
+                d[key] = json.loads(rn(json.dumps(d[key], ensure_ascii=False)))
+        if "claims" in d:
+            d["claims"] = json.loads(rn(json.dumps(d["claims"], ensure_ascii=False)))
+        if "source_commit" in d:
+            d["source_commit"] = REV; d["source_tree"] = TREE
+        if "page" in d:
+            d["page"]["sha256"] = digest(open(d["page"]["path"], "rb").read())
+        if WRITE:
+            open(p, "w").write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+print("REV", REV)
+print("CHANGED", len(changes))
+print("\n".join("PROBLEM " + x for x in problems) or "no problems")

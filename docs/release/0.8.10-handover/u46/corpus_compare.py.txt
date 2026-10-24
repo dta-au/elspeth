@@ -1,0 +1,21 @@
+"""Compare two U-46 corpora: failures, finished root results (compared) and unfinished roots (NOT compared)."""
+import json
+import sys
+from collections import Counter
+
+a, b = (json.load(open(path)) for path in sys.argv[1:3])
+key = lambda record: tuple(record[:6])  # path, lineno, col, end_lineno, end_col, root kind
+fa, fb = {key(r): r[6] for r in a["records"]}, {key(r): r[6] for r in b["records"]}
+ua, ub = {tuple(r) for r in a["unfinished"]}, {tuple(r) for r in b["unfinished"]}
+print(f"units {a['units']} / {b['units']}; cpu_s {a['cpu_s']:.0f} / {b['cpu_s']:.0f}; budget {a['budget']}")
+print(f"failure lists identical: {a['failures'] == b['failures']} ({len(a['failures'])} / {len(b['failures'])})")
+print(f"finished roots: {len(a['records'])} / {len(b['records'])}; distinct keys {len(fa)} / {len(fb)}")
+print(f"finished-root key sets identical: {set(fa) == set(fb)}")
+diff = [k for k in fa if k in fb and fa[k] != fb[k]]
+print(f"finished roots COMPARED: {len(set(fa) & set(fb))}; differing results: {len(diff)}")
+for k in diff[:10]:
+    print("   DIFF", k, fa[k], "->", fb[k])
+print(f"unfinished roots (NOT compared): {len(ua)} / {len(ub)}; sets identical: {ua == ub}")
+for record in sorted(ua)[:40]:
+    print("   UNFINISHED", record)
+print("unfinished by unit:", dict(Counter(r[0] for r in ua)))

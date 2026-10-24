@@ -1,0 +1,48 @@
+"""Lane-local: record (nodeid, normalised failure signature) pairs.
+
+Read from the report object, never from pytest's human output. This project's
+short summary emits no exception repr after the id, so a `sed` over `FAILED`
+lines silently yields EMPTY signatures and the pair chain degrades into the
+bare-id check it was meant to replace, while still looking like it worked.
+
+``reprcrash`` is read with a sentinel getattr because the report is a pytest
+object this repository does not own (ADR-032 Tier-3 parsing). Lane-local and
+gitignored: never committed.
+"""
+
+import os
+import re
+
+_VOLATILE = (
+    (re.compile(r"/[A-Za-z0-9_./-]*(?:tmp|pytest|worktrees)[A-Za-z0-9_./-]*"), "<path>"),
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "<uuid>"),
+    (re.compile(r"[0-9a-f]{32,}"), "<hex>"),
+    (re.compile(r"[0-9]{6,}"), "<num>"),
+)
+
+PAIRS: list[tuple[str, str]] = []
+
+
+def _normalise(text: str) -> str:
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    first = lines[0] if lines else "<no message>"
+    for pattern, replacement in _VOLATILE:
+        first = pattern.sub(replacement, first)
+    return first[:160]
+
+
+def pytest_runtest_logreport(report) -> None:
+    if not report.failed or report.when not in {"setup", "call"}:
+        return
+    crash = getattr(report.longrepr, "reprcrash", None)
+    message = crash.message if crash is not None else str(report.longrepr)
+    PAIRS.append((report.nodeid, _normalise(message)))
+
+
+def pytest_unconfigure(config) -> None:
+    out = os.environ.get("U45_PAIRS_OUT")
+    if not out:
+        return
+    with open(out, "w", encoding="utf-8") as handle:
+        for nodeid, signature in sorted(PAIRS):
+            handle.write(f"{nodeid}|{signature}\n")
