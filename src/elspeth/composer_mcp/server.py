@@ -901,15 +901,16 @@ def create_server(
                     if name != "generate_yaml":
                         state_ref[0] = new_state
                     # Capture baseline when session is created or loaded.
-                    # load_session can return success=False on SessionNotFoundError;
-                    # in that case, leave session_id_ref unchanged so the scratch
-                    # session scope ("unsaved") is used.
-                    if name in ("new_session", "load_session"):
+                    # load_session can return success=False on SessionNotFoundError
+                    # with the unchanged working state; in that case leave the
+                    # diff baseline and session_id_ref unchanged (TC-019), so the
+                    # next diff still measures against the intended baseline and
+                    # the current session scope is kept.
+                    if name in ("new_session", "load_session") and result_dict["success"]:
                         baseline_ref[0] = new_state
-                        if result_dict["success"]:
-                            resolved_sid: str = result_dict["data"]["session_id"]
-                            session_id_ref[0] = resolved_sid
-                            audit_recorder.resolve_session(resolved_sid)
+                        resolved_sid: str = result_dict["data"]["session_id"]
+                        session_id_ref[0] = resolved_sid
+                        audit_recorder.resolve_session(resolved_sid)
                     # Keep the deleted session id active until the finally
                     # block records this destructive success. Then clear it
                     # so subsequent calls use the unsaved scope unless a

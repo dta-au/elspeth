@@ -175,8 +175,12 @@ async def test_invalid_arguments_preserve_state_checkout_file_and_diff(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_tc019_missing_load_preserves_graph_and_checkout_but_resets_diff(tmp_path: Path) -> None:
-    """KNOWN_NONCONFORMANCE: an ordinary false result silently rebases diff."""
+async def test_tc019_missing_load_preserves_graph_checkout_and_diff_baseline(tmp_path: Path) -> None:
+    """TC-019 (#327): an unsuccessful load keeps the intended diff baseline.
+
+    Formerly KNOWN_NONCONFORMANCE: the false result rebased the baseline onto
+    the unsaved working state, so the next diff reported zero changes.
+    """
     server = local_server(tmp_path)
     first = await payload(server, "new_session", {"name": "Baseline"})
     active_id = first["data"]["session_id"]
@@ -192,8 +196,8 @@ async def test_tc019_missing_load_preserves_graph_and_checkout_but_resets_diff(t
     assert event["tool_name"] == "load_session" and event["status"] == "success"
     assert json.loads(event["result_canonical"]) == refused and event["version_after"] == edited["state"]["version"]
     after = await payload(server, "diff_pipeline", {})
-    assert after["data"]["total_changes"] == 0
-    assert after["data"]["from_version"] == edited["state"]["version"]
+    assert after == before
+    assert after["data"]["from_version"] == 1 and after["data"]["total_changes"] > 0
     assert (await payload(server, "get_pipeline_state", {}))["state"] == edited["state"]
     assert (await payload(server, "save_session", {"session_id": active_id}))["success"] is True
 
