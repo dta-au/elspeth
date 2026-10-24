@@ -2303,9 +2303,12 @@ class SessionServiceImpl:
                         from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
                         from elspeth.web.composer.withheld_replies import withheld_reply_envelope
 
+                        revoked_call_ids = {row.tool_call_id for row in graph_rows} if refused is not None else set()
                         audit_offset = 1 + 2 * len(redacted_tool_rows) + len(private_tool_failures)
                         for index, invocation in enumerate(continuation_members.invocations):
-                            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+                            content, envelope = redacted_tool_invocation_content_and_envelope(
+                                invocation, authority_revoked=invocation.tool_call_id in revoked_call_ids
+                            )
                             self._insert_chat_message(
                                 conn,
                                 session_id=session_id,

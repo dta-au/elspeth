@@ -24,6 +24,7 @@ from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_TRUST_KEY,
     PromptGuardContentPart,
 )
+from elspeth.web.composer.audit_storage import INVOCATION_AUTHORITY_REVOKED_KEY
 from elspeth.web.composer.continuation_message_shelf import (
     MessageShelfSnapshot,
     RetainedObservedMessage,
@@ -303,6 +304,7 @@ class AdvisorTranscriptHistory:
                     # a provider-request snapshot. Validate both canonical
                     # bindings before projecting their already-redacted bytes.
                     invocations = []
+                    result_revoked = False
                     for envelope in invocation_envelopes:
                         if envelope.get("_kind") != "audit" or not isinstance(envelope.get("invocation"), Mapping):
                             raise AuditIntegrityError("Historical tool row has unsupported audit provenance")
@@ -322,26 +324,33 @@ class AdvisorTranscriptHistory:
                                 continue
                             if type(canonical) is not str or hashlib.sha256(canonical.encode()).hexdigest() != digest:
                                 raise AuditIntegrityError("Historical tool audit canonical binding is invalid")
-                        invocations.append(
-                            {
-                                key: invocation[key]
-                                for key in (
-                                    "tool_call_id",
-                                    "tool_name",
-                                    "status",
-                                    "arguments_canonical",
-                                    "result_canonical",
-                                    "arguments_hash",
-                                    "result_hash",
-                                    "error_class",
-                                    "error_message",
-                                )
-                                if key in invocation
-                            }
-                        )
+                        # P4 refused this result after the tool ran: the
+                        # invocation stays visible, its result never does.
+                        projected = {
+                            key: invocation[key]
+                            for key in (
+                                "tool_call_id",
+                                "tool_name",
+                                "status",
+                                "arguments_canonical",
+                                "result_canonical",
+                                "arguments_hash",
+                                "result_hash",
+                                "error_class",
+                                "error_message",
+                            )
+                            if key in invocation
+                        }
+                        if envelope.get(INVOCATION_AUTHORITY_REVOKED_KEY) is True:
+                            projected["result_canonical"] = projected["result_hash"] = None
+                            result_revoked = True
+                        invocations.append(projected)
                     event["legacy_invocations"] = invocations
                     event["invocation_provenance"] = "public_canonical_audit_without_parent_protocol"
-                    if len(invocations) == 1 and row.content == invocations[0].get("result_canonical"):
+                    if result_revoked:
+                        del event["content"]
+                        event["result_withheld"] = "authority_revoked"
+                    elif len(invocations) == 1 and row.content == invocations[0].get("result_canonical"):
                         del event["content"]
                         event["content_ref"] = "legacy_invocations[0].result_canonical"
                 if visible_envelopes:

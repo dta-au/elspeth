@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, cast, final
+from typing import Any, Final, cast, final
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -48,6 +48,8 @@ from elspeth.web.composer.tool_error_payloads import (
 )
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.composer_operations import ComposerOperationError
+
+INVOCATION_AUTHORITY_REVOKED_KEY: Final = "authority_revoked"
 
 
 @final
@@ -411,8 +413,15 @@ def _redacted_result_canonical(
 
 def redacted_tool_invocation_content_and_envelope(
     invocation: ComposerToolInvocation,
+    *,
+    authority_revoked: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Return the one manifest-redacted projection allowed in chat storage.
+
+    ``authority_revoked`` marks an invocation whose result P4 refused after it
+    ran. Its record stays exact (it did run and returned this result); the
+    marker says the result was not the turn's outcome, so history must never
+    replay it as one.
 
     ``ComposerToolInvocation`` retains exact in-memory arguments/results for
     convergence and audit binding. Chat storage is a separate persistence
@@ -496,6 +505,8 @@ def redacted_tool_invocation_content_and_envelope(
                 error_message=invocation.error_message,
             )
         )
+    if authority_revoked:
+        return content, {"_kind": "audit", "invocation": invocation_payload, INVOCATION_AUTHORITY_REVOKED_KEY: True}
     return content, {"_kind": "audit", "invocation": invocation_payload}
 
 
@@ -541,4 +552,8 @@ def private_tool_invocation_draft(
     )
 
 
-__all__ = ["private_tool_invocation_draft", "redacted_tool_invocation_content_and_envelope"]
+__all__ = [
+    "INVOCATION_AUTHORITY_REVOKED_KEY",
+    "private_tool_invocation_draft",
+    "redacted_tool_invocation_content_and_envelope",
+]

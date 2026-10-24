@@ -5,6 +5,8 @@ P4 input seam and use real session admission, lease, SQL, complete snapshots,
 actual nominal results/audit, and the production writer/receipt reader.
 """
 
+import asyncio
+import json
 from dataclasses import replace
 from datetime import timedelta
 
@@ -27,7 +29,9 @@ from elspeth.web.composer._compose_loop_carriers import (
     _PersistOutcome,
     _ToolOutcome,
 )
+from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory, AdvisorTranscriptOwner
 from elspeth.web.composer.audit import begin_dispatch, finish_plugin_crash, finish_success
+from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.continuation import ToolBatchFrame
 from elspeth.web.composer.continuation_batch_data import encode_coupled_batch_chunk
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_response, encode_continuation_snapshot
@@ -400,6 +404,30 @@ def test_actual_revoked_publication_preserves_refusal_not_candidate_graph(operat
         assert audit.checkpoint is None and result.historical_effect is None
         assert result.outcome.authority_revocation_json is not None
         assert rows(engine)[1] == ()
+        # The invocation ran and stays recorded, but a later Advisor must never
+        # see its result as the turn's outcome once P4 refused the graph.
+        [invocation] = prepared_p4_members(prepared).invocations
+        success, _envelope = redacted_tool_invocation_content_and_envelope(invocation)
+        assert json.loads(success)["success"] is True
+        user = asyncio.run(
+            service.add_message(
+                sid, "user", "Continue", writer_principal="route_user_message", session_operation_context=running.session_operation_context
+            )
+        )
+        history = AdvisorTranscriptHistory.from_records(
+            session_id=str(sid),
+            actor_user_id="alice",
+            current_request_id=str(user.id),
+            request="Continue",
+            records=asyncio.run(service.get_messages(sid, limit=None)),
+        )
+        events = json.loads(AdvisorTranscriptOwner(request="Continue", history=history).snapshot().provider_json)["events"]
+        [replayed] = [event for event in events if "legacy_invocations" in event]
+        assert [item["tool_call_id"] for item in replayed["legacy_invocations"]] == [invocation.tool_call_id]
+        assert replayed["legacy_invocations"][0]["result_canonical"] is None
+        assert not any(event.get("content") == success for event in events)
+        assert "content" not in replayed and "content_ref" not in replayed
+        assert replayed["result_withheld"] == "authority_revoked"
     finally:
         repository.release(running.session_operation_context)
 
