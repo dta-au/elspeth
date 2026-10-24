@@ -40,7 +40,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, resolve_config
+from elspeth.core.config import ElspethSettings, PayloadStoreSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
 from elspeth.core.template_materialization import TemplateFileError
@@ -2885,7 +2885,10 @@ def purge(
         None,
         "--retention-days",
         "-r",
-        help="Delete payloads older than this many days (default: from config or 90).",
+        help=(
+            "Delete payloads older than this many days "
+            f"(default: from config, else the payload_store default of {PayloadStoreSettings().retention_days})."
+        ),
     ),
     dry_run: bool = typer.Option(
         False,
@@ -2929,7 +2932,8 @@ def purge(
     # Try to load settings from settings.yaml if database not provided
     db_url: str | None = None
     payload_path: Path | None = None
-    effective_retention_days: int = 90  # Fallback default
+    # Fallback: the settings model's own default, never a copy of its literal.
+    effective_retention_days: int = PayloadStoreSettings().retention_days
     config: ElspethSettings | None = None
 
     # Try loading settings.yaml first (for payload_store config)
@@ -3012,7 +3016,7 @@ def purge(
         else:
             payload_path = Path("payloads")
 
-    # Determine retention days: CLI override > config > default (90)
+    # Determine retention days: CLI override > config > PayloadStoreSettings default
     if retention_days is not None:
         if retention_days <= 0:
             typer.echo("Error: --retention-days must be greater than 0.", err=True)
@@ -3021,7 +3025,7 @@ def purge(
     elif config:
         effective_retention_days = config.payload_store.retention_days
         typer.echo(f"Using retention_days from config: {effective_retention_days}")
-    # else: use the fallback default of 90
+    # else: keep the PayloadStoreSettings default set above
 
     # Resolve SQLCipher passphrase
     from elspeth.cli_helpers import resolve_audit_passphrase
