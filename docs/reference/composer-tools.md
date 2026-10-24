@@ -491,6 +491,47 @@ discovery turns to read every page.
 
 ---
 
+### `inspect_source`
+
+Return bounded structural facts about a blob-backed source, never its rows.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `blob_id` | string | **Yes** | Blob ID to inspect |
+| `encoding` | string or null | No | Explicit CSV/TSV text encoding for this inspection only (1–128 characters); null or omitted uses default inspection. It does not configure the pipeline source. |
+
+**Returns:** `source_kind`, `observed_headers`, `runtime_headers`,
+`field_name_mapping`, `sample_row_count`, `inferred_types`, `url_candidates`,
+`warnings`, `byte_range_inspected` and `redacted_identity` (`filename`,
+`mime_type`, `byte_size`, `blob_id`, `content_hash_prefix`). Facts come from at
+most an 8 KiB prefix and at most 100 records, so they are bounded observations,
+not a complete inspection of the file.
+
+**Read path:** the same fenced reader as every blob content read. The read
+takes the session's blob-custody lock, reconciles crash leftovers (a pre-update
+sidecar or one matching delete tombstone) to the committed version, streams
+the whole file in bounded chunks to verify its stored SHA-256, and re-reads the
+blob's metadata after the stream. The facts use the metadata observed with the
+bytes, and `byte_size` is the number of bytes actually streamed. The draft
+graph and its version are unchanged.
+
+**Failures:**
+
+| Condition | Outcome |
+|-----------|---------|
+| Malformed `blob_id`, unknown blob, or a blob in another session | Repairable failure (`not found` for both of the latter; no other session's metadata is disclosed) |
+| Blob not `ready` | Repairable failure naming its status |
+| Backing file already missing, or removed during the read | Repairable failure; the storage path is not disclosed |
+| Explicit encoding on a non-CSV/TSV source, or an unsupported codec | Repairable failure |
+| Credential material in the facts | Repairable failure (`credential_material_rejected`) |
+| Content hash mismatch | Integrity error; no facts |
+| Released or stale session operation | `SessionOperationFenceLost`; storage is not read and no facts are published |
+| Metadata changed during the read, or a ready blob with no stored hash | Integrity error |
+| Missing storage root or session operation context, or a context for another session | Integrity error (a dispatcher fault, not an argument error) |
+| Any other I/O error | Propagates |
+
+---
+
 ### `set_source_from_blob`
 
 Wire a blob as the pipeline source. Resolves the blob's storage path internally and infers the source plugin from its MIME type.
