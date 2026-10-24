@@ -394,3 +394,76 @@ def test_cli_rejects_bad_identity_without_emitting_the_input(tmp_path: Path, cap
     captured = capsys.readouterr()
     assert not captured.out and secret not in captured.err
     assert "acceptance_internal" in captured.err
+
+
+STATE = "66666666-6666-4666-8666-666666666666"
+_STATE_BASE = {
+    "id": STATE,
+    "session_id": SESSION,
+    "version": 3,
+    "is_valid": True,
+    "created_at": "2026-10-24T00:00:00+00:00",
+}
+
+
+@pytest.mark.parametrize(
+    ("state_body", "expected_state_id"),
+    [
+        pytest.param(None, None, id="no-state"),
+        pytest.param(_STATE_BASE, STATE, id="0.8.9-shape-without-content-hash"),
+        pytest.param({**_STATE_BASE, "composition_content_hash": "a" * 64}, STATE, id="0.8.10-shape-with-content-hash"),
+    ],
+)
+def test_progress_reads_state_head_from_servers_either_side_of_the_checksum(
+    tmp_path: Path, state_body: dict[str, object] | None, expected_state_id: str | None
+) -> None:
+    """U-03 T3: the ACA probe reads only the state id it needs from ``/state``.
+
+    0.8.10 added a required ``composition_content_hash`` to the state
+    response. A probe validating the whole response model refuses a 0.8.9
+    server's body (missing key) and any newer server's extra keys, so the
+    probe parses the identity alone and threads it into the visibility write.
+    """
+    written: list[object] = []
+    uploaded = b""
+    message_content = ""
+    operation_id = ""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal uploaded, message_content, operation_id
+        label = request.url.host.split(".")[0]
+        path = request.url.path
+        headers = {"X-Elspeth-Instance": label}
+        if path == "/api/system/status":
+            return httpx.Response(200, json={}, headers=headers)
+        if path.endswith("/state"):
+            return httpx.Response(200, content=json.dumps(state_body).encode(), headers=headers)
+        if "/operations/" in path:
+            return httpx.Response(200, json=operation_document(operation_id, SESSION), headers=headers)
+        if path.endswith("/blobs"):
+            uploaded = request.content.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
+            return httpx.Response(201, json={"id": BLOB}, headers=headers)
+        if path.endswith("/execute"):
+            return httpx.Response(202, json={"run_id": RUN}, headers=headers)
+        if path.endswith("/outputs"):
+            return httpx.Response(
+                200, json={"run_id": RUN, "artifacts": [{"artifact_id": "artifact-one", "content_hash": "a" * 64}]}, headers=headers
+            )
+        if path.endswith("/messages"):
+            if request.method == "POST":
+                body = json.loads(request.content)
+                written.append(body["state_id"])
+                message_content = body["content"]
+                operation_id = body["operation_id"]
+                return httpx.Response(202, json={"operation_id": operation_id}, headers=headers)
+            assistant = {"id": "55555555-5555-4555-8555-555555555555", "role": "assistant", "content": "Acknowledged"}
+            return httpx.Response(200, json=[{"id": "new-user", "role": "user", "content": message_content}, assistant], headers=headers)
+        if path.endswith("/content"):
+            return httpx.Response(200, content=uploaded, headers=headers)
+        assert path == f"/api/runs/{RUN}"
+        return httpx.Response(200, json={"run_id": RUN, "status": "completed"}, headers=headers)
+
+    transport = httpx.MockTransport(respond)
+    with _client("a", transport) as owner, _client("b", transport) as reader:
+        collect_progress(owner=owner, reader=reader, session_id=SESSION, capture=Capture(tmp_path / "evidence"), polling=Polling())
+    assert written == [expected_state_id]

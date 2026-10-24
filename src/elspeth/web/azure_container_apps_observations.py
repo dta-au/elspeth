@@ -53,7 +53,7 @@ from elspeth.web.azure_container_apps_acceptance import (
     _SqlAlchemyReader,
     acceptance_error_envelope,
 )
-from elspeth.web.sessions.schemas import ComposerOperationStatusResponse, CompositionStateResponse
+from elspeth.web.sessions.schemas import ComposerOperationStatusResponse
 
 _FENCE_SQL = (
     "SELECT owner_instance_id, lease_expires_at FROM session_operation_fences "
@@ -309,7 +309,10 @@ def _fresh_message_visibility(
     head = _exchange(owner, "a", f"/api/sessions/{session_id}/state", capture, clock=polling.clock)
     if head.response.instance_id != owner_id or head.response.status != 200:
         raise AcceptanceCheckError("probe_message_head")
-    state_id = None if head.body is None else CompositionStateResponse.model_validate(head.body).id
+    # Read only the identity this write needs. The full response model is
+    # versioned with the server (0.8.10 added a required content hash), and a
+    # probe of a deployed replica must not refuse a body from either side.
+    state_id = None if head.body is None else _Identity.model_validate(head.body).id
     operation_id = str(uuid4())
     content = f"Keep the current pipeline unchanged. Briefly acknowledge this visibility check: {uuid4()}."
     written = _exchange(
