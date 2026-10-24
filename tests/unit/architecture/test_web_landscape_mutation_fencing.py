@@ -2489,6 +2489,57 @@ def _resolved_non_landscape_receiver_owner(node: ast.AST, method: str, resolver:
     return qualified
 
 
+def _non_landscape_scalar_attribute_read(node: ast.Attribute, resolver: _Resolver, proof: _AuthorityProof) -> bool:
+    """Identify the owned timing scalar without admitting any reserve callable.
+
+    This is separate from method-name collisions: only numeric expression use
+    is admitted. Callable extraction/aliasing, an untyped or rebound receiver,
+    a replacement field, and an absent/non-scalar declaration remain unproven.
+    Source-owned annotated fields can identify a nested receiver such as
+    ``self.segment``; they never confer mutation authority.
+    """
+    if node.attr != "reserve" or not isinstance(node.ctx, ast.Load):
+        return False
+    parent = next(_ancestors(node), None)
+    if not isinstance(parent, ast.BinOp) or not isinstance(parent.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+        return False
+
+    def receiver_owner(expression: ast.expr) -> str | None:
+        if isinstance(expression, ast.Name):
+            parameter = resolver.parameter(expression.id, node)
+            owner = _owner_function(parameter) if parameter is not None else None
+            if owner is None or _parameter_rebound(owner, expression.id):
+                return None
+            located = _method_receiver(node)
+            if located is not None and expression.id == located[1]:
+                module = resolver.unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+                return module + "." + _symbol(located[0])
+            return resolver.qualified_name(parameter.annotation, use=node) if parameter.annotation is not None else None
+        if isinstance(expression, ast.Attribute):
+            owner = proof.class_for(receiver_owner(expression.value))
+            field = proof.member(*owner, expression.attr) if owner is not None else None
+            if field is not None and isinstance(field[0], ast.AnnAssign) and field[0].value is None:
+                return field[2].qualified_name(field[0].annotation, use=field[0])
+        return None
+
+    qualified = receiver_owner(node.value)
+    if (qualified, node.attr) != ("elspeth.web.composer.continuation_policy.ContinuationSegmentPolicy", "reserve"):
+        return False
+    owner = proof.class_for(qualified)
+    field = proof.member(*owner, node.attr) if owner is not None else None
+    if field is None or not isinstance(field[0], ast.AnnAssign) or field[0].value is not None:
+        return False
+    annotation = field[2].resolve_value(field[0].annotation, use=field[0])
+    if (
+        isinstance(annotation, ast.Subscript)
+        and field[2].qualified_name(annotation.value, use=annotation) == "typing.Annotated"
+        and isinstance(annotation.slice, ast.Tuple)
+        and annotation.slice.elts
+    ):
+        annotation = annotation.slice.elts[0]
+    return field[2].qualified_name(annotation, use=annotation) in {"float", "builtins.float"}
+
+
 def _trusted_repository_construction(
     node: ast.AST,
     method: str,
@@ -11462,6 +11513,7 @@ class _reserve_ReserveProof:
 
     def dispatch_failures(self):
         failures = []
+        scalar_proof = _AuthorityProof(self.units)
         writer_recipes = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
         protected_bindings = set()
         protected_owned_classes = {}
@@ -13111,7 +13163,9 @@ class _reserve_ReserveProof:
                             and (data_owner.name == "_check_deadlines_before_commit")
                         ):
                             continue
-                        if not _looks_like_landscape_receiver(n.value, n.attr, resolver=r, use=n):
+                        if not _looks_like_landscape_receiver(n.value, n.attr, resolver=r, use=n) and not (
+                            _non_landscape_scalar_attribute_read(n, r, scalar_proof)
+                        ):
                             failures.append("reserve callable escape " + unit.path)
                     elif r.qualified_name(n.value, use=n) == _reserve_COORD:
                         failures.append("unbound coordinator dispatch " + unit.path)
@@ -13760,6 +13814,8 @@ def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
                 ):
                     violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} mapping mutation attribute dispatch")
             if not isinstance(node, ast.Attribute) or node.attr not in _ALL_MUTATION_METHOD_NAMES:
+                continue
+            if _non_landscape_scalar_attribute_read(node, resolver, proof):
                 continue
             proven_receiver = _looks_like_landscape_receiver(node.value, node.attr, resolver=resolver, use=node)
             parent = next(_ancestors(node), None)
@@ -22341,6 +22397,90 @@ def test_non_landscape_receiver_owners_are_pinned_to_the_tree() -> None:
         assert declaration is not None, f"{qualified}: no top-level class {owner} in {path}"
         declared = {member.name for member in declaration.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))}
         assert method in declared, f"{qualified}: {owner} does not declare {method}; the collision claim is stale"
+
+
+@pytest.mark.parametrize(
+    ("annotation", "statement", "admitted"),
+    [
+        ("Bounds", "return selected.reserve + 1.0", True),
+        ("Bounds", "return 1.0 + selected.reserve", True),
+        ("Bounds", "return selected.reserve", False),
+        ("Bounds", "value = selected.reserve\n    return value", False),
+        ("Bounds", "callback = selected.reserve\n    return callback(source)", False),
+        ("Bounds", "return selected.reserve()", False),
+        ("RequiredWorkCoordinator", "return selected.reserve", False),
+        ("RequiredWorkCoordinator", "return selected.reserve + 1.0", False),
+        ("RequiredWorkCoordinator", "return selected.reserve(source)", False),
+        ("RequiredWorkCoordinator", "alias = selected.reserve\n    return alias(source)", False),
+        ("", "return selected.reserve + 1.0", False),
+        ("Bounds", "selected = foreign\n    return selected.reserve + 1.0", False),
+        ("Bounds", "selected.reserve = foreign\n    return selected.reserve + 1.0", False),
+        ("Bounds", "del selected.reserve", False),
+    ],
+)
+def test_reserve_scalar_collision_requires_a_source_owned_scalar_read(annotation: str, statement: str, admitted: bool) -> None:
+    policy = next(unit for unit in _production_units() if unit.path == "src/elspeth/web/composer/continuation_policy.py")
+    parameter = "selected" + (":" + annotation if annotation else "")
+    unit = _parse_source(
+        "src/elspeth/web/reserve_scalar_control.py",
+        "from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy as Bounds\n"
+        "from elspeth.web.required_work import RequiredWorkCoordinator\n"
+        f"def probe({parameter}):\n    {statement}\n",
+    )
+    proof = _AuthorityProof((policy, unit))
+    reads = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+    assert reads
+    assert all(_non_landscape_scalar_attribute_read(node, _resolver_for_unit(unit), proof) is admitted for node in reads)
+    violations = _mutation_callable_escapes((policy, unit))
+    assert bool(violations) is not admitted, violations
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ("reserve: Callable[[], float]", "def reserve(self):\n        return foreign", "reserve = foreign"),
+)
+def test_reserve_scalar_collision_refuses_changed_live_field_declaration(replacement: str) -> None:
+    policy = next(unit for unit in _production_units() if unit.path == "src/elspeth/web/composer/continuation_policy.py")
+    assert policy.source.count("reserve: PositiveSeconds") == 1
+    changed = _parse_source(policy.path, policy.source.replace("reserve: PositiveSeconds", replacement))
+    unit = _parse_source(
+        "src/elspeth/web/reserve_scalar_control.py",
+        "from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy\n"
+        "def probe(policy: ContinuationSegmentPolicy):\n    return policy.reserve + 1.0\n",
+    )
+    [read] = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and node.attr == "reserve"]
+    assert not _non_landscape_scalar_attribute_read(read, _resolver_for_unit(unit), _AuthorityProof((changed, unit)))
+    assert any("unknown mutation receiver .reserve" in row for row in _mutation_callable_escapes((changed, unit)))
+
+
+def test_reserve_scalar_collision_preserves_unknown_dynamic_and_unbound_dispatch() -> None:
+    unit = _parse_source(
+        "src/elspeth/web/reserve_scalar_control.py",
+        "from elspeth.web.required_work import RequiredWorkCoordinator\n"
+        "def probe(factory):\n"
+        "    alias = factory.sink_effects.reserve\n"
+        "    alias(source)\n"
+        "    getattr(factory.sink_effects, 'reserve')(source)\n"
+        "    RequiredWorkCoordinator.reserve(factory, source)\n",
+    )
+    violations = _mutation_callable_escapes((unit,))
+    assert any("callable escape .reserve" in row for row in violations), violations
+    assert any("dynamic getattr('reserve')" in row for row in violations), violations
+    assert any("unknown mutation receiver .reserve" in row for row in violations), violations
+
+
+def test_reserve_scalar_collision_retains_the_complete_actual_call_inventory() -> None:
+    units = _production_units()
+    failures, calls = _reserve_current_call_inventory(units)
+    assert not failures, failures
+    assert calls
+    inserted_call = _parse_source(
+        "src/elspeth/web/reserve_scalar_control.py",
+        "from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy\n"
+        "def probe(policy: ContinuationSegmentPolicy):\n    return policy.reserve()\n",
+    )
+    failures, _calls = _reserve_current_call_inventory((*units, inserted_call))
+    assert failures == ["selected Web reserve call inventory changed"]
 
 
 def test_unknown_receiver_admission_is_keyed_on_the_resolved_non_landscape_owner() -> None:
