@@ -270,6 +270,6 @@ target health, public probes, and affected AWS integration checks.
 `docs/runbooks/aws-ecs-deployment.md` describes a much larger disposable
 two-scenario acceptance program. It is not the everyday redeploy workflow. Its
 Terraform package is tracked at `deploy/aws-ecs/terraform/`. Its hard-coded
-schema epochs matched the live constants on 2026-10-24 (session 78 /
-Landscape 50). Re-check them after any epoch change, and reconcile the owning
+schema epochs matched the live constants on 2026-10-24. Re-check them after
+any epoch change, and reconcile the owning
 Terraform state before executing it.

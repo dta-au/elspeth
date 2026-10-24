@@ -360,8 +360,8 @@ Discover-don't-remember still applies, but these are the traps that cost time.
   acceptance, not the everyday redeploy command sheet.
 
 Before using the exhaustive runbook for a new environment, reconcile every
-hard-coded schema epoch with the live constants. On 2026-10-24 it named only
-session epoch 78 / Landscape epoch 50, matching the constants; its Scenario A
+hard-coded schema epoch with the live constants. On 2026-10-24 its epoch
+literals matched the live constants; its Scenario A
 compatibility record is pinned to them by
 `tests/unit/docs/test_release_version_surfaces.py`. Re-check after any epoch
 change. The Terraform package it describes is tracked at `deploy/aws-ecs/terraform/`.
