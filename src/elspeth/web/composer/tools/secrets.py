@@ -221,9 +221,11 @@ _LIST_SECRET_REFS_DECLARATION = ToolDeclaration(
     kind=ToolKind.SECRET_DISCOVERY,
     response_contract=_SECRET_INVENTORY_RESPONSE,
     description=(
-        "List available secret references (API keys, credentials). Each entry carries the reference `name`, its "
-        "`scope`, `source_kind`, `available` (true when it resolves for you), and `reason` (why not, when it "
-        "does not); never values."
+        "List secret-reference metadata (API keys, credentials), never values. Each entry carries `name`, "
+        "`scope`, `source_kind`, `available`, and `reason` (null when available). User-store availability "
+        "means a stored row exists and fingerprinting is configured; listing does not check decryption. "
+        "Server availability checks the allowlisted environment value and fingerprinting configuration. "
+        "Call validate_secret_ref for the selected reference's current resolvability before relying on it."
     ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
 )
