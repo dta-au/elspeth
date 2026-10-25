@@ -5870,6 +5870,9 @@ _reserve_FULL_SOURCE_PATHS = (
     "src/elspeth/web/sessions/proposal_decoder.py",
     "src/elspeth/web/sessions/composer_operation_errors.py",
     "src/elspeth/web/sessions/composer_operations.py",
+    # The advisor-history blob read that ComposerServiceImpl.compose once ran
+    # inline (pinned by its reviewed method shape) now runs here.
+    "src/elspeth/web/composer/transcript_blob_reader.py",
 )
 
 _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operations.py"

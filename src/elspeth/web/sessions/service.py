@@ -6381,11 +6381,9 @@ class SessionServiceImpl:
                         requested_state_id=requested_state_id,
                         composition_state_id=composition_state_id,
                     )
-                    if isinstance(preparation, ContinuationIngressCheckpoint):
-                        if type(preparation) is not ContinuationIngressCheckpoint:
-                            raise AuditIntegrityError("initializer ingress replaced its actual SQL preparation")
+                    if type(preparation) is ContinuationIngressCheckpoint:
                         return preparation
-                    if not isinstance(preparation, ContinuationIngressPrepared) or type(preparation) is not ContinuationIngressPrepared:
+                    if type(preparation) is not ContinuationIngressPrepared:
                         raise AuditIntegrityError("initializer ingress replaced its actual SQL preparation")
                     prepared_ingress = preparation
                 if requested_sid is not None:

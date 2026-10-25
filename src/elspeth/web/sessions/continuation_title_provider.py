@@ -179,14 +179,7 @@ def require_title_creator(running: ComposerOperationRunning) -> tuple[int, int]:
         raise AuditIntegrityError("TITLE creator requires its actual current running owner")
     sequence = running.claim.segment_sequence
     generation = running.claim.ownership_generation
-    if (
-        not isinstance(sequence, int)
-        or type(sequence) is not int
-        or sequence < 1
-        or not isinstance(generation, int)
-        or type(generation) is not int
-        or generation < 1
-    ):
+    if type(sequence) is not int or sequence < 1 or type(generation) is not int or generation < 1:
         raise AuditIntegrityError("TITLE creator lost its actual positive sequence/generation")
     return sequence, generation
 
@@ -360,7 +353,7 @@ def prepare_title_provider_on_connection(
     from elspeth.web.sessions.service import SessionServiceImpl
 
     service = composer._require_sessions_service()
-    if not isinstance(service, SessionServiceImpl) or type(service) is not SessionServiceImpl:
+    if type(service) is not SessionServiceImpl:
         raise AuditIntegrityError("pre-title bootstrap requires the actual sessions SQL owner")
     stored = read_pretitle_bootstrap_on_connection(conn, service, running, selected=selected)
     root = decode_continuation_snapshot(selected.payload_json)
@@ -371,7 +364,7 @@ def prepare_title_provider_on_connection(
     snapshot = decode_continuation_bootstrap(stored.bootstrap)
     values = bootstrap_values(snapshot)
     original_request = values.request
-    if not isinstance(original_request, SendMessageRequest) or type(original_request) is not SendMessageRequest:
+    if type(original_request) is not SendMessageRequest:
         raise AuditIntegrityError("pre-title bootstrap has no implemented Recompose source owner")
     if not snapshot.auto_title_eligible or not original_request.content.strip():
         raise AuditIntegrityError("TITLE preparation has no original eligible nonempty request")

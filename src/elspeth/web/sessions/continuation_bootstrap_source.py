@@ -263,7 +263,7 @@ def read_pretitle_bootstrap_on_connection(
     require_current_pretitle_values_on_connection(conn, service, running, selected=selected, chunk=chunk)
     _require_no_provider_work(conn, session_id=sid, operation_id=operation)
     generation = running.claim.ownership_generation
-    if not isinstance(generation, int) or type(generation) is not int or generation < 1:
+    if type(generation) is not int or generation < 1:
         raise AuditIntegrityError("pre-title recovery lost its actual generation")
     require_pretitle_publication_lineage_on_connection(conn, running, selected=selected, chunk=chunk, generation=generation)
     return StoredPretitleBootstrap(selected, chunk)
@@ -296,7 +296,7 @@ def _current_pretitle_value_inputs(
     if values.retained_context is None or values.retained_context.availability != "available":
         raise AuditIntegrityError("pre-title bootstrap lost its actual bounded history read")
     request = values.request
-    if not isinstance(request, SendMessageRequest) or type(request) is not SendMessageRequest:
+    if type(request) is not SendMessageRequest:
         raise AuditIntegrityError("pre-title bootstrap has no implemented Recompose source owner")
     return snapshot, request
 

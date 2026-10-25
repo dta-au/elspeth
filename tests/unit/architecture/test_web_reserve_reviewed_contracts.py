@@ -21,6 +21,7 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/sessions/service.py"
 PROTOCOL = "src/elspeth/web/sessions/protocol.py"
 COMPOSER_PROTOCOL = "src/elspeth/web/composer/protocol.py"
+TRANSCRIPT_READER = "src/elspeth/web/composer/transcript_blob_reader.py"
 
 
 def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
@@ -283,6 +284,7 @@ def test_reviewed_writer_recipes_match_live_source_and_refuse_recovery_drift(fau
         "src/elspeth/web/sessions/composer_operation_errors.py",
         "src/elspeth/web/sessions/composer_operations.py",
         "src/elspeth/web/sessions/composer_async_worker.py",
+        TRANSCRIPT_READER,
     ),
 )
 def test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes(path: str) -> None:
@@ -302,6 +304,24 @@ def test_reviewed_source_guard_matches_live_source_and_refuses_changed_bytes(pat
     function.body.insert(0, ast.parse("unreviewed_effect()\n").body[0])
     sources[path] = ast.unparse(tree)
     assert check(sources) == [expected]
+
+
+def test_transcript_blob_reader_call_is_under_the_reviewed_source_guard() -> None:
+    """compose's inline history-blob read moved into CurrentTranscriptBlobReader.__call__.
+
+    The compose method shape no longer contains that body, so the reviewed
+    full-source guard must: an unreviewed edit inside __call__ refuses.
+    """
+    paths = (*fencing._reserve_FULL_SOURCE_PATHS, *fencing._reserve_CANCEL_CONSUMERS)
+    sources = {item: (ROOT / item).read_text() for item in paths}
+    assert TRANSCRIPT_READER in fencing._reserve_FULL_SOURCE_PATHS
+    assert fencing._reserve_full_source_failures(sources) == []
+    tree = ast.parse(sources[TRANSCRIPT_READER])
+    reader = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CurrentTranscriptBlobReader")
+    call = next(node for node in reader.body if isinstance(node, ast.FunctionDef) and node.name == "__call__")
+    call.body.insert(0, ast.parse("unreviewed_effect()\n").body[0])
+    sources[TRANSCRIPT_READER] = ast.unparse(tree)
+    assert fencing._reserve_full_source_failures(sources) == ["full source changed " + TRANSCRIPT_READER]
 
 
 @pytest.mark.parametrize(

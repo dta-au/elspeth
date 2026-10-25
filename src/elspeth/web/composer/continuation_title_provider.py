@@ -103,11 +103,11 @@ async def run_prepared_title_provider(
         with locked_session_transaction(prepared.authority._engine, str(prepared.running.claim.session_id)) as conn:
             _current(conn, prepared.running, prepared.selected)
             frame = decode_continuation_snapshot(prepared.selected.payload_json).frames[0]
-            if not isinstance(frame, InitializeFrame) or type(frame) is not InitializeFrame or frame.bootstrap is None:
+            if type(frame) is not InitializeFrame or frame.bootstrap is None:
                 raise AuditIntegrityError("TITLE producer lost its original bootstrap")
             values = bootstrap_values(decode_continuation_bootstrap(_chunk(conn, prepared.running, frame.bootstrap)))
             original_request = values.request
-            if not isinstance(original_request, SendMessageRequest) or type(original_request) is not SendMessageRequest:
+            if type(original_request) is not SendMessageRequest:
                 raise AuditIntegrityError("TITLE producer lost its actual original SendMessage request")
             return original_request.content
 
