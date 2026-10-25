@@ -1990,6 +1990,14 @@ runs_table = Table(
         "status IN ('pending', 'running', 'completed', 'completed_with_failures', 'failed', 'empty', 'cancelled')",
         name="ck_runs_status",
     ),
+    CheckConstraint(
+        "status NOT IN ('completed', 'completed_with_failures', 'empty') OR landscape_run_id IS NOT NULL",
+        name="ck_runs_completed_landscape_run_id",
+    ),
+    CheckConstraint(
+        "status != 'failed' OR error IS NOT NULL",
+        name="ck_runs_failed_error",
+    ),
     *_non_blank_text_constraints("id", name="ck_runs_id_nonblank"),
     *_non_blank_text_constraints("session_id", name="ck_runs_session_id_nonblank"),
     CheckConstraint(

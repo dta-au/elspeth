@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
+from collections import Counter
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_mock_engine, insert, inspect, select, text
+from sqlalchemy import create_mock_engine, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import QueuePool
 
@@ -22,6 +24,7 @@ from elspeth.web.sessions.models import (
     run_execution_inputs_table,
     run_start_permits_table,
     runs_table,
+    schema_identity_table,
     session_operation_fences_table,
     sessions_table,
     user_secrets_table,
@@ -39,6 +42,16 @@ from elspeth.web.sessions.schema import (
 )
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.run_terminal_checks import (
+    INVALID_RUN_FIELDS,
+    RUN_CHECK_NAMES,
+    RUN_CHECK_SQL,
+    VALID_RUN_FIELDS,
+    assert_run_fields,
+    run_rows,
+    run_values,
+    seed_run_owner,
+)
 
 
 @pytest.mark.parametrize(
@@ -533,8 +546,7 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
     for table_name, check_names in expected_checks.items():
         assert {check["name"] for check in inspector.get_check_constraints(table_name)} == check_names, table_name
 
-    run_checks = {check["name"] for check in inspector.get_check_constraints("runs")}
-    assert {"ck_runs_id_nonblank", "ck_runs_session_id_nonblank", "ck_runs_ownership_all_or_none"} <= run_checks
+    _assert_run_check_names(inspector.get_check_constraints("runs"))
     user_secret_checks = {check["name"] for check in inspector.get_check_constraints("user_secrets")}
     assert "ck_user_secrets_id_nonblank" in user_secret_checks
 
@@ -802,6 +814,7 @@ def test_runs_id_rejects_ascii_whitespace(engine) -> None:
                     session_id=session_id,
                     state_id=state_id,
                     status="completed",
+                    landscape_run_id="landscape",
                     started_at=now,
                 )
             )
@@ -815,6 +828,7 @@ def test_runs_session_id_rejects_ascii_whitespace(engine) -> None:
                 session_id="\n",
                 state_id=str(uuid.uuid4()),
                 status="completed",
+                landscape_run_id="landscape",
                 started_at=datetime.now(UTC),
             )
         )
@@ -1368,3 +1382,166 @@ def test_session_schema_authority_stamps_asserts_and_validates_on_an_engine_or_a
 
     with pytest.raises(IntegrityError):
         SessionSchemaAuthority(other).stamp_sentinels()
+
+
+def _assert_run_check_names(checks) -> None:
+    assert Counter(check["name"] for check in checks) == Counter(RUN_CHECK_NAMES), checks
+
+
+def test_runs_check_name_oracle_rejects_missing_extra_and_duplicate_constraints(engine) -> None:
+    checks = inspect(engine).get_check_constraints("runs")
+    _assert_run_check_names(checks)
+    for name in RUN_CHECK_SQL:
+        with pytest.raises(AssertionError):
+            _assert_run_check_names([check for check in checks if check["name"] != name])
+    with pytest.raises(AssertionError):
+        _assert_run_check_names([*checks, checks[0]])
+    with pytest.raises(AssertionError):
+        _assert_run_check_names([*checks, {"name": "ck_runs_unapproved", "sqltext": "1 = 1"}])
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+@pytest.mark.parametrize(("status", "error", "landscape_run_id"), VALID_RUN_FIELDS)
+def test_runs_conditional_checks_allow_only_the_approved_null_boundary(
+    engine, operation: str, status: str, error: str | None, landscape_run_id: str | None
+) -> None:
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status=status, error=error, landscape_run_id=landscape_run_id)
+        if operation == "insert":
+            conn.execute(insert(runs_table).values(**values))
+        else:
+            initial = run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)
+            initial["id"] = values["id"]
+            conn.execute(insert(runs_table).values(**initial))
+            conn.execute(
+                update(runs_table)
+                .where(runs_table.c.id == values["id"])
+                .values(
+                    status=status,
+                    error=error,
+                    landscape_run_id=landscape_run_id,
+                    finished_at=values["finished_at"],
+                    saga_state=values["saga_state"],
+                )
+            )
+        assert_run_fields(conn, run_id=values["id"], status=status, error=error, landscape_run_id=landscape_run_id)
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+@pytest.mark.parametrize(("status", "error", "landscape_run_id", "constraint"), INVALID_RUN_FIELDS)
+def test_runs_conditional_checks_refuse_invalid_database_rows_without_other_changes(
+    engine, operation: str, status: str, error: str | None, landscape_run_id: str | None, constraint: str
+) -> None:
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status=status, error=error, landscape_run_id=landscape_run_id)
+        if operation == "update":
+            initial = run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)
+            initial["id"] = values["id"]
+            conn.execute(insert(runs_table).values(**initial))
+        before = run_rows(conn)
+        with pytest.raises(IntegrityError) as raised, conn.begin_nested():
+            if operation == "insert":
+                conn.execute(insert(runs_table).values(**values))
+            else:
+                conn.execute(
+                    update(runs_table)
+                    .where(runs_table.c.id == values["id"])
+                    .values(
+                        status=status,
+                        error=error,
+                        landscape_run_id=landscape_run_id,
+                        finished_at=values["finished_at"],
+                        saga_state=values["saga_state"],
+                    )
+                )
+        assert isinstance(raised.value.orig, sqlite3.IntegrityError)
+        assert str(raised.value.orig) == f"CHECK constraint failed: {constraint}"
+        assert run_rows(conn) == before
+
+
+def test_runs_terminal_update_retains_an_already_stored_landscape_identity(engine) -> None:
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status="pending", error=None, landscape_run_id="already-recorded")
+        conn.execute(insert(runs_table).values(**values))
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.id == values["id"])
+            .values(status="completed", finished_at=datetime.now(UTC), saga_state="terminal")
+        )
+        assert_run_fields(conn, run_id=values["id"], status="completed", error=None, landscape_run_id="already-recorded")
+
+
+def _change_sqlite_run_check(engine, *, constraint: str, change: str) -> None:
+    """Alter only the named clause in a private test store's actual rendered DDL."""
+    with engine.begin() as conn:
+        original = conn.execute(text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'runs'")).scalar_one()
+        expression = RUN_CHECK_SQL[constraint]
+        assert original.count(f"CONSTRAINT {constraint} CHECK ({expression})") == 1
+        if change == "missing":
+            lines = original.splitlines(keepends=True)
+            selected = [line for line in lines if line.lstrip().startswith(f"CONSTRAINT {constraint} CHECK (")]
+            assert len(selected) == 1 and selected[0].rstrip().endswith(",")
+            changed = original.replace(selected[0], "", 1)
+        else:
+            assert change == "weakened" and original.count(expression) == 1
+            changed = original.replace(expression, "1 = 1", 1)
+        assert changed != original
+        conn.exec_driver_sql("PRAGMA writable_schema = ON")
+        try:
+            conn.execute(text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'runs'"), {"sql": changed})
+        finally:
+            conn.exec_driver_sql("PRAGMA writable_schema = OFF")
+
+
+@pytest.mark.parametrize("constraint", tuple(RUN_CHECK_SQL))
+@pytest.mark.parametrize("change", ("missing", "weakened"))
+def test_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identity_or_rows(tmp_path, constraint: str, change: str) -> None:
+    path = tmp_path / "terminal-run-checks.db"
+    url = f"sqlite:///{path}"
+    engine = create_session_engine(url)
+    initialize_session_schema(engine)
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        conn.execute(insert(runs_table).values(**run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)))
+    _change_sqlite_run_check(engine, constraint=constraint, change=change)
+    engine.dispose()
+    # The canonical read-only factory inspects the stale private fixture.
+    # Ordinary writable admission must refuse without changing that store.
+    stale = create_session_engine(url, read_only=True)
+    try:
+        with stale.connect() as conn:
+            schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
+            identities_before = conn.execute(select(schema_identity_table)).all()
+            rows_before = run_rows(conn)
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 79
+            assert identities_before[0].schema_epoch == 79
+        with pytest.raises(SessionSchemaError) as raised:
+            unexpectedly_admitted = create_session_engine(url)
+            unexpectedly_admitted.dispose()
+        assert constraint in str(raised.value)
+        expected = "CHECK constraint SQL mismatch" if change == "weakened" else "CHECK constraint mismatch"
+        assert expected in str(raised.value)
+        with stale.connect() as conn:
+            assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
+            assert conn.execute(select(schema_identity_table)).all() == identities_before
+            assert run_rows(conn) == rows_before
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 79
+    finally:
+        stale.dispose()
+
+
+def test_runs_check_reflection_is_current_idempotent_and_identity_bound(engine) -> None:
+    _assert_run_check_names(inspect(engine).get_check_constraints("runs"))
+    _validate_current_schema(engine)
+    with engine.connect() as conn:
+        before = conn.execute(select(schema_identity_table)).all()
+        rows_before = run_rows(conn)
+        assert before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+    initialize_session_schema(engine)
+    with engine.connect() as conn:
+        assert conn.execute(select(schema_identity_table)).all() == before
+        assert run_rows(conn) == rows_before
+    _assert_run_check_names(inspect(engine).get_check_constraints("runs"))

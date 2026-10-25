@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import pytest
 import structlog
+from psycopg.errors import CheckViolation
 from sqlalchemy import Connection, Engine, create_engine, event, func, insert, inspect, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.engine import make_url
@@ -26,6 +28,16 @@ from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.helpers.postgres_target import postgres_test_target
+from tests.helpers.run_terminal_checks import (
+    INVALID_RUN_FIELDS,
+    RUN_CHECK_NAMES,
+    RUN_CHECK_SQL,
+    VALID_RUN_FIELDS,
+    assert_run_fields,
+    run_rows,
+    run_values,
+    seed_run_owner,
+)
 from tests.unit.architecture import test_digest_column_shape_checks as digest_gate
 from tests.unit.core.test_schema_shape import _static_check_issues
 
@@ -58,6 +70,7 @@ from elspeth.web.sessions.models import (
     blob_inline_resolutions_table,
     blob_replacement_cleanups_table,
     chat_messages_table,
+    runs_table,
     session_operation_receipts_table,
     skill_markdown_history_table,
     user_preferences_table,
@@ -1906,3 +1919,134 @@ def test_catalog_proof_resists_shadowed_text_concatenation(postgres_engine: Engi
             builtin_connection=connection,
         )
     assert any(issue.subject.endswith("CHECK constraint SQL mismatch") for issue in issues)
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+@pytest.mark.parametrize(("status", "error", "landscape_run_id"), VALID_RUN_FIELDS)
+def test_postgres_runs_conditional_checks_allow_only_the_approved_null_boundary(
+    postgres_engine: Engine, operation: str, status: str, error: str | None, landscape_run_id: str | None
+) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status=status, error=error, landscape_run_id=landscape_run_id)
+        if operation == "insert":
+            conn.execute(insert(runs_table).values(**values))
+        else:
+            initial = run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)
+            initial["id"] = values["id"]
+            conn.execute(insert(runs_table).values(**initial))
+            conn.execute(
+                update(runs_table)
+                .where(runs_table.c.id == values["id"])
+                .values(
+                    status=status,
+                    error=error,
+                    landscape_run_id=landscape_run_id,
+                    finished_at=values["finished_at"],
+                    saga_state=values["saga_state"],
+                )
+            )
+        assert_run_fields(conn, run_id=values["id"], status=status, error=error, landscape_run_id=landscape_run_id)
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+@pytest.mark.parametrize(("status", "error", "landscape_run_id", "constraint"), INVALID_RUN_FIELDS)
+def test_postgres_runs_conditional_checks_refuse_invalid_database_rows_without_other_changes(
+    postgres_engine: Engine, operation: str, status: str, error: str | None, landscape_run_id: str | None, constraint: str
+) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status=status, error=error, landscape_run_id=landscape_run_id)
+        if operation == "update":
+            initial = run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)
+            initial["id"] = values["id"]
+            conn.execute(insert(runs_table).values(**initial))
+        before = run_rows(conn)
+        with pytest.raises(IntegrityError) as raised, conn.begin_nested():
+            if operation == "insert":
+                conn.execute(insert(runs_table).values(**values))
+            else:
+                conn.execute(
+                    update(runs_table)
+                    .where(runs_table.c.id == values["id"])
+                    .values(
+                        status=status,
+                        error=error,
+                        landscape_run_id=landscape_run_id,
+                        finished_at=values["finished_at"],
+                        saga_state=values["saga_state"],
+                    )
+                )
+        assert isinstance(raised.value.orig, CheckViolation)
+        assert raised.value.orig.sqlstate == "23514"
+        assert raised.value.orig.diag.constraint_name == constraint
+        assert raised.value.orig.diag.table_name == "runs"
+        assert run_rows(conn) == before
+
+
+def test_postgres_runs_terminal_update_retains_an_already_stored_landscape_identity(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status="pending", error=None, landscape_run_id="already-recorded")
+        conn.execute(insert(runs_table).values(**values))
+        conn.execute(
+            update(runs_table)
+            .where(runs_table.c.id == values["id"])
+            .values(status="completed", finished_at=datetime.now(UTC), saga_state="terminal")
+        )
+        assert_run_fields(conn, run_id=values["id"], status="completed", error=None, landscape_run_id="already-recorded")
+
+
+@pytest.mark.parametrize("constraint", tuple(RUN_CHECK_SQL))
+@pytest.mark.parametrize("change", ("missing", "weakened"))
+def test_postgres_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identity_or_rows(
+    postgres_engine: Engine, constraint: str, change: str
+) -> None:
+    init_session_schema(postgres_engine)
+    with postgres_engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        conn.execute(insert(runs_table).values(**run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)))
+        # Both names are closed test constants, not caller-provided identifiers.
+        assert constraint in RUN_CHECK_SQL
+        conn.exec_driver_sql(f"ALTER TABLE runs DROP CONSTRAINT {constraint}")
+        if change == "weakened":
+            conn.exec_driver_sql(f"ALTER TABLE runs ADD CONSTRAINT {constraint} CHECK (1 = 1)")
+        else:
+            assert change == "missing"
+    with postgres_engine.connect() as conn:
+        checks_before = Counter((check["name"], check["sqltext"]) for check in inspect(conn).get_check_constraints("runs"))
+        identity_before = conn.execute(select(session_schema_identity_table)).all()
+        rows_before = run_rows(conn)
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+    assert probe_session_schema(postgres_engine) is SchemaState.STALE
+    with pytest.raises(SessionSchemaError) as raised:
+        init_session_schema(postgres_engine)
+    assert constraint in str(raised.value)
+    expected = "CHECK constraint SQL mismatch" if change == "weakened" else "CHECK constraint mismatch"
+    assert expected in str(raised.value)
+    with postgres_engine.connect() as conn:
+        assert Counter((check["name"], check["sqltext"]) for check in inspect(conn).get_check_constraints("runs")) == checks_before
+        assert conn.execute(select(session_schema_identity_table)).all() == identity_before
+        assert run_rows(conn) == rows_before
+
+
+def test_postgres_runs_check_reflection_is_current_idempotent_and_identity_bound(postgres_engine: Engine) -> None:
+    init_session_schema(postgres_engine)
+    checks = inspect(postgres_engine).get_check_constraints("runs")
+    assert Counter(check["name"] for check in checks) == Counter(RUN_CHECK_NAMES), checks
+    # CURRENT uses the real declared/reflected expression canonicalizer,
+    # including PostgreSQL casts and its multi-value ALL/ARRAY spelling.
+    assert probe_session_schema(postgres_engine) is SchemaState.CURRENT
+    with postgres_engine.connect() as conn:
+        identity_before = conn.execute(select(session_schema_identity_table)).all()
+        rows_before = run_rows(conn)
+        assert identity_before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+    init_session_schema(postgres_engine)
+    with postgres_engine.connect() as conn:
+        assert conn.execute(select(session_schema_identity_table)).all() == identity_before
+        assert run_rows(conn) == rows_before
+    reflected = inspect(postgres_engine).get_check_constraints("runs")
+    assert Counter(check["name"] for check in reflected) == Counter(RUN_CHECK_NAMES), reflected
