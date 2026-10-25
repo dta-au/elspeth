@@ -17,7 +17,8 @@
 #
 # Checks, and the incident each one encodes:
 #   in-progress    unfinished operations FAIL; commit may finish a resolved merge
-#                  only when no other operation or unmerged index entries remain
+#                  or single cherry-pick only with no other operation/unmerged
+#                  entries; every sequencer state remains refused
 #   protected      on main or release/*: commit WARNs; rebase/push FAIL unless
 #                  --allow-protected (never move release/main unless asked)
 #   staged-paths   .claude/lanes|handovers|red-team|worktrees, *.log, *.done, *.pid,
@@ -101,7 +102,7 @@ echo
 
 # --- in-progress operations --------------------------------------------------
 inprog=""
-for f in CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
+for f in REVERT_HEAD BISECT_LOG; do [ -e "$GIT_DIR/$f" ] && inprog="$inprog $f"; done
 for d in rebase-merge rebase-apply sequencer; do [ -d "$GIT_DIR/$d" ] && inprog="$inprog $d"; done
 if ! unmerged="$(git ls-files --unmerged)"; then
     report FAIL in-progress "could not inspect unmerged index entries" "git ls-files --unmerged"
@@ -109,6 +110,16 @@ elif [ -n "$unmerged" ]; then
     report FAIL in-progress "unmerged index entries remain" "git ls-files --unmerged"
 elif [ -n "$inprog" ]; then
     report FAIL in-progress "unfinished:$inprog" "ls $GIT_DIR"
+elif [ -e "$GIT_DIR/CHERRY_PICK_HEAD" ]; then
+    # A sequencer was already refused above. Only completion of this one pick
+    # is eligible; another pending operation or starting new work still fails.
+    if [ -e "$GIT_DIR/MERGE_HEAD" ]; then
+        report FAIL in-progress "unfinished: CHERRY_PICK_HEAD with MERGE_HEAD; overlapping operations" "ls $GIT_DIR"
+    elif [ "$INTENT" = commit ]; then
+        report PASS in-progress "resolved single cherry-pick ready for completion by commit; no other operation or sequencer" "ls $GIT_DIR; git ls-files --unmerged"
+    else
+        report FAIL in-progress "unfinished: CHERRY_PICK_HEAD; complete the single cherry-pick before $INTENT" "ls $GIT_DIR"
+    fi
 elif [ -e "$GIT_DIR/MERGE_HEAD" ]; then
     if [ "$INTENT" = commit ]; then
         report PASS in-progress "resolved merge ready for completion by commit; no other operation" "ls $GIT_DIR; git ls-files --unmerged"

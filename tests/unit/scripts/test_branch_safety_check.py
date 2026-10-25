@@ -1,4 +1,4 @@
-"""Exercise merge completion preflight against actual Git index states."""
+"""Exercise operation completion preflight against actual Git index states."""
 
 from __future__ import annotations
 
@@ -66,6 +66,106 @@ def _resolve(repo: Path) -> None:
 
 def _preflight(repo: Path, intent: str, *options: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["bash", str(SCRIPT), "--intent", intent, *options], cwd=repo, capture_output=True, text=True, check=False)
+
+
+@pytest.fixture
+def picking_repo(merging_repo: Path) -> Path:
+    _git(merging_repo, "merge", "--abort")
+    _git(merging_repo, "-c", "rerere.enabled=false", "cherry-pick", "other", expected=1)
+    assert (merging_repo / ".git/CHERRY_PICK_HEAD").is_file()
+    assert not (merging_repo / ".git/sequencer").exists()
+    assert _git(merging_repo, "ls-files", "--unmerged")
+    return merging_repo
+
+
+@pytest.fixture
+def sequenced_pick_repo(merging_repo: Path) -> Path:
+    _git(merging_repo, "merge", "--abort")
+    first = _git(merging_repo, "rev-parse", "other").strip()
+    _git(merging_repo, "checkout", "--quiet", "other")
+    (merging_repo / "later.txt").write_text("later\n", encoding="utf-8")
+    _git(merging_repo, "add", "later.txt")
+    _git(merging_repo, "commit", "--quiet", "-m", "later")
+    later = _git(merging_repo, "rev-parse", "HEAD").strip()
+    _git(merging_repo, "checkout", "--quiet", "task")
+    _git(merging_repo, "-c", "rerere.enabled=false", "cherry-pick", first, later, expected=1)
+    assert (merging_repo / ".git/CHERRY_PICK_HEAD").is_file()
+    assert (merging_repo / ".git/sequencer/todo").is_file()
+    assert _git(merging_repo, "ls-files", "--unmerged")
+    return merging_repo
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+def test_unresolved_single_cherry_pick_refused(picking_repo: Path, intent: str) -> None:
+    result = _preflight(picking_repo, intent)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    assert "unmerged index entries remain" in result.stdout
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+def test_resolved_single_cherry_pick_only_allows_completion(picking_repo: Path, intent: str) -> None:
+    _resolve(picking_repo)
+    before = _git(picking_repo, "rev-parse", "HEAD", "CHERRY_PICK_HEAD")
+    staged = _git(picking_repo, "diff", "--cached", "--name-status")
+
+    result = _preflight(picking_repo, intent)
+
+    assert result.returncode == (0 if intent == "commit" else 1), result.stdout + result.stderr
+    if intent == "commit":
+        assert "[PASS] in-progress" in result.stdout
+        assert "resolved single cherry-pick ready for completion" in result.stdout
+    else:
+        assert "[FAIL] in-progress" in result.stdout
+        assert "CHERRY_PICK_HEAD" in result.stdout
+    assert _git(picking_repo, "rev-parse", "HEAD", "CHERRY_PICK_HEAD") == before
+    assert _git(picking_repo, "diff", "--cached", "--name-status") == staged
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+@pytest.mark.parametrize("resolved", [False, True])
+def test_cherry_pick_sequencer_remains_refused(sequenced_pick_repo: Path, intent: str, resolved: bool) -> None:
+    if resolved:
+        _resolve(sequenced_pick_repo)
+    result = _preflight(sequenced_pick_repo, intent)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    if resolved:
+        assert "unfinished:" in result.stdout
+        assert "sequencer" in result.stdout
+    else:
+        assert "unmerged index entries remain" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ["MERGE_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply", "sequencer"])
+def test_resolved_single_cherry_pick_does_not_hide_another_operation(picking_repo: Path, operation: str) -> None:
+    _resolve(picking_repo)
+    marker = picking_repo / ".git" / operation
+    if operation in {"rebase-merge", "rebase-apply", "sequencer"}:
+        marker.mkdir()
+    else:
+        marker.write_text(_git(picking_repo, "rev-parse", "HEAD"), encoding="utf-8")
+    result = _preflight(picking_repo, "commit")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    assert "unfinished:" in result.stdout
+
+
+def test_resolved_single_cherry_pick_keeps_blob_and_secret_checks(picking_repo: Path) -> None:
+    _resolve(picking_repo)
+    (picking_repo / "conflict.txt").write_text(str(Path.home()) + "\n", encoding="utf-8")
+    _git(picking_repo, "add", "conflict.txt")
+    scanner = picking_repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
+    scanner.parent.mkdir(parents=True)
+    scanner.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    scanner.chmod(0o755)
+
+    result = _preflight(picking_repo, "commit")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[PASS] in-progress" in result.stdout
+    assert "[FAIL] home-paths" in result.stdout
+    assert "[FAIL] secrets" in result.stdout
 
 
 @pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
