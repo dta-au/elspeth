@@ -15,6 +15,7 @@ Nine walkers once solved worktree-blindness with four different idioms
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -80,6 +81,21 @@ WALKERS: dict[str, Callable[[Path], Iterable[Path]]] = {
 
 @pytest.fixture
 def synthetic_tree(tmp_path: Path) -> Path:
+    # A project-local basetemp may itself be ignored by the parent checkout.
+    # Own the fixture's Git context so tree_gate tests these files rather than
+    # inheriting that unrelated ignore decision. Keep dependency exclusions in
+    # the walkers: an empty local excludes file must not hide any LEAK_FILE.
+    subprocess.run(["git", "init", "--quiet", "--template="], cwd=tmp_path, check=True, capture_output=True, text=True)
+    excludes = tmp_path / ".git" / "info" / "exclude"
+    excludes.parent.mkdir(parents=True, exist_ok=True)
+    excludes.write_text("", encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "--local", "core.excludesFile", str(excludes)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     for relative in (REAL_FILE, *LEAK_FILES):
         target = tmp_path / relative
         target.parent.mkdir(parents=True)
