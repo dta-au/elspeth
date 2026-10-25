@@ -877,8 +877,10 @@ class SchedulerDrainCoordinator:
         """Keep an unstarted claim undecided for ordinary immediate resume.
 
         FAILED without a token outcome retains the payload and is requeued by
-        resume. No plugin ran, so this writes neither a node failure nor a
-        terminal outcome or group loss. The normal owner/member fence remains
+        resume when the run is resumable. If the run is not resumable (for
+        example an interrupted non-snapshot source), run finalization records
+        the token ABANDONED instead. No plugin ran, so this writes neither a
+        node failure nor a terminal outcome or group loss. The normal owner/member fence remains
         authoritative if cancellation races with eviction or lease loss.
         """
         if self._pending_group_losses:

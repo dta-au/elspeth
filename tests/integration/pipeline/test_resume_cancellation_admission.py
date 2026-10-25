@@ -314,3 +314,62 @@ gates:
     assert sorted(prior_calls) == [1, 2, 3]
     assert len(later_calls) == 2
     assert result.rows_failed == 1
+
+
+def test_shutdown_during_retry_backoff_does_not_requeue_a_started_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A claim whose first transform attempt already ran is not "unstarted".
+
+    The first executable transform may preserve its claim as unstarted only
+    while no attempt has been invoked. Here attempt 1 runs (its effect is out),
+    requests shutdown and fails retryably, so RetryManager stops in backoff.
+    That claim keeps the established interruption disposition and must not be
+    requeued for a later resume to run the plugin a second time.
+    """
+    body = _BODY.replace("EXPANSION", "").replace("on_success: rows", "on_success: values").replace("DESTINATION", "out")
+    env = build_pipeline(tmp_path, body, [{"id": i, "item": i} for i in (1, 2, 3)])
+    lift = env["graph"].get_transform_name_id_map()["lift"]
+    original_traversal = RowProcessor._process_single_token
+
+    def fault(self: RowProcessor, *args: Any, **kwargs: Any):
+        if kwargs["current_node_id"] == lift:
+            raise _BacklogFault("fault before the first executable node")
+        return original_traversal(self, *args, **kwargs)
+
+    with monkeypatch.context() as fault_patch:
+        fault_patch.setattr(RowProcessor, "_process_single_token", fault)
+        with pytest.raises(_BacklogFault):
+            run_pipeline(env)
+    with env["db"].connection() as conn:
+        run_id = conn.execute(select(runs_table.c.run_id)).scalar_one()
+    recovery = RecoveryManager(env["db"], env["checkpoints"])
+    event = threading.Event()
+    calls: list[int] = []
+    original_process = ValueTransform.process
+
+    def started_then_backoff(self: ValueTransform, row: PipelineRow, ctx: PluginContext) -> TransformResult:
+        calls.append(row["id"])
+        if len(calls) == 1:
+            event.set()
+            raise ConnectionError("attempt 1 ran; shutdown requested before its retry")
+        return original_process(self, row, ctx)
+
+    with monkeypatch.context() as record_patch:
+        record_patch.setattr(ValueTransform, "process", started_then_backoff)
+        with pytest.raises(GracefulShutdownError):
+            env["orchestrator"].resume(
+                resume_point=recovery.get_resume_point(run_id, env["graph"]),
+                config=env["config"],
+                graph=env["graph"],
+                settings=env["settings"],
+                payload_store=env["payload_store"],
+                shutdown_event=event,
+            )
+        assert len(calls) == 1
+        started_id = calls[0]
+        result = resume_pipeline(env)
+
+    # The started row ran exactly once: resume did not replay its plugin.
+    assert calls.count(started_id) == 1
+    assert sorted(calls) == [1, 2, 3]
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
+    assert result.rows_failed == 1
