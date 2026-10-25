@@ -3406,6 +3406,17 @@ def test_advisor_mapping_envelopes_are_enumerated_even_though_they_are_not_censu
         for kw in node.keywords
         if kw.arg == "response" and isinstance(kw.value, ast.Name)
     }
+    # The continuation rewrite spreads per-call work over helpers. A named response appended
+    # anywhere else in the module would ship a Mapping this walk never reads.
+    outside = sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and _call_name(node) == "_append_tool_outcome"
+        and any(kw.arg == "response" and isinstance(kw.value, ast.Name) for kw in node.keywords)
+        and not (fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno))
+    )
+    assert not outside, f"named advisor responses appended outside {BATCH_PAYLOAD_OWNER}: lines {outside}"
     mappings: dict[str, tuple[str, ...]] = {}
     for name in sorted(responses):
         for rhs, _index, _annotation in _assignments_to(fn, name):
