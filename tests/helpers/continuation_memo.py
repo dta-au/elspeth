@@ -55,7 +55,7 @@ from sqlalchemy.util import _collections as sql_collections
 from sqlalchemy.util import immutabledict
 from sqlalchemy.util import langhelpers as sql_langhelpers
 
-from elspeth.contracts import credential_material, hashing, json_parser
+from elspeth.contracts import bounded_serialization, credential_material, hashing, json_parser
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.plugins.transforms.llm.transform import LLMTransform
@@ -149,15 +149,25 @@ _CONTEXT_POLICY = provider_context._POLICY
 _CONTEXT_VALIDATOR_NAME: Final = "provider_context_message_text"
 _UNCACHED_VALIDATORS: Final = (_METADATA_VALIDATOR_NAME, _CONTEXT_VALIDATOR_NAME)
 UncachedValidator = Literal["diagnostic_correlation_metadata", "provider_context_message_text"]
-_BYTE_CHANNELS: Final = ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_extent", "key_preparation")
-_FIND = credential_material._find.__code__
-_REFERENCE = credential_material._allowed_reference_finding.__code__
+_BYTE_CHANNELS: Final = ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_size", "scanner_extent", "key_preparation")
+_FIND_FUNCTION = credential_material._find
+_REFERENCE_FUNCTION = credential_material._allowed_reference_finding
+_FIND = _FIND_FUNCTION.__code__
+_REFERENCE = _REFERENCE_FUNCTION.__code__
+_UTF8_SIZE = bounded_serialization.utf8_size
+_UTF8_CODE = _UTF8_SIZE.__code__
+_UTF8_CHUNK_CHARACTERS = bounded_serialization._CHUNK_CHARACTERS
+_REFERENCE_MAX_BYTES = credential_material._SECRET_REFERENCE_NAME_MAX_BYTES
 _POLICY_NAMES = credential_guard._credential_policy_names.__code__
 _TOKEN = next(
     code for code in credential_guard._credential_input_tokens.__code__.co_consts if type(code) is CodeType and code.co_name == "token"
 )
 _LOAD_SNAPSHOT = stored_continuation.load_snapshot.__code__
 _LOAD_CHUNKS = continuation_selection.load_private_chunks.__code__
+_LOAD_CHUNKS_FUNCTION = continuation_selection.load_private_chunks
+_NESTED_CHUNKS_FUNCTION = continuation_selection.nested_private_chunks
+_NESTED_CHUNKS = _NESTED_CHUNKS_FUNCTION.__code__
+_PRIVATE_UTF8_LIMIT = continuation_selection.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 _ENCODE_CHUNK = continuation_codec.encode_private_chunk.__code__
 _RFC_DUMPS = hashing.rfc8785.dumps
 _SNAPSHOT_RFC_CODE = _RFC_DUMPS.__code__ if type(_RFC_DUMPS) is FunctionType else None
@@ -1741,9 +1751,106 @@ def _encoded_len_sites(code: CodeType, expected: int) -> frozenset[int]:
     return frozenset(sites)
 
 
-_EXTENT_SITES = {_FIND: _encoded_len_sites(_FIND, 2), _REFERENCE: _encoded_len_sites(_REFERENCE, 2)}
+def _keyword_call_names(code: CodeType, instructions: tuple[dis.Instruction, ...], index: int, names: tuple[str, ...]) -> bool:
+    """Recognize only the two native keyword grammars with their exact tuple."""
+    call, previous = instructions[index], instructions[index - 1]
+    if call.opname == "CALL_KW":
+        return previous.opname == "LOAD_CONST" and type(previous.argval) is tuple and previous.argval == names
+    if call.opname == "CALL" and previous.opname == "KW_NAMES" and type(previous.arg) is int:
+        return code.co_consts[previous.arg] == names
+    return False
+
+
+def _scanner_size_sites(code: CodeType, variables: tuple[str, str]) -> dict[int, str]:
+    """Bind the four original bounded-size keyword expressions, not other calls."""
+    instructions = tuple(dis.get_instructions(code))
+    loads = [(index, item) for index, item in enumerate(instructions) if item.opname == "LOAD_GLOBAL" and item.argval == "utf8_size"]
+    assert len(loads) == len(variables), "byte observer original bounded scanner sites changed"
+    sites = {}
+    for (index, load), variable in zip(loads, variables, strict=True):
+        call_index = next(
+            end
+            for end in range(index + 1, len(instructions))
+            if instructions[end].opname in ("CALL_KW", "CALL")
+            and (instructions[end].positions.lineno, instructions[end].positions.col_offset)
+            == (load.positions.lineno, load.positions.col_offset)
+        )
+        call = instructions[call_index]
+        assert call.arg == 3 and _keyword_call_names(code, instructions, call_index, ("errors", "limit")), (
+            "byte observer original bounded scanner signature changed"
+        )
+        assert instructions[index + 1].argval == variable, "byte observer original bounded scanner input changed"
+        sites[call.offset] = variable
+    return sites
+
+
+def _scanner_size_windows(code: CodeType, sites: dict[int, str]) -> dict[int, tuple[range, int]]:
+    """Include only an admitted CALL and its own following inline caches."""
+    instructions = tuple(dis.get_instructions(code, show_caches=True))
+    windows = {}
+    for index, call in enumerate(instructions):
+        if call.offset not in sites:
+            continue
+        assert call.opname in ("CALL", "CALL_KW") and call.positions.lineno is not None, "bounded scanner original call window changed"
+        end = index + 1
+        while end < len(instructions) and instructions[end].opname == "CACHE":
+            end += 1
+        assert end < len(instructions), "bounded scanner original call window has no successor"
+        windows[call.offset] = (range(call.offset, instructions[end].offset), call.positions.lineno)
+    assert windows.keys() == sites.keys(), "bounded scanner original call windows are incomplete"
+    return windows
+
+
+_SCANNER_SIZE_SITES = {_FIND: _scanner_size_sites(_FIND, ("value", "key")), _REFERENCE: _scanner_size_sites(_REFERENCE, ("ref", "value"))}
+_SCANNER_SIZE_WINDOWS = {code: _scanner_size_windows(code, sites) for code, sites in _SCANNER_SIZE_SITES.items()}
+_EXTENT_SITES = {_UTF8_CODE: _encoded_len_sites(_UTF8_CODE, 1)}
 _PREPARATION_SITES = {_POLICY_NAMES: _encoded_len_sites(_POLICY_NAMES, 1), _TOKEN: _encoded_len_sites(_TOKEN, 1)}
-_BYTE_CODES = (*_EXTENT_SITES, *_PREPARATION_SITES, _CHUNK_REQUEST)
+_BYTE_CODES = (*_SCANNER_SIZE_SITES, *_EXTENT_SITES, *_PREPARATION_SITES, _CHUNK_REQUEST)
+_UTF8_RETURN_BRANCHES = {
+    item.offset: {13: "length_excess", 15: "ascii", 21: "encoded_excess", 22: "encoded"}[item.positions.lineno - _UTF8_CODE.co_firstlineno]
+    for item in dis.get_instructions(_UTF8_CODE)
+    if item.opname in ("RETURN_VALUE", "RETURN_CONST") and item.positions.lineno is not None
+}
+assert set(_UTF8_RETURN_BRANCHES.values()) == {"length_excess", "ascii", "encoded_excess", "encoded"}, (
+    "byte observer original bounded scanner branches changed"
+)
+
+
+def _scanner_sources_current() -> bool:
+    return (
+        credential_material._find is _FIND_FUNCTION
+        and _FIND_FUNCTION.__code__ is _FIND
+        and credential_material._allowed_reference_finding is _REFERENCE_FUNCTION
+        and _REFERENCE_FUNCTION.__code__ is _REFERENCE
+        and credential_material.utf8_size is _UTF8_SIZE
+        and bounded_serialization.utf8_size is _UTF8_SIZE
+        and _UTF8_SIZE.__code__ is _UTF8_CODE
+        and _UTF8_SIZE.__globals__ is bounded_serialization.__dict__
+        and bounded_serialization.__dict__.get("str", str) is str
+        and bounded_serialization.__dict__.get("len", len) is len
+        and bounded_serialization.__dict__.get("range", range) is range
+        and bounded_serialization.__dict__.get("slice", slice) is slice
+        and bounded_serialization._CHUNK_CHARACTERS == _UTF8_CHUNK_CHARACTERS == 4096
+        and credential_material._SECRET_REFERENCE_NAME_MAX_BYTES == _REFERENCE_MAX_BYTES == 256
+    )
+
+
+def _private_size_sources_current() -> bool:
+    return (
+        _scanner_sources_current()
+        and continuation_selection.load_private_chunks is _LOAD_CHUNKS_FUNCTION
+        and _LOAD_CHUNKS_FUNCTION.__code__ is _LOAD_CHUNKS
+        and continuation_selection.nested_private_chunks is _NESTED_CHUNKS_FUNCTION
+        and _NESTED_CHUNKS_FUNCTION.__code__ is _NESTED_CHUNKS
+        and continuation_selection.utf8_size is _UTF8_SIZE
+        and continuation_selection.verify_private_chunk is _CHUNK_PUBLIC
+        and _CHUNK_PUBLIC.__code__ is _CHUNK_REQUEST
+        and continuation_selection.read_private_chunk is _READ_PRIVATE_CHUNK
+        and stored_continuation.read_private_chunk is _READ_PRIVATE_CHUNK
+        and _READ_PRIVATE_CHUNK.__code__ is _READ_PRIVATE_CHUNK_CODE
+        and stored_continuation.sha256 is _SHA256
+        and continuation_selection.CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES == _PRIVATE_UTF8_LIMIT
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2332,15 +2439,21 @@ def _direct_call_site(
     occurrence: int = 0,
     arguments: int,
     load_op: str = "LOAD_GLOBAL",
-    call_op: str = "CALL",
+    keywords: tuple[str, ...] | None = None,
 ) -> tuple[range, int]:
     """Bind one closed original callsite, including interpreter inline caches."""
     instructions = tuple(dis.get_instructions(code))
     loads = [index for index, instruction in enumerate(instructions) if instruction.opname == load_op and instruction.argval == symbol]
     assert len(loads) == loads_expected, "uncached validation original callsite changed"
-    index = next(index for index in range(loads[occurrence] + 1, len(instructions)) if instructions[index].opname == call_op)
+    index = next(
+        index
+        for index in range(loads[occurrence] + 1, len(instructions))
+        if instructions[index].opname in (("CALL",) if keywords is None else ("CALL_KW", "CALL"))
+    )
     call = instructions[index]
     assert call.arg == arguments and call.positions.lineno is not None, "uncached validation original signature changed"
+    if keywords is not None:
+        assert _keyword_call_names(code, instructions, index, keywords), "uncached validation original keyword signature changed"
     return range(call.offset, instructions[index + 1].offset), call.positions.lineno
 
 
@@ -2358,8 +2471,16 @@ _SNAPSHOT_PARSE_SITE = _direct_call_site(
 )
 _ENCODER_PARSE_SITE = _direct_call_site(_ENCODE_CHUNK, "parse_json_strict", arguments=1)
 _READ_CHUNK = stored_continuation.read_chunk
-_SNAPSHOT_DECODE_BYTES_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode", arguments=2, load_op="LOAD_ATTR", call_op="CALL_KW")
-_CHUNK_DECODE_BYTES_SITE = _direct_call_site(_LOAD_CHUNKS, "decode", arguments=2, load_op="LOAD_ATTR", call_op="CALL_KW")
+_READ_PRIVATE_CHUNK = stored_continuation.read_private_chunk
+_READ_PRIVATE_CHUNK_CODE = _READ_PRIVATE_CHUNK.__code__
+_CHUNK_READ_SITE = _direct_call_site(_LOAD_CHUNKS, "read_private_chunk", arguments=4, keywords=("session_id", "operation_id", "reference"))
+_NESTED_SIZE_SITE = _direct_call_site(_NESTED_CHUNKS, "utf8_size", arguments=2, keywords=("limit",))
+_NESTED_LOADER_SITE = _direct_call_site(_LOAD_CHUNKS, "nested_private_chunks", arguments=1)
+_CHUNK_SUCCESS_RETURNS = frozenset(
+    item.offset for item in dis.get_instructions(_CHUNK_REQUEST) if item.opname in ("RETURN_VALUE", "RETURN_CONST")
+)
+_SNAPSHOT_DECODE_BYTES_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode", arguments=2, load_op="LOAD_ATTR", keywords=("errors",))
+_CHUNK_DECODE_BYTES_SITE = _direct_call_site(_LOAD_CHUNKS, "decode", arguments=2, load_op="LOAD_ATTR", keywords=("errors",))
 _CHUNK_LENGTH_SITE = _direct_call_site(_CHUNK_REQUEST, "len", arguments=1)
 _CHUNK_DIGEST_SITE = _direct_call_site(_CHUNK_REQUEST, "sha256", arguments=1)
 _SNAPSHOT_WORK_SITE = _direct_call_site(_SNAPSHOT_VALUE_CODE, "producer", arguments=1, load_op="LOAD_FAST")
@@ -2569,6 +2690,43 @@ class UncachedValidationInvocation:
     expected_memo_id: int | None = None
     byte_calls: Counter[str] = field(default_factory=Counter)
     byte_counts: Counter[str] = field(default_factory=Counter)
+
+
+@dataclass(slots=True)
+class _ScannerSizeInspection:
+    """Numeric receipt only; the producer retains its text, chunks and frame."""
+
+    owner: MemoInspection | UncachedValidationInvocation
+    caller: int
+    text: int
+    characters: int
+    limit: int
+    thread: int
+    expected_memo_id: int | None
+    call_code: CodeType | None = None
+    call_offset: int | None = None
+    profile_offset: int | None = None
+    private_resource: bool = False
+    chunks: int = 0
+    encoded_bytes: int = 0
+    branch: Literal["length_excess", "ascii", "encoded_excess", "encoded"] | None = None
+    returned_size: int | None = None
+
+
+@dataclass(slots=True)
+class _PrivateSizeExpectation:
+    """One size obligation created only by an original successful loader verify."""
+
+    owner: MemoInspection
+    loader: int
+    reference: int
+    text: int
+    characters: int
+    byte_length: int
+    thread: int
+    expected_memo_id: int | None
+    calls: int = 0
+    inspection: _ScannerSizeInspection | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2799,17 +2957,25 @@ class RetentionMemoTrace:
         self._byte_diagnostic_lock = Lock()
         self._byte_pending_parses: dict[int, list[_PendingChunkParse]] = {}
         self._byte_detector_frames: dict[int, MemoInspection | UncachedValidationInvocation] = {}
+        self._byte_size_pending: dict[int, _ScannerSizeInspection] = {}
+        self._byte_size_frames: dict[int, _ScannerSizeInspection] = {}
+        self._byte_size_inspections: list[_ScannerSizeInspection] = []
         self._byte_canonical_buffers: dict[int, tuple[int, int]] = {}
         self._byte_canonical_owners: dict[int, MemoInspection | ContextCanonicalInspection] = {}
         self.context_canonical_inspections: list[ContextCanonicalInspection] = []
         self._context_byte_frames: dict[int, ContextCanonicalInspection] = {}
         self._byte_sources: dict[int, tuple[int, int]] = {}
+        self._byte_private_payloads: dict[int, tuple[int, int]] = {}
+        self._byte_private_expected: dict[int, _PrivateSizeExpectation] = {}
+        self._byte_private_requests: Counter[int] = Counter()
+        self._byte_private_sizes: list[_PrivateSizeExpectation] = []
         self._byte_threads: dict[int, int | None] = {get_ident(): None}
         self._byte_monitor: _ByteMonitor | None = None
         self._verified_byte_totals: tuple[NativeByteTotals, ...] | None = None
         self._terminal_byte_totals: tuple[NativeByteTotals, ...] = ()
         self._terminal_byte_errors: tuple[str, ...] = ()
         self._terminal_byte_diagnostics: tuple[NativeByteErrorDiagnostic, ...] = ()
+        self._terminal_private_sizes: tuple[tuple, ...] = ()
         self.require_snapshot_artifacts = require_snapshot_artifacts
         self.snapshot_artifact_errors: list[str] = []
         self._snapshot_artifact_requests: dict[int, _ArtifactRequest] = {}
@@ -5215,7 +5381,12 @@ class RetentionMemoTrace:
                     if type(payload) is not bytes or native is None or id(payload) != native[0]:
                         return None
                 else:
-                    if continuation_selection.sha256 is not _SHA256:
+                    if (
+                        continuation_selection.read_private_chunk is not _READ_PRIVATE_CHUNK
+                        or stored_continuation.read_private_chunk is not _READ_PRIVATE_CHUNK
+                        or _READ_PRIVATE_CHUNK.__code__ is not _READ_PRIVATE_CHUNK_CODE
+                        or stored_continuation.sha256 is not _SHA256
+                    ):
                         return None
                     native = self._byte_sources.get(id(ancestor))
                 # The exact original source site assigned this text from the
@@ -5225,22 +5396,271 @@ class RetentionMemoTrace:
             ancestor = ancestor.f_back
         return None
 
+    def _scanner_size_call(self, frame: FrameType, offset: int, callable_, operand) -> None:
+        expected = self._byte_threads.get(get_ident())
+        actual = current_retention_stage_memo()
+        ancestor = frame.f_back
+        owner = None
+        for _ in range(64):
+            if ancestor is None:
+                break
+            owner = self._byte_detector_frames.get(id(ancestor))
+            if owner is not None:
+                break
+            ancestor = ancestor.f_back
+        if actual is None and owner is None and expected is None:
+            return
+        if self._byte_carrier(expected, frame) is None:
+            return
+        variable = _SCANNER_SIZE_SITES[frame.f_code][offset]
+        state = frame.f_locals.get("state")
+        policy = state.policy if type(state) is credential_material._TraversalState else frame.f_locals.get("policy")
+        limit = policy.max_string_bytes if type(policy) is credential_material.CredentialTraversalPolicy else None
+        if frame.f_code is _REFERENCE and variable == "ref" and type(limit) is int:
+            limit = min(limit, _REFERENCE_MAX_BYTES)
+        if (
+            not _scanner_sources_current()
+            or callable_ is not _UTF8_SIZE
+            or frame.f_globals is not credential_material.__dict__
+            or type(operand) is not str
+            or operand is not frame.f_locals.get(variable)
+            or type(limit) is not int
+            or owner is None
+            or owner.memo is not actual
+            or id(frame) in self._byte_size_pending
+            or (variable == "ref" and frame.f_locals.get("ref_limit") != limit)
+        ):
+            self._byte_error("bounded scanner changed its original source, input, limit or owner", frame, expected, owner)
+            return
+        self._byte_size_pending[id(frame)] = _ScannerSizeInspection(
+            owner, id(frame), id(operand), str.__len__(operand), limit, get_ident(), expected, call_code=frame.f_code, call_offset=offset
+        )
+
+    def _expect_private_size(self, frame: FrameType, expected_id: int | None) -> None:
+        parent = frame.f_back
+        if parent is None or not self._at_site(parent, _LOAD_CHUNKS, _CHUNK_SOURCE_SITE):
+            return
+        actual = self._byte_carrier(expected_id, frame)
+        if actual is None:
+            return
+        reference, canonical = frame.f_locals.get("reference"), frame.f_locals.get("canonical")
+        owner = next(
+            (
+                record
+                for record in reversed(self.records)
+                if record.memo is actual
+                and type(record.key) is PrivateChunkVerificationKey
+                and record.key.reference is reference
+                and record.key.canonical is canonical
+            ),
+            None,
+        )
+        payload = parent.f_locals.get("payload")
+        previous = self._byte_private_expected.get(id(parent))
+        if (
+            not _private_size_sources_current()
+            or owner is None
+            or type(reference) is not PrivateChunkRef
+            or type(canonical) is not str
+            or parent.f_locals.get("ref") is not reference
+            or parent.f_locals.get("canonical") is not canonical
+            or type(payload) is not bytes
+            or self._byte_sources.get(id(parent)) != (id(payload), len(payload))
+            or owner.byte_calls["chunk_length"] != 1
+            or owner.byte_calls["chunk_digest"] != 1
+            or owner.byte_counts["chunk_length"] != reference.byte_length
+            or owner.byte_counts["chunk_digest"] != reference.byte_length
+            or (previous is not None and (previous.inspection is None or previous.inspection.branch is None))
+        ):
+            self._byte_error("private resource size lacks its original verified DATA request", frame, expected_id, owner)
+            return
+        expectation = _PrivateSizeExpectation(
+            owner, id(parent), id(reference), id(canonical), str.__len__(canonical), reference.byte_length, get_ident(), expected_id
+        )
+        self._byte_private_requests[id(owner)] += 1
+        self._byte_private_expected[id(parent)] = expectation
+        self._byte_private_sizes.append(expectation)
+
+    def _private_size_call(self, frame: FrameType, expected_id: int | None) -> bool:
+        parent = frame.f_back
+        loader = None if parent is None else parent.f_back
+        if parent is None or loader is None:
+            return False
+        expectation = self._byte_private_expected.get(id(loader))
+        chunk = parent.f_locals.get("chunk")
+        if (
+            expectation is None
+            or not self._at_site(parent, _NESTED_CHUNKS, _NESTED_SIZE_SITE)
+            or not self._at_site(loader, _LOAD_CHUNKS, _NESTED_LOADER_SITE)
+            or not _private_size_sources_current()
+            or frame.f_globals is not bounded_serialization.__dict__
+            or parent.f_globals is not continuation_selection.__dict__
+            or loader.f_globals is not continuation_selection.__dict__
+            or type(chunk) is not continuation_codec.PrivateChunk
+            or loader.f_locals.get("actual") is not chunk
+            or loader.f_locals.get("ref") is not chunk.reference
+            or id(chunk.reference) != expectation.reference
+            or id(chunk.canonical) != expectation.text
+            or frame.f_locals.get("text") is not chunk.canonical
+            or frame.f_locals.get("errors") != "strict"
+            or type(frame.f_locals.get("limit")) is not int
+            or frame.f_locals["limit"] != _PRIVATE_UTF8_LIMIT
+            or expectation.thread != get_ident()
+            or expectation.expected_memo_id != expected_id
+            or self._byte_carrier(expected_id, frame) is not expectation.owner.memo
+        ):
+            return False
+        expectation.calls += 1
+        if expectation.calls != 1:
+            self._byte_error("private resource size duplicated its verified request", frame, expected_id, expectation.owner)
+            return True
+        inspection = _ScannerSizeInspection(
+            expectation.owner,
+            id(parent),
+            expectation.text,
+            expectation.characters,
+            _PRIVATE_UTF8_LIMIT,
+            get_ident(),
+            expected_id,
+            private_resource=True,
+        )
+        expectation.inspection = inspection
+        self._byte_size_frames[id(frame)] = inspection
+        return True
+
+    def _scanner_size_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
+        if frame.f_code in _SCANNER_SIZE_SITES:
+            if event == "return" and self._byte_size_pending.pop(id(frame), None) is not None:
+                self._byte_error("bounded scanner invocation was not observed", frame, expected_id)
+            return
+        if frame.f_code is not _UTF8_CODE or event not in ("call", "return"):
+            return
+        if event == "call":
+            parent = frame.f_back
+            inspection = self._byte_size_pending.pop(id(parent), None)
+            if inspection is None:
+                if self._private_size_call(frame, expected_id):
+                    return
+                if any(current_retention_stage_memo() is memo for memo in self.memos) or expected_id is not None:
+                    self._byte_error("bounded scanner lacks its exact charged invocation", frame, expected_id)
+                return
+            if (
+                parent is None
+                or id(parent) != inspection.caller
+                or inspection.call_code is None
+                or type(inspection.call_offset) is not int
+                or inspection.profile_offset is not None
+                or parent.f_code is not inspection.call_code
+                or inspection.call_code not in _SCANNER_SIZE_WINDOWS
+                or inspection.call_offset not in _SCANNER_SIZE_WINDOWS[inspection.call_code]
+                or not self._at_site(parent, inspection.call_code, _SCANNER_SIZE_WINDOWS[inspection.call_code][inspection.call_offset])
+                or not _scanner_sources_current()
+                or frame.f_globals is not bounded_serialization.__dict__
+                or id(frame.f_locals.get("text")) != inspection.text
+                or frame.f_locals.get("errors") != "replace"
+                or type(frame.f_locals.get("limit")) is not int
+                or frame.f_locals["limit"] != inspection.limit
+                or inspection.thread != get_ident()
+                or inspection.expected_memo_id != expected_id
+                or self._byte_carrier(expected_id, frame) is not inspection.owner.memo
+            ):
+                self._byte_error("bounded scanner changed its original arguments or carrier", frame, expected_id, inspection.owner)
+                return
+            self._byte_size_frames[id(frame)] = inspection
+            inspection.profile_offset = parent.f_lasti
+            self._byte_size_inspections.append(inspection)
+            inspection.owner.byte_calls["scanner_size"] += 1
+            return
+        inspection = self._byte_size_frames.pop(id(frame), None)
+        if inspection is None:
+            return
+        branch = _UTF8_RETURN_BRANCHES.get(frame.f_lasti)
+        length = frame.f_locals.get("length")
+        size = frame.f_locals.get("size")
+        if (
+            not _scanner_sources_current()
+            or self._byte_carrier(expected_id, frame) is not inspection.owner.memo
+            or inspection.thread != get_ident()
+            or inspection.expected_memo_id != expected_id
+            or type(arg) is not int
+            or length != inspection.characters
+            or branch is None
+        ):
+            self._byte_error("bounded scanner return lost its original branch or carrier", frame, expected_id, inspection.owner)
+            return
+        if branch == "length_excess":
+            valid = length > inspection.limit and inspection.chunks == 0 and arg == inspection.limit + 1
+        elif branch == "ascii":
+            valid = length <= inspection.limit and inspection.chunks == 0 and arg == length
+        else:
+            valid = (
+                length <= inspection.limit
+                and inspection.chunks > 0
+                and size == inspection.encoded_bytes
+                and frame.f_locals.get("start") == (inspection.chunks - 1) * _UTF8_CHUNK_CHARACTERS
+                and (
+                    size > inspection.limit and arg == inspection.limit + 1
+                    if branch == "encoded_excess"
+                    else size <= inspection.limit
+                    and arg == size
+                    and inspection.chunks == (length + _UTF8_CHUNK_CHARACTERS - 1) // _UTF8_CHUNK_CHARACTERS
+                )
+            )
+        if not valid:
+            self._byte_error("bounded scanner chunks disagree with its actual return branch", frame, expected_id, inspection.owner)
+            return
+        inspection.branch = branch
+        inspection.returned_size = arg
+        if inspection.private_resource and not _private_size_sources_current():
+            self._byte_error("private resource size changed its original source", frame, expected_id, inspection.owner)
+
     def _byte_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         code = frame.f_code
+        self._scanner_size_profile(frame, event, arg, expected_id)
+        if code is _LOW_CODE_OBJECTS[2][0] and event == "call" and not _scanner_sources_current():
+            self._byte_error("bounded scanner original source changed", frame, expected_id)
         if code is _CHUNK_REQUEST and event == "return":
             for pending in self._byte_pending_parses.pop(id(frame), ()):
                 self._byte_error(
                     "strict parser has no bound native byte provenance", frame, expected_id, self.records[pending.record_ordinal - 1]
                 )
+            if frame.f_lasti in _CHUNK_SUCCESS_RETURNS:
+                self._expect_private_size(frame, expected_id)
         if code is _LOAD_SNAPSHOT or code is _LOAD_CHUNKS:
             if event == "return":
                 self._byte_sources.pop(id(frame), None)
+                self._byte_private_payloads.pop(id(frame), None)
+                expectation = self._byte_private_expected.pop(id(frame), None)
+                if expectation is not None and (expectation.inspection is None or expectation.inspection.branch is None):
+                    self._byte_error("private resource size invocation is missing or incomplete", frame, expected_id, expectation.owner)
             elif event == "c_call" and any(current_retention_stage_memo() is memo for memo in self.memos):
                 site = _SNAPSHOT_DECODE_BYTES_SITE if code is _LOAD_SNAPSHOT else _CHUNK_DECODE_BYTES_SITE
                 if self._at_site(frame, code, site) and type(arg) is BuiltinFunctionType and arg.__name__ == "decode":
                     receiver = arg.__self__
                     if type(receiver) is bytes and self._byte_carrier(expected_id, frame) is not None:
-                        self._byte_sources[id(frame)] = (id(receiver), len(receiver))
+                        native = (id(receiver), len(receiver))
+                        if code is _LOAD_CHUNKS and self._byte_private_payloads.pop(id(frame), None) != native:
+                            self._byte_error("private chunk decode lacks its original bounded SQL payload", frame, expected_id)
+                        else:
+                            self._byte_sources[id(frame)] = native
+        if code is _READ_PRIVATE_CHUNK_CODE and event == "return" and any(current_retention_stage_memo() is memo for memo in self.memos):
+            parent = frame.f_back
+            if (
+                parent is not None
+                and self._at_site(parent, _LOAD_CHUNKS, _CHUNK_READ_SITE)
+                and continuation_selection.read_private_chunk is _READ_PRIVATE_CHUNK
+                and stored_continuation.read_private_chunk is _READ_PRIVATE_CHUNK
+                and _READ_PRIVATE_CHUNK.__code__ is _READ_PRIVATE_CHUNK_CODE
+                and frame.f_globals is stored_continuation.__dict__
+                and stored_continuation.sha256 is _SHA256
+                and frame.f_locals.get("conn") is parent.f_locals.get("conn")
+                and frame.f_locals.get("reference") is parent.f_locals.get("ref")
+                and frame.f_locals.get("session_id") is parent.f_locals.get("sid")
+                and frame.f_locals.get("operation_id") is parent.f_locals.get("operation_id")
+                and type(arg) is bytes
+                and self._byte_carrier(expected_id, frame) is not None
+            ):
+                self._byte_private_payloads[id(parent)] = (id(arg), len(arg))
         if event == "return" and code is _LOW_CODE_OBJECTS[2][0]:
             self._byte_detector_frames.pop(id(frame), None)
         if event == "return" and type(_RFC_DUMPS) is FunctionType and code is _RFC_DUMPS.__code__:
@@ -5306,6 +5726,10 @@ class RetentionMemoTrace:
             if frame.f_code is not code or frame.f_lasti != offset:
                 self._byte_error("native byte CALL lost its original frame or offset", frame, self._byte_threads.get(get_ident()))
                 return
+            if code in _SCANNER_SIZE_SITES:
+                if offset in _SCANNER_SIZE_SITES[code]:
+                    self._scanner_size_call(frame, offset, callable_, operand)
+                return
             if code is _CHUNK_REQUEST:
                 if callable_ is builtins.len:
                     channel = "chunk_length"
@@ -5337,14 +5761,27 @@ class RetentionMemoTrace:
                 if channel == "key_preparation":
                     owner = self._ancestor(frame.f_back)
                 else:
-                    ancestor = frame.f_back
-                    for _ in range(64):
-                        if ancestor is None:
-                            break
-                        owner = self._byte_detector_frames.get(id(ancestor))
-                        if owner is not None:
-                            break
-                        ancestor = ancestor.f_back
+                    inspection = self._byte_size_frames.get(id(frame))
+                    owner = None if inspection is None else inspection.owner
+                    if inspection is not None:
+                        chunk = frame.f_locals.get("chunk")
+                        if (
+                            not _scanner_sources_current()
+                            or inspection.thread != get_ident()
+                            or inspection.expected_memo_id != self._byte_threads.get(get_ident())
+                            or frame.f_locals.get("start") != inspection.chunks * _UTF8_CHUNK_CHARACTERS
+                            or frame.f_locals.get("size") != inspection.encoded_bytes
+                            or type(chunk) is not str
+                            or str.__len__(chunk)
+                            != min(_UTF8_CHUNK_CHARACTERS, inspection.characters - inspection.chunks * _UTF8_CHUNK_CHARACTERS)
+                        ):
+                            self._byte_error(
+                                "bounded scanner chunk lost its exact invocation or sequence",
+                                frame,
+                                self._byte_threads.get(get_ident()),
+                                owner,
+                            )
+                            return
             actual = current_retention_stage_memo()
             # Local events also occur outside any observation stage. Only a
             # known live stage or a submitted observed thread is in scope.
@@ -5365,6 +5802,11 @@ class RetentionMemoTrace:
                     return
                 if code is _CHUNK_REQUEST:
                     self._bind_pending_chunk(frame, owner, operand, expected)
+                elif code is _UTF8_CODE:
+                    inspection.chunks += 1
+                    inspection.encoded_bytes += len(operand)
+                    if inspection.private_resource:
+                        return
                 owner.byte_calls[channel] += 1
                 owner.byte_counts[channel] += len(operand)
         except Exception as error:
@@ -5656,18 +6098,122 @@ class RetentionMemoTrace:
             for channel in _BYTE_CHANNELS
         )
 
+    def _private_size_state(self) -> tuple[tuple, ...]:
+        rows = tuple(
+            (
+                id(item.owner),
+                item.loader,
+                item.reference,
+                item.text,
+                item.characters,
+                item.byte_length,
+                item.thread,
+                item.expected_memo_id,
+                item.calls,
+                None
+                if item.inspection is None
+                else (
+                    id(item.inspection.owner),
+                    item.inspection.caller,
+                    item.inspection.text,
+                    item.inspection.characters,
+                    item.inspection.limit,
+                    item.inspection.thread,
+                    item.inspection.expected_memo_id,
+                    item.inspection.call_code,
+                    item.inspection.call_offset,
+                    item.inspection.profile_offset,
+                    item.inspection.private_resource,
+                    item.inspection.chunks,
+                    item.inspection.encoded_bytes,
+                    item.inspection.branch,
+                    item.inspection.returned_size,
+                ),
+            )
+            for item in self._byte_private_sizes
+        )
+        return (("requests", tuple(sorted(self._byte_private_requests.items()))), *rows)
+
+    def _assert_private_size_work(self) -> None:
+        assert not self._byte_private_expected, "private resource size work remains active"
+        assert (
+            self._byte_private_requests == Counter(id(item.owner) for item in self._byte_private_sizes)
+            and all(count == 1 for count in self._byte_private_requests.values())
+            and set(self._byte_private_requests).issubset(id(record) for record in self.records)
+        ), "private resource size lost or duplicated its finite request charge"
+        owners = set()
+        for item in self._byte_private_sizes:
+            inspection = item.inspection
+            assert item.calls == 1 and inspection is not None and id(item.owner) not in owners, (
+                "private resource size lost or duplicated its finite request charge"
+            )
+            owners.add(id(item.owner))
+            key = item.owner.key
+            assert (
+                type(key) is PrivateChunkVerificationKey
+                and id(key.reference) == item.reference
+                and id(key.canonical) == item.text
+                and key.reference.byte_length == item.byte_length
+                and item.owner.byte_calls["chunk_length"] == item.owner.byte_calls["chunk_digest"] == 1
+                and item.owner.byte_counts["chunk_length"] == item.owner.byte_counts["chunk_digest"] == item.byte_length
+                and inspection.owner is item.owner
+                and inspection.text == item.text
+                and inspection.characters == item.characters
+                and inspection.limit == _PRIVATE_UTF8_LIMIT
+                and inspection.thread == item.thread
+                and inspection.expected_memo_id == item.expected_memo_id
+                and inspection.call_code is inspection.call_offset is inspection.profile_offset is None
+                and inspection.private_resource
+                and inspection.returned_size == item.byte_length
+                and (
+                    (
+                        inspection.branch == "ascii"
+                        and inspection.chunks == inspection.encoded_bytes == 0
+                        and item.characters == item.byte_length
+                    )
+                    or (
+                        inspection.branch == "encoded"
+                        and inspection.encoded_bytes == item.byte_length
+                        and inspection.chunks == (item.characters + _UTF8_CHUNK_CHARACTERS - 1) // _UTF8_CHUNK_CHARACTERS
+                    )
+                )
+            ), "private resource size changed or exchanged its bounded DATA work"
+
     def _assert_native_byte_budget(self, budgets: tuple[NativeByteBudget, ...]) -> None:
         assert not self.byte_errors, "native byte provenance invalid: " + str(self.byte_errors)
         assert self._byte_monitor is not None and self._byte_monitor.closed, "native byte monitoring remains active"
         assert (
             not self._byte_detector_frames
+            and not self._byte_size_pending
+            and not self._byte_size_frames
+            and all(inspection.branch is not None for inspection in self._byte_size_inspections)
             and not self._byte_canonical_buffers
             and not self._byte_canonical_owners
             and not self._byte_sources
+            and not self._byte_private_payloads
             and not self._context_byte_frames
             and not self._byte_pending_parses
             and all(record.exited for record in self.context_canonical_inspections)
         ), "native byte work remains active"
+        self._assert_private_size_work()
+        assert all(
+            item.call_code is not None
+            and type(item.call_offset) is int
+            and type(item.profile_offset) is int
+            and item.call_code in _SCANNER_SIZE_WINDOWS
+            and item.call_offset in _SCANNER_SIZE_WINDOWS[item.call_code]
+            and item.profile_offset in _SCANNER_SIZE_WINDOWS[item.call_code][item.call_offset][0]
+            for item in self._byte_size_inspections
+        ), "bounded scanner lost its original native CALL origin"
+        for _stage, _family, _key, _producer, _invocation, records in self._byte_rows():
+            for record in records:
+                inspections = [inspection for inspection in self._byte_size_inspections if inspection.owner is record]
+                assert (
+                    record.byte_calls["scanner_size"] == len(inspections)
+                    and record.byte_counts["scanner_size"] == 0
+                    and record.byte_calls["scanner_extent"] == sum(inspection.chunks for inspection in inspections)
+                    and record.byte_counts["scanner_extent"] == sum(inspection.encoded_bytes for inspection in inspections)
+                ), "bounded scanner lost or duplicated its invocation or chunk charge"
         assert type(budgets) is tuple and all(type(budget) is NativeByteBudget for budget in budgets)
         rows = self._byte_rows()
         identities = [(stage, family, key, producer, invocation) for stage, family, key, producer, invocation, _records in rows]
@@ -5799,6 +6345,7 @@ class RetentionMemoTrace:
             )
             assert not self._byte_pending_parses, "native parse bindings remain after terminal assertion"
             assert self.native_byte_totals() == self._terminal_byte_totals, "native byte work changed after terminal assertion"
+            assert self._private_size_state() == self._terminal_private_sizes, "private resource size work changed after terminal assertion"
         if self.require_snapshot_artifacts:
             assert not self._snapshot_artifact_requests, "snapshot artifact work remains active after terminal assertion"
             assert tuple(self.snapshot_artifact_errors) == self._terminal_snapshot_artifact_errors, (
@@ -5896,6 +6443,7 @@ class RetentionMemoTrace:
         self._terminal_byte_totals = self.native_byte_totals()
         self._terminal_byte_errors = tuple(self.byte_errors)
         self._terminal_byte_diagnostics = tuple(self.byte_error_diagnostics)
+        self._terminal_private_sizes = self._private_size_state()
         self._terminal_snapshot_artifact_errors = tuple(self.snapshot_artifact_errors)
         self._terminal_snapshot_artifact_rows = self.snapshot_artifact_totals()
         self._terminal_snapshot_artifact_stages = self.snapshot_artifact_stage_totals()

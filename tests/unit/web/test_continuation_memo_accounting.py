@@ -2018,7 +2018,7 @@ def test_native_byte_call_operand_contract_is_source_bound_and_restores_monitor_
 def _native_byte_limits(**charges):
     from tests.helpers.continuation_memo import NativeByteLimit
 
-    channels = ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_extent", "key_preparation")
+    channels = ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_size", "scanner_extent", "key_preparation")
     assert not set(charges).difference(channels)
     return tuple(NativeByteLimit(channel, charges.get(channel, (0, 0))[0], *charges.get(channel, (0, 0))) for channel in channels)
 
@@ -2037,7 +2037,11 @@ def _native_scan_budget(stage, value, size, *, scans=1, requests=2):
     return NativeByteBudget(
         stage,
         "credential",
-        _native_byte_limits(scanner_extent=(scans, scans * size), key_preparation=(requests, requests * size)),
+        _native_byte_limits(
+            scanner_size=(scans, 0),
+            scanner_extent=(0, 0) if value.isascii() else (scans * ((len(value) + 4095) // 4096), scans * size),
+            key_preparation=(requests, requests * size),
+        ),
         key,
         guard._credential_finding_from_key,
     )
@@ -2054,8 +2058,45 @@ def _native_expected_rows(stage, family, group, *, invocation=None, **charges):
             "bytes": charges.get(channel, (0, 0))[1],
             "invocation": invocation,
         }
-        for channel in ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_extent", "key_preparation")
+        for channel in ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_size", "scanner_extent", "key_preparation")
     ]
+
+
+@pytest.fixture
+def _native_private_chunk_reader(engine, request):
+    """Seed original immutable bytes under a genuine owner, then read real SQL."""
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    def reader(chunk, payload):
+        repository, context, operation_id, selected, _revision = _closed_dml_seed(engine)
+        try:
+            with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+                assert store.require_continuation_mutation(conn, context) is True
+                store.put_chunk(
+                    conn,
+                    session_id=str(context.fence.session_id),
+                    operation_id=operation_id,
+                    key=f"value:{chunk.reference.codec}:{chunk.reference.digest}",
+                    payload=payload,
+                    codec=chunk.reference.codec,
+                )
+                assert (
+                    store.read_private_chunk(
+                        conn, session_id=str(context.fence.session_id), operation_id=operation_id, reference=chunk.reference
+                    )
+                    == payload
+                )
+                stack = _DECODE(selected.payload_json)
+            connection = engine.connect()
+        except BaseException:
+            repository.release(context)
+            raise
+        request.addfinalizer(lambda: repository.release(context))
+        request.addfinalizer(connection.close)
+        return connection, stack
+
+    return reader
 
 
 @pytest.mark.parametrize("value,size", [("", 0), ("ordinary", 8), ("café☃", 8)])
@@ -2086,17 +2127,21 @@ def test_native_byte_scan_measures_original_encoded_operands_and_warm_key_prepar
     if extra == "none":
         trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
         totals = {row.channel: (row.calls, row.bytes) for row in trace.native_byte_totals()}
-        assert totals["scanner_extent"] == (1, size)
+        scanner_extent = (0, 0) if value.isascii() else (1, size)
+        assert totals["scanner_size"] == (1, 0)
+        assert totals["scanner_extent"] == scanner_extent
         assert totals["key_preparation"] == (2, 2 * size)
         trace.assert_complete_coverage()
         record_property(
             "native_byte_expected",
-            json.dumps(_native_expected_rows(1, "credential", 1, scanner_extent=(1, size), key_preparation=(2, 2 * size))),
+            json.dumps(
+                _native_expected_rows(1, "credential", 1, scanner_size=(1, 0), scanner_extent=scanner_extent, key_preparation=(2, 2 * size))
+            ),
         )
     else:
         assert not trace.orphans and trace.records[0].attempts["detector_work"] > 0
         # This byte assertion must run before the older once-per-key guard.
-        with pytest.raises(AssertionError, match="native byte call budget exceeded or missing: scanner_extent"):
+        with pytest.raises(AssertionError, match="native byte call budget exceeded or missing: scanner_size"):
             trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
 
 
@@ -2105,8 +2150,8 @@ def test_native_byte_budgets_refuse_missing_balanced_wrong_and_altered_channels(
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         for _ in range(2):
-            assert _SCAN("ordinary", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic") is None
-    budget = _native_scan_budget(1, "ordinary", 8)
+            assert _SCAN("café☃", policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic") is None
+    budget = _native_scan_budget(1, "café☃", 8)
     budgets = (budget,)
     expected = "native byte budget is required"
     if mutation == "missing":
@@ -2140,10 +2185,8 @@ def test_native_byte_budgets_refuse_missing_balanced_wrong_and_altered_channels(
 
 @pytest.mark.parametrize("variation", ["normal", "extra", "direct", "bypass"])
 def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_charge_each_hit(
-    monkeypatch, request, record_property, variation
+    monkeypatch, request, record_property, variation, _native_private_chunk_reader
 ):
-    from types import SimpleNamespace
-
     from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from elspeth.web.sessions import continuation_selection as selection
     from tests.helpers.continuation_memo import NativeByteBudget
@@ -2152,15 +2195,8 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
     payload = b'{"message":"caf\xc3\xa9\xe2\x98\x83"}'
     canonical = payload.decode("utf-8")
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=canonical)
-    stack = initial_stack()
+    connection, stack = _native_private_chunk_reader(chunk, payload)
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
-
-    class Connection:
-        def execute(self, _statement):
-            return self
-
-        def one_or_none(self):
-            return SimpleNamespace(payload=payload, codec=chunk.reference.codec, byte_length=len(payload), sha256=chunk.reference.digest)
 
     method = RetentionStageMemo.private_chunk
 
@@ -2178,7 +2214,7 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
                 assert _VERIFY(chunk.reference, chunk.canonical) is None
             else:
                 assert selection.load_private_chunks(
-                    Connection(), session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
+                    connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
                 ) == (chunk,)
         if variation == "bypass":
             assert _CHUNK_WORK(canonical) is None
@@ -2199,7 +2235,15 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
         totals = {row.channel: (row.calls, row.bytes) for row in trace.native_byte_totals()}
         assert totals["strict_parse"] == totals["canonical"] == (1, len(payload))
         assert totals["chunk_length"] == totals["chunk_digest"] == (2, 2 * len(payload))
+        assert len(trace._byte_private_sizes) == (2 if variation == "normal" else 0)
         if variation == "normal":
+            assert all(
+                item.calls == 1
+                and item.inspection is not None
+                and (item.inspection.chunks, item.inspection.encoded_bytes) == (1, len(payload))
+                for item in trace._byte_private_sizes
+            )
+            record_property("native_private_size_expected", json.dumps({"calls": 2, "chunks": 2, "bytes": 2 * len(payload)}))
             record_property(
                 "native_byte_expected",
                 json.dumps(
@@ -2216,6 +2260,101 @@ def test_native_byte_chunk_channels_use_original_validated_loader_bytes_and_char
             )
     else:
         expected = "native byte call budget exceeded or missing: strict_parse" if variation == "extra" else "native byte provenance invalid"
+        with pytest.raises(AssertionError, match=expected):
+            trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "none",
+        "reader-wrapper",
+        "nested-wrapper",
+        "missing",
+        "errors",
+        "limit",
+        "unrelated",
+        "skipped-chunk",
+        "missing-receipt",
+        "duplicate-receipt",
+        "extra-call-charge",
+        "request-count",
+        "bytes",
+        "exchange",
+        "carrier",
+    ],
+)
+def test_native_byte_private_resource_work_has_exact_source_and_finite_per_request_closure(
+    monkeypatch, request, _native_private_chunk_reader, mutation
+):
+    from elspeth.contracts import bounded_serialization
+    from elspeth.web.sessions import continuation_selection as selection
+    from tests.helpers import continuation_memo as helper
+
+    payload = b'{"message":"caf\xc3\xa9\xe2\x98\x83"}'
+    chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
+    connection, stack = _native_private_chunk_reader(chunk, payload)
+    monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
+    read, nested = selection.read_private_chunk, selection.nested_private_chunks
+    if mutation == "reader-wrapper":
+
+        def wrapped_read(*args, **kwargs):
+            return read(*args, **kwargs)
+
+        monkeypatch.setattr(selection, "read_private_chunk", wrapped_read)
+    elif mutation == "nested-wrapper":
+
+        def wrapped_nested(value):
+            return nested(value)
+
+        monkeypatch.setattr(selection, "nested_private_chunks", wrapped_nested)
+    elif mutation == "missing":
+        monkeypatch.setattr(selection, "nested_private_chunks", lambda _chunk: ())
+    elif mutation == "errors":
+        monkeypatch.setitem(bounded_serialization.utf8_size.__kwdefaults__, "errors", "replace")
+    elif mutation == "limit":
+        monkeypatch.setattr(selection, "CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES", helper._PRIVATE_UTF8_LIMIT - 1)
+    elif mutation == "skipped-chunk":
+        monkeypatch.setitem(helper._EXTENT_SITES, helper._UTF8_CODE, frozenset())
+    trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+    with clock.retention_stage_memo_scope():
+        for _ in range(2):
+            assert selection.load_private_chunks(
+                connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
+            ) == (chunk,)
+        if mutation == "unrelated":
+            assert nested(chunk) == ()
+    expected = "native byte provenance invalid"
+    if mutation in ("missing-receipt", "duplicate-receipt", "extra-call-charge", "request-count"):
+        expected = "private resource size lost or duplicated its finite request charge"
+        if mutation == "missing-receipt":
+            trace._byte_private_sizes.pop()
+        elif mutation == "duplicate-receipt":
+            trace._byte_private_sizes.append(trace._byte_private_sizes[-1])
+        elif mutation == "extra-call-charge":
+            trace._byte_private_sizes[-1].calls += 1
+        else:
+            trace._byte_private_requests[id(trace._byte_private_sizes[-1].owner)] += 1
+    elif mutation in ("bytes", "exchange", "carrier"):
+        expected = "private resource size changed or exchanged its bounded DATA work"
+        first, second = trace._byte_private_sizes
+        assert first.inspection is not None and second.inspection is not None
+        if mutation == "bytes":
+            second.inspection.encoded_bytes += 1
+        elif mutation == "carrier":
+            second.inspection.expected_memo_id = id(trace.memos[0])
+        else:
+            first.inspection, second.inspection = second.inspection, first.inspection
+    budget = _late_chunk_budget(chunk, len(payload))
+    if mutation == "none":
+        trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
+        assert len(trace._byte_private_sizes) == 2
+        assert all(
+            item.calls == 1 and item.inspection is not None and (item.inspection.chunks, item.inspection.encoded_bytes) == (1, len(payload))
+            for item in trace._byte_private_sizes
+        )
+        assert all(row.calls == row.bytes == 0 for row in trace.native_byte_totals() if row.channel.startswith("scanner_"))
+    else:
         with pytest.raises(AssertionError, match=expected):
             trace.finish(stages=1, require_snapshot=False, native_byte_limits=(budget,))
 
@@ -2380,46 +2519,41 @@ def test_native_byte_uncached_and_memo_scanner_rows_remain_separately_charged(mo
         native_byte_limits=(
             _native_scan_budget(1, "ordinary", 8),
             NativeByteBudget(
-                1, "provider_context_message_text", _native_byte_limits(scanner_extent=(2, sum(len(text) for text in native_texts)))
+                1, "provider_context_message_text", _native_byte_limits(scanner_size=(2, 0), scanner_extent=(1, len(native_texts[1])))
             ),
             _native_capture_budget(1, 1),
         ),
     )
     totals = {(row.family, row.channel): (row.calls, row.bytes) for row in trace.native_byte_totals()}
-    assert totals["provider_context_message_text", "scanner_extent"] == (2, sum(len(text) for text in native_texts))
-    assert totals["credential", "scanner_extent"] == (1, 8)
+    assert totals["provider_context_message_text", "scanner_size"] == (2, 0)
+    assert totals["provider_context_message_text", "scanner_extent"] == (1, len(native_texts[1]))
+    assert totals["credential", "scanner_size"] == (1, 0)
+    assert totals["credential", "scanner_extent"] == (0, 0)
     assert totals["provider_context_capture", "canonical"] == (1, len(_provider_canonical_fixture_bytes()))
     assert totals["provider_context_message_text", "canonical"] == totals["credential", "canonical"] == (0, 0)
     assert trace.detector_stage_totals()[0].native_attempts == 3
 
 
-def test_native_byte_canonical_channel_refuses_a_wrapped_serializer_even_with_equal_product_bytes(monkeypatch, request):
-    from types import SimpleNamespace
-
+def test_native_byte_canonical_channel_refuses_a_wrapped_serializer_even_with_equal_product_bytes(
+    monkeypatch, request, _native_private_chunk_reader
+):
     from elspeth.contracts import hashing
     from elspeth.web.sessions import continuation_selection as selection
 
     payload = b'{"message":"ordinary"}'
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
-    stack = initial_stack()
+    connection, stack = _native_private_chunk_reader(chunk, payload)
     original = hashing.rfc8785.dumps
 
     def wrapped(value):
         return original(value)
-
-    class Connection:
-        def execute(self, _statement):
-            return self
-
-        def one_or_none(self):
-            return SimpleNamespace(payload=payload, codec=chunk.reference.codec, byte_length=len(payload), sha256=chunk.reference.digest)
 
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
     monkeypatch.setattr(hashing.rfc8785, "dumps", wrapped)
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         assert selection.load_private_chunks(
-            Connection(), session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
+            connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
         ) == (chunk,)
     assert "canonical output has no original RFC8785 buffer" in trace.byte_errors
     with pytest.raises(AssertionError, match="native byte provenance invalid"):
@@ -2432,9 +2566,10 @@ def test_native_byte_longer_real_scalar_exceeds_an_unchanged_extent_cap(monkeypa
     with clock.retention_stage_memo_scope():
         for _ in range(2):
             assert _SCAN(value, policy=CredentialTraversalPolicy(), surface="native-bytes-control", scanner_role="generic") is None
-    # The changed full DATA key is explicit; the independently fixed eight-byte
-    # native scanner cap is intentionally unchanged from the shorter fixture.
-    with pytest.raises(AssertionError, match="native byte extent budget exceeded: scanner_extent"):
+    # ASCII uses no scanner buffer, but both real key-preparation encodings
+    # remain bounded. Unicode also exceeds the unchanged native scanner cap.
+    channel = "key_preparation" if value.isascii() else "scanner_extent"
+    with pytest.raises(AssertionError, match="native byte extent budget exceeded: " + channel):
         trace.finish(stages=1, require_snapshot=False, native_byte_limits=(_native_scan_budget(1, value, 8),))
 
 
@@ -2618,7 +2753,7 @@ def test_native_byte_complete_context_canonical_owner_is_independent_of_enclosin
         native_byte_limits=(
             _native_scan_budget(1, "ordinary", 8),
             NativeByteBudget(
-                1, "provider_context_message_text", _native_byte_limits(scanner_extent=(2, sum(len(text) for text in text_bytes)))
+                1, "provider_context_message_text", _native_byte_limits(scanner_size=(2, 0), scanner_extent=(1, len(text_bytes[1])))
             ),
             _native_capture_budget(1, 1),
         ),
@@ -2632,8 +2767,8 @@ def test_native_byte_complete_context_canonical_owner_is_independent_of_enclosin
     context = trace.context_canonical_inspections[0]
     assert context.exited and context.thread_id == threading.get_ident() and context.memo is trace.memos[0]
     expected_rows = (
-        _native_expected_rows(1, "credential", 1, scanner_extent=(1, 8), key_preparation=(2, 16))
-        + _native_expected_rows(1, "provider_context_message_text", 2, scanner_extent=(2, sum(len(text) for text in text_bytes)))
+        _native_expected_rows(1, "credential", 1, scanner_size=(1, 0), key_preparation=(2, 16))
+        + _native_expected_rows(1, "provider_context_message_text", 2, scanner_size=(2, 0), scanner_extent=(1, len(text_bytes[1])))
         + _native_expected_rows(1, "provider_context_capture", 3, invocation=1, canonical=(1, len(canonical_bytes)))
     )
     record_property("native_byte_expected", json.dumps(expected_rows))
@@ -2648,12 +2783,14 @@ def test_native_byte_correct_capture_identities_cannot_exchange_balanced_canonic
     messages, texts, expected = _provider_fixture()
     longer_messages, longer_texts, longer_expected = _provider_fixture(longer=True)
     canonical_size = len(_provider_canonical_fixture_bytes())
-    scalar_size = len(b"AUTHORED SYSTEM CONTEXT CANARY") + len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
+    scalar_size = len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         assert provider_context.capture_provider_context(messages=messages, tools=None).canonical == expected
         assert provider_context.capture_provider_context(messages=longer_messages, tools=None).canonical == longer_expected
-    scalar = NativeByteBudget(1, "provider_context_message_text", _native_byte_limits(scanner_extent=(4, 2 * scalar_size + 1)))
+    scalar = NativeByteBudget(
+        1, "provider_context_message_text", _native_byte_limits(scanner_size=(4, 0), scanner_extent=(2, 2 * scalar_size + 1))
+    )
     caps = (canonical_size + 1, canonical_size) if exchanged else (canonical_size, canonical_size + 1)
     budgets = (scalar, _native_capture_budget(1, 1, allowance=caps[0]), _native_capture_budget(1, 2, allowance=caps[1]))
     limits = (_provider_limit(1, 2, 4, sum(len(text) for text in (*texts, *longer_texts))),)
@@ -2669,7 +2806,7 @@ def test_native_byte_correct_capture_identities_cannot_exchange_balanced_canonic
             stages=1, require_snapshot=False, require_population=False, uncached_validation_limits=limits, native_byte_limits=budgets
         )
         expected_rows = (
-            _native_expected_rows(1, "provider_context_message_text", 1, scanner_extent=(4, 2 * scalar_size + 1))
+            _native_expected_rows(1, "provider_context_message_text", 1, scanner_size=(4, 0), scanner_extent=(2, 2 * scalar_size + 1))
             + _native_expected_rows(1, "provider_context_capture", 2, invocation=1, canonical=(1, canonical_size))
             + _native_expected_rows(1, "provider_context_capture", 3, invocation=2, canonical=(1, canonical_size + 1))
         )
@@ -2733,13 +2870,15 @@ def test_native_byte_context_canonical_work_requires_its_original_finite_invocat
     from tests.helpers.continuation_memo import NativeByteBudget
 
     messages, texts, expected = _provider_fixture()
-    text_size = len(b"AUTHORED SYSTEM CONTEXT CANARY") + len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
+    text_size = len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
     count = 2 if mutation == "extra-capture" else 1
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         for _ in range(count):
             assert provider_context.capture_provider_context(messages=messages, tools=None).canonical == expected
-    scalar = NativeByteBudget(1, "provider_context_message_text", _native_byte_limits(scanner_extent=(2 * count, text_size * count)))
+    scalar = NativeByteBudget(
+        1, "provider_context_message_text", _native_byte_limits(scanner_size=(2 * count, 0), scanner_extent=(count, text_size * count))
+    )
     capture = _native_capture_budget(1, 1)
     budgets = (scalar, capture)
     if mutation == "missing":
@@ -2775,7 +2914,7 @@ async def test_native_byte_complete_context_worker_owner_requires_original_carri
     from tests.helpers.continuation_memo import NativeByteBudget
 
     messages, texts, expected = _provider_fixture()
-    text_size = len(b"AUTHORED SYSTEM CONTEXT CANARY") + len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
+    text_size = len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
     original_scope = clock.retention_stage_memo_scope
     if carrier == "missing":
         monkeypatch.setattr(async_workers, "prepare_retention_sql_callable", partial)
@@ -2807,7 +2946,9 @@ async def test_native_byte_complete_context_worker_owner_requires_original_carri
             require_population=False,
             uncached_validation_limits=(_provider_limit(1, 1, 2, sum(len(text) for text in texts)),),
             native_byte_limits=(
-                NativeByteBudget(1, "provider_context_message_text", _native_byte_limits(scanner_extent=(2, text_size))),
+                NativeByteBudget(
+                    1, "provider_context_message_text", _native_byte_limits(scanner_size=(2, 0), scanner_extent=(1, text_size))
+                ),
                 _native_capture_budget(1, 1),
             ),
         )
@@ -2857,9 +2998,9 @@ def test_native_byte_complete_context_zero_scalar_paths_keep_real_invocation_and
 
 
 @pytest.mark.parametrize("transfer", [False, True])
-def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_canonical_allowance(monkeypatch, request, transfer):
-    from types import SimpleNamespace
-
+def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_canonical_allowance(
+    monkeypatch, request, transfer, _native_private_chunk_reader
+):
     from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from elspeth.web.sessions import continuation_selection as selection
     from tests.helpers.continuation_memo import NativeByteBudget
@@ -2867,7 +3008,7 @@ def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_c
     messages, texts, expected = _provider_fixture()
     payload = b'{"message":"ordinary"}'
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
-    stack = initial_stack()
+    connection, stack = _native_private_chunk_reader(chunk, payload)
     original = codec._verify_private_chunk_canonical
     captures = []
 
@@ -2875,24 +3016,17 @@ def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_c
         captures.append(provider_context.capture_provider_context(messages=messages, tools=None))
         return original(canonical)
 
-    class Connection:
-        def execute(self, _statement):
-            return self
-
-        def one_or_none(self):
-            return SimpleNamespace(payload=payload, codec=chunk.reference.codec, byte_length=len(payload), sha256=chunk.reference.digest)
-
     monkeypatch.setattr(codec, "_verify_private_chunk_canonical", producing)
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
     with clock.retention_stage_memo_scope():
         for _ in range(2):
             assert selection.load_private_chunks(
-                Connection(), session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
+                connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
             ) == (chunk,)
     assert len(captures) == 1 and captures[0].canonical == expected
     context_size = len(_provider_canonical_fixture_bytes())
-    scalar_size = len(b"AUTHORED SYSTEM CONTEXT CANARY") + len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
+    scalar_size = len(b"AUTHORED USER caf\xc3\xa9\xe2\x98\x83")
     outer = NativeByteBudget(
         1,
         "chunk",
@@ -2907,7 +3041,7 @@ def test_native_byte_context_nested_in_real_chunk_producer_cannot_borrow_outer_c
     )
     budgets = (
         outer,
-        NativeByteBudget(1, "provider_context_message_text", _native_byte_limits(scanner_extent=(2, scalar_size))),
+        NativeByteBudget(1, "provider_context_message_text", _native_byte_limits(scanner_size=(2, 0), scanner_extent=(1, scalar_size))),
         _native_capture_budget(1, 1, allowance=0 if transfer else context_size),
     )
     limits = (_provider_limit(1, 1, 2, sum(len(text) for text in texts)),)
@@ -2960,30 +3094,21 @@ def test_native_byte_zero_scalar_capture_does_not_hide_changed_original_validati
 
 
 @pytest.mark.parametrize("depth", [0, 80])
-def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner(monkeypatch, request, depth):
-    from types import SimpleNamespace
-
+def test_native_byte_real_stack_exhaustion_cannot_authorize_a_nearer_chunk_owner(monkeypatch, request, depth, _native_private_chunk_reader):
     from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey
     from elspeth.web.sessions import continuation_selection as selection
     from tests.helpers.continuation_memo import NativeByteBudget
 
     payload = b'{"message":"ordinary"}'
     chunk = codec.encode_private_chunk(codec="composer.messages.v1", canonical=payload.decode("utf-8"))
-    stack = initial_stack()
+    connection, stack = _native_private_chunk_reader(chunk, payload)
     monkeypatch.setattr(selection, "required_private_chunks", lambda _stack: (chunk.reference,))
-
-    class Connection:
-        def execute(self, _statement):
-            return self
-
-        def one_or_none(self):
-            return SimpleNamespace(payload=payload, codec=chunk.reference.codec, byte_length=len(payload), sha256=chunk.reference.digest)
 
     def forward(remaining):
         if remaining:
             return forward(remaining - 1)
         return selection.load_private_chunks(
-            Connection(), session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
+            connection, session_id=stack.logical.session_id, operation_id=stack.logical.operation_id, stack=stack
         )
 
     trace = RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
