@@ -5445,10 +5445,10 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         symbol="resolve_reviewed_source_authority",
         table="<sessions-write-connection>",
         operation="write_connection",
-        fingerprint="46b9abcd81c9824c",
+        fingerprint="94d1096798c81fb5",
         ordinal=1,
         authority=None,
-        line=165,
+        line=190,
         connection_escape=False,
     ),
     WriterIdentity(

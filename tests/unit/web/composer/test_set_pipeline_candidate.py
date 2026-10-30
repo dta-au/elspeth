@@ -1345,32 +1345,75 @@ def test_authored_short_form_llm_review_is_canonicalized_not_a_keyerror(tmp_path
 
 @pytest.mark.parametrize("form", ["short", "full"])
 def test_actual_set_pipeline_executor_preserves_supported_review_forms(tmp_path: Path, form: str) -> None:
+    """Fresh shells and full echoes of actual owned rows preserve their facts."""
     args = _structured_llm_args(tmp_path)
     review = _short_form_shield_review()
     if form == "full":
-        review |= {
-            "id": "prompt_injection_shield_recommendation:classify",
-            "status": "pending",
-            "event_id": None,
-            "accepted_value": None,
-            "accepted_artifact_hash": None,
-            "resolved_prompt_template_hash": None,
-            "display_title": "Review the shield recommendation",
-        }
+        review["display_title"] = "Review the shield recommendation"
     args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [review]
-    before = deepcopy(args)
     state = _empty_state()
     context = _trained_context(data_dir=tmp_path)
+    if form == "full":
+        authored_before = deepcopy(args)
+        produced = _execute_set_pipeline(args, state, context)
+        assert produced.success is True, produced.to_dict()
+        assert args == authored_before
+        assert produced.updated_state.version == state.version + 1
+        state = produced.updated_state
+        canonical_requirements = deep_thaw(state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY])
+        review = next(item for item in canonical_requirements if item["user_term"] == review["user_term"])
+        assert review["display_title"] == "Review the shield recommendation"
+        assert all(
+            review[field] is None for field in ("event_id", "accepted_value", "accepted_artifact_hash", "resolved_prompt_template_hash")
+        )
+        args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = canonical_requirements
+    before = deepcopy(args)
+    state_before = state.to_dict()
     results = [_execute_set_pipeline(args, state, context) for _ in range(2)]
-    assert args == before
+    assert args == before and state.to_dict() == state_before
     for result in results:
         assert result.success is True, result.to_dict()
+        assert result.updated_state.version == state.version + 1
         requirements = deep_thaw(result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY])
         shield = next(item for item in requirements if item["user_term"] == review["user_term"])
         assert shield["id"] == "prompt_injection_shield_recommendation:classify"
         assert shield["status"] == "pending"
         assert all(shield[key] == value for key, value in review.items())
+        if form == "full":
+            assert requirements == before["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY]
+        assert result.updated_state.validate() is not None
     assert results[0].updated_state.to_dict() == results[1].updated_state.to_dict()
+
+
+def test_actual_set_pipeline_executor_refuses_unowned_full_pending_review(tmp_path: Path) -> None:
+    """A genuine canonical row cannot mint ownership on an empty component."""
+    args = _structured_llm_args(tmp_path)
+    review = _short_form_shield_review() | {"display_title": "Review the shield recommendation"}
+    args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    state = _empty_state()
+    context = _trained_context(data_dir=tmp_path)
+    authored_before = deepcopy(args)
+    produced = _execute_set_pipeline(args, state, context)
+    assert produced.success is True, produced.to_dict()
+    assert args == authored_before
+    canonical_requirements = deep_thaw(produced.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY])
+    shield = next(item for item in canonical_requirements if item["user_term"] == review["user_term"])
+    assert shield["status"] == "pending"
+    assert shield["display_title"] == review["display_title"]
+    args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [shield]
+    before = deepcopy(args)
+
+    result = _execute_set_pipeline(args, state, context)
+
+    assert result.success is False, result.to_dict()
+    assert result.updated_state is state and args == before
+    assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [
+        ("interpretation_requirements_invalid", "node:classify")
+    ]
+    assert (
+        "resolver-owned field(s): accepted_artifact_hash, accepted_value, event_id, id, resolved_prompt_template_hash, status."
+        in result.validation.errors[0].message
+    )
 
 
 def test_actual_set_pipeline_executor_does_not_normalize_resolved_input_into_pending(tmp_path: Path) -> None:
