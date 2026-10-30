@@ -13,10 +13,28 @@ from tests.unit.web.sessions.test_continuation_attachment_read import (
     test_complete_read_history_refuses_independent_binding_changes_after_positive as test_complete_read_history_refuses_independent_binding_changes_after_positive,
 )
 from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_configured_attachment_limit_changes_actual_inspection_fingerprint as test_configured_attachment_limit_changes_actual_inspection_fingerprint,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_configured_attachment_limit_controls_complete_original_before_file_read as test_configured_attachment_limit_controls_complete_original_before_file_read,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
     test_current_read_captures_actual_locked_original_and_preserves_result_alias as test_current_read_captures_actual_locked_original_and_preserves_result_alias,
 )
 from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure as test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_in_range_attachment_reads_its_complete_recorded_original as test_in_range_attachment_reads_its_complete_recorded_original,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_inspection_limit_does_not_raise_complete_serialized_response_limit as test_inspection_limit_does_not_raise_complete_serialized_response_limit,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
     test_original_tail_structured_secret_and_utf8_refuse_without_receipt as test_original_tail_structured_secret_and_utf8_refuse_without_receipt,
+)
+from tests.unit.web.sessions.test_continuation_attachment_read import (
+    test_oversized_recorded_attachment_refuses_before_any_file_read as test_oversized_recorded_attachment_refuses_before_any_file_read,
 )
 from tests.unit.web.sessions.test_continuation_attachment_read import (
     test_policy_uses_actual_names_inventory_without_resolving_values as test_policy_uses_actual_names_inventory_without_resolving_values,

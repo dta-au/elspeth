@@ -1803,6 +1803,9 @@ class ComposerSettings(Protocol):
     def composer_max_prepared_request_bytes(self) -> int: ...
 
     @property
+    def composer_attachment_inspection_max_bytes(self) -> int: ...
+
+    @property
     def composer_timeout_seconds(self) -> float: ...
 
     @property

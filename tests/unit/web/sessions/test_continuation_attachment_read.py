@@ -15,6 +15,7 @@ from sqlalchemy import insert, update
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer import continuation_attachment_read as reader
+from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.redaction import READ_ATTACHMENT_MAX_UTF8_BYTES
@@ -37,7 +38,7 @@ from tests.unit.web.sessions.test_continuation_selection import selected_case
 operation_store = test_composer_operation_authority.operation_store
 
 
-async def read_case(store, raw=b"Complete customer prose", *, secret_service=None):
+async def read_case(store, raw=b"Complete customer prose", *, secret_service=None, inspection_max_bytes=READ_ATTACHMENT_MAX_UTF8_BYTES):
     engine, _repository, authority, sessions, sid = store
     running, stored, _chunk = selected_case(store)
     work = inventory_work(running)
@@ -53,6 +54,7 @@ async def read_case(store, raw=b"Complete customer prose", *, secret_service=Non
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
         composer_rate_limit_per_minute=100,
+        composer_attachment_inspection_max_bytes=inspection_max_bytes,
         shareable_link_signing_key=b"\x00" * 32,
         data_dir=sessions._data_dir,
     )
@@ -118,6 +120,12 @@ async def read_case(store, raw=b"Complete customer prose", *, secret_service=Non
     return kwargs, path, actors
 
 
+def _set_current_inspection_limit(service, limit):
+    settings = service._settings
+    assert type(settings) is WebSettings
+    service._settings = WebSettings.model_validate({**settings.model_dump(), "composer_attachment_inspection_max_bytes": limit})
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tool_name", ("read_attachment", "get_blob_content"))
 async def test_current_read_captures_actual_locked_original_and_preserves_result_alias(operation_store, monkeypatch, tool_name):
@@ -143,6 +151,10 @@ async def test_current_read_captures_actual_locked_original_and_preserves_result
     assert inspection.content_hash == sha256(raw).hexdigest() and inspection.size_bytes == len(raw)
     assert inspection.session_id == str(operation_store[4])
     assert inspection.policy_fingerprint == observations[0][1].policy_fingerprint
+    assert (
+        inspection.policy_fingerprint
+        == AttachmentInspectionPolicy(READ_ATTACHMENT_MAX_UTF8_BYTES, env_ref_names=kwargs["inventory"].names).fingerprint
+    )
     assert len(actual.retained.blob_versions) == 1
     restored = decode_read_owner_result(canonical_json(actual.retained.model_dump(mode="json")))
     assert restored == actual.retained
@@ -171,38 +183,45 @@ async def test_original_tail_structured_secret_and_utf8_refuse_without_receipt(o
 class _CountingReader(io.BufferedReader):
     """Records every byte count a read takes from the spied blob file."""
 
-    def __init__(self, raw, reads):
+    def __init__(self, raw, reads, requested_sizes):
         super().__init__(raw)
         self._reads = reads
+        self._requested_sizes = requested_sizes
 
     def read(self, size=-1):
+        self._requested_sizes.append(size)
         data = super().read(size)
         self._reads.append(len(data))
         return data
 
 
 def _spy_blob_reads(monkeypatch, path):
-    """Count bytes read from ``path`` through ``Path.open``, which ``read_bytes`` also uses."""
+    """Observe opens, requested sizes and returned bytes for the actual blob path."""
     reads = []
+    requested_sizes = []
+    opened_paths = []
     real_open = Path.open
 
     def counting_open(self, *args, **kwargs):
         if self != path:
             return real_open(self, *args, **kwargs)
-        return _CountingReader(io.FileIO(self, "r"), reads)
+        opened_paths.append(self)
+        return _CountingReader(io.FileIO(self, "r"), reads, requested_sizes)
 
     monkeypatch.setattr(Path, "open", counting_open)
-    return reads
+    return reads, requested_sizes, opened_paths
 
 
 @pytest.mark.asyncio
 async def test_in_range_attachment_reads_its_complete_recorded_original(operation_store, monkeypatch):
     raw = b"x" * (READ_ATTACHMENT_MAX_UTF8_BYTES // 2)
     kwargs, path, _actors = await read_case(operation_store, raw)
-    reads = _spy_blob_reads(monkeypatch, path)
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
     actual = await reader.read_current_attachment(**kwargs)
     assert actual.result.success
     assert sum(reads) == len(raw)
+    assert requested_sizes == [READ_ATTACHMENT_MAX_UTF8_BYTES + 1]
+    assert opened_paths == [path]
     assert actual.retained.attachment_inspections[0].size_bytes == len(raw)
     kwargs["required_work"].coordinator.assert_completed()
 
@@ -211,23 +230,25 @@ async def test_in_range_attachment_reads_its_complete_recorded_original(operatio
 async def test_oversized_recorded_attachment_refuses_before_any_file_read(operation_store, monkeypatch):
     raw = b"x" * (READ_ATTACHMENT_MAX_UTF8_BYTES + 1)
     kwargs, path, _actors = await read_case(operation_store, raw)
-    reads = _spy_blob_reads(monkeypatch, path)
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
     actual = await reader.read_current_attachment(**kwargs)
     assert not actual.result.success
     assert actual.result.validation.errors[0].message == (
         "The complete attachment was refused by the current inspection policy; no content was returned."
     )
-    assert reads == []
+    assert reads == requested_sizes == opened_paths == []
     assert actual.retained.attachment_inspections == ()
     assert len(actual.retained.blob_versions) == 1
     kwargs["required_work"].coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
-async def test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure(operation_store, monkeypatch):
-    limit = READ_ATTACHMENT_MAX_UTF8_BYTES
+@pytest.mark.parametrize("tool_name", ("read_attachment", "get_blob_content"))
+async def test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure(operation_store, monkeypatch, tool_name):
+    limit = 128
     raw = b"x" * (limit * 2)
-    kwargs, path, _actors = await read_case(operation_store, raw)
+    kwargs, path, _actors = await read_case(operation_store, raw, inspection_max_bytes=limit)
+    kwargs["tool_name"] = tool_name
     engine = operation_store[0]
     with engine.begin() as conn:
         conn.execute(
@@ -235,10 +256,90 @@ async def test_disk_bytes_beyond_in_range_recorded_size_are_an_integrity_failure
             .where(blobs_table.c.id == kwargs["arguments"]["blob_id"])
             .values(size_bytes=limit, content_hash=sha256(raw[:limit]).hexdigest())
         )
-    reads = _spy_blob_reads(monkeypatch, path)
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
     with pytest.raises(AuditIntegrityError, match="recorded size"):
         await reader.read_current_attachment(**kwargs)
-    assert sum(reads) <= limit + 1
+    assert reads == requested_sizes == [limit + 1]
+    assert opened_paths == [path]
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ("read_attachment", "get_blob_content"))
+@pytest.mark.parametrize("raw", (b"x" * 128, ("é" * 64).encode("utf-8")), ids=("ascii", "multibyte-utf8"))
+async def test_configured_attachment_limit_controls_complete_original_before_file_read(operation_store, monkeypatch, tool_name, raw):
+    limit = len(raw)
+    kwargs, path, _actors = await read_case(operation_store, raw, inspection_max_bytes=limit)
+    kwargs["tool_name"] = tool_name
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
+
+    positive = await reader.read_current_attachment(**kwargs)
+    assert positive.result.success and positive.result.updated_state is kwargs["state"]
+    assert reads == [len(raw)] and requested_sizes == [limit + 1] and opened_paths == [path]
+    assert positive.retained.attachment_inspections[0].size_bytes == limit
+    historical_json = canonical_json(positive.retained.model_dump(mode="json"))
+
+    # The same original is one byte over the new limit. A prior successful
+    # inspection remains history and cannot clear this fresh current read.
+    _set_current_inspection_limit(kwargs["service"], limit - 1)
+    reads.clear()
+    requested_sizes.clear()
+    opened_paths.clear()
+    refused = await reader.read_current_attachment(**kwargs)
+    assert not refused.result.success and refused.result.updated_state is kwargs["state"]
+    assert refused.result.validation.errors[0].message == (
+        "The complete attachment was refused by the current inspection policy; no content was returned."
+    )
+    assert reads == requested_sizes == opened_paths == []
+    assert refused.retained.attachment_inspections == ()
+    assert refused.retained.blob_versions == positive.retained.blob_versions
+    assert decode_read_owner_result(historical_json) == positive.retained
+    assert re_admit_read_owner_result(positive.retained)["success"] is True
+    if len(raw.decode("utf-8")) != len(raw):
+        assert len(raw.decode("utf-8")) < limit - 1
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ("read_attachment", "get_blob_content"))
+async def test_configured_attachment_limit_changes_actual_inspection_fingerprint(operation_store, monkeypatch, tool_name):
+    raw = b"Complete ordinary customer prose"
+    limits = (64, 128, READ_ATTACHMENT_MAX_UTF8_BYTES)
+    kwargs, path, _actors = await read_case(operation_store, raw, inspection_max_bytes=limits[0])
+    kwargs["tool_name"] = tool_name
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
+    results = []
+    for limit in limits:
+        _set_current_inspection_limit(kwargs["service"], limit)
+        actual = await reader.read_current_attachment(**kwargs)
+        assert actual.result.success and actual.result.updated_state is kwargs["state"]
+        inspection = actual.retained.attachment_inspections[0]
+        assert inspection.policy_fingerprint == AttachmentInspectionPolicy(limit, env_ref_names=kwargs["inventory"].names).fingerprint
+        assert inspection.size_bytes == len(raw) and inspection.content_hash == sha256(raw).hexdigest()
+        results.append(actual)
+
+    assert len({actual.retained.attachment_inspections[0].policy_fingerprint for actual in results}) == len(limits)
+    assert all(actual.retained.blob_versions == results[0].retained.blob_versions for actual in results)
+    assert reads == [len(raw)] * len(limits)
+    assert requested_sizes == [limit + 1 for limit in limits]
+    assert opened_paths == [path] * len(limits)
+    for actual in results:
+        assert decode_read_owner_result(canonical_json(actual.retained.model_dump(mode="json"))) == actual.retained
+        assert re_admit_read_owner_result(actual.retained)["success"] is True
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
+async def test_inspection_limit_does_not_raise_complete_serialized_response_limit(operation_store, monkeypatch):
+    raw = b"x" * READ_ATTACHMENT_MAX_UTF8_BYTES
+    kwargs, path, _actors = await read_case(operation_store, raw)
+    reads, requested_sizes, opened_paths = _spy_blob_reads(monkeypatch, path)
+    actual = await reader.read_current_attachment(**kwargs)
+    assert not actual.result.success and actual.result.updated_state is kwargs["state"]
+    assert "complete serialized response exceeds" in actual.result.validation.errors[0].message
+    assert reads == [len(raw)] and requested_sizes == [READ_ATTACHMENT_MAX_UTF8_BYTES + 1] and opened_paths == [path]
+    assert actual.retained.attachment_inspections[0].size_bytes == len(raw)
+    assert re_admit_read_owner_result(actual.retained)["success"] is False
     kwargs["required_work"].coordinator.assert_completed()
 
 
@@ -414,7 +515,7 @@ async def test_policy_uses_actual_names_inventory_without_resolving_values(opera
         monkeypatch.setattr(resolver, "resolve", forbidden)
         monkeypatch.setattr(resolver, "resolve_scoped", forbidden)
     raw = b'{"api_key":"${ATTACHMENT_TEST_REF}"}'
-    kwargs, _path, _actors = await read_case(operation_store, raw, secret_service=resolver)
+    kwargs, _path, _actors = await read_case(operation_store, raw, secret_service=resolver, inspection_max_bytes=4096)
     actual = await reader.read_current_attachment(**kwargs)
     assert actual.result.success is configured
     assert bool(actual.retained.attachment_inspections) is configured

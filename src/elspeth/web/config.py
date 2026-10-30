@@ -376,6 +376,17 @@ class WebSettings(BaseModel):
         ge=1,
         description="Maximum canonical UTF-8 bytes of final prepared messages and tools for each physical model attempt.",
     )
+    composer_attachment_inspection_max_bytes: int = Field(
+        default=262_144,
+        strict=True,
+        ge=1,
+        le=262_144,
+        description=(
+            "Maximum complete-original bytes inspected by each current V2 attachment read, before paging. "
+            "Operators may tighten the existing inspection ceiling; independent response and credential limits still apply. "
+            "This setting does not configure V1 or direct-tool attachment reads."
+        ),
+    )
     composer_timeout_seconds: float = Field(..., gt=0)
     # Direct planner policy and legacy eligible Web v1 compatibility bounds.
     # Common v1 preserves physical calls, exact request bytes, completion and

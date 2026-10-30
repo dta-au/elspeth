@@ -18,7 +18,6 @@ from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, owned_json
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
-from elspeth.web.composer.redaction import READ_ATTACHMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_context
@@ -100,7 +99,7 @@ def _execute_current_attachment_read(
             raise AuditIntegrityError("attachment read changed its current session principal")
     snapshot, catalog = service._policy_context.build(actor)
     observations = ContinuationReadObservations()
-    policy = AttachmentInspectionPolicy(READ_ATTACHMENT_MAX_UTF8_BYTES, env_ref_names=names)
+    policy = AttachmentInspectionPolicy(service._settings.composer_attachment_inspection_max_bytes, env_ref_names=names)
     context = ToolContext(
         catalog=catalog,
         plugin_snapshot=snapshot,
