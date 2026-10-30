@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, TypeAliasType, Union, cast, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -4137,6 +4137,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "status",
                     "code",
                     "outbound_call_made",
+                    "error_type",
+                    "failure_code",
+                    "reason",
+                    "detail",
                     "error",
                     "error_class",
                     "budget_used",
@@ -4206,6 +4210,31 @@ def _redact_declarative_known_response_value(
         )
         return _project_validated_response_scalars(redacted)
     return _project_untrusted_response_structure(value, path=(field_name,))
+
+
+def _context_unsupported_response_projection(
+    tool_name: str,
+    *,
+    success: object,
+    outbound_call_made: object,
+    error_type: object,
+    failure_code: object,
+    reason: object,
+    detail: object,
+) -> dict[str, str]:
+    """Admit only the complete fixed manual-Advisor refusal vocabulary."""
+    if tool_name != "request_advisor_hint" or success is not False or outbound_call_made is not False:
+        return {}
+    from elspeth.web.composer.protocol import ComposerContextUnsupported, ComposerContextUnsupportedReason
+
+    if type(reason) is not str or reason not in get_args(ComposerContextUnsupportedReason):
+        return {}
+    expected = ComposerContextUnsupported(cast(ComposerContextUnsupportedReason, reason)).to_payload()
+    if any(type(value) is not str for value in (error_type, failure_code, detail)):
+        return {}
+    if error_type != expected["error_type"] or failure_code != expected["failure_code"] or detail != expected["detail"]:
+        return {}
+    return expected
 
 
 def redact_tool_call_response(
@@ -4355,6 +4384,15 @@ def redact_tool_call_response(
     policy = entry.policy
     assert policy is not None  # offensive: satisfies the type-checker contract
 
+    context_refusal_projection = _context_unsupported_response_projection(
+        tool_name,
+        success=response["success"] if "success" in response else None,
+        outbound_call_made=response["outbound_call_made"] if "outbound_call_made" in response else None,
+        error_type=response["error_type"] if "error_type" in response else None,
+        failure_code=response["failure_code"] if "failure_code" in response else None,
+        reason=response["reason"] if "reason" in response else None,
+        detail=response["detail"] if "detail" in response else None,
+    )
     redacted: dict[str, Any] = {}
     for key, value in response.items():
         if key in policy.sensitive_response_keys:
@@ -4375,6 +4413,10 @@ def redact_tool_call_response(
                 # Over-budget known value: degrade this key only, never the row.
                 telemetry.response_projection_limit(tool_name=tool_name, scope="key")
                 redacted[key] = _REDACTED_RESPONSE_PROJECTION_LIMIT
+            elif key in context_refusal_projection:
+                # These are the owned serializer's four fixed strings, admitted
+                # together with their reason/detail and undispatched binding.
+                redacted[key] = context_refusal_projection[key]
             else:
                 redacted[key] = _redact_declarative_known_response_value(
                     value,

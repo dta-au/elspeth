@@ -99,7 +99,7 @@ async def stored_reader_cut(store, data_dir):
         drained=graph.drained,
         env_ref_names=frozenset(),
     )
-    assert retained.requires_blob_reader
+    assert retained.snapshot.requires_blob_reader
     chunk = encode_turn_evidence(retained)
     frame = selected.stack.frames[0].model_copy(update={"evidence": chunk.reference})
     root = selected.stack.model_copy(update={"frames": (frame,)})
@@ -135,8 +135,10 @@ async def stored_reader_cut(store, data_dir):
 async def test_actual_current_restore_rebuilds_required_reader_without_serializing_capability(operation_store, tmp_path):
     service, original, running, selected, inventory, retained = await stored_reader_cut(operation_store, tmp_path)
     chunk = encode_turn_evidence(retained)
-    assert decode_turn_evidence(chunk, env_ref_names=inventory.names) == retained
-    assert not {"service", "engine", "data_dir", "context", "lease_token"}.intersection(retained.model_dump())
+    assert (
+        decode_turn_evidence(chunk, env_ref_names=inventory.names, source_chunks=retained.dependency_chunks).snapshot == retained.snapshot
+    )
+    assert not {"service", "engine", "data_dir", "context", "lease_token"}.intersection(retained.snapshot.model_dump())
     work = inventory_work(running)
     restored = await restore_turn_evidence(
         authority=operation_store[2], selected=selected, inventory=inventory, required_work=work, service=service
@@ -154,8 +156,8 @@ async def test_actual_current_restore_rebuilds_required_reader_without_serializi
             drained=restored.drained,
             logical=selected.stack.logical,
             env_ref_names=inventory.names,
-        )
-        == retained
+        ).snapshot
+        == retained.snapshot
     )
     work.coordinator.assert_completed()
     refusal = inventory_work(running)
@@ -220,9 +222,14 @@ async def test_required_reader_bit_cannot_default_when_omitted(operation_store, 
     from elspeth.web.composer.continuation_codec import encode_private_chunk
 
     _service, _reader, _running, _selected, inventory, retained = await stored_reader_cut(operation_store, tmp_path)
-    assert decode_turn_evidence(encode_turn_evidence(retained), env_ref_names=inventory.names) == retained
-    payload = retained.model_dump(mode="json")
+    assert (
+        decode_turn_evidence(
+            encode_turn_evidence(retained), env_ref_names=inventory.names, source_chunks=retained.dependency_chunks
+        ).snapshot
+        == retained.snapshot
+    )
+    payload = retained.snapshot.model_dump(mode="json")
     del payload["requires_blob_reader"]
-    chunk = encode_private_chunk(codec="composer.evidence.v1", canonical=canonical_json(payload))
+    chunk = encode_private_chunk(codec="composer.evidence.v2", canonical=canonical_json(payload))
     with pytest.raises(AuditIntegrityError):
-        decode_turn_evidence(chunk, env_ref_names=inventory.names)
+        decode_turn_evidence(chunk, env_ref_names=inventory.names, source_chunks=retained.dependency_chunks)

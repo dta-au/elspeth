@@ -258,6 +258,18 @@ def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[s
     for effects in (graph.effects, *(item for cut in graph.cuts for item in (cut.effects_before, cut.effects_after))):
         _admit_effects(effects, env_ref_names)
     encode_recorder_snapshot(graph.recorder)
+    from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
+
+    for data in (graph.selected, *(cut.data for cut in graph.cuts)):
+        require_retained_failure_links(data, graph.recorder.invocations)
+        failure = data.batch.retained_failure
+        source = None if failure is None else failure.refusal_source
+        if (
+            source is not None
+            and source.provider_call_id is not None
+            and sum(call.call_id == source.provider_call_id for call in graph.recorder.llm_calls) != 1
+        ):
+            raise AuditIntegrityError("retained policy refusal lost its actual recorder cost correlation")
     for cut in graph.cuts:
         if type(cut) is not ApplicationGraphCut:
             raise TypeError("application graph contains another cut owner")
@@ -271,20 +283,26 @@ def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[s
 
 
 def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozenset[str]) -> str:
-    from elspeth.web.composer.continuation_batch_data import _decode_graph, _encode
+    from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode, _encode_values
 
     encoded = _encode(graph.selected, env_ref_names, application=graph)
-    restored = _decode_graph(encoded, env_ref_names, application=True)
-    if type(restored) is not ApplicationGraph or _encode(restored.selected, env_ref_names, application=restored) != encoded:
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True)
+    if (
+        type(restored) is not ApplicationGraph
+        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored) != encoded
+    ):
         raise AuditIntegrityError("application constructors changed the actual alias partition")
     return encoded
 
 
 def decode_application_graph(encoded: str, *, env_ref_names: frozenset[str]) -> ApplicationGraph:
-    from elspeth.web.composer.continuation_batch_data import _decode_graph, _encode
+    from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode_values
 
-    restored = _decode_graph(encoded, env_ref_names, application=True)
-    if type(restored) is not ApplicationGraph or _encode(restored.selected, env_ref_names, application=restored) != encoded:
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True)
+    if (
+        type(restored) is not ApplicationGraph
+        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored) != encoded
+    ):
         raise AuditIntegrityError("application graph lost complete values or aliases")
     return restored
 

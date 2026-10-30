@@ -1,7 +1,7 @@
 {
   "src/elspeth/web/async_workers.py": {
     "protected_exports": [],
-    "sha256": "40b670cb74242c59fa129fefb6cee2fcd6f1e03127a1128e484d651fadd7b034"
+    "sha256": "8fe8b426e259de0163289bcb3999a0024379ed94f132bfe8de77402144cc62ef"
   },
   "src/elspeth/web/composer/transcript_blob_reader.py": {
     "protected_exports": [],
@@ -9,11 +9,11 @@
   },
   "src/elspeth/web/coordination/composer_operation_authority.py": {
     "protected_exports": [],
-    "sha256": "65f502b47064498200884d1015521b386bdeffb8148f5530a709f3094b6de851"
+    "sha256": "f4da24239a18419aca382174e42dbbcba9d7cefb3da02a93d0a8a8c216076891"
   },
   "src/elspeth/web/coordination/lifecycle.py": {
     "protected_exports": [],
-    "sha256": "e71f280555a04eae5c80fd1fe655a2e7da957d62e4a9fb49c02f93c523901b2c"
+    "sha256": "c328240de2b159e3e6682efc572944f6fdebca372d007aa0b74b859f3222fca6"
   },
   "src/elspeth/web/execution_lease_cleanup.py": {
     "protected_exports": [],
@@ -25,7 +25,7 @@
   },
   "src/elspeth/web/required_work.py": {
     "protected_exports": [],
-    "sha256": "89b424a876c255f5c71b5dc775e4fb6710d6807045a7e1210979d6e58e7e7b6e"
+    "sha256": "eaf9cb69d6bd2ab7d86262abd8e5af8fd97a2ca5ff652ad7d469273dcb106ad7"
   },
   "src/elspeth/web/sessions/composer_operation_errors.py": {
     "protected_exports": [
@@ -34,7 +34,7 @@
       "worker_lost_error",
       "project_composer_operation_error"
     ],
-    "sha256": "8a8e61070fcefb90379c8a88459592aae18705564575ca9a20c07a040d90e381"
+    "sha256": "34c5a8a43743c1a7bcc3e3013ddbfc29986a5b0138b37dfe45400c01859554ef"
   },
   "src/elspeth/web/sessions/composer_operations.py": {
     "protected_exports": [
@@ -62,10 +62,10 @@
   },
   "src/elspeth/web/sessions/protocol.py": {
     "protected_exports": [],
-    "sha256": "30f257a87e405eef36645cf2fd55e284d05c8cf32d1296128bb9a4192ca421e8"
+    "sha256": "5f453f3e66948e45e526fc770086498386d2c14868374fc9c55bcda15dec913d"
   },
   "src/elspeth/web/sessions/service.py": {
     "protected_exports": [],
-    "sha256": "798a772964bb9e6af87c0c78907b00dd72fc63a6c01f177fd8f1f68e1e948f93"
+    "sha256": "a97cec855dd7d059175a2da465177d6f3f0c3ea907702dbcef1e744122e91c3c"
   }
 }

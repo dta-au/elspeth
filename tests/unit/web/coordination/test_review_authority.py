@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import Engine, insert, select, update
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.web.coordination.review_authority import (
     ChangesRequestedNeedsNote,
@@ -59,7 +60,12 @@ def authority(engine: Engine) -> RepositoryReviewAuthority:
         )
         conn.execute(
             insert(composition_states_table).values(
-                id="state-1", session_id="session-1", version=1, provenance="session_seed", created_at=now
+                metadata_=stored_default_pipeline_metadata(),
+                id="state-1",
+                session_id="session-1",
+                version=1,
+                provenance="session_seed",
+                created_at=now,
             )
         )
     return RepositoryReviewAuthority(engine)
@@ -325,7 +331,12 @@ def test_addressed_request_only_admits_its_reviewer_and_cancelled_request_admits
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id="state-2", session_id="session-1", version=2, provenance="session_seed", created_at=datetime.now(UTC)
+                metadata_=stored_default_pipeline_metadata(),
+                id="state-2",
+                session_id="session-1",
+                version=2,
+                provenance="session_seed",
+                created_at=datetime.now(UTC),
             )
         )
     with pytest.raises(OpenReviewRequestRequired):

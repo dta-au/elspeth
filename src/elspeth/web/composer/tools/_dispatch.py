@@ -724,10 +724,8 @@ def _augment_with_plugin_schemas(
 def _augment_with_validation_guidance(result: ToolResult, tool_name: str) -> ToolResult:
     """Attach inline catalogue repair guidance to a failed mutation.
 
-    The freeform twin of the planner surface's rejection enrichment
-    (``pipeline_planner._allowlisted_candidate_feedback``, which resolves the
-    same catalogue through ``explain_validation_code``). Without it the
-    freeform tool loop shipped a bare closed code and the model had to spend
+    Resolve the static catalogue through ``explain_validation_code``.
+    Without it the tool loop shipped a bare closed code and the model had to spend
     a turn on ``explain_validation_error`` to learn the fix — the exact
     round-trip ``plugin_schemas`` already eliminates for option-shape
     failures (elspeth-5ff149dc4e; live session 891b7b1e burned a turn on

@@ -60,6 +60,7 @@ from elspeth_lints.core.protocols import (
     Finding as LintFinding,
 )
 from elspeth_lints.core.protocols import RuleContext, RuleMetadata, RuleScope, Severity
+from elspeth_lints.rules.trust_tier.tier_model.exception_taxonomy import ExceptionTaxonomy
 from elspeth_lints.rules.trust_tier.tier_model.metadata import RULE_ID, RULE_METADATA
 from elspeth_lints.rules.trust_tier.tier_model.scope_fingerprint import (
     compute_scope_fingerprint,
@@ -622,7 +623,14 @@ class TierModelVisitor(ast.NodeVisitor):
         "web/sessions/telemetry.py": frozenset({"observed_value"}),
     }
 
-    def __init__(self, file_path: str, source_lines: list[str], file_fingerprint: str) -> None:
+    def __init__(
+        self,
+        file_path: str,
+        source_lines: list[str],
+        file_fingerprint: str,
+        *,
+        exception_taxonomy: ExceptionTaxonomy | None = None,
+    ) -> None:
         self.file_path = file_path
         self.source_lines = source_lines
         self.file_fingerprint = file_fingerprint
@@ -647,6 +655,13 @@ class TierModelVisitor(ast.NodeVisitor):
         # and we can look at "the innermost enclosing decorated function" via
         # a reverse walk of the stack.
         self._boundary_stack: list[tuple[BoundaryMetadata, DerivedNameState] | None] = []
+        self._exception_taxonomy = exception_taxonomy
+
+    def visit_Module(self, node: ast.Module) -> None:
+        if self._exception_taxonomy is None:
+            # Direct visitors retain a finite, conservative single-AST mode.
+            self._exception_taxonomy = ExceptionTaxonomy({self.file_path: node})
+        self.generic_visit(node)
 
     @property
     def _import_aliases(self) -> dict[str, str]:
@@ -1588,6 +1603,10 @@ class TierModelVisitor(ast.NodeVisitor):
             or self._is_pydantic_before_validator()
             or self._is_fastapi_route_handler()
             or self._is_named_tier3_boundary_context()
+            or (
+                self._exception_taxonomy is not None
+                and self._exception_taxonomy.is_exception_kind(self.file_path, node, self._qualified_import_name)
+            )
         )
 
     def _is_immediate_setdefault_grouping_call(self, node: ast.Call) -> bool:
@@ -2194,34 +2213,61 @@ class TierModelVisitor(ast.NodeVisitor):
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class _TierModelSource:
+    relative_path: str
+    source_lines: list[str]
+    file_fingerprint: str
+    tree: ast.Module
+
+
 def scan_file(file_path: Path, root: Path) -> list[Finding]:
     """Scan a single Python file for bug-hiding patterns."""
     findings, _suppressed_findings = scan_file_with_observations(file_path, root)
     return findings
 
 
-def scan_file_with_observations(file_path: Path, root: Path) -> tuple[list[Finding], list[Finding]]:
-    """Scan a single Python file and return violations plus suppression observations."""
+def _read_tier_model_source(file_path: Path, root: Path) -> _TierModelSource | None:
     try:
         source_bytes = file_path.read_bytes()
         source = source_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError) as e:
         print(f"Warning: Could not read {file_path}: {e}", file=sys.stderr)
-        return [], []
+        return None
 
     try:
         tree = ast.parse(source, filename=str(file_path))
     except SyntaxError as e:
         print(f"Warning: Syntax error in {file_path}: {e}", file=sys.stderr)
-        return [], []
+        return None
 
-    source_lines = source.splitlines()
-    relative_path = str(file_path.relative_to(root))
-    file_fingerprint = hashlib.sha256(source_bytes).hexdigest()
+    return _TierModelSource(
+        relative_path=file_path.relative_to(root).as_posix(),
+        source_lines=source.splitlines(),
+        file_fingerprint=hashlib.sha256(source_bytes).hexdigest(),
+        tree=tree,
+    )
 
-    visitor = TierModelVisitor(relative_path, source_lines, file_fingerprint)
-    visitor.visit(tree)
+
+def _taxonomy_for_sources(sources: Sequence[_TierModelSource], root: Path) -> ExceptionTaxonomy:
+    return ExceptionTaxonomy(
+        {source.relative_path: source.tree for source in sources},
+        package_prefix="elspeth" if root.name == "elspeth" else "",
+    )
+
+
+def _scan_tier_model_source(source: _TierModelSource, taxonomy: ExceptionTaxonomy) -> tuple[list[Finding], list[Finding]]:
+    visitor = TierModelVisitor(source.relative_path, source.source_lines, source.file_fingerprint, exception_taxonomy=taxonomy)
+    visitor.visit(source.tree)
     return visitor.findings, visitor.suppressed_findings
+
+
+def scan_file_with_observations(file_path: Path, root: Path) -> tuple[list[Finding], list[Finding]]:
+    """Scan one file; missing cross-file facts deliberately remain unresolved."""
+    source = _read_tier_model_source(file_path, root)
+    if source is None:
+        return [], []
+    return _scan_tier_model_source(source, _taxonomy_for_sources((source,), root))
 
 
 def scan_directory(
@@ -2255,8 +2301,14 @@ def scan_directory_with_observations(
     findings: list[Finding] = []
     suppressed_findings: list[Finding] = []
 
-    for py_file in iter_scannable_python_files(root, exclude_patterns):
-        file_findings, file_suppressed_findings = scan_file_with_observations(py_file, root)
+    sources = [
+        source
+        for py_file in iter_scannable_python_files(root, exclude_patterns)
+        if (source := _read_tier_model_source(py_file, root)) is not None
+    ]
+    taxonomy = _taxonomy_for_sources(sources, root)
+    for source in sources:
+        file_findings, file_suppressed_findings = _scan_tier_model_source(source, taxonomy)
         findings.extend(file_findings)
         suppressed_findings.extend(file_suppressed_findings)
 
@@ -3268,15 +3320,23 @@ def collect_check_result(
     suppressed_boundary_findings: list[Finding] = []
     if files:
         all_findings: list[Finding] = []
+        selected: list[tuple[Path, _TierModelSource | None]] = []
+        parsed: dict[Path, _TierModelSource | None] = {}
         for file_path in files:
             resolved = file_path.resolve()
             try:
                 resolved.relative_to(resolved_root)
             except ValueError:
                 continue
-            file_findings, file_suppressed = scan_file_with_observations(resolved, resolved_root)
-            all_findings.extend(file_findings)
-            suppressed_boundary_findings.extend(file_suppressed)
+            if resolved not in parsed:
+                parsed[resolved] = _read_tier_model_source(resolved, resolved_root)
+            selected.append((resolved, parsed[resolved]))
+        taxonomy = _taxonomy_for_sources([source for source in parsed.values() if source is not None], resolved_root)
+        for resolved, source in selected:
+            if source is not None:
+                file_findings, file_suppressed = _scan_tier_model_source(source, taxonomy)
+                all_findings.extend(file_findings)
+                suppressed_boundary_findings.extend(file_suppressed)
             layer_v, layer_tc = scan_layer_imports_file(resolved, resolved_root)
             all_findings.extend(layer_v)
             all_tc_findings.extend(layer_tc)
@@ -3502,10 +3562,14 @@ class TierModelRule:
     def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> list[LintFinding]:
         """Analyze one syntax tree for focused tests, or the whole repository root."""
         if isinstance(tree, ast.Module) and tree.body and file_path.suffix == ".py":
+            relative_path = _display_rule_file_path(file_path, context.root)
             visitor = TierModelVisitor(
-                _display_rule_file_path(file_path, context.root),
+                relative_path,
                 _source_lines_for_rule(file_path),
                 _file_fingerprint_for_rule(file_path),
+                exception_taxonomy=ExceptionTaxonomy(
+                    {relative_path: tree}, package_prefix="elspeth" if context.root.name == "elspeth" else ""
+                ),
             )
             visitor.visit(tree)
             return [_legacy_finding_to_lint(finding) for finding in [*visitor.findings, *visitor.suppressed_findings]]

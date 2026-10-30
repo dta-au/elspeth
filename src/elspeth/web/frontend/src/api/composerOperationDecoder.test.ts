@@ -162,3 +162,15 @@ it("retains actual saved facts for mutation authority refusal without inventing 
   expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
   expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "invented_auto_proposal" } }, sid, id)).toThrow();
 });
+
+it("decodes the context-unsupported progress reason (U-22 F4)", () => {
+  const frame = { ...heartbeat, event: "progress", payload: {
+    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    phase: "failed", headline: "This request is too large to send to the model.",
+    evidence: ["The current pipeline is too large to send to the model. Reduce its size and try again."],
+    likely_next: "Reduce the pipeline or conversation size, then send the request again.", reason: "context_unsupported",
+    updated_at: "2026-10-25T08:00:00Z",
+  } };
+  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
+  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "context_unsupported_invented" } }, sid, id)).toThrow();
+});

@@ -27,13 +27,14 @@ from elspeth.contracts.prompt_guard import (
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
-from elspeth.web.composer.content_views import BoundedCompositionView, build_bounded_composition_view
+from elspeth.web.composer.content_views import BoundedCompositionView, CompositionViewUnsupported, build_bounded_composition_view
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
     COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
+    ComposerContextUnsupported,
     ComposerHistoryMessage,
 )
 from elspeth.web.composer.redaction import redact_source_storage_path
@@ -327,10 +328,9 @@ def _project_component_options(options: Any) -> Any:
 def project_server_owned_option_metadata(serialized: dict[str, Any]) -> dict[str, Any]:
     """Project server-owned option metadata out of a serialized state dict.
 
-    Applied between ``CompositionState.to_dict()`` and any planner-facing
-    surface (the per-turn state context message here; ``plan_pipeline``'s
-    ``provider_current_state`` in the direct planner library) so a read-modify-write over
-    what the planner sees is round-trippable into ``set_pipeline``. Drops
+    Applied between ``CompositionState.to_dict()`` and the model-facing
+    per-turn state context message here, so a read-modify-write over what the
+    model sees is round-trippable into ``set_pipeline``. Drops
     ``source_authoring`` and ``approved_prompt_artifact_hash`` from every
     source/node/output options block. Public ``prompt_template_parts`` remain
     exact. Requirement rows retain identity and status without resolver linkage;
@@ -395,7 +395,10 @@ def build_composition_content_view(
         raise AuditIntegrityError("Composition content projection requires owned state and actual session scope")
     if content_scope.composition_content_hash != composition_content_hash(state):
         raise AuditIntegrityError("Composition content projection differs from its current graph scope")
-    return build_bounded_composition_view(content_scope, project_composition_content(state, env_ref_names=env_ref_names))
+    try:
+        return build_bounded_composition_view(content_scope, project_composition_content(state, env_ref_names=env_ref_names))
+    except CompositionViewUnsupported as exc:
+        raise ComposerContextUnsupported("graph_resource_limit") from exc
 
 
 def build_context_string(

@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import func, insert, select, update
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy, QuotaDisposition
 from elspeth.contracts.errors import AuditIntegrityError
@@ -99,7 +100,12 @@ def _admission(engine):
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id), session_id=str(session.id), version=1, provenance="session_seed", created_at=datetime.now(UTC)
+                metadata_=stored_default_pipeline_metadata(),
+                id=str(state_id),
+                session_id=str(session.id),
+                version=1,
+                provenance="session_seed",
+                created_at=datetime.now(UTC),
             )
         )
     envelope = RunExecutionInput(

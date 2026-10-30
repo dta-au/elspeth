@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, NoReturn
 from pydantic import TypeAdapter
 from pydantic import ValidationError as ModelValidationError
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring, ToolArgumentErrorCategory
+from elspeth.contracts.composer_audit import (
+    ComposerToolInvocation,
+    ComposerToolStatus,
+    PrivateFailureFacts,
+    PrivateToolAuthoring,
+    ToolArgumentErrorCategory,
+)
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.enums import AuditCharacteristic
@@ -39,6 +45,7 @@ from elspeth.web.composer.continuation_dispatch_audit import (
 )
 from elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials
 from elspeth.web.composer.continuation_tool_batch import (
+    RetainedAdvisorRefusalSource,
     RetainedBatchFailure,
     _decode_validation,
     _read_json_value,
@@ -51,6 +58,7 @@ from elspeth.web.composer.continuation_tool_receipts import (
     require_receipt_result,
 )
 from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, admit_discovery_result
+from elspeth.web.composer.manual_advisor_allowance import ManualAdvisorAllowance
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts
@@ -155,6 +163,14 @@ def _joint(
     ):
         raise TypeError("batch retention requires the actual coupled owners")
     batch, acc, calls = data.batch, data.accumulator, data.calls
+    # This live-only owner has no retained wire representation. Every capture
+    # path (quiescent, prepared and completed) shares this check before encoding:
+    # cold reconstruction may restore only the settled spent integer, never
+    # silently drop an active dispatch/refund obligation.
+    if batch.manual_advisor_allowance is not None:
+        if type(batch.manual_advisor_allowance) is not ManualAdvisorAllowance:
+            _fail("batch manual Advisor allowance lost its nominal live owner")
+        batch.manual_advisor_allowance.require_settled(used=batch.advisor_calls_used)
     if memory_completion and prepared is None:
         _fail("memory completion lost its retained audit/dialect")
     if type(calls) is not tuple or any(
@@ -303,6 +319,9 @@ def _joint(
         _check_prepared(data, prepared[0], prepared[1], env_ref_names, memory_completion=memory_completion)
         if memory_completion:
             _check_memory_completion(data, prepared[0], env_ref_names, result_tools)
+    from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
+
+    require_retained_failure_links(data)
     return result_tools
 
 
@@ -538,6 +557,15 @@ def _members(value: Any, selected_tool: str | None = None) -> tuple[str, dict[st
         return "RetainedBatchFailure", {
             "kind": value.kind,
             "error_class": value.error_class,
+            "refusal_source": value.refusal_source,
+        }
+    if type(value) is RetainedAdvisorRefusalSource:
+        return "RetainedAdvisorRefusalSource", {
+            "kind": value.kind,
+            "outcome": value.outcome,
+            "invocation": value.invocation,
+            "provider_call_id": value.provider_call_id,
+            "allowance_limit": value.allowance_limit,
         }
     if type(value) is PluginSchemaInfo:
         return "PluginSchemaInfo", {
@@ -758,7 +786,8 @@ _FIELDS = {
         "diagnostic_reference",
         "retryable",
     ),
-    "RetainedBatchFailure": ("kind", "error_class"),
+    "RetainedBatchFailure": ("kind", "error_class", "refusal_source"),
+    "RetainedAdvisorRefusalSource": ("kind", "outcome", "invocation", "provider_call_id", "allowance_limit"),
 }
 
 
@@ -873,12 +902,9 @@ def _construct(kind: str, members: dict[str, Any]) -> Any:
             _fail("batch constructor changed nominal types or complete values")
         return checked_request_rejection.model_copy(update=members)
     if kind == "RetainedBatchFailure":
-        checked_retained_failure = RetainedBatchFailure(**members)
-        # The real constructor validates every value first. Preserve shared
-        # list/model objects instead of Pydantic's container copies.
-        if _constructor_shape(_members(checked_retained_failure)[1]) != _constructor_shape(members):
-            _fail("batch constructor changed nominal types or complete values")
-        return checked_retained_failure.model_copy(update=members)
+        return RetainedBatchFailure(**members)
+    if kind == "RetainedAdvisorRefusalSource":
+        return RetainedAdvisorRefusalSource(**members)
     if kind == "PluginSchemaInfo":
         checked_plugin_schema = PluginSchemaInfo(**members)
         if _constructor_shape(_members(checked_plugin_schema)[1]) != _constructor_shape(members):
@@ -922,6 +948,25 @@ def _encode(
             prepared = (application.selected_audit, application.selected_dialect)
     else:
         result_tools = _joint(data, env_ref_names, prepared, memory_completion=memory_completion)
+    return _encode_values(data, env_ref_names, result_tools, prepared, memory_completion=memory_completion, application=application)
+
+
+def _encode_values(
+    data: RestoredBatchData,
+    env_ref_names: frozenset[str],
+    result_tools: dict[int, str],
+    prepared: tuple[PortableDispatchAudit, ToolContractDialect] | None = None,
+    *,
+    memory_completion: bool = False,
+    application: ApplicationGraph | None = None,
+) -> str:
+    """Directional wire emission inside an already checked constructor call.
+
+    This returns JSON only, never admission or authority. Source constructors
+    still own complete decoding, role checks and the alias-partition comparison.
+    """
+    if application is not None and application.selected_audit is not None and application.selected_dialect is not None:
+        prepared = application.selected_audit, application.selected_dialect
     identities: dict[int, int] = {}
     active: set[int] = set()
     nodes: list[Any] = []
@@ -950,6 +995,16 @@ def _encode(
             from elspeth.web.composer.continuation_application_graph import application_members
 
             extra_members = application_members(value)
+        elif type(value) is ComposerToolInvocation:
+            # Only the new closed refusal edge reaches an invocation in a
+            # standalone batch. Reuse its exact codec/private-authoring links;
+            # arbitrary application roots remain unavailable in this mode.
+            from elspeth.web.composer.continuation_application_graph import application_members
+
+            extra_members = application_members(value)
+        elif type(value) is PrivateFailureFacts:
+            # Crash facts are not a lawful successful-refusal edge.
+            _fail("standalone refusal invocation cannot acquire crash facts")
         if extra_members is not None:
             extra_kind, extra_fields = extra_members
             node = {"kind": extra_kind, "value": [[key, visit(item, depth + 1)] for key, item in extra_fields.items()]}
@@ -1007,8 +1062,12 @@ def _encode(
                 # response contracts. Its copy is never used to infer aliases.
                 encode_tool_result_value(result_tools[identity], value, env_ref_names=env_ref_names)
                 _safe(value._validation_snapshot_hash, env_ref_names)
-            if type(value) in (ValidationResult, ComposerMutationRevocation, ComposerMutationCeiling, RetainedBatchFailure):
+            if type(value) in (ValidationResult, ComposerMutationRevocation, ComposerMutationCeiling):
                 _safe(TypeAdapter(type(value)).dump_python(value, mode="json", warnings="error"), env_ref_names)
+            if type(value) is RetainedBatchFailure:
+                _safe((value.kind, value.error_class), env_ref_names)
+            if type(value) is RetainedAdvisorRefusalSource:
+                _safe((value.kind, value.provider_call_id, value.allowance_limit), env_ref_names)
             node = {"kind": kind, "value": [[key, visit(item, depth + 1)] for key, item in members.items()]}
         nodes[index] = node
         active.remove(identity)
@@ -1040,6 +1099,17 @@ def _decode_graph(
     memory_completion: bool = False,
     application: bool = False,
 ) -> RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph:
+    return _decode_graph_values(encoded, env_ref_names, prepared=prepared, memory_completion=memory_completion, application=application)[0]
+
+
+def _decode_graph_values(
+    encoded: str,
+    env_ref_names: frozenset[str],
+    *,
+    prepared: bool = False,
+    memory_completion: bool = False,
+    application: bool = False,
+) -> tuple[RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph, dict[int, str]]:
     if type(encoded) is not str or len(encoded.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
         _fail("coupled batch data exceeds its complete byte bound")
     payload: Any = _read_json_value(encoded)
@@ -1150,7 +1220,7 @@ def _decode_graph(
                         _fail("prepared call lost its complete portable audit member")
                     audit_values.append(members["audit"])
                     members["audit"] = None
-                if application and kind.startswith("application_"):
+                if (application and kind.startswith("application_")) or kind == "application_invocation":
                     from elspeth.web.composer.continuation_application_graph import construct_application_member
 
                     result = construct_application_member(kind, members)
@@ -1174,26 +1244,26 @@ def _decode_graph(
                 application_value = ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)
             else:
                 application_value = ApplicationGraph(data, effects, recorder, cuts)
-            application_result_tools(application_value, env_ref_names)
+            result_tools = application_result_tools(application_value, env_ref_names)
         elif prepared:
             if len(audit_values) != 1 or dialect is None:
                 _fail("prepared batch lost its one exact audit/dialect owner")
-            _joint(data, env_ref_names, (audit_values[0], dialect), memory_completion=memory_completion)
+            result_tools = _joint(data, env_ref_names, (audit_values[0], dialect), memory_completion=memory_completion)
         else:
-            _joint(data, env_ref_names)
+            result_tools = _joint(data, env_ref_names)
     except (KeyError, TypeError, ValueError, ModelValidationError) as error:
         raise AuditIntegrityError("retained coupled batch violates its actual owned constructors") from error
     if len(restored) != len(nodes):
         _fail("batch graph contains unreachable nodes")
     if application_value is not None:
-        return application_value
+        return application_value, result_tools
     if prepared:
         if dialect is None:
             _fail("prepared batch has no dialect")
         if memory_completion:
-            return RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)
-        return RestoredPreparedBatchData(batch, accumulator, calls, audit_values[0], dialect)
-    return data
+            return RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect), result_tools
+        return RestoredPreparedBatchData(batch, accumulator, calls, audit_values[0], dialect), result_tools
+    return data, result_tools
 
 
 def _decode(encoded: str, env_ref_names: frozenset[str]) -> RestoredBatchData:
@@ -1212,18 +1282,22 @@ def encode_coupled_batch_data(
 ) -> str:
     """Retain an actual quiescent data cut; refuse unsupported authority cuts."""
     encoded = _encode(RestoredBatchData(batch, accumulator, calls), env_ref_names)
-    restored = _decode(encoded, env_ref_names)
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names)
+    if type(restored) is not RestoredBatchData:
+        _fail("quiescent encoder restored another phase owner")
     # Ref IDs are allocated by identity, not value equality. This compares the
     # complete alias partition, field order, and node kinds as well as values.
-    if _encode(restored, env_ref_names) != encoded:
+    if _encode_values(restored, env_ref_names, result_tools) != encoded:
         _fail("actual constructors cannot preserve this batch alias topology")
     return encoded
 
 
 def decode_coupled_batch_data(encoded: str, *, env_ref_names: frozenset[str] = frozenset()) -> RestoredBatchData:
     """Return data owners only; no current fence or executable context is made."""
-    restored = _decode(encoded, env_ref_names)
-    if _encode(restored, env_ref_names) != encoded:
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names)
+    if type(restored) is not RestoredBatchData:
+        _fail("quiescent decoder restored another phase owner")
+    if _encode_values(restored, env_ref_names, result_tools) != encoded:
         _fail("retained batch lost its exact values or object alias partition")
     return restored
 

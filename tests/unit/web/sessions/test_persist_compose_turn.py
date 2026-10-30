@@ -26,6 +26,7 @@ from elspeth.web.sessions.proposal_authority import _valid_compartment_ingress_m
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -209,7 +210,6 @@ def test_checkpoint_witness_identity_or_commit_failure_exposes_no_committed_witn
 
     from elspeth.web.sessions._persist_payload import RedactedToolRow
     from elspeth.web.sessions.models import chat_messages_table, composition_states_table
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     session_id = str(uuid4())
     with service._engine.begin() as conn:
@@ -235,7 +235,7 @@ def test_checkpoint_witness_identity_or_commit_failure_exposes_no_committed_witn
                 redacted_assistant_tool_calls=({"id": "witness_failure", "function": {"name": "set_metadata"}},),
                 redacted_tool_rows=(
                     RedactedToolRow(
-                        tool_call_id="witness_failure", content="{}", composition_state_payload=StatePayload(data=CompositionStateData())
+                        tool_call_id="witness_failure", content="{}", composition_state_payload=StatePayload(data=composition_state_data())
                     ),
                 ),
                 parent_composition_state_id=None,
@@ -851,7 +851,6 @@ def test_insert_composition_state_allocates_contiguous_versions(service):
     proof for current 1A helpers is the SQLite race regression
     immediately below; Task 16 owns only the later
     ``persist_compose_turn`` stale-state intent check."""
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000402")
@@ -863,7 +862,7 @@ def test_insert_composition_state_allocates_contiguous_versions(service):
                         conn,
                         session_id="00000000-0000-4000-8000-000000000402",
                         payload=StatePayload(
-                            data=CompositionStateData(),
+                            data=composition_state_data(),
                             derived_from_state_id=None,
                         ),
                         provenance="session_seed",
@@ -952,7 +951,6 @@ def test_insert_composition_state_versions_are_per_session(service):
     session, breaking the per-session monotonic-version contract every
     other read path assumes (cf. Task 11's ``assert states[0].version
     == 1`` after a fresh session)."""
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000404")
@@ -963,7 +961,7 @@ def test_insert_composition_state_versions_are_per_session(service):
                     conn,
                     session_id="00000000-0000-4000-8000-000000000404",
                     payload=StatePayload(
-                        data=CompositionStateData(),
+                        data=composition_state_data(),
                         derived_from_state_id=None,
                     ),
                     provenance="session_seed",
@@ -978,7 +976,7 @@ def test_insert_composition_state_versions_are_per_session(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000405",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -993,7 +991,6 @@ def test_insert_composition_state_versions_are_per_session(service):
 
 
 def test_insert_composition_state_requires_session_write_lock(service):
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="s4_no_lock")
@@ -1002,7 +999,7 @@ def test_insert_composition_state_requires_session_write_lock(service):
                 conn,
                 session_id="s4_no_lock",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -1012,8 +1009,6 @@ def test_insert_composition_state_requires_session_write_lock(service):
 
 def test_insert_composition_state_rejects_unknown_provenance(service):
     from sqlalchemy.exc import IntegrityError
-
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000406")
@@ -1026,7 +1021,7 @@ def test_insert_composition_state_rejects_unknown_provenance(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000406",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="rogue_value",
@@ -1050,8 +1045,6 @@ async def test_add_message_preserves_assert_state_in_session_guard(service):
     ``_assert_state_in_session``. Closes synthesised review finding SA-9."""
     from uuid import uuid4
 
-    from elspeth.web.sessions.protocol import CompositionStateData
-
     sid_a = uuid4()
     sid_b = uuid4()
     with service._engine.begin() as conn:
@@ -1071,7 +1064,7 @@ async def test_add_message_preserves_assert_state_in_session_guard(service):
     try:
         state_a = await service.save_composition_state(
             sid_a,
-            CompositionStateData(),
+            composition_state_data(),
             provenance="session_seed",
             session_operation_context=compose_context,
         )
@@ -1352,11 +1345,10 @@ async def test_add_messages_atomic_honors_per_draft_state_id_override(service):
     state) settle as ONE cohort: each draft's ``composition_state_id``
     override wins over the cohort-level value, and ``None`` falls back."""
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     session = await service.create_session("alice", "Pipeline", "local")
-    pre_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-    post_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    pre_state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
+    post_state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
 
     await service.add_messages_atomic(
         session.id,
@@ -1380,11 +1372,10 @@ async def test_add_messages_atomic_rejects_foreign_per_draft_state_id_atomically
     """A cross-session override state id is refused BEFORE any insert, so
     the well-formed sibling drafts in the same cohort persist nothing."""
     from elspeth.web.sessions._persist_payload import AuditMessageDraft
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     session = await service.create_session("alice", "Pipeline", "local")
     other_session = await service.create_session("alice", "Other", "local")
-    foreign_state = await service.save_composition_state(other_session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    foreign_state = await service.save_composition_state(other_session.id, composition_state_data(is_valid=True), provenance="session_seed")
 
     with pytest.raises(RuntimeError, match=r"add_messages_atomic.*cross-session"):
         await service.add_messages_atomic(
@@ -1424,7 +1415,6 @@ def test_persist_compose_turn_happy_path(service):
         RedactedToolRow,
         StatePayload,
     )
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     session_id = str(uuid5(_TEST_FENCE_NAMESPACE, "happy-path"))
     with service._engine.begin() as conn:
@@ -1443,7 +1433,7 @@ def test_persist_compose_turn_happy_path(service):
                 # held session write lock; the assertion below pins the
                 # allocated value to 1 (first state in this session).
                 composition_state_payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
             ),
@@ -1681,7 +1671,6 @@ def test_persist_compose_turn_rejects_cross_session_parent_state(service):
     FK error.
     """
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000407")
@@ -1691,7 +1680,7 @@ def test_persist_compose_turn_rejects_cross_session_parent_state(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000407",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -1724,7 +1713,6 @@ def test_persist_compose_turn_accepts_valid_same_session_parent_state(service):
     and the assistant row is correctly stamped with that
     ``composition_state_id``."""
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000409")
@@ -1733,7 +1721,7 @@ def test_persist_compose_turn_accepts_valid_same_session_parent_state(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000409",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -1768,7 +1756,7 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
     """A compose turn may not persist if the session's current state
     changed while the LLM call was in flight."""
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError
+    from elspeth.web.sessions.protocol import StaleComposeStateError
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000410")
@@ -1777,7 +1765,7 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000410",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -1787,7 +1775,7 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000410",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=stale_state_id,
                 ),
                 provenance="session_seed",
@@ -1830,7 +1818,6 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
     driver re-raises the captured crash.
     """
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000411")
@@ -1839,7 +1826,7 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
                 conn,
                 session_id="00000000-0000-4000-8000-000000000411",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",
@@ -1849,7 +1836,7 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
                 conn,
                 session_id="00000000-0000-4000-8000-000000000411",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=stale_state_id,
                 ),
                 provenance="session_seed",
@@ -1888,7 +1875,6 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
 
 def test_persist_compose_turn_accepts_matching_expected_current_state(service):
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     with service._engine.begin() as conn:
         _make_session(conn, session_id="00000000-0000-4000-8000-000000000412")
@@ -1897,7 +1883,7 @@ def test_persist_compose_turn_accepts_matching_expected_current_state(service):
                 conn,
                 session_id="00000000-0000-4000-8000-000000000412",
                 payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
                 provenance="session_seed",

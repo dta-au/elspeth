@@ -18,7 +18,7 @@ import httpx
 import pytest
 import pytest_asyncio
 import structlog
-from litellm.exceptions import APIError, ServiceUnavailableError
+from litellm.exceptions import APIError
 from litellm.litellm_core_utils import logging_worker
 from litellm.llms.openai.openai import OpenAIChatCompletion
 from sqlalchemy import select
@@ -28,17 +28,13 @@ from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, Charg
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer import pipeline_planner
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
     ComposerDiagnosticEvidence,
     diagnostic_evidence_identity,
 )
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.pipeline_proposal import AbsentBase
 from elspeth.web.composer.provider_gateway import _litellm_acompletion
 from elspeth.web.composer.provider_quota import (
     ProviderInvocationFamily,
@@ -50,8 +46,6 @@ from elspeth.web.coordination import chargeable_admission_authority, quota_autho
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import QuotaExceeded
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
 from elspeth.web.sessions.engine import create_session_engine
@@ -62,15 +56,8 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.fenced_session import IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.helpers.quota_guard import GuardedQuotaTurn, assert_provider_audit_companion, guarded_quota_turn
-from tests.unit.web.composer.test_pipeline_planner import (
+from tests.unit.web.composer._scripted_sdk import (
     _budget,
-    _custody,
-    _empty_state,
-    _lifecycle,
-    _model,
-    _origin,
-    _response,
-    _ScriptedCompletion,
 )
 
 
@@ -214,131 +201,6 @@ async def test_timeout_with_unknown_usage_blocks_next_physical_call(quota_servic
     assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
     assert dispatches == ["sent"]
     assert refusals == []
-
-
-async def _run_quota_planner(
-    *,
-    turn: GuardedQuotaTurn,
-    completion,
-    recorder: BufferingRecorder,
-    originating_message,
-    custody_config,
-):
-    """Use the real planner with this test's exact configured service and owner."""
-    catalog = create_catalog_service()
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    policy_catalog = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    # Match the original _plan fixture's complete discovery palette. Only the
-    # SDK response is scripted; guard, admission, planner and audit are real.
-    full_policy = pipeline_planner.PlannerDiscoveryPolicy(
-        manifest=pipeline_planner.PlannerInformationManifest(supplied=frozenset()),
-        discovery_tool_names=pipeline_planner.PLANNER_DISCOVERY_TOOL_NAMES,
-        unresolved_classes=(),
-    )
-    state = _empty_state()
-    with (
-        patch.object(pipeline_planner.PlannerDiscoveryPolicy, "initial", autospec=True, return_value=full_policy),
-        patch("litellm.acompletion", new=completion),
-    ):
-        return await pipeline_planner.plan_pipeline(
-            intent=turn.user_prompt,
-            current_state=state,
-            provider_current_state=state.to_dict(),
-            schemas_loaded=frozenset(),
-            mark_schema_loaded=None,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=snapshot,
-            originating_message=originating_message,
-            base=AbsentBase(),
-            model_config=_model(completion, max_api_attempts=2, prompt_guard_mode="required", prompt_guard_mount=turn.mount),
-            rendered_skill=f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
-            repair_budget=1,
-            budget_policy=_budget(),
-            custody_config=custody_config,
-            lifecycle=_lifecycle(),
-            recorder=recorder,
-            candidate_finalizer=lambda candidate: candidate,
-            provider_service=turn.owner.service,
-            provider_owner=turn.owner,
-        )
-
-
-@pytest.mark.asyncio
-async def test_second_planning_call_503_settles_before_quota_refuses_retry(
-    quota_service,
-    tmp_path: Path,
-    tool_context,
-) -> None:
-    engine, service, _ = quota_service
-    session = await service.create_session(user_id="alice", title="Planner quota", auth_provider_type="local")
-    secret = "UPSTREAM-RESPONSE-BODY-SECRET"
-
-    script = _ScriptedCompletion(
-        _response(("list_sources", {})),
-        ServiceUnavailableError(message=secret, llm_provider="test-provider", model="test/planner"),
-    )
-
-    recorder = BufferingRecorder()
-    origin = dataclasses.replace(_origin(), session_id=str(session.id), user_id="alice")
-
-    async with await _lease(service, session.id) as lease:
-        custody = dataclasses.replace(
-            _custody(tmp_path),
-            session_engine=engine,
-            session_operation_context=lease.context,
-            session_operation_authority=service.session_operation_authority,
-        )
-        with guarded_quota_turn(engine, service, lease.context) as turn, pytest.raises(ChargeableAdmissionRefused) as caught:
-            await _run_quota_planner(
-                turn=turn,
-                completion=script,
-                recorder=recorder,
-                originating_message=origin,
-                custody_config=custody,
-            )
-
-    turn.assert_audit(guards=3, calls=2, private=4)
-    rows = await service.get_messages(session.id, limit=None)
-    assert [
-        envelope["evidence"]["status"]
-        for row in rows
-        if row.role == "audit" and row.tool_calls
-        for envelope in row.tool_calls
-        if envelope["_kind"] == "composer_diagnostic_evidence"
-    ] == ["provider_request", "received_response", "provider_request", "provider_failure"]
-    assert caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
-    assert len(script.requests) == 2
-    assert [call.status for call in recorder.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.API_ERROR]
-    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
-    assert recorder.llm_calls[1].error_class == "ServiceUnavailableError"
-    assert secret not in repr(recorder.llm_calls)
-    with engine.connect() as connection:
-        attempts = connection.execute(select(quota_provider_attempts_table)).all()
-        usage = connection.execute(select(token_usage_ledger_table)).all()
-    assert len(attempts) == len(usage) == 2
-    assert all(attempt.settled_at is not None for attempt in attempts)
-    assert {call.call_id for call in recorder.llm_calls} == {attempt.attempt_id for attempt in attempts}
-    attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
-    usage_by_id = {entry.entry_id: entry for entry in usage}
-    success_usage = usage_by_id[attempts_by_id[recorder.llm_calls[0].call_id].ledger_entry_id]
-    failure_usage = usage_by_id[attempts_by_id[recorder.llm_calls[1].call_id].ledger_entry_id]
-    assert (success_usage.prompt_tokens, success_usage.completion_tokens) == (10, 5)
-    assert failure_usage.prompt_tokens is None and failure_usage.completion_tokens is None
-
-    # The settled unknown usage remains authoritative for a fresh operation.
-    async with await _lease(service, session.id) as fresh:
-        fresh_custody = dataclasses.replace(custody, session_operation_context=fresh.context)
-        with guarded_quota_turn(engine, service, fresh.context) as fresh_turn, pytest.raises(ChargeableAdmissionRefused) as fresh_caught:
-            await _run_quota_planner(
-                turn=fresh_turn,
-                completion=script,
-                recorder=BufferingRecorder(),
-                originating_message=origin,
-                custody_config=fresh_custody,
-            )
-    fresh_turn.assert_audit(guards=1, calls=0, private=0)
-    assert fresh_caught.value.decision.refusal_reason is AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE
-    assert len(script.requests) == 2
 
 
 @pytest.mark.asyncio

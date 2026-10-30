@@ -79,6 +79,14 @@ class PrimaryProviderResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RetainedPrimaryPhaseData:
+    """A proved paid response for an existing phase, never a physical receipt."""
+
+    response: PrivateChunk
+    outcome: _CallModelOutcome
+
+
+@dataclass(frozen=True, slots=True)
 class RetainedPrimaryInput:
     canonical: str = field(repr=False)
     messages_json: str = field(repr=False)
@@ -434,6 +442,43 @@ def _selected_effect(
         or effect.graph_sha256 is not None
     ):
         raise AuditIntegrityError("primary effect differs from its actual owner/frontier")
+    if (
+        type(effect.creator_sequence) is not int
+        or effect.creator_sequence < 1
+        or type(effect.creator_generation) is not int
+        or effect.creator_generation < 1
+    ):
+        raise AuditIntegrityError("primary effect lost its actual issuing attempt")
+    if effect.disposition in ("prepared", "dispatched", "unknown"):
+        if (
+            frame.phase != "awaiting_response"
+            or frame.pending_response is not None
+            or effect.result_chunk_key is not None
+            or effect.receipt_key is not None
+            or effect.provider_attempt_id is not None
+            or effect.physical_sequence is not None
+            or effect.physical_generation is not None
+            or effect.requested_model is not None
+            or effect.response_finished_at is not None
+        ):
+            raise AuditIntegrityError("unresolved primary carries contradictory result or physical settlement evidence")
+    elif effect.disposition == "committed":
+        if (
+            frame.phase not in ("response_retained", "classify")
+            or frame.pending_response is None
+            or effect.result_chunk_key != f"value:{frame.pending_response.codec}:{frame.pending_response.digest}"
+            or type(effect.receipt_key) is not str
+            or not effect.receipt_key
+            or effect.provider_attempt_id != effect.receipt_key
+            or effect.physical_sequence != effect.creator_sequence
+            or effect.physical_generation != effect.creator_generation
+            or type(effect.requested_model) is not str
+            or not effect.requested_model
+            or effect.response_finished_at is None
+        ):
+            raise AuditIntegrityError("committed primary lost its complete selected response/physical settlement shape")
+    else:
+        raise AuditIntegrityError("primary effect has an unknown durable disposition")
     return selected, stack, frame, effect
 
 
@@ -660,11 +705,19 @@ def publish_primary_provider_on_connection(
     if replace(previous, llm_calls=(*previous.llm_calls, call)) != recorder or not recorder.llm_calls or recorder.llm_calls[-1] is not call:
         raise AuditIntegrityError("primary publication changed its complete original recorder prefix/channels")
     response = encode_continuation_response(outcome.completion, audit_call=call)
-    audit = encode_recorder_snapshot(recorder)
-    evidence = decode_turn_evidence(_chunk(conn, running, frame.evidence), env_ref_names=env_ref_names)
-    if evidence.recorder_json != encode_recorder_snapshot(previous).canonical:
+    from elspeth.web.sessions.continuation_selection import load_private_chunks
+
+    evidence = decode_turn_evidence(
+        _chunk(conn, running, frame.evidence),
+        env_ref_names=env_ref_names,
+        source_chunks=load_private_chunks(
+            conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, stack=root
+        ),
+    )
+    if evidence.snapshot.recorder != frame.audit_buffer or evidence.recorder_chunk != encode_recorder_snapshot(previous):
         raise AuditIntegrityError("primary publication changed its actual evidence/recorder prefix join")
     extended_evidence = append_primary_call_to_evidence(evidence, call=call, recorder=recorder, env_ref_names=env_ref_names)
+    audit = extended_evidence.recorder_chunk
     updated_evidence = encode_turn_evidence(extended_evidence, env_ref_names=env_ref_names)
     for chunk in (response, audit, updated_evidence):
         put_chunk(
@@ -802,6 +855,56 @@ def read_committed_primary_response_on_connection(
     frontier, original input and actual physical audit/accounting source.
     """
     _require_current_continuation_running(conn, running)
+    return _read_committed_primary_response_data_on_connection(conn, running, selected=selected, reference=reference)
+
+
+def read_committed_primary_response_for_settlement_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+) -> PrivateChunk:
+    """Read an existing paid result while retaining an issued effect after Stop.
+
+    This facet grants no dispatch or business mutation. Its caller still proves
+    the exact pre-Stop issue before writing any owed retention.
+    """
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    return _read_committed_primary_response_data_on_connection(conn, running, selected=selected, reference=reference)
+
+
+def read_retained_primary_phase_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+    env_ref_names: frozenset[str],
+) -> RetainedPrimaryPhaseData:
+    """Read actual historical response DATA joined to the complete current graph."""
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+
+    response = read_committed_primary_response_for_settlement_on_connection(conn, running, selected=selected, reference=reference)
+    compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
+    if len(compose) != 1 or compose[0].pending_response != reference:
+        raise AuditIntegrityError("retained phase changed its actual selected primary response")
+    admitted = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=env_ref_names)
+    call = decode_retained_physical_audit_call(response)
+    recorder = decode_recorder_snapshot(admitted.recorder_chunk)
+    matching = tuple(item for item in recorder.llm_calls if item.call_id == call.call_id)
+    if len(matching) != 1 or matching[0] != call:
+        raise AuditIntegrityError("retained phase lost its actual paid call in the complete current recorder")
+    return RetainedPrimaryPhaseData(response, _CallModelOutcome(decode_continuation_response(response), matching[0]))
+
+
+def _read_committed_primary_response_data_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+) -> PrivateChunk:
     _require_selected_primary_source(conn, running, selected)
     if type(reference) is not PrivateChunkRef or reference.codec != "composer.response.v1":
         raise AuditIntegrityError("historical primary response lost its actual source codec")

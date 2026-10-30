@@ -145,6 +145,8 @@ interface ChatInputProps {
   onSend: (content: string) => void;
   disabled: boolean;
   onCancel?: () => void;
+  /** Stop was pressed and not yet settled: show "Stopping" and keep focus. */
+  stopPending?: boolean;
   inputRef: React.RefObject<HTMLTextAreaElement>;
   onToggleBlobManager?: () => void;
   showBlobManager?: boolean;
@@ -177,6 +179,7 @@ export function ChatInput({
   onSend,
   disabled,
   onCancel,
+  stopPending = false,
   inputRef,
   onToggleBlobManager,
   showBlobManager,
@@ -520,11 +523,15 @@ export function ChatInput({
         {disabled && onCancel && (
           <Button
             variant="bare"
-            onClick={onCancel}
-            aria-label="Stop composing"
-            className="chat-input-cancel-btn"
+            // While Stop is pending the control keeps focus and announces its
+            // state (aria-disabled, not disabled); a second press is a no-op.
+            onClick={stopPending ? undefined : onCancel}
+            aria-label={stopPending ? "Stopping" : "Stop composing"}
+            aria-disabled={stopPending ? true : undefined}
+            className={stopPending ? "chat-input-cancel-btn chat-input-cancel-btn--pending" : "chat-input-cancel-btn"}
           >
-            Stop
+            {stopPending && <span className="pulse-dot" aria-hidden="true" />}
+            {stopPending ? "Stopping" : "Stop"}
           </Button>
         )}
 

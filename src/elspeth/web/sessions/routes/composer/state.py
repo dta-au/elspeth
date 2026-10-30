@@ -127,12 +127,6 @@ async def _surface_reverted_interpretation_reviews(
     state_record: Any,
 ) -> None:
     """Repair review-card debt for a fresh or replayed revert result."""
-    # Historical minimal service-authored checkpoints can predate populated
-    # metadata and therefore cannot be promoted to CompositionState. They also
-    # predate structured interpretation requirements; preserve their existing
-    # revert compatibility instead of turning this additive repair into a 500.
-    if state_record.metadata_ is None:
-        return
     from elspeth.web.composer.interpretation_surfacing import (
         has_pending_interpretation_review_surfacing_debt,
         surface_pending_interpretation_reviews_for_state,

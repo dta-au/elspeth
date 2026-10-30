@@ -93,8 +93,8 @@ files:
   src/elspeth/contracts/preflight.py:
     Mapping[str, Any]: 1
   src/elspeth/contracts/prompt_guard.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 3
+    Mapping[str, Any]: 6
+    dict[str, Any]: 4
   src/elspeth/contracts/results.py:
     dict[str, Any]: 2
     dict[str, object]: 2
@@ -785,7 +785,7 @@ files:
     Mapping[str, Any]: 11
     dict[str, Any]: 15
   src/elspeth/web/composer/audit.py:
-    Mapping[str, Any]: 8
+    Mapping[str, Any]: 9
     dict[str, Any]: 4
     dict[str, object]: 6
   src/elspeth/web/composer/audit_storage.py:
@@ -795,9 +795,9 @@ files:
     Mapping[str, Any]: 4
   src/elspeth/web/composer/boot_probe.py:
     Mapping[str, Any]: 1
-    dict[str, Any]: 5
+    dict[str, Any]: 4
   src/elspeth/web/composer/capability_skill.py:
-    Mapping[str, Any]: 8
+    Mapping[str, Any]: 4
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
@@ -807,6 +807,8 @@ files:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/continuation_batch_data.py:
     dict[str, Any]: 4
+  src/elspeth/web/composer/continuation_controls.py:
+    dict[str, object]: 2
   src/elspeth/web/composer/continuation_dispatch_audit.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/continuation_evidence_graph.py:
@@ -815,10 +817,10 @@ files:
   src/elspeth/web/composer/continuation_message_builders.py:
     dict[str, Any]: 4
   src/elspeth/web/composer/continuation_message_families.py:
-    dict[str, Any]: 6
+    dict[str, Any]: 9
   src/elspeth/web/composer/continuation_message_family_builders.py:
     Mapping[str, Any]: 3
-    dict[str, Any]: 10
+    dict[str, Any]: 14
   src/elspeth/web/composer/continuation_p4_batch.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/continuation_prepared_p4.py:
@@ -827,10 +829,12 @@ files:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
   src/elspeth/web/composer/continuation_prompt_producers.py:
-    Mapping[str, Any]: 6
-    dict[str, Any]: 24
+    Mapping[str, Any]: 9
+    dict[str, Any]: 38
   src/elspeth/web/composer/continuation_provider_input.py:
     Mapping[str, Any]: 2
+  src/elspeth/web/composer/continuation_retention.py:
+    Mapping[str, object]: 3
   src/elspeth/web/composer/continuation_tool_argument_messages.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 4
@@ -858,10 +862,6 @@ files:
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_custody.py:
     Mapping[str, Any]: 6
-  src/elspeth/web/composer/pipeline_planner.py:
-    Mapping[str, Any]: 25
-    dict[str, Any]: 20
-    dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
     Mapping[str, Any]: 19
     dict[str, Any]: 18
@@ -909,7 +909,7 @@ files:
   src/elspeth/web/composer/service.py:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
-    dict[str, Any]: 17
+    dict[str, Any]: 14
   src/elspeth/web/composer/session_tool.py:
     boundary: 1
     dict[str, Any]: 4
@@ -979,9 +979,9 @@ files:
     dict[str, Any]: 19
     dict[str, object]: 2
   src/elspeth/web/composer/tools/wire_projection.py:
-    Mapping[str, Any]: 7
+    Mapping[str, Any]: 6
     boundary: 1
-    dict[str, Any]: 23
+    dict[str, Any]: 22
   src/elspeth/web/composer/transcript_blob_reader.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/turn_audit.py:
@@ -1131,10 +1131,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 824
-  Mapping[str, object]: 318
+  Mapping[str, Any]: 799
+  Mapping[str, object]: 321
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1190
+  dict[str, Any]: 1187
   dict[str, object]: 398
-  soft: 2738
+  soft: 2713

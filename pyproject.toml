@@ -479,6 +479,8 @@ disallow_incomplete_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "elspeth-lints/src"]
+strict_markers = true
+strict_config = true
 addopts = [
     "-ra",
     "--strict-markers",
@@ -495,13 +497,26 @@ addopts = [
     # in-process: worker startup dominates a small selection, and pdb/-s do not
     # work through xdist.
     "-n", "12",
+    "--max-worker-restart=0",
+    # pytest-timeout 2.4's store_true CLI default masks the equivalent INI
+    # setting; this flag keeps an attached debugger from disabling the guard.
+    "--timeout-disable-debugger-detection",
 ]
+# Task 0 baseline 2cbeccbaa: 74,125 ordinary passes, fixtures included;
+# maximum 212.772218031 s. Double it, then round UP to a 300 s block: 600 s.
+# Both known hang files were excluded from that diagnostic, so this is
+# measured headroom, not their qualification or a universal duration bound.
+# See docs/release/0.8.10-task0-retention-fixpoint.md for scope and receipts.
+timeout = 600
+timeout_method = "thread"
+timeout_func_only = false
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests requiring external services",
     "asyncio: marks tests as async (handled by pytest-asyncio)",
     "performance: marks tests as performance benchmarks",
     "landscape_long_run: identifies the three exact Landscape long-run cases for explicit CI partitioning",
+    "landscape_fencing_regression: Landscape receipt, supplier and refusal regression controls in ordinary CI shards",
     "stress: marks tests as stress tests requiring ChaosLLM HTTP server (deselect with '-m \"not stress\"')",
     "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     "chaosllm: Configure ChaosLLM server for the test (preset=None, **kwargs)",

@@ -6,6 +6,7 @@ It retains the original preparing creator for business-SQL comparison.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -13,7 +14,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring
 from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.credential_material import DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
 from elspeth.contracts.errors import AuditIntegrityError
@@ -24,7 +25,7 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_p4_state_payload import decode_p4_state_payload, encode_p4_state_payload
 from elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_text
-from elspeth.web.composer.continuation_tool_batch import _decode_owned, _dump_owned, _read_json_value
+from elspeth.web.composer.continuation_tool_batch import _decode_owned, _dump_owned, _read_json_value, _response_contract
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, build_private_tool_evidence, diagnostic_evidence_identity
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply
@@ -182,6 +183,39 @@ def _p4_mapping_hash(encoded: str, digest: str) -> None:
     value = _read_json_value(encoded)
     if type(value) is not dict or sha256(encoded.encode("utf-8")).hexdigest() != digest:
         raise AuditIntegrityError("retained P4 invocation lost its canonical mapping hash")
+
+
+def _require_crash_rejection(rejection: RejectionRecord, invocation: ComposerToolInvocation, *, env_ref_names: frozenset[str]) -> None:
+    """Admit only the generic crash producer's diagnostic after full joins."""
+    error_class = invocation.error_class
+    if (
+        invocation.status is not ComposerToolStatus.PLUGIN_CRASH
+        or invocation.tool_call_id != rejection.tool_call_id
+        or invocation.tool_name != rejection.tool_name
+        or error_class is None
+        or not error_class
+        or invocation.error_message != error_class
+        or invocation.result_canonical is not None
+        or invocation.result_hash is not None
+        or invocation.version_after is not None
+        or invocation.error_category is not None
+        or invocation.private_failure is None
+    ):
+        raise AuditIntegrityError("retained P4 crash diagnostic lost its original thrown invocation")
+    payload, error = parse_json_strict(rejection.planner_payload)
+    if error is not None:
+        raise AuditIntegrityError("retained P4 crash diagnostic is not strict JSON")
+    require_no_credential_material(payload, surface="continuation P4 crash diagnostic", env_ref_names=env_ref_names)
+    if (
+        type(payload) is not dict
+        or set(payload) != {"error_class", "error_message"}
+        or payload["error_class"] != error_class
+        or payload["error_message"] != error_class
+        or rejection.error_code != error_class
+        or rejection.message != error_class
+        or rejection.planner_payload != json.dumps({"error_class": error_class, "error_message": error_class})
+    ):
+        raise AuditIntegrityError("retained P4 crash diagnostic differs from its original class-only rejection")
 
 
 def prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str] = frozenset()) -> PreparedP4Members:
@@ -344,17 +378,6 @@ def prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str]
         item.tool_call_id not in names_by_id or item.tool_name != names_by_id[item.tool_call_id] for item in rejections
     ):
         raise AuditIntegrityError("retained P4 rejection names an unexecuted call")
-    for rejection in rejections:
-        _p4_safe_text(rejection.tool_call_id, env_ref_names=env_ref_names)
-        _p4_safe_text(rejection.tool_name, env_ref_names=env_ref_names)
-        _p4_safe_text(rejection.error_code, env_ref_names=env_ref_names)
-        _p4_safe_text(rejection.message, env_ref_names=env_ref_names)
-        require_retained_result_text(
-            rejection.tool_name,
-            rejection.planner_payload,
-            env_ref_names=env_ref_names,
-            outcome_status=statuses_by_id[rejection.tool_call_id],
-        )
     withheld = _decode_owned(_P4_WITHHELD, value.withheld_replies_json)
     for reply in withheld:
         _p4_safe_text(reply.content, env_ref_names=env_ref_names)
@@ -430,6 +453,25 @@ def prepared_p4_members(value: PreparedP4Value, *, env_ref_names: frozenset[str]
     )
     if failures != expected_failures:
         raise AuditIntegrityError("retained P4 private failures differ from their actual source audit")
+    # A thrown synchronous Discovery has no successful response envelope.
+    # Its separate rejection is admitted only after every original source
+    # cohort/hash/private-failure join above, never from an early status tag.
+    invocations_by_id = {item.tool_call_id: item for item in invocations}
+    for rejection in rejections:
+        _p4_safe_text(rejection.tool_call_id, env_ref_names=env_ref_names)
+        _p4_safe_text(rejection.tool_name, env_ref_names=env_ref_names)
+        _p4_safe_text(rejection.error_code, env_ref_names=env_ref_names)
+        _p4_safe_text(rejection.message, env_ref_names=env_ref_names)
+        invocation = invocations_by_id[rejection.tool_call_id]
+        if invocation.status is ComposerToolStatus.PLUGIN_CRASH and _response_contract(rejection.tool_name) is not None:
+            _require_crash_rejection(rejection, invocation, env_ref_names=env_ref_names)
+        else:
+            require_retained_result_text(
+                rejection.tool_name,
+                rejection.planner_payload,
+                env_ref_names=env_ref_names,
+                outcome_status=statuses_by_id[rejection.tool_call_id],
+            )
     return PreparedP4Members(
         tuple(calls), rows, revoked, ceiling, revocation, evidence, failures, rejections, withheld, invocations, authorings
     )

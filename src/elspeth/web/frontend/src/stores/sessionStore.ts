@@ -1,7 +1,8 @@
 import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
 import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
-import { composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal } from "./composerOperationCustody";
-import type { OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
+import { adoptComposerObserver, composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal, composerStopRequested } from "./composerOperationCustody";
+import type { ComposerOperationStatusV2, OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
+import { setComposerAdmissionVersion } from "@/config/composerProtocol";
 // src/stores/sessionStore.ts
 import { create } from "zustand";
 import type {
@@ -444,6 +445,10 @@ function mergeComposerFailureOutcomes(existing: ComposerOperationFailureNotice[]
   });
 }
 
+/** §4.2: the 409 composer_continuation_disabled refusal keeps the draft (the failed local message). */
+export const COMPOSER_CONTINUATION_DISABLED_COPY = "The composer's settings changed while this message was sending, so it was not sent. Use Retry to send it again.";
+export const COMPOSER_STOP_UNAVAILABLE_COPY = "Stopping this request is not available in this build. Updates will continue.";
+
 async function runDurableComposerTurn(descriptor: OperationCustody, localMessageId: string | null, signal: AbortSignal | undefined, submit: boolean, reconciliationOnly = false): Promise<void> {
   const sessionId = descriptor.sessionId;
   const generation = sessionPublicationGeneration;
@@ -452,10 +457,22 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   const beforeVersion = useSessionStore.getState().compositionState?.version ?? null;
   let result: import("@/types/index").MessageWithStateResponse | null = null;
   let failure: unknown = null;
+  // Stop state is scoped to this operation: restored intent comes from custody.
+  if (current() && !reconciliationOnly) useSessionStore.setState({ composerOperationStatusV2: null, composerLiveUpdatesInterrupted: false, composerStopPendingOperationId: composerStopRequested(descriptor) ? descriptor.operationId : null });
   try {
     const options = {
       signal, current, reconciliationOnly,
       progress: (snapshot: ComposerProgressSnapshot) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerProgress: snapshot }); },
+      status: (status: ComposerOperationStatusV2) => {
+        if (current() && !reconciliationOnly) useSessionStore.setState((state) => ({ composerOperationStatusV2: status, composerStopPendingOperationId: status.cancel_requested && state.composerStopPendingOperationId === status.operation_id ? null : state.composerStopPendingOperationId }));
+      },
+      stopUnconfirmed: (unconfirmed: boolean) => {
+        if (current() && !reconciliationOnly) useSessionStore.setState((state) => ({ composerStopPendingOperationId: unconfirmed ? descriptor.operationId : state.composerStopPendingOperationId === descriptor.operationId ? null : state.composerStopPendingOperationId }));
+      },
+      stopUnavailable: () => {
+        if (current() && !reconciliationOnly) useSessionStore.setState({ error: COMPOSER_STOP_UNAVAILABLE_COPY, errorDetails: null });
+      },
+      interrupted: (interrupted: boolean) => { if (current() && !reconciliationOnly) useSessionStore.setState({ composerLiveUpdatesInterrupted: interrupted }); },
       timeout: () => {
         if (!current()) return;
         useSessionStore.setState({
@@ -475,6 +492,7 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
     failure = error;
   }
   if (!current()) return;
+  if (useSessionStore.getState().composerStopPendingOperationId === descriptor.operationId) useSessionStore.setState({ composerStopPendingOperationId: null });
   let messagesAtReadDispatch = useSessionStore.getState().messages;
   const proposalSnapshot = beginProposalSnapshot();
   let authoritativeMessages: ChatMessage[] | null = null;
@@ -483,7 +501,8 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
   let proposals: CompositionProposal[] | null = null;
   let refreshed = false;
   const error = failure as ApiError | null;
-  const errorText = error === null ? null : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
+  if (error?.error_type === "composer_continuation_disabled") setComposerAdmissionVersion(1);
+  const errorText = error === null ? null : error.error_type === "composer_continuation_disabled" ? COMPOSER_CONTINUATION_DISABLED_COPY : error.error_type === "audit_integrity_error" ? formatAuditIntegrityError(error) : error.error_type === "llm_unavailable" ? formatLlmUnavailableError(error) : error.error_type === "llm_auth_error" ? formatLlmAuthError(error) : error.error_type === "convergence" ? formatConvergenceError(error) : error.detail ?? (failure instanceof Error ? failure.message : "Composer action failed.");
   const terminalFailure = failure instanceof ComposerActiveAttachment ? failure.terminal.status === "failed" ? failure.terminal.error : null : error;
   const terminalIdentity = terminalFailure?.composer_operation;
   const observedFailure: ComposerOperationFailureNotice | null = terminalFailure === null || terminalIdentity === undefined ? null : {
@@ -741,6 +760,12 @@ interface SessionState {
   staleProposalIds: string[];
   proposalActionPendingIds: string[];
   composerProgress: ComposerProgressSnapshot | null;
+  /** Latest accepted Composer-Operation-Version 2 state of the observed operation (null for v1). */
+  composerOperationStatusV2: ComposerOperationStatusV2 | null;
+  /** True after two failed live-update connects; the request may still be running. */
+  composerLiveUpdatesInterrupted: boolean;
+  /** The operation whose Stop was pressed and not yet confirmed (null: none). */
+  composerStopPendingOperationId: string | null;
   isComposing: boolean;
   /** Ephemeral browser requests, retained across view/session navigation. */
   composeRequests: ReadonlyMap<string, ComposeRequestOwner>;
@@ -887,6 +912,9 @@ const initialState = {
   staleProposalIds: [] as string[],
   proposalActionPendingIds: [] as string[],
   composerProgress: null as ComposerProgressSnapshot | null,
+  composerOperationStatusV2: null as ComposerOperationStatusV2 | null,
+  composerLiveUpdatesInterrupted: false,
+  composerStopPendingOperationId: null as string | null,
   isComposing: false,
   composeRequests: new Map<string, ComposeRequestOwner>(),
   composerModel: null as string | null,
@@ -951,6 +979,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   cancelComposition() {
     const { activeSessionId, composeRequests } = get();
     if (activeSessionId !== null) {
+      const scope = composerCustodyScope();
+      const target = scope === null ? null : findComposerOperationCustody(scope, activeSessionId).foreground;
+      set({ composerStopPendingOperationId: target?.operationId ?? null });
       const observing = cancelObservedComposerOperation(activeSessionId);
       if (composerStopPersistenceLimited()) set({ error: "Stop requested. Keep this tab open until the action settles; this browser could not save the pending cancellation." });
       if (!observing && composerSessionHasCustody(activeSessionId)) void get().resumeComposerOperation(activeSessionId);
@@ -1037,6 +1068,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set((state) => ({
       sessions: [session, ...state.sessions],
       activeSessionId: session.id,
+      composerOperationStatusV2: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       // A freshly created session is KNOWN to have no composition state.
       compositionState: null,
@@ -1089,6 +1123,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           ...(wasActive
             ? {
                 activeSessionId: null,
+                composerOperationStatusV2: null,
+                composerLiveUpdatesInterrupted: false,
+                composerStopPendingOperationId: null,
                 messages: [],
                 compositionState: null,
                 compositionStateLoaded: false,
@@ -1149,6 +1186,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(id);
     set({
       activeSessionId: id,
+      composerOperationStatusV2: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       lastComposeChangedPipeline: null,
@@ -1197,6 +1237,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         useBlobStore.getState().activateSession(null);
         set({
           activeSessionId: null,
+          composerOperationStatusV2: null,
+          composerLiveUpdatesInterrupted: false,
+          composerStopPendingOperationId: null,
           messages: [],
           compositionState: null,
           compositionStateLoaded: false,
@@ -1227,6 +1270,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(sessionId);
     set({
       activeSessionId: sessionId,
+      composerOperationStatusV2: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       compositionStateLoaded: false,
@@ -1253,6 +1299,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     useBlobStore.getState().activateSession(null);
     set({
       activeSessionId: null,
+      composerOperationStatusV2: null,
+      composerLiveUpdatesInterrupted: false,
+      composerStopPendingOperationId: null,
       messages: [],
       compositionState: null,
       compositionStateLoaded: false,
@@ -1296,6 +1345,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     } catch { return; }
     void get().loadComposerFailureOutcomes();
     const record = findComposerOperationCustody(scope, sessionId);
+    if (record.foreground === null && record.unresolvedSubmissions.size === 0) {
+      // Another tab or device may own a live request (D-8): adopt it as an
+      // observer so this tab shows it and its Stop.
+      let active: Awaited<ReturnType<typeof api.fetchActiveComposerOperation>> = null;
+      try { active = await api.fetchActiveComposerOperation(sessionId); } catch { return; }
+      if (active === null || !isCurrentAuthGeneration(authGeneration) || !sessionPublicationIsCurrent(sessionId, generation)) return;
+      const adopted = adoptComposerObserver(scope, sessionId, active);
+      if (adopted === null) return;
+      set({ isComposing: true });
+      void runDurableComposerTurn(adopted, null, undefined, false);
+      return;
+    }
     if (record.foreground !== null) {
       set({ isComposing: true });
       void runDurableComposerTurn(record.foreground, null, undefined, false);
@@ -1843,6 +1904,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         getExecutionStore().clearValidation();
         return {
           activeSessionId: result.session_id,
+          composerOperationStatusV2: null,
+          composerLiveUpdatesInterrupted: false,
+          composerStopPendingOperationId: null,
           messages,
           compositionState,
           compositionStateLoaded: true,

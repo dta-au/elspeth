@@ -25,6 +25,7 @@ from elspeth.web.sessions.continuation_attachment_result import _chunk
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import current_selected, new_owners, recovery_rows
 from tests.unit.web.sessions import test_continuation_attachment_application as application_cases
@@ -48,7 +49,7 @@ def _recover_released_application(store, original):
     )
     (claim,) = authority.claim_segment(limit=1)
     context = repository.start_composer_segment(
-        claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+        claim, owner_instance_id=authority._owner_instance_id, lease_seconds=OWNER_LEASE_SECONDS, auth_provider_type="local"
     )
     assert context.fence != original.session_operation_context.fence
     assert claim.operation_id == original.claim.operation_id
@@ -141,7 +142,7 @@ async def _complete_history_with_live_lease(store, arguments, runtime, ctx, call
     try:
         lifecycle_owns_context = True
         async with await SessionOperationLease.adopt(
-            store[1], running.session_operation_context, lease_seconds=30, required_work=work.coordinator
+            store[1], running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
         ) as lease:
             assert lease.context is running.session_operation_context and lease.required_work is work.coordinator
             pending = await lease.create_task(restore_continuation_runtime(**arguments), name="attachment-history-unfinished-positive")
@@ -162,7 +163,7 @@ async def _complete_history_with_live_lease(store, arguments, runtime, ctx, call
             assert cold.graph.batch.batch.next_tool_index == 1 and len(sdk) == 1
         assert lease.disposition is SessionOperationLeaseDisposition.RELEASED
         work.coordinator.assert_completed()
-        return applied
+        return applied, (*arguments["selected"].chunks, *cold.source.admitted_evidence.dependency_chunks)
     finally:
         if not lifecycle_owns_context:
             store[1].release(running.session_operation_context)
@@ -177,7 +178,7 @@ async def test_fresh_claim_refuses_current_attachment_event_or_cache_loss_after_
         operation_store, tmp_path, monkeypatch
     )
     original = arguments["inventory"].running
-    applied = await _complete_history_with_live_lease(operation_store, arguments, runtime, ctx, call_model, source, sdk)
+    applied, original_sources = await _complete_history_with_live_lease(operation_store, arguments, runtime, ctx, call_model, source, sdk)
     current, running = _recover_released_application(operation_store, original)
     work = inventory_work(running)
     try:
@@ -190,6 +191,7 @@ async def test_fresh_claim_refuses_current_attachment_event_or_cache_loss_after_
                 session_id=selected.stack.logical.session_id,
                 operation_id=selected.stack.logical.operation_id,
                 env_ref_names=latest["inventory"].names,
+                source_chunks=original_sources,
             )
             assert len(history.applications) == 1 and history.applications[0] == applied.application
             changed = encode_attachment_history(history.model_copy(update={"applications": ()}), env_ref_names=latest["inventory"].names)

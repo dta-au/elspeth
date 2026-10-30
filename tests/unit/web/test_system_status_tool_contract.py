@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from structlog.testing import capture_logs
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.app import create_app, lifespan
 from elspeth.web.composer.boot_probe import ComposerBootConfigError, ComposerProbeRequest
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -79,23 +78,6 @@ def test_planner_route_is_not_disclosed(tmp_path: Path) -> None:
     assert repr(_tool_contract(hosted)) == repr(_tool_contract(proxied))
 
 
-def test_hatch_route_is_not_disclosed(tmp_path: Path) -> None:
-    """The same pin on the advisor (escape-hatch) route: row 4 versus row 5."""
-    hosted = create_app(_settings(tmp_path / "a", composer_advisor_model=_OPENROUTER_ADVISOR))
-    proxied = create_app(
-        _settings(
-            tmp_path / "b",
-            composer_advisor_model=_OPENROUTER_ADVISOR,
-            composer_advisor_endpoint_base_url=_PROXY,
-            composer_advisor_endpoint_api_key=SecretStr(_KEY_CANARY),
-        )
-    )
-    assert _service(hosted).tool_contract_summary.contract.hatch.dialect is ToolContractDialect.OPENAI_STRICT
-    assert _service(proxied).tool_contract_summary.contract.hatch.dialect is ToolContractDialect.NONE
-
-    assert repr(_tool_contract(hosted)) == repr(_tool_contract(proxied))
-
-
 def _openrouter_pair(tmp_path: Path, **overrides: Any) -> FastAPI:
     return create_app(
         _settings(
@@ -122,21 +104,24 @@ async def _boot(app: FastAPI, monkeypatch: pytest.MonkeyPatch, *, rejected_surfa
     monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", _RecordingCounter())
     monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", _RecordingHistogram())
     with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
-        async with lifespan(app):
-            pass
-    assert sent == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+        if rejected_surface is None:
+            async with lifespan(app):
+                pass
+        else:
+            # Every surface's rejection is fatal to boot.
+            with pytest.raises(ComposerBootConfigError, match=f"surface={rejected_surface}"):
+                async with lifespan(app):
+                    pass
+    assert sent == ["loop_tools", "advisor"]
     return logs
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rejected_surface", [None, "hatch_terminal"], ids=["all-accepted", "hatch-rejected"])
-async def test_probe_outcomes_do_not_change_the_published_value(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rejected_surface: str | None
-) -> None:
+async def test_probe_outcomes_do_not_change_the_published_value(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     unprobed = _tool_contract(_openrouter_pair(tmp_path / "off"))
     app = _openrouter_pair(tmp_path / "on", composer_boot_probe_enabled=True)
 
-    await _boot(app, monkeypatch, rejected_surface=rejected_surface)
+    await _boot(app, monkeypatch, rejected_surface=None)
 
     assert repr(_tool_contract(app)) == repr(unprobed)
 
@@ -145,22 +130,18 @@ async def test_probe_outcomes_do_not_change_the_published_value(
 async def test_each_sent_surface_logs_one_owned_boot_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app = _openrouter_pair(tmp_path, composer_boot_probe_enabled=True)
 
-    logs = await _boot(app, monkeypatch, rejected_surface="hatch_terminal")
+    logs = await _boot(app, monkeypatch, rejected_surface="advisor")
 
     outcomes = [entry for entry in logs if entry["event"] == "composer_boot_probe_outcome"]
     assert [(entry["probed_surface"], entry["probed_role"], entry["probe_status"]) for entry in outcomes] == [
         ("loop_tools", "planner", "success"),
-        ("planner_tools", "planner", "success"),
-        ("hatch_terminal", "planner", "rejected"),
-        ("advisor", "advisor", "success"),
+        ("advisor", "advisor", "rejected"),
     ]
     counts = {
         entry["probed_surface"]: (entry["tool_count"], entry["strict_true_count"], entry["strict_false_count"], entry["strict_key_omitted"])
         for entry in outcomes
     }
     assert counts["loop_tools"] == (46, 36, 10, 0)
-    assert counts["planner_tools"] == (24, 23, 1, 0)
-    assert counts["hatch_terminal"] == (3, 2, 1, 0)
     assert counts["advisor"] == (0, 0, 0, 0)
     rendered = repr(outcomes)
     assert _KEY_CANARY not in rendered

@@ -22,7 +22,10 @@ GRAMMARS = {
     COMPLETE: "c3a5979ae7d9e64d630b8b1b1d0032f93e28f165f8787ea4ccc4251f07252c67",
     FAIL: "d9a28db1e77ac3fe1a9c9c8f945ce2b5a6555da0188654df739f141136bf3c13",
 }
-NAMESPACE_GRAMMAR = "31ea924a278fa39179348984202062d50b16907bbed9db3ea2e6352c94324d4e"
+# Current finite declaration includes the continuation P4/title methods and
+# nullable audit parameters. Every evaluated header/default stays in the hash;
+# the three invoked SQL bodies and their caller transfers are separate below.
+NAMESPACE_GRAMMAR = "00fedd827c71afdf19fc2d48bb4eebe59bc38ce7efcd40fac422b8bd67435b31"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),

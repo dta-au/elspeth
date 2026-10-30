@@ -39,7 +39,6 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
 from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
-from elspeth.web.composer.pipeline_planner import _PROSE_NUDGE_BUDGET
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX, STATE_CONTEXT_PREFIX
@@ -132,50 +131,6 @@ class _Response:
     usage: Mapping[str, object]
     model: str = "provider/planner-v1"
     id: str = "planner-request-1"
-
-
-def _malformed_completion() -> Any:
-    """An empty-reply overrun whose escape-hatch turn is also unusable.
-
-    Three empty no-tool-call replies exhaust the nudge budget and engage the escape
-    hatch; the advisor then answers with malformed tool-call arguments, so the
-    hatch is spent and the overrun's terminal MALFORMED_RESPONSE disposition
-    stands. The malformed arguments carry the leak sentinel.
-    """
-
-    def _empty_reply() -> _Response:
-        return _Response(
-            choices=[_Choice(message=_Message(content="", tool_calls=[]))],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-        )
-
-    def _malformed_arguments() -> _Response:
-        return _Response(
-            choices=[
-                _Choice(
-                    message=_Message(
-                        content=None,
-                        tool_calls=[
-                            _ToolCall(
-                                id="call-1",
-                                function=_Function(
-                                    name="emit_pipeline_proposal",
-                                    arguments=f"not strict json {_PROVIDER_LEAK_SENTINEL}",
-                                ),
-                            )
-                        ],
-                    )
-                )
-            ],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-        )
-
-    responses = [*(_empty_reply() for _ in range(_PROSE_NUDGE_BUDGET + 1)), _malformed_arguments()]
-
-    async def completion(**_kwargs: Any) -> _Response:
-        return responses.pop(0)
-
-    return completion
 
 
 def _conversational_completion() -> Any:
@@ -3379,7 +3334,7 @@ def _valid_pipeline_completion(tmp_path: Path, session_id_holder: dict[str, str]
                         tool_calls=[
                             _ToolCall(
                                 id="call-1",
-                                function=_Function(name="emit_pipeline_proposal", arguments=_json.dumps({"pipeline": pipeline})),
+                                function=_Function(name="set_pipeline", arguments=_json.dumps({"pipeline": pipeline})),
                             )
                         ],
                     )

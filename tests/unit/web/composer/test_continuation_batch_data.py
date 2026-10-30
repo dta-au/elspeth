@@ -10,8 +10,14 @@ from elspeth.contracts.composer_mutation import ComposerMutationCeiling, Compose
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome
-from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_data, encode_coupled_batch_data
+from elspeth.web.composer.continuation_batch_data import (
+    decode_coupled_batch_chunk,
+    decode_coupled_batch_data,
+    encode_coupled_batch_chunk,
+    encode_coupled_batch_data,
+)
 from elspeth.web.composer.continuation_tool_batch import RetainedBatchFailure
+from elspeth.web.composer.manual_advisor_allowance import ManualAdvisorAllowance
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState
 from elspeth.web.composer.tools._common import ToolResult
@@ -172,6 +178,70 @@ def test_empty_initialized_cut_is_real_and_keeps_accumulator_revocation():
     restored = decode_coupled_batch_data(encode(empty, acc, ()))
     assert restored.calls == () and restored.batch.tool_outcomes == []
     assert restored.accumulator.authority_revocation == acc.authority_revocation
+
+
+@pytest.mark.parametrize("route", ["data", "chunk"])
+@pytest.mark.parametrize("dispatched", [False, True], ids=["reserved", "dispatched-before-close"])
+def test_manual_advisor_active_reservation_refuses_capture_then_closed_count_survives_cold_restore(route, dispatched):
+    batch, acc, calls = actual_cut()
+    batch.advisor_calls_used = 0
+    allowance = ManualAdvisorAllowance(limit=2, used=0)
+    batch.manual_advisor_allowance = allowance
+    # This exact coupled cut is encodable before acquiring live reservation
+    # custody. Its independent accumulator count remains two throughout.
+    original = encode(batch, acc, calls)
+    reservation = allowance.reserve()
+    assert reservation is not None
+    if dispatched:
+        reservation.dispatch()
+        batch.advisor_calls_used = allowance.used
+    assert allowance.used == (1 if dispatched else 0)
+    with pytest.raises(AuditIntegrityError, match="reservation"):
+        if route == "data":
+            encode_coupled_batch_data(batch=batch, accumulator=acc, calls=calls)
+        else:
+            encode_coupled_batch_chunk(batch=batch, accumulator=acc, calls=calls)
+
+    reservation.close()
+    expected_spent = 1 if dispatched else 0
+    assert allowance.used == batch.advisor_calls_used == expected_spent
+    plain = replace(batch, manual_advisor_allowance=None)
+    canonical = encode(batch, acc, calls)
+    # The process-local owner is absent from the existing wire. Its removal
+    # changes neither bytes nor the graph's alias partition after settlement.
+    assert canonical == encode(plain, acc, calls)
+    assert "manual_advisor_allowance" not in canonical and "ManualAdvisorAllowance" not in canonical
+    if not dispatched:
+        assert canonical == original
+    chunk = encode_coupled_batch_chunk(batch=batch, accumulator=acc, calls=calls)
+    assert chunk.canonical == canonical
+    del batch, acc, calls, allowance, reservation, plain
+
+    restored = decode_coupled_batch_data(canonical) if route == "data" else decode_coupled_batch_chunk(chunk)
+    assert restored.batch.manual_advisor_allowance is None
+    assert restored.batch.advisor_calls_used == expected_spent
+    assert restored.accumulator.advisor_calls_used == 2
+    assert encode(restored.batch, restored.accumulator, restored.calls) == canonical
+    current_allowance = ManualAdvisorAllowance(limit=2, used=restored.batch.advisor_calls_used)
+    assert current_allowance.used == expected_spent and current_allowance.available == 2 - expected_spent
+
+
+@pytest.mark.parametrize("route", ["data", "chunk"])
+@pytest.mark.parametrize("mismatched_spent", [0, 2], ids=["erased-spent-attempt", "invented-spent-attempt"])
+def test_manual_advisor_settled_owner_cannot_capture_a_different_spent_count(route, mismatched_spent):
+    batch, acc, calls = actual_cut()
+    batch.advisor_calls_used = 1
+    batch.manual_advisor_allowance = ManualAdvisorAllowance(limit=2, used=1)
+    # Control the complete original fixture before changing only the integer
+    # that must agree with its live, fully closed allowance owner.
+    normal = encode(batch, acc, calls)
+    assert decode_coupled_batch_data(normal).batch.advisor_calls_used == 1
+    batch.advisor_calls_used = mismatched_spent
+    with pytest.raises(AuditIntegrityError, match="count"):
+        if route == "data":
+            encode_coupled_batch_data(batch=batch, accumulator=acc, calls=calls)
+        else:
+            encode_coupled_batch_chunk(batch=batch, accumulator=acc, calls=calls)
 
 
 @pytest.mark.parametrize("field", ["plugin_crash", "plugin_crash_cause", "advisor_failure"])

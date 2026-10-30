@@ -32,7 +32,7 @@ from elspeth.web.composer.continuation_batch_data import RestoredBatchData, Rest
 from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_evidence import decode_turn_evidence
+from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_primary import run_continuation_primary
@@ -68,6 +68,7 @@ from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.helpers.continuation_inventory import inventory_work
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted
 from tests.unit.web.coordination import test_composer_operation_authority as operations
@@ -125,14 +126,16 @@ async def _registered_runtime_sql_no_write(engine, arguments, *, error=None):
     )
 
 
-async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachment", failed=False, post_p4=False, native=False):
+async def application_case(
+    store, tmp_path, monkeypatch, *, tool="read_attachment", failed=False, post_p4=False, native=False, following_native=False
+):
     if post_p4:
         kwargs, produced, recorder, requests, drained = await post_p4_primary_input(store, tmp_path, monkeypatch)
     else:
         kwargs, produced, recorder, requests = await primary_input(store, tmp_path, monkeypatch)
         drained = RecorderDrainCursors()
     running = kwargs["inventory"].running
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
+    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
     assert renewed is running.session_operation_context
     # Explicit ordinary phase-input fixture: select the actual service/dialect
     # tool wire before the real SDK action. Preserve every other root/value,
@@ -206,6 +209,8 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
     arguments = {"blob_id": str(uuid4()) if failed else blob_id}
     if tool == "get_blob_content":
         arguments.update(offset_chars=1, expected_content_hash=sha256(raw).hexdigest())
+    from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+
     sdk = []
 
     async def completion(**sdk_arguments):
@@ -241,7 +246,23 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
                                 "type": "function",
                                 "function": {"name": tool, "arguments": canonical_json(arguments)},
                             }
-                        ],
+                        ]
+                        + (
+                            [
+                                {
+                                    "id": "actual-native-after-attachment",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_pipeline_state",
+                                        "arguments": canonical_json(
+                                            encode_semantic_arguments("get_pipeline_state", kwargs["service"]._planner_dialect, {})
+                                        ),
+                                    },
+                                }
+                            ]
+                            if following_native
+                            else []
+                        ),
                     },
                 }
             ],
@@ -264,10 +285,10 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
             timeout=5,
         )
     assert len(sdk) == 1 and published.outcome.audit_call is recorder.llm_calls[-1]
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
+    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
     assert renewed is running.session_operation_context
     current, _caches, _history = await runtime_case(store, provider_input=(kwargs, published))
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
+    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
     assert renewed is running.session_operation_context
     runtime = await restore_continuation_runtime(**current)
     ctx = await build_runtime_tool_batch_context(runtime, cancellation_requested=asyncio.Event())
@@ -294,7 +315,10 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
         await _prepare_continuation_call_live(call_model=published.outcome, ctx=ctx, llm_messages=live.llm_messages, batch=batch, call=call)
         == "prepared"
     )
-    assert await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30) is running.session_operation_context
+    assert (
+        await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
+        is running.session_operation_context
+    )
     original_audit = call.audit
     assert original_audit is not None
     # The actual initializer/argument admission registered this same object.
@@ -314,9 +338,16 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
     captured = await capture_continuation_runtime_owners(runtime, selected=current["selected"], inventory=current["inventory"])
     compose = captured.stack.frames[0]
     snapshot = decode_turn_evidence(
-        next(chunk for chunk in captured.chunks if chunk.reference == compose.evidence), env_ref_names=current["inventory"].names
+        next(chunk for chunk in captured.chunks if chunk.reference == compose.evidence),
+        env_ref_names=current["inventory"].names,
+        source_chunks=captured.chunks,
     )
-    graph = require_evidence_application_links(snapshot, env_ref_names=current["inventory"].names)
+    graph = require_evidence_application_links(
+        snapshot.snapshot,
+        env_ref_names=current["inventory"].names,
+        recorder_chunk=snapshot.recorder_chunk,
+        sources=snapshot.sources,
+    )
     assert graph is not None and graph.selected_audit is not None and graph.selected_dialect is not None
     prepared = encode_private_chunk(
         codec="composer.tool-batch.v1",
@@ -337,13 +368,16 @@ async def application_case(store, tmp_path, monkeypatch, *, tool="read_attachmen
     current = await install_capture(store, current, phase_input)
     runtime = replace(runtime, graph=replace(runtime.graph, selected_audit=graph.selected_audit))
     await run_attachment_result(**_read_args(current), service=current["service"], audit=original_audit)
-    assert await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30) is running.session_operation_context
+    assert (
+        await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
+        is running.session_operation_context
+    )
     current = await _latest(current)
     await apply_attachment_history(**_read_args(current))
     current = await _latest(current)
     source = await read_attachment_result(**_read_args(current))
     assert source.history_applied and source.read_audit is not None and source.result.success is not failed
-    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=30)
+    renewed = await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
     assert renewed is running.session_operation_context
     return current, runtime, ctx, published.outcome, source, original_audit, sdk, path
 
@@ -372,7 +406,7 @@ async def test_actual_attachment_finisher_commits_one_original_invocation_and_co
             effect_key=source.effect_key,
         )
         assert (
-            await asyncio.to_thread(operation_store[1].renew, running.session_operation_context, lease_seconds=30)
+            await asyncio.to_thread(operation_store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
             is running.session_operation_context
         )
         assert result.snapshot.cursor == arguments["selected"].stack.cursor + 1
@@ -412,7 +446,7 @@ async def test_actual_attachment_finisher_commits_one_original_invocation_and_co
         )
         assert replay.application == result.application and recovery_rows(operation_store[0]) == before
         assert (
-            await asyncio.to_thread(operation_store[1].renew, running.session_operation_context, lease_seconds=30)
+            await asyncio.to_thread(operation_store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
             is running.session_operation_context
         )
         # The exact no-write replay pair above is complete. Transfer this same
@@ -422,7 +456,7 @@ async def test_actual_attachment_finisher_commits_one_original_invocation_and_co
         async with await SessionOperationLease.adopt(
             operation_store[1],
             running.session_operation_context,
-            lease_seconds=30,
+            lease_seconds=OWNER_LEASE_SECONDS,
             required_work=arguments["required_work"].coordinator,
         ) as lease:
             assert lease.context is running.session_operation_context
@@ -442,8 +476,9 @@ async def test_actual_attachment_finisher_commits_one_original_invocation_and_co
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("point", ("before", "after"))
+@pytest.mark.parametrize("handoff", ("release_then_recover", "live_handover"))
 async def test_attachment_application_real_release_fresh_claim_preserves_original_read_and_receipt(
-    operation_store, tmp_path, monkeypatch, point
+    operation_store, tmp_path, monkeypatch, point, handoff
 ):
     arguments, runtime, ctx, call_model, source, _audit, sdk, _path = await application_case(operation_store, tmp_path, monkeypatch)
     original = arguments["inventory"].running
@@ -462,26 +497,37 @@ async def test_attachment_application_real_release_fresh_claim_preserves_origina
             effect_key=source.effect_key,
         )
         assert (
-            await asyncio.to_thread(operation_store[1].renew, original.session_operation_context, lease_seconds=30)
+            await asyncio.to_thread(operation_store[1].renew, original.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)
             is original.session_operation_context
         )
     arguments["required_work"].coordinator.assert_completed()
-    operation_store[1].release(original.session_operation_context)
-    current = new_owners(operation_store)
-    _engine, repository, authority, sessions, sid = current
-    assert (
-        repository.recover_composer_segment(
-            session_id=sid,
-            operation_id=original.claim.operation_id,
-            expected_generation=original.claim.ownership_generation,
-            actor_user_id="alice",
-            auth_provider_type="local",
+    if handoff == "live_handover":
+        # The live owner hands over in one transaction (design §3.4 B). The
+        # landed attachment owner must read it exactly as it reads a recovery.
+        receipt = operation_store[1].suspend_composer_segment(original)
+        assert (receipt.previous_generation, receipt.generation) == (
+            original.claim.ownership_generation,
+            original.claim.ownership_generation + 1,
         )
-        is True
-    )
+        current = new_owners(operation_store)
+        _engine, repository, authority, sessions, sid = current
+    else:
+        operation_store[1].release(original.session_operation_context)
+        current = new_owners(operation_store)
+        _engine, repository, authority, sessions, sid = current
+        assert (
+            repository.recover_composer_segment(
+                session_id=sid,
+                operation_id=original.claim.operation_id,
+                expected_generation=original.claim.ownership_generation,
+                actor_user_id="alice",
+                auth_provider_type="local",
+            )
+            is True
+        )
     (claim,) = authority.claim_segment(limit=1)
     context = repository.start_composer_segment(
-        claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
+        claim, owner_instance_id=authority._owner_instance_id, lease_seconds=OWNER_LEASE_SECONDS, auth_provider_type="local"
     )
     running = ComposerOperationRunning(claim=claim, session_operation_context=context)
     lifecycle_owns_context = False
@@ -490,7 +536,9 @@ async def test_attachment_application_real_release_fresh_claim_preserves_origina
         # This is the genuine newly started claim, not a private pause/restart
         # of the original context. Its positive scope has no no-write pair.
         lifecycle_owns_context = True
-        async with await SessionOperationLease.adopt(repository, context, lease_seconds=30, required_work=work.coordinator) as lease:
+        async with await SessionOperationLease.adopt(
+            repository, context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
+        ) as lease:
             assert lease.context is context and lease.required_work is work.coordinator
             selected, inventory = await lease.create_task(current_selected(current, running), name="attachment-fresh-current-selection")
             service, _actors = current_service(current)
@@ -550,7 +598,7 @@ async def _complete_prior_p4_with_live_lease(operation_store, arguments, runtime
         # Adoption owns original-context cleanup even when its await fails.
         lifecycle_owns_context = True
         async with await SessionOperationLease.adopt(
-            operation_store[1], running.session_operation_context, lease_seconds=30, required_work=work.coordinator
+            operation_store[1], running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
         ) as lease:
             assert lease.context is running.session_operation_context and lease.required_work is work.coordinator
             active = await lease.create_task(restore_continuation_runtime(**arguments), name="attachment-prior-p4-active-positive")
@@ -604,7 +652,7 @@ async def test_prior_real_p4_journal_survives_active_and_applied_attachment_and_
         async with await SessionOperationLease.adopt(
             operation_store[1],
             running.session_operation_context,
-            lease_seconds=30,
+            lease_seconds=OWNER_LEASE_SECONDS,
             required_work=arguments["required_work"].coordinator,
         ) as lease:
             assert lease.context is running.session_operation_context
@@ -715,6 +763,179 @@ async def test_attachment_application_rolls_back_every_chunk_and_event_preservin
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ("none", "native_wrong_owner", "read_wrong_owner", "dual_source"))
+async def test_actual_mixed_attachment_and_native_prefix_keeps_both_original_source_proofs(operation_store, tmp_path, monkeypatch, fault):
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+
+    arguments, runtime, ctx, call_model, source, _audit, sdk, _path = await application_case(
+        operation_store, tmp_path, monkeypatch, following_native=True
+    )
+    running = arguments["inventory"].running
+    owns_lease = False
+    try:
+        await apply_current_attachment_runtime(
+            runtime=runtime,
+            selected=arguments["selected"],
+            inventory=arguments["inventory"],
+            ctx=ctx,
+            call_model=call_model,
+            effect_key=source.effect_key,
+        )
+        latest = await _latest(arguments)
+        owns_lease = True
+        async with await SessionOperationLease.adopt(
+            operation_store[1],
+            running.session_operation_context,
+            lease_seconds=OWNER_LEASE_SECONDS,
+            required_work=arguments["required_work"].coordinator,
+        ) as lease:
+            cold = await lease.create_task(restore_continuation_runtime(**latest), name="mixed-prefix-original-attachment-cold")
+            assert cold.graph.batch is not None and cold.graph.batch.batch.next_tool_index == 1
+            owner = ContinuationLivePhases(
+                arguments["service"], arguments["authority"], arguments["required_work"], cold.bindings.provider_owner, lease
+            )
+            owner.bind_initial(cold)
+            await lease.create_task(
+                owner.service.advance_continuation_phase(
+                    owner=owner,
+                    authority=owner.authority,
+                    selected=latest["selected"],
+                    work=owner.work,
+                    provider_owner=owner.provider_owner,
+                ),
+                name="mixed-prefix-actual-native-completion",
+            )
+            assert owner.runtime is not None and owner.runtime.graph.batch is not None
+            data = owner.runtime.graph.batch
+            assert data.batch.next_tool_index == 2 and len(data.batch.tool_outcomes) == 2 and data.batch.current_call is None
+            latest = await _latest(latest)
+            await lease.create_task(_registered_runtime_sql_no_write(operation_store[0], latest), name="mixed-prefix-positive-source-read")
+            response = latest["selected"].stack.frames[-1].response
+            native_key, read_key = f"tool:{response.digest}:1", f"attachment:{response.digest}:0"
+            with operation_store[0].begin() as conn:
+                native_row = conn.execute(
+                    select(effects).where(
+                        effects.c.session_id == str(operation_store[4]),
+                        effects.c.operation_id == running.claim.operation_id,
+                        effects.c.effect_key == native_key,
+                    )
+                ).one()
+                read_row = conn.execute(
+                    select(effects).where(
+                        effects.c.session_id == str(operation_store[4]),
+                        effects.c.operation_id == running.claim.operation_id,
+                        effects.c.effect_key == read_key,
+                    )
+                ).one()
+                assert native_row.owner == "tool_dispatch" and read_row.owner == "read"
+                assert native_row.disposition == read_row.disposition == "committed"
+                if fault == "native_wrong_owner":
+                    conn.execute(
+                        update(effects)
+                        .where(
+                            effects.c.session_id == native_row.session_id,
+                            effects.c.operation_id == native_row.operation_id,
+                            effects.c.effect_key == native_key,
+                        )
+                        .values(owner="read")
+                    )
+                elif fault == "read_wrong_owner":
+                    conn.execute(
+                        update(effects)
+                        .where(
+                            effects.c.session_id == read_row.session_id,
+                            effects.c.operation_id == read_row.operation_id,
+                            effects.c.effect_key == read_key,
+                        )
+                        .values(owner="tool_dispatch")
+                    )
+                elif fault == "dual_source":
+                    conn.execute(insert(effects).values(**{**dict(native_row._mapping), "effect_key": f"tool:{response.digest}:0"}))
+            if fault != "none":
+                expected = {
+                    "native_wrong_owner": "runtime native prefix lost its actual issued source",
+                    "read_wrong_owner": "attachment effect lost its actual selected read owner/frontier",
+                    "dual_source": "runtime prefix has missing or dual completed source ownership",
+                }[fault]
+                await lease.create_task(
+                    _registered_runtime_sql_no_write(operation_store[0], latest, error=expected), name="mixed-prefix-source-opposition"
+                )
+            assert len(sdk) == 1
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        if not owns_lease:
+            operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ("before", "after"))
+async def test_historical_attachment_requires_own_original_audit_after_actual_recorder_progress(
+    operation_store, tmp_path, monkeypatch, role
+):
+    from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+
+    arguments, runtime, ctx, call_model, source, _audit, sdk, _path = await application_case(operation_store, tmp_path, monkeypatch)
+    running = arguments["inventory"].running
+    owns_lease = False
+    try:
+        applied = await apply_current_attachment_runtime(
+            runtime=runtime,
+            selected=arguments["selected"],
+            inventory=arguments["inventory"],
+            ctx=ctx,
+            call_model=call_model,
+            effect_key=source.effect_key,
+        )
+        latest = await _latest(arguments)
+        owns_lease = True
+        async with await SessionOperationLease.adopt(
+            operation_store[1],
+            running.session_operation_context,
+            lease_seconds=OWNER_LEASE_SECONDS,
+            required_work=arguments["required_work"].coordinator,
+        ) as lease:
+            cold = await lease.create_task(restore_continuation_runtime(**latest), name="historical-audit-original-positive")
+            cold.live.recorder.record_withheld_reply("planner_prose_unadmitted", "Actual later private recorder observation")
+            captured = await lease.create_task(
+                capture_continuation_runtime_owners(cold, selected=latest["selected"], inventory=latest["inventory"]),
+                name="historical-audit-later-real-capture",
+            )
+            latest = await install_capture(operation_store, latest, captured)
+            await lease.create_task(
+                _registered_runtime_sql_no_write(operation_store[0], latest), name="historical-audit-after-progress-positive"
+            )
+            compose = latest["selected"].stack.frames[0]
+            actual = next(chunk for chunk in latest["selected"].chunks if chunk.reference == compose.audit_buffer)
+            original_fields = TurnEvidenceSnapshot.model_validate_json(
+                applied.application.before_evidence_json if role == "before" else applied.application.after_evidence_json
+            )
+            original = original_fields.recorder
+            assert original != actual.reference and len(sdk) == 1
+            # Deliberate original-row substitution: current audit remains valid,
+            # but cannot stand in for the historical role's original dependency.
+            with operation_store[0].begin() as conn:
+                changed = conn.execute(
+                    update(chunks)
+                    .where(
+                        chunks.c.session_id == str(operation_store[4]),
+                        chunks.c.operation_id == running.claim.operation_id,
+                        chunks.c.chunk_key == f"value:{original.codec}:{original.digest}",
+                    )
+                    .values(payload=actual.canonical.encode(), byte_length=actual.reference.byte_length, sha256=actual.reference.digest)
+                )
+                assert changed.rowcount == 1
+            await lease.create_task(
+                _registered_runtime_sql_no_write(operation_store[0], latest, error="SQL binding mismatch"),
+                name="historical-audit-original-source-opposition",
+            )
+            assert len(sdk) == 1
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        if not owns_lease:
+            operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ("effect", "version"))
 async def test_attachment_finisher_refuses_before_invocation_when_current_selector_or_blob_changed(
     operation_store, tmp_path, monkeypatch, change
@@ -774,7 +995,7 @@ async def test_complete_attachment_application_data_refuses_one_coherent_changed
         async with await SessionOperationLease.adopt(
             operation_store[1],
             running.session_operation_context,
-            lease_seconds=30,
+            lease_seconds=OWNER_LEASE_SECONDS,
             required_work=arguments["required_work"].coordinator,
         ) as lease:
             assert lease.context is running.session_operation_context
@@ -793,7 +1014,13 @@ async def test_complete_attachment_application_data_refuses_one_coherent_changed
         assert lease.disposition is SessionOperationLeaseDisposition.RELEASED
         arguments["required_work"].coordinator.assert_completed()
         value = stored.application
-        admit_attachment_application(value, env_ref_names=names)
+        from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
+
+        # The actual live completion has not advanced again. Retain its exact
+        # source beside the original selected before-source for this DATA check.
+        actual_after_audit = encode_recorder_snapshot(runtime.live.recorder.snapshot_for_continuation(drained=runtime.drained))
+        original_sources = (*arguments["selected"].chunks, actual_after_audit)
+        admit_attachment_application(value, env_ref_names=names, source_chunks=original_sources)
         if change == "receipt":
             receipt = decode_retained_tool_receipt(value.receipt_json, env_ref_names=names)
             # A valid receipt for another effect still cannot replace this one.
@@ -801,18 +1028,22 @@ async def test_complete_attachment_application_data_refuses_one_coherent_changed
             value = value.model_copy(update={"receipt_json": encode_retained_tool_receipt(changed, env_ref_names=names)})
         elif change == "message":
             evidence = decode_turn_evidence(
-                encode_private_chunk(codec="composer.evidence.v1", canonical=value.after_evidence_json, env_ref_names=names),
+                encode_private_chunk(codec="composer.evidence.v2", canonical=value.after_evidence_json, env_ref_names=names),
                 env_ref_names=names,
+                source_chunks=original_sources,
             )
-            shelf = evidence.transcript
+            shelf = evidence.snapshot.transcript
             last = shelf.current_indexes[-1]
             changed_messages = list(shelf.messages_json)
             wire, error = parse_json_strict(changed_messages[last])
             assert error is None and type(wire) is dict
             wire["content"] = "changed ordinary retained tool prose"
             changed_messages[last] = canonical_json(wire)
-            evidence = evidence.model_copy(update={"transcript": shelf.model_copy(update={"messages_json": tuple(changed_messages)})})
-            value = value.model_copy(update={"after_evidence_json": encode_turn_evidence(evidence, env_ref_names=names).canonical})
+            changed = evidence.snapshot.model_copy(
+                update={"transcript": shelf.model_copy(update={"messages_json": tuple(changed_messages)})}
+            )
+            fresh = admit_turn_evidence(changed, env_ref_names=names, source_chunks=evidence.dependency_chunks)
+            value = value.model_copy(update={"after_evidence_json": encode_turn_evidence(fresh, env_ref_names=names).canonical})
         elif change == "iteration":
             raw, error = parse_json_strict(value.after_iteration_json)
             assert error is None and type(raw) is dict
@@ -824,7 +1055,7 @@ async def test_complete_attachment_application_data_refuses_one_coherent_changed
         else:
             value = value.model_copy(update={"application_operation_id": "another-ordinary-creator"})
         with pytest.raises((AuditIntegrityError, ValueError)):
-            admit_attachment_application(value, env_ref_names=names)
+            admit_attachment_application(value, env_ref_names=names, source_chunks=original_sources)
     finally:
         if not lifecycle_owns_context:
             operation_store[1].release(running.session_operation_context)
@@ -878,4 +1109,37 @@ async def test_actual_concurrent_successor_cas_consumes_one_completed_projection
         assert recovery_rows(operation_store[0]) == before
     finally:
         arguments["required_work"].coordinator.assert_completed()
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ("stale", "foreign"))
+async def test_warm_attachment_current_history_refuses_stale_or_foreign_selection_before_finish(
+    operation_store, tmp_path, monkeypatch, selection
+):
+    arguments, runtime, ctx, call_model, source, _audit, sdk, _path = await application_case(operation_store, tmp_path, monkeypatch)
+    running = arguments["inventory"].running
+    original_graph, original_live = runtime.graph, runtime.live
+    before = recovery_rows(operation_store[0])
+    selected = runtime.source.selected if selection == "stale" else replace(arguments["selected"], checkpoint_id=str(uuid4()))
+    assert selected.checkpoint_id != arguments["selected"].checkpoint_id
+
+    async def forbidden(**_arguments):
+        raise AssertionError("invalid current history cannot reach the B2 finisher")
+
+    monkeypatch.setattr(driver, "finish_current_attachment_result", forbidden)
+    try:
+        with pytest.raises(AuditIntegrityError):
+            await apply_current_attachment_runtime(
+                runtime=runtime,
+                selected=selected,
+                inventory=arguments["inventory"],
+                ctx=ctx,
+                call_model=call_model,
+                effect_key=source.effect_key,
+            )
+        assert runtime.graph is original_graph and runtime.live is original_live
+        assert len(sdk) == 1 and recovery_rows(operation_store[0]) == before
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
         operation_store[1].release(running.session_operation_context)

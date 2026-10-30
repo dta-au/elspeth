@@ -16,13 +16,13 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.composer_content import ComposerContentScope
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS, PromptGuardContentPart
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.composer.advisor_context import (
     ADVISOR_CHARS_PER_TOKEN,
-    AdvisorGraphCoverageUnavailable,
     AdvisorSummaryParts,
     advisor_user_content_parts,
     build_advisor_user_message,
@@ -33,6 +33,7 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import _request, prompt_guard_user_scope
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -712,14 +713,22 @@ def test_configured_source_reference_preservation_is_positional_and_grants_no_tr
     assert "\n".join(request.documents).count(reference) == 1
 
 
-@pytest.mark.parametrize("reference", ["private-storage/path", "api_key=PRIVATE_SOURCE_REF_CANARY", 1234])
-def test_invalid_source_identity_never_gets_a_preserved_reference(reference: object) -> None:
+@pytest.mark.parametrize(
+    ("reference", "failure_type"),
+    [
+        pytest.param("private-storage/path", AuditIntegrityError, id="malformed-identity"),
+        pytest.param("ABCDEF01-2345-6789-ABCD-EF0123456789", AuditIntegrityError, id="noncanonical-identity"),
+        pytest.param("api_key=PRIVATE_SOURCE_REF_CANARY", CredentialMaterialRefused, id="credential-refusal"),
+        pytest.param(1234, None, id="ordinary-nonstring-value"),
+    ],
+)
+def test_invalid_source_identity_never_gets_a_preserved_reference(reference: object, failure_type) -> None:
     state = _graph()
     state = replace(
         state, sources={"source": replace(state.sources["source"], options={"blob_ref": reference, "path": "INTERNAL_PATH_CANARY"})}
     )
-    if type(reference) is str:
-        with pytest.raises((AdvisorGraphCoverageUnavailable, CredentialMaterialRefused)):
+    if failure_type is not None:
+        with pytest.raises(failure_type):
             _checkpoint_arguments(phase="end", state=state)
     else:
         arguments = _checkpoint_arguments(phase="end", state=state)
@@ -783,8 +792,11 @@ def test_redaction_never_silently_merges_authored_mapping_values(surface: str, a
             state, nodes=(replace(_node(0), plugin="field_mapper" if surface == "mapping" else "passthrough", options={surface: values}),)
         )
     if ambiguous:
-        with pytest.raises(AdvisorGraphCoverageUnavailable, match=r"redaction.*ambiguous"):
+        with pytest.raises(ComposerContextUnsupported) as refusal:
             _checkpoint_arguments(phase="end", state=state)
+        assert refusal.value.reason == "graph_coverage_unavailable"
+        assert refusal.value.llm_calls == ()
+        assert all(key not in json.dumps(refusal.value.to_payload()) for key in keys)
     else:
         arguments = _checkpoint_arguments(phase="end", state=state)
         message = build_advisor_user_message(arguments)
@@ -838,11 +850,11 @@ def test_special_option_interpretation_retains_complete_authored_values(surface:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_unresolved_complete_values_never_dispatch_or_publish_a_clean_pass(invocation, monkeypatch, phase):
-    """Incomplete coverage withholds before dispatch (U-22: coverage, not presence, decides).
+    """Incomplete selected coverage refuses before dispatch or publication.
 
     A long value is now resolved and reviewed (F1). If resolution covers less
-    than the manifest, the checkpoint must still withhold with zero provider
-    calls and no clean pass, rather than review unseen bytes.
+    than the manifest, the checkpoint raises the exact preparation refusal
+    with zero provider calls and no clean pass.
     """
     from elspeth.web.composer import advisor_context
 
@@ -866,8 +878,8 @@ async def test_unresolved_complete_values_never_dispatch_or_publish_a_clean_pass
 
     monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
     recorder = BufferingRecorder()
-    with prompt_guard_user_scope(request):
-        verdict = await owner._run_advisor_checkpoint(
+    with prompt_guard_user_scope(request), pytest.raises(ComposerContextUnsupported) as refusal:
+        await owner._run_advisor_checkpoint(
             phase=phase,
             state=state,
             session_id=context.fence.session_id,
@@ -876,7 +888,9 @@ async def test_unresolved_complete_values_never_dispatch_or_publish_a_clean_pass
             recorder=recorder,
             publication_review=review if phase == "end" else None,
         )
-    assert not verdict.ok and verdict.failure_class == "unavailable" and verdict.publication_verdict is None
+    assert refusal.value.reason == "graph_coverage_unavailable"
+    assert refusal.value.partial_state is None
+    assert refusal.value.llm_calls == () and refusal.value.tool_invocations == ()
     assert recorder.llm_calls == ()
     with engine.connect() as conn:
         assert conn.execute(select(quota_provider_attempts_table)).all() == []

@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
 
+from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.composer._compose_loop_carriers import _ToolOutcome
 from elspeth.web.composer.audit import _normalize_audit_payload
 from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_result_credentials import restore_retained_plugin_schema_data
@@ -239,7 +242,47 @@ def decode_tool_result_json(
     return decode_tool_result_value(value, pre_state=pre_state, env_ref_names=env_ref_names)
 
 
-class RetainedBatchFailure(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+@dataclass(frozen=True, slots=True)
+class RetainedAdvisorRefusalSource:
+    """Original successful refusal owners; DATA never grants completion."""
+
+    kind: Literal["context_unsupported", "provider_cost_refused", "prompt_guard_refused"]
+    outcome: _ToolOutcome
+    invocation: ComposerToolInvocation
+    provider_call_id: str | None
+    allowance_limit: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.kind not in ("context_unsupported", "provider_cost_refused", "prompt_guard_refused")
+            or type(self.outcome) is not _ToolOutcome
+            or type(self.invocation) is not ComposerToolInvocation
+            or (self.provider_call_id is not None and (type(self.provider_call_id) is not str or not self.provider_call_id))
+            or (self.kind != "provider_cost_refused" and self.provider_call_id is not None)
+            or (self.kind == "context_unsupported" and (type(self.allowance_limit) is not int or self.allowance_limit < 0))
+            or (self.kind != "context_unsupported" and self.allowance_limit is not None)
+        ):
+            raise AuditIntegrityError("retained Advisor refusal lost its closed original owners")
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedBatchFailure:
+    """Closed graph DATA; nested live owners use their explicit graph codec."""
+
     kind: Literal["plugin_crash", "advisor_failure", "advisor_timeout"]
-    error_class: str = Field(min_length=1, max_length=128)
+    error_class: str
+    refusal_source: RetainedAdvisorRefusalSource | None = None
+
+    def __post_init__(self) -> None:
+        kind: object = self.kind
+        if (
+            type(kind) is not str
+            or kind not in ("plugin_crash", "advisor_failure", "advisor_timeout")
+            or type(self.error_class) is not str
+            or not 1 <= len(self.error_class) <= 128
+            or (
+                self.refusal_source is not None
+                and (type(self.refusal_source) is not RetainedAdvisorRefusalSource or self.kind != "advisor_failure")
+            )
+        ):
+            raise AuditIntegrityError("retained batch failure lost its complete closed descriptor")

@@ -12,7 +12,6 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
-from elspeth.web.composer.pipeline_planner import planner_tool_definitions
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -163,8 +162,6 @@ def test_dialect_decode_enters_real_dispatch(inventory_engine: sa.Engine, dialec
 @pytest.mark.parametrize("dialect", [ToolContractDialect.NONE, ToolContractDialect.OPENAI_STRICT])
 def test_offered_description_distinguishes_metadata_from_resolution(dialect: ToolContractDialect) -> None:
     loop = next(tool for tool in composer_loop_tool_definitions(dialect) if tool["function"]["name"] == "list_secret_refs")
-    planner = next(tool for tool in planner_tool_definitions(dialect=dialect) if tool["function"]["name"] == "list_secret_refs")
-    assert loop == planner
     description = loop["function"]["description"]
     assert "listing does not check decryption" in description
     assert "Call validate_secret_ref" in description

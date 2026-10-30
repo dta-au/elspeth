@@ -884,7 +884,7 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         composer_seed=seed,
         composer_prompt_guard_mode=mode,
     )
-    assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
+    assert [request.surface for request in requests] == ["loop_tools"]
     assert requests[0].tool_count == 46
 
     for request in requests:

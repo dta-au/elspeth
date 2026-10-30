@@ -54,7 +54,7 @@ class EndContinuationCandidate(ContinuationValue):
         expected = (
             (self.response, "composer.response.v1"),
             (self.state, "composer.state.v1"),
-            (self.evidence, "composer.evidence.v1"),
+            (self.evidence, "composer.evidence.v2"),
             (self.iteration, "composer.iteration.v1"),
         )
         if any(reference.codec != codec for reference, codec in expected):

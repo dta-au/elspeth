@@ -664,6 +664,7 @@ def composer_title_prelude(invoke):
         "(PipelinePlannerError, CommonProviderCostRefused)",
         "ChargeableAdmissionRefused",
         "PromptGuardRefused",
+        "ComposerContextUnsupported",
         "ComposerAdmissionRefused",
         "ComposerMutationAuthorityRevoked",
         "ComposerServiceError",
@@ -693,6 +694,34 @@ def composer_title_prelude(invoke):
     )
     if ast.dump(invoke.handlers[9], include_attributes=False) != ast.dump(expected_refusal, include_attributes=False):
         return None
+    expected_context_refusal = (
+        ast.parse(
+            "try:\n"
+            "    pass\n"
+            "except ComposerContextUnsupported as exc:\n"
+            "    llm_calls = exc.llm_calls\n"
+            "    observation.pending_exception_llm_calls = llm_calls\n"
+            "    observation.pending_exception_tool_invocations = exc.tool_invocations\n"
+            "    if llm_calls or exc.tool_invocations:\n"
+            "        await _required_audit(observation, _persist_turn_audit_cohort(\n"
+            "            service, session.id, exc.tool_invocations, llm_calls,\n"
+            "            tool_composition_state_id=compose_base_state_id,\n"
+            "            llm_composition_state_id=compose_base_state_id, plugin_crash_pending=True,\n"
+            "            session_operation_context=lease.context, required_audit=True,\n"
+            "            required_work=observation.required_work))\n"
+            "        observation.audit_cohort_durable = True\n"
+            "    await _publish_progress(progress_sink, event=ComposerProgressEvent(\n"
+            "        phase='failed', headline=\"The model cannot review this request's complete context.\",\n"
+            "        evidence=(exc.to_payload()['detail'],),\n"
+            "        likely_next='Review the pipeline and request size before sending again.',\n"
+            "        reason='context_unsupported'))\n"
+            "    raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc\n"
+        )
+        .body[0]
+        .handlers[0]
+    )
+    if ast.dump(invoke.handlers[10], include_attributes=False) != ast.dump(expected_context_refusal, include_attributes=False):
+        return None
     expected_revocation = (
         ast.parse(
             "try:\n"
@@ -708,7 +737,7 @@ def composer_title_prelude(invoke):
         .body[0]
         .handlers[0]
     )
-    if ast.dump(invoke.handlers[11], include_attributes=False) != ast.dump(expected_revocation, include_attributes=False):
+    if ast.dump(invoke.handlers[12], include_attributes=False) != ast.dump(expected_revocation, include_attributes=False):
         return None
     return invoke.body[0]
 

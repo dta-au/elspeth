@@ -21,6 +21,7 @@ from elspeth.web.sessions.models import composer_completion_events_table, compos
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.sessions.test_routes import _close_app_session_engines as _close_app_session_engines
 from tests.unit.web.sessions.test_routes import _make_app, _save_test_composition_state
@@ -263,8 +264,8 @@ async def test_revert_refuses_foreign_session_target_without_publication(tmp_pat
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Current", "local")
     other = await service.create_session("alice", "Other", "local")
-    before = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-    foreign = await _save_test_composition_state(service, other.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    before = await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
+    foreign = await _save_test_composition_state(service, other.id, composition_state_data(is_valid=True), provenance="session_seed")
     response = SyncASGITestClient(app).post(
         f"/api/sessions/{session.id}/state/revert",
         json={"operation_id": str(uuid4()), "state_id": str(foreign.id)},
@@ -279,7 +280,7 @@ async def test_revert_refuses_foreign_session_target_without_publication(tmp_pat
 async def test_recovery_requires_session_ownership_without_mutating_content(tmp_path: Path, operation: str) -> None:
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Owned", "local")
-    before = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    before = await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
     with service._engine.begin() as connection:
         ensure_test_identity(connection, identity_id="bob")
         grant_test_pipeline_user(connection, identity_id="bob")

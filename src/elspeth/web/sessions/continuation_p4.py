@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import TypeAdapter
@@ -38,6 +38,7 @@ from elspeth.web.composer.continuation_p4_outcome import (
     RetainedAuditOutcome,
     decode_audit_outcome_data,
     encode_audit_outcome_data,
+    historical_checkpoint_columns_json,
     historical_checkpoint_record,
 )
 from elspeth.web.composer.continuation_prepared_p4 import (
@@ -53,6 +54,10 @@ from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.turn_effects import authored_state_hash
 from elspeth.web.credential_guard import require_no_credential_material
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
+    from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
 from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
@@ -66,6 +71,7 @@ from elspeth.web.sessions.continuation import (
     _OwedP4Scope,
     _require_current_continuation_running,
     append_complete_snapshot,
+    load_snapshot,
     private_chunk_key,
     put_chunk,
     read_chunk,
@@ -104,6 +110,227 @@ class ReadmittedP4Result:
     receipt: PersistedComposerTurnReceipt
     outcome: RetainedAuditOutcome
     historical_effect: ValidatedHistoricalEffectReference | None
+
+
+@dataclass(slots=True)
+class P4WriterObservation:
+    """Actual committing owner's candidate; DATA until committed readback."""
+
+    commit: ContinuationOwnerCommit
+    prepared: PreparedP4Value
+    candidate: AuditOutcome | None = None
+    original_error: BaseException | None = None
+    readback: ReadmittedP4Result | None = None
+    known_not_committed: bool = False
+    committed: bool = False
+    application_candidate: StoredP4Application | None = None
+    failed_candidates: tuple[AuditOutcome, ...] = ()
+    prior_errors: tuple[BaseException, ...] = ()
+
+
+def read_p4_transaction_outcome_on_connection(
+    conn: Connection, observation: P4WriterObservation, *, env_ref_names: frozenset[str]
+) -> AuditOutcome | None:
+    """Resolve a transaction error under the same real session lock.
+
+    The original transaction must surrender its advisory lock before this read
+    can finish. A receipt is compared to the actual candidate object retained
+    by that committing owner; historical DATA never remints its witness.
+    """
+    if type(observation) is not P4WriterObservation or type(observation.commit) is not ContinuationOwnerCommit:
+        raise AuditIntegrityError("P4 transaction readback lost its actual observation owner")
+    commit = observation.commit
+    running = commit.running
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    stored = load_snapshot(conn, session_id=sid, operation_id=operation)
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+    from elspeth.web.sessions.models import composer_continuation_events_table as events
+    from elspeth.web.sessions.models import sessions_table
+
+    original_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation,
+            checkpoints.c.checkpoint_id == commit.expected_checkpoint_id,
+        )
+    ).one_or_none()
+    if original_row is None or original_row.cursor != commit.expected_cursor:
+        raise AuditIntegrityError("P4 readback lost its actual original prepared checkpoint")
+    original = StoredContinuationSnapshot(
+        read_chunk(conn, session_id=sid, operation_id=operation, key=original_row.snapshot_chunk_key).decode("utf-8", errors="strict"),
+        original_row.cursor,
+        original_row.checkpoint_id,
+    )
+    prepared = _selected_prepared(conn, original, running=running, effect_key=commit.effect_key, env_ref_names=env_ref_names)
+    if encode_prepared_p4(prepared, env_ref_names=env_ref_names) != encode_prepared_p4(observation.prepared, env_ref_names=env_ref_names):
+        raise AuditIntegrityError("P4 transaction readback changed its complete original input")
+    effect = conn.execute(
+        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == commit.effect_key)
+    ).one()
+    if effect.disposition == "prepared":
+        _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+        if (
+            stored.checkpoint_id != commit.expected_checkpoint_id
+            or stored.cursor != commit.expected_cursor
+            or effect.receipt_key is not None
+            or effect.result_chunk_key is not None
+            or effect.input_sha256 != commit.input_sha256
+            or effect.owner != "session_sql"
+            or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
+        ):
+            raise AuditIntegrityError("uncommitted P4 readback changed its original prepared owner")
+        candidate = observation.candidate
+        if (
+            candidate is not None
+            and candidate.assistant_id is not None
+            and conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.id == candidate.assistant_id)).one_or_none()
+            is not None
+        ):
+            raise AuditIntegrityError("P4 transaction has published rows without its atomic receipt")
+        observation.known_not_committed = True
+        return None
+    candidate = observation.candidate
+    application = observation.application_candidate
+    if candidate is None or application is None:
+        raise AuditIntegrityError("committed P4 lacks its actual committing owner's two candidates")
+    # This is historical outcome readback of this physical invocation, not a
+    # current mutation boundary. Exact immutable creator/source joins tolerate
+    # legitimate subsequent head/generation progress without granting its fence.
+    creator = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == running.claim.segment_sequence,
+            attempts.c.generation == running.claim.ownership_generation,
+        )
+    ).one_or_none()
+    source = application.bundle.evidence_after.snapshot
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one_or_none()
+    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).one_or_none()
+    current_root = decode_continuation_snapshot(stored.payload_json)
+    original_root = decode_continuation_snapshot(original.payload_json)
+    if (
+        creator is None
+        or parent is None
+        or principal is None
+        or creator.session_operation_id != running.session_operation_context.fence.operation_id
+        or creator.session_operation_epoch != running.session_operation_context.fence.operation_epoch
+        or creator.claim_attempt != running.claim.attempt
+        or parent.lifecycle_version != 2
+        or parent.actor_user_id != source.actor_user_id
+        or principal.user_id != source.actor_user_id
+        or source.physical_operation_id != creator.session_operation_id
+        or source.physical_operation_epoch != creator.session_operation_epoch
+        or current_root.logical != original_root.logical
+        or source.logical != original_root.logical
+        or effect.owner != "session_sql"
+        or effect.disposition != "committed"
+        or effect.input_sha256 != commit.input_sha256
+        or (effect.creator_sequence, effect.creator_generation) != (creator.sequence, creator.generation)
+    ):
+        raise AuditIntegrityError("P4 historical readback changed its actual creator/principal/source")
+    record = application.bundle.entry.applications[-1]
+    result_chunk = application.bundle.evidence_after.sources.chunk(record.result)
+    if effect.result_chunk_key != private_chunk_key(result_chunk):
+        raise AuditIntegrityError("P4 readback changed its actual receipt source")
+    if read_chunk(conn, session_id=sid, operation_id=operation, key=effect.result_chunk_key) != result_chunk.canonical.encode("utf-8"):
+        raise AuditIntegrityError("P4 readback changed its original receipt bytes")
+    receipt, data = decode_p4_receipt(result_chunk.canonical, env_ref_names=env_ref_names)
+    result = verify_p4_immutable_receipt_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=operation,
+        effect_key=commit.effect_key,
+        input_sha256=commit.input_sha256,
+        receipt_key=effect.receipt_key,
+        creator_sequence=creator.sequence,
+        creator_generation=creator.generation,
+        receipt=receipt,
+        data=data,
+        selected=prepared,
+        env_ref_names=env_ref_names,
+    )
+    actual = decode_audit_outcome_data(
+        encode_audit_outcome_data(candidate, prepared=prepared, env_ref_names=env_ref_names),
+        prepared=prepared,
+        env_ref_names=env_ref_names,
+    )
+    if actual != result.outcome:
+        raise AuditIntegrityError("committed P4 differs from its retained actual writer outcome")
+    applied = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation,
+            checkpoints.c.checkpoint_id == application.snapshot.checkpoint_id,
+        )
+    ).one_or_none()
+    event = conn.execute(
+        select(events).where(
+            events.c.session_id == sid,
+            events.c.operation_id == operation,
+            events.c.sequence == application.snapshot.cursor,
+        )
+    ).one_or_none()
+    if (
+        applied is None
+        or applied.cursor != application.snapshot.cursor
+        or applied.cursor > stored.cursor
+        or record.effect_key != commit.effect_key
+        or record.input_sha256 != commit.input_sha256
+        or event is None
+        or event.tag != "checkpoint"
+        or read_chunk(conn, session_id=sid, operation_id=operation, key=applied.snapshot_chunk_key).decode("utf-8", errors="strict")
+        != application.snapshot.payload_json
+    ):
+        raise AuditIntegrityError("P4 receipt has no exact durable complete application")
+    expected_event = canonical_json(
+        {
+            "phase": "p4_application_committed",
+            "effect_key": commit.effect_key,
+            "selected_checkpoint_id": record.checkpoint_id,
+            "selected_cursor": record.cursor,
+            "evidence_digest": application.bundle.evidence_chunk.reference.digest,
+            "batch_digest": application.bundle.batch_chunk.reference.digest,
+        }
+    ).encode("utf-8")
+    if read_chunk(conn, session_id=sid, operation_id=operation, key=event.payload_chunk_key) != expected_event:
+        raise AuditIntegrityError("P4 readback changed its actual application event/predecessor")
+    predecessor = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation,
+            checkpoints.c.checkpoint_id == record.checkpoint_id,
+        )
+    ).one_or_none()
+    if predecessor is None or predecessor.cursor != record.cursor or predecessor.cursor + 1 != applied.cursor:
+        raise AuditIntegrityError("P4 readback lost its exact committed pending predecessor")
+    pending_root = decode_continuation_snapshot(
+        read_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation,
+            key=predecessor.snapshot_chunk_key,
+        ).decode("utf-8", errors="strict")
+    )
+    if (
+        pending_root.logical != original_root.logical
+        or len(pending_root.pending_owner_results) != 1
+        or pending_root.pending_owner_results[0].effect_key != commit.effect_key
+        or pending_root.pending_owner_results[0].result != record.result
+    ):
+        raise AuditIntegrityError("P4 readback changed its pending result's original source relation")
+    for chunk in (
+        application.bundle.evidence_chunk,
+        application.bundle.batch_chunk,
+        application.bundle.audit_chunk,
+        application.bundle.state_chunk,
+        *application.bundle.evidence_after.sources.chunks,
+    ):
+        if read_chunk(conn, session_id=sid, operation_id=operation, key=private_chunk_key(chunk)) != chunk.canonical.encode("utf-8"):
+            raise AuditIntegrityError("P4 readback changed its exact committed successor dependency")
+    observation.readback, observation.committed = result, True
+    return candidate
 
 
 def _selected_prepared(
@@ -615,11 +842,15 @@ def verify_p4_immutable_receipt_on_connection(
     ]
     if tuple(_state_row_hash(row) for row in state_rows) != receipt.state_row_hashes:
         raise AuditIntegrityError("P4 recovery changed complete inserted state history")
-    if data.checkpoint is not None and (
-        not state_rows
-        or state_record_from_row(state_rows[-1]) != historical_checkpoint_record(data.checkpoint, env_ref_names=env_ref_names)
-    ):
-        raise AuditIntegrityError("P4 historical checkpoint differs from its actual full immutable row")
+    if data.checkpoint is not None:
+        if not state_rows:
+            raise AuditIntegrityError("P4 historical checkpoint differs from its actual full immutable row")
+        actual_checkpoint = state_record_from_row(state_rows[-1])
+        if (
+            actual_checkpoint != historical_checkpoint_record(data.checkpoint, env_ref_names=env_ref_names)
+            or historical_checkpoint_columns_json(actual_checkpoint) != data.checkpoint.original_columns_json
+        ):
+            raise AuditIntegrityError("P4 historical checkpoint differs from its actual full immutable row")
     historical = None
     if data.checkpoint_disposition == "committed":
         if receipt.authored_state_hash is None or receipt.assistant_id is None:
@@ -704,6 +935,7 @@ def prepare_p4_on_connection(
     expected_cursor: int,
     pending_batch: PrivateChunk,
     env_ref_names: frozenset[str] = frozenset(),
+    captured: CapturedContinuationRuntime | None = None,
 ) -> ContinuationOwnerCommit:
     """Prepare only the exact selected completed batch's first P4 effect.
 
@@ -719,7 +951,7 @@ def prepare_p4_on_connection(
     from elspeth.web.sessions.continuation import bound_action_json
     from elspeth.web.sessions.models import composer_operation_segments_table as segments
 
-    _require_current_continuation_running(conn, running)
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
     sid, operation_id = str(running.claim.session_id), running.claim.operation_id
     stored = require_snapshot_cas(
         conn, session_id=sid, operation_id=operation_id, expected_checkpoint_id=expected_checkpoint_id, expected_cursor=expected_cursor
@@ -732,13 +964,36 @@ def prepare_p4_on_connection(
         conn, session_id=sid, operation_id=operation_id, key=f"value:{frame.accumulator.codec}:{frame.accumulator.digest}"
     ).decode("utf-8", errors="strict")
     old = decode_coupled_batch_chunk(PrivateChunk(frame.accumulator, old_raw), env_ref_names=env_ref_names)
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+
+    parent = conn.execute(select(jobs.c.cancel_requested_at).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
+    if parent.cancel_requested_at is None:
+        _require_current_continuation_running(conn, running)
+    else:
+        from elspeth.web.composer.continuation_phase_transitions import require_completed_tool_prefix_on_connection
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+
+        current = SelectedContinuationState(stored.checkpoint_id, stack, load_selected_private_chunks_on_connection(conn, running, stored))
+        require_completed_tool_prefix_on_connection(conn, running, selected=current, env_ref_names=env_ref_names)
     pending = decode_p4_pending_batch_chunk(pending_batch, env_ref_names=env_ref_names)
-    if old.batch.phase != "dispatch_ready" or pending.batch.p4_input_json is None:
+    expected_completed = old_raw
+    if parent.cancel_requested_at is not None and old.batch.phase == "call_ready":
+        # The current SQL Stop, together with the actual issued/committed
+        # prefix proved above, closes only the unissued suffix. No live flag
+        # can authorize skipping a tool while this marker is absent.
+        stopped = replace(old.batch, phase="dispatch_ready", stop_issued_batch=True)
+        expected_completed = encode_coupled_batch_data(
+            batch=stopped, accumulator=old.accumulator, calls=old.calls, env_ref_names=env_ref_names
+        )
+    elif old.batch.phase != "dispatch_ready":
+        raise AuditIntegrityError("P4 preparation cannot skip remaining admitted tool work")
+    if pending.batch.p4_input_json is None:
         raise AuditIntegrityError("P4 preparation cannot skip remaining admitted tool work")
     unchanged = replace(pending.batch, phase="dispatch_ready", p4_input_json=None)
     if (
         encode_coupled_batch_data(batch=unchanged, accumulator=pending.accumulator, calls=pending.calls, env_ref_names=env_ref_names)
-        != old_raw
+        != expected_completed
     ):
         raise AuditIntegrityError("P4 preparation changed actual completed batch data/aliases")
     response_raw = read_chunk(
@@ -794,10 +1049,52 @@ def prepare_p4_on_connection(
             action_json=action,
         )
     )
+    retained_stack = stack
+    if captured is not None:
+        from elspeth.web.composer.continuation import ComposeFrame
+        from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
+
+        if (
+            type(captured) is not CapturedContinuationRuntime
+            or captured.selected.checkpoint_id != stored.checkpoint_id
+            or encode_continuation_snapshot(captured.selected.stack) != stored.payload_json
+            or len(stack.frames) != 2
+            or len(captured.stack.frames) != 2
+            or type(stack.frames[0]) is not ComposeFrame
+            or type(captured.stack.frames[0]) is not ComposeFrame
+            or captured.stack.frames[-1] != frame
+            or captured.stack.model_copy(update={"frames": stack.frames}) != stack
+        ):
+            raise AuditIntegrityError("P4 recorder capture replaced its actual selected predecessor")
+        before_compose, after_compose = stack.frames[0], captured.stack.frames[0]
+        unchanged_compose = after_compose.model_copy(
+            update={
+                "messages": before_compose.messages,
+                "tools": before_compose.tools,
+                "state": before_compose.state,
+                "evidence": before_compose.evidence,
+                "transcript": before_compose.transcript,
+                "audit_buffer": before_compose.audit_buffer,
+                "caches": before_compose.caches,
+                "iteration": before_compose.iteration,
+            }
+        )
+        if unchanged_compose != before_compose:
+            raise AuditIntegrityError("P4 recorder capture changed logical counters/state/disposition")
+        for chunk in captured.chunks:
+            put_chunk(
+                conn,
+                session_id=sid,
+                operation_id=operation_id,
+                key=private_chunk_key(chunk),
+                payload=chunk.canonical.encode("utf-8"),
+                codec=chunk.reference.codec,
+            )
+        retained_stack = captured.stack
     next_frame = frame.model_copy(update={"phase": "effect_reconciling", "accumulator": pending_batch.reference})
-    next_stack = stack.model_copy(
+    next_stack = retained_stack.model_copy(
         update={
-            "frames": (*stack.frames[:-1], next_frame),
+            "frames": (*retained_stack.frames[:-1], next_frame),
             "effect_frontier": (*stack.effect_frontier, EffectFrontierEntry(effect_id=key, disposition="prepared", receipt_id=None)),
         }
     )
@@ -830,4 +1127,15 @@ def prepare_p4_on_connection(
         event_batch=(ContinuationEvent("tool_prepared", canonical_json({"effect_key": key, "input_sha256": input_hash})),),
         handoff=False,
     )
+    if captured is not None:
+        from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+
+        full = SelectedContinuationState(
+            selected.checkpoint_id,
+            decode_continuation_snapshot(selected.payload_json),
+            load_selected_private_chunks_on_connection(conn, running, selected),
+        )
+        read_selected_turn_evidence_graph_on_connection(conn, running, selected=full, names=env_ref_names)
     return ContinuationOwnerCommit(running, key, input_hash, selected.checkpoint_id, selected.cursor)

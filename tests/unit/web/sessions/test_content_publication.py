@@ -18,6 +18,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -194,14 +195,14 @@ def test_publication_is_closed_versioned_identity_and_cannot_grant_permission(fi
 
 def test_storage_digest_preserves_json_number_types_nulls_and_authored_order():
     def digest(value):
-        return storage_content_hash(CompositionStateData(nodes=[{"id": "number", "options": {"number": value}}]))
+        return storage_content_hash(composition_state_data(nodes=[{"id": "number", "options": {"number": value}}]))
 
     assert len({digest(1), digest(1.0), digest(True)}) == 3
     assert digest(2**60) != digest(2**60 + 1)
-    assert storage_content_hash(CompositionStateData(nodes=None)) != storage_content_hash(CompositionStateData(nodes=[]))
+    assert storage_content_hash(composition_state_data(nodes=None)) != storage_content_hash(composition_state_data(nodes=[]))
     first = {"first": {"plugin": "csv"}, "second": {"plugin": "csv"}}
-    assert storage_content_hash(CompositionStateData(sources=first)) != storage_content_hash(
-        CompositionStateData(sources=dict(reversed(list(first.items()))))
+    assert storage_content_hash(composition_state_data(sources=first)) != storage_content_hash(
+        composition_state_data(sources=dict(reversed(list(first.items()))))
     )
 
 
@@ -212,7 +213,7 @@ async def test_storage_number_type_binding_survives_database_roundtrip(store):
     saved = []
     for value in (1, 1.0, 2**60 + 1):
         row = await service.save_composition_state(
-            session.id, CompositionStateData(nodes=[{"id": "number", "options": {"number": value}}]), provenance="session_seed"
+            session.id, composition_state_data(nodes=[{"id": "number", "options": {"number": value}}]), provenance="session_seed"
         )
         saved.append(await service.get_state(row.id))
     assert len({read_content_publication(row).storage_content_hash for row in saved}) == 3

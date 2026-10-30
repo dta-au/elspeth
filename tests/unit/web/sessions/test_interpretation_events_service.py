@@ -95,6 +95,7 @@ from elspeth.web.sessions.service import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data, default_pipeline_metadata
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -2241,7 +2242,7 @@ async def test_06_resolve_raises_when_node_removed_since_surfacing(service) -> N
     await _save_composition_state(
         service,
         session_id,
-        CompositionStateData(
+        composition_state_data(
             nodes=[{"id": "different-node", "kind": "csv", "options": {}}],
             is_valid=True,
         ),
@@ -3287,7 +3288,7 @@ def _state_with_node(node: dict) -> CompositionStateRecord:
         nodes=[node],
         edges=None,
         outputs=None,
-        metadata_=None,
+        metadata_=default_pipeline_metadata(),
         is_valid=True,
         validation_errors=None,
         created_at=datetime.now(UTC),

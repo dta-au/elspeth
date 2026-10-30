@@ -29,7 +29,6 @@ from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import planner_authoring_aids
@@ -1406,22 +1405,6 @@ class TestDiscoveryDigest:
         with pytest.raises(RuntimeError, match="discovery_digest_budget_invariant"):
             discovery_digest(view, summaries=summaries)
 
-    @pytest.mark.parametrize("name", ["web_scrape", "llm", "field_mapper"])
-    def test_selected_plugin_schema_remains_available_when_compact_attachment_budget_is_spent(self, name: str) -> None:
-        """Targeted discovery retains the admitted schema after aggregate compaction fills."""
-        from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
-        from elspeth.web.composer.pipeline_planner import _ParsedToolCall, _serialize_provider_discovery_result
-
-        view, snapshot = _trained_view()
-        arguments = {"plugin_type": "transform", "name": name}
-        result = _dispatch_tool("get_plugin_schema", arguments, _empty_state(), view, plugin_snapshot=snapshot)
-        assert result.success
-        admitted = admit_discovery_result("get_plugin_schema", result)
-        call = _ParsedToolCall("schema-call", "get_plugin_schema", json.dumps(arguments), arguments)
-        serialized = _serialize_provider_discovery_result(call=call, result=admitted, schema_contract_budget_remaining=0)
-        assert serialized == serialize_admitted_discovery_result(admitted)
-        assert json.loads(serialized)["success"] is True
-
     def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
         """The exact g11 regression anchor, held on the stable token only.
 
@@ -2670,7 +2653,7 @@ class TestSession891b7b1eLiveReviewEdits:
 
         replacement_rule = next(rule for rule in rules if rule.startswith("set_pipeline is a FULL replacement"))
         mutation_rule = next(rule for rule in rules if rule.startswith("ORDINARY/FREEFORM MUTATION SURFACE"))
-        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
+        request_rule = next(rule for rule in rules if rule.startswith("Use only tools advertised in this request"))
 
         assert "source: null never means" in replacement_rule
         assert "Plugin-backed sources must be preserved" in replacement_rule
@@ -2686,32 +2669,11 @@ class TestSession891b7b1eLiveReviewEdits:
         assert "advertised narrow patch tool" in mutation_rule
         assert "surface the named gap" in mutation_rule
 
-        assert "current-state context" in proposal_rule
-        assert "only tools advertised in this request" in proposal_rule
-        assert "never invoke an unadvertised inspection or mutation tool" in proposal_rule
-        assert "exact authorable source binding" in proposal_rule
-        assert "exact-source/round-trip gap" in proposal_rule
-        assert "stop instead of guessing" in proposal_rule
-
-    def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
-        """Shared aids must not teach proposal planners calls absent from their palette."""
-        from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
-        from elspeth.web.composer.tools import get_tool_definitions
-
-        view, _snapshot = _trained_view()
-        rules = build_planner_authoring_aids(view)["source_custody"]["rules"]
-        proposal_rule = next(rule for rule in rules if rule.startswith("PROPOSAL PLANNER SURFACE"))
-        registered_names = {definition["name"] for definition in get_tool_definitions()}
-        named_tools = {name for name in registered_names if name in proposal_rule}
-
-        policy = PlannerDiscoveryPolicy.initial()
-        advertised_names = {
-            definition["function"]["name"] for definition in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)
-        }
-        assert named_tools <= advertised_names
-
-        assert "get_pipeline_state" not in proposal_rule
-        assert "patch_source_options" not in proposal_rule
+        assert "never invoke an unadvertised tool" in request_rule
+        assert "authoritative source binding" in request_rule
+        assert "exact-source/round-trip gap" in request_rule
+        assert "stop instead of guessing" in request_rule
+        assert all("PROPOSAL PLANNER SURFACE" not in rule for rule in rules)
 
     def test_custody_verbatim_rule_names_the_user_requested_sample_exception(self) -> None:
         """Planner-authored samples must be an explicit, provenance-preserving exception."""

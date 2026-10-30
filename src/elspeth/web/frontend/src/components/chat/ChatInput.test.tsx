@@ -1318,3 +1318,24 @@ describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
     expect(rule).toMatch(/fill:\s*none/);
   });
 });
+
+describe("Stop while pending (F-13)", () => {
+  it("keeps focus, announces Stopping and ignores a second press", async () => {
+    const onCancel = vi.fn();
+    render(<ChatInput onSend={vi.fn()} disabled onCancel={onCancel} stopPending inputRef={{ current: null }} />);
+    const stop = screen.getByRole("button", { name: "Stopping" });
+    expect(stop).toHaveAttribute("aria-disabled", "true");
+    expect(stop).not.toBeDisabled();
+    await userEvent.setup().click(stop);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+});
+
+it("R13: Stop keeps focus through the transition to Stopping", async () => {
+  const props = { onSend: vi.fn(), disabled: true, onCancel: vi.fn(), inputRef: { current: null } };
+  const { rerender } = render(<ChatInput {...props} />);
+  const stop = screen.getByRole("button", { name: "Stop composing" });
+  stop.focus();
+  rerender(<ChatInput {...props} stopPending />);
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "Stopping" }));
+});

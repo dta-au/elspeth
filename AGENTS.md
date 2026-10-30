@@ -96,13 +96,20 @@ working around it.
   base range, rerere, the HMAC key in the environment, and that
   `elspeth.__file__` resolves inside this tree. Exit 1 on any FAIL. `--fetch`
   is its only write.
-- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--root DIR] [--log-dir DIR]`
+- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--workers N] [--root DIR] [--log-dir DIR] [--run-timeout-seconds N]`
   runs the pre-merge gate as CI runs it: one log per stage, every exit code
   written to `summary.txt`, the tree state hashed before and after
   (`frozen=NO` means the run is not evidence), provenance proved with both
-  `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
-  suites are on the box. From an agent shell use `--execute --detach` and poll
-  the printed `.done` path. The suite is never piped through `tail`.
+  `-o pythonpath` and an exported `PYTHONPATH`. Omitted workers trigger automatic
+  host sibling discovery (12 workers, or 8 with matching siblings). Explicit
+  `--workers N`, including 0 for serial, bypasses discovery entirely and records
+  siblings as unobserved; establish capacity before choosing N. Public execution
+  supervises the foreground driver, including preflight. From an agent shell use
+  `--execute --detach --workers N` with the assigned capacity and poll
+  the printed `launcher.exit` path. Require zero launcher and actual
+  `supervisor.exit` statuses, `supervisor.json` cleanup complete, and a passing
+  driver with complete stage receipts and `summary.txt` frozen=yes before qualifying the
+  gate. `.done` is driver-only. The suite is never piped through `tail`.
 - `scripts/work-at-risk.sh [--count-all]` reports, for every registered
   worktree, the hours since the oldest uncommitted or untracked file, the
   hours since the last commit, the `src/elspeth` copies under gitignored paths
@@ -233,9 +240,14 @@ working around it.
   unique, lane-private log path, not a shared generic filename.
 - Do not claim "zero failures", "suite green", or "passes in isolation" until
   the process has exited and you have read its exit code.
-- `scripts/full-suite-gate.sh --execute --detach` does all of the above for
-  you (per-stage logs, recorded exit codes, a frozen-tree check); read its
-  `summary.txt`, not its terminal output.
+- `scripts/full-suite-gate.sh --execute --detach --workers N` with established
+  capacity does all of the above for
+  you (per-stage logs, recorded exits, a frozen-tree check and ordinary-group
+  supervision). Read `launcher.exit`, actual `supervisor.exit` and
+  `supervisor.json` alongside `summary.txt` and driver/stage receipts;
+  require complete cleanup and a passing frozen driver to qualify. `.done`
+  alone proves only driver receipt completion. Terminal output alone is
+  not the result.
 - Every commit that lands on a release or integration branch must keep green
   tests green. No landed commit may turn a passing test red; that is what
   `git bisect` treats as a regression. Fixes made one after another, even in

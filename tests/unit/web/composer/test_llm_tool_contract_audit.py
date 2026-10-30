@@ -36,7 +36,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.composer.tools.wire_projection import stamp_planner_terminal, wire_tool_definitions
+from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 
 _NEW_FIELDS = ("tool_contract_dialect", "strict_tool_count")
 
@@ -175,9 +175,7 @@ class TestDerivation:
         assert record.strict_tool_count == 0
 
     def test_a_list_stamped_only_false_is_openai_strict_with_zero(self) -> None:
-        terminal = stamp_planner_terminal(_tool("emit_pipeline_proposal"), ToolContractDialect.OPENAI_STRICT)
-
-        record = _record([terminal])
+        record = _record([_tool("a", strict=False), _tool("b", strict=False)])
 
         assert record.tool_contract_dialect is ToolContractDialect.OPENAI_STRICT
         assert record.strict_tool_count == 0

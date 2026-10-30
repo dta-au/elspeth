@@ -16,7 +16,7 @@ from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_continuation_snapshot, verify_private_chunk
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory, require_current_env_inventory_on_connection
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot, decode_turn_evidence
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, decode_turn_evidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _restore_current_evidence
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -54,7 +54,7 @@ def read_turn_evidence_on_connection(
     *,
     selected: SelectedContinuationState,
     inventory: CurrentContinuationEnvInventory,
-) -> TurnEvidenceSnapshot:
+) -> AdmittedTurnEvidence:
     if type(selected) is not SelectedContinuationState or type(running) is not ComposerOperationRunning:
         raise AuditIntegrityError("cold evidence requires its actual selected/current owners")
     selected.__post_init__()
@@ -67,7 +67,7 @@ def read_turn_evidence_on_connection(
     if root.pending_owner_results:
         raise AuditIntegrityError("cold pre-P4 evidence cannot consume a pending owner result")
     snapshot = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=names)
-    if snapshot.application_entry is not None:
+    if snapshot.snapshot.application_entry is not None:
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
 
         require_p4_application_journal_on_connection(conn, running, selected=selected, evidence=snapshot, env_ref_names=names)
@@ -80,7 +80,7 @@ def read_selected_turn_evidence_graph_on_connection(
     *,
     selected: SelectedContinuationState,
     names: frozenset[str],
-) -> TurnEvidenceSnapshot:
+) -> AdmittedTurnEvidence:
     """Validate selected evidence DATA after the caller proves current admission."""
     root = selected.stack
     compose = tuple(frame for frame in root.frames if type(frame) is ComposeFrame)
@@ -101,7 +101,8 @@ def read_selected_turn_evidence_graph_on_connection(
         verify_private_chunk(reference, candidates[0].canonical)
         return candidates[0]
 
-    snapshot = decode_turn_evidence(actual_chunk(frame.evidence), env_ref_names=names)
+    admitted = decode_turn_evidence(actual_chunk(frame.evidence), env_ref_names=names, source_chunks=selected.chunks)
+    snapshot = admitted.snapshot
     if snapshot.logical != root.logical:
         raise AuditIntegrityError("cold evidence changed its complete logical binding")
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
@@ -154,7 +155,8 @@ def read_selected_turn_evidence_graph_on_connection(
     ):
         raise AuditIntegrityError("cold evidence changed its actual initial state/frontier")
     if (
-        actual_chunk(frame.audit_buffer).canonical != snapshot.recorder_json
+        snapshot.recorder != frame.audit_buffer
+        or actual_chunk(frame.audit_buffer) != admitted.recorder_chunk
         or actual_chunk(frame.transcript) != encode_message_shelf(snapshot.transcript)
         or frame.messages.codec != "composer.messages.v1"
         or actual_chunk(frame.messages).canonical
@@ -174,11 +176,11 @@ def read_selected_turn_evidence_graph_on_connection(
         if type(batch_frame) is ToolBatchFrame:
             actual_chunk(batch_frame.accumulator)
             actual_chunk(batch_frame.response)
-    require_selected_active_batch_graph(selected, snapshot, env_ref_names=names)
+    require_selected_active_batch_graph(selected, admitted, env_ref_names=names)
     from elspeth.web.sessions.continuation_attachment_application import require_attachment_applications_on_connection
 
-    require_attachment_applications_on_connection(conn, running, selected=selected, evidence=snapshot, env_ref_names=names)
-    return snapshot
+    require_attachment_applications_on_connection(conn, running, selected=selected, evidence=admitted, env_ref_names=names)
+    return admitted
 
 
 async def restore_turn_evidence(
@@ -232,10 +234,11 @@ async def restore_turn_evidence(
     elif type(outcome) is RequiredSQLReturned:
         projection.begin_projection()
         try:
-            if type(outcome.value) is not TurnEvidenceSnapshot:
+            if type(outcome.value) is not AdmittedTurnEvidence:
                 raise AuditIntegrityError("cold evidence read replaced its owned DATA result")
+            admitted = require_admitted_turn_evidence(outcome.value, env_ref_names=inventory.names)
             reader = None
-            if outcome.value.requires_blob_reader:
+            if admitted.snapshot.requires_blob_reader:
                 if service is None:
                     raise AuditIntegrityError("cold evidence requires its actual current reader service")
                 _require_current_reader_service(service, authority)
@@ -245,7 +248,7 @@ async def restore_turn_evidence(
                     service, session_id=str(running.claim.session_id), context=running.session_operation_context
                 )
             result = _restore_current_evidence(
-                outcome.value, context=running.session_operation_context, reader=reader, env_ref_names=inventory.names
+                admitted, context=running.session_operation_context, reader=reader, env_ref_names=inventory.names
             )
         except BaseException as error:
             projection.complete_owned(error)

@@ -8,11 +8,307 @@ Other phase owners remain explicit refusals until their real producers exist.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+from sqlalchemy import Connection, select
+
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.continuation import ComposeFrame, InitializeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation import (
+    AdvisorFrame,
+    ComposeFrame,
+    ContinuationFrameStack,
+    EndFrame,
+    InitializeFrame,
+    ToolBatchFrame,
+)
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy, decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
+    from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+
+
+def validate_continuation_structure_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    selected: SelectedContinuationState,
+    *,
+    env_ref_names: frozenset[str],
+) -> tuple[str, ...]:
+    """Validate the actual full phase before granting an ambiguous disposition.
+
+    This is a read facet under the caller's current transaction, never an
+    exception-to-allowance conversion. Reuse the original graph/input/receipt
+    readers; a matching effect label alone cannot validate corrupted DATA.
+    """
+    from elspeth.contracts.hashing import stable_hash
+    from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+    from elspeth.web.composer.continuation_prepared_p4 import p4_semantic_input
+    from elspeth.web.composer.continuation_tool_batch import _read_json_value
+    from elspeth.web.sessions.continuation import _require_current_continuation_running, load_snapshot
+    from elspeth.web.sessions.continuation_p4 import _selected_prepared, read_p4_result_on_connection
+    from elspeth.web.sessions.continuation_primary import _selected_effect, _stored_input
+    from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+    from elspeth.web.sessions.continuation_title_provider import _source_chain
+    from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+
+    if type(selected) is not SelectedContinuationState or type(env_ref_names) is not frozenset:
+        raise TypeError("structural admission requires its actual selected DATA and source names")
+    selected.__post_init__()
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    root = selected.stack
+    stored = load_snapshot(conn, session_id=root.logical.session_id, operation_id=root.logical.operation_id)
+    if (
+        stored.checkpoint_id != selected.checkpoint_id
+        or stored.payload_json != encode_continuation_snapshot(root)
+        or load_selected_private_chunks_on_connection(conn, running, stored) != selected.chunks
+    ):
+        raise AuditIntegrityError("structural admission changed its actual full selected root")
+    actual = conn.execute(
+        select(effects).where(effects.c.session_id == root.logical.session_id, effects.c.operation_id == root.logical.operation_id)
+    ).all()
+    if {(row.effect_key, row.disposition, row.receipt_key) for row in actual} != {
+        (entry.effect_id, entry.disposition, entry.receipt_id) for entry in root.effect_frontier
+    }:
+        raise AuditIntegrityError("structural admission lost its exact SQL effect frontier")
+    ambiguous = tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
+    top = root.frames[-1]
+    if type(top) is InitializeFrame and top.provider_effect_key is not None:
+        # Includes original bootstrap, every stage/recovery event, descriptor,
+        # frontier and the original physical provider/accounting cohort.
+        _source_chain(conn, running, stored, names=env_ref_names)
+        policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+        next_continuation_action_policy(selected=selected, policy=policy)
+        return tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("dispatched", "unknown"))
+    compose = tuple(frame for frame in root.frames if type(frame) is ComposeFrame)
+    admitted: AdmittedTurnEvidence | None = None
+    if compose:
+        # The existing reader proves full shared evidence/recorder/messages,
+        # original actor/base/ingress, selected batch and prior receipts. DATA
+        # stays source-admitted through the real AdmittedTurnEvidence flow.
+        admitted = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=env_ref_names)
+        if admitted.snapshot.application_entry is not None:
+            from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
+
+            require_p4_application_journal_on_connection(conn, running, selected=selected, evidence=admitted, env_ref_names=env_ref_names)
+    from elspeth.web.composer.continuation_phase_transitions import validate_tool_effects_on_connection
+
+    tool_unresolved = validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=env_ref_names)
+    if type(top) is ToolBatchFrame and top.accumulator.codec == "composer.tool-batch.v1" and tool_unresolved:
+        from elspeth.web.composer.continuation_batch_data import decode_prepared_batch_data
+
+        chunk = next(chunk for chunk in selected.chunks if chunk.reference == top.accumulator)
+        prepared_tool = decode_prepared_batch_data(chunk.canonical, env_ref_names=env_ref_names)
+        call = prepared_tool.batch.current_call
+        key = f"tool:{top.response.digest}:{top.next_tool_index}"
+        if (
+            top.phase != "effect_reconciling"
+            or call is None
+            or call.index != top.next_tool_index
+            or call.effect_key is not None
+            or ambiguous != (key,)
+            or tool_unresolved != ambiguous
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+        ):
+            raise AuditIntegrityError("structural admission lost its exact issued tool/complete prepared graph")
+        return ambiguous
+    if type(top) is ComposeFrame and top.phase == "awaiting_response":
+        if (
+            len(root.frames) != 1
+            or top.provider_effect_key is None
+            or top.provider_input_sha256 is None
+            or top.pending_response is not None
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or root.active_action_json is not None
+            or root.active_action_source is not None
+            or root.semantic_frontier is None
+            or ambiguous != (top.provider_effect_key,)
+        ):
+            raise AuditIntegrityError("structural admission lost the closed in-flight PRIMARY shape")
+        _stored, _root, frame, effect = _selected_effect(
+            conn,
+            running,
+            checkpoint_id=stored.checkpoint_id,
+            cursor=stored.cursor,
+            effect_key=top.provider_effect_key,
+            input_sha256=top.provider_input_sha256,
+        )
+        _stored_input(conn, running, effect, frame)
+        return ambiguous
+    if type(top) is ToolBatchFrame and top.accumulator.codec == "composer.p4-pending-batch.v1":
+        key = f"batch:{top.response.digest}:p4"
+        prepared = _selected_prepared(conn, stored, running=running, effect_key=key, env_ref_names=env_ref_names)
+        matching = tuple(row for row in actual if row.effect_key == key)
+        if len(matching) != 1 or top.phase != "effect_reconciling" or root.pending_settlement_ids:
+            raise AuditIntegrityError("structural admission lost the selected P4 effect/pending cut")
+        effect = matching[0]
+        if effect.owner != "session_sql" or effect.input_sha256 != stable_hash(
+            _read_json_value(p4_semantic_input(prepared, env_ref_names=env_ref_names))
+        ):
+            raise AuditIntegrityError("structural admission changed the original P4 input/owner")
+        p4_unresolved = key in ambiguous
+        if p4_unresolved:
+            if set(ambiguous) != {key, *tool_unresolved} or root.pending_owner_results or effect.receipt_key is not None:
+                raise AuditIntegrityError("structural admission mixed unresolved P4 and another frontier")
+            return ambiguous
+        read_p4_result_on_connection(
+            conn,
+            running,
+            expected_checkpoint_id=stored.checkpoint_id,
+            expected_cursor=stored.cursor,
+            effect_key=key,
+            env_ref_names=env_ref_names,
+        )
+        if tool_unresolved:
+            if set(ambiguous) != set(tool_unresolved):
+                raise AuditIntegrityError("structural admission mixed a tool result with another unresolved owner")
+            return ambiguous
+    if tool_unresolved:
+        if (
+            type(top) is ToolBatchFrame
+            and top.phase == "result_retained"
+            and top.accumulator.codec == "composer.applied-p4-batch.v1"
+            and set(ambiguous) == set(tool_unresolved)
+            and not root.pending_owner_results
+            and not root.pending_settlement_ids
+            and admitted is not None
+            and admitted.snapshot.application_entry is not None
+        ):
+            # The full application journal above proved the paid prefix and
+            # its actual SQL receipt. An independently proved unknown tool
+            # suffix remains unknown; it cannot turn that P4 into a handover.
+            return ambiguous
+        if (
+            type(top) is not ToolBatchFrame
+            or top.phase != "tool_ready"
+            or top.accumulator.codec != "composer.coupled-batch-data.v1"
+            or set(ambiguous) != set(tool_unresolved)
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+        ):
+            raise AuditIntegrityError("structural admission lost its interrupted issued-tool prefix")
+        return ambiguous
+    if ambiguous:
+        raise AuditIntegrityError("structural admission has no landed owner for this unresolved shape")
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    next_continuation_action_policy(selected=selected, policy=policy)
+    return ()
+
+
+class ContinuationCutNotResumable(AuditIntegrityError):
+    """A structurally valid retained cut holds work no new owner may redo.
+
+    The cut has an in-flight provider or business effect whose outcome is not
+    durably known. A new generation could re-dispatch it, so the cut is never
+    resumed: the operation is settled with the effect recorded as unknown.
+    It subclasses ``AuditIntegrityError`` so every caller that treated this
+    refusal as an integrity stop keeps doing so; only recovery and drain
+    catch it specifically (design §3.4, §5.2).
+    """
+
+    def __init__(self, message: str, *, effect_ids: tuple[str, ...]) -> None:
+        super().__init__(message)
+        self.effect_ids = effect_ids
+
+
+def require_resumable_cut(stack: ContinuationFrameStack) -> None:
+    """Classify a decoded, chunk-verified stack against the explicit in-flight shapes.
+
+    Runs after structural validation (codec decode and private-chunk digest
+    checks) and before allowance selection. A match raises
+    ``ContinuationCutNotResumable``; anything else falls through to the
+    selector, whose own refusals stay plain ``AuditIntegrityError``.
+    """
+    unknown = tuple(item.effect_id for item in stack.effect_frontier if item.disposition == "unknown")
+    if unknown:
+        raise ContinuationCutNotResumable("retained cut holds an unknown effect outcome", effect_ids=unknown)
+    top = stack.frames[-1]
+    if type(top) is ComposeFrame and top.phase == "awaiting_response" and top.provider_effect_key is not None:
+        in_flight = tuple(
+            item.effect_id
+            for item in stack.effect_frontier
+            if item.effect_id == top.provider_effect_key and item.disposition in ("prepared", "dispatched")
+        )
+        if in_flight:
+            raise ContinuationCutNotResumable("next allowance cannot retry an unresolved primary provider effect", effect_ids=in_flight)
+    if type(top) is ToolBatchFrame:
+        in_flight = tuple(item.effect_id for item in stack.effect_frontier if item.disposition in ("prepared", "dispatched"))
+        if in_flight:
+            raise ContinuationCutNotResumable("next allowance cannot retry a prepared or unknown business effect", effect_ids=in_flight)
+
+
+def _is_first_compose_iteration(frame: ComposeFrame) -> bool:
+    """The admitted first Compose cut: nothing has run in the request yet."""
+    return (
+        frame.slice_sequence == 1
+        and frame.composition_total == 0
+        and frame.discovery_total == 0
+        and frame.advisor_calls == 0
+        and frame.repair_turns == 0
+        and frame.advisor_checkpoint_passes == 0
+        and not frame.mutation_success_seen
+        and frame.persisted_assistant_message_id is None
+    )
+
+
+def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
+    """A cut sized only for a handoff: no pending settlement, owner result or open effect."""
+    if root.pending_settlement_ids or root.pending_owner_results or not root.is_handoff_safe:
+        raise AuditIntegrityError("next allowance requires a quiescent handoff-safe cut")
+    if any(item.disposition not in ("committed", "refused") for item in root.effect_frontier):
+        raise AuditIntegrityError("next allowance cut still holds an open effect")
+
+
+def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy) -> ContinuationActionPolicy | None:
+    """Size the handoff-safe cuts no recovery owner produces; None for every other cut.
+
+    These cuts exist only after a yield (design §2.4): a later Compose
+    iteration, an Advisor input, an End phase, or a general ``tool_ready``.
+    Sizing is structural and reads no private chunk; the owner of the cut
+    re-proves it after the new claim and fence.
+    """
+    top = root.frames[-1]
+    if type(top) is ComposeFrame and top.phase == "action_ready" and not _is_first_compose_iteration(top):
+        _require_quiescent_handoff_cut(root)
+        if len(root.frames) != 1 or top.provider_effect_key is not None or top.pending_response is not None or top.tools is None:
+            raise AuditIntegrityError("next allowance lost its closed later Compose iteration cut")
+        if root.semantic_frontier is None:
+            raise AuditIntegrityError("later Compose iteration lost its retained semantic frontier")
+        return policy.actions.primary
+    if type(top) is AdvisorFrame and top.phase == "input_ready":
+        _require_quiescent_handoff_cut(root)
+        if top.provider_effect_key is not None or top.response is not None:
+            raise AuditIntegrityError("next allowance lost its closed Advisor input cut")
+        return policy.actions.advisor
+    if type(top) is EndFrame:
+        _require_quiescent_handoff_cut(root)
+        match top.phase:
+            case "review_needed":
+                return policy.actions.advisor
+            case "repair_needed":
+                return policy.actions.primary
+            case "publication_ready":
+                return policy.actions.session_sql
+    if (
+        type(top) is ToolBatchFrame
+        and top.phase == "tool_ready"
+        and top.accumulator.codec != "composer.coupled-batch-data.v1"
+        and len(root.frames) == 2
+        and type(root.frames[0]) is ComposeFrame
+    ):
+        _require_quiescent_handoff_cut(root)
+        # The next tool's arguments are not decoded before the new owner holds
+        # current names, so the cut is sized for the largest local action.
+        return max(
+            (policy.actions.read, policy.actions.session_sql, policy.actions.blob, policy.actions.external),
+            key=lambda action: action.total,
+        )
+    return None
 
 
 def next_continuation_action_policy(
@@ -24,6 +320,10 @@ def next_continuation_action_policy(
     root = selected.stack
     if decode_continuation_policy(root.admission_policy_json, root.policy_hash) != policy:
         raise AuditIntegrityError("next allowance changed its retained complete policy")
+    require_resumable_cut(root)
+    handoff = handoff_cut_allowance(root, policy)
+    if handoff is not None:
+        return handoff
     top = root.frames[-1]
     if type(top) is InitializeFrame and top.provider_effect_key is not None:
         entries = root.effect_frontier
@@ -131,11 +431,10 @@ def next_continuation_action_policy(
                 # Keep the original refusal for a manufactured later phase
                 # carrying no actual complete bounded bootstrap input.
                 raise AuditIntegrityError("next allowance has no closed reserved/inserted ingress cut")
-        # SQL-only sizing. Actual current ingress source/receipt admission is
-        # mandatory after start; no title/provider/Compose entry is granted.
-        # Published cuts additionally require the actual bootstrap publication
-        # event/predecessor/creator/private-source reader under the fresh claim.
-        return policy.actions.session_sql
+        # Fresh TITLE input includes its real provider allowance. Other ingress
+        # cuts size SQL work only. Every real owner still rechecks the original
+        # bootstrap, actor, current fence and may-dispatch boundary after start.
+        return policy.actions.title if top.ingress_phase == "title_pending" else policy.actions.session_sql
     if type(top) is ComposeFrame and top.phase == "action_ready":
         if (
             len(root.frames) != 1
@@ -230,6 +529,28 @@ def next_continuation_action_policy(
         # Only immutable-result/current-version SQL is admitted here. The complete
         # actual call, inner DATA, creator and current root are checked after start.
         return policy.actions.session_sql
+    if (
+        top.phase == "tool_ready"
+        and top.accumulator.codec == "composer.coupled-batch-data.v1"
+        and (not top.settled_effect_ids or all(key.startswith(f"tool:{top.response.digest}:") for key in top.settled_effect_ids))
+    ):
+        if (
+            len(root.frames) != 2
+            or type(root.frames[0]) is not ComposeFrame
+            or root.frames[0].pending_response != top.response
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or root.active_action_json is not None
+            or root.active_action_source is not None
+            or any(item.disposition not in ("committed", "refused") for item in root.effect_frontier)
+        ):
+            raise AuditIntegrityError("next allowance lost its complete current tool-batch prefix")
+        # Sizing does not replace actual source-name admission or decode tool
+        # arguments with an invented empty inventory. The current graph/phase
+        # reader chooses the real tool/P4 owner after the actual claim starts.
+        return max(
+            (policy.actions.read, policy.actions.session_sql, policy.actions.blob, policy.actions.external), key=lambda value: value.total
+        )
     if top.phase == "tool_ready" and top.accumulator.codec == "composer.coupled-batch-data.v1":
         key = f"attachment:{top.response.digest}:{top.next_tool_index - 1}"
         frontier = tuple(item for item in root.effect_frontier if item.effect_id == key)

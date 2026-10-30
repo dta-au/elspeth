@@ -2,24 +2,35 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from _thread import LockType
+from dataclasses import dataclass
+from threading import Lock
+from typing import TYPE_CHECKING, Annotated, Literal, Never, SupportsIndex
 from uuid import UUID
 
 from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
-from elspeth.web.composer.continuation import ContinuationValue, LogicalRequestBinding
+from elspeth.web.composer.continuation import ContinuationValue, LogicalRequestBinding, PrivateChunkRef
 from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, verify_private_chunk
-from elspeth.web.composer.continuation_evidence_application_values import PortableP4ApplicationEntry
+from elspeth.web.composer.continuation_evidence_application_values import P4ApplicationSources, PortableP4ApplicationEntry
+from elspeth.web.composer.continuation_limits import (
+    CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES,
+    CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+)
 from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 from elspeth.web.sessions.continuation import HistoricalEffectLocator
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_application_graph import ApplicationGraph
 
 
 class RetainedBlobPage(ContinuationValue):
@@ -163,8 +174,15 @@ class RetainedHistoricalEffect(ContinuationValue):
         )
 
 
-class TurnEvidenceSnapshot(ContinuationValue):
-    schema_version: Literal["composer.evidence.v1"] = "composer.evidence.v1"
+class TurnEvidenceFields(ContinuationValue):
+    """Actual non-transcript evidence fields and their shared live invariants.
+
+    This value has no retained codec. Fresh capture validates these complete
+    current fields before deciding a borrowed transcript's resource admission;
+    the stored snapshot below inherits the same fields and validator.
+    """
+
+    schema_version: Literal["composer.evidence.v2"] = "composer.evidence.v2"
     logical: LogicalRequestBinding
     actor_user_id: str
     session_id: str
@@ -173,7 +191,6 @@ class TurnEvidenceSnapshot(ContinuationValue):
     request_id: str
     request_content_hash: str
     effects: RetainedTurnEffects
-    transcript: MessageShelfSnapshot
     retained_history: str | None
     registration_revision: int = Field(ge=0)
     page_shelf: tuple[RetainedInspection, ...]
@@ -189,14 +206,14 @@ class TurnEvidenceSnapshot(ContinuationValue):
     abandonment_limitations: tuple[RetainedLimitation, ...]
     effect_locators: tuple[RetainedHistoricalEffect, ...]
     initial_is_latest: bool
-    recorder_json: str
+    recorder: PrivateChunkRef
     requires_blob_reader: bool
     historical_application_count: int = Field(ge=0)
     joint_graph_json: str | None = None
     application_entry: PortableP4ApplicationEntry | None = None
 
     @model_validator(mode="after")
-    def complete_links(self) -> TurnEvidenceSnapshot:
+    def complete_links(self) -> TurnEvidenceFields:
         if self.session_id != self.logical.session_id or self.request_id != self.logical.original_user_message_id:
             raise ValueError("evidence differs from its logical request")
         if tuple(item.scope for item in self.deliveries) != ("primary", "planner"):
@@ -235,7 +252,8 @@ class TurnEvidenceSnapshot(ContinuationValue):
             raise ValueError("evidence review/decision shelf contains orphaned or reordered identities")
         if self.initial_is_latest and self.effects.initial_state_json != self.effects.latest_verified_state_json:
             raise ValueError("shared initial/latest state changed its complete bytes")
-        recorder_from_evidence_json(self.recorder_json)
+        if self.recorder.codec != "composer.audit-buffer.v1":
+            raise ValueError("evidence recorder changed its closed original source role")
         if len({item.binding for item in self.abandonment_limitations}) != len(self.abandonment_limitations):
             raise ValueError("evidence limitation map contains duplicate bindings")
         for item in self.abandonment_limitations:
@@ -297,6 +315,10 @@ class TurnEvidenceSnapshot(ContinuationValue):
         return self
 
 
+class TurnEvidenceSnapshot(TurnEvidenceFields):
+    transcript: MessageShelfSnapshot
+
+
 def state_from_evidence_json(text: str) -> CompositionState:
     value, error = parse_json_strict(text)
     if error is not None or type(value) is not dict:
@@ -314,9 +336,9 @@ def recorder_from_evidence_json(encoded: str) -> RecorderSnapshot:
     return decode_recorder_snapshot(chunk)
 
 
-def _require_evidence_metadata(snapshot: TurnEvidenceSnapshot, *, env_ref_names: frozenset[str]) -> None:
+def _require_evidence_metadata(snapshot: TurnEvidenceFields, *, env_ref_names: frozenset[str]) -> None:
     """Inspect owned metadata without treating an effect locator as a secret slot."""
-    if type(snapshot) is not TurnEvidenceSnapshot:
+    if type(snapshot) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
         raise TypeError("evidence metadata requires its exact snapshot owner")
     # Keep every other locator/member under its original keyed traversal.
     # The actual effect_key field is a historical identifier, not a declared
@@ -326,7 +348,7 @@ def _require_evidence_metadata(snapshot: TurnEvidenceSnapshot, *, env_ref_names:
         exclude={
             "effects": True,
             "transcript": True,
-            "recorder_json": True,
+            "recorder": True,
             "joint_graph_json": True,
             "application_entry": True,
             "effect_locators": {"__all__": {"effect_key"}},
@@ -337,20 +359,211 @@ def _require_evidence_metadata(snapshot: TurnEvidenceSnapshot, *, env_ref_names:
         require_no_credential_material(locator.effect_key, surface="composer_continuation_effect_locator", env_ref_names=env_ref_names)
 
 
-def encode_turn_evidence(
+@dataclass(frozen=True, slots=True, init=False, eq=False)
+class AdmittedTurnEvidence:
+    """Source-admitted DATA for one fixed reconstruction, never current authority.
+
+    Construction admits actual source bytes. There is no snapshot/graph field
+    constructor, allocation token or caller-supplied admission flag.
+    """
+
+    snapshot: TurnEvidenceSnapshot
+    _graph: ApplicationGraph | None
+    _graph_lock: LockType
+    _graph_taken: bool
+    env_ref_names: frozenset[str]
+    source_chunk: PrivateChunk
+    sources: P4ApplicationSources
+    recorder_chunk: PrivateChunk
+
+    def __init__(
+        self,
+        source: TurnEvidenceSnapshot | PrivateChunk,
+        *,
+        env_ref_names: frozenset[str],
+        mandatory_retention: bool = False,
+        source_chunks: tuple[PrivateChunk, ...] = (),
+    ) -> None:
+        if type(env_ref_names) is not frozenset or any(type(name) is not str for name in env_ref_names):
+            raise TypeError("evidence admission requires its closed environment-name set")
+        if type(source) is PrivateChunk:
+            if source.reference.codec != "composer.evidence.v2":
+                raise AuditIntegrityError("evidence chunk has the wrong codec")
+            if not 0 <= source.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
+                utf8_size(source.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != source.reference.byte_length
+            ):
+                raise AuditIntegrityError("evidence source exceeds its original complete document bound")
+            verify_private_chunk(source.reference, source.canonical)
+            # The original verifier proved strict canonical JSON. The owned
+            # model below separately requires its complete object schema.
+            try:
+                snapshot = TurnEvidenceSnapshot.model_validate_json(source.canonical)
+            except (ValidationError, ValueError, TypeError) as exc:
+                raise AuditIntegrityError("evidence chunk violates its closed owned codec") from exc
+            if canonical_json(snapshot.model_dump(mode="json")) != source.canonical:
+                raise AuditIntegrityError("evidence chunk changed fields during its owned decode")
+        elif type(source) is TurnEvidenceSnapshot:
+            snapshot = source
+        else:
+            raise TypeError("evidence admission requires its actual snapshot or private chunk source")
+        sources = P4ApplicationSources(snapshot.application_entry, source_chunks)
+        recorder_chunk = _select_recorder_chunk(snapshot, source_chunks)
+        chunk, graph = _encode_turn_evidence_source(
+            snapshot,
+            env_ref_names=env_ref_names,
+            mandatory_retention=mandatory_retention,
+            sources=sources,
+            recorder_chunk=recorder_chunk,
+        )
+        if type(source) is PrivateChunk and chunk != source:
+            raise AuditIntegrityError("evidence complete admission changed its chunk")
+        object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "_graph", graph)
+        object.__setattr__(self, "_graph_lock", Lock())
+        object.__setattr__(self, "_graph_taken", False)
+        object.__setattr__(self, "env_ref_names", env_ref_names)
+        object.__setattr__(self, "source_chunk", source if type(source) is PrivateChunk else chunk)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "recorder_chunk", recorder_chunk)
+
+    @property
+    def dependency_chunks(self) -> tuple[PrivateChunk, ...]:
+        """The one original recorder plus the unchanged four-role journal leaves."""
+        return (self.recorder_chunk, *self.sources.chunks)
+
+    @property
+    def graph(self) -> ApplicationGraph | None:
+        with self._graph_lock:
+            if self._graph_taken:
+                raise AuditIntegrityError("admitted graph was already transferred to its mutable owner")
+            return self._graph
+
+    def take_graph(self) -> ApplicationGraph | None:
+        """Transfer once, after proving exposed nested values still match source."""
+        from elspeth.web.composer.continuation_application_graph import encode_application_graph
+
+        with self._graph_lock:
+            if self._graph_taken:
+                raise AuditIntegrityError("admitted graph cannot be transferred twice")
+            if canonical_json(self.snapshot.model_dump(mode="json")) != self.source_chunk.canonical:
+                raise AuditIntegrityError("admitted evidence snapshot changed its original immutable source")
+            if self._graph is not None:
+                original = (
+                    self.snapshot.joint_graph_json
+                    if self.snapshot.application_entry is None
+                    else self.snapshot.application_entry.graph_json
+                )
+                if encode_application_graph(self._graph, env_ref_names=self.env_ref_names) != original:
+                    raise AuditIntegrityError("admitted graph changed its original values or alias partition")
+            object.__setattr__(self, "_graph_taken", True)
+            return self._graph
+
+    def __copy__(self) -> Never:
+        raise TypeError("evidence copies require fresh source admission")
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Never:
+        raise TypeError("evidence copies require fresh source admission")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> Never:
+        raise TypeError("admitted evidence is process-local; serialize its owned source")
+
+
+def admit_turn_evidence(
     snapshot: TurnEvidenceSnapshot,
     *,
-    env_ref_names: frozenset[str] = frozenset(),
-) -> PrivateChunk:
+    env_ref_names: frozenset[str],
+    mandatory_retention: bool = False,
+    source_chunks: tuple[PrivateChunk, ...] = (),
+) -> AdmittedTurnEvidence:
     if type(snapshot) is not TurnEvidenceSnapshot:
         raise TypeError("evidence requires its owned closed snapshot")
-    encoded = canonical_json(snapshot.model_dump(mode="json"))
-    try:
-        checked = TurnEvidenceSnapshot.model_validate_json(encoded)
-    except (ValidationError, ValueError, TypeError) as error:
-        raise AuditIntegrityError("evidence capture violates its complete owned DATA contract") from error
-    if canonical_json(checked.model_dump(mode="json")) != encoded:
-        raise AuditIntegrityError("evidence capture changed fields during complete admission")
+    return AdmittedTurnEvidence(snapshot, env_ref_names=env_ref_names, mandatory_retention=mandatory_retention, source_chunks=source_chunks)
+
+
+def require_admitted_turn_evidence(evidence: AdmittedTurnEvidence, *, env_ref_names: frozenset[str]) -> AdmittedTurnEvidence:
+    if type(evidence) is not AdmittedTurnEvidence:
+        raise TypeError("evidence reuse requires its actual source-admitted owner")
+    if type(env_ref_names) is not frozenset or any(type(name) is not str for name in env_ref_names):
+        raise TypeError("evidence reuse requires its closed environment-name set")
+    if evidence.env_ref_names != env_ref_names:
+        raise AuditIntegrityError("evidence reuse changed its admitted credential environment")
+    return evidence
+
+
+def encode_turn_evidence(
+    evidence: AdmittedTurnEvidence,
+    *,
+    env_ref_names: frozenset[str] = frozenset(),
+    mandatory_retention: bool = False,
+) -> PrivateChunk:
+    admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    # This serializes the admitted immutable source, never a subsequently
+    # mutated live graph. Changed captures require a new source constructor.
+    # Mandatory fresh retention was decided by that actual constructor before
+    # it produced this chunk; stored decoding keeps its separate DATA boundary.
+    return admitted.source_chunk
+
+
+def _select_recorder_chunk(snapshot: TurnEvidenceFields, chunks: tuple[PrivateChunk, ...]) -> PrivateChunk:
+    """Resolve the closed role, checking every conflicting occurrence first."""
+    if type(chunks) is not tuple:
+        raise TypeError("evidence recorder requires its original source cohort")
+    available: dict[tuple[str, str], PrivateChunk] = {}
+    for chunk in chunks:
+        if type(chunk) is not PrivateChunk:
+            raise AuditIntegrityError("evidence recorder cohort contains a foreign source")
+        key = chunk.reference.codec, chunk.reference.digest
+        previous = available.get(key)
+        if previous is not None and previous != chunk:
+            raise AuditIntegrityError("evidence dependency has conflicting original bytes or lengths before deduplication")
+        available.setdefault(key, chunk)
+    reference = snapshot.recorder
+    if type(reference) is not PrivateChunkRef or reference.codec != "composer.audit-buffer.v1":
+        raise AuditIntegrityError("evidence recorder lost its nominal closed original reference")
+    actual = available.get((reference.codec, reference.digest))
+    if actual is None or actual.reference != reference:
+        raise AuditIntegrityError("evidence lost its original recorder dependency")
+    return actual
+
+
+def _require_recorder_chunk(snapshot: TurnEvidenceFields, chunk: PrivateChunk, *, env_ref_names: frozenset[str]) -> None:
+    from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+
+    if type(chunk) is not PrivateChunk or chunk.reference != snapshot.recorder or chunk.reference.codec != "composer.audit-buffer.v1":
+        raise AuditIntegrityError("evidence recorder differs from its original closed source")
+    if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
+        utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
+    ):
+        raise AuditIntegrityError("evidence recorder exceeds its original complete document bound")
+    decode_recorder_snapshot(chunk)
+    require_no_credential_material(
+        chunk.canonical,
+        surface="composer_continuation_evidence_recorder",
+        env_ref_names=env_ref_names,
+        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+    )
+
+
+def require_evidence_fields_admission(
+    snapshot: TurnEvidenceFields,
+    *,
+    env_ref_names: frozenset[str],
+    recorder_chunk: PrivateChunk,
+    sources: P4ApplicationSources | None = None,
+) -> ApplicationGraph | None:
+    """Admit actual shared evidence fields without encoding a transcript.
+
+    Fresh capture supplies its validated current field value; stored encoding
+    supplies the complete snapshot. Graph/application and credential checks are
+    the same source-owned operations for both, never a stored-source substitute.
+    """
+    if type(snapshot) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
+        raise TypeError("evidence field admission requires its actual complete owned value")
+    from elspeth.web.composer.continuation_retention import validate_retained_model
+
+    validate_retained_model(snapshot)
+    _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
     require_no_credential_material_in_state(
         state_from_evidence_json(snapshot.effects.initial_state_json),
         surface="composer_continuation_evidence_initial_state",
@@ -363,30 +576,74 @@ def encode_turn_evidence(
     )
     from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
 
-    require_evidence_application_links(snapshot, env_ref_names=env_ref_names)
-    # Graph, receipt, transcript and recorder admission stays with its actual
-    # complete owner; this projection only admits the remaining metadata.
+    graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
     _require_evidence_metadata(snapshot, env_ref_names=env_ref_names)
-    return encode_private_chunk(
-        codec="composer.evidence.v1",
-        canonical=canonical_json(snapshot.model_dump(mode="json")),
-        env_ref_names=env_ref_names,
+    return graph
+
+
+def _encode_turn_evidence_source(
+    snapshot: TurnEvidenceSnapshot,
+    *,
+    env_ref_names: frozenset[str] = frozenset(),
+    mandatory_retention: bool = False,
+    sources: P4ApplicationSources,
+    recorder_chunk: PrivateChunk,
+) -> tuple[PrivateChunk, ApplicationGraph | None]:
+    if type(snapshot) is not TurnEvidenceSnapshot:
+        raise TypeError("evidence requires its owned closed snapshot")
+    from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+    from elspeth.web.composer.continuation_retention import (
+        bind_retained_json_encoding,
+        require_retention_capacity,
+        retained_model_json_view,
     )
 
+    measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    graph = require_evidence_fields_admission(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+    from elspeth.web.composer.continuation_message_shelf import require_message_shelf_integrity
 
-def decode_turn_evidence(chunk: PrivateChunk, *, env_ref_names: frozenset[str]) -> TurnEvidenceSnapshot:
-    if type(chunk) is not PrivateChunk or chunk.reference.codec != "composer.evidence.v1":
-        raise AuditIntegrityError("evidence chunk has the wrong codec")
-    verify_private_chunk(chunk.reference, chunk.canonical)
-    value, error = parse_json_strict(chunk.canonical)
-    if error is not None or type(value) is not dict or canonical_json(value) != chunk.canonical:
-        raise AuditIntegrityError("evidence chunk is not its complete canonical object")
+    require_message_shelf_integrity(snapshot.transcript, env_ref_names=env_ref_names)
+    if mandatory_retention:
+        # A complete shelf has its own first-party limit. Evidence may then
+        # exceed independently through complete states, journals and recorder.
+        require_retention_capacity(
+            bounded_canonical_json_size(retained_model_json_view(snapshot.transcript), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES),
+            reason="retained_history_bytes",
+        )
+        expected_bytes = require_retention_capacity(measured, reason="retained_chunk_bytes")
+    else:
+        if measured.admitted_bytes is None:
+            raise AuditIntegrityError("evidence source exceeds its original complete document bound")
+        expected_bytes = measured.admitted_bytes
+    # This is one explicit two-document unit, independent of the selected
+    # frame's reference occurrence. It is not a complete-closure/work bound.
+    if expected_bytes + recorder_chunk.reference.byte_length > CONTINUATION_EVIDENCE_PAIR_MAX_UTF8_BYTES:
+        if mandatory_retention:
+            from elspeth.web.composer.protocol import ComposerContextUnsupported
+
+            raise ComposerContextUnsupported("retained_chunk_bytes")
+        raise AuditIntegrityError("evidence and original recorder exceed their complete pair bound")
+    encoded = canonical_json(snapshot.model_dump(mode="json"))
+    bind_retained_json_encoding(encoded, expected_bytes=expected_bytes)
     try:
-        snapshot = TurnEvidenceSnapshot.model_validate_json(chunk.canonical)
-    except (ValidationError, ValueError, TypeError) as exc:
-        raise AuditIntegrityError("evidence chunk violates its closed owned codec") from exc
-    if canonical_json(snapshot.model_dump(mode="json")) != chunk.canonical:
-        raise AuditIntegrityError("evidence chunk changed fields during its owned decode")
-    if encode_turn_evidence(snapshot, env_ref_names=env_ref_names) != chunk:
-        raise AuditIntegrityError("evidence complete admission changed its chunk")
-    return snapshot
+        checked = TurnEvidenceSnapshot.model_validate_json(encoded)
+    except (ValidationError, ValueError, TypeError) as error:
+        raise AuditIntegrityError("evidence capture violates its complete owned DATA contract") from error
+    if canonical_json(checked.model_dump(mode="json")) != encoded:
+        raise AuditIntegrityError("evidence capture changed fields during complete admission")
+    # Graph, receipt, transcript and recorder admission stays with its actual
+    # complete owner; this projection only admits the remaining metadata.
+    chunk = encode_private_chunk(
+        codec="composer.evidence.v2",
+        canonical=encoded,
+        env_ref_names=env_ref_names,
+    )
+    return chunk, graph
+
+
+def decode_turn_evidence(
+    chunk: PrivateChunk, *, env_ref_names: frozenset[str], source_chunks: tuple[PrivateChunk, ...] = ()
+) -> AdmittedTurnEvidence:
+    if type(chunk) is not PrivateChunk:
+        raise AuditIntegrityError("evidence chunk has the wrong codec")
+    return AdmittedTurnEvidence(chunk, env_ref_names=env_ref_names, source_chunks=source_chunks)

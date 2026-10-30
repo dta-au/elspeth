@@ -50,7 +50,7 @@ def read_first_runtime_sources_on_connection(
     if not initial.initialized:
         raise AuditIntegrityError("first Compose consumption requires its actual committed initialization")
     evidence = read_turn_evidence_on_connection(conn, running, selected=selected, inventory=inventory)
-    _require_first_values_from_evidence(initial, evidence)
+    _require_first_values_from_evidence(initial, evidence.snapshot)
     inputs = _inputs_from_current_evidence_on_connection(conn, selected=selected, inventory=inventory, evidence=evidence)
     runtime = _runtime_source_from_inputs_on_connection(conn, running, selected=selected, inventory=inventory, inputs=inputs)
     return FirstRuntimeSources(initial, runtime, inputs)

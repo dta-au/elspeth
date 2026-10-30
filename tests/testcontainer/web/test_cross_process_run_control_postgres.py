@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import event, func, insert, select
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.testcontainer.web.test_chargeable_admission_postgres import _assert_lock_wait
 from tests.testcontainer.web.test_global_run_recovery_postgres import _register_live_instance
 
@@ -193,7 +194,12 @@ def _prepare(url, *, grant_user_role=True):
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id), session_id=str(session.id), version=1, provenance="session_seed", created_at=datetime.now(UTC)
+                metadata_=stored_default_pipeline_metadata(),
+                id=str(state_id),
+                session_id=str(session.id),
+                version=1,
+                provenance="session_seed",
+                created_at=datetime.now(UTC),
             )
         )
     return engine, authority, context, state_id, user_id

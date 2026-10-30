@@ -5,11 +5,13 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.attachment_admission import AttachmentInspectionPolicy, AttachmentInspectionRefused, inspect_attachment_original
+from elspeth.web.composer.continuation_attachment_application_values import AttachmentApplicationData
 from elspeth.web.composer.continuation_attachment_history import (
     append_attachment_inspections,
     decode_attachment_history,
     empty_attachment_history,
     encode_attachment_history,
+    extend_attachment_history,
 )
 from elspeth.web.credential_guard import CredentialMaterialRefused
 
@@ -69,6 +71,40 @@ def test_actual_receipt_wrong_session_and_impostor_refuse():
         append_attachment_inspections(history, effect_key="first", inspections=(replace(actual, session_id="other"),))
     with pytest.raises(TypeError):
         append_attachment_inspections(history, effect_key="first", inspections=({},))
+
+
+def _application(effect_key):
+    return AttachmentApplicationData(
+        effect_key=effect_key,
+        source_checkpoint_id="checkpoint",
+        source_cursor=0,
+        source_snapshot_json="{}",
+        prepared_json="{}",
+        response_json="{}",
+        published_result_json="{}",
+        receipt_json="{}",
+        before_evidence_json="{}",
+        after_evidence_json="{}",
+        after_batch_json="{}",
+        before_iteration_json="{}",
+        after_iteration_json="{}",
+        before_caches_json="{}",
+        after_caches_json="{}",
+        application_sequence=1,
+        application_generation=1,
+        application_operation_id="operation",
+        application_operation_epoch=1,
+    )
+
+
+def test_history_extension_refuses_a_repeated_application():
+    """The application append (sessions/continuation_attachment_application.py)
+    extends through this builder. Control: build with model_copy -> red."""
+    history = extend_attachment_history(
+        empty_attachment_history(session_id="session", operation_id="operation"), applications=(_application("apply:one"),)
+    )
+    with pytest.raises(ValueError, match="repeats an actual application"):
+        extend_attachment_history(history, applications=(_application("apply:one"),))
 
 
 def test_historical_effect_identifier_keeps_string_credential_guard():

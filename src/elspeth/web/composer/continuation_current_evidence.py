@@ -45,6 +45,8 @@ def _restore_current_message_evidence(
         raise AuditIntegrityError("current evidence crossed its actual selected message producers")
     _require_current_reader_service(service, authority)
     selected.__post_init__()
+    if materialization.finish_read is not None:
+        materialization.finish_read.require_selection(selected, inventory)
     running = inventory.running
     materialization.require_context(
         session_id=selected.stack.logical.session_id,
@@ -53,7 +55,8 @@ def _restore_current_message_evidence(
     )
     # Use this actual just-validated complete read, not the owner's older input
     # DATA. Reconstruction remains bracketed by an independent fresh final read.
-    snapshot = materialization._require_current().evidence
+    admitted = materialization._require_current().admitted_evidence
+    snapshot = admitted.snapshot
     reader = None
     if snapshot.requires_blob_reader:
         from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
@@ -62,7 +65,7 @@ def _restore_current_message_evidence(
             service, session_id=str(running.claim.session_id), context=running.session_operation_context
         )
     restored = _restore_current_evidence(
-        snapshot,
+        admitted,
         context=running.session_operation_context,
         reader=reader,
         env_ref_names=inventory.names,
@@ -88,6 +91,8 @@ async def restore_current_turn_evidence(
     if type(running) is not ComposerOperationRunning or inventory.running is not running:
         raise AuditIntegrityError("current evidence changed its actual running owner")
     required_work.validate_context(running.session_operation_context)
+    if materialization.finish_read is not None:
+        materialization.finish_read.require_selection(selected, inventory)
     custody = required_work.coordinator.authority
     if (
         custody.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE

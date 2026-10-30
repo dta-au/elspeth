@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import Engine, func, insert, select, text
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data, stored_default_pipeline_metadata
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -28,7 +29,7 @@ from elspeth.web.sessions.models import (
     run_events_table,
     runs_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation
+from elspeth.web.sessions.protocol import SessionCompositionStateCreation
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +71,7 @@ def _seed_run_and_blob(
                 nodes=None,
                 edges=None,
                 outputs=None,
-                metadata_=None,
+                metadata_=stored_default_pipeline_metadata(),
                 is_valid=True,
                 validation_errors=None,
                 composer_meta=None,
@@ -132,7 +133,7 @@ def _state_creation(
 ) -> SessionCompositionStateCreation:
     return SessionCompositionStateCreation(
         id=uuid4(),
-        data=CompositionStateData(
+        data=composition_state_data(
             sources={"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}},
             is_valid=True,
         ),

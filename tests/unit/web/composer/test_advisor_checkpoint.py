@@ -998,7 +998,7 @@ class _AsyncRecorder:
         self.calls.append(_RecordedAsyncCall(args=args, kwargs=kwargs))
         # Advisor-call fakes represent an admitted provider dispatch, including
         # calls that subsequently fail. Other collaborator fakes lack this key.
-        if "on_provider_dispatch" in kwargs:
+        if "on_provider_dispatch" in kwargs and kwargs["on_provider_dispatch"] is not None:
             kwargs["on_provider_dispatch"]()
         effect = self.side_effect
         if isinstance(effect, BaseException):
@@ -7079,8 +7079,9 @@ async def test_actual_checkpoint_dispatch_and_retry_preserve_complete_diagnostic
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_checkpoint_with_unresolved_graph_value_never_dispatches(make_service, simple_state, monkeypatch, physical_advisor, phase):
-    """Incomplete coverage withholds with zero provider calls (U-22: coverage, not presence, decides)."""
+    """Incomplete selected coverage refuses before a provider or guard decision."""
     from elspeth.web.composer import advisor_context
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
 
     resolve = advisor_context.materialize_advisor_complete_values
     monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", lambda *a, **k: resolve(*a, **k)[:-1])
@@ -7089,13 +7090,19 @@ async def test_checkpoint_with_unresolved_graph_value_never_dispatches(make_serv
     fenced = physical_advisor.bind(service, review_state=state if phase == "end" else None)
     calls = _install_budget_advisor_transport(monkeypatch, [])
     recorder = make_recorder()
-    with prompt_guard_user_scope(""):
-        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
-    assert not verdict.ok and verdict.failure_class == "unavailable"
-    assert verdict.publication_verdict is None and verdict.publication_binding is None
+    with prompt_guard_user_scope(""), pytest.raises(ComposerContextUnsupported) as caught:
+        await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
+    assert caught.value.reason == "graph_coverage_unavailable"
+    assert caught.value.partial_state is None and caught.value.failed_turn is None
+    assert caught.value.tool_invocations == () and caught.value.llm_calls == ()
     assert calls == [] and recorder.llm_calls == ()
     with physical_advisor.engine.connect() as connection:
         assert connection.execute(select(quota_provider_attempts_table)).all() == []
+        audit_rows = connection.execute(select(chat_messages_table.c.tool_calls).where(chat_messages_table.c.role == "audit")).all()
+    kinds = [envelope["_kind"] for row in audit_rows for envelope in (row.tool_calls or ())]
+    assert not {"llm_call_audit", "prompt_guard_audit", "advisor_checkpoint_pass_audit", "advisor_terminal_publication_audit"}.intersection(
+        kinds
+    )
     physical_advisor.coordinator.assert_completed()
 
 
@@ -7347,13 +7354,15 @@ async def test_actual_advisor_large_transcript_retains_one_complete_body_through
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_dispatch(make_service, simple_state, monkeypatch):
-    from elspeth.web.composer.advisor_context import AdvisorGraphCoverageUnavailable
+async def test_checkpoint_unrepresentable_graph_refuses_without_provider_dispatch(
+    make_service, simple_state, monkeypatch, physical_advisor
+):
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
 
     service = make_service()
 
     def refuse(_state):
-        raise AdvisorGraphCoverageUnavailable("Redaction made distinct authored keys ambiguous")
+        raise ComposerContextUnsupported("graph_coverage_unavailable")
 
     monkeypatch.setattr("elspeth.web.composer.advisor_context.summarize_pipeline_for_advisor", refuse)
     dispatch = AsyncMock(
@@ -7361,12 +7370,121 @@ async def test_checkpoint_unrepresentable_graph_is_unavailable_without_provider_
         side_effect=AssertionError("No provider call is allowed for an unrepresentable graph"),
     )
     monkeypatch.setattr(service._advisor_checkpoint, "_call_advisor_with_audit", dispatch)
-    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
-        phase="end", state=simple_state, session_id=None, recorder=make_recorder()
-    )
-    assert verdict.failure_class == "unavailable" and verdict.retryable is False
-    assert verdict.findings_text == "Complete required graph evidence could not be represented safely."
+    fenced = physical_advisor.bind(service, review_state=simple_state)
+    with pytest.raises(ComposerContextUnsupported) as caught:
+        await service._advisor_checkpoint._run_advisor_checkpoint(phase="end", state=simple_state, recorder=make_recorder(), **fenced)
+    assert caught.value.reason == "graph_coverage_unavailable"
+    assert caught.value.llm_calls == ()
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+@pytest.mark.parametrize("first_outcome", ["format", "transport"])
+async def test_retry_preparation_refusal_keeps_the_previous_physical_call(
+    make_service, simple_state, monkeypatch, physical_advisor, phase, first_outcome
+):
+    import litellm
+    from litellm.exceptions import ServiceUnavailableError
+
+    from elspeth.web.composer import advisor_context
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
+
+    service = make_service()
+    state = dataclass_replace(simple_state, metadata=PipelineMetadata(description="Complete ordinary graph description. " * 100))
+    fenced = physical_advisor.bind(service, review_state=state)
+    if phase == "early":
+        fenced.pop("publication_review")
+    materialize = advisor_context.materialize_advisor_complete_values
+    preparations = []
+
+    def resolve_selected(*args, **kwargs):
+        resolved = materialize(*args, **kwargs)
+        assert len(resolved) == 1
+        preparations.append(resolved)
+        return resolved if len(preparations) == 1 else ()
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", resolve_selected)
+    physical_calls = []
+
+    async def complete(**kwargs):
+        physical_calls.append(kwargs)
+        assert len(physical_calls) == 1, "retry preparation must refuse before the second SDK entry"
+        if first_outcome == "transport":
+            raise ServiceUnavailableError(message="PRIVATE retryable provider outage", llm_provider="openai", model=kwargs["model"])
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9},
+            choices=[{"message": {"role": "assistant", "content": "{malformed checkpoint JSON"}}],
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    recorder = make_recorder()
+    with prompt_guard_user_scope(_ASSISTANT_CONTENT), pytest.raises(ComposerContextUnsupported) as refused:
+        await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
+    assert refused.value.reason == "graph_coverage_unavailable"
+    assert len(preparations) == 2 and len(physical_calls) == 1
+    assert refused.value.llm_calls == recorder.llm_calls and len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status.name == ("SUCCESS" if first_outcome == "format" else "API_ERROR")
+    with physical_advisor.engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        messages = connection.execute(select(chat_messages_table.c.tool_calls)).all()
+    assert len(attempts) == 1 and attempts[0].attempt_id == call.call_id
+    assert attempts[0].settled_at is not None
+    kinds = [envelope["_kind"] for row in messages for envelope in (row.tool_calls or ())]
+    assert kinds.count("prompt_guard_audit") == 1
+    assert "advisor_checkpoint_pass_audit" not in kinds and "advisor_terminal_publication_audit" not in kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_nonretryable_transport_failure_does_not_repeat_checkpoint_preparation(
+    make_service, simple_state, monkeypatch, physical_advisor, phase
+):
+    import httpx
+    import litellm
+    from openai import APIConnectionError
+
+    from elspeth.web.composer import advisor_context
+
+    service = make_service()
+    state = dataclass_replace(simple_state, metadata=PipelineMetadata(description="Complete ordinary graph description. " * 100))
+    fenced = physical_advisor.bind(service, review_state=state if phase == "end" else None)
+    materialize = advisor_context.materialize_advisor_complete_values
+    preparations = []
+
+    def resolve_selected(*args, **kwargs):
+        resolved = materialize(*args, **kwargs)
+        preparations.append(resolved)
+        assert len(preparations) == 1, "nonretryable provider policy must not enter retry preparation"
+        return resolved
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", resolve_selected)
+    physical_calls = []
+
+    async def complete(**kwargs):
+        physical_calls.append(kwargs)
+        raise APIConnectionError(request=httpx.Request("POST", "https://provider.invalid/completions"))
+
+    monkeypatch.setattr(litellm, "acompletion", complete)
+    recorder = make_recorder()
+    with prompt_guard_user_scope(_ASSISTANT_CONTENT):
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=state, recorder=recorder, **fenced)
+    assert not verdict.ok and verdict.failure_class == "unavailable" and verdict.retryable is False
+    assert len(preparations) == len(physical_calls) == len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status.name == "API_ERROR" and call.error_class == "APIConnectionError"
+    with physical_advisor.engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        messages = connection.execute(select(chat_messages_table.c.tool_calls)).all()
+    assert len(attempts) == 1 and attempts[0].attempt_id == call.call_id and attempts[0].settled_at is not None
+    envelopes = [envelope for row in messages for envelope in (row.tool_calls or ())]
+    assert sum(envelope["_kind"] == "prompt_guard_audit" for envelope in envelopes) == 1
+    passes = [envelope["pass"] for envelope in envelopes if envelope["_kind"] == "advisor_checkpoint_pass_audit"]
+    assert len(passes) == 1 and passes[0]["provider_attempts"] == 1 and passes[0]["verdict"] == "unavailable"
+    assert not any(envelope["_kind"] == "advisor_terminal_publication_audit" for envelope in envelopes)
+    physical_advisor.coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
@@ -7506,6 +7624,7 @@ async def test_unsent_format_retry_keeps_first_actual_call_without_completed_rev
 @pytest.mark.asyncio
 @pytest.mark.parametrize("required_scope", [False, True])
 async def test_public_hint_dispatch_guard_precedes_provider_and_audit(make_service, simple_state, monkeypatch, required_scope):
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.required_work import (
         RequiredAuthorityKind,
@@ -7537,13 +7656,15 @@ async def test_public_hint_dispatch_guard_precedes_provider_and_audit(make_servi
     arguments["problem_summary"] = "x" * 16001
     calls = _install_budget_advisor_transport(monkeypatch, [_checkpoint_reply()])
     recorder = make_recorder()
-    with pytest.raises(InvariantError, match="complete-message budget"):
+    with pytest.raises(ComposerContextUnsupported) as caught:
         await service._advisor_checkpoint._call_advisor_with_audit(
             arguments,
             recorder=recorder,
             structured_output=False,
             provider_owner=owner if required_scope else None,
         )
+    assert caught.value.reason == "manual_advisor_allowance"
+    assert caught.value.llm_calls == () and caught.value.tool_invocations == ()
     assert calls == [] and recorder.llm_calls == () and coordinator.tickets == ()
     service._sessions_service.add_message.assert_not_awaited()
 

@@ -171,25 +171,24 @@ class TestStateFromRecord:
         assert reconstructed.metadata.name == "Test Pipeline"
 
     def test_none_metadata_crashes(self) -> None:
-        """Tier 1: None metadata_ on a record is database corruption — crash."""
+        """Tier 1: None metadata_ on a record is database corruption — crash at decode."""
         original = _make_empty_state()
         record = _make_state_record(original)
-        record_with_none_meta = CompositionStateRecord(
-            id=record.id,
-            session_id=record.session_id,
-            version=record.version,
-            source=None,
-            nodes=None,
-            edges=None,
-            outputs=None,
-            metadata_=None,
-            is_valid=False,
-            validation_errors=None,
-            created_at=record.created_at,
-            derived_from_state_id=None,
-        )
         with pytest.raises(ValueError, match="None metadata_"):
-            _state_from_record(record_with_none_meta)
+            CompositionStateRecord(
+                id=record.id,
+                session_id=record.session_id,
+                version=record.version,
+                source=None,
+                nodes=None,
+                edges=None,
+                outputs=None,
+                metadata_=None,
+                is_valid=False,
+                validation_errors=None,
+                created_at=record.created_at,
+                derived_from_state_id=None,
+            )
 
     def test_none_nodes_edges_outputs_map_to_empty(self) -> None:
         """None nodes/edges/outputs on a record map to empty tuples (initial state)."""

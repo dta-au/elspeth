@@ -34,6 +34,7 @@ from elspeth.web.composer.continuation_policy import (
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
 from elspeth.web.sessions.composer_operation_preconditions import (
     ComposerOperationPreconditions,
     check_composer_request_preconditions_on_connection,
@@ -83,7 +84,7 @@ from elspeth.web.sessions.continuation import (
     validate_historical_effect_reference,
 )
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.locking import continuation_connection_deadline_scope, locked_session_transaction
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_states_table,
@@ -95,6 +96,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from elspeth.web.sessions.models import composer_segment_attempts_table as segment_attempts
 from elspeth.web.sessions.models import (
     session_operation_fences_table as fences,
 )
@@ -105,26 +107,29 @@ from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+    from elspeth.web.composer.continuation import PrivateChunkRef
     from elspeth.web.composer.continuation_attachment_finisher import CompletedAttachmentProjection
     from elspeth.web.composer.continuation_attachment_read import CurrentAttachmentRead
     from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+    from elspeth.web.composer.continuation_clock import ContinuationTimingObservation
     from elspeth.web.composer.continuation_composition_initialization_data import CapturedInitialComposition, InitialCompositionOwners
     from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
     from elspeth.web.composer.continuation_env_inventory import ContinuationEnvSelection, CurrentContinuationEnvInventory
-    from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+    from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.composer.continuation_owed_evidence import OwedP4EvidenceData
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
-    from elspeth.web.sessions.continuation import ContinuationOwnerCommit
+    from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement
     from elspeth.web.sessions.continuation_attachment_application import StoredAttachmentApplication
     from elspeth.web.sessions.continuation_attachment_result import AttachmentEffectPreparation, AttachmentResultCheckpoint
     from elspeth.web.sessions.continuation_composition_initialization import CurrentCompositionInitializationSource
     from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
     from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
-    from elspeth.web.sessions.continuation_primary import PrimaryProviderResult
+    from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+    from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
 
 
 def _continuation_claim_scope() -> tuple[ColumnElement[bool], ...]:
@@ -259,8 +264,26 @@ def _read(conn: Connection, session_id: UUID, operation_id: str, *, body: bool =
 def _saved_failure_revisions(
     conn: Connection, session_id: UUID, records: tuple[ComposerOperationRecord, ...]
 ) -> dict[str, ComposerOperationSavedRevisions]:
-    """Aggregate only the returned operations' own fences, never later session edits."""
-    operation_fences = tuple(record.session_operation_id for record in records if record.session_operation_id is not None)
+    """Aggregate only the returned operations' own fences, never later session edits.
+
+    A V2 operation writes under one fence per segment attempt, so its saves are
+    folded across every attempt fence and keyed under its last fence, which is
+    the key the caller looks up (design §2.7, protocol R8).
+    """
+    owner_of: dict[str, str] = {}
+    for record in records:
+        if record.session_operation_id is None:
+            continue
+        if record.lifecycle_version == 2:
+            for fence_id in conn.execute(
+                select(segment_attempts.c.session_operation_id).where(
+                    segment_attempts.c.session_id == str(session_id),
+                    segment_attempts.c.operation_id == record.operation_id,
+                )
+            ).scalars():
+                owner_of[fence_id] = record.session_operation_id
+        owner_of[record.session_operation_id] = record.session_operation_id
+    operation_fences = tuple(owner_of)
     if not operation_fences:
         return {}
     states = composition_states_table
@@ -282,15 +305,24 @@ def _saved_failure_revisions(
         )
         .where(states.c.session_id == str(session_id))
     ).all()
+    by_owner: dict[str, list[Row[Any]]] = {owner: [] for owner in owner_of.values()}
+    for row in rows:
+        by_owner[owner_of[row.fence_id]].append(row)
+    saved: dict[str, ComposerOperationSavedRevisions] = {}
     try:
-        return {
-            row.fence_id: ComposerOperationSavedRevisions(
-                attribution="fenced", count=row.saved_count, latest_state_id=UUID(row.id), latest_version=row.latest_version
+        for key, group in by_owner.items():
+            if not group:
+                continue
+            latest = max(group, key=lambda row: row.latest_version)
+            saved[key] = ComposerOperationSavedRevisions(
+                attribution="fenced",
+                count=sum(row.saved_count for row in group),
+                latest_state_id=UUID(latest.id),
+                latest_version=latest.latest_version,
             )
-            for row in rows
-        }
     except ValueError as exc:
         raise AuditIntegrityError("Invalid operation-owned saved revision projection") from exc
+    return saved
 
 
 def _failure_outcome(record: ComposerOperationRecord, saved: ComposerOperationSavedRevisions) -> ComposerOperationFailureOutcome:
@@ -336,6 +368,79 @@ def _claim_matches(row: Row[Any], claim: ComposerOperationClaim) -> bool:
     return bool(row.status == "queued" and row.claim_token == claim.claim_token and row.attempt == claim.attempt)
 
 
+def _segment_claim_predicates(claim: ComposerOperationClaim, owner_instance_id: str) -> tuple[ColumnElement[bool], ...]:
+    """The exact pre-start V2 claim: its segment row, generation, token and owner."""
+    return (
+        segments.c.session_id == str(claim.session_id),
+        segments.c.operation_id == claim.operation_id,
+        segments.c.sequence == claim.segment_sequence,
+        segments.c.generation == claim.ownership_generation,
+        segments.c.state.in_(("queued", "interrupted")),
+        segments.c.claim_token == claim.claim_token,
+        segments.c.claim_owner_instance_id == owner_instance_id,
+    )
+
+
+def _request_continuation_cancel_on_connection(conn: Connection, row: Row[Any], *, now: datetime) -> ComposerOperationRecord:
+    """Mark Stop on a nonterminal V2 parent; never settle it here.
+
+    The owning worker settles ``request_cancelled`` at its next boundary, or
+    the recovery sweep does when no owner remains (design §2.7). The marker
+    advances ``status_revision`` so observers see it. A current segment that
+    is queued or interrupted with no live claim becomes eligible now, so a
+    backed-off segment does not hold the Stop behind its retry delay.
+    """
+    if row.cancel_requested_at is None:
+        marked = conn.execute(
+            update(jobs)
+            .where(
+                *_key(UUID(row.session_id), row.operation_id),
+                jobs.c.lifecycle_version == 2,
+                jobs.c.status == row.status,
+                jobs.c.cancel_requested_at.is_(None),
+            )
+            .values(cancel_requested_at=now, updated_at=now, status_revision=jobs.c.status_revision + 1)
+        )
+        if marked.rowcount != 1:
+            raise AuditIntegrityError("continuation Stop marker lost its exact parent")
+        conn.execute(
+            update(segments)
+            .where(
+                segments.c.session_id == row.session_id,
+                segments.c.operation_id == row.operation_id,
+                segments.c.sequence == row.current_segment_sequence,
+                segments.c.state.in_(("queued", "interrupted")),
+                or_(segments.c.claim_token.is_(None), segments.c.claim_expires_at <= now),
+            )
+            .values(next_eligible_at=now)
+        )
+    updated = _read(conn, UUID(row.session_id), row.operation_id)
+    if updated is None:
+        raise AuditIntegrityError("cancelled operation missing")
+    return _record_from_row(updated)
+
+
+def _request_cancel_on_connection(
+    conn: Connection, row: Row[Any], *, cancelled_failure: ComposerOperationCancelledFailure
+) -> ComposerOperationRecord:
+    """Mutate only under the caller's session lock, after its authorization."""
+    if row.status in ("completed", "failed"):
+        return _record_from_row(row)
+    session_id = UUID(row.session_id)
+    operation_id = row.operation_id
+    now = database_now(conn)
+    if row.lifecycle_version == 2:
+        return _request_continuation_cancel_on_connection(conn, row, now=now)
+    values: _ComposerTerminalValues = {"cancel_requested_at": row.cancel_requested_at or now, "updated_at": now}
+    if row.status == "queued" and row.claim_token is None:
+        values.update(_terminal_values(cancelled_failure(request_id=row.request_id), now=now, settled_by="request_cancel"))
+    conn.execute(update(jobs).where(*_key(session_id, operation_id), jobs.c.status == row.status).values(**values))
+    updated = _read(conn, session_id, operation_id)
+    if updated is None:
+        raise AuditIntegrityError("cancelled operation missing")
+    return _record_from_row(updated)
+
+
 def _binding(row: Row[Any], *, kind: ComposerOperationKind, request_hash: str, actor_user_id: str, base_state_id: UUID | None) -> None:
     if (
         row.kind != kind
@@ -344,6 +449,22 @@ def _binding(row: Row[Any], *, kind: ComposerOperationKind, request_hash: str, a
         or row.base_state_id != (str(base_state_id) if base_state_id else None)
     ):
         raise ComposerOperationConflictError(session_id=UUID(row.session_id), operation_id=row.operation_id)
+
+
+def _replay_request_hash(
+    old: Row[Any], *, session_id: UUID, kind: ComposerOperationKind, request: SendMessageRequest | RecomposeRequest
+) -> str:
+    """The hash a replay must match: the existing row's own lifecycle hash.
+
+    A retried POST can negotiate another lifecycle than the one that admitted
+    the operation. It is the same request when its bytes hash to the stored
+    value under the stored lifecycle's function; ``_binding`` refuses otherwise.
+    """
+    if old.lifecycle_version == 1:
+        return composer_operation_request_hash(session_id=session_id, kind=kind, request=request)
+    if old.lifecycle_version == 2:
+        return composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request)
+    raise AuditIntegrityError("stored composer operation has an unknown lifecycle version")
 
 
 def _require_owner(conn: Connection, *, session_id: UUID, actor_user_id: str, auth_provider_type: str) -> None:
@@ -406,7 +527,7 @@ def _select_failure_on_connection(
         return ComposerOperationError(
             http_status=499, failure_code="request_cancelled", error_type="request_cancelled", body=body, diagnostic_id=None
         )
-    if restore_utc(row.deadline_at) <= now:
+    if row.lifecycle_version == 1 and restore_utc(row.deadline_at) <= now:
         body = {
             "error_type": "composer_operation_deadline_expired",
             "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
@@ -502,9 +623,13 @@ class ComposerAsyncOperationAuthority:
             _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
             old = _read(conn, session_id, operation_id)
             if old is not None:
-                if old.lifecycle_version != lifecycle_version:
-                    raise ComposerOperationConflictError(session_id=session_id, operation_id=operation_id)
-                _binding(old, kind=kind, request_hash=request_hash, actor_user_id=actor_user_id, base_state_id=base_state_id)
+                _binding(
+                    old,
+                    kind=kind,
+                    request_hash=_replay_request_hash(old, session_id=session_id, kind=kind, request=request),
+                    actor_user_id=actor_user_id,
+                    base_state_id=base_state_id,
+                )
                 return _record_from_row(old), False
             if lifecycle_version == 2 and not continuation_enabled:
                 raise ComposerOperationPreconditionRefused(
@@ -653,9 +778,13 @@ class ComposerAsyncOperationAuthority:
             except IntegrityError:
                 old = _read(conn, session_id, operation_id)
                 if old is not None:
-                    if old.lifecycle_version != lifecycle_version:
-                        raise ComposerOperationConflictError(session_id=session_id, operation_id=operation_id) from None
-                    _binding(old, kind=kind, request_hash=request_hash, actor_user_id=actor_user_id, base_state_id=base_state_id)
+                    _binding(
+                        old,
+                        kind=kind,
+                        request_hash=_replay_request_hash(old, session_id=session_id, kind=kind, request=request),
+                        actor_user_id=actor_user_id,
+                        base_state_id=base_state_id,
+                    )
                     return _record_from_row(old), False
                 active = conn.execute(
                     select(jobs.c.operation_id, jobs.c.kind)
@@ -678,16 +807,99 @@ class ComposerAsyncOperationAuthority:
 
     def get_with_database_now(self, *, session_id: UUID, operation_id: str) -> tuple[ComposerOperationRecord | None, datetime]:
         _identity(session_id, operation_id)
-        with self._engine.connect() as conn:
+        with self._engine.connect() as conn, continuation_connection_deadline_scope(conn, str(session_id)):
             row = _read(conn, session_id, operation_id)
             now = database_now(conn)
             return (_record_from_row(row) if row is not None else None), now
 
     def get_for_turn(self, *, session_id: UUID, operation_id: str) -> ComposerOperationRecord | None:
         _identity(session_id, operation_id)
-        with self._engine.connect() as conn:
+        with self._engine.connect() as conn, continuation_connection_deadline_scope(conn, str(session_id)):
             row = _read(conn, session_id, operation_id, body=True)
             return _record_from_row(row, request_json=row.request_json) if row is not None else None
+
+    def read_segment_claim(self, claim: ComposerOperationClaim) -> ComposerOperationRecord | None:
+        """Read only the exact still-live pre-start segment claim.
+
+        A successor's parent is running. There is no V1 queued-parent or
+        legacy-deadline condition; start rechecks this read under its lock.
+        """
+        if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
+            raise TypeError("segment claim observation requires its exact V2 claim")
+        with self._engine.connect() as conn:
+            now = database_now(conn)
+            row = conn.execute(
+                select(jobs)
+                .join(segments, and_(segments.c.session_id == jobs.c.session_id, segments.c.operation_id == jobs.c.operation_id))
+                .where(
+                    *_segment_claim_predicates(claim, self._owner_instance_id),
+                    segments.c.claim_expires_at > now,
+                    jobs.c.lifecycle_version == 2,
+                    jobs.c.status.in_(("queued", "running")),
+                    jobs.c.current_segment_sequence == claim.segment_sequence,
+                    jobs.c.ownership_generation == claim.ownership_generation,
+                    jobs.c.attempt == claim.attempt,
+                )
+            ).one_or_none()
+            return _record_from_row(row, request_json=row.request_json) if row is not None else None
+
+    def settle_continuation_owner(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        outcome: MessageWithStateResponse | ComposerOperationError,
+        env_ref_names: frozenset[str] = frozenset(),
+        deadline: ComposerDrainDeadline | None = None,
+    ) -> ComposerOperationRecord:
+        """Use the existing current-fence V2 terminal body, never a V1 deadline."""
+        if type(running) is not ComposerOperationRunning or running.claim.segment_sequence is None:
+            raise TypeError("continuation terminal requires its actual V2 running owner")
+        with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
+            from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
+            from elspeth.web.composer.continuation_selection import SelectedContinuationState
+            from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+
+            stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            selected = SelectedContinuationState(
+                stored.checkpoint_id,
+                decode_continuation_snapshot(stored.payload_json),
+                load_selected_private_chunks_on_connection(conn, running, stored),
+            )
+            ambiguous = validate_continuation_structure_on_connection(conn, running, selected, env_ref_names=env_ref_names)
+            if ambiguous:
+                from elspeth.web.sessions.composer_operation_errors import request_cancelled_error, worker_lost_error
+
+                if type(outcome) is MessageWithStateResponse:
+                    raise AuditIntegrityError("continuation success cannot conceal an unresolved actual effect")
+                parent = _read(conn, running.claim.session_id, running.claim.operation_id)
+                if parent is None:
+                    raise AuditIntegrityError("continuation disposition lost its logical request")
+                outcome = (
+                    request_cancelled_error(request_id=parent.request_id)
+                    if parent.cancel_requested_at is not None
+                    else worker_lost_error(request_id=parent.request_id)
+                )
+            return settle_composer_operation_on_connection(conn, running, outcome=outcome)
+
+    def classify_continuation_owner(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        env_ref_names: frozenset[str],
+        deadline: ComposerDrainDeadline | None = None,
+    ) -> Literal["handoff", "handover", "unresolved"]:
+        from elspeth.web.composer.continuation_handoff import classify_drain_cut_on_connection
+        from elspeth.web.composer.continuation_selection import SelectedContinuationState
+        from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
+            stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            selected = SelectedContinuationState(
+                stored.checkpoint_id,
+                decode_continuation_snapshot(stored.payload_json),
+                load_selected_private_chunks_on_connection(conn, running, stored),
+            )
+            return classify_drain_cut_on_connection(conn, running, selected, env_ref_names=env_ref_names)
 
     def load_continuation_snapshot(self, running: ComposerOperationRunning) -> StoredContinuationSnapshot:
         if type(running) is not ComposerOperationRunning:
@@ -695,6 +907,36 @@ class ComposerAsyncOperationAuthority:
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
             _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
             return load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+
+    def read_continuation_timing(
+        self, running: ComposerOperationRunning, *, deadline: ComposerDrainDeadline | None = None
+    ) -> ContinuationTimingObservation:
+        from elspeth.web.composer.continuation_clock import freeze_observation
+        from elspeth.web.sessions.time_normalization import restore_utc
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
+            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+            stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            root = decode_continuation_snapshot(stored.payload_json)
+            policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == str(running.claim.session_id),
+                    segments.c.operation_id == running.claim.operation_id,
+                    segments.c.sequence == running.claim.segment_sequence,
+                    segments.c.generation == running.claim.ownership_generation,
+                )
+            ).one()
+            if segment.deadline_at is None or segment.cooperative_at is None:
+                raise AuditIntegrityError("running continuation lost its actual segment clock")
+            return freeze_observation(
+                sequence=segment.sequence,
+                generation=segment.generation,
+                now=database_now(conn),
+                deadline=restore_utc(segment.deadline_at),
+                cooperative=restore_utc(segment.cooperative_at),
+                watermark=policy.segment.watermark,
+            )
 
     def load_continuation_chunks(
         self,
@@ -863,6 +1105,45 @@ class ComposerAsyncOperationAuthority:
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
             return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
+    def read_continuation_tool_failure(
+        self, running: ComposerOperationRunning, *, env_ref_names: frozenset[str]
+    ) -> RetainedToolFailureSource | None:
+        from elspeth.web.sessions.continuation_tool_failure import read_tool_failure_source_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            return read_tool_failure_source_on_connection(conn, running, env_ref_names=env_ref_names)
+
+    def read_continuation_owed_batch_runtime(
+        self, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+    ) -> ContinuationRuntimeSource:
+        from elspeth.web.sessions.continuation_runtime import read_owed_batch_runtime_source_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            return read_owed_batch_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+
+    def read_continuation_owed_tool_runtime(
+        self, running: ComposerOperationRunning, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+    ) -> ContinuationRuntimeSource:
+        from elspeth.web.sessions.continuation_runtime import read_owed_tool_runtime_source_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            return read_owed_tool_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
+
+    def read_continuation_phase_primary(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        selected: SelectedContinuationState,
+        reference: PrivateChunkRef,
+        env_ref_names: frozenset[str],
+    ) -> RetainedPrimaryPhaseData:
+        from elspeth.web.sessions.continuation_primary import read_retained_primary_phase_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            return read_retained_primary_phase_on_connection(
+                conn, running, selected=selected, reference=reference, env_ref_names=env_ref_names
+            )
+
     def apply_attachment_application(
         self,
         running: ComposerOperationRunning,
@@ -1009,6 +1290,7 @@ class ComposerAsyncOperationAuthority:
         expected_cursor: int,
         pending_batch: PrivateChunk,
         env_ref_names: frozenset[str] = frozenset(),
+        captured: CapturedContinuationRuntime | None = None,
     ) -> ContinuationOwnerCommit:
         from elspeth.web.sessions.continuation_p4 import prepare_p4_on_connection
 
@@ -1020,6 +1302,7 @@ class ComposerAsyncOperationAuthority:
                 expected_cursor=expected_cursor,
                 pending_batch=pending_batch,
                 env_ref_names=env_ref_names,
+                captured=captured,
             )
 
     def read_continuation_p4_result(
@@ -1049,7 +1332,7 @@ class ComposerAsyncOperationAuthority:
         *,
         selected: SelectedContinuationState,
         inventory: CurrentContinuationEnvInventory,
-    ) -> TurnEvidenceSnapshot:
+    ) -> AdmittedTurnEvidence:
         from elspeth.web.composer.continuation_evidence_restore import read_turn_evidence_on_connection
 
         if type(running) is not ComposerOperationRunning:
@@ -1392,6 +1675,19 @@ class ComposerAsyncOperationAuthority:
     def renew_claim(self, claim: ComposerOperationClaim) -> ComposerOperationRecord:
         with locked_session_transaction(self._engine, str(claim.session_id)) as conn:
             now = database_now(conn)
+            if claim.segment_sequence is not None:
+                # A V2 claim lives on its segment row; the parent never holds one.
+                renewed = conn.execute(
+                    update(segments)
+                    .where(*_segment_claim_predicates(claim, self._owner_instance_id), segments.c.claim_expires_at > now)
+                    .values(claim_expires_at=now + timedelta(seconds=self._claim_lease_seconds))
+                )
+                if renewed.rowcount != 1:
+                    raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+                row = _read(conn, claim.session_id, claim.operation_id)
+                if row is None:
+                    raise AuditIntegrityError("renewed operation missing")
+                return _record_from_row(row)
             result = conn.execute(
                 update(jobs)
                 .where(
@@ -1413,6 +1709,15 @@ class ComposerAsyncOperationAuthority:
 
     def release_claim(self, claim: ComposerOperationClaim) -> None:
         with locked_session_transaction(self._engine, str(claim.session_id)) as conn:
+            if claim.segment_sequence is not None:
+                released = conn.execute(
+                    update(segments)
+                    .where(*_segment_claim_predicates(claim, self._owner_instance_id))
+                    .values(claim_token=None, claim_owner_instance_id=None, claim_expires_at=None)
+                )
+                if released.rowcount != 1:
+                    raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+                return
             result = conn.execute(
                 update(jobs)
                 .where(
@@ -1430,21 +1735,29 @@ class ComposerAsyncOperationAuthority:
     def request_cancel(
         self, *, session_id: UUID, operation_id: str, cancelled_failure: ComposerOperationCancelledFailure
     ) -> ComposerOperationRecord | None:
+        """Trusted internal cancellation; HTTP callers must use request_owner_cancel."""
         with locked_session_transaction(self._engine, str(session_id)) as conn:
             row = _read(conn, session_id, operation_id)
             if row is None:
                 return None
-            if row.status in ("completed", "failed"):
-                return _record_from_row(row)
-            now = database_now(conn)
-            values: _ComposerTerminalValues = {"cancel_requested_at": row.cancel_requested_at or now, "updated_at": now}
-            if row.status == "queued" and row.claim_token is None:
-                values.update(_terminal_values(cancelled_failure(request_id=row.request_id), now=now, settled_by="request_cancel"))
-            conn.execute(update(jobs).where(*_key(session_id, operation_id), jobs.c.status == row.status).values(**values))
-            updated = _read(conn, session_id, operation_id)
-            if updated is None:
-                raise AuditIntegrityError("cancelled operation missing")
-            return _record_from_row(updated)
+            return _request_cancel_on_connection(conn, row, cancelled_failure=cancelled_failure)
+
+    def request_owner_cancel(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        actor_user_id: str,
+        auth_provider_type: str,
+        cancelled_failure: ComposerOperationCancelledFailure,
+    ) -> ComposerOperationRecord | None:
+        """Authenticate the Stop actor again inside the mutation's session lock."""
+        with locked_session_transaction(self._engine, str(session_id)) as conn:
+            _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
+            row = _read(conn, session_id, operation_id)
+            if row is None or row.actor_user_id != actor_user_id:
+                return None
+            return _request_cancel_on_connection(conn, row, cancelled_failure=cancelled_failure)
 
     def settle_unstarted(
         self,
@@ -2002,8 +2315,22 @@ def settle_composer_operation_on_connection(
     outcome: MessageWithStateResponse | ComposerOperationError,
     authoritative_failure: bool = False,
     settled_at: datetime | None = None,
+    prepared_settlement: PreparedSegmentSettlement | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
+    if running.claim.segment_sequence is not None:
+        from elspeth.web.sessions.continuation import settle_continuation_on_connection
+
+        current = _read(conn, running.claim.session_id, running.claim.operation_id)
+        if current is not None and current.status in ("completed", "failed"):
+            return _record_from_row(current)
+        if current is not None and isinstance(outcome, ComposerOperationError):
+            outcome = _select_failure_on_connection(current, outcome, now=database_now(conn), authoritative_failure=authoritative_failure)
+        settle_continuation_on_connection(conn, running, outcome=outcome, prepared_settlement=prepared_settlement)
+        settled_v2 = _read(conn, running.claim.session_id, running.claim.operation_id)
+        if settled_v2 is None:
+            raise AuditIntegrityError("continuation terminal missing")
+        return _record_from_row(settled_v2)
     row = _read(conn, running.claim.session_id, running.claim.operation_id)
     if row is not None and row.status in ("completed", "failed"):
         return _record_from_row(row)

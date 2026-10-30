@@ -20,7 +20,6 @@ from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, ComposerToolFailure
 from elspeth.web.composer.discovery_cache import serialize_tool_result
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
@@ -156,7 +155,7 @@ def test_source_refusals_keep_saved_findings_and_precise_subject(surface: Surfac
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch"])
 @pytest.mark.parametrize("tool", ["set_source", "patch_source_options"])
-def test_source_path_is_safe_in_response_history_redaction_and_planner(tmp_path: Path, surface: Surface, tool: str) -> None:
+def test_source_path_is_safe_in_response_history_and_redaction(tmp_path: Path, surface: Surface, tool: str) -> None:
     private_root = tmp_path / "NON-AUTHORED-SOURCE-ROOT-CANARY"
     path = "/outside-session/authored.csv"
     raw = _validate_source_path({"path": path}, str(private_root), session_id="test-session")
@@ -181,13 +180,12 @@ def test_source_path_is_safe_in_response_history_redaction_and_planner(tmp_path:
         "Use the session's blob binding or an authorized source path."
     )
     assert result.plugin_schemas is None
-    feedback = _allowlisted_candidate_feedback(result)
-    projected = feedback["validation"]["errors"][0]
-    assert projected["component"] == "source:orders" and "detail" not in projected
-    assert projected["suggested_fix"]
+    if surface == "dispatch":
+        assert result.validation_guidance is not None
+        assert result.validation_guidance["codes"]["source_path_policy_invalid"]["suggested_fix"]
     redacted = redact_tool_call_response(tool, result.to_dict(), telemetry=NoopRedactionTelemetry())
     assert redacted["validation"]["errors"][0]["error_code"] == "source_path_policy_invalid"
-    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(feedback), repr(redacted)):
+    for payload in (repr(result.to_dict()), serialize_tool_result(result), repr(redacted)):
         assert "NON-AUTHORED-SOURCE-ROOT-CANARY" not in payload
 
 
@@ -281,8 +279,6 @@ def test_source_prevalidation_retains_exact_tuple_code_identity_and_authored_det
         ("source", "csv"),
     )
     assert "AUTHORED-SOURCE-OPTION-CANARY" in entry.message
-    feedback = _allowlisted_candidate_feedback(result)
-    assert "AUTHORED-SOURCE-OPTION-CANARY" in feedback["validation"]["errors"][0]["detail"]
     if surface == "dispatch":
         assert result.to_dict()["plugin_schemas"] == {"source/csv": context.catalog.get_schema("source", "csv").model_dump(mode="json")}
 
@@ -369,7 +365,6 @@ def test_source_profile_prevalidation_keeps_distinct_owned_tuple_code(
         assert "elspeth-demo-input" not in repr(result.plugin_schemas)
     assert "PRIVATE-PROFILE-LOWERING-CANARY" not in repr(result.to_dict())
     assert "PRIVATE-PROFILE-LOWERING-CANARY" not in serialize_tool_result(result)
-    assert "PRIVATE-PROFILE-LOWERING-CANARY" not in repr(_allowlisted_candidate_feedback(result))
 
 
 @pytest.mark.parametrize("tool", ["set_source", "patch_source_options"])
@@ -422,7 +417,6 @@ def test_source_credential_refusal_retains_repair_without_literal(finalized: boo
     assert result.data["repair"]["inline_form"]["example_options"] == {"api_key": {"secret_ref": "<NAME>"}}
     assert result.data["repair"]["post_hoc_form"]["tool_sequence"] == ("list_secret_refs", "validate_secret_ref", "wire_secret_ref")
     assert literal not in repr(result.to_dict()) and literal not in serialize_tool_result(result)
-    assert literal not in repr(_allowlisted_candidate_feedback(result))
 
 
 @pytest.mark.parametrize("tool", ["set_source", "patch_source_options"])
@@ -537,9 +531,6 @@ def test_plural_refuses_whole_list_without_reads_or_partial_mutation(harness, mo
     if code == "source_blob_duplicate":
         assert result.validation_guidance is not None and code in result.validation_guidance["codes"]
         assert "distinct intended input" in result.validation_guidance["codes"][code]["suggested_fix"]
-        feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-        assert feedback["error_code"] == code and feedback["component"] == "source:documents"
-        assert feedback["suggested_fix"] and "detail" not in feedback
     if case in {"missing", "foreign"}:
         assert result.validation.errors[0].message.endswith("not found.")
         assert "one.png" not in result.validation.errors[0].message

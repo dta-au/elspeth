@@ -36,6 +36,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -63,6 +64,7 @@ def _insert_session(conn, session_id: str) -> None:
 def _seed_composition_state(conn, *, state_id: str, session_id: str) -> None:
     conn.execute(
         insert(composition_states_table).values(
+            metadata_=stored_default_pipeline_metadata(),
             id=state_id,
             session_id=session_id,
             version=1,
@@ -942,6 +944,7 @@ class TestCompositionStatesProvenanceEnum:
             with pytest.raises(IntegrityError):
                 conn.execute(
                     insert(composition_states_table).values(
+                        metadata_=stored_default_pipeline_metadata(),
                         id=str(uuid.uuid4()),
                         session_id=session_id,
                         version=1,
@@ -957,6 +960,7 @@ class TestCompositionStatesProvenanceEnum:
             _insert_session(conn, session_id)
             conn.execute(
                 insert(composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=str(uuid.uuid4()),
                     session_id=session_id,
                     version=1,

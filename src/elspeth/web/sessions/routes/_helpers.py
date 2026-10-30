@@ -992,7 +992,7 @@ def _state_response(
         id=str(state.id),
         session_id=str(state.session_id),
         version=state.version,
-        composition_content_hash=(composition_content_hash(_state_from_record(state)) if state.metadata_ is not None else None),
+        composition_content_hash=composition_content_hash(_state_from_record(state)),
         sources=sources_data,
         nodes=deep_thaw(state.nodes),
         edges=deep_thaw(state.edges),

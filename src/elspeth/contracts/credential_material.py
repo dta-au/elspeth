@@ -10,12 +10,13 @@ general-purpose DLP system.
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Mapping, Set
+from collections.abc import Collection, Iterable, Mapping, Set
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, Literal, cast
 from urllib.parse import ParseResult, parse_qs, urlparse
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
@@ -144,6 +145,23 @@ class CredentialMaterialFinding:
 DEFAULT_CREDENTIAL_TRAVERSAL_POLICY: Final[CredentialTraversalPolicy] = CredentialTraversalPolicy()
 
 
+@dataclass(frozen=True, slots=True)
+class MeasuredCredentialTextExcess:
+    """Refusal-only evidence at one projected string's traversal visit.
+
+    The ordinary detector rejects this process-local value. Only the owned
+    projected-sequence validator below understands its measured policy excess;
+    it cannot clear a credential check or become provider wire content.
+    """
+
+    max_string_bytes: int
+    measured_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.max_string_bytes) is not int or type(self.measured_bytes) is not int or self.measured_bytes <= self.max_string_bytes:
+            raise ValueError("Measured credential text requires actual policy excess")
+
+
 def is_secret_field(field_name: str, additional_fields: Collection[str] = frozenset()) -> bool:
     """Return whether ``field_name`` is in the closed credential vocabulary."""
     normalized = field_name.lower()
@@ -170,11 +188,42 @@ def find_credential_material(
     return _find(value, state=state, depth=0, location="root", credential_parent=False)
 
 
+def find_credential_material_in_projected_sequence(
+    values: Iterable[object],
+    *,
+    length: int,
+    policy: CredentialTraversalPolicy = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY,
+) -> CredentialMaterialFinding | None:
+    """Validate an owned lazy root array under the original shared budget.
+
+    Items are ordinary message projections, built one at a time. A measured
+    excessive text may stand in for an already-proved policy failure at that
+    exact leaf visit. The ordinary detector's container grammar is unchanged.
+    """
+    if type(length) is not int or length < 0:
+        raise ValueError("Projected credential sequence requires its exact nonnegative length")
+    state = _TraversalState(policy=policy, active_ids=set(), nodes=1, measured_text=True)
+    if policy.max_depth < 0 or state.nodes > policy.max_nodes or length > policy.max_width:
+        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
+    observed = 0
+    for value in values:
+        observed += 1
+        if observed > length:
+            raise ValueError("Projected credential sequence changed its exact length")
+        finding = _find(value, state=state, depth=1, location="sequence_item", credential_parent=False)
+        if finding is not None:
+            return finding
+    if observed != length:
+        raise ValueError("Projected credential sequence changed its exact length")
+    return None
+
+
 @dataclass(slots=True)
 class _TraversalState:
     policy: CredentialTraversalPolicy
     active_ids: set[int]
     nodes: int = 0
+    measured_text: bool = False
 
 
 def _find(
@@ -195,8 +244,12 @@ def _find(
         if reference_finding is not False:
             return reference_finding
         return CredentialMaterialFinding("credential_field", location)
+    if state.measured_text and type(value) is MeasuredCredentialTextExcess:
+        if value.max_string_bytes != state.policy.max_string_bytes:
+            raise ValueError("Measured credential text changed its original traversal policy")
+        return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
     if type(value) is str:
-        if len(value.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
+        if utf8_size(value, errors="replace", limit=state.policy.max_string_bytes) > state.policy.max_string_bytes:
             return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
         category = _classify_string(value)
         return CredentialMaterialFinding(category, location) if category is not None else None
@@ -213,7 +266,7 @@ def _find(
             for key, child in value.items():
                 if type(key) is not str:
                     return CredentialMaterialFinding("unsupported_value", "mapping_key")
-                if len(key.encode("utf-8", errors="replace")) > state.policy.max_string_bytes:
+                if utf8_size(key, errors="replace", limit=state.policy.max_string_bytes) > state.policy.max_string_bytes:
                     return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
                 key_category = _classify_string(key)
                 if key_category is not None:
@@ -269,8 +322,8 @@ def _allowed_reference_finding(
         scope = value["secret_scope"] if "secret_scope" in value else None
         if type(ref) is not str or not ref or (scope is not None and scope not in ("user", "server", "org")):
             return False
-        ref_size = len(ref.encode("utf-8", errors="replace"))
-        if ref_size > min(policy.max_string_bytes, _SECRET_REFERENCE_NAME_MAX_BYTES):
+        ref_limit = min(policy.max_string_bytes, _SECRET_REFERENCE_NAME_MAX_BYTES)
+        if utf8_size(ref, errors="replace", limit=ref_limit) > ref_limit:
             return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
         category = _classify_string(ref)
         if category is not None:
@@ -283,7 +336,7 @@ def _allowed_reference_finding(
     match = _EXACT_ENV_VAR_REF_PATTERN.fullmatch(value)
     if match is None or match.group(1) not in policy.env_ref_names:
         return False
-    if len(value.encode("utf-8", errors="replace")) > policy.max_string_bytes:
+    if utf8_size(value, errors="replace", limit=policy.max_string_bytes) > policy.max_string_bytes:
         return CredentialMaterialFinding("traversal_limit", "traversal_boundary")
     return None
 

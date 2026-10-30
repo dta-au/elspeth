@@ -31,6 +31,8 @@ from elspeth.web.plugin_policy.models import PluginUnavailableReason
 _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "BLOB_QUOTA_EXCEEDED",
+        "CONTINUATION_CALL_NOT_ALONE",
+        "CONTINUATION_UNAVAILABLE",
         "DISCOVERY_NO_GAIN",
         "TERMINAL_CALL_NOT_ALONE",
         "advisor_signoff_blocked",

@@ -6,6 +6,7 @@ input boundary. It does not activate a worker or replace the provider phase.
 
 import asyncio
 import json
+from dataclasses import FrozenInstanceError
 from threading import Event
 from time import monotonic
 
@@ -28,7 +29,7 @@ from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors,
 from elspeth.web.composer.continuation_bootstrap import capture_continuation_bootstrap, encode_continuation_bootstrap
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_evidence import encode_turn_evidence
+from elspeth.web.composer.continuation_evidence import admit_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import capture_turn_evidence
 from elspeth.web.composer.continuation_iteration import (
     capture_continuation_iteration,
@@ -179,10 +180,11 @@ async def producer_case(store, *, secret_service=None, retain_ingress=True, admi
                     select(messages_table).where(messages_table.c.session_id == str(sid)).order_by(messages_table.c.sequence_no)
                 )
             )
-    snapshot = capture_turn_evidence(
+    admitted = capture_turn_evidence(
         owner, messages, logical=root.logical, recorder=recorder, drained=RecorderDrainCursors(), env_ref_names=frozenset()
     )
-    evidence = encode_turn_evidence(snapshot)
+    evidence = encode_turn_evidence(admitted)
+    snapshot = admitted.snapshot
     state = encode_private_chunk(codec="composer.state.v1", canonical=canonical_json(owner.effects.initial_state.to_dict()))
     transcript = encode_message_shelf(snapshot.transcript)
     audit = encode_recorder_snapshot(recorder.snapshot_for_continuation(drained=RecorderDrainCursors()))
@@ -315,8 +317,15 @@ async def save_produced_shelf(store, kwargs, snapshot, iteration, transcript, me
     if transform_shelf is not None:
         shelf = transform_shelf(shelf)
     audit = encode_recorder_snapshot(recorder.snapshot_for_continuation(drained=RecorderDrainCursors())) if recorder is not None else None
-    changed = snapshot.model_copy(update={"transcript": shelf, **({"recorder_json": audit.canonical} if audit is not None else {})})
-    evidence = encode_turn_evidence(changed)
+    changed = snapshot.model_copy(update={"transcript": shelf, **({"recorder": audit.reference} if audit is not None else {})})
+    evidence = encode_turn_evidence(
+        admit_turn_evidence(
+            changed,
+            env_ref_names=kwargs["inventory"].names,
+            source_chunks=((audit,) if audit is not None else ()) + kwargs["selected"].chunks,
+        ),
+        env_ref_names=kwargs["inventory"].names,
+    )
     transcript_chunk = encode_message_shelf(shelf)
     message_chunk = encode_private_chunk(
         codec="composer.messages.v1",
@@ -376,6 +385,10 @@ async def test_initial_and_fixed_actual_producers_restore_order_aliases_and_curr
     kwargs, evidence, _recorder, snapshot, iteration, actors = await producer_case(operation_store)
     produced = await producers.load_current_message_producers(**kwargs, initial=True)
     owner = produced.producers
+    assert type(produced.messages) is tuple
+    assert all(owner.capture_message(message)[1] is not None for message in produced.messages)
+    with pytest.raises(FrozenInstanceError):
+        produced.messages = ()
     initial = list(produced.messages)
     current_snapshot, catalog = kwargs["service"]._policy_context.build("alice")
     warm = await asyncio.to_thread(
@@ -406,6 +419,11 @@ async def test_initial_and_fixed_actual_producers_restore_order_aliases_and_curr
     assert shelf.current_indexes[-1] == shelf.current_indexes[-3]
     assert shelf.current_indexes[-2] != shelf.current_indexes[-3]
     cold = await producers.load_current_message_producers(**next_kwargs, retained_shelf=shelf)
+    assert type(cold.messages) is tuple
+    assert cold.messages[-1] is cold.messages[-3] and cold.messages[-2] is not cold.messages[-3]
+    assert tuple(cold.producers.capture_message(message) for message in cold.messages) == tuple(
+        (shelf.messages_json[index], shelf.producer_recipes[index]) for index in shelf.current_indexes
+    )
     assert detached(cold.messages) == detached(messages)
     # The transcript owner reconstructs the complete current/excluded/observed
     # partition from the interned shelf, preserving actual reference identities.

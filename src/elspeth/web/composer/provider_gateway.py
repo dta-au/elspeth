@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, TypedDict, cast
 
 from openai import OpenAIError
 
@@ -17,18 +17,17 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCal
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.prompt_guard import (
+    GuardedProviderMessage,
     PromptGuardContentPart,
     PromptGuardMode,
     PromptGuardRole,
     PromptGuardTextMessage,
     PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
-    detach_prompt_guard_evidence,
-    validate_prompt_guard_content_parts,
-    validate_prompt_guard_thinking_parts,
-    validate_prompt_guard_tool_argument_parts,
 )
+from elspeth.contracts.readonly_json import JsonValue
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.core.canonical import stable_hash
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
@@ -39,17 +38,18 @@ from elspeth.web.composer._compose_loop_carriers import (
 )
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent, scan_prepared_advisor_content
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.capability_skill import load_pipeline_capability_core, validate_capability_field_contract
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_hash
 from elspeth.web.composer.llm_response_parsing import (
     admit_llm_provider_metadata,
-    apply_anthropic_cache_markers,
     attach_llm_calls,
     build_llm_call_record,
     supports_anthropic_prompt_cache_markers,
 )
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.private_diagnostic_facts import bind_received_response, capture_received_response
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount, enforce_prompt_guard
-from elspeth.web.composer.protocol import ComposerServiceError, ComposerSettings
+from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerServiceError, ComposerSettings
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_cost import CommonProviderCostRequest
 from elspeth.web.composer.provider_errors import classify_provider_failure
@@ -60,7 +60,9 @@ from elspeth.web.composer.provider_quota import (
     required_provider_audit_scope,
 )
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
+from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
@@ -71,6 +73,16 @@ from elspeth.web.credential_guard import (
 )
 
 _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
+
+
+class _DeclaredFunction(TypedDict):
+    name: str
+
+
+class _DeclaredFunctionTool(TypedDict):
+    """The existing owned function-tool name projection, without a wire copy."""
+
+    function: _DeclaredFunction
 
 
 class _MalformedLLMResponseError(ComposerServiceError):
@@ -397,7 +409,8 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
 
     The compose loop and the boot probe both call this, so the probe sends
     exactly the list production sends. The list is the static wire
-    projection W of the registry for ``dialect``
+    projection W of the registry for ``dialect``, with runtime naming
+    disclosures on its ``set_pipeline`` document
     (:func:`elspeth.web.composer.tools.wire_projection.wire_tool_definitions`),
     which also owns the web ``set_pipeline`` envelope;
     :mod:`elspeth.web.composer.tool_batch` unwraps that envelope before
@@ -411,6 +424,16 @@ def composer_loop_tool_definitions(dialect: ToolContractDialect) -> list[dict[st
     from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 
     tools = wire_tool_definitions(dialect)
+    for tool in tools:
+        function = tool["function"]
+        if function["name"] == "set_pipeline":
+            schema = function["parameters"]["properties"]["pipeline"]
+            if stable_hash(schema) != stable_hash(canonical_set_pipeline_schema()):
+                raise AuditIntegrityError("Compose loop advertised pipeline schema differs from canonical")
+            validate_capability_field_contract(schema, load_pipeline_capability_core())
+            break
+    else:
+        raise AuditIntegrityError("Compose loop must advertise set_pipeline")
     # Preserve the established trailing cache anchor.
     return [*tools[:-1], *recovery_tool_definitions(dialect), tools[-1]]
 
@@ -466,6 +489,8 @@ async def _litellm_acompletion(
     provider_custody: ProviderCallCustody | None = None,
     on_provider_dispatch: Callable[[], None] | None = None,
     continuation_input_sha256: str | None = None,
+    prepared_input: PreparedProviderInput | None = None,
+    max_prepared_request_bytes: int = DEFAULT_MAX_PREPARED_REQUEST_BYTES,
     **kwargs: Any,
 ) -> Any:
     """Call LiteLLM lazily so app startup never imports provider machinery.
@@ -479,51 +504,83 @@ async def _litellm_acompletion(
     """
     if type(provider_custody) is not ProviderCallCustody:
         raise AuditIntegrityError("Physical provider requires exact explicit custody")
+    provider_custody.required_work.validate_context(provider_custody.context)
     title = provider_custody.continuation_title
+    if prepared_input is None:
+        prepared_input = prepare_provider_input(
+            messages=kwargs["messages"],
+            tools=kwargs["tools"] if "tools" in kwargs else None,
+            tools_present="tools" in kwargs,
+            model=kwargs["model"],
+            role=prompt_guard_role,
+            mount=prompt_guard_mount,
+            mode=prompt_guard_mode,
+            user_prompt=prompt_guard_user_prompt,
+            max_bytes=max_prepared_request_bytes,
+            trusted_message_indexes=prompt_guard_trusted_message_indexes,
+            content_parts=prompt_guard_content_parts,
+            tool_argument_parts=prompt_guard_tool_argument_parts,
+            thinking_parts=prompt_guard_thinking_parts,
+            advisor_content=prepared_advisor_content,
+        )
+    else:
+        if type(prepared_input) is not PreparedProviderInput:
+            raise AuditIntegrityError("Physical provider requires its exact nominal input preparation")
+        if (
+            kwargs["messages"] is not prepared_input.evidence.messages
+            or ("tools" in kwargs) != prepared_input.tools_present
+            or ("tools" in kwargs and kwargs["tools"] is not prepared_input.tools)
+        ):
+            raise AuditIntegrityError("Physical provider changed its captured input preparation")
+        if (
+            type(prompt_guard_trusted_message_indexes) is not frozenset
+            or not prompt_guard_trusted_message_indexes.issubset(prepared_input.evidence.trusted_message_indexes)
+            or (prompt_guard_content_parts is not None and prompt_guard_content_parts != prepared_input.evidence.content_parts)
+            or (
+                prompt_guard_tool_argument_parts is not None
+                and prompt_guard_tool_argument_parts != prepared_input.evidence.tool_argument_parts
+            )
+            or (prompt_guard_thinking_parts is not None and prompt_guard_thinking_parts != prepared_input.evidence.thinking_parts)
+            or (prepared_advisor_content is not None and prepared_advisor_content != prepared_input.advisor_content)
+        ):
+            raise AuditIntegrityError("Physical provider changed its prepared producer provenance")
+    if type(max_prepared_request_bytes) is not int or max_prepared_request_bytes != prepared_input.byte_limit:
+        raise AuditIntegrityError("Physical provider changed its current prepared-input allowance")
+    dispatch = prepared_input.consume(
+        model=kwargs["model"],
+        role=prompt_guard_role,
+        mount=prompt_guard_mount,
+        mode=prompt_guard_mode,
+        user_prompt=prompt_guard_user_prompt,
+    )
+    # Credentials remain purpose-specific transport configuration. Preserve
+    # their existing deepcopy isolation while adopting the bounded SDK copy.
+    kwargs = deepcopy({key: value for key, value in kwargs.items() if key not in ("messages", "tools")})
+    evidence = dispatch.evidence
+    kwargs["messages"] = evidence.messages
+    if dispatch.tools is not None:
+        kwargs["tools"] = dispatch.tools
+    content_parts, argument_parts, thinking_parts = evidence.content_parts, evidence.tool_argument_parts, evidence.thinking_parts
+    prepared_advisor_content = prepared_input.advisor_content
+
+    def verify_dispatch() -> None:
+        if (
+            kwargs["messages"] is not dispatch.evidence.messages
+            or ("tools" in kwargs) != (dispatch.tools is not None)
+            or ("tools" in kwargs and kwargs["tools"] is not dispatch.tools)
+        ):
+            raise AuditIntegrityError("Physical provider changed its exact prepared dispatch wire")
+        prepared_input.verify(
+            model=kwargs["model"],
+            role=prompt_guard_role,
+            mount=prompt_guard_mount,
+            mode=prompt_guard_mode,
+            user_prompt=prompt_guard_user_prompt,
+            dispatch=dispatch,
+        )
+
     import litellm
 
-    # Endpoint credentials are purpose-specific transport configuration and
-    # intentionally excluded.  The dynamic messages are the Web/Composer
-    # control content that crosses the provider boundary.
-    kwargs = deepcopy(kwargs)
-    evidence = detach_prompt_guard_evidence(kwargs["messages"])
-    kwargs["messages"] = evidence.messages
-    content_parts = evidence.content_parts
-    argument_parts = evidence.tool_argument_parts
-    thinking_parts = evidence.thinking_parts
-    if prompt_guard_content_parts is not None:
-        validate_prompt_guard_content_parts(evidence.messages, prompt_guard_content_parts)
-        if any(
-            current is not None and forwarded is not None and current != forwarded
-            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
-        ):
-            raise AuditIntegrityError("Prompt guard content provenance changed before physical dispatch")
-        content_parts = tuple(
-            current if current is not None else forwarded
-            for current, forwarded in zip(content_parts, prompt_guard_content_parts, strict=True)
-        )
-    if prompt_guard_tool_argument_parts is not None:
-        validate_prompt_guard_tool_argument_parts(evidence.messages, prompt_guard_tool_argument_parts)
-        if any(
-            current is not None and forwarded is not None and current != forwarded
-            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
-        ):
-            raise AuditIntegrityError("Prompt guard tool argument provenance changed before physical dispatch")
-        argument_parts = tuple(
-            current if current is not None else forwarded
-            for current, forwarded in zip(argument_parts, prompt_guard_tool_argument_parts, strict=True)
-        )
-    if prompt_guard_thinking_parts is not None:
-        validate_prompt_guard_thinking_parts(evidence.messages, prompt_guard_thinking_parts)
-        if any(
-            current is not None and forwarded is not None and current != forwarded
-            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
-        ):
-            raise AuditIntegrityError("Provider thinking provenance changed before physical dispatch")
-        thinking_parts = tuple(
-            current if current is not None else forwarded
-            for current, forwarded in zip(thinking_parts, prompt_guard_thinking_parts, strict=True)
-        )
     credential_messages: list[Mapping[str, Any]] = []
     for message in kwargs["messages"]:
         if "thinking_blocks" in message:
@@ -557,7 +614,7 @@ async def _litellm_acompletion(
             messages=kwargs["messages"],
             tools=kwargs["tools"] if "tools" in kwargs else (),
             user_prompt=prompt_guard_user_prompt,
-            trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+            trusted_message_indexes=evidence.trusted_message_indexes,
             content_parts=content_parts,
             tool_argument_parts=argument_parts,
             thinking_parts=thinking_parts,
@@ -573,13 +630,14 @@ async def _litellm_acompletion(
                 messages=kwargs["messages"],
                 tools=kwargs["tools"] if "tools" in kwargs else (),
                 user_prompt=prompt_guard_user_prompt,
-                trusted_message_indexes=evidence.trusted_message_indexes | prompt_guard_trusted_message_indexes,
+                trusted_message_indexes=evidence.trusted_message_indexes,
                 content_parts=content_parts,
                 tool_argument_parts=argument_parts,
                 thinking_parts=thinking_parts,
             )
 
         await title.clock.run("guard", title_guard)
+    verify_dispatch()
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
     if continuation_input_sha256 is not None and continuation_provider_input_hash(kwargs) != continuation_input_sha256:
@@ -605,6 +663,7 @@ async def _litellm_acompletion(
                     raise BaseExceptionGroup("TITLE quota stage and original cancellations", [quota_failure, *cancellations]) from None
             raise
     try:
+        verify_dispatch()
         provider_custody.require_cost_dispatch()
         if on_provider_dispatch is not None:
             on_provider_dispatch()
@@ -625,6 +684,7 @@ async def _litellm_acompletion(
         return await litellm.acompletion(**kwargs)
 
     async def title_physical() -> Any:
+        verify_dispatch()
         if asyncio.get_running_loop().time() >= title.clock.deadline:
             raise TimeoutError("TITLE original action deadline expired before SDK entry")
         provider_custody.mark_sdk_entered()
@@ -649,6 +709,7 @@ async def _litellm_acompletion(
 class PreparedContinuationPrimaryRequest:
     input_sha256: str
     kwargs: Mapping[str, Any] = field(repr=False)
+    provider_input: PreparedProviderInput = field(repr=False)
 
     def __post_init__(self) -> None:
         freeze_fields(self, "kwargs")
@@ -685,25 +746,137 @@ class ProviderGateway:
         self,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
+        *,
+        user_prompt: str | None = None,
     ) -> PreparedContinuationPrimaryRequest:
         """Freeze ordinary physical-input identity without guard/quota/SDK clearance."""
-        evidence = detach_prompt_guard_evidence(messages)
-        wire_messages = evidence.messages
-        wire_tools = [dict(tool) for tool in tools]
-        if supports_anthropic_prompt_cache_markers(self._model):
-            wire_messages, selected = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
-            wire_tools = selected if selected is not None else wire_tools
+        prepared = self.prepare_loop_input(messages, tools, user_prompt=user_prompt)
         kwargs = build_composer_loop_request_kwargs(
             model=self._model,
-            messages=wire_messages,
-            tools=wire_tools,
+            messages=prepared.evidence.messages,
+            tools=prepared.tools if prepared.tools is not None else (),
             settings=self._settings,
             api_base=self._endpoint_base_url,
             api_key=self._endpoint_api_key,
         )
         _apply_openrouter_app_identity(kwargs)
         _apply_openrouter_usage_accounting(kwargs)
-        return PreparedContinuationPrimaryRequest(continuation_provider_input_hash(kwargs), kwargs)
+        self.verify_input(prepared)
+        return PreparedContinuationPrimaryRequest(continuation_provider_input_hash(kwargs), kwargs, prepared)
+
+    def prepare_input(
+        self,
+        messages: Sequence[GuardedProviderMessage],
+        tools: Sequence[Mapping[str, JsonValue]],
+        *,
+        user_prompt: str | None = None,
+        tools_present: bool | None = None,
+        cache_markers: bool = False,
+        mark_history_tail: bool = False,
+        trusted_message_indexes: frozenset[int] = frozenset(),
+        content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
+    ) -> PreparedProviderInput:
+        """Prepare one current Composer candidate before copying or capture."""
+        return prepare_provider_input(
+            messages=messages,
+            tools=tools,
+            tools_present=bool(tools) if tools_present is None else tools_present,
+            model=self._model,
+            role="composer",
+            mount=self.prompt_guard_mount,
+            mode=self._prompt_guard_mode,
+            user_prompt=user_prompt,
+            max_bytes=self._settings.composer_max_prepared_request_bytes,
+            cache_markers=cache_markers,
+            mark_history_tail=mark_history_tail,
+            trusted_message_indexes=trusted_message_indexes,
+            content_parts=content_parts,
+            tool_argument_parts=tool_argument_parts,
+            thinking_parts=thinking_parts,
+        )
+
+    def verify_input(self, prepared: PreparedProviderInput) -> None:
+        """Recheck the same current input before retained receipt serialization."""
+        if type(prepared) is not PreparedProviderInput or prepared.byte_limit != self._settings.composer_max_prepared_request_bytes:
+            raise AuditIntegrityError("Primary provider changed its current input preparation")
+        prepared.verify(
+            model=self._model,
+            role="composer",
+            mount=self.prompt_guard_mount,
+            mode=self._prompt_guard_mode,
+            user_prompt=prepared.genuine_user,
+        )
+
+    def prepare_loop_input(
+        self,
+        messages: Sequence[GuardedProviderMessage],
+        tools: Sequence[Mapping[str, JsonValue]],
+        *,
+        user_prompt: str | None = None,
+    ) -> PreparedProviderInput:
+        """Select this gateway model's actual loop cache adaptation once."""
+        return self.prepare_input(
+            messages,
+            tools,
+            user_prompt=user_prompt,
+            cache_markers=supports_anthropic_prompt_cache_markers(self._model),
+            mark_history_tail=True,
+        )
+
+    def reprepare_input(self, previous: PreparedProviderInput) -> PreparedProviderInput:
+        """Prepare the same sealed logical input afresh for a transport retry."""
+        if type(previous) is not PreparedProviderInput:
+            raise AuditIntegrityError("Provider retry requires its original owned preparation")
+        previous.verify(
+            model=self._model,
+            role="composer",
+            mount=self.prompt_guard_mount,
+            mode=self._prompt_guard_mode,
+            user_prompt=previous.genuine_user,
+        )
+        # The previous input is already finally adapted and isolated from SDK
+        # mutations. Carry its original provenance, then read the current cap;
+        # no guard decision or dispatch permission survives this new builder.
+        return self.prepare_input(
+            previous.evidence.messages,
+            previous.tools if previous.tools is not None else (),
+            user_prompt=previous.genuine_user,
+            tools_present=previous.tools_present,
+            trusted_message_indexes=previous.evidence.trusted_message_indexes,
+            content_parts=previous.evidence.content_parts,
+            tool_argument_parts=previous.evidence.tool_argument_parts,
+            thinking_parts=previous.evidence.thinking_parts,
+        )
+
+    def prepare_reply_input(
+        self,
+        messages: Sequence[GuardedProviderMessage],
+        tools: Sequence[Mapping[str, JsonValue]],
+        *,
+        instruction: GuardedProviderMessage,
+        prefix: str,
+        suffix: str,
+        frame_one: Callable[[GuardedProviderMessage], GuardedProviderMessage],
+        frame_all: Callable[[], Sequence[GuardedProviderMessage]],
+    ) -> tuple[PreparedProviderInput, Sequence[GuardedProviderMessage]]:
+        from elspeth.web.composer.reply_preparation import prepare_reply_provider_input
+
+        return prepare_reply_provider_input(
+            messages=messages,
+            tools=tools,
+            instruction=instruction,
+            model=self._model,
+            mount=self.prompt_guard_mount,
+            mode=self._prompt_guard_mode,
+            max_bytes=self._settings.composer_max_prepared_request_bytes,
+            cache_markers=supports_anthropic_prompt_cache_markers(self._model),
+            prefix=prefix,
+            suffix=suffix,
+            frame_one=frame_one,
+            frame_all=frame_all,
+        )
 
     async def _call_llm(
         self,
@@ -717,29 +890,51 @@ class ProviderGateway:
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
         prompt_guard_thinking_parts: tuple[PromptGuardThinkingParts | None, ...] | None = None,
         continuation_input_sha256: str | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
+            if prepared_input is None:
+                prepared_input = self.prepare_input(
+                    messages,
+                    tools,
+                    trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                    content_parts=prompt_guard_content_parts,
+                    tool_argument_parts=prompt_guard_tool_argument_parts,
+                    thinking_parts=prompt_guard_thinking_parts,
+                )
+            elif (
+                type(prepared_input) is not PreparedProviderInput
+                or messages is not prepared_input.evidence.messages
+                or (prepared_input.tools is not None and tools is not prepared_input.tools)
+                or (prepared_input.tools is None and tools)
+            ):
+                raise AuditIntegrityError("Primary provider call changed its captured input identity")
             kwargs = build_composer_loop_request_kwargs(
                 model=self._model,
-                messages=messages,
-                tools=tools,
+                messages=prepared_input.evidence.messages,
+                tools=prepared_input.tools if prepared_input.tools is not None else (),
                 settings=self._settings,
                 api_base=self._endpoint_base_url,
                 api_key=self._endpoint_api_key,
             )
+            if prepared_input.tools_present:
+                kwargs["tools"] = prepared_input.tools
             response = await _litellm_acompletion(
                 provider_custody=provider_custody,
                 prompt_guard_mount=self.prompt_guard_mount,
                 prompt_guard_mode=self._prompt_guard_mode,
                 prompt_guard_role="composer",
+                prompt_guard_user_prompt=prepared_input.genuine_user,
                 prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
                 prompt_guard_content_parts=prompt_guard_content_parts,
                 prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
                 prompt_guard_thinking_parts=prompt_guard_thinking_parts,
                 continuation_input_sha256=continuation_input_sha256,
+                prepared_input=prepared_input,
+                max_prepared_request_bytes=self._settings.composer_max_prepared_request_bytes,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -775,14 +970,29 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         """Call the LLM for non-tool text generation."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
+            if prepared_input is None:
+                prepared_input = self.prepare_input(
+                    messages,
+                    (),
+                    user_prompt="",
+                    trusted_message_indexes=prompt_guard_trusted_message_indexes,
+                    content_parts=prompt_guard_content_parts,
+                )
+            elif (
+                type(prepared_input) is not PreparedProviderInput
+                or messages is not prepared_input.evidence.messages
+                or prepared_input.tools_present
+            ):
+                raise AuditIntegrityError("Text provider call changed its captured input identity")
             kwargs = build_composer_loop_request_kwargs(
                 model=self._model,
-                messages=messages,
+                messages=prepared_input.evidence.messages,
                 tools=(),
                 settings=self._settings,
                 api_base=self._endpoint_base_url,
@@ -796,6 +1006,8 @@ class ProviderGateway:
                 prompt_guard_user_prompt="",
                 prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
                 prompt_guard_content_parts=prompt_guard_content_parts,
+                prepared_input=prepared_input,
+                max_prepared_request_bytes=self._settings.composer_max_prepared_request_bytes,
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
@@ -864,6 +1076,7 @@ class ProviderGateway:
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         """Preserve the completion-returning primary audit boundary."""
         outcome = await self._call_llm_outcome_with_audit_body(
@@ -873,6 +1086,7 @@ class ProviderGateway:
             recorder=recorder,
             provider_custody=provider_custody,
             credential_state=credential_state,
+            prepared_input=prepared_input,
         )
         return outcome.completion
 
@@ -886,16 +1100,28 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
         continuation_input_sha256: str | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _CallModelOutcome:
         """Call the primary model once and record the exact marked request."""
-        evidence = detach_prompt_guard_evidence(messages)
+        if prepared_input is None:
+            try:
+                prepared_input = self.prepare_loop_input(messages, tools)
+            except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as refused:
+                attach_llm_calls(refused, recorder)
+                raise
+        elif (
+            type(prepared_input) is not PreparedProviderInput
+            or messages is not prepared_input.evidence.messages
+            or (prepared_input.tools is not None and tools is not prepared_input.tools)
+            or (prepared_input.tools is None and tools)
+        ):
+            raise AuditIntegrityError("Primary audit changed its exact prepared input identity")
+        self.verify_input(prepared_input)
+        evidence = prepared_input.evidence
         wire_messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
-        wire_tools = [dict(tool) for tool in tools]
-        if supports_anthropic_prompt_cache_markers(self._model):
-            wire_messages, tools_or_none = apply_anthropic_cache_markers(wire_messages, wire_tools, mark_history_tail=True)
-            wire_tools = tools_or_none if tools_or_none is not None else wire_tools
+        wire_tools = prepared_input.tools if prepared_input.tools is not None else []
 
-        private_request = capture_provider_context(messages=wire_messages, tools=wire_tools or None)
+        private_request = capture_provider_context(messages=wire_messages, tools=prepared_input.tools)
 
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -918,6 +1144,7 @@ class ProviderGateway:
                     prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
                     prompt_guard_thinking_parts=evidence.thinking_parts,
                     continuation_input_sha256=continuation_input_sha256,
+                    prepared_input=prepared_input,
                 )
             elif any(parts is not None for parts in evidence.thinking_parts):
                 completion_call = self._call_llm(
@@ -929,6 +1156,7 @@ class ProviderGateway:
                     prompt_guard_content_parts=evidence.content_parts,
                     prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
                     prompt_guard_thinking_parts=evidence.thinking_parts,
+                    prepared_input=prepared_input,
                 )
             elif any(parts is not None for parts in evidence.tool_argument_parts):
                 completion_call = self._call_llm(
@@ -939,6 +1167,7 @@ class ProviderGateway:
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                     prompt_guard_content_parts=evidence.content_parts,
                     prompt_guard_tool_argument_parts=evidence.tool_argument_parts,
+                    prepared_input=prepared_input,
                 )
             elif any(parts is not None for parts in evidence.content_parts):
                 completion_call = self._call_llm(
@@ -948,6 +1177,7 @@ class ProviderGateway:
                     credential_state=credential_state,
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                     prompt_guard_content_parts=evidence.content_parts,
+                    prepared_input=prepared_input,
                 )
             elif provider_custody is not None or credential_state is not None or trusted_indexes:
                 completion_call = self._call_llm(
@@ -956,9 +1186,10 @@ class ProviderGateway:
                     provider_custody=provider_custody,
                     credential_state=credential_state,
                     prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prepared_input=prepared_input,
                 )
             else:
-                completion_call = self._call_llm(wire_messages, wire_tools)
+                completion_call = self._call_llm(wire_messages, wire_tools, prepared_input=prepared_input)
             completion = await asyncio.wait_for(completion_call, timeout=timeout)
             _require_no_credential_material_in_completion(
                 completion,
@@ -969,7 +1200,9 @@ class ProviderGateway:
 
             if any(tool.function.name in RECOVERY_TOOL_NAMES for tool in completion.tool_batch.calls):
                 recovery_batch = completion.tool_batch
-            recovery_only = bool(wire_tools) and all(tool["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools)
+            recovery_only = bool(wire_tools) and all(
+                cast(_DeclaredFunctionTool, tool)["function"]["name"] in RECOVERY_TOOL_NAMES for tool in wire_tools
+            )
             if recovery_only and (
                 any(call.function.name not in RECOVERY_TOOL_NAMES for call in completion.tool_batch.calls)
                 or (not completion.tool_batch.calls and not (completion.message.content or "").strip())
@@ -1048,7 +1281,7 @@ class ProviderGateway:
                             model_requested=self._model,
                             pricing_model=self._settings.composer_pricing_model,
                             messages=wire_messages,
-                            tools=wire_tools or None,
+                            tools=prepared_input.tools,
                             status=status,
                             started_at=started_at,
                             started_ns=started_ns,
@@ -1091,7 +1324,7 @@ class ProviderGateway:
                                 },
                                 namespace=call.call_id,
                                 ordinal=1,
-                                known_tools=frozenset(tool["function"]["name"] for tool in wire_tools),
+                                known_tools=frozenset(cast(_DeclaredFunctionTool, tool)["function"]["name"] for tool in wire_tools),
                             )
                             call = replace(
                                 call,
@@ -1122,7 +1355,12 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody | None = None,
     ) -> str:
         """Call the diagnostics text model and record one redacted audit row."""
-        evidence = detach_prompt_guard_evidence(messages)
+        try:
+            prepared_input = self.prepare_input(messages, (), user_prompt="")
+        except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as refused:
+            attach_llm_calls(refused, recorder)
+            raise
+        evidence = prepared_input.evidence
         messages, trusted_indexes = evidence.messages, evidence.trusted_message_indexes
         private_request = capture_provider_context(messages=messages, tools=None)
         started_at = datetime.now(UTC)
@@ -1139,13 +1377,17 @@ class ProviderGateway:
                     provider_custody=provider_custody,
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                     prompt_guard_content_parts=evidence.content_parts,
+                    prepared_input=prepared_input,
                 )
             elif provider_custody is not None or trusted_indexes:
                 response_call = self._call_text_llm(
-                    messages, provider_custody=provider_custody, prompt_guard_trusted_message_indexes=trusted_indexes
+                    messages,
+                    provider_custody=provider_custody,
+                    prompt_guard_trusted_message_indexes=trusted_indexes,
+                    prepared_input=prepared_input,
                 )
             else:
-                response_call = self._call_text_llm(messages)
+                response_call = self._call_text_llm(messages, prepared_input=prepared_input)
             provider_response = await asyncio.wait_for(response_call, timeout=timeout)
             choice = provider_response.choices[0] if provider_response.choices else None
             message = choice.message if choice is not None else None
@@ -1274,8 +1516,11 @@ class ProviderGateway:
         timeout: float,
         recorder: BufferingRecorder | None,
         credential_state: CompositionState | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
-        return await self._call_llm_with_audit_body(messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state)
+        return await self._call_llm_with_audit_body(
+            messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state, prepared_input=prepared_input
+        )
 
     async def _call_llm_with_audit(
         self,
@@ -1286,10 +1531,11 @@ class ProviderGateway:
         recorder: BufferingRecorder | None,
         provider_custody: ProviderCallCustody | None = None,
         credential_state: CompositionState | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         if provider_custody is None:
             return await self._call_llm_with_audit_legacy(
-                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state
+                messages, tools, timeout=timeout, recorder=recorder, credential_state=credential_state, prepared_input=prepared_input
             )
         async with provider_call_scope(provider_custody):
             return await self._call_llm_with_audit_body(
@@ -1299,6 +1545,7 @@ class ProviderGateway:
                 recorder=recorder,
                 provider_custody=provider_custody,
                 credential_state=credential_state,
+                prepared_input=prepared_input,
             )
 
     async def _call_llm_outcome_with_audit(
@@ -1311,6 +1558,7 @@ class ProviderGateway:
         provider_custody: ProviderCallCustody,
         credential_state: CompositionState | None = None,
         continuation_input_sha256: str | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _CallModelOutcome:
         """Carry the original primary audit through its existing settlement."""
         async with provider_call_scope(provider_custody):
@@ -1322,6 +1570,7 @@ class ProviderGateway:
                 provider_custody=provider_custody,
                 credential_state=credential_state,
                 continuation_input_sha256=continuation_input_sha256,
+                prepared_input=prepared_input,
             )
         if outcome.audit_call is None:
             raise AuditIntegrityError("Primary provider outcome lacks its original physical audit")

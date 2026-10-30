@@ -52,6 +52,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.session_fences import acquire_compose_context, seed_live_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
@@ -2986,7 +2987,7 @@ async def test_step2_first_tool_turn_uses_existing_current_state_id(
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     state_record = await sessions_service.save_composition_state(
         result_session_id,
-        CompositionStateData(is_valid=False),
+        composition_state_data(is_valid=False),
         provenance="session_seed",
     )
 
@@ -3074,13 +3075,13 @@ async def test_overlapping_composes_keep_tool_audits_with_their_own_sessions(
     ):
         first_state = await sessions_service.save_composition_state(
             UUID(result_session_id),
-            CompositionStateData(is_valid=False),
+            composition_state_data(is_valid=False),
             provenance="session_seed",
             session_operation_context=first_context,
         )
         second_state = await sessions_service.save_composition_state(
             UUID(second_session_id),
-            CompositionStateData(is_valid=False),
+            composition_state_data(is_valid=False),
             provenance="session_seed",
             session_operation_context=second_context,
         )
@@ -3549,7 +3550,6 @@ async def test_plugin_crash_remains_primary_when_a_concurrent_writer_stales_the_
     which the unit test pins only at the persistence seam.
     """
     from elspeth.web.sessions._persist_payload import StatePayload
-    from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.telemetry import observed_value
 
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
@@ -3593,7 +3593,7 @@ async def test_plugin_crash_remains_primary_when_a_concurrent_writer_stales_the_
                         conn,
                         session_id=result_session_id,
                         payload=StatePayload(
-                            data=CompositionStateData(),
+                            data=composition_state_data(),
                             derived_from_state_id=head,
                         ),
                         provenance="session_seed",

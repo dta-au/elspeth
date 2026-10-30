@@ -16,7 +16,11 @@ from elspeth.web.composer.continuation_clock import (
     freeze_observation,
     size_segment,
 )
+from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationSegmentPolicy
+from elspeth.web.continuation_retention_memo import RetentionStageMemo, current_retention_stage_memo, retention_stage_memo_scope
+from tests.helpers.continuation_memo import RetentionMemoTrace
+from tests.unit.web.composer.test_continuation_frames import initial_stack
 
 
 def test_long_action_gets_its_own_full_allowance() -> None:
@@ -339,3 +343,210 @@ async def test_physical_timeout_is_its_declared_bound_not_segment_remainder() ->
         await clock.run("physical", physical)
     with pytest.raises(ValueError, match="inapplicable"):
         await clock.run("quota", physical)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_retention_clock_closes_its_populated_carrier_on_success_or_original_error(fails):
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+    captured = []
+    expected = object()
+    original = RuntimeError("original retention operation failure")
+
+    async def operation():
+        memo = current_retention_stage_memo()
+        assert memo is not None
+        captured.append(memo)
+        first = decode_continuation_snapshot(encoded)
+        assert decode_continuation_snapshot(encoded) is first and memo.cached_entry_count == 1
+        if fails:
+            raise original
+        return expected
+
+    if fails:
+        with pytest.raises(RuntimeError) as caught:
+            await clock.run("retention", operation)
+        assert caught.value is original
+    else:
+        assert await clock.run("retention", operation) is expected
+    assert len(captured) == 1 and not captured[0].active and captured[0].cached_entry_count == 0
+    assert current_retention_stage_memo() is None
+    with pytest.raises(ValueError, match="repeated"):
+        await clock.run("retention", operation)
+
+
+@pytest.mark.asyncio
+async def test_action_clock_masks_other_stages_and_restores_an_outer_memo():
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+    with retention_stage_memo_scope() as outer:
+        original = decode_continuation_snapshot(encoded)
+
+        async def nonretention():
+            assert current_retention_stage_memo() is None and outer.active
+            first = decode_continuation_snapshot(encoded)
+            assert decode_continuation_snapshot(encoded) is not first
+
+        for stage in ("guard", "quota", "physical"):
+            await clock.run(stage, nonretention)
+            assert current_retention_stage_memo() is outer
+            assert decode_continuation_snapshot(encoded) is original
+
+        async def retention():
+            inner = current_retention_stage_memo()
+            assert inner is not None and inner is not outer
+            assert decode_continuation_snapshot(encoded) is not original
+            return inner
+
+        inner = await clock.run("retention", retention)
+        assert not inner.active and inner.cached_entry_count == 0
+        assert current_retention_stage_memo() is outer and decode_continuation_snapshot(encoded) is original
+    assert not outer.active and current_retention_stage_memo() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["guard", "quota", "physical"])
+async def test_nonretention_error_resets_only_its_mask_token(stage):
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=1, quota=1, physical=1, retention=1))
+    clock.finish_preparation()
+    original = RuntimeError("original nonretention failure")
+
+    async def operation():
+        assert current_retention_stage_memo() is None
+        raise original
+
+    with retention_stage_memo_scope() as outer:
+        with pytest.raises(RuntimeError) as caught:
+            await clock.run(stage, operation)
+        assert caught.value is original and current_retention_stage_memo() is outer and outer.active
+
+
+@pytest.mark.asyncio
+async def test_retention_cancellation_clears_the_actual_carrier():
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=1, retention=1))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+    entered = asyncio.Event()
+    captured = []
+
+    async def operation():
+        memo = current_retention_stage_memo()
+        assert memo is not None
+        captured.append(memo)
+        decode_continuation_snapshot(encoded)
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(clock.run("retention", operation))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        task.cancel("controlled original retention cancellation")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("controlled original retention cancellation",)
+        assert not captured[0].active and captured[0].cached_entry_count == 0
+        assert current_retention_stage_memo() is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_retention_expiry_closes_only_after_the_cancel_retaining_owner_joins():
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=1, retention=0.05))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+    release, observed = asyncio.Event(), asyncio.Event()
+    captured = []
+    cancellations = []
+    expected = object()
+
+    async def actual_child():
+        await release.wait()
+        return expected
+
+    child = asyncio.create_task(actual_child())
+
+    async def operation():
+        memo = current_retention_stage_memo()
+        assert memo is not None
+        captured.append(memo)
+        decode_continuation_snapshot(encoded)
+        try:
+            return await asyncio.shield(child)
+        except asyncio.CancelledError as original:
+            cancellations.append(original)
+            observed.set()
+            result = await asyncio.shield(child)
+            assert memo.active and current_retention_stage_memo() is memo
+            return result
+
+    task = asyncio.create_task(clock.run("retention", operation))
+    try:
+        await asyncio.wait_for(observed.wait(), timeout=2)
+        assert captured[0].active and not task.done() and not child.done()
+        release.set()
+        with pytest.raises(TimeoutError, match="actual owner was joined"):
+            await asyncio.wait_for(task, timeout=2)
+        assert child.result() is expected and len(cancellations) == 1
+        assert not captured[0].active and captured[0].cached_entry_count == 0
+        assert current_retention_stage_memo() is None
+    finally:
+        release.set()
+        await asyncio.gather(child, task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_retention_monotonic_postjoin_expiry_closes_the_populated_carrier():
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=1, retention=0.02))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+    captured = []
+
+    async def operation():
+        memo = current_retention_stage_memo()
+        assert memo is not None
+        captured.append(memo)
+        decode_continuation_snapshot(encoded)
+        time.sleep(0.04)
+        assert memo.active
+        return "actual late result"
+
+    with pytest.raises(TimeoutError, match="actual owner was joined"):
+        await clock.run("retention", operation)
+    assert not captured[0].active and captured[0].cached_entry_count == 0
+    assert current_retention_stage_memo() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recompute", [False, True], ids=["healthy", "extra-actual-work"])
+async def test_retention_trace_accepts_real_hits_and_refuses_extra_actual_work(monkeypatch, recompute, request):
+    original_snapshot = RetentionStageMemo.snapshot
+    requested = set()
+
+    def force_second_computation(memo, key, producer):
+        if (memo, key) in requested:
+            return producer(key.encoded)
+        requested.add((memo, key))
+        return original_snapshot(memo, key, producer)
+
+    if recompute:
+        monkeypatch.setattr(RetentionStageMemo, "snapshot", force_second_computation)
+    trace = RetentionMemoTrace(monkeypatch, request)
+    clock = ContinuationActionClock(ContinuationActionPolicy(preparation=1, guard=None, quota=None, physical=1, retention=1))
+    clock.finish_preparation()
+    encoded = encode_continuation_snapshot(initial_stack())
+
+    async def operation():
+        first = decode_continuation_snapshot(encoded)
+        assert decode_continuation_snapshot(encoded) == first
+
+    await clock.run("retention", operation)
+    if recompute:
+        with pytest.raises(AssertionError, match="snapshot input recomputed"):
+            trace.finish(stages=1)
+    else:
+        trace.finish(stages=1)

@@ -5,15 +5,12 @@ from typing import Literal
 
 from pydantic import Field, ValidationError, model_validator
 
+from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
-from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_CONTENT_PARTS_KEY,
-    PROMPT_GUARD_THINKING_PARTS_KEY,
-    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
-    PROMPT_GUARD_TRUST_KEY,
-)
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_PROVENANCE_KEYS
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import ContinuationValue
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -21,6 +18,7 @@ from elspeth.web.composer.continuation_codec import (
     owned_json,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_prompt_recipes import ContinuationMessageRecipe
 
 
@@ -76,14 +74,7 @@ class MessageShelfSnapshot(ContinuationValue):
             value, _ = parse_json_strict(text)
             if not isinstance(value, dict):
                 raise ValueError("transcript shelf message is not an object")
-            if frozenset(
-                {
-                    PROMPT_GUARD_TRUST_KEY,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY,
-                    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
-                    PROMPT_GUARD_THINKING_PARTS_KEY,
-                }
-            ).intersection(value):
+            if PROMPT_GUARD_PROVENANCE_KEYS.intersection(value):
                 raise ValueError("plain transcript shelf cannot restore guard provenance")
         if self.history is not None:
             value, error = parse_json_strict(self.history.events_json)
@@ -92,12 +83,61 @@ class MessageShelfSnapshot(ContinuationValue):
         return self
 
 
-def encode_message_shelf(snapshot: MessageShelfSnapshot) -> PrivateChunk:
+def require_message_shelf_retention(snapshot: MessageShelfSnapshot, *, env_ref_names: frozenset[str] = frozenset()) -> int:
+    """Validate the complete fresh shelf before classifying measured excess."""
+    from elspeth.web.composer.continuation_retention import require_retention_capacity, retained_model_json_view
+
+    measured = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+    require_message_shelf_integrity(snapshot, env_ref_names=env_ref_names)
+    return require_retention_capacity(measured, reason="retained_history_bytes")
+
+
+def require_message_shelf_integrity(snapshot: MessageShelfSnapshot, *, env_ref_names: frozenset[str] = frozenset()) -> None:
+    """Complete owned/native/credential admission, without a capacity decision."""
+    from elspeth.web.composer.continuation_retention import (
+        require_retention_message_credentials,
+        validate_retained_model,
+    )
+    from elspeth.web.credential_guard import require_no_credential_material
+
+    if type(snapshot) is not MessageShelfSnapshot:
+        raise TypeError("transcript integrity requires its complete owned shelf")
+    validate_retained_model(snapshot)
+    for text in (*snapshot.messages_json, *(entry.event_json for entry in snapshot.observed)):
+        value, error = parse_json_strict(text)
+        if error is not None or type(value) is not dict:
+            raise AuditIntegrityError("fresh transcript retention lost its complete object")
+        require_retention_message_credentials(value, env_ref_names=env_ref_names)
+    if snapshot.history is not None:
+        require_no_credential_material(
+            snapshot.history.events_json,
+            surface="composer_continuation_private_chunk",
+            env_ref_names=env_ref_names,
+            max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+        )
+    require_no_credential_material(
+        snapshot.request,
+        surface="composer_continuation_private_chunk",
+        env_ref_names=env_ref_names,
+        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+    )
+
+
+def encode_message_shelf(
+    snapshot: MessageShelfSnapshot, *, mandatory_retention: bool = False, env_ref_names: frozenset[str] = frozenset()
+) -> PrivateChunk:
     if type(snapshot) is not MessageShelfSnapshot:
         raise TypeError("transcript shelf requires its owned snapshot")
+    expected = require_message_shelf_retention(snapshot, env_ref_names=env_ref_names) if mandatory_retention else None
+    canonical = canonical_json(snapshot.model_dump(mode="json"))
+    if expected is not None:
+        from elspeth.web.composer.continuation_retention import bind_retained_json_encoding
+
+        bind_retained_json_encoding(canonical, expected_bytes=expected)
     return encode_private_chunk(
         codec="composer.transcript.v1",
-        canonical=canonical_json(snapshot.model_dump(mode="json")),
+        canonical=canonical,
+        env_ref_names=env_ref_names,
     )
 
 

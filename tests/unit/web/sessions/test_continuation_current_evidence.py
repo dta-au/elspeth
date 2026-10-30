@@ -11,6 +11,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY
 from elspeth.web.composer import continuation_prompt_producers as producers
 from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
+from elspeth.web.composer.continuation_evidence import admit_turn_evidence
 from elspeth.web.composer.continuation_evidence_restore import restore_turn_evidence
 from elspeth.web.composer.continuation_prompt_producers import load_current_message_producers
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -70,6 +71,77 @@ async def test_current_materialization_restores_one_complete_evidence_shelf(oper
             materialization.capture_message(message)[0] == shelf.messages_json[index]
             for message, index in zip(messages, shelf.current_indexes, strict=True)
         )
+        kwargs["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_current_restore_receives_the_exact_fresh_sql_admission_and_keeps_the_final_read(operation_store, monkeypatch):
+    from elspeth.web.composer import continuation_current_evidence as bridge
+
+    kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
+    running = kwargs["inventory"].running
+    original_inputs = materialization.inputs
+    actual_read = producers.CurrentContinuationMessageProducers._require_current
+    actual_restore = bridge._restore_current_evidence
+    observed = []
+    transferred = []
+
+    def read(self):
+        value = actual_read(self)
+        observed.append(value)
+        return value
+
+    def restore(evidence, **values):
+        assert observed and evidence is observed[-1].admitted_evidence
+        assert evidence is not original_inputs.admitted_evidence
+        result = actual_restore(evidence, **values)
+        transferred.append((evidence, len(observed)))
+        return result
+
+    monkeypatch.setattr(producers.CurrentContinuationMessageProducers, "_require_current", read)
+    monkeypatch.setattr(bridge, "_restore_current_evidence", restore)
+    try:
+        result = await restore_current_turn_evidence(**kwargs, materialization=materialization)
+        assert len(transferred) == 1
+        assert len(observed) > transferred[0][1]
+        assert observed[-1].admitted_evidence is not transferred[0][0]
+        assert all(value == original_inputs for value in observed)
+        assert all(value.evidence is value.admitted_evidence.snapshot for value in observed)
+        assert len({id(value.admitted_evidence) for value in observed}) == len(observed)
+        assert result.messages[-1] is result.messages[-3]
+        kwargs["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_current_input_equality_retains_complete_snapshot_data_and_derives_it_from_one_admission(operation_store):
+    kwargs, materialization, _shelf, _recorder = await guarded_case(operation_store)
+    running = kwargs["inventory"].running
+    try:
+        first = await asyncio.to_thread(materialization._require_current)
+        second = await asyncio.to_thread(materialization._require_current)
+        assert first == second
+        assert first.admitted_evidence is not second.admitted_evidence
+        assert first.evidence is first.admitted_evidence.snapshot
+        assert second.evidence is second.admitted_evidence.snapshot
+        changed_source = first.evidence.model_copy(update={"actor_user_id": "different-retained-actor"})
+        changed_admission = admit_turn_evidence(
+            changed_source, env_ref_names=kwargs["inventory"].names, source_chunks=first.admitted_evidence.dependency_chunks
+        )
+        changed = replace(first, admitted_evidence=changed_admission)
+        assert changed.evidence is changed_admission.snapshot and changed.evidence != first.evidence
+        assert changed.bootstrap is first.bootstrap and changed.values is first.values
+        assert changed.producer_inputs is first.producer_inputs and changed.evidence_messages_json == first.evidence_messages_json
+        assert changed != first
+        # This is only a DATA equality discriminator, never current authority.
+        # Python 3.12 raises ValueError here; Python 3.13 raises TypeError.
+        with pytest.raises((TypeError, ValueError), match="init=False"):
+            replace(first, evidence=changed_source)
+        with pytest.raises(TypeError, match="actual source-admitted evidence"):
+            replace(first, admitted_evidence=changed_source)
         kwargs["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

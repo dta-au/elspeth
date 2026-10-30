@@ -116,6 +116,7 @@ from elspeth.web.composer.discovery_response import (
     serialize_admitted_discovery_result,
 )
 from elspeth.web.composer.llm_response_parsing import attach_llm_calls
+from elspeth.web.composer.manual_advisor_allowance import ManualAdvisorAllowance
 from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
@@ -141,6 +142,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardRefused
 from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
+    ComposerContextUnsupported,
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
@@ -203,6 +205,7 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.secrets import WebSecretResolver
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+    from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation, ContinuationToolFailureCustody
     from elspeth.web.composer.pipeline_custody import PipelineCustodyPreparation
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
@@ -1012,14 +1015,33 @@ class ContinuationBatchState:
     p4_receipt_json: str | None = None
     p4_input_json: str | None = None
     p4_verification_failed: bool = False
+    # Live-only reservation owner. The continuation codec retains the spent
+    # integer above; a checkpoint is taken only after the active stage closes.
+    manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)
 
 
-async def _await_started_tool_stage[T](awaitable: Awaitable[T], *, audit: DispatchAudit, recorder: BufferingRecorder) -> T:
+async def _await_started_tool_stage[T](
+    awaitable: Awaitable[T],
+    *,
+    audit: DispatchAudit,
+    recorder: BufferingRecorder,
+    failure_observation: ContinuationDispatchFailureObservation | None = None,
+) -> T:
     """Close a started dispatch when one unaudited async stage cancels."""
     try:
         return await awaitable
     except asyncio.CancelledError as cancellation:
-        recorder.record(finish_cancelled(audit, exc=cancellation))
+        if failure_observation is None:
+            recorder.record(finish_cancelled(audit, exc=cancellation))
+        else:
+            failure_observation.observe_primary(cancellation)
+            try:
+                recorder.record_with_failure_observation(finish_cancelled(audit, exc=cancellation), failure_observation)
+            except BaseException as error:
+                combined = failure_observation.owner.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
         raise
 
 
@@ -1760,6 +1782,7 @@ async def _execute_continuation_call_live(
     batch: ContinuationBatchState,
     call: ContinuationCallState,
     retained_attachment: AttachmentResultCheckpoint | None = None,
+    failure_custody: ContinuationToolFailureCustody | None = None,
 ) -> Literal["applied"]:
     """Execute the original suffix with the actual caller's revocation owner."""
     if retained_attachment is not None:
@@ -1777,6 +1800,11 @@ async def _execute_continuation_call_live(
         ):
             raise AuditIntegrityError("retained attachment execution changed its actual selected read graph")
     recorder = ctx.recorder
+    observation = None if failure_custody is None else failure_custody.observation
+    if failure_custody is not None and observation is not None:
+        if call.audit is None or failure_custody.batch is not batch or failure_custody.call is not call:
+            raise AuditIntegrityError("issued failure custody changed its actual batch/call")
+        observation.require(recorder, call.audit)
     anti_anchor = ctx.anti_anchor
     discovery_cache = ctx.discovery_cache
     runtime_preflight_cache = ctx.runtime_preflight_cache
@@ -1821,6 +1849,25 @@ async def _execute_continuation_call_live(
     audit = call.audit
     before = len(tool_outcomes)
     ran_to_end = False
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+
+    publication = None
+    if ctx.message_producers is not None:
+        ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
+        publication = ContinuationToolMessagePublication(
+            ctx.message_producers, call_model.completion, batch, call, recorder, llm_messages, ctx.policy_catalog
+        )
+
+    def _append_issued_feedback(serialized: str) -> None:
+        message = {
+            "role": "tool",
+            "tool_call_id": call.tool_call.id,
+            "content": serialized,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(serialized),
+        }
+        if publication is not None:
+            publication.register_feedback(serialized=serialized, message=message)
+        llm_messages.append(message)
 
     def _append_tool_outcome(
         *,
@@ -1902,6 +1949,7 @@ async def _execute_continuation_call_live(
                         ),
                         audit=audit,
                         recorder=recorder,
+                        failure_observation=observation,
                     )
                     try:
                         cached_admitted = (
@@ -2095,7 +2143,7 @@ async def _execute_continuation_call_live(
                     candidate = finalization.candidate
                     if finalization.changed:
                         audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
-                        audit = rebind_dispatch_arguments(audit, audit_arguments)
+                        audit = rebind_dispatch_arguments(audit, audit_arguments, failure_observation=observation)
                         decoded_args_by_call_id[tool_call.id] = audit_arguments
                         transcript_arguments = (
                             redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
@@ -2204,7 +2252,7 @@ async def _execute_continuation_call_live(
                             candidate = finalization.candidate
                             if finalization.changed:
                                 audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
-                                audit = rebind_dispatch_arguments(audit, audit_arguments)
+                                audit = rebind_dispatch_arguments(audit, audit_arguments, failure_observation=observation)
                                 decoded_args_by_call_id[tool_call.id] = audit_arguments
                                 redacted_arguments = redact_tool_call_arguments(
                                     tool_name,
@@ -2242,7 +2290,7 @@ async def _execute_continuation_call_live(
                                 # From this point forward every authority-bearing
                                 # and externally visible copy uses source.blob_id.
                                 arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
-                                audit = rebind_dispatch_arguments(audit, arguments)
+                                audit = rebind_dispatch_arguments(audit, arguments, failure_observation=observation)
                                 decoded_args_by_call_id[tool_call.id] = arguments
                                 # Authority retains the exact review draft. Only its
                                 # redacted projection belongs in provider history.
@@ -2488,6 +2536,7 @@ async def _execute_continuation_call_live(
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     else:
                         if type(ctx.session_operation_context) is not SessionOperationContext:
@@ -2514,6 +2563,7 @@ async def _execute_continuation_call_live(
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     proposals_this_turn += 1
                     proposal_result = ToolResult(
@@ -2574,7 +2624,12 @@ async def _execute_continuation_call_live(
                 # pre-proposal work. All fall through to the canonical
                 # dispatch/outcome path below.
 
-            await _await_started_tool_stage(emit_progress(progress, tool_started_progress_event(tool_name)), audit=audit, recorder=recorder)
+            await _await_started_tool_stage(
+                emit_progress(progress, tool_started_progress_event(tool_name)),
+                audit=audit,
+                recorder=recorder,
+                failure_observation=observation,
+            )
 
             # Advisor escape-hatch interception. The request_advisor_hint
             # tool is intercepted here BEFORE execute_tool() because the
@@ -2630,19 +2685,20 @@ async def _execute_continuation_call_live(
                     )
                     anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
                     tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_rejection_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
                 budget = ctx.advisor_max_calls_per_compose
-                if advisor_calls_used >= budget:
+                if batch.manual_advisor_allowance is None:
+                    batch.manual_advisor_allowance = ManualAdvisorAllowance(limit=budget, used=advisor_calls_used)
+                allowance = batch.manual_advisor_allowance
+                if type(allowance) is not ManualAdvisorAllowance:
+                    raise AuditIntegrityError("Manual Advisor admission lost its nominal allowance owner")
+                if allowance.limit != budget:
+                    raise AuditIntegrityError("Manual Advisor allowance changed during its issued batch")
+                advisor_calls_used = allowance.used
+                if allowance.available <= 0:
                     budget_payload = {
                         "status": "BUDGET_EXHAUSTED",
                         "budget_used": advisor_calls_used,
@@ -2674,14 +2730,7 @@ async def _execute_continuation_call_live(
                     # the LLM repeating an identical request, it's the
                     # operator's policy refusing further hints.
                     tool_feedback_json = json.dumps(advisor_feedback_payload(budget_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
@@ -2735,14 +2784,7 @@ async def _execute_continuation_call_live(
                         post_version=state.version,
                     )
                     tool_feedback_json = json.dumps(advisor_feedback_payload(deadline_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
@@ -2750,44 +2792,49 @@ async def _execute_continuation_call_live(
                 effective_advisor_timeout = min(advisor_timeout, remaining)
                 advisor_deadline_limited = remaining <= advisor_timeout
 
-                # F2: consume budget BEFORE the outbound call, not after.
-                # The cost guard's purpose is to bound outbound LiteLLM
-                # calls regardless of outcome. Counting only successes
-                # would let a flaky provider rack up unlimited failed
-                # outbound calls until anti-anchor or the discovery-
-                # turn limit fired. ARG_ERROR (above) and pre-call compose
-                # timeout (above) do NOT consume advisor budget because no
-                # outbound advisor call is made.
-                advisor_calls_used += 1
+                # Reserve before awaiting preparation. Commit at the physical
+                # dispatch callback, irrespective of provider result or later
+                # audit-buffer failure. Release every undispatched exit before
+                # the outer timeout/failure classification reads the allowance.
+                reservation = allowance.reserve()
+                if reservation is None:
+                    raise AuditIntegrityError("Manual Advisor admission lost its reserved allowance")
 
                 abandonment_context = None
                 try:
-                    if ctx.turn_evidence is not None:
-                        ctx.turn_evidence.transcript.observe_messages(llm_messages)
-                    if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
-                        if ctx.turn_evidence is None or user_message_content is None:
-                            raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
-                        abandonment_context = ctx.turn_evidence.abandonment_context(
-                            request=user_message_content,
-                            current_state=state,
-                            plugin_snapshot=ctx.plugin_snapshot,
-                            messages=llm_messages,
-                        )
-                    advisor_outcome = await _await_started_tool_stage(
-                        ctx.advisor_checkpoint._call_advisor_for_tool(
-                            advisor_arg_error,
+                    try:
+                        if ctx.turn_evidence is not None:
+                            ctx.turn_evidence.transcript.observe_messages(llm_messages)
+                        if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
+                            if ctx.turn_evidence is None or user_message_content is None:
+                                raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
+                            abandonment_context = ctx.turn_evidence.abandonment_context(
+                                request=user_message_content,
+                                current_state=state,
+                                plugin_snapshot=ctx.plugin_snapshot,
+                                messages=llm_messages,
+                            )
+                        advisor_outcome = await _await_started_tool_stage(
+                            ctx.advisor_checkpoint._call_advisor_for_tool(
+                                advisor_arg_error,
+                                recorder=recorder,
+                                timeout=effective_advisor_timeout,
+                                provider_owner=ctx.provider_owner,
+                                abandonment_context=abandonment_context,
+                                advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
+                                current_state=state,
+                                session_id=ctx.session_id,
+                                session_operation_context=ctx.session_operation_context,
+                                on_provider_dispatch=reservation.dispatch,
+                                failure_observation=observation,
+                            ),
+                            audit=audit,
                             recorder=recorder,
-                            timeout=effective_advisor_timeout,
-                            provider_owner=ctx.provider_owner,
-                            abandonment_context=abandonment_context,
-                            advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
-                            current_state=state,
-                            session_id=ctx.session_id,
-                            session_operation_context=ctx.session_operation_context,
-                        ),
-                        audit=audit,
-                        recorder=recorder,
-                    )
+                            failure_observation=observation,
+                        )
+                    finally:
+                        reservation.close()
+                        advisor_calls_used = allowance.used
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     # Lifecycle exceptions: do not absorb. Propagate so
                     # cancellation and shutdown work normally; the inner
@@ -2819,6 +2866,8 @@ async def _execute_continuation_call_live(
                             post_version=state.version,
                         )
                         advisor_compose_timeout = "in_flight"
+                        if failure_custody is not None:
+                            failure_custody.consume_nonprimary()
                         break
                     # Advisor-specific timeout with compose budget still
                     # remaining: return structured tool feedback so the
@@ -2846,15 +2895,10 @@ async def _execute_continuation_call_live(
                     )
                     anti_anchor.record_failure(tool_name, audit.arguments_hash)
                     tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
+                    if failure_custody is not None:
+                        failure_custody.consume_nonprimary()
                     continue
 
                 except Exception as advisor_context_error:
@@ -2862,9 +2906,8 @@ async def _execute_continuation_call_live(
 
                 if type(advisor_outcome) is _AdvisorProviderFailure:
                     # The service owns the Tier-3 provider taxonomy and returns
-                    # this explicit recoverable outcome. Budget was already
-                    # consumed above: the outbound attempt counts whether or not
-                    # it produced guidance.
+                    # this explicit recoverable outcome. Only an actual
+                    # dispatch spends the reservation, regardless of guidance.
                     # Advisor failure IS counted for §7.7 anchor
                     # tracking — repeated identical failed advisor
                     # calls indicate the LLM is spamming a broken
@@ -2919,15 +2962,10 @@ async def _execute_continuation_call_live(
                         )
                         anti_anchor.record_failure(tool_name, audit.arguments_hash)
                         tool_feedback_json = json.dumps(advisor_feedback_payload(request_rejection_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
+                    if failure_custody is not None:
+                        failure_custody.consume_nonprimary()
                     continue
 
                 if type(advisor_outcome) is _AdvisorFirstPartyFailure:
@@ -2936,6 +2974,39 @@ async def _execute_continuation_call_live(
                     # driver re-raise this exact exception object after the tool
                     # row has been published.
                     first_party_exc = advisor_outcome.original_exc
+                    if failure_custody is not None:
+                        failure_custody.observe_primary(first_party_exc)
+                        if failure_custody.errors or isinstance(first_party_exc, BaseExceptionGroup):
+                            raise failure_custody.failure(first_party_exc)
+                    if isinstance(first_party_exc, ComposerContextUnsupported):
+                        context_payload = {
+                            "success": False,
+                            "outbound_call_made": False,
+                            "error_type": "composer_context_unsupported",
+                            "failure_code": "context_unsupported",
+                            "reason": first_party_exc.reason,
+                            "detail": first_party_exc.to_payload()["detail"],
+                            "budget_used": advisor_calls_used,
+                            "budget_remaining": budget - advisor_calls_used,
+                        }
+                        context_invocation = finish_success(audit, result_payload=context_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(context_invocation)
+                        else:
+                            recorder.record_with_failure_observation(context_invocation, observation)
+                        _append_tool_outcome(
+                            response=context_payload,
+                            error_class=None,
+                            error_category=None,
+                            error_message=None,
+                            post_version=state.version,
+                        )
+                        advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure", original=first_party_exc, refusal="context_unsupported", allowance_limit=budget
+                            )
+                        break
                     if isinstance(first_party_exc, CommonProviderCostRefused):
                         cost_refusal_payload = {
                             "success": False,
@@ -2943,7 +3014,11 @@ async def _execute_continuation_call_live(
                             "code": first_party_exc.code,
                             "outbound_call_made": first_party_exc.call_id is not None,
                         }
-                        recorder.record(finish_success(audit, result_payload=cost_refusal_payload, version_after=state.version))
+                        cost_invocation = finish_success(audit, result_payload=cost_refusal_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(cost_invocation)
+                        else:
+                            recorder.record_with_failure_observation(cost_invocation, observation)
                         _append_tool_outcome(
                             response=cost_refusal_payload,
                             error_class=None,
@@ -2952,12 +3027,23 @@ async def _execute_continuation_call_live(
                             post_version=state.version,
                         )
                         advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure",
+                                original=first_party_exc,
+                                refusal="provider_cost_refused",
+                                provider_call_id=first_party_exc.call_id,
+                            )
                         break
                     if isinstance(first_party_exc, PromptGuardRefused):
                         # The tool completed with a semantic refusal. It is neither
                         # provider-outage feedback nor a plugin implementation fault.
                         refusal_payload = {"success": False, "outbound_call_made": False, **first_party_exc.to_payload()}
-                        recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                        guard_invocation = finish_success(audit, result_payload=refusal_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(guard_invocation)
+                        else:
+                            recorder.record_with_failure_observation(guard_invocation, observation)
                         _append_tool_outcome(
                             response=refusal_payload,
                             error_class=None,
@@ -2966,8 +3052,16 @@ async def _execute_continuation_call_live(
                             post_version=state.version,
                         )
                         advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure", original=first_party_exc, refusal="prompt_guard_refused"
+                            )
                         break
-                    recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
+                    advisor_invocation = finish_plugin_crash(audit, exc=first_party_exc)
+                    if observation is None:
+                        recorder.record(advisor_invocation)
+                    else:
+                        recorder.record_with_failure_observation(advisor_invocation, observation)
                     _append_tool_outcome(
                         response=None,
                         error_class=type(first_party_exc).__name__,
@@ -2976,6 +3070,8 @@ async def _execute_continuation_call_live(
                         post_version=state.version,
                     )
                     advisor_failure = first_party_exc
+                    if failure_custody is not None:
+                        failure_custody.promote_completed_failure(kind="advisor_failure", original=first_party_exc)
                     break
 
                 if type(advisor_outcome) is not _AdvisorCallSuccess:
@@ -3058,6 +3154,8 @@ async def _execute_continuation_call_live(
                 }
                 if abandonment_context is not None and ctx.turn_evidence is not None:
                     ctx.turn_evidence.seal_abandonment_feedback(abandonment_context, feedback_message)
+                if publication is not None:
+                    publication.register_feedback(serialized=tool_feedback_json, message=feedback_message)
                 llm_messages.append(feedback_message)
                 continue
 
@@ -3082,7 +3180,7 @@ async def _execute_continuation_call_live(
                 # owner without being recategorized as a handler crash.
                 try:
                     review_preflight = await _await_started_tool_stage(
-                        _pending_review_runtime_findings(state, ctx), audit=audit, recorder=recorder
+                        _pending_review_runtime_findings(state, ctx), audit=audit, recorder=recorder, failure_observation=observation
                     )
                 except ComposerRuntimePreflightError as preflight_exc:
                     raise ComposerRuntimePreflightError(
@@ -3109,9 +3207,12 @@ async def _execute_continuation_call_live(
                             anti_anchor=anti_anchor,
                             policy_catalog=ctx.policy_catalog,
                             review_preflight=review_preflight,
+                            failure_observation=observation,
+                            publication=publication,
                         ),
                         audit=audit,
                         recorder=recorder,
+                        failure_observation=observation,
                     )
                 except (AssertionError, MemoryError, RecursionError, SystemError):
                     # Same narrow-class discipline as the sync execute_tool
@@ -3130,7 +3231,17 @@ async def _execute_continuation_call_live(
                     # it through the same plugin-crash carrier as the sync
                     # path so the turn persists and the route layer answers
                     # with the coded envelope.
-                    recorder.record(finish_plugin_crash(audit, exc=tool_exc))
+                    if failure_custody is not None:
+                        failure_custody.observe_primary(tool_exc)
+                        if failure_custody.errors or observation is None or not observation.execution_failed:
+                            combined = failure_custody.failure(tool_exc)
+                            if combined is tool_exc:
+                                raise
+                            raise combined from combined.__cause__
+                        recorded_crash = finish_plugin_crash(audit, exc=tool_exc)
+                        recorder.record_with_failure_observation(recorded_crash, observation)
+                    else:
+                        recorder.record(finish_plugin_crash(audit, exc=tool_exc))
                     _append_tool_outcome(
                         response=None,
                         error_class=type(tool_exc).__name__,
@@ -3146,6 +3257,8 @@ async def _execute_continuation_call_live(
                         llm_calls=recorder.llm_calls,
                     )
                     plugin_crash_cause = tool_exc
+                    if failure_custody is not None:
+                        failure_custody.promote_completed_failure(kind="plugin_crash", original=tool_exc, wrapper=plugin_crash)
                     break
                 all_cache_hits = False
                 _append_tool_outcome(
@@ -3155,6 +3268,8 @@ async def _execute_continuation_call_live(
                     error_message=session_aware_outcome.error_message,
                     post_version=session_aware_outcome.post_version,
                 )
+                if publication is not None and session_aware_outcome.result is None:
+                    publication.bind_completed_outcome(tool_outcomes[-1])
                 if session_aware_outcome.is_discovery:
                     turn_has_discovery = True
                 else:
@@ -3192,10 +3307,18 @@ async def _execute_continuation_call_live(
                         session_operation_context=ctx.session_operation_context,
                     )
                 except asyncio.CancelledError as cancellation:
-                    recorder.record(finish_cancelled(audit, exc=cancellation))
+                    if observation is not None:
+                        observation.observe_primary(cancellation)
+                        recorder.record_with_failure_observation(finish_cancelled(audit, exc=cancellation), observation)
+                    else:
+                        recorder.record(finish_cancelled(audit, exc=cancellation))
                     raise
                 except ComposerRuntimePreflightError as preflight_exc:
-                    recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                    if observation is not None:
+                        observation.observe_primary(preflight_exc.original_exc)
+                        recorder.record_with_failure_observation(finish_plugin_crash(audit, exc=preflight_exc.original_exc), observation)
+                    else:
+                        recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
                     raise ComposerRuntimePreflightError.capture(
                         preflight_exc.original_exc,
                         state=state,
@@ -3243,9 +3366,16 @@ async def _execute_continuation_call_live(
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     except ComposerRuntimePreflightError as preflight_exc:
-                        recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                        if observation is not None:
+                            observation.observe_primary(preflight_exc.original_exc)
+                            recorder.record_with_failure_observation(
+                                finish_plugin_crash(audit, exc=preflight_exc.original_exc), observation
+                            )
+                        else:
+                            recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
                         raise ComposerRuntimePreflightError.capture(
                             preflight_exc.original_exc,
                             state=state,
@@ -3432,6 +3562,7 @@ async def _execute_continuation_call_live(
                     do_dispatch=_do_dispatch,
                     version_after_provider=_version_after,
                     arg_error_payload_factory=_arg_error_payload_factory,
+                    failure_observation=observation,
                 )
             except ToolArgumentError as exc:
                 # The audit record was already written by the helper.
@@ -3474,14 +3605,7 @@ async def _execute_continuation_call_live(
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
                 tool_feedback_json = json.dumps(arg_error_payload)
-                llm_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_feedback_json,
-                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                    }
-                )
+                _append_issued_feedback(tool_feedback_json)
                 continue
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Plugin-ownership policy exception — DOCUMENTED DIVERGENCE.
@@ -3585,6 +3709,11 @@ async def _execute_continuation_call_live(
                 # takes the recorder buffer (including the helper's
                 # final crash record) so the route handler's
                 # ``_handle_plugin_crash`` gets the complete sequence.
+                if failure_custody is not None and (failure_custody.errors or observation is None or not observation.execution_failed):
+                    combined = failure_custody.failure(tool_exc)
+                    if combined is tool_exc:
+                        raise
+                    raise combined from combined.__cause__
                 _append_tool_outcome(
                     response=None,
                     error_class=type(tool_exc).__name__,
@@ -3600,6 +3729,8 @@ async def _execute_continuation_call_live(
                     llm_calls=recorder.llm_calls,
                 )
                 plugin_crash_cause = tool_exc
+                if failure_custody is not None:
+                    failure_custody.promote_completed_failure(kind="plugin_crash", original=tool_exc, wrapper=plugin_crash)
                 break
 
             # SUCCESS path — the helper already recorded
@@ -3736,6 +3867,17 @@ async def _execute_continuation_call_live(
                 ctx.message_producers.register_attachment_message(
                     response=response_source, call=tool_call, result=admitted_result.to_tool_result(), message=result_message
                 )
+            elif ctx.message_producers is not None and not (tool_name == "get_plugin_schema" and result.success):
+                ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
+                ctx.message_producers.register_tool_result_message(
+                    completion=call_model.completion,
+                    tool_index=call.index,
+                    call=tool_call,
+                    result=admitted_result if admitted_result is not None else result,
+                    serialized=result_json,
+                    message=result_message,
+                    catalog=ctx.policy_catalog,
+                )
             llm_messages.append(result_message)
 
             if not is_discovery_tool(tool_name):
@@ -3754,6 +3896,15 @@ async def _execute_continuation_call_live(
 
         else:
             ran_to_end = True
+    except BaseException as error:
+        if failure_custody is not None:
+            if failure_custody.original is None:
+                failure_custody.observe_primary(error)
+            combined = failure_custody.failure(error)
+            if combined is error:
+                raise
+            raise combined from combined.__cause__
+        raise
     finally:
         batch.state = state
         batch.last_validation = last_validation
@@ -3763,9 +3914,10 @@ async def _execute_continuation_call_live(
         batch.turn_has_discovery = turn_has_discovery
         batch.all_cache_hits = all_cache_hits
         batch.tool_outcomes = tool_outcomes
-        batch.plugin_crash = plugin_crash
-        batch.plugin_crash_cause = plugin_crash_cause
-        batch.advisor_failure = advisor_failure
+        if failure_custody is None:
+            batch.plugin_crash = plugin_crash
+            batch.plugin_crash_cause = plugin_crash_cause
+            batch.advisor_failure = advisor_failure
         batch.advisor_compose_timeout = advisor_compose_timeout
         batch.pre_state_id = pre_state_id
         batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -3790,6 +3942,7 @@ def _finish_continuation_batch_live(
     ctx: ToolBatchContext,
     acc: BatchAccumulator,
     batch: ContinuationBatchState,
+    failure_custody: ContinuationToolFailureCustody | None = None,
 ) -> tuple[_DispatchOutcome, int]:
     """Project the actual complete issued batch and executed prefix."""
     state = batch.state
@@ -3804,6 +3957,16 @@ def _finish_continuation_batch_live(
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    if failure_custody is not None and failure_custody.completed:
+        if failure_custody.batch is not batch:
+            raise AuditIntegrityError("batch finish changed its original native failure custody")
+        plugin_crash = failure_custody.wrapper
+        plugin_crash_cause = failure_custody.original if plugin_crash is not None else None
+        advisor_origin = failure_custody.original
+        if batch.retained_failure is not None and batch.retained_failure.kind == "advisor_failure":
+            if not isinstance(advisor_origin, Exception):
+                raise AuditIntegrityError("Advisor finish lost its actual handled exception")
+            advisor_failure = advisor_origin
     advisor_compose_timeout = batch.advisor_compose_timeout
     mutation_success_observed = batch.mutation_success_observed
     pre_state_id = batch.pre_state_id

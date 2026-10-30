@@ -87,23 +87,15 @@ def _selected_complete_value_message(invocation, state, path):
     """Read one explicitly selected current value through its real tool owner."""
     from elspeth.web.composer.discovery_cache import tool_result_content_parts
     from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+    from elspeth.web.composer.prompts import build_composition_content_view
     from elspeth.web.composer.tools import execute_tool
-    from elspeth.web.composer.tools._common import ToolContext, prepare_bounded_pipeline_state
 
     _engine, sessions, owner, _coordinator = invocation
     context = owner.required_work.coordinator.authority.context
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    tool_context = ToolContext(
-        catalog=policy,
-        plugin_snapshot=snapshot,
-        session_id=context.fence.session_id,
-        user_id="alice",
-        session_operation_context=context,
-        session_operation_authority=sessions.session_operation_authority,
-    )
-    view = prepare_bounded_pipeline_state(state, tool_context)
+    view = build_composition_content_view(state, content_scope=_current_scope(invocation, state))
     selected = next(reference for reference in view.manifest.values if reference.path == path)
     result = execute_tool(
         "get_complete_pipeline_value",
@@ -378,31 +370,9 @@ async def test_default_fifty_token_diagnostics_preserve_all_pretty_wire_evidence
 
 
 @pytest.mark.asyncio
-async def test_real_planner_discovery_keeps_registered_contract_on_sdk_wire(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    client, sent = azure
-    completion = _ScriptedCompletion(
-        _response(("get_plugin_schema", {"plugin_type": "transform", "name": "llm"})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 2
-    tools = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert "json_schema" in tools[0]["content"]
-    assert "json_schema" not in "\n".join(document for body in sent for document in body["documents"])
-    assert all(guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY not in message for message in completion.requests[1]["messages"])
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["manual", "end-twelve-nodes"])
 async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch, azure, checkpoint):
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -463,7 +433,7 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
     )
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     def template(label):
         prefix = f"{label}: inspect {{{{ row.record }}}}. "
@@ -615,7 +585,7 @@ async def test_real_advisor_inspects_decoded_prompt_words_on_unchanged_wire(invo
         advisor_user_content_parts,
         build_advisor_user_message,
     )
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     # The literal escape must stay literal; the neighboring Unicode words
     # must reach inspection decoded, including quotes and a genuine newline.
@@ -778,7 +748,7 @@ def test_advisor_summary_carrier_refuses_trusted_units():
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(invocation, monkeypatch, azure, phase):
     from elspeth.web.composer.advisor_context import build_advisor_user_message
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     state = _empty().with_metadata({"description": "x" * 10_001})
     client, sent = azure
@@ -833,7 +803,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     from elspeth.web.composer import provider_gateway
     from elspeth.web.sessions.models import chat_messages_table
     from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _make_settings
-    from tests.unit.web.composer.test_pipeline_planner import _response, _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _response, _ScriptedCompletion, _text_response
 
     policy, snapshot = catalog
     client, sent = azure
@@ -934,44 +904,9 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
 
 
 @pytest.mark.asyncio
-async def test_real_planner_repair_keeps_contract_and_authored_detail_separate(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    client, sent = azure
-    invalid = _pipeline(tmp_path)
-    invalid["nodes"] = [
-        {
-            "id": "review",
-            "node_type": "transform",
-            "plugin": "llm",
-            "input": "rows",
-            "on_success": "output",
-            "on_error": "discard",
-            "options": {"unexpected_option": "authored_detail_canary"},
-        }
-    ]
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": invalid})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 2
-    wire = completion.requests[1]["messages"]
-    assert "plugin_contracts" in "\n".join(message["content"] for message in wire if message["role"] == "tool")
-    inspected = "\n".join(document for body in sent for document in body["documents"])
-    assert "authored_detail_canary" in inspected
-    assert "json_schema" not in inspected
-
-
-@pytest.mark.asyncio
 async def test_real_end_publication_review_survives_actual_format_retry(invocation, monkeypatch, azure):
     from elspeth.web.composer.turn_effects import TurnEvidence
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -1034,11 +969,16 @@ async def test_real_end_publication_review_survives_actual_format_retry(invocati
 
 
 @pytest.mark.asyncio
-async def test_actual_planner_assistant_argument_producer_keeps_complete_large_graph(tmp_path, azure):
+async def test_actual_common_assistant_argument_producer_keeps_complete_large_graph(tmp_path, azure):
+    from jsonschema import Draft202012Validator
+
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
-    from elspeth.web.composer.pipeline_planner import _assistant_tool_calls_message, _parse_response_tool_calls
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+    from elspeth.web.composer.tool_batch import _retain_llm_tool_argument_parts
     from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _response
+    from elspeth.web.composer.tools.wire_projection import decode_wire_arguments
+    from tests.unit.web.composer._scripted_sdk import _pipeline
 
     pipeline = _pipeline(tmp_path)
     pipeline["nodes"] = [
@@ -1055,12 +995,26 @@ async def test_actual_planner_assistant_argument_producer_keeps_complete_large_g
         for i in range(12)
     ]
     require_schema_valid_arguments("set_pipeline", pipeline)
-    response = _response(("emit_pipeline_proposal", {"pipeline": pipeline}))
-    message, calls = _parse_response_tool_calls(
-        response, max_tool_calls=1, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset({"emit_pipeline_proposal"})
+    original = json.dumps({"pipeline": pipeline})
+    wire_schema = next(
+        tool["function"]["parameters"]
+        for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)
+        if tool["function"]["name"] == "set_pipeline"
     )
-    produced = _assistant_tool_calls_message(message, calls)
-    original = calls[0].raw_arguments
+    validator = Draft202012Validator(wire_schema)
+    wire_arguments = json.loads(original)
+    validator.validate(wire_arguments)
+    assert not validator.is_valid(pipeline), "the wire requires its pipeline envelope"
+    decoded = decode_wire_arguments("set_pipeline", ToolContractDialect.NONE, wire_arguments)
+    assert decoded.wire_conformant is True
+    assert deep_thaw(decoded.semantic) == pipeline
+    produced = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "set_pipeline", "arguments": original}}],
+    }
+    _retain_llm_tool_argument_parts([produced], tool_call_id="call-1")
+    assert guard_contracts.PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in produced
     assert len(original) > 10000
     decision, request, evidence, sent = await _inspect(azure, [produced])
     assert decision.disposition == "allow" and sent
@@ -1070,45 +1024,6 @@ async def test_actual_planner_assistant_argument_producer_keeps_complete_large_g
     assert "".join(part.text for part in entries[0].parts) == original
     assert all(part.trust is None for part in entries[0].parts)
     assert "clean_11" in "\n".join(request.documents)
-
-
-@pytest.mark.asyncio
-async def test_real_planner_initial_large_state_retains_all_authored_nodes(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    state = _empty()
-    for index in range(12):
-        state = state.with_node(
-            NodeSpec(
-                id=f"clean_{index}",
-                node_type="transform",
-                plugin="passthrough",
-                input=f"stage_{index}",
-                on_success=f"stage_{index + 1}",
-                on_error="discard",
-                options={"schema": {"mode": "flexible"}},
-                description="Retain the neutral record title, category and score. " * 12,
-                condition=None,
-                routes=None,
-                fork_to=None,
-                branches=None,
-                policy=None,
-                merge=None,
-            )
-        )
-    client, sent = azure
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        current_state=state,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 1
-    inspected = "\n".join(document for body in sent for document in body["documents"])
-    for index in range(12):
-        assert f"clean_{index}" in inspected
 
 
 @pytest.mark.parametrize("ensure_ascii", [False, True])

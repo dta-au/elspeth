@@ -1,7 +1,7 @@
 """Composer boot probe: production-shaped requests per surface.
 
 The probe builds each request with the production builder for its surface
-(loop list, planner list, advisor), but skips sessionless physical calls.
+(loop list and advisor), but skips sessionless physical calls.
 Production parity against
 real ``compose()`` turns is pinned in
 ``tests/integration/web/composer/test_boot_probe_production_parity.py``.
@@ -20,13 +20,7 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-from elspeth.web.composer.pipeline_planner import (
-    build_planner_request_kwargs,
-    planner_terminal_tool_definition,
-    planner_tool_definitions,
-)
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
-from elspeth.web.composer.recovery_controls import recovery_tool_definitions
 from elspeth.web.config import WebSettings
 
 _PROBE_PROMPT = "This is a composer boot-time configuration smoke test. Please reply with ok."
@@ -64,7 +58,6 @@ def test_requests_cover_every_surface_in_send_order(settings_factory: Any) -> No
 
     assert [(request.surface, request.role, request.model) for request in requests] == [
         ("loop_tools", "planner", "gpt-5.5"),
-        ("planner_tools", "planner", "gpt-5.5"),
         ("advisor", "advisor", "anthropic/claude-sonnet-4-6"),
     ]
 
@@ -76,20 +69,6 @@ def test_loop_request_sends_the_exact_compose_loop_tool_list(settings_factory: A
     assert request.to_litellm_kwargs()["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
     assert request.tool_count == 46
     assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, 46)
-
-
-def test_planner_request_sends_the_planner_tool_list_with_the_planner_token_cap(settings_factory: Any) -> None:
-    settings = settings_factory(composer_model="gpt-5.5", composer_planner_max_completion_tokens=9000)
-    request = _request(settings, "planner_tools")
-    planner_tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-
-    assert request.to_litellm_kwargs()["tools"] == planner_tools
-    assert request.to_litellm_kwargs()["max_tokens"] == 9000
-    assert request.to_litellm_kwargs()["num_retries"] == 0
-    assert request.to_litellm_kwargs()["max_retries"] == 0
-    assert request.tool_count == len(planner_tools)
-    assert "emit_pipeline_proposal" in {tool["function"]["name"] for tool in planner_tools}
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (0, 0, len(planner_tools))
 
 
 def test_strict_counts_are_computed_from_the_sent_tools(settings_factory: Any) -> None:
@@ -117,11 +96,13 @@ def test_loop_request_on_a_forwarding_route_sends_the_stamped_loop_list(settings
     assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (36, 10, 0)
 
 
-def test_planner_request_on_a_forwarding_route_sends_the_stamped_planner_list(settings_factory: Any) -> None:
-    request = _request(settings_factory(composer_model=_OPENROUTER_PLANNER), "planner_tools")
-
-    assert request.to_litellm_kwargs()["tools"] == planner_tool_definitions(dialect=ToolContractDialect.OPENAI_STRICT)
-    assert (request.strict_true_count, request.strict_false_count, request.strict_key_omitted) == (23, 1, 0)
+def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: Any) -> None:
+    # Retain the live builder's route/configuration controls under the original
+    # native test name. The only request descriptions are now loop and advisor.
+    for advisor in ("anthropic/claude-sonnet-4-6", "probe-model"):
+        requests = bp.build_composer_probe_requests(settings_factory(composer_model=_OPENROUTER_PLANNER, composer_advisor_model=advisor))
+        assert [request.surface for request in requests] == ["loop_tools", "advisor"]
+        assert requests[1].model == advisor
 
 
 def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -> None:
@@ -137,60 +118,6 @@ def test_strict_counts_are_computed_from_a_stamped_list(settings_factory: Any) -
     assert (mutated.strict_true_count, mutated.strict_false_count, mutated.strict_key_omitted) == (35, 11, 0)
 
 
-def test_requests_include_hatch_terminal_on_a_forwarding_hatch(settings_factory: Any) -> None:
-    """D9 / ruling 1: the hatch route's terminal, sent as a 16-token rejection check to the advisor's endpoint.
-
-    Control: build it with the planner token cap and the ``max_tokens``
-    assertion goes red.
-    """
-    settings = settings_factory(
-        composer_model="gpt-5.5",
-        composer_discovery_reasoning_effort="low",
-        composer_candidate_reasoning_effort="high",
-        composer_advisor_endpoint_base_url="https://openrouter.ai/api/v1",
-        composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
-    )
-    requests = bp.build_composer_probe_requests(settings)
-
-    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-    hatch = requests[2]
-    kwargs = hatch.to_litellm_kwargs()
-    assert (hatch.role, hatch.model) == ("planner", "openrouter/z-ai/glm-5.3")
-    assert kwargs["model"] == "openrouter/z-ai/glm-5.3"
-    assert kwargs["tools"] == [
-        *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
-        planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
-    ]
-    assert kwargs["tools"][-1]["function"]["strict"] is False
-    assert kwargs["max_tokens"] == bp.LOOP_PROBE_MAX_TOKENS == 16
-    assert kwargs["api_base"] == "https://openrouter.ai/api/v1"
-    assert kwargs["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
-    assert "api_base" not in requests[1].kwargs
-    expected = build_planner_request_kwargs(
-        model="openrouter/z-ai/glm-5.3",
-        messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=[
-            *recovery_tool_definitions(ToolContractDialect.OPENAI_STRICT),
-            planner_terminal_tool_definition(dialect=ToolContractDialect.OPENAI_STRICT),
-        ],
-        max_completion_tokens=settings.composer_planner_max_completion_tokens,
-        temperature=settings.composer_temperature,
-        seed=settings.composer_seed,
-        reasoning_effort="high",
-        api_base="https://openrouter.ai/api/v1",
-        api_key="advisor-bearer-token",  # secret-scan: allow-this-line
-    )
-    expected["max_tokens"] = bp.LOOP_PROBE_MAX_TOKENS
-    assert kwargs == expected
-    assert (hatch.strict_true_count, hatch.strict_false_count, hatch.strict_key_omitted) == (2, 1, 0)
-
-
-def test_no_hatch_terminal_when_the_hatch_route_resolves_none(settings_factory: Any) -> None:
-    for advisor in ("anthropic/claude-sonnet-4-6", "probe-model"):
-        requests = bp.build_composer_probe_requests(settings_factory(composer_model=_OPENROUTER_PLANNER, composer_advisor_model=advisor))
-        assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
-
-
 def test_probe_env_defaults_to_the_process_environment_the_service_resolves_against(
     monkeypatch: pytest.MonkeyPatch, settings_factory: Any
 ) -> None:
@@ -198,7 +125,7 @@ def test_probe_env_defaults_to_the_process_environment_the_service_resolves_agai
 
     ``OPENROUTER_API_BASE`` pointing at a proxy makes both OpenRouter routes
     resolve to ``none``, so the probe sends no ``strict`` key and no
-    ``hatch_terminal``. The explicit ``env={}`` build is the in-test contrast:
+    retired surfaces. The explicit ``env={}`` build is the in-test contrast:
     the same settings without the variable send the stamped lists, so the
     variable is what decides the outcome. Control: default the probe's
     ``env`` to ``{}`` and this test goes red.
@@ -208,19 +135,17 @@ def test_probe_env_defaults_to_the_process_environment_the_service_resolves_agai
 
     requests = bp.build_composer_probe_requests(settings)
 
-    assert [request.surface for request in requests] == ["loop_tools", "planner_tools", "advisor"]
-    loop, planner = requests[0], requests[1]
+    assert [request.surface for request in requests] == ["loop_tools", "advisor"]
+    loop = requests[0]
     assert (loop.strict_true_count, loop.strict_false_count, loop.strict_key_omitted) == (0, 0, 46)
-    assert (planner.strict_true_count, planner.strict_false_count, planner.strict_key_omitted) == (0, 0, 24)
 
     contrast = bp.build_composer_probe_requests(settings, env={})
-    assert [request.surface for request in contrast] == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
+    assert [request.surface for request in contrast] == ["loop_tools", "advisor"]
     assert contrast[0].strict_true_count == 36
-    assert contrast[1].strict_true_count == 23
 
 
-def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_factory: Any) -> None:
-    """The loop sends discovery effort (``_call_llm``); the planner request sends candidate effort."""
+def test_loop_request_uses_discovery_reasoning_effort(settings_factory: Any) -> None:
+    """The loop sends discovery effort even when the other configured effort differs."""
     settings = settings_factory(
         composer_model="anthropic/claude-sonnet-4-6",
         composer_discovery_reasoning_effort="low",
@@ -228,31 +153,6 @@ def test_loop_and_planner_requests_use_their_own_reasoning_efforts(settings_fact
     )
 
     assert _request(settings, "loop_tools").to_litellm_kwargs()["reasoning_effort"] == "low"
-    assert _request(settings, "planner_tools").to_litellm_kwargs()["reasoning_effort"] == "high"
-
-
-def test_planner_request_is_the_planner_builder_output(settings_factory: Any) -> None:
-    settings = settings_factory(
-        composer_model="openrouter/deepseek/deepseek-v4.1-flash",
-        composer_temperature=0.3,
-        composer_seed=11,
-        composer_candidate_reasoning_effort="medium",
-        composer_endpoint_base_url="https://gateway.example.test/v1",
-        composer_endpoint_api_key="probe-bearer-token",  # secret-scan: allow-this-line
-    )
-    expected = build_planner_request_kwargs(
-        model="openrouter/deepseek/deepseek-v4.1-flash",
-        messages=[{"role": "user", "content": _PROBE_PROMPT}],
-        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
-        max_completion_tokens=settings.composer_planner_max_completion_tokens,
-        temperature=0.3,
-        seed=11,
-        reasoning_effort="medium",
-        api_base="https://gateway.example.test/v1",
-        api_key="probe-bearer-token",  # secret-scan: allow-this-line
-    )
-
-    assert _request(settings, "planner_tools").to_litellm_kwargs() == expected
 
 
 def test_advisor_request_uses_production_request_options(settings_factory: Any) -> None:
@@ -287,17 +187,12 @@ def test_advisor_request_uses_production_request_options(settings_factory: Any) 
 def test_anthropic_routes_mirror_the_production_cache_markers(settings_factory: Any) -> None:
     settings = settings_factory(composer_model="anthropic/claude-sonnet-4-6")
     loop = _request(settings, "loop_tools")
-    planner = _request(settings, "planner_tools")
     loop_messages, loop_tools = apply_anthropic_cache_markers(
         [{"role": "user", "content": _PROBE_PROMPT}], composer_loop_tool_definitions(ToolContractDialect.NONE), mark_history_tail=True
-    )
-    planner_messages, planner_tools = apply_anthropic_cache_markers(
-        [{"role": "user", "content": _PROBE_PROMPT}], planner_tool_definitions(dialect=ToolContractDialect.NONE)
     )
 
     assert "cache_control" in loop.to_litellm_kwargs()["tools"][-1]
     assert (loop.to_litellm_kwargs()["messages"], loop.to_litellm_kwargs()["tools"]) == (loop_messages, loop_tools)
-    assert (planner.to_litellm_kwargs()["messages"], planner.to_litellm_kwargs()["tools"]) == (planner_messages, planner_tools)
 
 
 def test_request_repr_never_carries_the_endpoint_key(settings_factory: Any) -> None:
@@ -314,7 +209,7 @@ def test_request_repr_never_carries_the_endpoint_key(settings_factory: Any) -> N
 # --- endpoints ----------------------------------------------------------------
 
 
-def test_planner_surfaces_use_the_primary_endpoint_and_the_advisor_its_own(settings_factory: Any) -> None:
+def test_live_surfaces_use_their_respective_endpoints(settings_factory: Any) -> None:
     settings = settings_factory(
         composer_model="gpt-5.5",
         composer_endpoint_base_url="https://primary-gateway.example.test/v1",
@@ -324,11 +219,10 @@ def test_planner_surfaces_use_the_primary_endpoint_and_the_advisor_its_own(setti
         composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
         composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
     )
-    loop, planner, advisor = bp.build_composer_probe_requests(settings)
+    loop, advisor = bp.build_composer_probe_requests(settings)
 
-    for request in (loop, planner):
-        assert request.to_litellm_kwargs()["api_base"] == "https://primary-gateway.example.test/v1"
-        assert request.to_litellm_kwargs()["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+    assert loop.to_litellm_kwargs()["api_base"] == "https://primary-gateway.example.test/v1"
+    assert loop.to_litellm_kwargs()["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
     assert advisor.to_litellm_kwargs()["api_base"] == "https://advisor-gateway.example.test/v1"
     assert advisor.to_litellm_kwargs()["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
 
@@ -350,7 +244,7 @@ def test_pinned_thinking_budget_matches_the_installed_litellm() -> None:
     assert bp.ANTHROPIC_MIN_THINKING_BUDGET_TOKENS == ANTHROPIC_MIN_THINKING_BUDGET_TOKENS == 1024
     thinking = AnthropicThinkingParam(type="enabled", budget_tokens=1024)
     # The behaviour the flag relies on: a 16-token cap drops thinking, the
-    # planner's cap keeps it.
+    # normal production cap keeps it; that former planner probe is retired.
     assert AnthropicConfig.cap_thinking_budget_to_max_tokens(thinking, bp.LOOP_PROBE_MAX_TOKENS) is None
     assert AnthropicConfig.cap_thinking_budget_to_max_tokens(thinking, 16_384) is not None
 
@@ -373,7 +267,6 @@ def test_thinking_route_flag_follows_the_sent_request(settings_factory: Any, mod
 
     assert ("reasoning_effort" in _request(settings, "loop_tools").kwargs) is not model.startswith(("openrouter/", "gpt-"))
     assert _request(settings, "loop_tools").thinking_route_unproven is loop_unproven
-    assert _request(settings, "planner_tools").thinking_route_unproven is False
 
 
 def test_thinking_route_flag_is_off_when_reasoning_is_off(settings_factory: Any) -> None:
@@ -388,7 +281,7 @@ def test_thinking_route_flag_is_off_when_reasoning_is_off(settings_factory: Any)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["required", "debug-when-unconfigured"])
-@pytest.mark.parametrize("surface", ["loop_tools", "planner_tools", "hatch_terminal", "advisor"])
+@pytest.mark.parametrize("surface", ["loop_tools", "advisor"])
 async def test_sessionless_probe_is_not_qualified_and_never_dispatches(
     monkeypatch: pytest.MonkeyPatch, settings_factory: Any, mode: str, surface: str
 ) -> None:

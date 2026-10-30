@@ -5293,7 +5293,9 @@ def web(
         )
         raise typer.Exit(1) from None
 
-    uvicorn.run(
+    from elspeth.web.composer_server import run_composer_server
+
+    config = uvicorn.Config(
         "elspeth.web.app:create_app",
         host=host,
         port=port,
@@ -5303,6 +5305,7 @@ def web(
         proxy_headers=bool(trusted_proxy_hosts),
         forwarded_allow_ips=list(trusted_proxy_hosts),
     )
+    run_composer_server(config)
 
 
 if __name__ == "__main__":

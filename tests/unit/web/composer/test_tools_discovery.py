@@ -15,7 +15,6 @@ from elspeth.plugins.infrastructure.manager import PluginManager, PluginNotFound
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
@@ -280,9 +279,6 @@ def _assert_discovery_refusal(
     assert wire["success"] is False and wire["version"] == state.version
     assert wire["validation"]["errors"][0]["error_code"] == code
     assert not {"data", "plugin_schemas", "validation_guidance", "prior_validation", "validation_delta"} & wire.keys()
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert len(feedback) == 1 and feedback[0]["error_code"] == code
-    assert feedback[0]["component"] == "rejected_mutation" and "detail" not in feedback[0]
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch", "readonly"])
@@ -451,7 +447,7 @@ def test_discovery_invalid_arguments_remain_typed_before_requested_access(
     assert calls == []
 
 
-def test_discovery_feedback_excludes_private_saved_diagnostics_but_authenticated_raw_keeps_them() -> None:
+def test_discovery_redaction_excludes_private_saved_diagnostics_but_authenticated_raw_keeps_them() -> None:
     state, context = _saved_state(), _context()
     canary = "PRIVATE-DISCOVERY-SAVED-ROUTE-CANARY"
     source = state.sources["source"]
@@ -461,9 +457,6 @@ def test_discovery_feedback_excludes_private_saved_diagnostics_but_authenticated
     assert any(entry.component == "source" and canary in entry.message for entry in result.validation.warnings)
     raw = serialize_admitted_discovery_result(admit_discovery_result("diff_pipeline", result))
     assert canary in raw
-    feedback = _allowlisted_candidate_feedback(result)
-    assert canary not in repr(feedback)
-    assert len(feedback["validation"]["errors"]) == 1 and "detail" not in feedback["validation"]["errors"][0]
     redacted = redact_tool_call_response("diff_pipeline", result.to_dict(), telemetry=NoopRedactionTelemetry())
     assert canary not in repr(redacted)
 

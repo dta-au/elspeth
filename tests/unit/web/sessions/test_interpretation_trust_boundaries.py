@@ -31,6 +31,7 @@ from elspeth.web.sessions.protocol import (
     SessionPendingInterpretationCommand,
     SessionPendingInterpretationSnapshot,
 )
+from tests.helpers.composition_state import default_pipeline_metadata
 
 
 def _llm_node(options: dict[str, object]) -> dict[str, object]:
@@ -50,7 +51,7 @@ def _state_record(nodes: list[dict[str, object]]) -> CompositionStateRecord:
         nodes=nodes,
         edges=None,
         outputs=None,
-        metadata_=None,
+        metadata_=default_pipeline_metadata(),
         is_valid=True,
         validation_errors=None,
         created_at=datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC),

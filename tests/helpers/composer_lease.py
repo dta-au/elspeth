@@ -168,14 +168,43 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
 
     async def run_one_turn(self, **kwargs):
         scripted_llm = kwargs.pop("llm", None)
+        scripted_sdk = kwargs.pop("sdk", None)
+        if scripted_llm is not None and scripted_sdk is not None:
+            raise ValueError("Choose either the legacy llm script or the physical sdk script")
 
         async def call(**kw):
+            if scripted_sdk is not None:
+                # Raw SDK scripts retain the actual gateway admission,
+                # physical custody, audit and settlement owners.
+                from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
+
+                binding = kw.pop("required_work", None)
+                provider = kw.pop("provider_owner", None)
+                actor = kw.pop("user_id", None)
+                if type(binding) is not RequiredWorkBinding or type(provider) is not ProviderInvocationOwner:
+                    raise ValueError("Physical SDK scripts require actual required-work and provider owners")
+                if provider.required_work is not binding or provider.service is not self._sessions_service:
+                    raise ValueError("Physical SDK script owners must retain their exact binding and session service")
+                actual_loop = self._compose_loop
+
+                async def owned_loop(message, *args, **loop_kwargs):
+                    assert loop_kwargs["session_id"] == kw["session_id"]
+                    assert loop_kwargs["session_operation_context"] is kw["session_operation_context"]
+                    binding.validate_context(loop_kwargs["session_operation_context"])
+                    assert "required_work" not in loop_kwargs and "provider_owner" not in loop_kwargs and "user_id" not in loop_kwargs
+                    with prompt_guard_user_scope(message):
+                        return await actual_loop(
+                            message, *args, **loop_kwargs, required_work=binding, provider_owner=provider, user_id=actor
+                        )
+
+                with patch("litellm.acompletion", new=scripted_sdk), patch.object(self, "_compose_loop", new=owned_loop):
+                    return await real_turn(self, **kw)
             if scripted_llm is None:
                 return await real_turn(self, **kw)
             with patch.object(self._provider_gateway, "_call_llm", new=scripted_llm):
                 return await real_turn(self, **kw)
 
-        return await _with_lease(self, kwargs.get("session_id"), kwargs, call)
+        return await _with_lease(self, kwargs.get("session_id"), kwargs, call, bind_provider_owner=scripted_sdk is not None)
 
     monkeypatch.setattr(ComposerServiceImpl, "compose", compose)
     monkeypatch.setattr(ComposerServiceImpl, "_run_one_turn_for_test", run_one_turn)

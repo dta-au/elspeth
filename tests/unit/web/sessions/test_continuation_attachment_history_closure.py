@@ -60,6 +60,7 @@ async def test_current_attachment_root_retains_complete_application_and_cache_hi
                     session_id=selected.stack.logical.session_id,
                     operation_id=selected.stack.logical.operation_id,
                     env_ref_names=latest["inventory"].names,
+                    source_chunks=(*arguments["selected"].chunks, *cold.source.admitted_evidence.dependency_chunks),
                 )
                 assert len(history.applications) == 1 and history.applications[0] == applied.application
                 changed = encode_attachment_history(

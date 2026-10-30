@@ -303,25 +303,6 @@ async def test_gateway_terminal_paths_keep_the_preawait_context(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_planner_context_matches_each_ordered_request_including_feedback(tmp_path, tool_context) -> None:
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    completion = _ScriptedCompletion(
-        _response(("list_sources", {})), _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
-    )
-    recorder = BufferingRecorder()
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
-    assert len(recorder.llm_calls) == len(completion.requests) == 2
-    for call, request in zip(recorder.llm_calls, completion.requests, strict=True):
-        assert call.private_request is not None
-        assert call.private_request.disposition == "retained"
-        context = json.loads(call.private_request.canonical)
-        assert context["messages"] == request["messages"]
-        assert context["tools"] == request["tools"]
-    assert recorder.llm_calls[0].private_request != recorder.llm_calls[1].private_request
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["primary", "text", "advisor"])
 async def test_real_rendered_composer_prompt_is_reconstructable_on_covered_surfaces(
     tmp_path, monkeypatch, surface, private_writer, test_client

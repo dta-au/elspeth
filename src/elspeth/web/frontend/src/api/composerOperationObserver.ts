@@ -1,13 +1,15 @@
 import * as api from "./client";
 import { currentAuthGeneration, isCurrentAuthGeneration } from "./authSession";
 import { ComposerSseDecoder, validateComposerRecoveryBody, decodeComposerOperationFrame } from "./composerOperationDecoder";
-import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, composerStopRequested, requestComposerStop, attachComposerObserver, clearComposerSessionCustody, composerCustodyScope, findComposerOperationCustody, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
+import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, composerProtocolVersion, composerStopRequested, requestComposerStop, attachComposerObserver, clearComposerSessionCustody, composerCustodyScope, findComposerOperationCustody, recordComposerProtocolVersion, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
+import { detachComposerObserversV2, observeComposerOperationV2, wakeComposerObserverV2 } from "./composerOperationObserverV2";
+import { composerAdmissionVersion } from "@/config/composerProtocol";
 import { COMPOSE_CLIENT_GRACE_MS, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
 import type { ApiError, ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
-import type { OperationCustody, SubmittedCustody } from "@/types/composerOperations";
+import type { ComposerOperationStatusV2, OperationCustody, SubmittedCustody } from "@/types/composerOperations";
 
-export class ComposerObservationDetached extends Error { constructor() { super("Composer observation detached; the durable action remains pending"); this.name = "ComposerObservationDetached"; } }
-export class ComposerSessionMissing extends Error { constructor() { super("Session not found"); this.name = "ComposerSessionMissing"; } }
+import { ComposerObservationDetached, ComposerSessionMissing } from "./composerObserverErrors";
+export { ComposerObservationDetached, ComposerSessionMissing };
 /** The winner's authenticated terminal is separate from the refused submission. */
 export class ComposerActiveAttachment extends Error {
   constructor(readonly terminal: { status: "completed"; result: MessageWithStateResponse } | { status: "failed"; error: ApiError }) {
@@ -15,7 +17,7 @@ export class ComposerActiveAttachment extends Error {
     this.name = "ComposerActiveAttachment";
   }
 }
-interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; timeout?: () => void; reconciliationOnly?: boolean }
+interface ObserverOptions { signal?: AbortSignal; current?: () => boolean; progress?: (snapshot: ComposerProgressSnapshot) => void; timeout?: () => void; reconciliationOnly?: boolean; status?: (status: ComposerOperationStatusV2) => void; interrupted?: (interrupted: boolean) => void; stopUnconfirmed?: (unconfirmed: boolean) => void; stopUnavailable?: () => void }
 interface ObserverOwner { generation: number; descriptor: OperationCustody; controller: AbortController; stop: boolean; stopRequested: boolean; stopTarget: OperationCustody | null }
 const owners = new Map<string, ObserverOwner>();
 function replayAgeEligible(descriptor: OperationCustody): boolean {
@@ -33,6 +35,12 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 export function detachComposerObservers(sessionId?: string): void {
   for (const owner of owners.values()) if (sessionId === undefined || owner.descriptor.sessionId === sessionId) owner.controller.abort();
+  detachComposerObserversV2(sessionId);
+}
+/** v2 observation that hands a lifecycle-1 answer back to this (v1) observer. */
+function observeV2(descriptor: OperationCustody, options: ObserverOptions): Promise<MessageWithStateResponse> {
+  const { submit: _submit, ...rest } = options as ObserverOptions & { submit?: boolean };
+  return observeComposerOperationV2(descriptor, { ...rest, handBackToV1: (v1) => observeComposerOperation(v1, rest) });
 }
 export function cancelObservedComposerOperation(sessionId: string): boolean {
   const scope = composerCustodyScope();
@@ -45,6 +53,12 @@ export function cancelObservedComposerOperation(sessionId: string): boolean {
   for (const target of targets.values()) {
     const owner = [...owners.values()].find((item) => !item.controller.signal.aborted && isCurrentAuthGeneration(item.generation) && item.descriptor.operationId === target.operationId && item.descriptor.sessionId === sessionId && samePrincipal(item.descriptor.scope, scope));
     requestComposerStop(target);
+    if (composerProtocolVersion(target) === 2) {
+      // The v2 observer re-sends Stop until the server acknowledges it.
+      wakeComposerObserverV2(sessionId, target.operationId);
+      void api.cancelComposerOperationV2(sessionId, target.operationId).catch(() => undefined);
+      continue;
+    }
     if (owner !== undefined) { owner.stop = true; owner.stopRequested = true; owner.stopTarget = target; }
     else allObserved = false;
     // Only durable terminal establishes settlement. Capture each held target,
@@ -54,10 +68,15 @@ export function cancelObservedComposerOperation(sessionId: string): boolean {
   return allObserved;
 }
 export async function submitAndObserveComposerOperation(descriptor: SubmittedCustody, options: ObserverOptions = {}): Promise<MessageWithStateResponse> {
-  const admitted = acquireComposerOperationCustody(descriptor);
+  // Every compose submission (freeform and tutorial alike) passes through here,
+  // so this is the one place a new submission's version is chosen: the
+  // server-advertised admission version. A v1 descriptor carries no field.
+  const requested = descriptor.protocolVersion ?? composerAdmissionVersion();
+  const admitted = acquireComposerOperationCustody(requested === 2 ? { ...descriptor, protocolVersion: 2 } : descriptor);
   return observeComposerOperation(admitted, { ...options, submit: true });
 }
 export async function observeComposerOperation(initial: OperationCustody, options: ObserverOptions & { submit?: boolean } = {}): Promise<MessageWithStateResponse> {
+  if (composerProtocolVersion(initial) === 2 && options.submit !== true) return observeV2(initial, options);
   const generation = currentAuthGeneration();
   const owner: ObserverOwner = { generation, descriptor: initial, controller: new AbortController(), stop: composerStopRequested(initial), stopRequested: composerStopRequested(initial), stopTarget: composerStopRequested(initial) ? initial : null };
   const key = ownerKey(initial);
@@ -80,6 +99,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
   // retire the original immutable body.
   let ambiguous = initial.mode === "submitted" && options.submit !== true;
   let shouldSubmit = options.submit === true;
+  let delegateToV2 = false;
   let streamAttempted = false;
   let backoff = 1000;
   let observationDeadline = Number.POSITIVE_INFINITY;
@@ -108,6 +128,11 @@ export async function observeComposerOperation(initial: OperationCustody, option
           check();
           if (ack.operation_id !== owner.descriptor.operationId || ack.kind !== owner.descriptor.kind) throw new Error("Composer acknowledgement identity mismatch");
           ambiguous = false;
+          // Custody records the version the server echoed (a missing echo is 1).
+          const echoed = ack.protocolVersion ?? 1;
+          if (echoed !== composerProtocolVersion(owner.descriptor)) owner.descriptor = recordComposerProtocolVersion(owner.descriptor, echoed);
+          // Delegate after the admission boundary, so observation errors are never read as admission errors.
+          delegateToV2 = echoed === 2;
         } catch (error) {
           check();
           const active = api.composerActiveOperation(error);
@@ -123,6 +148,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
           }
         }
       }
+      if (delegateToV2) return await observeV2(owner.descriptor, options);
       check();
       if (owner.stop) {
         try {
@@ -180,6 +206,11 @@ export async function observeComposerOperation(initial: OperationCustody, option
         await sleep(Math.max(100, Math.min(snapshot.poll_after_ms, 60000)), owner.controller.signal);
       } catch (error) {
         check();
+        if (isVersionRequired(error) && !durableTerminal) {
+          // The attached (or restored) operation is lifecycle 2: read it as v2.
+          owner.descriptor = recordComposerProtocolVersion(owner.descriptor, 2);
+          return await delegateAttached(owner.descriptor, initial, options);
+        }
         if (durableTerminal || error instanceof ComposerSessionMissing || error instanceof ComposerActiveAttachment || api.isDefinitiveComposerRefusal(error)) throw error;
         // Decode/transport/GET outages preserve pending custody and retry under
         // the same generation. They do not fail or replay an observed action.
@@ -191,6 +222,20 @@ export async function observeComposerOperation(initial: OperationCustody, option
     options.signal?.removeEventListener("abort", abort);
     if (owners.get(key) === owner) owners.delete(key);
   }
+}
+function isVersionRequired(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "error_type" in error && error.error_type === "composer_operation_version_required";
+}
+/** A v2 operation observed on behalf of a refused submission keeps the v1 "another action finished" contract. */
+async function delegateAttached(descriptor: OperationCustody, initial: OperationCustody, options: ObserverOptions): Promise<MessageWithStateResponse> {
+  if (!(descriptor.mode === "observer" && initial.mode === "submitted")) return observeV2(descriptor, options);
+  let result: MessageWithStateResponse;
+  try { result = await observeV2(descriptor, options); }
+  catch (error) {
+    if (typeof error === "object" && error !== null && "composer_operation" in error) throw new ComposerActiveAttachment({ status: "failed", error: error as ApiError });
+    throw error;
+  }
+  throw new ComposerActiveAttachment({ status: "completed", result });
 }
 async function readStream(owner: ObserverOwner, current: () => boolean, tightenDeadline: (remainingMs: number) => void, progress?: (snapshot: ComposerProgressSnapshot) => void): Promise<void> {
   const controller = new AbortController();

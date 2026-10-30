@@ -34,7 +34,7 @@ async def test_runtime_source_retains_its_actual_validated_evidence_and_rejects_
             selected=arguments["selected"],
             inventory=arguments["inventory"],
         )
-        assert len(observed) == 1 and result.evidence is observed[0]
+        assert len(observed) == 1 and result.evidence is observed[0].snapshot
         assert result.selected is arguments["selected"]
         assert recovery_rows(operation_store[0]) == before
         another = replace(running)

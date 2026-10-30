@@ -90,7 +90,7 @@ GRAMMARS = {
     "_handle_convergence_error": "8032fa7144f05421b9d59d93be654a0e800bb6090b8307f374c34296c99f45be",
     "_handle_plugin_crash": "c0345259ed743d014249dfc660177a0f614e7d48572bd85107b2dbf1cc33aa25",
     "_handle_runtime_preflight_failure": "fd3578fce1748f626a5c0e09fab7f7f60f15c1e8ee0e8c950f580c378f553865",
-    "_run_composer_turn": "bfe1cbd9a1de4f2911c12bc1a033de2f38e6e20dc3f0c00bdfb942da910bc31b",
+    "_run_composer_turn": "b3bef80cd134df318bf1ec528478f783c3f3dfd82f9d6b49a679a5930a2194b9",
 }
 IMPORT_GRAMMARS = {
     "src/elspeth/web/sessions/routes/_helpers.py|elspeth.web.required_work": "24c410aedf7d87072b30e0483a70191b9729d6d67166d1ef15b55ff0013b5199",

@@ -408,6 +408,7 @@ from elspeth.web.sessions.protocol import (
     TransitionResponseSettlement,
     TrustModeAutoCommitRevokedError,
     decode_stored_composition_validation_errors,
+    require_stored_state_metadata,
     serialize_composition_validation_errors,
 )
 from elspeth.web.sessions.protocol import (
@@ -429,12 +430,16 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.state import CompositionState, ValidationSummary
     from elspeth.web.execution.envelope import RunExecutionInput
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-    from elspeth.web.sessions.continuation import ContinuationOwnerCommit, StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement, StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
+    from elspeth.web.sessions.continuation_p4 import P4WriterObservation
+    from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure, ContinuationFailureObservation
 
 
 # Process-wide SQLite session-write lock registry.
@@ -670,6 +675,29 @@ def _refuse_unrecorded_quota_exceeded(outcome: QuotaExceeded) -> None:
 
 class ComposerTerminalSQLCompletionUnknown(AuditIntegrityError):
     """The SQL worker completion witness is unavailable; settlement must wait."""
+
+
+class ComposerP4SQLCompletionUnknown(ComposerTerminalSQLCompletionUnknown):
+    def __init__(self, observation: P4WriterObservation) -> None:
+        self.observation = observation
+        super().__init__("P4 transaction outcome lacks its actual verified durable readback")
+
+
+class ComposerToolFailureSQLCompletionUnknown(ComposerTerminalSQLCompletionUnknown):
+    """Retain actual failed-terminal candidates and physical/native custody."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        observation: ContinuationFailureObservation | None,
+        prepared_candidates: tuple[PreparedSegmentSettlement, ...],
+        ticket: RequiredWorkTicket | None,
+        custody: ContinuationToolFailureCustody | None,
+    ) -> None:
+        self.observation, self.prepared_candidates = observation, prepared_candidates
+        self.ticket, self.custody = ticket, custody
+        super().__init__(message)
 
 
 class ComposerRequiredAuditPersistenceError(AuditIntegrityError):
@@ -1045,7 +1073,13 @@ class SessionServiceImpl:
     @contextlib.contextmanager
     def _session_process_locked_begin(self, session_id: str) -> Iterator[Connection]:
         """Acquire SQLite process exclusion before opening the DB transaction."""
-        with process_session_lock(self._engine, session_id), self._engine.begin() as conn:
+        from elspeth.web.sessions.locking import continuation_connection_deadline_scope
+
+        with (
+            process_session_lock(self._engine, session_id),
+            self._engine.begin() as conn,
+            continuation_connection_deadline_scope(conn, session_id),
+        ):
             yield conn
 
     @contextlib.contextmanager
@@ -1799,6 +1833,7 @@ class SessionServiceImpl:
         state = prepare_content_publication(
             state, session_id=UUID(session_id), state_id=UUID(allocated_state_id), state_version=int(next_version)
         )
+        require_stored_state_metadata(state, state_id=allocated_state_id)
         conn.execute(
             insert(composition_states_table).values(
                 id=allocated_state_id,
@@ -1906,6 +1941,7 @@ class SessionServiceImpl:
         continuation: ContinuationOwnerCommit | None = None,
         continuation_prepared: PreparedP4Value | None = None,
         continuation_env_ref_names: frozenset[str] = frozenset(),
+        continuation_observation: P4WriterObservation | None = None,
     ) -> AuditOutcome:
         """Synchronous, single-transaction persistence of one compose turn.
 
@@ -1964,6 +2000,20 @@ class SessionServiceImpl:
 
         if (continuation is None) != (continuation_prepared is None):
             raise AuditIntegrityError("continuation P4 requires both actual commit and complete prepared input")
+        if continuation is not None and continuation_prepared is not None:
+            from elspeth.web.sessions.continuation_p4 import P4WriterObservation
+
+            if continuation_observation is None:
+                continuation_observation = P4WriterObservation(continuation, continuation_prepared)
+            elif (
+                type(continuation_observation) is not P4WriterObservation
+                or continuation_observation.commit is not continuation
+                or continuation_observation.prepared is not continuation_prepared
+                or continuation_observation.candidate is not None
+            ):
+                raise AuditIntegrityError("P4 writer observation replaced its actual original owner/input")
+        elif continuation_observation is not None:
+            raise AuditIntegrityError("ordinary P4 cannot accept a continuation writer observation")
         if continuation is None and continuation_env_ref_names:
             raise AuditIntegrityError("ordinary P4 cannot receive continuation metadata")
         continuation_members = None
@@ -2091,305 +2141,314 @@ class SessionServiceImpl:
         # ``IntegrityError`` -- not ``Exception``, not ``SQLAlchemyError``
         # -- because only constraint violations belong on this counter.
         try:
-            with self._session_process_locked_begin(session_id) as conn:
-                with (
-                    self._session_write_lock(conn, session_id),
-                    selected_p4_drain_scope(conn, continuation, continuation_prepared, env_ref_names=continuation_env_ref_names),
-                    self._session_composer_mutation_transaction(
+            with (
+                self._session_process_locked_begin(session_id) as conn,
+                self._session_write_lock(conn, session_id),
+                selected_p4_drain_scope(conn, continuation, continuation_prepared, env_ref_names=continuation_env_ref_names),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
+                if continuation is not None:
+                    from elspeth.web.sessions.continuation_p4 import require_selected_p4_input
+
+                    if continuation_prepared is None or writer_principal != "compose_loop":
+                        raise AuditIntegrityError("continuation P4 lost its real prepared input/principal")
+                    require_selected_p4_input(
                         conn,
-                        session_id=session_id,
-                        session_operation_context=session_operation_context,
-                        expected_kind=SessionOperationKind.COMPOSE,
-                    ),
-                ):
-                    if continuation is not None:
-                        from elspeth.web.sessions.continuation_p4 import require_selected_p4_input
-
-                        if continuation_prepared is None or writer_principal != "compose_loop":
-                            raise AuditIntegrityError("continuation P4 lost its real prepared input/principal")
-                        require_selected_p4_input(
-                            conn,
-                            continuation,
-                            prepared=continuation_prepared,
-                            context=session_operation_context,
-                            assistant_content=assistant_content,
-                            raw_content=raw_content,
-                            redacted_assistant_tool_calls=redacted_assistant_tool_calls,
-                            redacted_tool_rows=redacted_tool_rows,
-                            revoked_tool_rows=revoked_tool_rows,
-                            mutation_ceiling=mutation_ceiling,
-                            authority_revocation=authority_revocation,
-                            private_tool_evidence=private_tool_evidence,
-                            private_tool_failures=private_tool_failures,
-                            rejection_records=rejection_records,
-                            parent_composition_state_id=parent_composition_state_id,
-                            expected_current_state_id=expected_current_state_id,
-                            plugin_crash_pending=plugin_crash_pending,
-                            env_ref_names=continuation_env_ref_names,
-                        )
-                    # B5: if a parent
-                    # composition state is supplied, it MUST belong to this
-                    # session.
-                    if parent_composition_state_id is not None:
-                        _assert_state_in_session(
-                            conn,
-                            state_id=parent_composition_state_id,
-                            expected_session_id=session_id,
-                            caller="persist_compose_turn",
-                        )
-
-                    current_state_id = conn.execute(
-                        select(composition_states_table.c.id)
-                        .where(composition_states_table.c.session_id == session_id)
-                        .order_by(composition_states_table.c.version.desc())
-                        .limit(1)
-                    ).scalar_one_or_none()
-                    if current_state_id != expected_current_state_id:
-                        raise StaleComposeStateError(
-                            "persist_compose_turn: current composition state changed "
-                            f"for session_id={session_id!r}; "
-                            f"expected={expected_current_state_id!r}, "
-                            f"actual={current_state_id!r}. Refusing to persist a "
-                            "compose result based on a stale state."
-                        )
-
-                    graph_rows = tuple(row for row in redacted_tool_rows if row.composition_state_payload is not None)
-                    refused = authority_revocation
-                    if graph_rows:
-                        if mutation_ceiling is None:
-                            raise AuditIntegrityError("Auto graph checkpoint lost its request ceiling")
-                        locked_refusal = check_auto_mutation_on_connection(
-                            conn, context=session_operation_context, ceiling=mutation_ceiling
-                        )
-                        if refused is None:
-                            refused = locked_refusal
-                    published_tool_rows = revoked_tool_rows if refused is not None else redacted_tool_rows
-                    published_assistant_content = "" if refused is not None else assistant_content
-                    redacted_tool_rows = published_tool_rows
-                    assistant_content = published_assistant_content
-
-                    base_seq = self._reserve_sequence_range(
+                        continuation,
+                        prepared=continuation_prepared,
+                        context=session_operation_context,
+                        assistant_content=assistant_content,
+                        raw_content=raw_content,
+                        redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                        redacted_tool_rows=redacted_tool_rows,
+                        revoked_tool_rows=revoked_tool_rows,
+                        mutation_ceiling=mutation_ceiling,
+                        authority_revocation=authority_revocation,
+                        private_tool_evidence=private_tool_evidence,
+                        private_tool_failures=private_tool_failures,
+                        rejection_records=rejection_records,
+                        parent_composition_state_id=parent_composition_state_id,
+                        expected_current_state_id=expected_current_state_id,
+                        plugin_crash_pending=plugin_crash_pending,
+                        env_ref_names=continuation_env_ref_names,
+                    )
+                # B5: if a parent
+                # composition state is supplied, it MUST belong to this
+                # session.
+                if parent_composition_state_id is not None:
+                    _assert_state_in_session(
                         conn,
-                        session_id,
-                        count=1
-                        + 2 * len(redacted_tool_rows)
-                        + len(private_tool_failures)
-                        + (
-                            0
-                            if continuation_members is None
-                            else len(continuation_members.invocations) + len(continuation_members.withheld_replies)
-                        ),
+                        state_id=parent_composition_state_id,
+                        expected_session_id=session_id,
+                        caller="persist_compose_turn",
                     )
 
-                    assistant_id = self._insert_chat_message(
+                current_state_id = conn.execute(
+                    select(composition_states_table.c.id)
+                    .where(composition_states_table.c.session_id == session_id)
+                    .order_by(composition_states_table.c.version.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if current_state_id != expected_current_state_id:
+                    raise StaleComposeStateError(
+                        "persist_compose_turn: current composition state changed "
+                        f"for session_id={session_id!r}; "
+                        f"expected={expected_current_state_id!r}, "
+                        f"actual={current_state_id!r}. Refusing to persist a "
+                        "compose result based on a stale state."
+                    )
+
+                graph_rows = tuple(row for row in redacted_tool_rows if row.composition_state_payload is not None)
+                refused = authority_revocation
+                if graph_rows:
+                    if mutation_ceiling is None:
+                        raise AuditIntegrityError("Auto graph checkpoint lost its request ceiling")
+                    locked_refusal = check_auto_mutation_on_connection(conn, context=session_operation_context, ceiling=mutation_ceiling)
+                    if refused is None:
+                        refused = locked_refusal
+                published_tool_rows = revoked_tool_rows if refused is not None else redacted_tool_rows
+                published_assistant_content = "" if refused is not None else assistant_content
+                redacted_tool_rows = published_tool_rows
+                assistant_content = published_assistant_content
+
+                base_seq = self._reserve_sequence_range(
+                    conn,
+                    session_id,
+                    count=1
+                    + 2 * len(redacted_tool_rows)
+                    + len(private_tool_failures)
+                    + (
+                        0
+                        if continuation_members is None
+                        else len(continuation_members.invocations) + len(continuation_members.withheld_replies)
+                    ),
+                )
+
+                assistant_id = self._insert_chat_message(
+                    conn,
+                    session_id=session_id,
+                    role="assistant",
+                    content=assistant_content,
+                    # B2: raw_content captures pre-redaction LLM output.
+                    raw_content=raw_content,
+                    # ``deep_thaw`` recursively converts MappingProxyType /
+                    # tuple to JSON-serialisable dict / list (closes
+                    # P-L-4 / L18). Mirrors ``add_message``'s pattern.
+                    tool_calls=deep_thaw(redacted_assistant_tool_calls) if redacted_assistant_tool_calls else None,
+                    sequence_no=base_seq,
+                    writer_principal=writer_principal,
+                    composition_state_id=parent_composition_state_id,
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                    created_at=now,
+                    session_operation_context=session_operation_context,
+                )
+
+                inserted_state_ids: list[UUID] = []
+                for offset, tool_row in enumerate(redacted_tool_rows, start=1):
+                    state_id: str | None = None
+                    if tool_row.composition_state_payload is not None:
+                        payload = tool_row.composition_state_payload
+                        if payload.derived_from_state_id is None:
+                            # Re-derive lineage under the held session
+                            # write lock (spec §5.7.1): the async loop
+                            # cannot know predecessor ids for rows not
+                            # yet allocated, so it leaves lineage None
+                            # and this primitive fills in the verified
+                            # session head — the pre-turn state for the
+                            # first insert, then each previously
+                            # inserted revision of this turn
+                            # (elspeth-7536e5d919).
+                            payload = replace(payload, derived_from_state_id=current_state_id)
+                        state_id = self._insert_composition_checkpoint(
+                            conn,
+                            session_id=session_id,
+                            state=payload.data,
+                            derived_from_state_id=payload.derived_from_state_id,
+                            provenance="tool_call",
+                            created_at=now,
+                            session_operation_context=session_operation_context,
+                        )
+                        current_state_id = state_id
+                        inserted_state_ids.append(UUID(state_id))
+                    self._insert_chat_message(
                         conn,
                         session_id=session_id,
-                        role="assistant",
-                        content=assistant_content,
-                        # B2: raw_content captures pre-redaction LLM output.
-                        raw_content=raw_content,
-                        # ``deep_thaw`` recursively converts MappingProxyType /
-                        # tuple to JSON-serialisable dict / list (closes
-                        # P-L-4 / L18). Mirrors ``add_message``'s pattern.
-                        tool_calls=deep_thaw(redacted_assistant_tool_calls) if redacted_assistant_tool_calls else None,
-                        sequence_no=base_seq,
+                        role="tool",
+                        content=tool_row.content,
+                        raw_content=None,
+                        tool_calls=[tool_row.visible_event.with_parent(assistant_id).to_envelope()]
+                        if tool_row.visible_event is not None
+                        else None,
+                        sequence_no=base_seq + 2 * offset - 1,
                         writer_principal=writer_principal,
-                        composition_state_id=parent_composition_state_id,
+                        composition_state_id=state_id,
+                        tool_call_id=tool_row.tool_call_id,
+                        parent_assistant_id=assistant_id,
+                        created_at=now,
+                        session_operation_context=session_operation_context,
+                    )
+                    self._insert_chat_message(
+                        conn,
+                        session_id=session_id,
+                        role="audit",
+                        content="Private credential-filtered tool evidence",
+                        raw_content=None,
+                        tool_calls=[evidence_by_id[tool_row.tool_call_id].to_envelope()],
+                        sequence_no=base_seq + 2 * offset,
+                        writer_principal=writer_principal,
+                        composition_state_id=current_state_id,
                         tool_call_id=None,
                         parent_assistant_id=None,
                         created_at=now,
                         session_operation_context=session_operation_context,
                     )
-
-                    inserted_state_ids: list[UUID] = []
-                    for offset, tool_row in enumerate(redacted_tool_rows, start=1):
-                        state_id: str | None = None
-                        if tool_row.composition_state_payload is not None:
-                            payload = tool_row.composition_state_payload
-                            if payload.derived_from_state_id is None:
-                                # Re-derive lineage under the held session
-                                # write lock (spec §5.7.1): the async loop
-                                # cannot know predecessor ids for rows not
-                                # yet allocated, so it leaves lineage None
-                                # and this primitive fills in the verified
-                                # session head — the pre-turn state for the
-                                # first insert, then each previously
-                                # inserted revision of this turn
-                                # (elspeth-7536e5d919).
-                                payload = replace(payload, derived_from_state_id=current_state_id)
-                            state_id = self._insert_composition_checkpoint(
-                                conn,
-                                session_id=session_id,
-                                state=payload.data,
-                                derived_from_state_id=payload.derived_from_state_id,
-                                provenance="tool_call",
-                                created_at=now,
-                                session_operation_context=session_operation_context,
-                            )
-                            current_state_id = state_id
-                            inserted_state_ids.append(UUID(state_id))
-                        self._insert_chat_message(
+                    # elspeth-3e28029d2f: a refused mutation's reason
+                    # persists unredacted alongside its (redacted) tool
+                    # row, linked to the state CURRENT at rejection —
+                    # ``current_state_id`` at this iteration, since a
+                    # rejection commits no state of its own.
+                    for record in rejection_records:
+                        if record.tool_call_id != tool_row.tool_call_id:
+                            continue
+                        with self._session_mutations(
                             conn,
                             session_id=session_id,
-                            role="tool",
-                            content=tool_row.content,
-                            raw_content=None,
-                            tool_calls=[tool_row.visible_event.with_parent(assistant_id).to_envelope()]
-                            if tool_row.visible_event is not None
-                            else None,
-                            sequence_no=base_seq + 2 * offset - 1,
-                            writer_principal=writer_principal,
-                            composition_state_id=state_id,
-                            tool_call_id=tool_row.tool_call_id,
-                            parent_assistant_id=assistant_id,
-                            created_at=now,
                             session_operation_context=session_operation_context,
-                        )
-                        self._insert_chat_message(
-                            conn,
-                            session_id=session_id,
-                            role="audit",
-                            content="Private credential-filtered tool evidence",
-                            raw_content=None,
-                            tool_calls=[evidence_by_id[tool_row.tool_call_id].to_envelope()],
-                            sequence_no=base_seq + 2 * offset,
-                            writer_principal=writer_principal,
-                            composition_state_id=current_state_id,
-                            tool_call_id=None,
-                            parent_assistant_id=None,
-                            created_at=now,
-                            session_operation_context=session_operation_context,
-                        )
-                        # elspeth-3e28029d2f: a refused mutation's reason
-                        # persists unredacted alongside its (redacted) tool
-                        # row, linked to the state CURRENT at rejection —
-                        # ``current_state_id`` at this iteration, since a
-                        # rejection commits no state of its own.
-                        for record in rejection_records:
-                            if record.tool_call_id != tool_row.tool_call_id:
-                                continue
-                            with self._session_mutations(
-                                conn,
-                                session_id=session_id,
-                                session_operation_context=session_operation_context,
-                            ) as session_mutations:
-                                session_mutations.record_composition_rejection(
-                                    tool_call_id=record.tool_call_id,
-                                    tool_name=record.tool_name,
-                                    error_code=record.error_code,
-                                    message=record.message,
-                                    planner_payload=record.planner_payload,
-                                    composition_state_id=current_state_id,
-                                    created_at=now,
-                                )
-
-                    for offset, failure in enumerate(private_tool_failures, start=1):
-                        self._insert_chat_message(
-                            conn,
-                            session_id=session_id,
-                            role="audit",
-                            content="Private credential-filtered failure facts",
-                            raw_content=None,
-                            tool_calls=[failure.to_envelope()],
-                            sequence_no=base_seq + 2 * len(redacted_tool_rows) + offset,
-                            writer_principal=writer_principal,
-                            composition_state_id=current_state_id,
-                            tool_call_id=None,
-                            parent_assistant_id=None,
-                            created_at=now,
-                            session_operation_context=session_operation_context,
-                        )
-                    if continuation_members is not None:
-                        from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
-                        from elspeth.web.composer.withheld_replies import withheld_reply_envelope
-
-                        revoked_call_ids = {row.tool_call_id for row in graph_rows} if refused is not None else set()
-                        audit_offset = 1 + 2 * len(redacted_tool_rows) + len(private_tool_failures)
-                        for index, invocation in enumerate(continuation_members.invocations):
-                            content, envelope = redacted_tool_invocation_content_and_envelope(
-                                invocation, authority_revoked=invocation.tool_call_id in revoked_call_ids
-                            )
-                            self._insert_chat_message(
-                                conn,
-                                session_id=session_id,
-                                role="audit",
-                                content=content,
-                                raw_content=None,
-                                tool_calls=[envelope],
-                                sequence_no=base_seq + audit_offset + index,
-                                writer_principal=writer_principal,
+                        ) as session_mutations:
+                            session_mutations.record_composition_rejection(
+                                tool_call_id=record.tool_call_id,
+                                tool_name=record.tool_name,
+                                error_code=record.error_code,
+                                message=record.message,
+                                planner_payload=record.planner_payload,
                                 composition_state_id=current_state_id,
-                                tool_call_id=None,
-                                parent_assistant_id=None,
                                 created_at=now,
-                                session_operation_context=session_operation_context,
                             )
-                        audit_offset += len(continuation_members.invocations)
-                        for index, reply in enumerate(continuation_members.withheld_replies):
-                            self._insert_chat_message(
-                                conn,
-                                session_id=session_id,
-                                role="audit",
-                                content=reply.content,
-                                raw_content=None,
-                                tool_calls=[withheld_reply_envelope(reply.origin, reply.content)],
-                                sequence_no=base_seq + audit_offset + index,
-                                writer_principal=writer_principal,
-                                composition_state_id=current_state_id,
-                                tool_call_id=None,
-                                parent_assistant_id=None,
-                                created_at=now,
-                                session_operation_context=session_operation_context,
-                            )
-                    checkpoint = None
-                    if inserted_state_ids:
-                        row = conn.execute(
-                            select(composition_states_table).where(
-                                composition_states_table.c.id == str(inserted_state_ids[-1]),
-                                composition_states_table.c.session_id == session_id,
-                            )
-                        ).one_or_none()
-                        if row is None or row.creator_operation_id != session_operation_context.fence.operation_id:
-                            raise AuditIntegrityError("Inserted compose checkpoint does not match its exact session and creator fence")
-                        checkpoint_state = self._row_to_state_record(row)
-                        if str(checkpoint_state.id) != current_state_id or str(checkpoint_state.session_id) != session_id:
-                            raise AuditIntegrityError("Decoded compose checkpoint differs from its exact saved row identity")
-                        checkpoint = CommittedCheckpointWitness(
-                            state=checkpoint_state,
-                            creator_operation_id=row.creator_operation_id,
-                            inserted_state_ids=tuple(inserted_state_ids),
-                        )
-                    audit_outcome = AuditOutcome(
-                        assistant_id=assistant_id,
-                        unwind_audit_failed=False,
-                        current_state_id=current_state_id,
-                        checkpoint_disposition="committed"
-                        if checkpoint is not None
-                        else "no_new_checkpoint"
-                        if current_state_id is not None
-                        else "empty",
-                        checkpoint=checkpoint,
-                        authority_revocation=refused,
-                        published_tool_rows=published_tool_rows,
-                        published_assistant_content=published_assistant_content,
+
+                for offset, failure in enumerate(private_tool_failures, start=1):
+                    self._insert_chat_message(
+                        conn,
+                        session_id=session_id,
+                        role="audit",
+                        content="Private credential-filtered failure facts",
+                        raw_content=None,
+                        tool_calls=[failure.to_envelope()],
+                        sequence_no=base_seq + 2 * len(redacted_tool_rows) + offset,
+                        writer_principal=writer_principal,
+                        composition_state_id=current_state_id,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=now,
+                        session_operation_context=session_operation_context,
                     )
-                    if continuation is not None:
-                        from elspeth.web.sessions.continuation_p4 import retain_p4_result_on_connection
+                if continuation_members is not None:
+                    from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+                    from elspeth.web.composer.withheld_replies import withheld_reply_envelope
 
-                        if continuation_prepared is None:
-                            raise AuditIntegrityError("continuation P4 lost its complete prepared input")
-                        retain_p4_result_on_connection(
-                            conn,
-                            continuation,
-                            prepared=continuation_prepared,
-                            outcome=audit_outcome,
-                            base_sequence=base_seq,
-                            created_at=now,
-                            env_ref_names=continuation_env_ref_names,
+                    revoked_call_ids = {row.tool_call_id for row in graph_rows} if refused is not None else set()
+                    audit_offset = 1 + 2 * len(redacted_tool_rows) + len(private_tool_failures)
+                    for index, invocation in enumerate(continuation_members.invocations):
+                        content, envelope = redacted_tool_invocation_content_and_envelope(
+                            invocation, authority_revoked=invocation.tool_call_id in revoked_call_ids
                         )
-                # The original actual outcome becomes visible only after the
-                # same transaction (including private receipt/root) commits.
-                return audit_outcome
+                        self._insert_chat_message(
+                            conn,
+                            session_id=session_id,
+                            role="audit",
+                            content=content,
+                            raw_content=None,
+                            tool_calls=[envelope],
+                            sequence_no=base_seq + audit_offset + index,
+                            writer_principal=writer_principal,
+                            composition_state_id=current_state_id,
+                            tool_call_id=None,
+                            parent_assistant_id=None,
+                            created_at=now,
+                            session_operation_context=session_operation_context,
+                        )
+                    audit_offset += len(continuation_members.invocations)
+                    for index, reply in enumerate(continuation_members.withheld_replies):
+                        self._insert_chat_message(
+                            conn,
+                            session_id=session_id,
+                            role="audit",
+                            content=reply.content,
+                            raw_content=None,
+                            tool_calls=[withheld_reply_envelope(reply.origin, reply.content)],
+                            sequence_no=base_seq + audit_offset + index,
+                            writer_principal=writer_principal,
+                            composition_state_id=current_state_id,
+                            tool_call_id=None,
+                            parent_assistant_id=None,
+                            created_at=now,
+                            session_operation_context=session_operation_context,
+                        )
+                checkpoint = None
+                if inserted_state_ids:
+                    row = conn.execute(
+                        select(composition_states_table).where(
+                            composition_states_table.c.id == str(inserted_state_ids[-1]),
+                            composition_states_table.c.session_id == session_id,
+                        )
+                    ).one_or_none()
+                    if row is None or row.creator_operation_id != session_operation_context.fence.operation_id:
+                        raise AuditIntegrityError("Inserted compose checkpoint does not match its exact session and creator fence")
+                    checkpoint_state = self._row_to_state_record(row)
+                    if str(checkpoint_state.id) != current_state_id or str(checkpoint_state.session_id) != session_id:
+                        raise AuditIntegrityError("Decoded compose checkpoint differs from its exact saved row identity")
+                    checkpoint = CommittedCheckpointWitness(
+                        state=checkpoint_state,
+                        creator_operation_id=row.creator_operation_id,
+                        inserted_state_ids=tuple(inserted_state_ids),
+                    )
+                audit_outcome = AuditOutcome(
+                    assistant_id=assistant_id,
+                    unwind_audit_failed=False,
+                    current_state_id=current_state_id,
+                    checkpoint_disposition="committed"
+                    if checkpoint is not None
+                    else "no_new_checkpoint"
+                    if current_state_id is not None
+                    else "empty",
+                    checkpoint=checkpoint,
+                    authority_revocation=refused,
+                    published_tool_rows=published_tool_rows,
+                    published_assistant_content=published_assistant_content,
+                )
+                if continuation_observation is not None:
+                    continuation_observation.candidate = audit_outcome
+                if continuation is not None:
+                    from elspeth.web.sessions.continuation_p4 import retain_p4_result_on_connection
+
+                    if continuation_prepared is None:
+                        raise AuditIntegrityError("continuation P4 lost its complete prepared input")
+                    retain_p4_result_on_connection(
+                        conn,
+                        continuation,
+                        prepared=continuation_prepared,
+                        outcome=audit_outcome,
+                        base_sequence=base_seq,
+                        created_at=now,
+                        env_ref_names=continuation_env_ref_names,
+                    )
+                    from elspeth.web.sessions.continuation_p4_application_store import apply_committing_p4_application_on_connection
+
+                    if continuation_observation is None:
+                        raise AuditIntegrityError("committing P4 lost its actual observation owner")
+                    continuation_observation.application_candidate = apply_committing_p4_application_on_connection(
+                        conn, continuation, env_ref_names=continuation_env_ref_names
+                    )
+            # The outer engine.begin context has now exited successfully.
+            # Neither output becomes a physical success before that boundary.
+            if continuation_observation is not None:
+                continuation_observation.committed = True
+            return audit_outcome
 
         except StaleComposeStateError as stale_exc:
             # StaleComposeStateError disposition (elspeth-45f72a949c):
@@ -2430,14 +2489,30 @@ class SessionServiceImpl:
                 )
                 if continuation is not None:
                     unavailable = self._retain_unavailable_continuation_p4(
-                        continuation, prepared=continuation_prepared, outcome=unavailable, env_ref_names=continuation_env_ref_names
+                        continuation,
+                        prepared=continuation_prepared,
+                        outcome=unavailable,
+                        env_ref_names=continuation_env_ref_names,
+                        observation=continuation_observation,
                     )
                 return unavailable
             raise
-        except IntegrityError:
+        except IntegrityError as integrity_exc:
             self._telemetry.tool_row_integrity_violation_total.add(1)
+            if continuation_observation is not None and continuation_observation.candidate is not None:
+                committed = self._readback_continuation_p4_transaction(
+                    continuation_observation, original=integrity_exc, env_ref_names=continuation_env_ref_names
+                )
+                if committed is not None:
+                    return committed
             raise
         except OperationalError as audit_exc:
+            if continuation_observation is not None:
+                committed = self._readback_continuation_p4_transaction(
+                    continuation_observation, original=audit_exc, env_ref_names=continuation_env_ref_names
+                )
+                if committed is not None:
+                    return committed
             # OperationalError disposition (spec §5.2.2 / §5.5
             # rows 9-10): the audit insert itself failed (commit-time
             # disk full, fsync failure, network partition, etc.). The
@@ -2493,7 +2568,11 @@ class SessionServiceImpl:
                 )
                 if continuation is not None:
                     unavailable = self._retain_unavailable_continuation_p4(
-                        continuation, prepared=continuation_prepared, outcome=unavailable, env_ref_names=continuation_env_ref_names
+                        continuation,
+                        prepared=continuation_prepared,
+                        outcome=unavailable,
+                        env_ref_names=continuation_env_ref_names,
+                        observation=continuation_observation,
                     )
                 return unavailable
             self._telemetry.tool_row_tier1_violation_total.add(1)
@@ -2503,6 +2582,12 @@ class SessionServiceImpl:
                 f"Tier-1 audit corruption (no recovery)"
             ) from audit_exc
         except SQLAlchemyError as audit_exc:
+            if continuation_observation is not None:
+                committed = self._readback_continuation_p4_transaction(
+                    continuation_observation, original=audit_exc, env_ref_names=continuation_env_ref_names
+                )
+                if committed is not None:
+                    return committed
             # Spec §5.2.2 / §5.5 row 9: any non-Integrity, non-Operational
             # SQLAlchemyError (DataError, DatabaseError, ProgrammingError,
             # InterfaceError, DBAPIError siblings) on the audit insert
@@ -2533,6 +2618,31 @@ class SessionServiceImpl:
                 f"({type(audit_exc).__name__}) — Tier-1 audit "
                 f"corruption (no recovery)"
             ) from audit_exc
+        except BaseException as original:
+            if continuation_observation is not None and continuation_observation.candidate is not None:
+                committed = self._readback_continuation_p4_transaction(
+                    continuation_observation, original=original, env_ref_names=continuation_env_ref_names
+                )
+                if committed is not None:
+                    return committed
+            raise
+
+    def _readback_continuation_p4_transaction(
+        self, observation: P4WriterObservation, *, original: BaseException, env_ref_names: frozenset[str]
+    ) -> AuditOutcome | None:
+        from elspeth.web.sessions.continuation_p4 import read_p4_transaction_outcome_on_connection
+
+        if observation.original_error is not None and observation.original_error is not original:
+            observation.prior_errors = (*observation.prior_errors, observation.original_error)
+        observation.original_error = original
+        sid = str(observation.commit.running.claim.session_id)
+        try:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                return read_p4_transaction_outcome_on_connection(conn, observation, env_ref_names=env_ref_names)
+        except BaseException as readback:
+            unknown = ComposerP4SQLCompletionUnknown(observation)
+            unknown.__cause__ = BaseExceptionGroup("Original P4 transaction error and readback outcome", (original, readback))
+            raise unknown from unknown.__cause__
 
     def _retain_unavailable_continuation_p4(
         self,
@@ -2541,11 +2651,23 @@ class SessionServiceImpl:
         prepared: PreparedP4Value | None,
         outcome: AuditOutcome,
         env_ref_names: frozenset[str],
+        observation: P4WriterObservation | None,
     ) -> AuditOutcome:
         from elspeth.web.sessions.continuation_p4 import retain_p4_result_on_connection, selected_p4_drain_scope
 
         if prepared is None or type(outcome) is not AuditOutcome or not outcome.unwind_audit_failed:
             raise AuditIntegrityError("unavailable P4 retention requires its actual rolled-back result")
+        if observation is None or observation.commit is not continuation or observation.prepared is not prepared:
+            raise AuditIntegrityError("unavailable P4 lost its original committing owner")
+        if observation.candidate is not None:
+            if not observation.known_not_committed:
+                raise AuditIntegrityError("unavailable P4 cannot replace an unresolved actual candidate")
+            observation.failed_candidates = (*observation.failed_candidates, observation.candidate)
+        observation.candidate = outcome
+        observation.application_candidate = None
+        observation.committed = False
+        observation.known_not_committed = False
+        observation.readback = None
         context = continuation.running.session_operation_context
         sid = str(continuation.running.claim.session_id)
         try:
@@ -2566,13 +2688,22 @@ class SessionServiceImpl:
                     created_at=None,
                     env_ref_names=env_ref_names,
                 )
+                from elspeth.web.sessions.continuation_p4_application_store import apply_committing_p4_application_on_connection
+
+                observation.application_candidate = apply_committing_p4_application_on_connection(
+                    conn, continuation, env_ref_names=env_ref_names
+                )
         except Exception as error:
+            committed = self._readback_continuation_p4_transaction(observation, original=error, env_ref_names=env_ref_names)
+            if committed is not None:
+                return committed
             # This is secondary to the primary plugin crash already selected
             # by the existing unavailable branch. Preserve the exact error as
             # cause and hand it to the existing persist-before-propagate path.
             failure = AuditIntegrityError("Unavailable P4 receipt could not be retained")
             failure.__cause__ = error
             return replace(outcome, continuation_retention_failure=failure)
+        observation.committed = True
         return outcome
 
     async def persist_continuation_compose_turn(
@@ -2598,7 +2729,11 @@ class SessionServiceImpl:
         continuation_prepared: PreparedP4Value,
         continuation_env_ref_names: frozenset[str] = frozenset(),
         required_work: RequiredWorkTicket,
-    ) -> RequiredSQLFinishOnce[AuditOutcome]:
+        continuation_observation: P4WriterObservation | None = None,
+    ) -> RequiredSQLFinishOnce[CommittedContinuationP4]:
+        from elspeth.web.sessions.continuation_p4 import P4WriterObservation
+        from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+
         _validate_required_sql_ticket(
             required_work,
             sources=(RequiredWorkSource.COMPOSE_CHECKPOINT_SQL,),
@@ -2608,29 +2743,40 @@ class SessionServiceImpl:
         )
         if type(required_work) is not RequiredWorkTicket:
             raise AuditIntegrityError("continuation P4 requires its actual preallocated SQL ticket")
-        return await run_required_sql_finish_once(
-            required_work,
-            self.persist_compose_turn,
-            session_id=session_id,
-            assistant_content=assistant_content,
-            raw_content=raw_content,
-            redacted_assistant_tool_calls=redacted_assistant_tool_calls,
-            redacted_tool_rows=redacted_tool_rows,
-            revoked_tool_rows=revoked_tool_rows,
-            mutation_ceiling=mutation_ceiling,
-            authority_revocation=authority_revocation,
-            private_tool_evidence=private_tool_evidence,
-            private_tool_failures=private_tool_failures,
-            rejection_records=rejection_records,
-            parent_composition_state_id=parent_composition_state_id,
-            expected_current_state_id=expected_current_state_id,
-            writer_principal=writer_principal,
-            plugin_crash_pending=plugin_crash_pending,
-            session_operation_context=session_operation_context,
-            continuation=continuation,
-            continuation_prepared=continuation_prepared,
-            continuation_env_ref_names=continuation_env_ref_names,
+        observation = (
+            continuation_observation if continuation_observation is not None else P4WriterObservation(continuation, continuation_prepared)
         )
+
+        def physical() -> CommittedContinuationP4:
+            actual = self.persist_compose_turn(
+                session_id=session_id,
+                assistant_content=assistant_content,
+                raw_content=raw_content,
+                redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                redacted_tool_rows=redacted_tool_rows,
+                revoked_tool_rows=revoked_tool_rows,
+                mutation_ceiling=mutation_ceiling,
+                authority_revocation=authority_revocation,
+                private_tool_evidence=private_tool_evidence,
+                private_tool_failures=private_tool_failures,
+                rejection_records=rejection_records,
+                parent_composition_state_id=parent_composition_state_id,
+                expected_current_state_id=expected_current_state_id,
+                writer_principal=writer_principal,
+                plugin_crash_pending=plugin_crash_pending,
+                session_operation_context=session_operation_context,
+                continuation=continuation,
+                continuation_prepared=continuation_prepared,
+                continuation_env_ref_names=continuation_env_ref_names,
+                continuation_observation=observation,
+            )
+            if not observation.committed or observation.candidate is not actual or observation.application_candidate is None:
+                if actual.continuation_retention_failure is not None:
+                    raise actual.continuation_retention_failure
+                raise AuditIntegrityError("P4 physical owner did not commit both actual outputs")
+            return CommittedContinuationP4(actual, observation.application_candidate)
+
+        return await run_required_sql_finish_once(required_work, physical)
 
     async def persist_compose_turn_async(
         self,
@@ -9933,6 +10079,28 @@ class SessionServiceImpl:
             return result
 
         return await self._run_composer_terminal_sql(running, _sync, can_retry=_can_retry, required_work=required_work)
+
+    async def fail_continuation_tool_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        required_work: RequiredWorkCoordinator,
+        failure_projection_work: RequiredWorkTicket,
+        env_ref_names: frozenset[str],
+        original: BaseException | None = None,
+        custody: ContinuationToolFailureCustody | None = None,
+    ) -> CommittedContinuationFailure:
+        from elspeth.web.sessions.continuation_tool_failure import fail_continuation_tool_operation
+
+        return await fail_continuation_tool_operation(
+            self,
+            running,
+            required_work=required_work,
+            failure_projection_work=failure_projection_work,
+            env_ref_names=env_ref_names,
+            original=original,
+            custody=custody,
+        )
 
     async def fail_composer_async_operation(
         self,

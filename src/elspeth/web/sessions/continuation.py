@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import Connection, Row, func, insert, select, update
+from sqlalchemy import Connection, LargeBinary, Row, case, cast, func, insert, select, update
 from sqlalchemy.engine import RootTransaction
+from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -18,6 +19,7 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer.continuation import (
     ContinuationFrameStack,
     InitializeFrame,
+    PrivateChunkRef,
     prepare_composer_continuation_admission,
     reserved_user_message_id,
 )
@@ -28,6 +30,7 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
@@ -38,6 +41,7 @@ from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationCancelledDuringTurn,
     ComposerOperationClaim,
+    ComposerOperationError,
     ComposerOperationFenceLost,
     ComposerOperationRunning,
     composer_operation_v2_request_hash,
@@ -75,9 +79,12 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table as fences,
 )
 from elspeth.web.sessions.models import sessions_table
-from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
+from elspeth.web.sessions.schemas import MessageWithStateResponse, RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.state_decoder import state_record_from_row
 from elspeth.web.sessions.time_normalization import restore_utc
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
 
 _OWED_P4_SCOPE_KEY = "elspeth.continuation.owed-p4"
 _OWED_P4_SEAL = object()
@@ -321,6 +328,55 @@ def read_chunk(conn: Connection, *, session_id: str, operation_id: str, key: str
     return row.payload
 
 
+def read_private_chunk(conn: Connection, *, session_id: str, operation_id: str, reference: PrivateChunkRef) -> bytes:
+    """Return bounded private bytes through one conditional SQL projection.
+
+    Actual database byte length and payload selection share this statement and
+    connection. This does not bound database work, roots or aggregate closure,
+    nor confer any authority beyond the caller's original SQL admission.
+    """
+    if type(reference) is not PrivateChunkRef or not 0 <= reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        raise AuditIntegrityError("private chunk exceeds its complete document bound")
+    if conn.dialect.name == "postgresql":
+        actual_length = func.octet_length(chunks.c.payload)
+    elif conn.dialect.name == "sqlite":
+        # length(TEXT) counts characters; inspect even a forged storage class
+        # as its actual UTF8 bytes instead of trusting metadata or characters.
+        actual_length = func.length(cast(chunks.c.payload, LargeBinary))
+    else:
+        raise AuditIntegrityError("private chunk byte projection has an unsupported database")
+    row = conn.execute(
+        select(
+            chunks.c.codec,
+            chunks.c.sha256,
+            chunks.c.byte_length,
+            actual_length.label("actual_byte_length"),
+            case(
+                (actual_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES, chunks.c.payload),
+                else_=None,
+            ).label("payload"),
+        ).where(
+            chunks.c.session_id == session_id,
+            chunks.c.operation_id == operation_id,
+            chunks.c.chunk_key == f"value:{reference.codec}:{reference.digest}",
+        )
+    ).one_or_none()
+    if (
+        row is None
+        or type(row.actual_byte_length) is not int
+        or not 0 <= row.actual_byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+        or type(row.payload) is not bytes
+        or len(row.payload) != row.actual_byte_length
+        or row.byte_length != row.actual_byte_length
+        or row.actual_byte_length != reference.byte_length
+        or row.codec != reference.codec
+        or row.sha256 != reference.digest
+        or sha256(row.payload).hexdigest() != reference.digest
+    ):
+        raise AuditIntegrityError("private chunk complete byte bound or SQL binding mismatch")
+    return row.payload
+
+
 def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> StoredContinuationSnapshot:
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 
@@ -356,6 +412,203 @@ def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> St
     return StoredContinuationSnapshot(encoded, snapshot.cursor, snapshot.checkpoint_id)
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedContinuationAppend:
+    session_id: str
+    operation_id: str
+    expected_checkpoint_id: str
+    expected_cursor: int
+    snapshot_json: str
+    events: tuple[ContinuationEvent, ...]
+    checkpoint_id: str
+    published_at: datetime
+    handoff: bool
+    predecessor_json: str
+    original_values: tuple[object, ...] = field(repr=False)
+
+    def require_original(self) -> None:
+        if self.original_values != (
+            self.session_id,
+            self.operation_id,
+            self.expected_checkpoint_id,
+            self.expected_cursor,
+            self.snapshot_json,
+            self.events,
+            self.checkpoint_id,
+            self.published_at,
+            self.handoff,
+            self.predecessor_json,
+        ):
+            raise AuditIntegrityError("prepared continuation append changed its original complete values")
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementAttemptState:
+    sequence: int
+    generation: int
+    claim_attempt: int
+    operation_id: str | None
+    operation_epoch: int | None
+    lease_token: str | None
+    revoked_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementDrivingState:
+    status: str
+    attempt: int
+    status_revision: int
+    sequence: int
+    generation: int
+    cancel_requested_at: datetime | None
+    checkpoint_id: str
+    cursor: int
+    segment_sequence: int
+    segment_generation: int
+    segment_state: str
+    segment_started_at: datetime | None
+    segment_cooperative_at: datetime | None
+    segment_deadline_at: datetime | None
+    claim_token: str | None
+    claim_owner_instance_id: str | None
+    claim_expires_at: datetime | None
+    operation_id: str | None
+    operation_epoch: int | None
+    lease_token: str | None
+    history: SettlementAttemptState | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSegmentSettlement:
+    outcome: MessageWithStateResponse | ComposerOperationError
+    published_at: datetime
+    append: PreparedContinuationAppend
+    driving: SettlementDrivingState
+    settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"]
+    attempt_outcome: Literal["settled", "interrupted"]
+    outcome_json: str
+
+
+def _settlement_driving(parent: Row[Any], segment: Row[Any], history: Row[Any] | None) -> SettlementDrivingState:
+    return SettlementDrivingState(
+        parent.status,
+        parent.attempt,
+        parent.status_revision,
+        parent.current_segment_sequence,
+        parent.ownership_generation,
+        parent.cancel_requested_at,
+        parent.checkpoint_id,
+        parent.journal_cursor,
+        segment.sequence,
+        segment.generation,
+        segment.state,
+        None if segment.started_at is None else restore_utc(segment.started_at),
+        None if segment.cooperative_at is None else restore_utc(segment.cooperative_at),
+        None if segment.deadline_at is None else restore_utc(segment.deadline_at),
+        segment.claim_token,
+        segment.claim_owner_instance_id,
+        segment.claim_expires_at,
+        segment.session_operation_id,
+        segment.session_operation_epoch,
+        segment.session_operation_lease_token,
+        None
+        if history is None
+        else SettlementAttemptState(
+            history.sequence,
+            history.generation,
+            history.claim_attempt,
+            history.session_operation_id,
+            history.session_operation_epoch,
+            history.session_operation_lease_token,
+            history.revoked_at,
+        ),
+    )
+
+
+def _settlement_transition(
+    stored: StoredContinuationSnapshot,
+    *,
+    segment: Row[Any],
+    outcome: MessageWithStateResponse | ComposerOperationError,
+    published_at: datetime,
+    settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"],
+) -> tuple[ContinuationFrameStack, tuple[str, ...], tuple[ContinuationEvent, ...]]:
+    from elspeth.web.coordination.composer_operation_authority import _terminal_values
+
+    stack = decode_continuation_snapshot(stored.payload_json)
+    unresolved = tuple(item.effect_id for item in stack.effect_frontier if item.disposition == "dispatched")
+    frontier = tuple(
+        item.model_copy(update={"disposition": "unknown"}) if item.effect_id in unresolved else item for item in stack.effect_frontier
+    )
+    terminal = _terminal_values(outcome, now=published_at, settled_by=settled_by)
+    attribution = (
+        *(ContinuationEvent("effect_unknown", canonical_json({"version": 1, "effect_key": key})) for key in unresolved),
+        ContinuationEvent(
+            "settled",
+            canonical_json(
+                {
+                    "version": 1,
+                    "sequence": segment.sequence,
+                    "generation": segment.generation,
+                    "status": terminal["status"],
+                    "failure_code": terminal["failure_code"],
+                }
+            ),
+        ),
+    )
+    return stack.model_copy(update={"effect_frontier": frontier}), unresolved, attribution
+
+
+def prepare_segment_settlement_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    parent: Row[Any],
+    segment: Row[Any],
+    history: Row[Any] | None,
+    outcome: MessageWithStateResponse | ComposerOperationError,
+    settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"],
+    attempt_outcome: Literal["settled", "interrupted"],
+) -> PreparedSegmentSettlement:
+    """Freeze publication DATA under the caller's real lock, before any write."""
+    stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    published = database_now(conn)
+    stack, _unresolved, attribution = _settlement_transition(
+        stored, segment=segment, outcome=outcome, published_at=published, settled_by=settled_by
+    )
+    encoded = encode_continuation_snapshot(stack.model_copy(update={"cursor": stored.cursor + len(attribution)}))
+    checkpoint_id = str(uuid4())
+    original = (
+        session_id,
+        operation_id,
+        stored.checkpoint_id,
+        stored.cursor,
+        encoded,
+        attribution,
+        checkpoint_id,
+        published,
+        False,
+        stored.payload_json,
+    )
+    append = PreparedContinuationAppend(
+        session_id,
+        operation_id,
+        stored.checkpoint_id,
+        stored.cursor,
+        encoded,
+        attribution,
+        checkpoint_id,
+        published,
+        False,
+        stored.payload_json,
+        original,
+    )
+    return PreparedSegmentSettlement(
+        outcome, published, append, _settlement_driving(parent, segment, history), settled_by, attempt_outcome, outcome.model_dump_json()
+    )
+
+
 def append_complete_snapshot(
     conn: Connection,
     *,
@@ -366,6 +619,7 @@ def append_complete_snapshot(
     snapshot_json: str,
     event_batch: tuple[ContinuationEvent, ...],
     handoff: bool,
+    prepared_append: PreparedContinuationAppend | None = None,
 ) -> StoredContinuationSnapshot:
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 
@@ -384,8 +638,24 @@ def append_complete_snapshot(
         or frame_stack.cursor not in (expected_cursor, expected_cursor + len(event_batch))
     ):
         raise ContinuationCASConflict("continuation transition changed immutable request/policy or cursor")
-    now = database_now(conn)
-    checkpoint_id = str(uuid4())
+    if prepared_append is None:
+        now = database_now(conn)
+        checkpoint_id = str(uuid4())
+    else:
+        prepared_append.require_original()
+        final_json = encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": expected_cursor + len(event_batch)}))
+        if (
+            prepared_append.session_id != session_id
+            or prepared_append.operation_id != operation_id
+            or prepared_append.expected_checkpoint_id != expected_checkpoint_id
+            or prepared_append.expected_cursor != expected_cursor
+            or prepared_append.snapshot_json != final_json
+            or prepared_append.predecessor_json != current.payload_json
+            or prepared_append.events != event_batch
+            or prepared_append.handoff is not handoff
+        ):
+            raise AuditIntegrityError("prepared append differs from its actual current transition")
+        now, checkpoint_id = prepared_append.published_at, prepared_append.checkpoint_id
     cursor = expected_cursor
     for item in event_batch:
         cursor += 1
@@ -408,7 +678,11 @@ def append_complete_snapshot(
                 created_at=now,
             )
         )
-    snapshot_json = encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": cursor}))
+    snapshot_json = (
+        encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": cursor}))
+        if prepared_append is None
+        else prepared_append.snapshot_json
+    )
     snapshot_key = f"snapshot:{checkpoint_id}"
     put_chunk(
         conn, session_id=session_id, operation_id=operation_id, key=snapshot_key, payload=snapshot_json.encode("utf-8"), codec="snapshot.v2"
@@ -544,6 +818,770 @@ def _retained_successor_action(
         if supplied != expected:
             raise AuditIntegrityError("successor allowance differs from the actual selected retained action")
     return expected.model_dump_json(), stack.policy_hash
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerSegmentRecoveryReceipt:
+    """One same-sequence generation advance: peer recovery or a live handover."""
+
+    session_id: UUID
+    operation_id: str
+    sequence: int
+    previous_generation: int
+    generation: int
+    checkpoint_id: str
+    cursor: int
+    next_eligible_at: datetime
+    # Observed by a live handover under its fence (design §2.5, F11); a peer
+    # recovery holds no lease. Not part of the transition's identity.
+    lease_validity_remaining: timedelta | None = field(default=None, compare=False)
+    # Set only by the live handover transaction after releasing this exact
+    # fence. Peer recovery has no current lease to release.
+    released_context: SessionOperationContext | None = field(default=None, compare=False)
+
+
+@dataclass(slots=True)
+class ComposerSegmentStartObservation:
+    """The actual start producer's context and commit/readback observations.
+
+    A context observed before commit is not authority. Reconciliation proves
+    the exact claim/fence/attempt in SQL before it may be adopted after error.
+    """
+
+    claim: ComposerOperationClaim
+    context: SessionOperationContext | None = None
+    committed: bool = False
+    reconciled: bool = False
+    policy: ContinuationAdmissionPolicy | None = None
+    hard_expires_at: float | None = None
+
+
+def recover_segment_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    parent: Row[Any],
+    segment: Row[Any],
+    history: Row[Any],
+    now: datetime,
+    next_eligible_at: datetime,
+) -> ComposerSegmentRecoveryReceipt:
+    """Advance one owner's segment to the next generation at the same sequence.
+
+    The caller has already proved the owner may be replaced: a dead owner by
+    lease and membership expiry, or a live owner by its own exact fence. This
+    body is shared by both, so every phase reader that accepts a recovery
+    accepts a handover: the event bytes, the unchanged root and the
+    interrupted attempt pair are identical (design §2.2, review F3).
+
+    The retained cut is classified and sized before any write. A cut holding
+    unresolved work raises ``ContinuationCutNotResumable`` with nothing written.
+    """
+    expected_generation = segment.generation
+    stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    action_json, policy_hash = _retained_successor_action(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        snapshot=stored,
+        next_action_json=None,
+        policy_sha256=None,
+    )
+    retained = append_complete_snapshot(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        expected_checkpoint_id=stored.checkpoint_id,
+        expected_cursor=stored.cursor,
+        snapshot_json=stored.payload_json,
+        event_batch=(
+            ContinuationEvent(
+                "recovered",
+                canonical_json(
+                    {
+                        "version": 2,
+                        "same_sequence": segment.sequence,
+                        "previous_generation": expected_generation,
+                        "generation": expected_generation + 1,
+                    }
+                ),
+            ),
+        ),
+        handoff=False,
+    )
+    previous = conn.execute(
+        update(attempts)
+        .where(
+            attempts.c.session_id == session_id,
+            attempts.c.operation_id == operation_id,
+            attempts.c.sequence == segment.sequence,
+            attempts.c.generation == expected_generation,
+            attempts.c.claim_attempt == history.claim_attempt,
+            attempts.c.session_operation_id == history.session_operation_id,
+            attempts.c.session_operation_epoch == history.session_operation_epoch,
+            attempts.c.session_operation_lease_token == history.session_operation_lease_token,
+            attempts.c.revoked_at.is_(None),
+        )
+        .values(revoked_at=now, outcome="interrupted")
+    )
+    recovered = conn.execute(
+        update(segments)
+        .where(
+            segments.c.session_id == session_id,
+            segments.c.operation_id == operation_id,
+            segments.c.sequence == segment.sequence,
+            segments.c.generation == expected_generation,
+            segments.c.state == "running",
+            segments.c.claim_token == segment.claim_token,
+        )
+        .values(
+            state="interrupted",
+            generation=expected_generation + 1,
+            checkpoint_id=retained.checkpoint_id,
+            claim_token=None,
+            claim_owner_instance_id=None,
+            claim_expires_at=None,
+            enqueued_at=now,
+            next_eligible_at=next_eligible_at,
+            next_action_json=action_json,
+            policy_sha256=policy_hash,
+        )
+    )
+    advanced = conn.execute(
+        update(jobs)
+        .where(
+            jobs.c.session_id == session_id,
+            jobs.c.operation_id == operation_id,
+            jobs.c.lifecycle_version == 2,
+            jobs.c.status == "running",
+            jobs.c.current_segment_sequence == segment.sequence,
+            jobs.c.ownership_generation == expected_generation,
+            jobs.c.checkpoint_id == retained.checkpoint_id,
+            jobs.c.attempt == parent.attempt,
+        )
+        .values(
+            ownership_generation=expected_generation + 1,
+            phase="reconciling" if next_eligible_at <= now else "retry_waiting",
+            updated_at=now,
+            status_revision=jobs.c.status_revision + 1,
+        )
+    )
+    if previous.rowcount != 1 or recovered.rowcount != 1 or advanced.rowcount != 1:
+        raise AuditIntegrityError("continuation recovery lost its exact generation transition")
+    return ComposerSegmentRecoveryReceipt(
+        UUID(session_id),
+        operation_id,
+        segment.sequence,
+        expected_generation,
+        expected_generation + 1,
+        retained.checkpoint_id,
+        retained.cursor,
+        next_eligible_at,
+    )
+
+
+def verify_recovery_on_connection(conn: Connection, receipt: ComposerSegmentRecoveryReceipt) -> None:
+    """Verify this committed generation transition, allowing later peer progress.
+
+    The recovered checkpoint/event and revoked predecessor attempt are the
+    immutable evidence. The current segment is allowed to have started,
+    recovered again or settled; requiring it to remain interrupted races the
+    peer that the committing handover deliberately made immediately eligible.
+    """
+    if type(receipt) is not ComposerSegmentRecoveryReceipt:
+        raise TypeError("recovery verification requires its nominal receipt")
+    sid, operation = str(receipt.session_id), receipt.operation_id
+    if receipt.generation != receipt.previous_generation + 1:
+        raise AuditIntegrityError("recovery receipt skipped its predecessor generation")
+    checkpoint = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation,
+            checkpoints.c.checkpoint_id == receipt.checkpoint_id,
+        )
+    ).one_or_none()
+    event = conn.execute(
+        select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == receipt.cursor)
+    ).one_or_none()
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == receipt.sequence,
+            attempts.c.generation == receipt.previous_generation,
+        )
+    ).one_or_none()
+    current = conn.execute(
+        select(segments).where(segments.c.session_id == sid, segments.c.operation_id == operation, segments.c.sequence == receipt.sequence)
+    ).one_or_none()
+    if (
+        checkpoint is None
+        or event is None
+        or history is None
+        or current is None
+        or checkpoint.cursor != receipt.cursor
+        or checkpoint.kind != "transition"
+        or event.tag != "recovered"
+        or history.revoked_at is None
+        or history.outcome != "interrupted"
+        or current.generation < receipt.generation
+    ):
+        raise AuditIntegrityError("durable recovery readback mismatch")
+    expected = canonical_json(
+        {
+            "version": 2,
+            "same_sequence": receipt.sequence,
+            "previous_generation": receipt.previous_generation,
+            "generation": receipt.generation,
+        }
+    ).encode("utf-8")
+    if read_chunk(conn, session_id=sid, operation_id=operation, key=event.payload_chunk_key) != expected:
+        raise AuditIntegrityError("recovery event names another generation transition")
+    recovered_stack = decode_continuation_snapshot(
+        read_chunk(conn, session_id=sid, operation_id=operation, key=checkpoint.snapshot_chunk_key).decode("utf-8", errors="strict")
+    )
+    if (
+        recovered_stack.cursor != receipt.cursor
+        or recovered_stack.logical.session_id != sid
+        or recovered_stack.logical.operation_id != operation
+    ):
+        raise AuditIntegrityError("recovery checkpoint names another logical request or cursor")
+    for generation in range(receipt.generation, current.generation):
+        later = conn.execute(
+            select(attempts.c.outcome, attempts.c.revoked_at).where(
+                attempts.c.session_id == sid,
+                attempts.c.operation_id == operation,
+                attempts.c.sequence == receipt.sequence,
+                attempts.c.generation == generation,
+            )
+        ).one_or_none()
+        if later is None or later.outcome != "interrupted" or later.revoked_at is None:
+            raise AuditIntegrityError("recovery advanced without its predecessor attempt history")
+    context = receipt.released_context
+    if context is not None:
+        fence = context.fence
+        if (
+            context.operation_kind is not SessionOperationKind.COMPOSE
+            or fence.session_id != sid
+            or history.session_operation_id != fence.operation_id
+            or history.session_operation_epoch != fence.operation_epoch
+            or history.session_operation_lease_token != fence.lease_token
+        ):
+            raise AuditIntegrityError("handover release differs from its exact predecessor fence")
+        owner = conn.execute(select(fences).where(fences.c.session_id == sid)).one_or_none()
+        if owner is None or owner.operation_epoch < fence.operation_epoch:
+            raise AuditIntegrityError("handover lost its physical fence history")
+        if owner.operation_epoch == fence.operation_epoch and (
+            owner.operation_id != fence.operation_id or owner.lease_token != fence.lease_token or owner.released_at is None
+        ):
+            raise AuditIntegrityError("handover did not release its physical fence")
+
+
+def settle_segment_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    operation_id: str,
+    parent: Row[Any],
+    segment: Row[Any],
+    history: Row[Any] | None,
+    outcome: MessageWithStateResponse | ComposerOperationError,
+    settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"],
+    attempt_outcome: Literal["settled", "interrupted"],
+    now: datetime,
+    prepared_settlement: PreparedSegmentSettlement | None = None,
+) -> None:
+    """Write one V2 terminal: settled event, attempt, segment and parent together.
+
+    Shared by the live owner's terminal (``owner_terminal``, attempt
+    ``settled``) and the settlement of a lost owner (``settle_lost*``, attempt
+    ``interrupted``). Every ``dispatched`` effect becomes ``unknown`` with one
+    ``effect_unknown`` event: its outcome is not durably known, and its real
+    cost stays in the quota ledger (design §5.3). A never-started segment
+    stays ``queued``; moving it to ``settled`` would violate its time bundle.
+    """
+    from elspeth.web.coordination.composer_operation_authority import _terminal_values
+
+    stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    if prepared_settlement is not None:
+        candidate = prepared_settlement
+        candidate.append.require_original()
+        if (
+            candidate.driving != _settlement_driving(parent, segment, history)
+            or candidate.outcome_json != outcome.model_dump_json()
+            or candidate.outcome.model_dump_json() != candidate.outcome_json
+            or candidate.settled_by != settled_by
+            or candidate.attempt_outcome != attempt_outcome
+            or candidate.published_at != candidate.append.published_at
+        ):
+            raise AuditIntegrityError("prepared terminal settlement changed its actual driving state or outcome")
+        now = candidate.published_at
+    stack, unresolved, event_batch = _settlement_transition(
+        stored, segment=segment, outcome=outcome, published_at=now, settled_by=settled_by
+    )
+    terminal_values = _terminal_values(outcome, now=now, settled_by=settled_by)
+    retained = append_complete_snapshot(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        expected_checkpoint_id=stored.checkpoint_id,
+        expected_cursor=stored.cursor,
+        snapshot_json=encode_continuation_snapshot(stack),
+        event_batch=event_batch,
+        handoff=False,
+        prepared_append=None if prepared_settlement is None else prepared_settlement.append,
+    )
+    if unresolved:
+        marked = conn.execute(
+            update(effects)
+            .where(
+                effects.c.session_id == session_id,
+                effects.c.operation_id == operation_id,
+                effects.c.effect_key.in_(unresolved),
+                effects.c.disposition == "dispatched",
+            )
+            .values(disposition="unknown")
+        )
+        if marked.rowcount != len(unresolved):
+            raise AuditIntegrityError("continuation settlement lost an unresolved effect row")
+    if history is not None:
+        revoked = conn.execute(
+            update(attempts)
+            .where(
+                attempts.c.session_id == session_id,
+                attempts.c.operation_id == operation_id,
+                attempts.c.sequence == history.sequence,
+                attempts.c.generation == history.generation,
+                attempts.c.session_operation_id == history.session_operation_id,
+                attempts.c.revoked_at.is_(None),
+            )
+            .values(revoked_at=now, outcome=attempt_outcome)
+        )
+        if revoked.rowcount != 1:
+            raise AuditIntegrityError("continuation settlement lost its exact attempt")
+    if segment.state != "queued":
+        closed = conn.execute(
+            update(segments)
+            .where(
+                segments.c.session_id == session_id,
+                segments.c.operation_id == operation_id,
+                segments.c.sequence == segment.sequence,
+                segments.c.generation == segment.generation,
+                segments.c.state == segment.state,
+            )
+            .values(state="settled", claim_token=None, claim_owner_instance_id=None, claim_expires_at=None)
+        )
+        if closed.rowcount != 1:
+            raise AuditIntegrityError("continuation settlement lost its exact segment")
+    terminal = conn.execute(
+        update(jobs)
+        .where(
+            jobs.c.session_id == session_id,
+            jobs.c.operation_id == operation_id,
+            jobs.c.lifecycle_version == 2,
+            jobs.c.status == parent.status,
+            jobs.c.current_segment_sequence == segment.sequence,
+            jobs.c.ownership_generation == segment.generation,
+            jobs.c.checkpoint_id == retained.checkpoint_id,
+        )
+        .values(**terminal_values, phase="settled")
+    )
+    if terminal.rowcount != 1:
+        raise AuditIntegrityError("continuation settlement lost its exact parent")
+
+
+def settle_continuation_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    outcome: MessageWithStateResponse | ComposerOperationError,
+    prepared_settlement: PreparedSegmentSettlement | None = None,
+) -> None:
+    """The live owner's V2 terminal under its exact current fence and attempt.
+
+    A ``request_cancelled`` outcome is the one terminal a pending Stop allows.
+    The fence is left for the lease close, as for V1, so the worker verifies
+    the terminal before it releases (design §2.7).
+    """
+    claim, context = running.claim, running.session_operation_context
+    if claim.segment_sequence is None or claim.ownership_generation is None:
+        raise TypeError("continuation settlement requires its segment claim")
+    cancelling = isinstance(outcome, ComposerOperationError) and outcome.failure_code == "request_cancelled"
+    # False means no live continuation attempt holds this fence: not this owner.
+    if not require_continuation_mutation(conn, context, allow_cancel=cancelling, allow_expired_segment=True):
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+    sid = str(claim.session_id)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == claim.operation_id)).one()
+    if cancelling and parent.cancel_requested_at is None:
+        raise AuditIntegrityError("cancel outcome requires a durable Stop marker")
+    segment = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid,
+            segments.c.operation_id == claim.operation_id,
+            segments.c.sequence == claim.segment_sequence,
+        )
+    ).one()
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == claim.operation_id,
+            attempts.c.sequence == claim.segment_sequence,
+            attempts.c.generation == claim.ownership_generation,
+        )
+    ).one()
+    if segment.claim_token != claim.claim_token or parent.attempt != claim.attempt or history.claim_attempt != claim.attempt:
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+    settle_segment_on_connection(
+        conn,
+        session_id=sid,
+        operation_id=claim.operation_id,
+        parent=parent,
+        segment=segment,
+        history=history,
+        outcome=outcome,
+        settled_by="owner_terminal",
+        attempt_outcome="settled",
+        now=database_now(conn),
+        prepared_settlement=prepared_settlement,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerSegmentYieldReceipt:
+    """One committed handoff: the predecessor and its one queued successor."""
+
+    session_id: UUID
+    operation_id: str
+    predecessor_sequence: int
+    predecessor_generation: int
+    successor_sequence: int
+    successor_generation: int
+    checkpoint_id: str
+    cursor: int
+    released_epoch: int
+    # Observed by the committing call only (design §2.5, F11); a read-back
+    # cannot know it. Not part of the yield's identity.
+    lease_validity_remaining: timedelta | None = field(default=None, compare=False)
+
+
+def yield_segment_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    expected_head: UUID | None,
+    expected_checkpoint_id: str,
+    expected_cursor: int,
+    snapshot_json: str,
+    reason: ContinuationYieldReason,
+    now: datetime,
+) -> ComposerSegmentYieldReceipt:
+    """Write a handoff checkpoint, yield the segment and queue one successor.
+
+    The caller holds the session lock and releases the fence in this same
+    transaction (``commit_checkpoint_and_successor``), so the successor is
+    claimable at commit. A pending Stop refuses: Stop wins over a yield.
+    """
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent, roll_slice_for_successor
+
+    claim, context = running.claim, running.session_operation_context
+    if claim.segment_sequence is None or claim.ownership_generation is None:
+        raise TypeError("yield requires a continuation segment claim")
+    fence = context.fence
+    # False means no live continuation attempt holds this fence: not this owner.
+    if not require_continuation_mutation(conn, context, allow_cancel=False, allow_expired_segment=True):
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
+    stack = decode_continuation_snapshot(snapshot_json)
+    if not stack.is_handoff_safe:
+        raise AuditIntegrityError("handoff contains live or unsettled work")
+    sid, operation = str(claim.session_id), claim.operation_id
+    open_effect = conn.execute(
+        select(effects.c.effect_key)
+        .where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.disposition.in_(("dispatched", "unknown")))
+        .limit(1)
+    ).one_or_none()
+    if open_effect is not None:
+        raise AuditIntegrityError("handoff contains an unresolved dispatched effect")
+    head = conn.execute(
+        select(states.c.id).where(states.c.session_id == sid).order_by(states.c.version.desc()).limit(1)
+    ).scalar_one_or_none()
+    if head != (str(expected_head) if expected_head is not None else None):
+        raise ContinuationCASConflict("composition head changed before handoff")
+    sequence, generation = claim.segment_sequence, claim.ownership_generation
+    event = ContinuationYieldEvent(
+        reason=reason,
+        predecessor_sequence=sequence,
+        predecessor_generation=generation,
+        successor_sequence=sequence + 1,
+        successor_generation=generation + 1,
+    )
+    retained = append_complete_snapshot(
+        conn,
+        session_id=sid,
+        operation_id=operation,
+        expected_checkpoint_id=expected_checkpoint_id,
+        expected_cursor=expected_cursor,
+        snapshot_json=encode_continuation_snapshot(roll_slice_for_successor(stack, predecessor_sequence=sequence)),
+        event_batch=(ContinuationEvent("yielded", canonical_json(event.model_dump(mode="json"))),),
+        handoff=True,
+    )
+    action_json, policy_hash = _retained_successor_action(
+        conn, session_id=sid, operation_id=operation, snapshot=retained, next_action_json=None, policy_sha256=None
+    )
+    revoked = conn.execute(
+        update(attempts)
+        .where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == sequence,
+            attempts.c.generation == generation,
+            attempts.c.claim_attempt == claim.attempt,
+            attempts.c.session_operation_id == fence.operation_id,
+            attempts.c.session_operation_epoch == fence.operation_epoch,
+            attempts.c.session_operation_lease_token == fence.lease_token,
+            attempts.c.revoked_at.is_(None),
+        )
+        .values(revoked_at=now, outcome="yielded")
+    )
+    if revoked.rowcount != 1:
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=operation, attempt=claim.attempt)
+    yielded = conn.execute(
+        update(segments)
+        .where(
+            segments.c.session_id == sid,
+            segments.c.operation_id == operation,
+            segments.c.sequence == sequence,
+            segments.c.generation == generation,
+            segments.c.state == "running",
+            segments.c.claim_token == claim.claim_token,
+            segments.c.session_operation_id == fence.operation_id,
+            segments.c.session_operation_epoch == fence.operation_epoch,
+            segments.c.session_operation_lease_token == fence.lease_token,
+        )
+        .values(
+            state="yielded",
+            checkpoint_id=retained.checkpoint_id,
+            claim_token=None,
+            claim_owner_instance_id=None,
+            claim_expires_at=None,
+            rollover_reason=reason,
+        )
+    )
+    if yielded.rowcount != 1:
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=operation, attempt=claim.attempt)
+    try:
+        with conn.begin_nested():
+            conn.execute(
+                insert(segments).values(
+                    session_id=sid,
+                    operation_id=operation,
+                    sequence=sequence + 1,
+                    predecessor_sequence=sequence,
+                    state="queued",
+                    generation=generation + 1,
+                    enqueued_at=now,
+                    next_eligible_at=now,
+                    checkpoint_id=retained.checkpoint_id,
+                    next_action_json=action_json,
+                    policy_sha256=policy_hash,
+                )
+            )
+    except IntegrityError as error:
+        raise AuditIntegrityError("a yielded segment already has its successor") from error
+    advanced = conn.execute(
+        update(jobs)
+        .where(
+            jobs.c.session_id == sid,
+            jobs.c.operation_id == operation,
+            jobs.c.lifecycle_version == 2,
+            jobs.c.status == "running",
+            jobs.c.current_segment_sequence == sequence,
+            jobs.c.ownership_generation == generation,
+            jobs.c.attempt == claim.attempt,
+            jobs.c.checkpoint_id == retained.checkpoint_id,
+            jobs.c.cancel_requested_at.is_(None),
+            jobs.c.session_operation_id == fence.operation_id,
+            jobs.c.session_operation_lease_token == fence.lease_token,
+            jobs.c.session_operation_epoch == fence.operation_epoch,
+        )
+        .values(
+            current_segment_sequence=sequence + 1,
+            ownership_generation=generation + 1,
+            phase="continuation_queued",
+            status_revision=jobs.c.status_revision + 1,
+            updated_at=now,
+        )
+    )
+    if advanced.rowcount != 1:
+        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=operation, attempt=claim.attempt)
+    return ComposerSegmentYieldReceipt(
+        claim.session_id,
+        operation,
+        sequence,
+        generation,
+        sequence + 1,
+        generation + 1,
+        retained.checkpoint_id,
+        retained.cursor,
+        fence.operation_epoch,
+    )
+
+
+def verify_yield_on_connection(conn: Connection, receipt: ComposerSegmentYieldReceipt) -> None:
+    """Read back a committed yield, tolerating any later progress of its successor.
+
+    The fence was released at commit, so a peer may already have started,
+    recovered or even settled the successor. Only the yield's own immutable
+    rows are compared: the predecessor, its attempt, the handoff checkpoint and
+    event, and the successor's lineage (design §2.3, review F7).
+    """
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent
+
+    sid, operation = str(receipt.session_id), receipt.operation_id
+    predecessor = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid, segments.c.operation_id == operation, segments.c.sequence == receipt.predecessor_sequence
+        )
+    ).one_or_none()
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == receipt.predecessor_sequence,
+            attempts.c.generation == receipt.predecessor_generation,
+        )
+    ).one_or_none()
+    checkpoint = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation, checkpoints.c.checkpoint_id == receipt.checkpoint_id
+        )
+    ).one_or_none()
+    event_row = conn.execute(
+        select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == receipt.cursor)
+    ).one_or_none()
+    successor = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid, segments.c.operation_id == operation, segments.c.sequence == receipt.successor_sequence
+        )
+    ).one_or_none()
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one_or_none()
+    if (
+        predecessor is None
+        or history is None
+        or checkpoint is None
+        or event_row is None
+        or successor is None
+        or parent is None
+        or predecessor.state != "yielded"
+        or predecessor.generation != receipt.predecessor_generation
+        or predecessor.checkpoint_id != receipt.checkpoint_id
+        or history.revoked_at is None
+        or history.outcome != "yielded"
+        or checkpoint.kind != "handoff"
+        or checkpoint.cursor != receipt.cursor
+        or event_row.tag != "yielded"
+        or successor.predecessor_sequence != receipt.predecessor_sequence
+        or successor.generation < receipt.successor_generation
+    ):
+        raise AuditIntegrityError("durable yield readback mismatch")
+    try:
+        payload = read_chunk(conn, session_id=sid, operation_id=operation, key=event_row.payload_chunk_key).decode("utf-8", errors="strict")
+        event = ContinuationYieldEvent.model_validate_json(payload, strict=True)
+    except ValueError as error:  # includes UnicodeDecodeError
+        raise AuditIntegrityError("yield event violates its closed payload") from error
+    if (event.predecessor_sequence, event.predecessor_generation, event.successor_sequence, event.successor_generation) != (
+        receipt.predecessor_sequence,
+        receipt.predecessor_generation,
+        receipt.successor_sequence,
+        receipt.successor_generation,
+    ):
+        raise AuditIntegrityError("yield event names another predecessor or successor")
+    # Any generation above the one the yield queued must be a recovery step.
+    for later in range(receipt.successor_generation, successor.generation):
+        step = conn.execute(
+            select(attempts.c.outcome, attempts.c.revoked_at).where(
+                attempts.c.session_id == sid,
+                attempts.c.operation_id == operation,
+                attempts.c.sequence == receipt.successor_sequence,
+                attempts.c.generation == later,
+            )
+        ).one_or_none()
+        if step is None or step.revoked_at is None or step.outcome != "interrupted":
+            raise AuditIntegrityError("yield successor advanced without its recovery history")
+    if parent.status in ("queued", "running") and (
+        parent.current_segment_sequence < receipt.successor_sequence
+        or (parent.current_segment_sequence == receipt.successor_sequence and parent.ownership_generation < receipt.successor_generation)
+    ):
+        raise AuditIntegrityError("parent pointer is behind its committed yield")
+
+
+def read_yield_outcome_on_connection(conn: Connection, running: ComposerOperationRunning) -> ComposerSegmentYieldReceipt | None:
+    """After an ambiguous commit: ``None`` if the yield did not commit, else its receipt.
+
+    ``None`` means the caller's attempt is still live and unrevoked under its own
+    fence, so the yield may be retried while that fence lasts. Any other
+    revocation means another writer moved the operation: an integrity stop.
+    """
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent
+
+    claim, fence = running.claim, running.session_operation_context.fence
+    if claim.segment_sequence is None or claim.ownership_generation is None:
+        raise TypeError("yield outcome requires a continuation segment claim")
+    sid, operation = str(claim.session_id), claim.operation_id
+    history = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation,
+            attempts.c.sequence == claim.segment_sequence,
+            attempts.c.generation == claim.ownership_generation,
+        )
+    ).one_or_none()
+    if (
+        history is None
+        or history.session_operation_id != fence.operation_id
+        or history.session_operation_epoch != fence.operation_epoch
+        or history.session_operation_lease_token != fence.lease_token
+        or history.claim_attempt != claim.attempt
+    ):
+        raise AuditIntegrityError("yield outcome lost the caller's exact attempt")
+    if history.revoked_at is None:
+        return None
+    if history.outcome != "yielded":
+        raise AuditIntegrityError("the caller's attempt was revoked by another writer")
+    predecessor = conn.execute(
+        select(segments.c.checkpoint_id).where(
+            segments.c.session_id == sid, segments.c.operation_id == operation, segments.c.sequence == claim.segment_sequence
+        )
+    ).scalar_one()
+    checkpoint = conn.execute(
+        select(checkpoints.c.cursor).where(
+            checkpoints.c.session_id == sid, checkpoints.c.operation_id == operation, checkpoints.c.checkpoint_id == predecessor
+        )
+    ).scalar_one()
+    event_row = conn.execute(
+        select(events.c.payload_chunk_key).where(
+            events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == checkpoint
+        )
+    ).scalar_one()
+    try:
+        event = ContinuationYieldEvent.model_validate_json(
+            read_chunk(conn, session_id=sid, operation_id=operation, key=event_row).decode("utf-8", errors="strict"), strict=True
+        )
+    except ValueError as error:
+        raise AuditIntegrityError("yield event violates its closed payload") from error
+    receipt = ComposerSegmentYieldReceipt(
+        claim.session_id,
+        operation,
+        event.predecessor_sequence,
+        event.predecessor_generation,
+        event.successor_sequence,
+        event.successor_generation,
+        predecessor,
+        checkpoint,
+        history.session_operation_epoch,
+    )
+    verify_yield_on_connection(conn, receipt)
+    return receipt
 
 
 def _select_segment_start_on_connection(

@@ -1,132 +1,104 @@
-"""Freeform planner repair, exhaustion, and policy-rejection regressions.
+"""Common-loop correction, bounded refusal, and live policy feedback regressions.
 
-The provider is scripted while the planner feedback, candidate validation,
-proposal acceptance, and durable failure disposition remain real.
+The provider is finite and scripted; tool validation, actual END review,
+proposal acceptance, accounting, and durable failure disposition remain real.
+The historical native test names are retained across the planner retirement.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import re
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
 
+from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.tool_error_payloads import arg_error_payload
+from elspeth.web.composer.tools import require_schema_valid_arguments
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.sessions.models import chat_messages_table
+from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 from tests.helpers.composer_graphs import assert_isomorphic
 from tests.helpers.composer_operations import submit_and_settle
 
-from .conftest import (
-    PARITY_FIXTURES,
-    ParityEnv,
-    _empty_state,
-    _ScriptedCompletion,
-    emit_proposal_response,
-    rewrite_source_paths,
-)
+from .conftest import PARITY_FIXTURES, ParityEnv, _empty_state, rewrite_source_paths
 
-# A simple source-transform-sink fixture keeps repair checks about planner behavior.
 _LINEAR = next(fixture for fixture in PARITY_FIXTURES if fixture["class"] == "linear_transform")
-
-# A real transform plugin that is installed in the catalog but NOT admitted by the
-# parity web policy (absent from ``_PARITY_ALLOWLIST`` and ``REQUIRED_WEB_PLUGIN_IDS``),
-# so a candidate that names it is a genuine policy denial.
 _POLICY_DENIED_TRANSFORM = "truncate"
-
-
-# --------------------------------------------------------------------------- #
-# Planner helpers                                                            #
-# --------------------------------------------------------------------------- #
+_REPLY = "The corrected pipeline is waiting for approval."
 
 
 def _valid_pipeline(env: ParityEnv, fixture: dict[str, Any], session_id: str) -> dict[str, Any]:
-    """The fixture's canonical pipeline with source paths bound under the S2 allowlist."""
     return rewrite_source_paths(fixture["canonical_arguments"], env.data_dir, session_id)
 
 
 def _malformed_missing_edges(pipeline: dict[str, Any]) -> dict[str, Any]:
-    """A schema-malformed terminal: drop the required top-level ``edges`` key.
-
-    ``SetPipelineArgumentsModel`` requires ``edges``; omitting it fails the
-    terminal schema check (``_canonical_schema_feedback``) — a genuine malformed
-    terminal, not a candidate-validation rejection.
-    """
+    """Drop a required semantic field; the actual set_pipeline S-gate must reject it."""
     return {key: value for key, value in pipeline.items() if key != "edges"}
 
 
 def _policy_denied_variant(pipeline: dict[str, Any]) -> dict[str, Any]:
-    """A shape-valid terminal that names a policy-denied transform plugin.
-
-    Passes ``SetPipelineArgumentsModel`` (structurally a valid transform node) but
-    fails ``build_set_pipeline_candidate`` authorization, so the planner receives
-    the allowlisted *candidate* feedback (``ValidationError``), not schema feedback.
-    """
+    """Use an installed transform outside the parity deployment's allowed set."""
     denied = copy.deepcopy(pipeline)
     denied["nodes"][0]["plugin"] = _POLICY_DENIED_TRANSFORM
     return denied
 
 
 def _last_tool_feedback(request: dict[str, Any]) -> dict[str, Any]:
-    """Parse the last ``role="tool"`` message the planner fed back into a request."""
-    messages = request["messages"]
-    tool_messages = [message for message in messages if message.get("role") == "tool"]
-    if not tool_messages:
-        raise AssertionError("scripted request carried no tool-role feedback message")
+    tool_messages = [message for message in request["messages"] if message.get("role") == "tool"]
+    assert tool_messages, "scripted request carried no actual tool feedback"
     return json.loads(tool_messages[-1]["content"])
 
 
-async def _drive_freeform_scripted(
-    env: ParityEnv,
-    fixture: dict[str, Any],
-    completion: _ScriptedCompletion,
-    session: Any,
-) -> tuple[Any, Any]:
-    """Run the real freeform ``compose`` empty-build path under ``completion``, then accept.
+def _repair_script(env: ParityEnv, bad: dict[str, Any], valid: dict[str, Any]) -> CommonSDK:
+    script = CommonSDK(
+        request=_LINEAR["intent"],
+        candidate=_REPLY,
+        steps=(
+            Step("primary", tool_name="set_pipeline", arguments={"pipeline": bad}),
+            Step("primary", tool_name="set_pipeline", arguments={"pipeline": valid}),
+            Step("primary", content=_REPLY),
+            Step("end"),
+        ),
+    )
+    script.bind(env.composer, env.monkeypatch)
+    env.monkeypatch.setattr("litellm.acompletion", script)
+    return script
 
-    Mirrors ``ParityEnv.drive_freeform`` but injects a caller-supplied multi-response
-    completion (the positive driver scripts exactly one). Returns the committed
-    ``CompositionState`` and the accepted proposal record.
-    """
-    env.monkeypatch.setattr("litellm.acompletion", completion)
-    await env.sessions.update_composer_preferences(
-        session.id,
-        trust_mode="explicit_approve",
-        density_default="high",
-        actor="test",
+
+async def _drive_freeform_scripted(env: ParityEnv, completion: CommonSDK, session: Any) -> tuple[Any, Any]:
+    await env.sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
+    user_message = await env.sessions.add_message(session.id, "user", _LINEAR["intent"], writer_principal="route_user_message")
+    result = await env.composer.compose(
+        _LINEAR["intent"], [], _empty_state(), session_id=str(session.id), user_id="alice", user_message_id=str(user_message.id)
     )
-    user_message = await env.sessions.add_message(
-        session.id,
-        "user",
-        fixture["intent"],
-        writer_principal="route_user_message",
+    if result.raw_assistant_content is not None:
+        assert result.raw_assistant_content == _REPLY
+    else:
+        assert result.message == _REPLY
+    completion.assert_done()
+    assert completion.phases == ["end"]
+    assert_actual_audits(
+        env.app.state.session_engine, completion.requests, ("success", "success", "success", "success"), session_id=str(session.id)
     )
-    await env.composer.compose(
-        fixture["intent"],
-        [],
-        _empty_state(),
-        session_id=str(session.id),
-        user_id="alice",
-        user_message_id=str(user_message.id),
-    )
+    # The rejected and pending candidates have not changed the authoritative graph.
+    assert await env.sessions.get_current_state(session.id) is None
     proposals = await env.sessions.list_composition_proposals(session.id, status="pending")
-    if len(proposals) != 1:
-        raise AssertionError(f"freeform scripted repair staged {len(proposals)} proposals, expected exactly one")
+    assert len(proposals) == 1
     proposal = proposals[0]
+    assert proposal.pipeline_metadata.repair_count == 0  # Common proposal metadata is not a planner repair counter.
     async with env._client() as client:
         response = await client.post(
-            f"/api/sessions/{session.id}/proposals/{proposal.id}/accept",
-            json={"draft_hash": proposal.pipeline_metadata.draft_hash},
+            f"/api/sessions/{session.id}/proposals/{proposal.id}/accept", json={"draft_hash": proposal.pipeline_metadata.draft_hash}
         )
-    if response.status_code != 200:
-        raise AssertionError(f"freeform scripted repair accept failed ({response.status_code}): {response.text}")
+    assert response.status_code == 200, response.text
     return await env._committed_state(session.id), proposal
 
 
 def _disposition_rows(engine: Any) -> list[Any]:
-    """The durable ``planner_failure_disposition`` audit rows (freeform terminalization)."""
     with engine.connect() as conn:
         rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
     return [
@@ -134,115 +106,51 @@ def _disposition_rows(engine: Any) -> list[Any]:
     ]
 
 
-def _assert_allowlisted_feedback_shape(feedback: dict[str, Any], *, error_class: str) -> None:
-    """The repair feedback is the redaction-safe structured projection only."""
-    # "guidance" rides candidate-rejection feedback only (not the canonical
-    # schema projection) and is a STATIC usage line — never per-request data —
-    # so it does not widen the redaction boundary this allowlist protects.
-    # "truncation_notice" rides a rejection the candidate builder capped
-    # (elspeth-4fad98a453). Its only variable part is the integer count of
-    # defective components the builder did not list — a number ELSPETH
-    # derived from its own gates, never candidate content — so the closed
-    # equality below is what keeps it at zero egress.
-    assert {"success", "validation"} <= set(feedback) <= {"success", "validation", "guidance", "truncation_notice"}, feedback
-    if "guidance" in feedback:
-        assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
-    if "truncation_notice" in feedback:
-        withheld_count = re.fullmatch(
-            r"(\d+) further component\(s\) of this candidate also failed validation and are not listed here\. "
-            r"Repair every component named above and re-emit; the remaining failures are reported on the next turn\.",
-            feedback["truncation_notice"],
-        )
-        assert withheld_count is not None, feedback["truncation_notice"]
-        assert int(withheld_count.group(1)) > 0, feedback["truncation_notice"]
-    assert feedback["success"] is False
-    validation = feedback["validation"]
-    assert set(validation) == {"is_valid", "errors"}, validation
-    assert validation["is_valid"] is False
-    assert validation["errors"], "expected at least one structured error"
-    for entry in validation["errors"]:
-        # The four structured fields are always present. A closed error_code may
-        # additionally carry the STATIC (explanation, suggested_fix) catalogue
-        # text keyed by the code (tools.generation.explain_validation_code) — a
-        # public constant, never per-request data — so the redaction-safe
-        # allowlist widens by exactly those two paired keys. A schema-contract
-        # rejection may additionally carry the structured "contract" facts
-        # (producer/consumer component ids + schema FIELD NAMES from validated
-        # config — pipeline metadata, never row content; see
-        # SchemaContractDetail in composer.state). Nothing else may ride.
-        # A canonical-schema rejection may additionally carry
-        # "schema_violations": the JSON path of each structural violation, the
-        # violated keyword, and a scalar constraint from the schema the SAME
-        # provider was advertised — location and rule only, never the rejected
-        # value (elspeth-4fad98a453). Nothing else may ride.
-        assert {"component", "severity", "error_code", "error_class"} <= set(entry), entry
-        assert set(entry) <= {
-            "component",
-            "severity",
-            "error_code",
-            "error_class",
-            "explanation",
-            "suggested_fix",
-            "contract",
-            "schema_violations",
-            "schema_violations_withheld",
-        }, entry
-        assert ("explanation" in entry) == ("suggested_fix" in entry), entry
-        if "contract" in entry:
-            assert set(entry["contract"]) <= {"producer", "consumer", "missing_fields", "extra_fields"}, entry
-        for violation in entry["schema_violations"] if "schema_violations" in entry else ():
-            assert {"path", "rule"} <= set(violation), violation
-            assert set(violation) <= {"path", "rule", "constraint", "detail"}, violation
-        assert entry["error_class"] == error_class
-    # No provider prose, plugin name, option value, or raw message may ride
-    # the feedback. The static catalogue enrichment legitimately mentions the
-    # WORD "options" (e.g. "patch_node_options"), so the leak canary checks
-    # the redaction boundary itself: no "message" key (raw validation text)
-    # and no denied-plugin identifier anywhere in the projection.
-    blob = json.dumps(feedback)
-    assert _POLICY_DENIED_TRANSFORM not in blob
-    assert '"message"' not in blob
-
-
-# --------------------------------------------------------------------------- #
-# Freeform: repair success / exhaustion / policy rejection                    #
-# --------------------------------------------------------------------------- #
-
-
 @pytest.mark.asyncio
 async def test_freeform_one_repair_converges_to_reference_graph(parity_env: ParityEnv) -> None:
-    """A malformed terminal, then a valid one: converges with repair_count == 1."""
     reference = parity_env.reference_state(_LINEAR)
     session = await parity_env.sessions.create_session("alice", "Alice", "local")
     valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
-    completion = _ScriptedCompletion(
-        emit_proposal_response(_malformed_missing_edges(valid)),
-        emit_proposal_response(valid),
-    )
+    malformed = _malformed_missing_edges(valid)
+    # Independent controls: the omitted field trips the live S-gate, the valid
+    # neighbor passes it, and the actual feedback is produced by that same owner.
+    with pytest.raises(ToolArgumentError) as rejected:
+        require_schema_valid_arguments("set_pipeline", malformed)
+    expected = arg_error_payload(rejected.value, "set_pipeline")
+    assert any(item["loc"] == ["edges"] and item["type"] == "missing" for item in expected["validation_errors"])
+    require_schema_valid_arguments("set_pipeline", valid)
+    completion = _repair_script(parity_env, malformed, valid)
 
-    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion, session)
+    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session)
 
     assert_isomorphic(committed, reference, left="freeform-one-repair:linear_transform", right="reference")
-    assert proposal.pipeline_metadata.repair_count == 1
-    assert len(completion.requests) == 2, "exactly one malformed attempt plus one valid attempt"
-    # The repair feedback that provoked the second attempt is the schema projection.
-    _assert_allowlisted_feedback_shape(_last_tool_feedback(completion.requests[1]), error_class="SchemaValidationError")
+    assert _last_tool_feedback(completion.requests[1]) == expected
 
 
 @pytest.mark.asyncio
 async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(parity_env: ParityEnv) -> None:
-    """Every terminal malformed: REPAIR_EXHAUSTED → planner_repair_exhausted 500 + one closed disposition row."""
+    """The existing common call allowance bounds repeated failed tool attempts.
+
+    This ports the public bounded-failure control; the retired hatch and its
+    planner repair counter are deliberately not represented as live evidence.
+    """
+    bounded = parity_env.app.state.settings.model_copy(update={"composer_planner_max_provider_calls": 2})
+    parity_env.monkeypatch.setattr(parity_env.composer, "_settings", bounded)
     async with parity_env._client() as client:
         created = await client.post("/api/sessions", json={"title": "freeform repair exhaustion"})
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
         valid = _valid_pipeline(parity_env, _LINEAR, session_id)
-        malformed = emit_proposal_response(_malformed_missing_edges(valid))
-        # Budget is 2 (parity settings inherit the WebSettings default); the third
-        # malformed terminal makes repair_count == 3 > 2, which now engages the
-        # escape-hatch overtime turn on the advisor model. A fourth malformed
-        # terminal spends the hatch, so the original REPAIR_EXHAUSTED stands.
-        completion = _ScriptedCompletion(malformed, malformed, malformed, malformed)
+        malformed = _malformed_missing_edges(valid)
+        completion = CommonSDK(
+            request=_LINEAR["intent"],
+            candidate=_REPLY,
+            steps=(
+                Step("primary", tool_name="set_pipeline", arguments={"pipeline": malformed}),
+                Step("primary", tool_name="set_pipeline", arguments={"pipeline": malformed}),
+            ),
+        )
+        completion.bind(parity_env.composer, parity_env.monkeypatch)
         parity_env.monkeypatch.setattr("litellm.acompletion", completion)
         settled = await submit_and_settle(
             client,
@@ -252,39 +160,43 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
         )
 
     status, body = settled.error()
-    assert status == 500, settled.final.text
-    detail = body["detail"]
-    assert detail["error_type"] == "composer_planner_failure"
-    assert detail["failure_code"] == "planner_repair_exhausted"
-    assert len(completion.requests) == 4, "repair_budget + 1 primary calls, then the spent escape-hatch turn"
-    assert completion.requests[3]["model"] != completion.requests[0]["model"], "overtime turn runs on the advisor model"
-
+    assert status == 502, settled.final.text
+    assert body["detail"]["error_type"] == "composer_planner_failure"
+    assert body["detail"]["failure_code"] == "invalid_provider_response"
+    assert body["detail"]["planner_code"] == "PROVIDER_CALLS_EXHAUSTED"
+    completion.assert_done()
+    assert completion.phases == []
+    assert_actual_audits(parity_env.app.state.session_engine, completion.requests, ("success", "success"), session_id=session_id)
     rows = _disposition_rows(parity_env.app.state.session_engine)
-    assert len(rows) == 1, "exactly one durable closed failure-disposition audit row"
+    assert len(rows) == 1
     envelope = rows[0].tool_calls[0]
-    assert envelope["failure_code"] == "planner_repair_exhausted"
+    assert envelope["failure_code"] == "invalid_provider_response"
+    assert envelope["planner_code"] == "PROVIDER_CALLS_EXHAUSTED"
     assert envelope["surface"] == "freeform"
-    # The disposition names the wall: the last rejection's closed validation
-    # codes, so a live exhaustion 500 is diagnosable from the DB alone.
-    assert envelope["rejection_codes"], "exhaustion disposition must carry the last rejection codes"
+    assert await parity_env.sessions.get_current_state(UUID(session_id)) is None
+    assert await parity_env.sessions.list_composition_proposals(UUID(session_id)) == []
 
 
 @pytest.mark.asyncio
 async def test_freeform_policy_denied_candidate_is_rejected_with_allowlisted_shape(parity_env: ParityEnv) -> None:
-    """A policy-denied plugin is rejected with the allowlisted candidate feedback, then repaired."""
     reference = parity_env.reference_state(_LINEAR)
     session = await parity_env.sessions.create_session("alice", "Alice", "local")
     valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
-    completion = _ScriptedCompletion(
-        emit_proposal_response(_policy_denied_variant(valid)),
-        emit_proposal_response(valid),
-    )
+    denied = _policy_denied_variant(valid)
+    require_schema_valid_arguments("set_pipeline", denied)
+    completion = _repair_script(parity_env, denied, valid)
 
-    committed, proposal = await _drive_freeform_scripted(parity_env, _LINEAR, completion, session)
+    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session)
 
     assert_isomorphic(committed, reference, left="freeform-policy-rejection:linear_transform", right="reference")
-    assert proposal.pipeline_metadata.repair_count == 1
-    assert len(completion.requests) == 2
-    # Candidate authorization rejection → ValidationError projection (NOT the schema
-    # projection the one-repair case trips), carrying no denied-plugin leak.
-    _assert_allowlisted_feedback_shape(_last_tool_feedback(completion.requests[1]), error_class="ValidationError")
+    feedback = _last_tool_feedback(completion.requests[1])
+    assert feedback["success"] is False
+    assert feedback["validation"]["is_valid"] is False
+    (rejection,) = [entry for entry in feedback["validation"]["errors"] if entry["error_code"] == "plugin_not_enabled"]
+    assert rejection["component"] == "rejected_mutation"
+    assert rejection["rejected_component"] == f"node:{valid['nodes'][0]['id']}"
+    guidance = feedback["validation_guidance"]["codes"]["plugin_not_enabled"]
+    assert (guidance["explanation"], guidance["suggested_fix"]) == explain_validation_code("plugin_not_enabled")
+    # The actual policy producer gives a closed generic refusal, not the denied
+    # identifier. This is a live envelope check, not the removed planner wrapper.
+    assert _POLICY_DENIED_TRANSFORM not in json.dumps(feedback)

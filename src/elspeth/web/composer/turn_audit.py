@@ -34,6 +34,9 @@ from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, RejectionRecord
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+
 
 def _serialize_response_via_walker(
     outcome: _ToolOutcome,
@@ -279,6 +282,7 @@ async def persist_turn_audit(
     chat_ingress_inputs: list[ChatIngressInput] | None = None,
     required_work: RequiredWorkBinding | None = None,
     turn_evidence: TurnEvidence | None = None,
+    continuation: ContinuationLiveP4 | None = None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -481,6 +485,7 @@ async def persist_turn_audit(
     checkpoint_projection = None
     effect_verification_failure = None
     audit_outcome: AuditOutcome | None = None
+    effects_before = turn_evidence.effects if turn_evidence is not None else None
     if session_id is not None:
         if type(session_operation_context) is not SessionOperationContext:
             raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
@@ -544,11 +549,85 @@ async def persist_turn_audit(
             if type(required_work) is not RequiredWorkBinding:
                 raise AuditIntegrityError("Compose checkpoint requires a nominal required-work binding")
             required_work.validate_context(session_operation_context)
-            checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
-                RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
-            )
+            if continuation is None:
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
         try:
-            if checkpoint_sql is None:
+            if continuation is not None:
+                from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+                from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4
+
+                if (
+                    type(continuation) is not ContinuationLiveP4
+                    or continuation.work is not required_work
+                    or continuation.inventory.running.session_operation_context is not session_operation_context
+                    or type(required_work) is not RequiredWorkBinding
+                ):
+                    raise AuditIntegrityError("V2 P4 publication changed its retained current phase/ticket owners")
+                prepared = capture_prepared_p4(
+                    context=session_operation_context,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_calls=redacted_assistant_tool_calls,
+                    redacted_rows=redacted_tool_rows,
+                    revoked_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    withheld_replies=continuation.withheld_replies,
+                    invocations=private_invocations,
+                    authorings=private_authorings,
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    assistant_row_uses_current_dispatch=assistant_row_uses_current_dispatch,
+                    crash_pending=crash_pending,
+                    env_ref_names=continuation.inventory.names,
+                )
+                commit = await continuation.prepare(prepared)
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
+                try:
+                    continuation.bind_checkpoint_ticket(checkpoint_sql)
+                except BaseException as original:
+                    # This exact local reservation has not reached the physical
+                    # service call. Preserve its real no-submission failure;
+                    # the existing outer handler closes the paired projection.
+                    try:
+                        checkpoint_sql.complete_without_submission(original)
+                    except BaseException as cleanup:
+                        if cleanup is original:
+                            raise
+                        raise BaseExceptionGroup("P4 checkpoint binding and no-submission cleanup", (original, cleanup)) from None
+                    raise
+                physical = await sessions_service.persist_continuation_compose_turn(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                    continuation=commit,
+                    continuation_prepared=prepared,
+                    continuation_env_ref_names=continuation.inventory.names,
+                    required_work=checkpoint_sql,
+                    continuation_observation=continuation.writer_observation,
+                )
+                audit_outcome = continuation.accept_physical(checkpoint_sql, physical)
+            elif checkpoint_sql is None:
                 audit_outcome = await sessions_service.persist_compose_turn_async(
                     session_id=session_id,
                     assistant_content=assistant_message.content or "",
@@ -697,10 +776,19 @@ async def persist_turn_audit(
             effect_verification_failure=effect_verification_failure,
             authority_revocation=authority_revocation,
         )
+        if continuation is not None:
+            from elspeth.web.composer.continuation_live_p4_application import finish_live_p4_application
+
+            continuation.publication = result
+            if effects_before is None:
+                raise AuditIntegrityError("continuation publication lost its actual before effects owner")
+            await finish_live_p4_application(continuation, effects_before=effects_before)
     except BaseException as exc:
         if checkpoint_projection is not None:
             checkpoint_projection.complete_owned(exc)
         raise
     if checkpoint_projection is not None:
         checkpoint_projection.complete_owned(effect_verification_failure)
+    if continuation is not None:
+        continuation.raise_after_publication()
     return result

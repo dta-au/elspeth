@@ -114,7 +114,7 @@ async def test_two_actual_applications_restore_one_shared_graph_and_do_not_repea
         selected, inventory, restored = await read_current(operation_store, running)
         assert restored.batch is restored.evidence._portable_p4_graph.selected
         assert restored.evidence.effects is restored.evidence._portable_p4_graph.effects
-        assert restored.evidence.effects.committed_revision_ids == applied.bundle.evidence_after.effects.committed_revision_ids
+        assert restored.evidence.effects.committed_revision_ids == applied.bundle.evidence_after.snapshot.effects.committed_revision_ids
         assert restored.batch.batch.p4 is None
         assert restored.batch.batch.phase == "complete"
         running2, selected2, inventory2, _snapshot, second = await second_pending(operation_store, running)

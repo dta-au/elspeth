@@ -97,8 +97,6 @@ def _quarantine_rejection_state() -> CompositionState:
 
 
 def test_real_quarantine_producer_has_direct_repair_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
     state = _quarantine_rejection_state()
     entry = next(error for error in state.validate().errors if error.component == "source" and "on_validation_failure" in error.message)
     code = entry.error_code
@@ -109,10 +107,9 @@ def test_real_quarantine_producer_has_direct_repair_guidance() -> None:
     assert code in direct
     assert "on_validation_failure" in guidance[0]
     assert "discard" in guidance[1]
-    feedback = _allowlisted_candidate_feedback(
-        generation.ToolResult(success=False, updated_state=state, validation=state.validate(), affected_nodes=())
-    )
-    reported = next(error for error in feedback["validation"]["errors"] if error["error_code"] == code)
+    inline = generation.build_validation_guidance(error.error_code for error in state.validate().errors)
+    assert inline is not None
+    reported = inline["codes"][code]
     assert reported["explanation"] == guidance[0]
     assert reported["suggested_fix"] == guidance[1]
 
@@ -138,8 +135,7 @@ def test_real_producer_witness_detects_missing_direct_index_record(monkeypatch: 
         test_real_quarantine_producer_has_direct_repair_guidance()
 
 
-def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+def test_real_count_rejection_carries_mode_choice_guidance() -> None:
     from tests.unit.web.composer.test_set_pipeline_candidate import _trained_context
 
     context = _trained_context()
@@ -175,8 +171,8 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
     assert result.validation.suggestions == standing.suggestions
     assert result.validation.edge_contracts == standing.edge_contracts
     assert result.validation.semantic_contracts == standing.semantic_contracts
-    (reported,) = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert (reported["error_code"], reported["component"]) == (code, "node:batch")
+    assert result.validation_guidance is not None
+    reported = result.validation_guidance["codes"][code]
     guidance = generation._VALIDATION_GUIDANCE_BY_CODE[code]
     assert isinstance(guidance, generation.DirectValidationGuidance)
     assert (reported["explanation"], reported["suggested_fix"]) == (guidance.explanation, guidance.suggested_fix)
@@ -185,15 +181,15 @@ def test_real_count_rejection_reaches_planner_with_mode_choice_guidance() -> Non
     assert "different row semantics" in reported["suggested_fix"]
 
 
-def test_real_diff_without_baseline_retains_planner_guidance() -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
+def test_real_diff_without_baseline_has_catalogue_guidance() -> None:
     result = execute_tool("diff_pipeline", {}, _empty_state(), _mock_catalog())
     assert not result.success
-    (reported,) = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert reported["error_code"] == "diff_baseline_unavailable"
-    assert "baseline" in reported["explanation"].lower()
-    assert reported["suggested_fix"]
+    assert result.validation.errors[0].error_code == "diff_baseline_unavailable"
+    guidance = generation.explain_validation_code("diff_baseline_unavailable")
+    assert guidance is not None
+    explanation, suggested_fix = guidance
+    assert "baseline" in explanation.lower()
+    assert suggested_fix
 
 
 @pytest.mark.parametrize(
@@ -204,9 +200,7 @@ def test_real_diff_without_baseline_retains_planner_guidance() -> None:
         ("require_all", "select", "coalesce_merge_select_unsupported"),
     ],
 )
-def test_real_coalesce_rejections_retain_planner_guidance(policy: str, merge: str, code: str) -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-
+def test_real_coalesce_rejections_have_inline_guidance(policy: str, merge: str, code: str) -> None:
     node = NodeSpec(
         id="merge",
         node_type="coalesce",
@@ -225,8 +219,9 @@ def test_real_coalesce_rejections_retain_planner_guidance(policy: str, merge: st
     state = replace(_empty_state(), nodes=(node,))
     validation = state.validate()
     assert any(entry.error_code == code for entry in validation.errors)
-    result = generation.ToolResult(success=False, updated_state=state, validation=validation, affected_nodes=())
-    reported = next(entry for entry in _allowlisted_candidate_feedback(result)["validation"]["errors"] if entry["error_code"] == code)
+    inline = generation.build_validation_guidance(entry.error_code for entry in validation.errors)
+    assert inline is not None
+    reported = inline["codes"][code]
     assert reported["explanation"]
     assert reported["suggested_fix"]
 

@@ -115,14 +115,8 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
         "and the original tool producer remains the census authority"
     ),
 }
-# Sites on a surface this gate's taught side does not cover. The taught text is the COMPOSER skill
-# plus the composer tool descriptions (``_teaching_blocks``); the planner reads pipeline_capabilities.md
-# and its own briefs, so admitting planner payloads here would ask the composer skill to teach a
-# wire no composer model ever sees. Their shapes are closed by owned types and pinned in
-# test_pipeline_planner.py instead.
-_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE: dict[tuple[str, str], str] = {
-    ("pipeline_planner.py", "_serialize_provider_discovery_result"): "planner disclosure surface",
-}
+# No producer is excluded from the live Composer tool surface.
+_DATA_SITES_OFF_THE_COMPOSER_TOOL_SURFACE: dict[tuple[str, str], str] = {}
 
 
 class ShippedKey(NamedTuple):
@@ -3236,6 +3230,18 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     # Adjudicated 0.8.10: CommonProviderCostRefused is a refusal, not a provider error; its
     # outbound_call_made says whether the refused call reached the provider. Exact keys.
     "cost_refusal_payload": ("success", "status", "code", "outbound_call_made"),
+    # Preparation refusal is a completed semantic tool outcome. No physical
+    # call left the process; the reservation is released before this payload.
+    "context_payload": (
+        "success",
+        "outbound_call_made",
+        "error_type",
+        "failure_code",
+        "reason",
+        "detail",
+        "budget_used",
+        "budget_remaining",
+    ),
     "success_payload": (
         "status",
         "guidance",

@@ -113,7 +113,7 @@ def _restore_first_graph(
         service, session_id=str(running.claim.session_id), context=running.session_operation_context
     )
     graph = _finish_current_evidence(
-        snapshot,
+        inputs.admitted_evidence,
         context=running.session_operation_context,
         owner=evidence,
         initial=initial,

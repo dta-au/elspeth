@@ -23,7 +23,7 @@ export function ComposerOperationOutcomeNotice({ outcome }: { outcome: ComposerO
       ) : saved.count === 0 ? (
         <p>No draft revisions were saved by this operation. Earlier draft changes remain available.</p>
       ) : (
-        <p>This operation saved {saved.count} draft revisions, last saved version {saved.latest_version}. Later changes may be newer.</p>
+        <p>{outcome.failure_code === "request_cancelled" && "Saved draft changes remain available. "}This operation saved {saved.count} draft {saved.count === 1 ? "revision" : "revisions"}, last saved version {saved.latest_version}. Later changes may be newer.</p>
       )}
       <p>Support reference: <code>{reference}</code></p>
     </aside>

@@ -32,6 +32,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.validation import _redact_sensitive_content
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_p4_application import HistoricalP4Application
 
 
@@ -376,6 +377,7 @@ class TurnEvidence:
         "_pending_deliveries",
         "_portable_p4_entry",
         "_portable_p4_graph",
+        "_portable_p4_sources",
         "_quoted_inspections",
         "_registration_revision",
         "_retained_history",
@@ -440,6 +442,7 @@ class TurnEvidence:
 
         self._portable_p4_entry: PortableP4ApplicationEntry | None = None
         self._portable_p4_graph: ApplicationGraph | None = None
+        self._portable_p4_sources: tuple[PrivateChunk, ...] = ()
         self._continuation_actor_user_id = actor_user_id
         self._continuation_current_epoch = (
             session_operation_context.fence.operation_epoch if session_operation_context is not None else None

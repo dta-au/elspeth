@@ -10,12 +10,14 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import litellm
 import pytest
 import structlog
 from hypothesis import example, given, settings
@@ -24,6 +26,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 from tests.fixtures.identities import grant_test_pipeline_user
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 from tests.property.web.composer.strategies import (
@@ -44,19 +47,14 @@ from tests.property.web.composer.strategies import (
 
 import elspeth.web.composer.tool_batch as composer_tool_batch_module
 from elspeth.contracts.prompt_guard import (
-    PromptGuardContentPart,
     PromptGuardDecision,
     PromptGuardRequest,
-    PromptGuardToolArgumentParts,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
-from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.redaction import REDACTED_UNKNOWN_RESPONSE_KEY
 from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
@@ -113,23 +111,9 @@ class _FakeLLMResponse:
     choices: list[_FakeChoice]
 
 
-class _ReplayLLM:
-    def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
-        self._responses = list(responses)
-
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> _AdmittedLLMCompletion:
-        assert self._responses, "No further primary response is supplied by this trace"
-        return self._responses.pop(0)
+class _ReplayLLM(ComposerSDKScript):
+    def __init__(self, responses: tuple[_FakeLLMResponse, ...]) -> None:
+        super().__init__(primary_model=EVAL_MODEL, primary=responses)
 
 
 class _BlockingLLM:
@@ -137,20 +121,17 @@ class _BlockingLLM:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> _AdmittedLLMCompletion:
+    async def __call__(self, **kwargs: Any) -> _FakeLLMResponse:
+        assert kwargs["model"] == EVAL_MODEL and kwargs["tools"]
         self.entered.set()
         await self.release.wait()
         return _make_llm_response(content="Done.")
+
+
+@dataclass
+class _PhysicalSDKCall:
+    request: dict[str, Any]
+    status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +151,7 @@ class _Harness:
     guard_requests: list[PromptGuardRequest]
     guard_http_requests: list[dict[str, Any]]
     guard_observers: contextlib.ExitStack
+    primary_calls: list[_PhysicalSDKCall] = field(default_factory=list)
     completed_results: list[ComposeLoopTestResult] = field(default_factory=list)
 
     def release(self) -> None:
@@ -194,6 +176,9 @@ class _TraceOutcome:
     assistant_ids: frozenset[str]
     tool_call_ids: frozenset[str]
     rows: tuple[Any, ...]
+    # Complete rows above remain available; these atomic turn rows exclude
+    # only primary provider rows already validated against native custody.
+    turn_rows: tuple[Any, ...]
     state_rows: tuple[Any, ...]
     tool_row_tier1_violations: int
     tool_row_integrity_violations: int
@@ -222,7 +207,7 @@ def _mock_catalog() -> MagicMock:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _AdmittedLLMCompletion:
+) -> _FakeLLMResponse:
     fake_tool_calls: list[_FakeToolCall] | None = None
     if tool_calls is not None:
         fake_tool_calls = [
@@ -235,8 +220,7 @@ def _make_llm_response(
             )
             for tool_call in tool_calls
         ]
-    response = _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
-    return _admit_composer_llm_completion(response)
+    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=fake_tool_calls))])
 
 
 def _web_settings(data_dir: Path) -> WebSettings:
@@ -374,41 +358,87 @@ def _make_harness(tmp_path: Path, *, session_state: SessionState = "empty") -> _
 
 async def _run_one_turn(harness: _Harness, llm: Any) -> Any:
     driver = cast(Any, harness.service)
-    real_loop = driver._compose_loop
+    advisor_sdk = litellm.acompletion
 
-    async def owned_loop(message: str, *args: Any, **kwargs: Any) -> Any:
-        assert message == _CURRENT_REQUEST
-        assert kwargs["session_id"] == harness.session_id
-        assert kwargs["session_operation_context"] is harness.compose_context
-        assert "required_work" not in kwargs and "provider_owner" not in kwargs and "user_id" not in kwargs
-        harness.required_work.validate_context(harness.compose_context)
-        with prompt_guard_user_scope(message):
-            return await real_loop(
-                message,
-                *args,
-                **kwargs,
-                user_id=EVAL_USER_ID,
-                required_work=harness.required_work,
-                provider_owner=harness.provider_owner,
-            )
+    async def sdk(**kwargs: Any) -> object:
+        if "tools" not in kwargs:
+            # The outer trace supplies the one explicit END failure script.
+            # An absent script must never delegate to the real SDK.
+            assert isinstance(advisor_sdk, AsyncMock), "No physical Advisor script is installed for this trace"
+            return await advisor_sdk(**kwargs)
+        assert kwargs["model"] == EVAL_MODEL and kwargs["tools"]
+        call = _PhysicalSDKCall(deepcopy(kwargs))
+        harness.primary_calls.append(call)
+        try:
+            response = await llm(**kwargs)
+        except asyncio.CancelledError:
+            call.status = "cancelled"
+            raise
+        else:
+            call.status = "success"
+            return response
 
-    with patch.object(driver, "_compose_loop", new=owned_loop):
-        result = await driver._run_one_turn_for_test(
-            llm=llm,
-            session_id=harness.session_id,
-            session_operation_context=harness.compose_context,
-            message=_CURRENT_REQUEST,
-            initial_state=CompositionState(
-                source=None,
-                nodes=(),
-                edges=(),
-                outputs=(),
-                metadata=PipelineMetadata(),
-                version=1,
-            ),
-        )
+    harness.required_work.validate_context(harness.compose_context)
+    result = await driver._run_one_turn_for_test(
+        sdk=sdk,
+        session_id=harness.session_id,
+        session_operation_context=harness.compose_context,
+        message=_CURRENT_REQUEST,
+        required_work=harness.required_work,
+        provider_owner=harness.provider_owner,
+        user_id=EVAL_USER_ID,
+        initial_state=CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        ),
+    )
     harness.completed_results.append(result)
     return result
+
+
+def test_physical_sdk_mode_rejects_a_simultaneous_legacy_llm_script(tmp_path: Path) -> None:
+    harness = _make_harness(tmp_path)
+    script = _ReplayLLM((_make_llm_response(content="Done."),))
+    try:
+        with pytest.raises(ValueError, match="either the legacy llm script or the physical sdk script"):
+            asyncio.run(
+                harness.service._run_one_turn_for_test(
+                    llm=script, sdk=script, session_id=harness.session_id, session_operation_context=harness.compose_context
+                )
+            )
+        assert script.primary.call_count == 0
+        assert _provider_accounting_rows(harness) == ((), ())
+    finally:
+        harness.release()
+
+
+def test_physical_sdk_mode_refuses_a_conflicting_actual_provider_owner(tmp_path: Path) -> None:
+    current_root, foreign_root = tmp_path / "current", tmp_path / "foreign"
+    current_root.mkdir()
+    foreign_root.mkdir()
+    with contextlib.ExitStack() as cleanup:
+        harness = _make_harness(current_root)
+        cleanup.callback(harness.release)
+        foreign = _make_harness(foreign_root)
+        cleanup.callback(foreign.release)
+        script = _ReplayLLM((_make_llm_response(content="Done."),))
+        with pytest.raises(ValueError, match="owners must retain their exact binding and session service"):
+            asyncio.run(
+                harness.service._run_one_turn_for_test(
+                    sdk=script,
+                    session_id=harness.session_id,
+                    session_operation_context=harness.compose_context,
+                    required_work=harness.required_work,
+                    provider_owner=foreign.provider_owner,
+                    user_id=EVAL_USER_ID,
+                )
+            )
+        assert script.primary.call_count == 0
+        assert _provider_accounting_rows(harness) == _provider_accounting_rows(foreign) == ((), ())
 
 
 def _chat_rows(harness: _Harness) -> tuple[Any, ...]:
@@ -435,7 +465,7 @@ def _state_rows(harness: _Harness) -> tuple[Any, ...]:
         )
 
 
-def _assert_guard_row(harness: _Harness, row: Any) -> None:
+def _assert_guard_row(harness: _Harness, row: Any, *, request: PromptGuardRequest | None = None) -> None:
     assert row.role == "audit" and row.session_id == harness.session_id
     envelopes = json.loads(row.tool_calls)
     assert len(envelopes) == 1 and envelopes[0]["_kind"] == "prompt_guard_audit"
@@ -460,16 +490,35 @@ def _assert_guard_row(harness: _Harness, row: Any) -> None:
     assert str(uuid.UUID(check["audit_id"])) == check["audit_id"]
     assert check["operation_id"] == harness.compose_context.fence.operation_id
     assert check["operation_epoch"] == harness.compose_context.fence.operation_epoch
-    assert (check["role"], check["adapter"], check["mode"]) == ("advisor", "azure_prompt_shields", "required")
+    request = harness.guard_requests[-1] if request is None else request
+    assert (check["role"], check["adapter"], check["mode"]) == (request.role, "azure_prompt_shields", "required")
     assert (check["disposition"], check["reason"]) == ("allow", "clean")
-    assert len(harness.guard_requests) == 1
-    request = harness.guard_requests[0]
-    assert request.role == "advisor" and request.user_prompt == _CURRENT_REQUEST
+    assert request.role in {"composer", "advisor"} and request.user_prompt == _CURRENT_REQUEST
     assert check["policy_fingerprint"] == harness.guard_policy_fingerprint
     assert check["request_hash"] == request.request_hash
-    assert harness.guard_http_requests
+
+
+def _assert_all_guard_rows(harness: _Harness) -> set[str]:
+    guard_rows = []
+    for row in _chat_rows(harness):
+        envelopes = json.loads(row.tool_calls) if row.tool_calls else []
+        if envelopes and envelopes[0].get("_kind") == "prompt_guard_audit":
+            guard_rows.append(row)
+    primary_ids = set()
+    for row, request in zip(guard_rows, harness.guard_requests, strict=True):
+        _assert_guard_row(harness, row, request=request)
+        if request.role == "composer":
+            primary_ids.add(row.id)
+    assert [request.role for request in harness.guard_requests] == [
+        *("composer" for _ in harness.primary_calls),
+        *("advisor" for _ in harness.completed_results),
+    ]
     assert all(payload["userPrompt"] == _CURRENT_REQUEST for payload in harness.guard_http_requests)
-    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == request.documents
+    assert tuple(document for payload in harness.guard_http_requests for document in payload["documents"]) == tuple(
+        document for request in harness.guard_requests for document in request.documents
+    )
+    assert bool(harness.guard_http_requests) is bool(harness.guard_requests)
+    return primary_ids
 
 
 def _provider_accounting_rows(harness: _Harness) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
@@ -491,20 +540,23 @@ def _provider_accounting_rows(harness: _Harness) -> tuple[tuple[Any, ...], tuple
 
 def _assert_end_accounting(harness: _Harness, *, settled: bool) -> None:
     attempts, ledger = _provider_accounting_rows(harness)
-    assert len(attempts) == 1
-    attempt = attempts[0]
+    assert len(attempts) == len(harness.primary_calls) + 1
+    primary_ledger_ids = {entry.entry_id for entry in ledger if entry.model == EVAL_MODEL}
+    assert len(primary_ledger_ids) == len(harness.primary_calls)
+    (attempt,) = tuple(entry for entry in attempts if entry.ledger_entry_id not in primary_ledger_ids)
     assert attempt.identity_id == EVAL_USER_ID and attempt.session_id == harness.session_id
     assert attempt.source == "composer" and attempt.run_id is None
     assert attempt.operation_id == harness.compose_context.fence.operation_id
     assert attempt.operation_epoch == harness.compose_context.fence.operation_epoch
     assert attempt.lease_token == harness.compose_context.fence.lease_token
     if not settled:
-        assert attempt.settled_at is None and attempt.ledger_entry_id is None and ledger == ()
+        assert attempt.settled_at is None and attempt.ledger_entry_id is None
+        assert len(ledger) == len(harness.primary_calls)
         return
-    assert attempt.settled_at is not None and len(ledger) == 1
-    assert attempt.ledger_entry_id == ledger[0].entry_id
-    assert ledger[0].identity_id == EVAL_USER_ID and ledger[0].session_id == harness.session_id
-    assert ledger[0].source == "composer" and ledger[0].model == harness.service._settings.composer_advisor_model
+    assert attempt.settled_at is not None and len(ledger) == len(harness.primary_calls) + 1
+    (end_ledger,) = tuple(entry for entry in ledger if entry.entry_id == attempt.ledger_entry_id)
+    assert end_ledger.identity_id == EVAL_USER_ID and end_ledger.session_id == harness.session_id
+    assert end_ledger.source == "composer" and end_ledger.model == harness.service._settings.composer_advisor_model
     harness.required_work.coordinator.assert_completed()
 
 
@@ -599,6 +651,34 @@ def _instrument_tool_turn_commits(harness: _Harness, instrument: Callable[[Any],
             real_commit(connection)
 
     with patch.object(service, "persist_compose_turn", side_effect=persist), patch.object(service._engine.dialect, "do_commit", commit):
+        yield
+    assert not active_threads
+
+
+@contextlib.contextmanager
+def _instrument_tool_turn_locks(harness: _Harness, instrument: Callable[..., Any]) -> Iterator[None]:
+    """Keep lock failures on tool persistence, after actual provider settlement."""
+    service = harness.sessions_service
+    real_persist = service.persist_compose_turn
+    real_lock = service._session_write_lock
+    active_threads: set[int] = set()
+
+    def persist(**kwargs: Any) -> Any:
+        identity = threading.get_ident()
+        assert identity not in active_threads
+        active_threads.add(identity)
+        try:
+            return real_persist(**kwargs)
+        finally:
+            active_threads.remove(identity)
+
+    @contextlib.contextmanager
+    def lock(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        selected = instrument if threading.get_ident() in active_threads else real_lock
+        with selected(*args, **kwargs) as result:
+            yield result
+
+    with patch.object(service, "persist_compose_turn", new=persist), patch.object(service, "_session_write_lock", new=lock):
         yield
     assert not active_threads
 
@@ -714,7 +794,6 @@ async def _drive_trace_async(
         return True
 
     if cancellation_arrival_time == "during_advisory_lock_acquisition":
-        real_session_write_lock = harness.sessions_service._session_write_lock
         lock_entered = threading.Event()
         release_lock = threading.Event()
 
@@ -730,8 +809,7 @@ async def _drive_trace_async(
             )
             yield
 
-        harness.sessions_service._session_write_lock = _blocked_session_write_lock  # type: ignore[method-assign]
-        try:
+        with _instrument_tool_turn_locks(harness, _blocked_session_write_lock):
             task = asyncio.create_task(_run_one_turn(harness, llm))
             for _ in range(200):
                 if lock_entered.is_set():
@@ -746,8 +824,6 @@ async def _drive_trace_async(
             with pytest.raises(asyncio.CancelledError):
                 await task
             await asyncio.sleep(0)
-        finally:
-            harness.sessions_service._session_write_lock = real_session_write_lock  # type: ignore[method-assign]
         return True
 
     if cancellation_arrival_time == "after_commit_before_response_yielded":
@@ -907,16 +983,19 @@ def _drive_single_example_trace_with(
                     argument_dict=chosen_arguments,
                 )
             )
+    primary_row_ids = _assert_all_guard_rows(harness) | _assert_primary_settlement_rows(harness)
+    assert len(primary_row_ids) == 3 * len(harness.primary_calls)
     if harness.completed_results:
         assert not cancelled and len(harness.completed_results) == 1 and len(reviews) == 1
         _assert_end_accounting(harness, settled=True)
         assert len(sdk_messages) == 1
-        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0], sdk_messages[0])
+        _assert_completed_trace_ledger(harness, harness.completed_results[0], reviews[0], sdk_messages[0], primary_row_ids=primary_row_ids)
     else:
         assert reviews == [], "Cancellation or failed atomic persistence must prevent END dispatch"
         assert sdk_messages == []
-        assert harness.guard_requests == [] and harness.guard_http_requests == []
-        assert _provider_accounting_rows(harness) == ((), ())
+        # Primary work already crossed its real physical boundary. Cancellation
+        # and failed tool persistence must retain that independently settled audit.
+        assert all(request.role == "composer" for request in harness.guard_requests)
     outcome = _TraceOutcome(
         cancellation_arrival_time=cancellation_arrival_time,
         operation_id=harness.compose_context.fence.operation_id,
@@ -925,6 +1004,7 @@ def _drive_single_example_trace_with(
         assistant_ids=frozenset(row.id for row in _chat_rows(harness) if row.role == "assistant"),
         tool_call_ids=frozenset(row.tool_call_id for row in _chat_rows(harness) if row.role == "tool"),
         rows=_chat_rows(harness),
+        turn_rows=tuple(row for row in _chat_rows(harness) if row.id not in primary_row_ids),
         state_rows=_state_rows(harness),
         tool_row_tier1_violations=observed_value(harness.sessions_service._telemetry.tool_row_tier1_violation_total),
         tool_row_integrity_violations=observed_value(harness.sessions_service._telemetry.tool_row_integrity_violation_total),
@@ -934,7 +1014,15 @@ def _drive_single_example_trace_with(
     return outcome
 
 
-def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], sdk_messages: list[dict[str, Any]]) -> None:
+def _assert_provider_settlement_rows(
+    harness: _Harness,
+    rows: tuple[Any, ...],
+    sdk_messages: list[dict[str, Any]],
+    *,
+    sdk_tools: list[dict[str, Any]] | None = None,
+    status: str = "auth_error",
+    model: str | None = None,
+) -> None:
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer.audit import _LLM_CALL_PUBLIC_AUDIT_FIELDS
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, diagnostic_evidence_identity
@@ -956,14 +1044,28 @@ def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], s
     call = envelopes[0]["call"]
     assert set(call) == set(_LLM_CALL_PUBLIC_AUDIT_FIELDS)
     attempts, ledger = _provider_accounting_rows(harness)
-    assert len(attempts) == len(ledger) == 1
-    assert call["call_id"] == attempts[0].attempt_id
-    assert attempts[0].ledger_entry_id == ledger[0].entry_id
-    assert call["model_requested"] == ledger[0].model == harness.service._settings.composer_advisor_model
-    assert (call["status"], call["error_class"], call["error_message"]) == ("auth_error", "AuthenticationError", "AuthenticationError")
+    assert len(attempts) == len(ledger) == len(harness.primary_calls) + len(harness.completed_results)
+    (attempt,) = tuple(entry for entry in attempts if entry.attempt_id == call["call_id"])
+    (usage,) = tuple(entry for entry in ledger if entry.entry_id == attempt.ledger_entry_id)
+    assert attempt.settled_at is not None
+    assert attempt.identity_id == usage.identity_id == EVAL_USER_ID
+    assert attempt.session_id == usage.session_id == harness.session_id
+    assert attempt.source == usage.source == "composer" and attempt.run_id is usage.run_id is None
+    assert attempt.operation_id == harness.compose_context.fence.operation_id
+    assert attempt.operation_epoch == harness.compose_context.fence.operation_epoch
+    assert attempt.lease_token == harness.compose_context.fence.lease_token
+    assert call["model_requested"] == usage.model == (model or harness.service._settings.composer_advisor_model)
+    errors = {
+        "success": (None, None),
+        "cancelled": ("CancelledError", "CancelledError"),
+        "auth_error": ("AuthenticationError", "AuthenticationError"),
+    }
+    assert (call["status"], call["error_class"], call["error_message"]) == (status, *errors[status])
     assert call["model_returned"] is None and call["provider_request_id"] is None and call["finish_reason"] is None
     assert call["messages_hash"] == stable_hash(sdk_messages)
-    assert call["tools_spec_hash"] is None and call["declared_tool_names"] == []
+    assert call["tools_spec_hash"] == (stable_hash(sdk_tools) if sdk_tools is not None else None)
+    assert set(call["declared_tool_names"]) == {tool["function"]["name"] for tool in sdk_tools or ()}
+    assert len(call["declared_tool_names"]) == len(sdk_tools or ())
 
     assert request_row.content == "Private credential-filtered diagnostic facts"
     envelopes = json.loads(request_row.tool_calls)
@@ -972,13 +1074,13 @@ def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], s
         envelopes[0],
         expected_session_id=harness.session_id,
         expected_operation_id=harness.compose_context.fence.operation_id,
-        expected_tool_call_id=attempts[0].attempt_id,
+        expected_tool_call_id=attempt.attempt_id,
     )
     assert request.operation_epoch == harness.compose_context.fence.operation_epoch
-    assert request.evidence_id == diagnostic_evidence_identity("provider-request", attempts[0].attempt_id)
+    assert request.evidence_id == diagnostic_evidence_identity("provider-request", attempt.attempt_id)
     assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
     # Apply the real privacy policy to the actual SDK input; generated text need not always be retainable.
-    expected = capture_provider_context(messages=sdk_messages, tools=None)
+    expected = capture_provider_context(messages=sdk_messages, tools=sdk_tools)
     assert (request.arguments.disposition, request.arguments.content, request.arguments.reasons) == (
         expected.disposition,
         expected.canonical,
@@ -993,8 +1095,54 @@ def _assert_provider_settlement_rows(harness: _Harness, rows: tuple[Any, ...], s
     )
 
 
+def _assert_primary_settlement_rows(harness: _Harness) -> set[str]:
+    rows = _chat_rows(harness)
+    calls = []
+    requests = {}
+    all_call_ids = set()
+    for row in rows:
+        envelopes = json.loads(row.tool_calls) if row.tool_calls else []
+        if not envelopes:
+            continue
+        if envelopes[0].get("_kind") == "llm_call_audit":
+            call = envelopes[0]["call"]
+            assert call["call_id"] not in all_call_ids
+            all_call_ids.add(call["call_id"])
+            if call["model_requested"] == EVAL_MODEL:
+                calls.append((row, call))
+        elif envelopes[0].get("_kind") == "composer_diagnostic_evidence" and envelopes[0]["evidence"]["status"] == "provider_request":
+            identity = envelopes[0]["evidence"]["tool_call_id"]
+            assert identity not in requests
+            requests[identity] = row
+    attempts, ledger = _provider_accounting_rows(harness)
+    assert len(all_call_ids) == len(harness.primary_calls) + len(harness.completed_results)
+    assert all_call_ids == {attempt.attempt_id for attempt in attempts} == set(requests)
+    assert all(attempt.settled_at is not None for attempt in attempts)
+    assert {attempt.ledger_entry_id for attempt in attempts} == {entry.entry_id for entry in ledger}
+    assert len(attempts) == len(ledger)
+    validated_ids = set()
+    for (row, audit), sdk in zip(calls, harness.primary_calls, strict=True):
+        assert sdk.status in {"success", "cancelled"}
+        request_row = requests[audit["call_id"]]
+        _assert_provider_settlement_rows(
+            harness,
+            (row, request_row),
+            sdk.request["messages"],
+            sdk_tools=sdk.request["tools"],
+            status=sdk.status,
+            model=sdk.request["model"],
+        )
+        validated_ids.update((row.id, request_row.id))
+    return validated_ids
+
+
 def _assert_completed_trace_ledger(
-    harness: _Harness, result: ComposeLoopTestResult, review: dict[str, Any], sdk_messages: list[dict[str, Any]]
+    harness: _Harness,
+    result: ComposeLoopTestResult,
+    review: dict[str, Any],
+    sdk_messages: list[dict[str, Any]],
+    *,
+    primary_row_ids: set[str],
 ) -> None:
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer import advisor_policy, no_tool_policy
@@ -1004,7 +1152,10 @@ def _assert_completed_trace_ledger(
     from elspeth.web.composer.withheld_replies import withheld_reply_envelope
     from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_or_tool_messages
 
-    rows = _chat_rows(harness)
+    assert len(harness.primary_calls) == 2 and all(call.status == "success" for call in harness.primary_calls)
+    # Remove only primary rows already validated against each actual SDK input,
+    # original call/attempt/ledger and guard request. Keep the exact END oracle.
+    rows = tuple(row for row in _chat_rows(harness) if row.id not in primary_row_ids)
     prior = rows[:1] if rows[0].role == "user" else ()
     if prior:
         assert prior[0].content == "prior"
@@ -1096,10 +1247,12 @@ def _drive_advisory_lock_failure_trace(
 ) -> None:
     from elspeth.contracts.errors import AuditIntegrityError
 
-    real_session_write_lock = harness.sessions_service._session_write_lock
+    fired = False
 
     @contextlib.contextmanager
     def _unavailable_session_write_lock(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal fired
+        fired = True
         raise OperationalError(
             "session write lock acquisition",
             {},
@@ -1116,12 +1269,9 @@ def _drive_advisory_lock_failure_trace(
             _make_llm_response(content="Done."),
         )
     )
-    harness.sessions_service._session_write_lock = _unavailable_session_write_lock  # type: ignore[method-assign]
-    try:
-        with pytest.raises(AuditIntegrityError):
-            asyncio.run(_run_one_turn(harness, llm))
-    finally:
-        harness.sessions_service._session_write_lock = real_session_write_lock  # type: ignore[method-assign]
+    with _instrument_tool_turn_locks(harness, _unavailable_session_write_lock), pytest.raises(AuditIntegrityError):
+        asyncio.run(_run_one_turn(harness, llm))
+    assert fired, "failure injection must reach the tool persistence lock"
 
 
 def _drive_commit_failure_trace(
@@ -1296,7 +1446,7 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_response_yielded",
     }:
         if cancellation_arrival_time == "after_response_yielded":
-            assert [row.role for row in outcome.rows] == [
+            assert [row.role for row in outcome.turn_rows] == [
                 "assistant",
                 "tool",
                 "audit",
@@ -1308,10 +1458,10 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
                 "audit",
                 "audit",
             ]
-            assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.rows[1].composition_state_id
+            assert len(outcome.state_rows) == 1 and outcome.state_rows[0].id == outcome.turn_rows[1].composition_state_id
         else:
-            assert [row.role for row in outcome.rows] == ["assistant", "tool", "audit"]
-        _assert_private_tool_cohort(outcome.rows[:3], outcome.operation_id, outcome.operation_epoch)
+            assert [row.role for row in outcome.turn_rows] == ["assistant", "tool", "audit"]
+        _assert_private_tool_cohort(outcome.turn_rows[:3], outcome.operation_id, outcome.operation_epoch)
     if cancellation_arrival_time in {
         "before_llm_call",
         "during_llm_call",
@@ -1320,7 +1470,7 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_tool_before_sync_dispatch",
         "during_advisory_lock_acquisition",
     }:
-        assert outcome.rows == ()
+        assert outcome.turn_rows == ()
 
 
 def test_failure_injection_strategy_contains_required_arms() -> None:
@@ -1344,7 +1494,7 @@ def test_failure_injection_arms_are_mechanically_drivable(failure_injection_poin
         "advisory_lock_unavailable",
         "tool_call_cap_exceeded",
     }:
-        assert outcome.rows == ()
+        assert outcome.turn_rows == ()
 
 
 def test_otel_counter_postconditions() -> None:
@@ -1369,4 +1519,4 @@ def test_otel_counter_postconditions() -> None:
     )
     assert tier1.tool_row_tier1_violations == 1
     assert tier1.tool_row_integrity_violations == 0
-    assert tier1.rows == ()
+    assert tier1.turn_rows == ()

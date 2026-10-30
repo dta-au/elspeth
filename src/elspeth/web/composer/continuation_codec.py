@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import Field, JsonValue, ValidationError
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMProviderCostSource
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -30,6 +31,8 @@ from elspeth.web.composer.continuation import (
     InitializeFrame,
     PrivateChunkRef,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
+from elspeth.web.continuation_retention_memo import PrivateChunkVerificationKey, SnapshotDecodeKey, current_retention_stage_memo
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_progress import ContinuationFrontier
@@ -45,6 +48,13 @@ def encode_continuation_snapshot(frame_stack: ContinuationFrameStack) -> str:
 
 
 def decode_continuation_snapshot(encoded: str) -> ContinuationFrameStack:
+    memo = current_retention_stage_memo()
+    if memo is None or type(encoded) is not str:
+        return _decode_continuation_snapshot_uncached(encoded)
+    return memo.snapshot(SnapshotDecodeKey(encoded), _decode_continuation_snapshot_uncached)
+
+
+def _decode_continuation_snapshot_uncached(encoded: str) -> ContinuationFrameStack:
     from elspeth.web.composer.continuation_policy import decode_continuation_policy
 
     value, error = parse_json_strict(encoded)
@@ -69,6 +79,20 @@ class PrivateChunk:
     canonical: str
 
 
+def encode_mandatory_private_chunk(*, codec: str, value: object, env_ref_names: frozenset[str] = frozenset()) -> PrivateChunk:
+    """Encode a fresh owner's complete value after its local admission checks.
+
+    The default string codec below remains the integrity-only path used for
+    retained-data verification. Fresh callers must establish their original
+    graph/source/credential authority before invoking this resource obligation.
+    """
+    from elspeth.web.composer.continuation_retention import bind_retained_json_encoding, preflight_retained_json
+
+    expected = preflight_retained_json(value, reason="retained_chunk_bytes")
+    canonical = bind_retained_json_encoding(canonical_json(value), expected_bytes=expected)
+    return encode_private_chunk(codec=codec, canonical=canonical, env_ref_names=env_ref_names)
+
+
 def encode_private_chunk(
     *,
     codec: str,
@@ -79,9 +103,9 @@ def encode_private_chunk(
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_state
 
-    encoded = canonical.encode("utf-8")
-    if len(encoded) > JSON_MAX_TOTAL_UTF8_BYTES:
+    if utf8_size(canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
         raise AuditIntegrityError("private chunk exceeds the complete JSON admission bound")
+    encoded = canonical.encode("utf-8")
     value, error = parse_json_strict(canonical)
     if error is not None or canonical_json(value) != canonical:
         raise AuditIntegrityError("private chunk must retain canonical strict JSON")
@@ -112,12 +136,36 @@ def encode_private_chunk(
 
 
 def verify_private_chunk(reference: PrivateChunkRef, canonical: str) -> None:
-    value, error = parse_json_strict(canonical)
-    if error is not None or canonical_json(value) != canonical:
-        raise AuditIntegrityError("retained private chunk is not canonical strict JSON")
+    memo = current_retention_stage_memo()
+    if memo is None or type(canonical) is not str or not _private_chunk_memo_reference(reference):
+        _verify_private_chunk_canonical(canonical)
+    else:
+        memo.private_chunk(PrivateChunkVerificationKey(reference, canonical), _verify_private_chunk_canonical)
     encoded = canonical.encode("utf-8")
     if len(encoded) != reference.byte_length or sha256(encoded).hexdigest() != reference.digest:
         raise AuditIntegrityError("private chunk bytes differ from their binding")
+
+
+def _private_chunk_memo_reference(reference: PrivateChunkRef) -> bool:
+    if type(reference) is not PrivateChunkRef:
+        return False
+    try:
+        # model_copy/model_construct can retain malformed nominal fields. Do
+        # not hash them or move their original refusal ahead of canonical JSON.
+        return all(
+            actual is expected
+            for actual, expected in zip(
+                (type(reference.codec), type(reference.digest), type(reference.byte_length)), (str, str, int), strict=True
+            )
+        )
+    except AttributeError:
+        return False
+
+
+def _verify_private_chunk_canonical(canonical: str) -> None:
+    value, error = parse_json_strict(canonical)
+    if error is not None or canonical_json(value) != canonical:
+        raise AuditIntegrityError("retained private chunk is not canonical strict JSON")
 
 
 def encode_frontier_chunk(frontier: ContinuationFrontier) -> PrivateChunk:

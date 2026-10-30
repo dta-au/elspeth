@@ -1,0 +1,112 @@
+"""U-35b handover, yield and terminal transactions on actual serial PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_a_lost_fence_during_handoff_marks_the_lease_lost as test_a_lost_fence_during_handoff_marks_the_lease_lost,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_a_peer_with_v2_off_still_claims_and_starts_a_handed_over_segment as test_a_peer_with_v2_off_still_claims_and_starts_a_handed_over_segment,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_a_stop_refused_handoff_keeps_the_lease_live_for_the_cancel_settlement as test_a_stop_refused_handoff_keeps_the_lease_live_for_the_cancel_settlement,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_handover_keeps_sequence_advances_generation_and_releases_fence as test_handover_keeps_sequence_advances_generation_and_releases_fence,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_handover_refuses_a_stale_owner_and_writes_nothing as test_handover_refuses_a_stale_owner_and_writes_nothing,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_lease_consume_marks_consumed_and_close_makes_no_second_release as test_lease_consume_marks_consumed_and_close_makes_no_second_release,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_settle_lost_segment_pairs_revocation_and_settles_never_started_parents as test_settle_lost_segment_pairs_revocation_and_settles_never_started_parents,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_stop_wins_over_a_handover as test_stop_wins_over_a_handover,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_cancel_terminal_requires_its_durable_stop_marker as test_v2_cancel_terminal_requires_its_durable_stop_marker,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_completed_terminal_settles_with_phase_settled as test_v2_completed_terminal_settles_with_phase_settled,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_pre_start_claim_renews_and_releases_on_the_segment_row as test_v2_pre_start_claim_renews_and_releases_on_the_segment_row,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_request_cancel_leaves_a_live_claim_alone as test_v2_request_cancel_leaves_a_live_claim_alone,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_request_cancel_marks_only_bumps_revision_and_makes_the_segment_eligible as test_v2_request_cancel_marks_only_bumps_revision_and_makes_the_segment_eligible,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_saved_revisions_aggregate_every_segment_fence as test_v2_saved_revisions_aggregate_every_segment_fence,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_terminal_refuses_a_context_with_no_live_attempt as test_v2_terminal_refuses_a_context_with_no_live_attempt,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_terminal_refuses_a_stale_claim_and_writes_nothing as test_v2_terminal_refuses_a_stale_claim_and_writes_nothing,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_v2_terminal_settles_with_phase_settled as test_v2_terminal_settles_with_phase_settled,
+)
+from tests.unit.web.coordination.test_composer_continuation_handover import (
+    test_yield_outcome_refuses_a_caller_that_is_not_the_exact_attempt as test_yield_outcome_refuses_a_caller_that_is_not_the_exact_attempt,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_a_cas_refused_yield_retries_under_the_same_lease as test_a_cas_refused_yield_retries_under_the_same_lease,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_a_write_failure_after_each_step_rolls_the_whole_yield_back as test_a_write_failure_after_each_step_rolls_the_whole_yield_back,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_duplicate_yield_body_refuses_at_the_revoked_attempt as test_duplicate_yield_body_refuses_at_the_revoked_attempt,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_duplicate_yield_refuses_without_a_second_successor as test_duplicate_yield_refuses_without_a_second_successor,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_read_yield_outcome_distinguishes_committed_from_uncommitted as test_read_yield_outcome_distinguishes_committed_from_uncommitted,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_read_yield_outcome_refuses_after_a_peer_recovered_the_owner as test_read_yield_outcome_refuses_after_a_peer_recovered_the_owner,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_stale_owner_cannot_yield_and_writes_nothing as test_stale_owner_cannot_yield_and_writes_nothing,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_stop_wins_over_a_yield as test_stop_wins_over_a_yield,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_the_successor_runtime_read_accepts_the_rolled_slice as test_the_successor_runtime_read_accepts_the_rolled_slice,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_two_processes_race_a_yield_and_a_successor_claim as test_two_processes_race_a_yield_and_a_successor_claim,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_unsafe_cut_refuses_before_any_write as test_unsafe_cut_refuses_before_any_write,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_v2_saved_revisions_fold_across_yielded_sequences as test_v2_saved_revisions_fold_across_yielded_sequences,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_yield_after_the_segment_hard_deadline_is_admitted as test_yield_after_the_segment_hard_deadline_is_admitted,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_yield_and_handover_transaction_latency_is_recorded as test_yield_and_handover_transaction_latency_is_recorded,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_yield_commits_handoff_successor_and_releases_fence as test_yield_commits_handoff_successor_and_releases_fence,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_yield_readback_tolerates_a_recovered_successor as test_yield_readback_tolerates_a_recovered_successor,
+)
+from tests.unit.web.sessions.test_composer_continuation_yield import (
+    test_yield_refuses_when_the_composition_head_moved as test_yield_refuses_when_the_composition_head_moved,
+)
+
+pytestmark = pytest.mark.testcontainer

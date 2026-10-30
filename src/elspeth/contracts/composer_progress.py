@@ -115,6 +115,9 @@ type ComposerProgressReason = Literal[
     "service_setup_failed",
     "mutation_authority_revoked",
     "admission_refused",
+    # Prepared context cannot supply the supported complete model evidence.
+    # Repeating the same request cannot resolve this refusal.
+    "context_unsupported",
     "accounting_unavailable",
     # Client closed the HTTP connection or operator cancelled the request
     # before the composer returned. Distinct from convergence_wall_clock_timeout

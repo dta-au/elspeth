@@ -18,8 +18,8 @@ from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, Ret
 from elspeth.web.composer.continuation_attachment_history import (
     ContinuationAttachmentHistory,
     RetainedAttachmentRead,
-    decode_attachment_history,
     encode_attachment_history,
+    extend_attachment_history,
 )
 from elspeth.web.composer.continuation_attachment_read import CurrentAttachmentRead
 from elspeth.web.composer.continuation_attachment_result_data import (
@@ -169,13 +169,18 @@ def _input(
     return compose, frame, prepared, key, stable_hash(descriptor)
 
 
-def _history(selected: SelectedContinuationState, compose: ComposeFrame, names: frozenset[str]) -> ContinuationAttachmentHistory:
-    return decode_attachment_history(
-        _chunk(selected, compose.attachment_admissions),
-        session_id=selected.stack.logical.session_id,
-        operation_id=selected.stack.logical.operation_id,
-        env_ref_names=names,
-    )
+def _history(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    selected: SelectedContinuationState,
+    compose: ComposeFrame,
+    names: frozenset[str],
+) -> ContinuationAttachmentHistory:
+    from elspeth.web.sessions.continuation_attachment_application import load_attachment_history_sources_on_connection
+
+    if selected.stack.frames[0] is not compose:
+        raise AuditIntegrityError("attachment history changed its actual selected Compose owner")
+    return load_attachment_history_sources_on_connection(conn, running, selected=selected, names=names).history
 
 
 def prepare_attachment_result_on_connection(
@@ -183,7 +188,7 @@ def prepare_attachment_result_on_connection(
 ) -> AttachmentEffectPreparation:
     current, names = _selected(conn, running, selected, inventory)
     compose, frame, prepared, key, digest = _input(selected, names)
-    _history(selected, compose, names)
+    _history(conn, running, selected, compose, names)
     call = prepared.batch.current_call
     if type(call) is not ContinuationCallState or (call.original_creator_id, call.original_creator_epoch) != (
         running.session_operation_context.fence.operation_id,
@@ -417,7 +422,7 @@ def _retained_history(
         if previous != (incoming,):
             raise AuditIntegrityError("attachment history changed the same read's complete inspections")
         return history
-    return history.model_copy(update={"reads": (*history.reads, incoming)})
+    return extend_attachment_history(history, reads=(incoming,))
 
 
 def read_attachment_result_on_connection(
@@ -509,7 +514,7 @@ def verify_attachment_result_source_on_connection(
         require_attachment_read_audit(prepared, read_audit, names=names)
     retained = decode_read_owner_result(publication.result_json, env_ref_names=names)
     result = _result(retained, prepared, names)
-    history = _history(selected, compose, names)
+    history = _history(conn, running, selected, compose, names)
     if applied and _retained_history(history, key, retained) != history:
         raise AuditIntegrityError("consumed attachment result lacks its complete history")
     return AttachmentResultCheckpoint(snapshot, key, prepared, result, retained, history, applied, read_audit)
@@ -524,7 +529,16 @@ def apply_attachment_history_on_connection(
     compose, frame = selected.stack.frames
     if type(compose) is not ComposeFrame or type(frame) is not ToolBatchFrame:
         raise AuditIntegrityError("attachment application lost its actual frames")
-    history = encode_attachment_history(_retained_history(value.history, value.effect_key, value.retained), env_ref_names=inventory.names)
+    from elspeth.web.sessions.continuation_attachment_application import load_attachment_history_sources_on_connection
+
+    original = load_attachment_history_sources_on_connection(conn, running, selected=selected, names=inventory.names)
+    if original.history != value.history:
+        raise AuditIntegrityError("attachment inspection application changed its actual history source")
+    history = encode_attachment_history(
+        _retained_history(value.history, value.effect_key, value.retained),
+        env_ref_names=inventory.names,
+        source_chunks=original.chunks,
+    )
     sid, operation = str(running.claim.session_id), running.claim.operation_id
     put_chunk(
         conn,

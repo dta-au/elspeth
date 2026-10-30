@@ -125,6 +125,8 @@ async def run_prepared_title_provider(
         prompt_guard_mount=prepared.composer.composer_prompt_guard_mount,
         prompt_guard_mode=settings.composer_prompt_guard_mode,
         user_message=user,
+        max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,
+        prepared_input=prepared.provider_input,
     )
     return custody.continuation_title_result
 

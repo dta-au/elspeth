@@ -17,9 +17,21 @@ from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameSta
 from elspeth.web.composer.continuation_attachment_application import admit_attachment_application
 from elspeth.web.composer.continuation_attachment_application_values import AttachmentApplicationData
 from elspeth.web.composer.continuation_attachment_finisher import CompletedAttachmentProjection
-from elspeth.web.composer.continuation_attachment_history import decode_attachment_history, encode_attachment_history
+from elspeth.web.composer.continuation_attachment_history import (
+    ContinuationAttachmentHistory,
+    attachment_history_dependencies,
+    decode_attachment_history,
+    decode_attachment_history_fields,
+    encode_attachment_history,
+    extend_attachment_history,
+)
 from elspeth.web.composer.continuation_attachment_result_data import decode_attachment_history_batch
-from elspeth.web.composer.continuation_batch_data import encode_coupled_batch_data
+from elspeth.web.composer.continuation_batch_data import (
+    RestoredBatchData,
+    decode_coupled_batch_data,
+    decode_prepared_batch_data,
+    encode_coupled_batch_data,
+)
 from elspeth.web.composer.continuation_caches import decode_continuation_caches
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -28,8 +40,13 @@ from elspeth.web.composer.continuation_codec import (
     encode_private_chunk,
 )
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot, decode_turn_evidence, encode_turn_evidence
-from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
+from elspeth.web.composer.continuation_evidence import (
+    AdmittedTurnEvidence,
+    admit_turn_evidence,
+    decode_turn_evidence,
+    encode_turn_evidence,
+    require_admitted_turn_evidence,
+)
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime, _selected_chunks
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -60,6 +77,39 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as attem
 class StoredAttachmentApplication:
     snapshot: StoredContinuationSnapshot
     application: AttachmentApplicationData
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentHistorySources:
+    """Source-admitted historical DATA for this read, never current authority."""
+
+    history: ContinuationAttachmentHistory
+    chunks: tuple[PrivateChunk, ...]
+
+
+def load_attachment_history_sources_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    selected: SelectedContinuationState,
+    names: frozenset[str],
+) -> AttachmentHistorySources:
+    """Resolve closed original dependencies on the caller's physical read."""
+    from elspeth.web.sessions.continuation_p4_application_store import _private_chunk_on_connection
+
+    compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
+    if len(compose) != 1:
+        raise AuditIntegrityError("attachment history lost its exact selected Compose owner")
+    actual = _chunk(selected, compose[0].attachment_admissions)
+    if _text(conn, running, private_chunk_key(actual)) != actual.canonical:
+        raise AuditIntegrityError("attachment history differs from its original SQL bytes")
+    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    fields = decode_attachment_history_fields(actual, session_id=sid, operation_id=operation, env_ref_names=names)
+    # Preserve every occurrence and its physical work. There is no new ticket,
+    # budget reset or reference deduplication before a conflicting length check.
+    chunks = tuple(_private_chunk_on_connection(conn, running, ref) for ref in attachment_history_dependencies(fields))
+    history = decode_attachment_history(actual, session_id=sid, operation_id=operation, env_ref_names=names, source_chunks=chunks)
+    return AttachmentHistorySources(history, chunks)
 
 
 def _text(conn: Connection, running: ComposerOperationRunning, key: str) -> str:
@@ -139,12 +189,17 @@ def _require_before(selected: SelectedContinuationState, value: AttachmentApplic
     compose = selected.stack.frames[0]
     if type(compose) is not ComposeFrame:
         raise AuditIntegrityError("attachment application lost its original Compose owner")
-    original = decode_turn_evidence(_chunk(selected, compose.evidence), env_ref_names=names)
-    rebound = original.model_copy(
+    original = decode_turn_evidence(_chunk(selected, compose.evidence), env_ref_names=names, source_chunks=selected.chunks)
+    if original.snapshot.recorder != compose.audit_buffer:
+        raise AuditIntegrityError("attachment predecessor changed its original frame recorder join")
+    rebound = original.snapshot.model_copy(
         update={"physical_operation_id": value.application_operation_id, "physical_operation_epoch": value.application_operation_epoch}
     )
     if (
-        encode_turn_evidence(rebound, env_ref_names=names).canonical != value.before_evidence_json
+        encode_turn_evidence(
+            admit_turn_evidence(rebound, env_ref_names=names, source_chunks=original.dependency_chunks), env_ref_names=names
+        ).canonical
+        != value.before_evidence_json
         or _chunk(selected, compose.iteration).canonical != value.before_iteration_json
         or _chunk(selected, compose.caches).canonical != value.before_caches_json
     ):
@@ -152,13 +207,19 @@ def _require_before(selected: SelectedContinuationState, value: AttachmentApplic
 
 
 def _after_root(
-    selected: SelectedContinuationState, value: AttachmentApplicationData, *, names: frozenset[str]
+    selected: SelectedContinuationState,
+    value: AttachmentApplicationData,
+    *,
+    names: frozenset[str],
+    source_chunks: tuple[PrivateChunk, ...],
+    history: ContinuationAttachmentHistory,
 ) -> tuple[ContinuationFrameStack, tuple[PrivateChunk, ...]]:
     compose, frame = selected.stack.frames
     if type(compose) is not ComposeFrame or type(frame) is not ToolBatchFrame:
         raise AuditIntegrityError("attachment application lost its original frame pair")
-    evidence = encode_private_chunk(codec="composer.evidence.v1", canonical=value.after_evidence_json, env_ref_names=names)
-    snapshot = decode_turn_evidence(evidence, env_ref_names=names)
+    evidence = encode_private_chunk(codec="composer.evidence.v2", canonical=value.after_evidence_json, env_ref_names=names)
+    admitted = decode_turn_evidence(evidence, env_ref_names=names, source_chunks=source_chunks)
+    snapshot = admitted.snapshot
     transcript = encode_message_shelf(snapshot.transcript)
     messages = encode_private_chunk(
         codec="composer.messages.v1",
@@ -167,22 +228,16 @@ def _after_root(
         ),
         env_ref_names=names,
     )
-    audit = encode_private_chunk(codec="composer.audit-buffer.v1", canonical=snapshot.recorder_json, env_ref_names=names)
+    audit = admitted.recorder_chunk
     batch = encode_private_chunk(codec="composer.coupled-batch-data.v1", canonical=value.after_batch_json, env_ref_names=names)
     iteration = encode_private_chunk(codec="composer.iteration.v1", canonical=value.after_iteration_json, env_ref_names=names)
     caches = encode_private_chunk(codec="composer.caches.v1", canonical=value.after_caches_json, env_ref_names=names)
-    history = decode_attachment_history(
-        _chunk(selected, compose.attachment_admissions),
-        session_id=selected.stack.logical.session_id,
-        operation_id=selected.stack.logical.operation_id,
-        env_ref_names=names,
-    )
     if any(item.effect_key == value.effect_key for item in history.applications):
         raise AuditIntegrityError("attachment application cannot append the same actual effect twice")
     history_chunk = encode_attachment_history(
-        history.model_copy(update={"applications": (*history.applications, value)}), env_ref_names=names
+        extend_attachment_history(history, applications=(value,)), env_ref_names=names, source_chunks=source_chunks
     )
-    graph = require_evidence_application_links(snapshot, env_ref_names=names)
+    graph = admitted.graph
     if graph is None:
         raise AuditIntegrityError("attachment application lost its exact shared successor")
     changed = compose.model_copy(
@@ -257,9 +312,11 @@ def apply_attachment_application_on_connection(
         application_operation_id=running.session_operation_context.fence.operation_id,
         application_operation_epoch=running.session_operation_context.fence.operation_epoch,
     )
-    admit_attachment_application(value, env_ref_names=names)
+    historical = load_attachment_history_sources_on_connection(conn, running, selected=selected, names=names)
+    original_sources = (*historical.chunks, *selected.chunks, *projection.after.dependency_chunks)
+    admit_attachment_application(value, env_ref_names=names, source_chunks=original_sources)
     _require_before(selected, value, names=names)
-    root, complete = _after_root(selected, value, names=names)
+    root, complete = _after_root(selected, value, names=names, source_chunks=original_sources, history=historical.history)
     # Runtime captures data, not phase authority. Its only pending phase change
     # here is precisely the one call advancement admitted by the original B2.
     expected_frames = list(root.frames)
@@ -298,10 +355,10 @@ def require_attachment_applications_on_connection(
     running: ComposerOperationRunning,
     *,
     selected: SelectedContinuationState,
-    evidence: TurnEvidenceSnapshot,
+    evidence: AdmittedTurnEvidence,
     env_ref_names: frozenset[str],
-) -> None:
-    """Reprove every completed attachment application after actual current admission."""
+) -> AttachmentHistorySources:
+    """Reprove complete historical DATA and return this read's original cohort."""
     compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
         raise AuditIntegrityError("attachment history requires its exact current Compose owner")
@@ -309,9 +366,8 @@ def require_attachment_applications_on_connection(
     actual = _chunk(selected, ref)
     if _text(conn, running, private_chunk_key(actual)) != actual.canonical:
         raise AuditIntegrityError("attachment history differs from its actual current SQL bytes")
-    history = decode_attachment_history(
-        actual, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, env_ref_names=env_ref_names
-    )
+    sources = load_attachment_history_sources_on_connection(conn, running, selected=selected, names=env_ref_names)
+    history = sources.history
     # An absent portable entry must not erase a real completed application.
     # Inspection-only published reads legitimately have no application event.
     actual_applications: list[tuple[int, str]] = []
@@ -334,10 +390,9 @@ def require_attachment_applications_on_connection(
             actual_applications.append((stored_event.sequence, event_text))
     if tuple(actual_applications) != tuple((value.source_cursor + 1, _event(value)) for value in history.applications):
         raise AuditIntegrityError("attachment history omitted or changed its complete actual application cohort")
-    current_graph = require_evidence_application_links(evidence, env_ref_names=env_ref_names)
+    current_graph = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names).graph
     previous_cursor = -1
     for value in history.applications:
-        admit_attachment_application(value, env_ref_names=env_ref_names)
         if not previous_cursor < value.source_cursor < selected.stack.cursor:
             raise AuditIntegrityError("attachment applications changed their actual historical order")
         previous_cursor = value.source_cursor
@@ -350,7 +405,6 @@ def require_attachment_applications_on_connection(
         ):
             raise AuditIntegrityError("attachment application crossed its original logical policy/ceiling")
         _require_before(old, value, names=env_ref_names)
-        expected, _cohort = _after_root(old, value, names=env_ref_names)
         sid, operation = str(running.claim.session_id), running.claim.operation_id
         event = conn.execute(
             select(events).where(
@@ -367,21 +421,27 @@ def require_attachment_applications_on_connection(
             or event.tag != "checkpoint"
             or _text(conn, running, event.payload_chunk_key) != _event(value)
             or following is None
-            or _text(conn, running, following.snapshot_chunk_key)
-            != encode_continuation_snapshot(expected.model_copy(update={"cursor": value.source_cursor + 1}))
         ):
             raise AuditIntegrityError("attachment application lost its actual atomic successor/event")
+        following_text = _text(conn, running, following.snapshot_chunk_key)
+        following_root = decode_continuation_snapshot(following_text)
+        following_selected = SelectedContinuationState(
+            following.checkpoint_id,
+            following_root,
+            load_private_chunks(conn, session_id=sid, operation_id=operation, stack=following_root),
+        )
+        prior_sources = load_attachment_history_sources_on_connection(conn, running, selected=old, names=env_ref_names)
+        original_sources = (*prior_sources.chunks, *old.chunks, *following_selected.chunks)
+        admit_attachment_application(value, env_ref_names=env_ref_names, source_chunks=original_sources)
+        expected, _cohort = _after_root(old, value, names=env_ref_names, source_chunks=original_sources, history=prior_sources.history)
+        if following_text != encode_continuation_snapshot(expected.model_copy(update={"cursor": value.source_cursor + 1})):
+            raise AuditIntegrityError("attachment application changed its actual complete atomic successor")
         # The current root may append later observations, but cannot rewind
         # the complete owners that this actual atomic successor published.
         predecessor_compose = old.stack.frames[0]
         if type(predecessor_compose) is not ComposeFrame:
             raise AuditIntegrityError("attachment application lost its predecessor Compose owner")
-        predecessor_history = decode_attachment_history(
-            _chunk(old, predecessor_compose.attachment_admissions),
-            session_id=sid,
-            operation_id=operation,
-            env_ref_names=env_ref_names,
-        )
+        predecessor_history = prior_sources.history
         expected_applications = (*predecessor_history.applications, value)
         if (
             history.reads[: len(predecessor_history.reads)] != predecessor_history.reads
@@ -412,10 +472,11 @@ def require_attachment_applications_on_connection(
         ):
             raise AuditIntegrityError("attachment application rewound or changed its complete cache observation history")
         after = decode_turn_evidence(
-            encode_private_chunk(codec="composer.evidence.v1", canonical=value.after_evidence_json, env_ref_names=env_ref_names),
+            encode_private_chunk(codec="composer.evidence.v2", canonical=value.after_evidence_json, env_ref_names=env_ref_names),
             env_ref_names=env_ref_names,
+            source_chunks=following_selected.chunks,
         )
-        old_graph = require_evidence_application_links(after, env_ref_names=env_ref_names)
+        old_graph = after.graph
         if current_graph is None or old_graph is None:
             raise AuditIntegrityError("attachment application lost its complete current recorder graph")
         old_recorder, current_recorder = old_graph.recorder, current_graph.recorder
@@ -441,6 +502,63 @@ def require_attachment_applications_on_connection(
         ):
             raise AuditIntegrityError("attachment application reset its original recorder drain cursors")
 
+    return sources
+
+
+def completed_attachment_prefix_correspondence(
+    *, selected: SelectedContinuationState, data: RestoredBatchData, sources: AttachmentHistorySources, names: frozenset[str]
+) -> dict[int, str]:
+    """Join current outcomes to the caller's FULL SQL-verified history DATA.
+
+    This pure per-read projection grants no current, issue, Stop or dispatch
+    authority. Its SQL caller must first run the complete historical verifier.
+    Original and current decodes retain their own aliases; full DATA comparison
+    across those decodes does not pretend they share Python object identities.
+    """
+    if (
+        type(selected) is not SelectedContinuationState
+        or type(data) is not RestoredBatchData
+        or type(sources) is not AttachmentHistorySources
+    ):
+        raise AuditIntegrityError("attachment prefix changed its nominal source cohort")
+    root = selected.stack
+    frame = root.frames[-1]
+    if type(frame) is not ToolBatchFrame or (sources.history.session_id, sources.history.operation_id) != (
+        root.logical.session_id,
+        root.logical.operation_id,
+    ):
+        raise AuditIntegrityError("attachment prefix crossed its original selected source")
+    response = _chunk(selected, frame.response)
+    result: dict[int, str] = {}
+    for value in sources.history.applications:
+        if value.response_json != response.canonical:
+            continue
+        prepared = decode_prepared_batch_data(value.prepared_json, env_ref_names=names)
+        after = decode_coupled_batch_data(value.after_batch_json, env_ref_names=names)
+        index, call = prepared.batch.next_tool_index, prepared.batch.current_call
+        if (
+            call is None
+            or not 0 <= index < len(data.batch.tool_outcomes)
+            or index in result
+            or index >= len(data.calls)
+            or index >= len(prepared.calls)
+            or call.index != index
+            or call.tool_call is not prepared.calls[index]
+            or value.effect_key != f"attachment:{frame.response.digest}:{index}"
+            or value.effect_key not in frame.settled_effect_ids
+            or prepared.calls != data.calls
+            or after.calls != data.calls
+            or after.batch.next_tool_index != index + 1
+            or len(after.batch.tool_outcomes) != index + 1
+            or prepared.batch.tool_outcomes != data.batch.tool_outcomes[:index]
+            or after.batch.tool_outcomes != data.batch.tool_outcomes[: index + 1]
+            or data.batch.tool_outcomes[index].call is not data.calls[index]
+            or after.batch.tool_outcomes[index].call is not after.calls[index]
+        ):
+            raise AuditIntegrityError("attachment prefix changed its original call/index/outcome source")
+        result[index] = value.effect_key
+    return result
+
 
 def read_applied_attachment_on_connection(
     conn: Connection,
@@ -455,13 +573,7 @@ def read_applied_attachment_on_connection(
     current, names = _selected(conn, running, selected, inventory)
     evidence = read_turn_evidence_on_connection(conn, running, selected=selected, inventory=inventory)
     require_attachment_applications_on_connection(conn, running, selected=selected, evidence=evidence, env_ref_names=names)
-    compose = next(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
-    history = decode_attachment_history(
-        _chunk(selected, compose.attachment_admissions),
-        session_id=str(running.claim.session_id),
-        operation_id=running.claim.operation_id,
-        env_ref_names=names,
-    )
+    history = load_attachment_history_sources_on_connection(conn, running, selected=selected, names=names).history
     values = tuple(value for value in history.applications if value.effect_key == effect_key)
     if len(values) != 1:
         raise AuditIntegrityError("attachment application has no exact already-applied history")

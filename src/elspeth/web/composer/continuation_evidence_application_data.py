@@ -14,6 +14,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDi
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
 from elspeth.web.composer.continuation import LogicalRequestBinding
 from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraph,
@@ -26,13 +27,18 @@ from elspeth.web.composer.continuation_batch_data import RestoredBatchData, Rest
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_response, encode_private_chunk, verify_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
 from elspeth.web.composer.continuation_evidence import (
+    AdmittedTurnEvidence,
     RetainedBatchEffects,
     RetainedHistoricalEffect,
     RetainedTurnEffects,
+    TurnEvidenceFields,
     TurnEvidenceSnapshot,
+    admit_turn_evidence,
     encode_turn_evidence,
+    require_admitted_turn_evidence,
 )
 from elspeth.web.composer.continuation_evidence_application_values import (
+    P4ApplicationSources,
     P4EffectProducerData,
     PortableP4ApplicationEntry,
     PortableP4ApplicationRecord,
@@ -51,13 +57,14 @@ Verification = Literal["verified", "not_applicable", "authored_state_mismatch", 
 @dataclass(frozen=True, slots=True)
 class PortableP4ApplicationBundle:
     entry: PortableP4ApplicationEntry
-    evidence_after: TurnEvidenceSnapshot
+    evidence_after: AdmittedTurnEvidence
     batch_after: RestoredBatchData
     recorder_after: RecorderSnapshot
     evidence_chunk: PrivateChunk
     batch_chunk: PrivateChunk
     audit_chunk: PrivateChunk
     state_chunk: PrivateChunk
+    result: ReadmittedP4Result
 
 
 def retained_effects(value: PersistedTurnEffects) -> RetainedTurnEffects:
@@ -248,65 +255,38 @@ def _require_input(
         raise AuditIntegrityError("portable application changed previously accepted history")
 
 
-def require_evidence_application_links(snapshot: TurnEvidenceSnapshot, *, env_ref_names: frozenset[str]) -> ApplicationGraph | None:
-    if snapshot.application_entry is not None and snapshot.joint_graph_json is not None:
-        raise AuditIntegrityError("evidence duplicated its journal graph outside its one owner")
-    graph_json = snapshot.application_entry.graph_json if snapshot.application_entry is not None else snapshot.joint_graph_json
-    if graph_json is None:
-        return None
-    graph = decode_application_graph(graph_json, env_ref_names=env_ref_names)
-    if (
-        retained_effects(graph.effects) != snapshot.effects
-        or encode_recorder_snapshot(graph.recorder).canonical != snapshot.recorder_json
-        or (graph.effects.initial_state is graph.effects.latest_verified_state) is not snapshot.initial_is_latest
-    ):
-        raise AuditIntegrityError("evidence differs from its actual shared effects/recorder graph")
-    entry = snapshot.application_entry
-    if entry is None:
-        if (
-            graph.cuts
-            or graph.selected.batch.phase not in ("p4_pending", "call_active", "call_ready", "dispatch_ready")
-            or snapshot.historical_application_count
-        ):
-            raise AuditIntegrityError("pending evidence invented applied history")
-    elif (
-        entry.logical != snapshot.logical
-        or len(entry.applications) != len(graph.cuts)
-        or snapshot.historical_application_count != len(graph.cuts)
-    ):
-        raise AuditIntegrityError("evidence journal lost its ordered graph/identity binding")
-    if entry is not None:
-        admit_journal_values(entry, env_ref_names=env_ref_names)
-        if snapshot.effect_locators != journal_effect_locators(entry, env_ref_names=env_ref_names):
-            raise AuditIntegrityError("evidence changed its exact historical graph locators")
-    if graph.cuts:
-        if graph.effects is not graph.cuts[-1].effects_after:
-            raise AuditIntegrityError("evidence differs from the final applied frontier")
-        _require_recorder_extension(graph.cuts[-1].recorder_after, graph.recorder)
-        for prior, following in pairwise(graph.cuts):
-            if following.effects_before is not prior.effects_after:
-                raise AuditIntegrityError("application journal broke its actual effects identity chain")
-    return graph
+def require_evidence_application_links(
+    snapshot: TurnEvidenceFields,
+    *,
+    env_ref_names: frozenset[str],
+    recorder_chunk: PrivateChunk,
+    sources: P4ApplicationSources | None = None,
+) -> ApplicationGraph | None:
+    if type(snapshot) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
+        raise TypeError("evidence application admission requires its actual snapshot source")
+    return _admit_application_source(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
 
 
 def append_primary_call_to_evidence(
-    snapshot: TurnEvidenceSnapshot,
+    evidence: AdmittedTurnEvidence,
     *,
     call: ComposerLLMCall,
     recorder: RecorderSnapshot,
     env_ref_names: frozenset[str],
-) -> TurnEvidenceSnapshot:
+) -> AdmittedTurnEvidence:
     """Extend the actual shared recorder graph without replacing any prior cut.
 
     Current SQL/physical admission belongs to the publication owner. This pure
     source update preserves original graph atom identities and immutable result
     records; it neither creates a P4 application nor authorizes a provider.
     """
-    from elspeth.web.composer.continuation_evidence import recorder_from_evidence_json
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
 
-    if type(snapshot) is not TurnEvidenceSnapshot or type(call) is not ComposerLLMCall or type(recorder) is not RecorderSnapshot:
+    admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
+    if type(call) is not ComposerLLMCall or type(recorder) is not RecorderSnapshot:
         raise TypeError("primary evidence extension requires its complete actual nominal sources")
-    before = recorder_from_evidence_json(snapshot.recorder_json)
+    before = decode_recorder_snapshot(admitted.recorder_chunk)
     if (
         call.call_id is None
         or replace(before, llm_calls=(*before.llm_calls, call)) != recorder
@@ -315,26 +295,25 @@ def append_primary_call_to_evidence(
         or any(item.call_id == call.call_id for item in before.llm_calls)
     ):
         raise AuditIntegrityError("primary evidence extension changed its exact original recorder prefix")
-    graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names)
-    updated = snapshot.model_copy(update={"recorder_json": encode_recorder_snapshot(recorder).canonical})
+    graph = admitted.graph
+    audit = encode_recorder_snapshot(recorder)
+    updated = snapshot.model_copy(update={"recorder": audit.reference})
     if graph is not None:
         # The SQL snapshot and live recorder were independently decoded. Reuse
         # the actual graph's prefix objects so cut/batch/event aliases remain
         # shared; the one new atom is the actual original physical call.
         extended = replace(graph.recorder, llm_calls=(*graph.recorder.llm_calls, call))
         _require_recorder_extension(graph.recorder, extended)
-        if encode_recorder_snapshot(extended) != encode_recorder_snapshot(recorder):
+        if encode_recorder_snapshot(extended) != audit:
             raise AuditIntegrityError("primary evidence extension differs from its complete actual recorder")
         changed_graph = replace(graph, recorder=extended)
         graph_json = encode_application_graph(changed_graph, env_ref_names=env_ref_names)
         if snapshot.application_entry is not None:
             entry = snapshot.application_entry.model_copy(update={"graph_json": graph_json})
-            admit_journal_values(entry, env_ref_names=env_ref_names)
             updated = updated.model_copy(update={"application_entry": entry})
         else:
             updated = updated.model_copy(update={"joint_graph_json": graph_json})
-    require_evidence_application_links(updated, env_ref_names=env_ref_names)
-    return updated
+    return admit_turn_evidence(updated, env_ref_names=env_ref_names, source_chunks=(audit, *admitted.sources.chunks))
 
 
 def build_portable_p4_application(
@@ -344,21 +323,22 @@ def build_portable_p4_application(
     cursor: int,
     response_chunk: PrivateChunk,
     pending_batch_chunk: PrivateChunk,
-    evidence_snapshot: TurnEvidenceSnapshot,
+    evidence_snapshot: AdmittedTurnEvidence,
     result_chunk: PrivateChunk,
     result: ReadmittedP4Result,
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
 ) -> PortableP4ApplicationBundle:
     _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
-    encode_turn_evidence(evidence_snapshot, env_ref_names=env_ref_names)
-    if evidence_snapshot.logical != logical:
+    admitted = require_admitted_turn_evidence(evidence_snapshot, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
+    if snapshot.logical != logical:
         raise AuditIntegrityError("portable application changed the evidence logical binding")
-    graph = require_evidence_application_links(evidence_snapshot, env_ref_names=env_ref_names)
+    graph = admitted.graph
     if graph is None:
         raise AuditIntegrityError("portable application requires the producer-captured joint identity graph")
     _require_input(logical, response_chunk, pending_batch_chunk, graph, result, env_ref_names=env_ref_names)
-    previous = evidence_snapshot.application_entry
+    previous = snapshot.application_entry
     records = () if previous is None else previous.applications
     if any(item.effect_key == result.receipt.effect_key for item in records):
         raise AuditIntegrityError("portable application effect already belongs to applied history")
@@ -390,17 +370,13 @@ def build_portable_p4_application(
         creator_operation_id=producer.creator_operation_id,
         creator_operation_epoch=producer.creator_operation_epoch,
         response=response_chunk.reference,
-        response_json=response_chunk.canonical,
         pending_batch=pending_batch_chunk.reference,
-        pending_batch_json=pending_batch_chunk.canonical,
         prepared_input=prepared_chunk.reference,
-        prepared_input_json=prepared_json,
         result=result_chunk.reference,
-        result_json=result_chunk.canonical,
         verification=code,
     )
     entry = PortableP4ApplicationEntry(logical=logical, applications=(*records, record), graph_json=graph_json)
-    locators = evidence_snapshot.effect_locators
+    locators = snapshot.effect_locators
     historical = result.historical_effect
     if historical is not None:
         locators = (
@@ -414,18 +390,24 @@ def build_portable_p4_application(
                 authored_state_hash=historical.authored_state_hash,
             ),
         )
-    after = evidence_snapshot.model_copy(
+    audit = encode_recorder_snapshot(recorder)
+    after_snapshot = snapshot.model_copy(
         update={
             "effects": retained_effects(effects),
             "initial_is_latest": effects.initial_state is effects.latest_verified_state,
-            "recorder_json": encode_recorder_snapshot(recorder).canonical,
+            "recorder": audit.reference,
             "joint_graph_json": None,
             "application_entry": entry,
             "effect_locators": locators,
             "historical_application_count": len(entry.applications),
         }
     )
-    require_portable_p4_application(entry, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+    after = admit_turn_evidence(
+        after_snapshot,
+        env_ref_names=env_ref_names,
+        source_chunks=(audit, *admitted.sources.chunks, response_chunk, pending_batch_chunk, prepared_chunk, result_chunk),
+    )
+    require_admitted_p4_application(after, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
     return PortableP4ApplicationBundle(
         entry,
         after,
@@ -433,10 +415,11 @@ def build_portable_p4_application(
         recorder,
         encode_turn_evidence(after, env_ref_names=env_ref_names),
         encode_private_chunk(codec="composer.applied-p4-batch.v1", canonical=graph_json, env_ref_names=env_ref_names),
-        encode_recorder_snapshot(recorder),
+        after.recorder_chunk,
         encode_private_chunk(
             codec="composer.state.v1", canonical=canonical_json(after_data.batch.state.to_dict()), env_ref_names=env_ref_names
         ),
+        result,
     )
 
 
@@ -447,13 +430,61 @@ def require_portable_p4_application(
     result: ReadmittedP4Result,
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
+    source_chunks: tuple[PrivateChunk, ...],
 ) -> None:
     if type(entry) is not PortableP4ApplicationEntry:
         raise TypeError("portable application requires its closed journal owner")
-    entry = PortableP4ApplicationEntry.model_validate_json(canonical_json(entry.model_dump(mode="json")))
-    _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
-    admit_journal_values(entry, env_ref_names=env_ref_names)
-    graph = decode_application_graph(entry.graph_json, env_ref_names=env_ref_names)
+    _require_p4_application_source(
+        entry,
+        result_chunk=result_chunk,
+        result=result,
+        producer=producer,
+        env_ref_names=env_ref_names,
+        sources=P4ApplicationSources(entry, source_chunks),
+    )
+
+
+def require_admitted_p4_application(
+    evidence: AdmittedTurnEvidence,
+    *,
+    result_chunk: PrivateChunk,
+    result: ReadmittedP4Result,
+    producer: P4EffectProducerData,
+    env_ref_names: frozenset[str],
+) -> None:
+    if type(evidence) is not AdmittedTurnEvidence:
+        raise TypeError("portable evidence requires its actual source-admitted owner")
+    _require_p4_application_source(evidence, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+
+
+def _require_p4_application_source(
+    source: PortableP4ApplicationEntry | AdmittedTurnEvidence,
+    *,
+    result_chunk: PrivateChunk,
+    result: ReadmittedP4Result,
+    producer: P4EffectProducerData,
+    env_ref_names: frozenset[str],
+    sources: P4ApplicationSources | None = None,
+) -> None:
+    if type(source) is PortableP4ApplicationEntry:
+        entry = PortableP4ApplicationEntry.model_validate_json(canonical_json(source.model_dump(mode="json")))
+        _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+        if type(sources) is not P4ApplicationSources:
+            raise AuditIntegrityError("journal admission lost its original dependency owners")
+        graph = admit_journal_values(entry, env_ref_names=env_ref_names, sources=sources)
+    elif type(source) is AdmittedTurnEvidence:
+        admitted = require_admitted_turn_evidence(source, env_ref_names=env_ref_names)
+        _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
+        admitted_entry = admitted.snapshot.application_entry
+        admitted_graph = admitted.graph
+        if admitted_entry is None or admitted_graph is None:
+            raise AuditIntegrityError("portable evidence lost its admitted application journal")
+        entry, graph = admitted_entry, admitted_graph
+        sources = admitted.sources
+    else:
+        raise TypeError("portable application requires its actual journal or admitted evidence source")
+    if type(sources) is not P4ApplicationSources:
+        raise AuditIntegrityError("application admission lost its original dependency owners")
     if len(entry.applications) != len(graph.cuts):
         raise AuditIntegrityError("portable journal lost a complete projection cut")
     matches = [(index, item) for index, item in enumerate(entry.applications) if item.effect_key == result.receipt.effect_key]
@@ -462,7 +493,7 @@ def require_portable_p4_application(
     index, record = matches[0]
     if (
         record.result != result_chunk.reference
-        or record.result_json != result_chunk.canonical
+        or sources.chunk(record.result).canonical != result_chunk.canonical
         or record.input_sha256 != result.receipt.input_sha256
         or (record.creator_sequence, record.creator_generation, record.creator_operation_id, record.creator_operation_epoch)
         != (producer.creator_sequence, producer.creator_generation, producer.creator_operation_id, producer.creator_operation_epoch)
@@ -470,14 +501,14 @@ def require_portable_p4_application(
         raise AuditIntegrityError("portable journal changed actual result/producer bytes")
     cut = graph.cuts[index]
     before = ApplicationGraph(cut.data, cut.effects_before, cut.recorder_before, graph.cuts[:index])
-    response = PrivateChunk(record.response, record.response_json)
-    pending = PrivateChunk(record.pending_batch, record.pending_batch_json)
+    response = sources.chunk(record.response)
+    pending = sources.chunk(record.pending_batch)
     _require_input(entry.logical, response, pending, before, result, env_ref_names=env_ref_names)
     prepared_json = result.receipt.prepared_p4_json
     if prepared_json is None:
         raise AuditIntegrityError("portable application lost its complete original P4 input")
     prepared = encode_private_chunk(codec="composer.prepared-p4.v1", canonical=prepared_json, env_ref_names=env_ref_names)
-    if record.prepared_input != prepared.reference or record.prepared_input_json != prepared.canonical:
+    if record.prepared_input != prepared.reference or sources.chunk(record.prepared_input).canonical != prepared.canonical:
         raise AuditIntegrityError("portable journal changed its complete prepared input locator")
     expected_effects, expected_recorder, code = _project(before, result, env_ref_names=env_ref_names)
     if (
@@ -498,17 +529,19 @@ def require_portable_p4_application(
             raise AuditIntegrityError("portable journal changed the actual final frontier")
         _require_recorder_extension(cut.recorder_after, graph.recorder)
         if graph.selected.batch.phase == "complete" and (
-            graph.selected.batch.p4_receipt_json != record.result_json
+            graph.selected.batch.p4_receipt_json != sources.chunk(record.result).canonical
             or graph.selected.batch.p4_verification_failed != (code in ("authored_state_mismatch", "checkpoint_decode_or_compare_failed"))
         ):
             raise AuditIntegrityError("completed batch changed its actual result/verification")
 
 
-def journal_effect_locators(entry: PortableP4ApplicationEntry, *, env_ref_names: frozenset[str]) -> tuple[RetainedHistoricalEffect, ...]:
+def journal_effect_locators(
+    entry: PortableP4ApplicationEntry, *, env_ref_names: frozenset[str], sources: P4ApplicationSources
+) -> tuple[RetainedHistoricalEffect, ...]:
     """Historical locator values only; no validated SQL owner is constructed."""
     locators = []
     for record in entry.applications:
-        receipt, outcome = decode_p4_receipt(record.result_json, env_ref_names=env_ref_names)
+        receipt, outcome = decode_p4_receipt(sources.chunk(record.result).canonical, env_ref_names=env_ref_names)
         if outcome.checkpoint_disposition == "committed":
             if receipt.authored_state_hash is None:
                 raise AuditIntegrityError("graph receipt lost its actual authored hash")
@@ -525,59 +558,144 @@ def journal_effect_locators(entry: PortableP4ApplicationEntry, *, env_ref_names:
     return tuple(locators)
 
 
-def admit_journal_values(entry: PortableP4ApplicationEntry, *, env_ref_names: frozenset[str]) -> None:
-    """Complete owned DATA admission; root still owes every actual SQL join."""
-    encoded = canonical_json(entry.model_dump(mode="json"))
-    checked = PortableP4ApplicationEntry.model_validate_json(encoded)
-    if canonical_json(checked.model_dump(mode="json")) != encoded:
-        raise AuditIntegrityError("portable journal changed during complete inner admission")
-    graph = decode_application_graph(entry.graph_json, env_ref_names=env_ref_names)
-    if len(graph.cuts) != len(entry.applications):
-        raise AuditIntegrityError("portable journal lost its exact ordered cuts")
-    _require_initial_frontier(graph.cuts[0].effects_before, entry.logical)
-    for prior, following in pairwise(graph.cuts):
-        if following.effects_before is not prior.effects_after:
-            raise AuditIntegrityError("portable journal broke its real effects identity chain")
-        _require_recorder_extension(prior.recorder_after, following.recorder_before)
-    if graph.effects is not graph.cuts[-1].effects_after:
-        raise AuditIntegrityError("portable journal changed its current effects identity")
-    _require_recorder_extension(graph.cuts[-1].recorder_after, graph.recorder)
-    _require_completed_graph(graph, entry.applications[-1])
-    for index, record in enumerate(entry.applications):
-        response = PrivateChunk(record.response, record.response_json)
-        decoded_response = decode_continuation_response(response)
-        verify_private_chunk(record.pending_batch, record.pending_batch_json)
-        verify_private_chunk(record.prepared_input, record.prepared_input_json)
-        verify_private_chunk(record.result, record.result_json)
-        if record.result.codec != "composer.owner-result.v1" or record.prepared_input.codec != "composer.prepared-p4.v1":
-            raise AuditIntegrityError("portable journal substituted an immutable owner codec")
-        receipt, outcome = decode_p4_receipt(record.result_json, env_ref_names=env_ref_names)
-        prepared = decode_prepared_p4(record.prepared_input_json, env_ref_names=env_ref_names)
-        cut = graph.cuts[index]
+def admit_journal_values(
+    entry: PortableP4ApplicationEntry, *, env_ref_names: frozenset[str], sources: P4ApplicationSources
+) -> ApplicationGraph:
+    """Admit one source journal and return its graph; callers still owe SQL joins."""
+    if type(entry) is not PortableP4ApplicationEntry:
+        raise TypeError("journal admission requires its actual application entry source")
+    graph = _admit_application_source(entry, env_ref_names=env_ref_names, sources=sources)
+    if graph is None:
+        raise AuditIntegrityError("portable journal lost its admitted application graph")
+    return graph
+
+
+def _admit_application_source(
+    source: PortableP4ApplicationEntry | TurnEvidenceFields,
+    *,
+    env_ref_names: frozenset[str],
+    sources: P4ApplicationSources | None = None,
+    recorder_chunk: PrivateChunk | None = None,
+) -> ApplicationGraph | None:
+    """Own the source decode and both admission orders without accepting a graph."""
+
+    def require_canonical_entry(entry: PortableP4ApplicationEntry) -> None:
+        encoded = canonical_json(entry.model_dump(mode="json"))
+        checked = PortableP4ApplicationEntry.model_validate_json(encoded)
+        if canonical_json(checked.model_dump(mode="json")) != encoded:
+            raise AuditIntegrityError("portable journal changed during complete inner admission")
+
+    def require_journal_graph(entry: PortableP4ApplicationEntry, graph: ApplicationGraph) -> None:
+        if len(graph.cuts) != len(entry.applications):
+            raise AuditIntegrityError("portable journal lost its exact ordered cuts")
+        _require_initial_frontier(graph.cuts[0].effects_before, entry.logical)
+        for prior, following in pairwise(graph.cuts):
+            if following.effects_before is not prior.effects_after:
+                raise AuditIntegrityError("portable journal broke its real effects identity chain")
+            _require_recorder_extension(prior.recorder_after, following.recorder_before)
+        if graph.effects is not graph.cuts[-1].effects_after:
+            raise AuditIntegrityError("portable journal changed its current effects identity")
+        _require_recorder_extension(graph.cuts[-1].recorder_after, graph.recorder)
+        if type(sources) is not P4ApplicationSources:
+            raise AuditIntegrityError("journal graph lost its original dependency owners")
+        _require_completed_graph(graph, entry.applications[-1], sources)
+        for index, record in enumerate(entry.applications):
+            response = sources.chunk(record.response)
+            pending_chunk = sources.chunk(record.pending_batch)
+            prepared_chunk = sources.chunk(record.prepared_input)
+            result_chunk = sources.chunk(record.result)
+            # The old inline record exposed these original strings to the
+            # complete evidence credential traversal. References must retain
+            # that same policy check before ordinary excess can win, without
+            # reconstructing or replacing their original source owners.
+            require_no_credential_material(
+                [response.canonical, pending_chunk.canonical, prepared_chunk.canonical, result_chunk.canonical],
+                surface="portable application original sources",
+                env_ref_names=env_ref_names,
+                max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+            )
+            decoded_response = decode_continuation_response(response)
+            if record.result.codec != "composer.owner-result.v1" or record.prepared_input.codec != "composer.prepared-p4.v1":
+                raise AuditIntegrityError("portable journal substituted an immutable owner codec")
+            receipt, outcome = decode_p4_receipt(result_chunk.canonical, env_ref_names=env_ref_names)
+            prepared = decode_prepared_p4(prepared_chunk.canonical, env_ref_names=env_ref_names)
+            cut = graph.cuts[index]
+            if (
+                _pending_chunk(cut.data, env_ref_names=env_ref_names) != pending_chunk
+                or cut.data.calls != decoded_response.tool_batch.calls
+                or record.effect_key != f"batch:{record.response.digest}:p4"
+                or receipt.effect_key != record.effect_key
+                or receipt.input_sha256 != record.input_sha256
+                or receipt.prepared_p4_json != prepared_chunk.canonical
+                or receipt.creator_operation_id != record.creator_operation_id
+                or prepared.creator_operation_epoch != record.creator_operation_epoch
+                or prepared.session_id != entry.logical.session_id
+            ):
+                raise AuditIntegrityError("portable journal changed its complete selected input/result joins")
+            expected_locator = str(receipt.assistant_id) if receipt.assistant_id is not None else f"unavailable:{record.effect_key}"
+            if record.receipt_id != expected_locator:
+                raise AuditIntegrityError("portable journal changed its immutable receipt locator")
+            if (outcome.checkpoint_disposition == "committed") != (record.verification != "not_applicable"):
+                raise AuditIntegrityError("portable journal changed graph verification applicability")
+            require_no_credential_material(
+                [record.checkpoint_id, record.effect_key, record.receipt_id, record.creator_operation_id],
+                surface="portable application metadata",
+                env_ref_names=env_ref_names,
+            )
+            _record_effects_aliases(cut.effects_before, cut.effects_after, record.verification)
+            _recorder_aliases(cut.recorder_before, cut.recorder_after)
+
+    if type(source) is PortableP4ApplicationEntry:
+        require_canonical_entry(source)
+        graph = decode_application_graph(source.graph_json, env_ref_names=env_ref_names)
+        require_journal_graph(source, graph)
+        return graph
+    if not isinstance(source, TurnEvidenceFields) or type(source) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
+        raise TypeError("application admission requires its actual evidence or journal source")
+    snapshot = source
+    if type(recorder_chunk) is not PrivateChunk or recorder_chunk.reference != snapshot.recorder:
+        raise AuditIntegrityError("evidence graph lost its original recorder source")
+    if snapshot.application_entry is not None and snapshot.joint_graph_json is not None:
+        raise AuditIntegrityError("evidence duplicated its journal graph outside its one owner")
+    graph_json = snapshot.application_entry.graph_json if snapshot.application_entry is not None else snapshot.joint_graph_json
+    if graph_json is None:
+        return None
+    graph = decode_application_graph(graph_json, env_ref_names=env_ref_names)
+    if (
+        retained_effects(graph.effects) != snapshot.effects
+        or encode_recorder_snapshot(graph.recorder) != recorder_chunk
+        or (graph.effects.initial_state is graph.effects.latest_verified_state) is not snapshot.initial_is_latest
+    ):
+        raise AuditIntegrityError("evidence differs from its actual shared effects/recorder graph")
+    entry = snapshot.application_entry
+    if entry is None:
         if (
-            _pending_chunk(cut.data, env_ref_names=env_ref_names) != PrivateChunk(record.pending_batch, record.pending_batch_json)
-            or cut.data.calls != decoded_response.tool_batch.calls
-            or record.effect_key != f"batch:{record.response.digest}:p4"
-            or receipt.effect_key != record.effect_key
-            or receipt.input_sha256 != record.input_sha256
-            or receipt.prepared_p4_json != record.prepared_input_json
-            or receipt.creator_operation_id != record.creator_operation_id
-            or prepared.creator_operation_epoch != record.creator_operation_epoch
-            or prepared.session_id != entry.logical.session_id
+            graph.cuts
+            or graph.selected.batch.phase not in ("p4_pending", "call_active", "call_ready", "dispatch_ready")
+            or snapshot.historical_application_count
         ):
-            raise AuditIntegrityError("portable journal changed its complete selected input/result joins")
-        expected_locator = str(receipt.assistant_id) if receipt.assistant_id is not None else f"unavailable:{record.effect_key}"
-        if record.receipt_id != expected_locator:
-            raise AuditIntegrityError("portable journal changed its immutable receipt locator")
-        if (outcome.checkpoint_disposition == "committed") != (record.verification != "not_applicable"):
-            raise AuditIntegrityError("portable journal changed graph verification applicability")
-        require_no_credential_material(
-            [record.checkpoint_id, record.effect_key, record.receipt_id, record.creator_operation_id],
-            surface="portable application metadata",
-            env_ref_names=env_ref_names,
-        )
-        _record_effects_aliases(cut.effects_before, cut.effects_after, record.verification)
-        _recorder_aliases(cut.recorder_before, cut.recorder_after)
+            raise AuditIntegrityError("pending evidence invented applied history")
+    elif (
+        entry.logical != snapshot.logical
+        or len(entry.applications) != len(graph.cuts)
+        or snapshot.historical_application_count != len(graph.cuts)
+    ):
+        raise AuditIntegrityError("evidence journal lost its ordered graph/identity binding")
+    if entry is not None:
+        if type(sources) is not P4ApplicationSources:
+            raise AuditIntegrityError("evidence journal lost its original dependency owners")
+        require_canonical_entry(entry)
+        require_journal_graph(entry, graph)
+        if snapshot.effect_locators != journal_effect_locators(entry, env_ref_names=env_ref_names, sources=sources):
+            raise AuditIntegrityError("evidence changed its exact historical graph locators")
+    if graph.cuts:
+        if graph.effects is not graph.cuts[-1].effects_after:
+            raise AuditIntegrityError("evidence differs from the final applied frontier")
+        _require_recorder_extension(graph.cuts[-1].recorder_after, graph.recorder)
+        for prior, following in pairwise(graph.cuts):
+            if following.effects_before is not prior.effects_after:
+                raise AuditIntegrityError("application journal broke its actual effects identity chain")
+    return graph
 
 
 def capture_joint_evidence_graph(
@@ -587,6 +705,7 @@ def capture_joint_evidence_graph(
     drained: RecorderDrainCursors,
     data: RestoredBatchData | RestoredPreparedBatchData | None,
     env_ref_names: frozenset[str],
+    recorder_snapshot: RecorderSnapshot | None = None,
 ) -> tuple[str | None, PortableP4ApplicationEntry | None]:
     if type(owner) is not TurnEvidence or type(recorder) is not BufferingRecorder or type(drained) is not RecorderDrainCursors:
         raise TypeError("joint capture requires actual evidence/recorder owners")
@@ -614,12 +733,14 @@ def capture_joint_evidence_graph(
     elif type(data) is not RestoredBatchData:
         raise TypeError("joint capture requires the actual complete coupled batch")
     cuts = () if prior is None else prior.cuts
-    snapshot = recorder.snapshot_for_continuation(drained=drained)
+    snapshot = recorder.snapshot_for_continuation(drained=drained) if recorder_snapshot is None else recorder_snapshot
+    if type(snapshot) is not RecorderSnapshot or snapshot.drained != drained:
+        raise AuditIntegrityError("joint capture lost its actual original recorder cut")
     graph = ApplicationGraph(data, owner.effects, snapshot, cuts, audit, dialect)
     graph_json = encode_application_graph(graph, env_ref_names=env_ref_names)
     if entry is not None:
         entry = entry.model_copy(update={"graph_json": graph_json})
-        admit_journal_values(entry, env_ref_names=env_ref_names)
+        admit_journal_values(entry, env_ref_names=env_ref_names, sources=P4ApplicationSources(entry, owner._portable_p4_sources))
         for key, live in owner._historical_p4_applications.items():
             indexes = [index for index, item in enumerate(entry.applications) if item.effect_key == key]
             if len(indexes) != 1:
@@ -678,7 +799,7 @@ def retain_portable_application_on_live_evidence(
         replace(
             application.data.batch,
             phase="complete",
-            p4_receipt_json=record.result_json,
+            p4_receipt_json=bundle.evidence_after.sources.chunk(record.result).canonical,
             p4_verification_failed=application.verification_failure is not None,
         ),
         application.data.accumulator,
@@ -689,10 +810,11 @@ def retain_portable_application_on_live_evidence(
         raise AuditIntegrityError("warm and retained projections differ in values or actual alias partition")
     owner._portable_p4_graph = graph
     owner._portable_p4_entry = bundle.entry
+    owner._portable_p4_sources = bundle.evidence_after.sources.chunks
     return after
 
 
-def require_selected_applied_batch_chunk(chunk: PrivateChunk, *, evidence: TurnEvidenceSnapshot, env_ref_names: frozenset[str]) -> None:
+def require_selected_applied_batch_chunk(chunk: PrivateChunk, *, evidence: AdmittedTurnEvidence, env_ref_names: frozenset[str]) -> None:
     """Bind the separate selected chunk to the ONE evidence graph restoration.
 
     Callers use RestoredTurnEvidence.batch after this check. Decoding a second
@@ -701,12 +823,14 @@ def require_selected_applied_batch_chunk(chunk: PrivateChunk, *, evidence: TurnE
     if type(chunk) is not PrivateChunk or chunk.reference.codec != "composer.applied-p4-batch.v1":
         raise AuditIntegrityError("selected applied batch has another actual codec")
     verify_private_chunk(chunk.reference, chunk.canonical)
-    graph = require_evidence_application_links(evidence, env_ref_names=env_ref_names)
+    admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
+    graph = admitted.graph
     if (
         graph is None
-        or evidence.application_entry is None
+        or snapshot.application_entry is None
         or graph.selected.batch.phase != "complete"
-        or evidence.application_entry.graph_json != chunk.canonical
+        or snapshot.application_entry.graph_json != chunk.canonical
     ):
         raise AuditIntegrityError("selected applied batch changed its complete shared evidence graph")
 
@@ -725,7 +849,7 @@ def _require_initial_frontier(effects: PersistedTurnEffects, logical: LogicalReq
         raise AuditIntegrityError("portable journal invented history before its first actual application")
 
 
-def _require_completed_graph(graph: ApplicationGraph, record: PortableP4ApplicationRecord) -> None:
+def _require_completed_graph(graph: ApplicationGraph, record: PortableP4ApplicationRecord, sources: P4ApplicationSources) -> None:
     if graph.selected.batch.phase != "complete":
         return
     from elspeth.web.composer.continuation_batch_data import _members
@@ -744,7 +868,7 @@ def _require_completed_graph(graph: ApplicationGraph, record: PortableP4Applicat
                 raise AuditIntegrityError("completed application changed an original batch scalar")
         elif left is not right:
             raise AuditIntegrityError("completed application replaced an original batch object")
-    if graph.selected.batch.p4_receipt_json != record.result_json or graph.selected.batch.p4_verification_failed != (
+    if graph.selected.batch.p4_receipt_json != sources.chunk(record.result).canonical or graph.selected.batch.p4_verification_failed != (
         record.verification in ("authored_state_mismatch", "checkpoint_decode_or_compare_failed")
     ):
         raise AuditIntegrityError("completed application changed its actual receipt/verification")

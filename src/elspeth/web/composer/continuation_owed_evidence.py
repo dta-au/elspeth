@@ -11,7 +11,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.continuation_codec import PrivateChunk, verify_private_chunk
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _restore_current_evidence
 from elspeth.web.composer.continuation_evidence_restore import (
     _require_current_reader_service,
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class OwedP4EvidenceData:
-    snapshot: TurnEvidenceSnapshot
+    snapshot: AdmittedTurnEvidence
     result: ReadmittedP4Result
     result_chunk: PrivateChunk
     creator_sequence: int
@@ -75,7 +75,7 @@ def read_owed_p4_evidence_on_connection(
         effect_key=effect_key,
     )
     snapshot = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=inventory.names)
-    if snapshot.application_entry is not None:
+    if snapshot.snapshot.application_entry is not None:
         from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
 
         require_p4_application_journal_on_connection(conn, running, selected=selected, evidence=snapshot, env_ref_names=inventory.names)
@@ -162,8 +162,9 @@ async def restore_owed_p4_evidence(
             if type(outcome.value) is not OwedP4EvidenceData:
                 raise AuditIntegrityError("owed evidence replaced its complete checked result")
             checked = outcome.value
+            admitted = require_admitted_turn_evidence(checked.snapshot, env_ref_names=inventory.names)
             reader = None
-            if checked.snapshot.requires_blob_reader:
+            if admitted.snapshot.requires_blob_reader:
                 if service is None:
                     raise AuditIntegrityError("owed evidence requires its actual current reader service")
                 _require_current_reader_service(service, authority)
@@ -171,7 +172,7 @@ async def restore_owed_p4_evidence(
                     service, session_id=str(running.claim.session_id), context=running.session_operation_context
                 )
             restored = _restore_current_evidence(
-                checked.snapshot, context=running.session_operation_context, reader=reader, env_ref_names=inventory.names
+                admitted, context=running.session_operation_context, reader=reader, env_ref_names=inventory.names
             )
             result = RestoredOwedP4Evidence(restored, checked)
         except BaseException as error:

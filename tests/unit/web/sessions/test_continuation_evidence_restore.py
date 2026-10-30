@@ -70,7 +70,7 @@ async def stored_evidence(store):
     )
     evidence = encode_turn_evidence(snapshot)
     state = encode_private_chunk(codec="composer.state.v1", canonical=canonical_json(owner.effects.initial_state.to_dict()))
-    transcript = encode_message_shelf(snapshot.transcript)
+    transcript = encode_message_shelf(snapshot.snapshot.transcript)
     audit = encode_recorder_snapshot(recorder.snapshot_for_continuation(drained=RecorderDrainCursors()))
     # These values are outside this owner. Their actual bytes/ref closure are
     # retained; no placeholder module or fake decoder is called or installed.
@@ -85,7 +85,7 @@ async def stored_evidence(store):
     current_messages = encode_private_chunk(
         codec="composer.messages.v1",
         canonical=canonical_json(
-            {"messages_json": snapshot.transcript.messages_json, "current_indexes": snapshot.transcript.current_indexes}
+            {"messages_json": snapshot.snapshot.transcript.messages_json, "current_indexes": snapshot.snapshot.transcript.current_indexes}
         ),
     )
     frame = ComposeFrame(
@@ -190,8 +190,8 @@ async def test_actual_current_read_restores_full_graph_without_writes(operation_
             drained=actual.drained,
             logical=selected.stack.logical,
             env_ref_names=inventory.names,
-        )
-        == expected
+        ).snapshot
+        == expected.snapshot
     )
     assert actual.recorder.withheld_replies[0].content == "A retained unpublished reply"
     assert "middle amendment" in actual.evidence.transcript.snapshot().provider_json

@@ -393,6 +393,8 @@ export type ComposerProgressReason =
   | "service_setup_failed"
   | "mutation_authority_revoked"
   | "admission_refused"
+  // U-22 F4: prepared provider context outside the supported envelope.
+  | "context_unsupported"
   | "accounting_unavailable"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
@@ -1299,6 +1301,11 @@ export interface SystemStatus {
    * server always sends it.
    */
   composer_timeout_seconds?: number;
+  /**
+   * The Composer-Operation-Version a new submission should request: 2 only
+   * when the server admits Continuation. Missing (older servers) means 1.
+   */
+  composer_operation_admission_version?: 1 | 2;
   /**
    * False when the deployment runs in locked-down server-only mode
    * (ELSPETH_WEB__USER_SECRETS_ENABLED=false): users cannot add their own

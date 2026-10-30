@@ -78,7 +78,6 @@ from elspeth.web.sessions.models import identity_roles_table, runs_table
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
-    CompositionStateData,
     CompositionStateRecord,
     RunRecord,
 )
@@ -88,6 +87,7 @@ from elspeth.web.sso_wiring import SsoWiring
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import expire_leader_seat
 from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -277,7 +277,7 @@ async def _save_session_seed_state(
     try:
         return await service.save_composition_state(
             session_id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=context,
         )
@@ -2041,26 +2041,26 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 reached_serving = True
 
-        surfaces = ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-        roles = ["planner", "planner", "planner", "advisor"]
+        surfaces = ["loop_tools", "advisor"]
+        roles = ["planner", "advisor"]
         status = "skipped_no_durable_guard_audit"
         assert reached_serving
-        assert probed == list(zip(surfaces, roles, [None] * 4, strict=True))
+        assert probed == list(zip(surfaces, roles, [None] * 2, strict=True))
         assert sdk_calls == guard_calls == []
         warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_not_qualified"]
         assert [entry["probed_surface"] for entry in warnings] == surfaces
         assert [entry["probed_role"] for entry in warnings] == roles
-        assert [entry["mode"] for entry in warnings] == [mode] * 4
+        assert [entry["mode"] for entry in warnings] == [mode] * 2
         assert {entry["reason"] for entry in warnings} == {
             "No durable lifecycle prompt-guard audit sink is available for sessionless probes."
         }
         outcomes = [entry for entry in logs if entry["event"] == "composer_boot_probe_outcome"]
         assert [(entry["probed_surface"], entry["probed_role"], entry["probe_status"]) for entry in outcomes] == list(
-            zip(surfaces, roles, [status] * 4, strict=True)
+            zip(surfaces, roles, [status] * 2, strict=True)
         )
-        assert [amount for amount, _attributes in counter.calls] == [1] * 4
+        assert [amount for amount, _attributes in counter.calls] == [1] * 2
         attributes = [attrs for _amount, attrs in counter.calls]
-        assert [(attrs["probed_surface"], attrs["probe_status"]) for attrs in attributes] == list(zip(surfaces, [status] * 4, strict=True))
+        assert [(attrs["probed_surface"], attrs["probe_status"]) for attrs in attributes] == list(zip(surfaces, [status] * 2, strict=True))
         assert [attrs for _value, attrs in latency.calls] == attributes
         assert all(type(value) is int and value >= 0 for value, _attrs in latency.calls)
         assert not any(entry["event"] == "composer_boot_probe_transient_failure" for entry in logs)
@@ -2315,14 +2315,14 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert probed_models == ["gpt-5.5", "gpt-5.5", "anthropic/claude-sonnet-4-6"]
-        assert len(counter.calls) == 3
-        assert len(latency.calls) == 3
+        assert probed_models == ["gpt-5.5", "anthropic/claude-sonnet-4-6"]
+        assert len(counter.calls) == 2
+        assert len(latency.calls) == 2
         counter_attributes = [attributes for _amount, attributes in counter.calls]
         assert [attrs["probed_model"] for attrs in counter_attributes] == probed_models
-        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "planner", "advisor"]
-        assert [attrs["probed_surface"] for attrs in counter_attributes] == ["loop_tools", "planner_tools", "advisor"]
-        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, False, True]
+        assert [attrs["probed_role"] for attrs in counter_attributes] == ["planner", "advisor"]
+        assert [attrs["probed_surface"] for attrs in counter_attributes] == ["loop_tools", "advisor"]
+        assert [attrs["structured_output"] for attrs in counter_attributes] == [False, True]
         for attributes in counter_attributes:
             assert attributes["composer_model"] == "gpt-5.5"
             assert attributes["composer_temperature"] == "0.0"
@@ -2370,13 +2370,12 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert [request.surface for request in probed] == ["loop_tools", "planner_tools", "advisor"]
-        loop_request, planner_request, advisor_request = probed
-        for primary_request in (loop_request, planner_request):
-            assert primary_request.role == "planner"
-            assert primary_request.kwargs["model"] == "gpt-5.5"
-            assert primary_request.kwargs["api_base"] == "https://primary-gateway.example.test/v1"
-            assert primary_request.kwargs["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert [request.surface for request in probed] == ["loop_tools", "advisor"]
+        loop_request, advisor_request = probed
+        assert loop_request.role == "planner"
+        assert loop_request.kwargs["model"] == "gpt-5.5"
+        assert loop_request.kwargs["api_base"] == "https://primary-gateway.example.test/v1"
+        assert loop_request.kwargs["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
         assert advisor_request.role == "advisor"
         assert advisor_request.kwargs["model"] == "gpt-5.5"
         assert advisor_request.kwargs["max_tokens"] == 8192
@@ -2408,14 +2407,15 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert len(probed) == 3
+        assert [request.surface for request in probed] == ["loop_tools", "advisor"]
         for request in probed:
             assert "api_base" not in request.kwargs
             assert "api_key" not in request.kwargs
 
     @pytest.mark.asyncio
-    async def test_lifespan_caps_planner_probes_inside_one_shared_deadline(self, monkeypatch, tmp_path) -> None:
-        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
+    @pytest.mark.parametrize("advisor_model", ["anthropic/claude-sonnet-4-6", "openrouter/z-ai/glm-5.3"])
+    async def test_lifespan_caps_live_probes_inside_one_shared_deadline(self, monkeypatch, tmp_path, advisor_model) -> None:
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model=advisor_model))
         surfaces: list[str] = []
 
         async def _probe(request: ComposerProbeRequest) -> bool:
@@ -2439,103 +2439,43 @@ class TestLifespanShutdown:
             async with lifespan(app):
                 pass
 
-        assert surfaces == ["loop_tools", "planner_tools", "advisor"]
-        assert timeouts[:2] == [5.0, 5.0]
+        assert surfaces == ["loop_tools", "advisor"]
+        assert timeouts[0] == 5.0
         # The first probe consumed at least 0.1 seconds of the shared deadline.
         # A fresh 45-second advisor timeout would fail this control.
-        assert len(timeouts) == 3
-        assert 0 < timeouts[2] < 44.95
+        assert len(timeouts) == 2
+        assert 0 < timeouts[1] < 44.95
 
     @pytest.mark.asyncio
-    async def test_lifespan_caps_three_planner_role_probes_on_a_forwarding_hatch(self, monkeypatch, tmp_path) -> None:
-        """S1 T8 / D9: an OpenRouter advisor adds ``hatch_terminal``, a planner-role probe with the 5 s cap.
-
-        Control: order the hatch after the advisor and the surface order goes red.
-        """
-        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
-        surfaces: list[str] = []
-
-        async def _probe(request: ComposerProbeRequest) -> bool:
-            surfaces.append(request.surface)
-            return True
-
-        real_wait_for = asyncio.wait_for
-        timeouts: list[float] = []
-
-        async def _wait_with_delay(awaitable: Awaitable[bool], *, timeout: float) -> bool:
-            timeouts.append(timeout)
-            if len(timeouts) == 1:
-                await asyncio.sleep(0.1)
-            return await real_wait_for(awaitable, timeout=timeout)
-
-        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
-        with (
-            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-            patch("elspeth.web.app.asyncio.wait_for", new=_wait_with_delay),
-        ):
-            async with lifespan(app):
-                pass
-
-        assert surfaces == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-        # Every planner-role probe is capped at min(remaining, 5 s); the
-        # advisor gets what is left after the first probe's controlled delay.
-        assert timeouts[:3] == [5.0, 5.0, 5.0]
-        assert len(timeouts) == 4
-        assert 0 < timeouts[3] < 44.95
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("rejected_surface", ["hatch_terminal", "planner_tools", "loop_tools", "advisor"])
-    async def test_hatch_terminal_rejection_is_nonfatal(self, monkeypatch, tmp_path, rejected_surface: str) -> None:
-        """Ruling 8 (b): a ``hatch_terminal`` 400 is logged and boot continues; every other surface's 400 stays fatal.
-
-        Control: drop the surface check so every 400 is non-fatal, and the
-        ``planner_tools`` case goes red.
-        """
+    @pytest.mark.parametrize("rejected_surface", ["loop_tools", "advisor"])
+    async def test_every_live_probe_configuration_rejection_is_fatal(self, monkeypatch, tmp_path, rejected_surface) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True, composer_advisor_model="openrouter/z-ai/glm-5.3"))
         counter = _RecordingCounter()
         latency = _RecordingHistogram()
-        sent: list[str] = []
+        sent = []
 
-        async def _probe(request: ComposerProbeRequest) -> bool:
+        async def reject_selected(request):
             sent.append(request.surface)
             if request.surface == rejected_surface:
-                raise ComposerBootConfigError(
-                    f"composer {request.role} boot request rejected by {request.model}: surface={request.surface}"
-                )
+                raise ComposerBootConfigError(f"controlled surface={request.surface}")
             return True
 
-        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", reject_selected)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
         monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
-
-        if rejected_surface == "hatch_terminal":
-            with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
-                async with lifespan(app):
-                    pass
-            assert sent == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-            statuses = {attributes["probed_surface"]: attributes["probe_status"] for _amount, attributes in counter.calls}
-            assert statuses == {"loop_tools": "success", "planner_tools": "success", "hatch_terminal": "rejected", "advisor": "success"}
-            [event] = [entry for entry in logs if entry["event"] == "composer_boot_probe_rejected_nonfatal"]
-            assert event["probed_surface"] == "hatch_terminal"
-            assert event["probed_role"] == "planner"
-            assert event["model"] == "openrouter/z-ai/glm-5.3"
-            assert (event["tool_count"], event["strict_true_count"], event["strict_false_count"], event["strict_key_omitted"]) == (
-                3,
-                2,
-                1,
-                0,
-            )
-            assert "hatch" in event["action"]
-            assert "rejected by" not in repr(event)
-        else:
-            with (
-                patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-                pytest.raises(ComposerBootConfigError, match=f"surface={rejected_surface}"),
-            ):
-                async with lifespan(app):
-                    pass
-            assert sent[-1] == rejected_surface
-            assert [attributes["probe_status"] for _amount, attributes in counter.calls][-1] == "rejected"
+        with (
+            capture_logs() as logs,
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            pytest.raises(ComposerBootConfigError, match=f"surface={rejected_surface}"),
+        ):
+            async with lifespan(app):
+                pytest.fail("A rejected live configuration must not start serving")
+        expected = ["loop_tools"] if rejected_surface == "loop_tools" else ["loop_tools", "advisor"]
+        assert sent == expected
+        assert [attributes["probed_surface"] for _amount, attributes in counter.calls] == expected
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["success"] * (len(expected) - 1) + ["rejected"]
+        assert len(latency.calls) == len(expected)
+        assert not any(entry["event"] == "composer_boot_probe_rejected_nonfatal" for entry in logs)
 
     def test_composer_boot_probe_deadline_fits_the_startup_contract(self) -> None:
         """The probes run before uvicorn binds, so they spend the 150 s startup contract.
@@ -2613,22 +2553,22 @@ class TestLifespanShutdown:
             await asyncio.wait_for(_enter_and_exit_lifespan(), timeout=5.0)
 
         timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list if call.kwargs["timeout"] != 5.0]
-        assert timeouts[:2] == [0.1, 0.1]
-        assert len(timeouts) == 3
+        assert timeouts[0] == 0.1
+        assert len(timeouts) == 2
         # Every probe request fits inside the one deadline.
         assert sum(timeouts) <= 0.3 + 0.01
-        assert 0.05 < timeouts[2] <= 0.1 + 0.01
-        assert cancelled == ["loop_tools", "planner_tools", "advisor"]
-        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
-        assert len(latency.calls) == 3
+        assert 0.15 < timeouts[1] <= 0.2 + 0.01
+        assert cancelled == ["loop_tools", "advisor"]
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 2
+        assert len(latency.calls) == 2
         warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
-        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
-        assert [warning["failure_class"] for warning in warnings] == ["TimeoutError"] * 3
-        for warning in warnings[:2]:
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "advisor"]
+        assert [warning["failure_class"] for warning in warnings] == ["TimeoutError"] * 2
+        for warning in warnings[:1]:
             assert "structured_output_conformance_verified" not in warning
             assert "tool schemas unverified at boot" in warning["action"]
-        assert warnings[2].get("structured_output_conformance_verified") is False
-        assert "structured-output conformance was not verified this boot" in warnings[2]["action"]
+        assert warnings[1].get("structured_output_conformance_verified") is False
+        assert "structured-output conformance was not verified this boot" in warnings[1]["action"]
 
     @pytest.mark.asyncio
     async def test_lifespan_sends_nothing_once_the_shared_deadline_is_spent(self, monkeypatch, tmp_path) -> None:
@@ -2651,11 +2591,11 @@ class TestLifespanShutdown:
                 pass
 
         assert sent == []
-        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 3
-        assert len(latency.calls) == 3
+        assert [attributes["probe_status"] for _amount, attributes in counter.calls] == ["transient_failure"] * 2
+        assert len(latency.calls) == 2
         warnings = [entry for entry in logs if entry["event"] == "composer_boot_probe_transient_failure"]
-        assert [warning["failure_class"] for warning in warnings] == ["SharedDeadlineExhausted"] * 3
-        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "planner_tools", "advisor"]
+        assert [warning["failure_class"] for warning in warnings] == ["SharedDeadlineExhausted"] * 2
+        assert [warning["probed_surface"] for warning in warnings] == ["loop_tools", "advisor"]
 
     @pytest.mark.asyncio
     async def test_lifespan_logs_an_unproven_thinking_route_on_success(self, monkeypatch, tmp_path) -> None:

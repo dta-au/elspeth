@@ -108,12 +108,9 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
         ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
-        # Planner / discovery feedback that projects an already-produced code,
-        # a closed ``ToolArgumentError.code`` or a closed category value.
-        ("composer/pipeline_planner.py", "_compile_candidate_feedback", "code"),
-        ("composer/pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
-        ("composer/pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
-        ("composer/pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
+        # Live commit / discovery feedback forwards an already-produced code
+        # or a closed ToolArgumentError category. The retired planner-only
+        # projectors no longer produce a code and are not census exemptions.
         ("composer/pipeline_commit.py", "prepare_pipeline_proposal_commit", "exc.category.value"),
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),

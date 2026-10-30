@@ -239,9 +239,27 @@ PRODUCER_GRAMMARS = {
     "for_proposal": "ac4f3d19ab1b799bb5ad618074f3e864eb0aded708f4cb6c6b83af19fb979ecd",
 }
 NAMESPACE_GRAMMARS = {
-    "RequiredWorkCoordinator": "b2c87a9e9270600679f8d9d6fccc13f88f644f940e6891538d5dc7deb9f22471",
+    # Includes the closed-source continuation SQL-outcome validator header;
+    # current required-work source/body recipes retain its exact SQL custody.
+    "RequiredWorkCoordinator": "44b1bd6207bc1021388061afadbadf23f4644fb2ce8d9439211ebe4b2d3eb584",
     "RequiredWorkBinding": "e4e502c55b4ecd87baa32c1165c938a6fceafd737f930b55287a87fd392164b2",
 }
+_CONTINUATION_SQL_OUTCOME_SOURCE = """def validate_continuation_sql_outcome[T](
+    self,
+    *,
+    ticket: RequiredWorkTicket,
+    expected_source: RequiredWorkSource,
+    actual_outcome: RequiredSQLFinishOnce[T],
+) -> None:
+    if type(expected_source) is not RequiredWorkSource or expected_source not in (
+        RequiredWorkSource.CONTINUATION_STATE_SQL,
+        RequiredWorkSource.CONTINUATION_READ_SQL,
+    ):
+        raise AuditIntegrityError("Continuation SQL outcome has an unsupported source")
+    with self._lock:
+        self._registered(ticket, expected_source)
+        self._verify_sql_outcome(ticket, actual_outcome)
+"""
 SOURCES = (
     "PREPARATION_VALIDATION_PRODUCER",
     "POSTCOMMIT_REVIEW_READ_SQL",
@@ -470,6 +488,20 @@ def proposal_child_local_contracts(units):
                 "supplier_definition": _identity(REQUIRED, definition),
                 "actual_kind_bits": code.co_flags & MASK,
                 "qualification": "ORDINARY_SOURCE_MEMBER_BEHAVIOR_AND_RUNTIME_UNKNOWN",
+            }
+        )
+    continuation_validator, _ = find(required_tree, "RequiredWorkCoordinator.validate_continuation_sql_outcome")
+    expected_validator = ast.parse(_CONTINUATION_SQL_OUTCOME_SOURCE).body[0]
+    if not isinstance(continuation_validator, ast.FunctionDef) or ast.dump(continuation_validator, include_attributes=False) != ast.dump(
+        expected_validator, include_attributes=False
+    ):
+        failures.append("proposal child transfer: continuation SQL outcome ownership changed")
+    else:
+        receipt["source_origins"].append(
+            {
+                "binding": "RequiredWorkCoordinator.validate_continuation_sql_outcome",
+                "supplier_definition": _identity(REQUIRED, continuation_validator),
+                "qualification": "CURRENT_SOURCE_HEADER_AND_BODY_RUNTIME_SQL_UNKNOWN",
             }
         )
     if failures or len(selected) != 2:

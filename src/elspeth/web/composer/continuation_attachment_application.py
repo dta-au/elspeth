@@ -17,8 +17,15 @@ from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snaps
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData, encode_restored_prepared_batch_data
 from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continuation_response
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
-from elspeth.web.composer.continuation_evidence import RetainedBlobPage, RetainedPageLink, TurnEvidenceSnapshot, encode_turn_evidence
-from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
+from elspeth.web.composer.continuation_evidence import (
+    AdmittedTurnEvidence,
+    RetainedBlobPage,
+    RetainedPageLink,
+    TurnEvidenceSnapshot,
+    admit_turn_evidence,
+    encode_turn_evidence,
+    require_admitted_turn_evidence,
+)
 from elspeth.web.composer.continuation_message_family_builders import attachment_result_message, family_message_wire
 from elspeth.web.composer.continuation_message_family_recipes import AttachmentResultMessageRecipe
 from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
@@ -118,8 +125,8 @@ def _register_page(snapshot: TurnEvidenceSnapshot, *, call_id: str, admitted: Ad
 
 def require_attachment_projection(
     *,
-    before: TurnEvidenceSnapshot,
-    after: TurnEvidenceSnapshot,
+    before: AdmittedTurnEvidence,
+    after: AdmittedTurnEvidence,
     prepared_source: RestoredPreparedBatchData,
     retained_result: ContinuationReadOwnerResult,
     read_audit: PortableDispatchAudit,
@@ -128,10 +135,11 @@ def require_attachment_projection(
     response: PrivateChunk,
     env_ref_names: frozenset[str],
 ) -> ApplicationGraph:
-    encode_turn_evidence(before, env_ref_names=env_ref_names)
-    encode_turn_evidence(after, env_ref_names=env_ref_names)
-    old = require_evidence_application_links(before, env_ref_names=env_ref_names)
-    new = require_evidence_application_links(after, env_ref_names=env_ref_names)
+    before_admitted = require_admitted_turn_evidence(before, env_ref_names=env_ref_names)
+    after_admitted = require_admitted_turn_evidence(after, env_ref_names=env_ref_names)
+    before_snapshot = before_admitted.snapshot
+    old = before_admitted.graph
+    new = after_admitted.graph
     if old is None or new is None or old.selected_audit is None or old.selected_dialect is None:
         raise AuditIntegrityError("attachment projection lacks its complete original prepared identity graph")
     prepared = RestoredPreparedBatchData(
@@ -208,29 +216,37 @@ def require_attachment_projection(
     expected_json = encode_application_graph(expected_graph, env_ref_names=env_ref_names)
     if encode_application_graph(new, env_ref_names=env_ref_names) != expected_json:
         raise AuditIntegrityError("attachment projection changed its complete batch/recorder/history identity graph")
-    expected = _register_page(before, call_id=call.tool_call.id, admitted=admitted)
+    expected = _register_page(before_snapshot, call_id=call.tool_call.id, admitted=admitted)
     message = attachment_result_message(call=call.tool_call, result=nominal)
     shelf = _append_message(
-        before.transcript,
+        before_snapshot.transcript,
         wire=family_message_wire(message),
         recipe=AttachmentResultMessageRecipe(response=response.reference, tool_call_id=call.tool_call.id),
     )
-    entry = None if before.application_entry is None else before.application_entry.model_copy(update={"graph_json": expected_json})
+    entry = (
+        None
+        if before_snapshot.application_entry is None
+        else before_snapshot.application_entry.model_copy(update={"graph_json": expected_json})
+    )
+    recorder_chunk = encode_recorder_snapshot(recorder)
     expected = expected.model_copy(
         update={
             "transcript": shelf,
-            "recorder_json": encode_recorder_snapshot(recorder).canonical,
+            "recorder": recorder_chunk.reference,
             "joint_graph_json": expected_json if entry is None else None,
             "application_entry": entry,
         }
     )
-    if encode_turn_evidence(after, env_ref_names=env_ref_names) != encode_turn_evidence(expected, env_ref_names=env_ref_names):
+    expected_admitted = admit_turn_evidence(expected, env_ref_names=env_ref_names, source_chunks=(recorder_chunk, *before.sources.chunks))
+    if encode_turn_evidence(after_admitted, env_ref_names=env_ref_names) != encode_turn_evidence(
+        expected_admitted, env_ref_names=env_ref_names
+    ):
         raise AuditIntegrityError("attachment projection changed original evidence/transcript or actual page registration")
     return new
 
 
 def admit_attachment_application(
-    value: AttachmentApplicationData, *, env_ref_names: frozenset[str]
+    value: AttachmentApplicationData, *, env_ref_names: frozenset[str], source_chunks: tuple[PrivateChunk, ...] = ()
 ) -> tuple[ContinuationFrameStack, ContinuationReadOwnerResult]:
     """Check complete historical DATA; current SQL source proof is still owed."""
     from elspeth.contracts.hashing import canonical_json
@@ -288,14 +304,16 @@ def admit_attachment_application(
     read_audit = decode_dispatch_audit(publication.read_audit_json, env_ref_names=env_ref_names)
     retained = decode_read_owner_result(publication.result_json, env_ref_names=env_ref_names)
     before = decode_turn_evidence(
-        encode_private_chunk(codec="composer.evidence.v1", canonical=value.before_evidence_json, env_ref_names=env_ref_names),
+        encode_private_chunk(codec="composer.evidence.v2", canonical=value.before_evidence_json, env_ref_names=env_ref_names),
         env_ref_names=env_ref_names,
+        source_chunks=source_chunks,
     )
     after = decode_turn_evidence(
-        encode_private_chunk(codec="composer.evidence.v1", canonical=value.after_evidence_json, env_ref_names=env_ref_names),
+        encode_private_chunk(codec="composer.evidence.v2", canonical=value.after_evidence_json, env_ref_names=env_ref_names),
         env_ref_names=env_ref_names,
+        source_chunks=source_chunks,
     )
-    if before.logical != root.logical or (before.physical_operation_id, before.physical_operation_epoch) != (
+    if before.snapshot.logical != root.logical or (before.snapshot.physical_operation_id, before.snapshot.physical_operation_epoch) != (
         value.application_operation_id,
         value.application_operation_epoch,
     ):

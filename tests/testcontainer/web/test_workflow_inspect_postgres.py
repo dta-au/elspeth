@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
@@ -76,6 +77,7 @@ def _seed(engine: Engine) -> None:
         )
         conn.execute(
             insert(composition_states_table).values(
+                metadata_=stored_default_pipeline_metadata(),
                 id="state-1",
                 session_id="session-1",
                 version=1,

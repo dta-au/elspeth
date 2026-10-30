@@ -14,11 +14,6 @@ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
-from elspeth.web.composer.pipeline_planner import (
-    _allowlisted_candidate_feedback,
-    _ParsedToolCall,
-    _serialize_provider_discovery_result,
-)
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.composer.tools import _dispatch, secrets
@@ -194,8 +189,6 @@ def _assert_discovery_failure(tool: str, arguments: dict[str, Any], result: Tool
     admitted = admit_discovery_result(tool, result)
     assert admitted.response is None
     ordinary = json.loads(serialize_admitted_discovery_result(admitted))
-    call = _ParsedToolCall(call_id="metadata-call", name=tool, raw_arguments=json.dumps(arguments), arguments=arguments)
-    assert json.loads(_serialize_provider_discovery_result(call=call, result=admitted)) == ordinary
     assert ordinary["success"] is False
     assert "data" not in ordinary
     assert "validation_guidance" not in ordinary
@@ -481,8 +474,7 @@ def test_availability_discovery_remains_successful_metadata(available: bool, lis
     if listed:
         expected.update(scope="user", source_kind="stored", reason=None if available else "value_decryption_failed")
     assert admitted.response.to_wire() == expected
-    call = _ParsedToolCall(call_id="availability", name="validate_secret_ref", raw_arguments=json.dumps(args), arguments=args)
-    assert json.loads(_serialize_provider_discovery_result(call=call, result=admitted))["data"] == expected
+    assert json.loads(serialize_admitted_discovery_result(admitted))["data"] == expected
     assert inventory.calls == [("list", "operator-one"), ("has", "operator-one", "ROUTE_REF")]
 
 
@@ -601,7 +593,7 @@ def test_secret_codes_have_exact_static_guidance(code: str, context: ToolContext
     assert (result.data["explanation"], result.data["suggested_fix"]) == pair
 
 
-def test_restricted_feedback_keeps_static_repair_and_omits_raw_diagnostic(context: ToolContext) -> None:
+def test_restricted_refusal_carries_static_repair_guidance(context: ToolContext) -> None:
     state = _state()
     args = _wire_arguments("node", "clean", "PRIVATE_OPTION_CANARY")
     args["name"] = "PRIVATE_REF_CANARY"
@@ -619,16 +611,13 @@ def test_restricted_feedback_keeps_static_repair_and_omits_raw_diagnostic(contex
     assert "PRIVATE_REF_CANARY" in rejection.message
     assert "PRIVATE_OPTION_CANARY" in rejection.message
     assert rejection.error_code == "unauthorized_secret_ref"
-    feedback = _allowlisted_candidate_feedback(result)
-    rendered = json.dumps(feedback)
-    assert "PRIVATE_REF_CANARY" not in rendered
-    assert "PRIVATE_OPTION_CANARY" not in rendered
-    assert "detail" not in feedback["validation"]["errors"][0]
     assert rejection.plugin_identity is None
     assert result.plugin_schemas is None
     pair = explain_validation_code("unauthorized_secret_ref")
     assert pair is not None
-    assert pair[0] in rendered and pair[1] in rendered
+    assert result.validation_guidance is not None
+    guidance = result.validation_guidance["codes"]["unauthorized_secret_ref"]
+    assert (guidance["explanation"], guidance["suggested_fix"]) == pair
 
 
 def test_changed_owned_snapshot_recomputes_surviving_findings(context: ToolContext) -> None:

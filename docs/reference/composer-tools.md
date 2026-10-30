@@ -606,18 +606,18 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 
 Every registered tool, and `request_interpretation_review`, returns a
 `ToolResult`. The model receives it serialized verbatim; the audit row
-receives the redaction manifest's projection of the same object. Four offered
-tools answer in another form:
+receives the redaction manifest's projection of the same object. The offered
+tools below answer in another form:
 
 | Tool | What the model receives |
 |------|-------------------------|
 | `request_advisor_hint` | A flat feedback object keyed by `status`. `SUCCESS` carries the advice in `guidance` with a `note`; `ARG_ERROR`, `BUDGET_EXHAUSTED`, `DEADLINE_TOO_CLOSE` and `ADVISOR_ERROR` carry no advice. Budget accounting is kept in the audit row and removed from the model's copy. There is no `version`, `affected_nodes` or `validation`. |
 | `handoff_to_user`, `restore_parked_graph` | No tool result. The call must be the only one in its response; it ends the turn, and the server settles the recovery and reports the outcome. |
-| `emit_pipeline_proposal` (planner terminal) | On rejection, `success: false` and `validation` errors, optionally with `guidance`, `truncation_notice` or `repeat_notice`. An accepted proposal ends planning with no tool result. |
-The key vocabulary is one registry (`src/elspeth/web/composer/tool_result_envelope.py`)
-that the producer, the redaction manifest, and the planner's closed discovery
-twin all derive from, and this section is pinned to it by
-`tests/unit/web/composer/test_tool_result_envelope_gate.py`.
+
+The envelope key vocabulary is defined in
+`src/elspeth/web/composer/tool_result_envelope.py`.
+`tests/unit/web/composer/test_tool_result_envelope_gate.py` pins the producer,
+the redaction manifest, and this section to that vocabulary.
 
 ```json
 {

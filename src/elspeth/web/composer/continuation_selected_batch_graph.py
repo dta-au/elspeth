@@ -15,16 +15,15 @@ from elspeth.web.composer.continuation_batch_data import (
     encode_restored_prepared_batch_data,
 )
 from elspeth.web.composer.continuation_codec import decode_continuation_response, verify_private_chunk
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
-from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.continuation_tool_batch import _read_json_value
 
 
 def require_selected_active_batch_graph(
-    selected: SelectedContinuationState, evidence: TurnEvidenceSnapshot, *, env_ref_names: frozenset[str]
+    selected: SelectedContinuationState, evidence: AdmittedTurnEvidence, *, env_ref_names: frozenset[str]
 ) -> None:
-    graph = require_evidence_application_links(evidence, env_ref_names=env_ref_names)
+    graph = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names).graph
     if graph is None or graph.selected.batch.phase in ("p4_pending", "complete"):
         return
     if type(selected) is not SelectedContinuationState:

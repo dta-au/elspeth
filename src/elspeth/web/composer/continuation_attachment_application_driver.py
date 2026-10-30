@@ -7,15 +7,14 @@ from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_attachment_finisher import finish_current_attachment_result
-from elspeth.web.composer.continuation_attachment_history import decode_attachment_history
 from elspeth.web.composer.continuation_attachment_result import _owners, _project
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, capture_continuation_runtime_owners
+from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime, _registered_read, capture_continuation_runtime_owners
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.tool_batch import ToolBatchContext
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.continuation_attachment_application import StoredAttachmentApplication
-from elspeth.web.sessions.continuation_runtime import runtime_chunk
+from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 
 
 async def read_current_applied_attachment(
@@ -70,12 +69,17 @@ async def apply_current_attachment_runtime(
     compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
         raise AuditIntegrityError("attachment application lost its actual Compose owner")
-    history = decode_attachment_history(
-        runtime_chunk(selected, compose[0].attachment_admissions),
-        session_id=selected.stack.logical.session_id,
-        operation_id=selected.stack.logical.operation_id,
-        env_ref_names=inventory.names,
+    # Warm publication advances the selected root while retaining the original
+    # live B2 objects. Read the supplied current history through its SQL owner;
+    # an old runtime's historical DATA is not a current/already-applied grant.
+    current_source = await _registered_read(
+        work,
+        ContinuationRuntimeSource,
+        lambda: authority.read_continuation_runtime(running, selected=selected, inventory=inventory),
     )
+    if current_source.selected is not selected:
+        raise AuditIntegrityError("attachment history read changed its actual selected source")
+    history = current_source.attachments
     if any(value.effect_key == effect_key for value in history.applications):
         # Only the actual current SQL verifier, not the decoded history branch,
         # can return the already-applied disposition.

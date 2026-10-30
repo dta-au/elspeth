@@ -40,7 +40,7 @@ class ComposerOperationWatchReader:
         worker: ComposerAsyncWorker,
         running: ComposerOperationRunning,
         lease: SessionOperationLease,
-        anchor: ComposerBudgetAnchor,
+        anchor: ComposerBudgetAnchor | None,
     ) -> None:
         if seal is not _WATCH_CREATION_SEAL:
             raise AuditIntegrityError("Operation observation owner is worker-issued")
@@ -48,9 +48,10 @@ class ComposerOperationWatchReader:
         self.running = running
         self.lease = lease
         self.anchor = anchor
-        self.deadline = anchor.monotonic_at_running + anchor.remaining_at_running_seconds
-        if (
-            not math.isfinite(self.deadline)
+        self.deadline = None if anchor is None else anchor.monotonic_at_running + anchor.remaining_at_running_seconds
+        if anchor is not None and (
+            self.deadline is None
+            or not math.isfinite(self.deadline)
             or not math.isfinite(anchor.remaining_at_running_seconds)
             or anchor.remaining_at_running_seconds <= 0
         ):
@@ -89,7 +90,37 @@ class ComposerOperationWatchReader:
             raise AuditIntegrityError("Operation observation lacks exact owned running authority")
         return cls(_WATCH_CREATION_SEAL, worker, running, lease, anchor)
 
+    @classmethod
+    def for_segment(
+        cls, worker: ComposerAsyncWorker, running: ComposerOperationRunning, lease: SessionOperationLease
+    ) -> ComposerOperationWatchReader:
+        from elspeth.web.coordination.lifecycle import SessionOperationLease
+        from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+        from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+
+        if (
+            type(worker) is not ComposerAsyncWorker
+            or type(running) is not ComposerOperationRunning
+            or running.claim.segment_sequence is None
+            or type(lease) is not SessionOperationLease
+            or lease.context != running.session_operation_context
+        ):
+            raise AuditIntegrityError("Segment observation lacks exact owned running authority")
+        return cls(_WATCH_CREATION_SEAL, worker, running, lease, None)
+
     def invoke(self) -> tuple[ComposerOperationRecord | None, datetime]:
+        if self.anchor is None:
+            from elspeth.web.sessions.locking import continuation_sql_deadline_scope
+
+            work = self.lease.required_work
+            if work is None or work.sql_deadline_owner is None:
+                raise AuditIntegrityError("Segment observation lost its actual SQL timing owner")
+            owner = work.sql_deadline_owner
+            owner.validate_context(self.lease.context, operation_id=self.running.claim.operation_id, attempt=self.running.claim.attempt)
+            # This method is the registered physical watch invocation. Install
+            # the owned scope here rather than relying on cross-thread context.
+            with continuation_sql_deadline_scope(owner, lifecycle=True):
+                return self._invocation(session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id)
         return self._invocation(session_id=self.running.claim.session_id, operation_id=self.running.claim.operation_id)
 
     def pin_generation(self, executor: ThreadPoolExecutor, generation: RequiredExecutorGenerationCustodian) -> None:
@@ -106,8 +137,16 @@ class ComposerOperationWatchReader:
             raise self.lease.renewal_error
         if self.lease.closed:
             raise asyncio.CancelledError(COMPOSER_LEASE_LOST)
-        if self.worker._stopping or self.worker._instance_draining.is_set():
+        draining = self.worker._stopping or self.worker._instance_draining.is_set()
+        if draining and (self.anchor is not None or self.worker.drain_deadline is None):
             raise asyncio.CancelledError(COMPOSER_SHUTDOWN)
+        if self.anchor is None:
+            # V2 has segment/action clocks. A process drain is observed by the
+            # stage owner, which must keep watching durable Stop until its own
+            # cutoff instead of treating H as a V1 parent timeout.
+            return
+        if self.deadline is None:
+            raise AuditIntegrityError("V1 observation lost its actual parent deadline")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ComposerTurnDeadlineExpired(

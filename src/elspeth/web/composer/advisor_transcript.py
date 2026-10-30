@@ -17,14 +17,9 @@ from pydantic import JsonValue
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
-from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_CONTENT_PARTS_KEY,
-    PROMPT_GUARD_THINKING_PARTS_KEY,
-    PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
-    PROMPT_GUARD_TRUST_KEY,
-    PromptGuardContentPart,
-)
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_PROVENANCE_KEYS, PromptGuardContentPart
 from elspeth.web.composer.audit_storage import INVOCATION_AUTHORITY_REVOKED_KEY
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_message_shelf import (
     MessageShelfSnapshot,
     RetainedObservedMessage,
@@ -863,6 +858,7 @@ class AdvisorTranscriptOwner:
         messages: Sequence[Mapping[str, Any]],
         *,
         materialization: CurrentContinuationMessageProducers | None = None,
+        mandatory_retention: bool = False,
     ) -> MessageShelfSnapshot:
         shelf: list[Mapping[str, Any]] = []
 
@@ -875,6 +871,90 @@ class AdvisorTranscriptOwner:
 
         current = tuple(intern(message) for message in messages)
         excluded = tuple(intern(message) for message in self._excluded)
+        expected_bytes: int | None = None
+        if mandatory_retention:
+            from elspeth.contracts.bounded_serialization import bounded_canonical_json_size
+            from elspeth.contracts.json_parser import parse_json_strict
+            from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+            from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+            from elspeth.web.composer.continuation_retention import (
+                OrderedObjectJSON,
+                require_retention_capacity,
+                require_retention_message_credentials,
+                retained_model_json_view,
+            )
+
+            # Intern all event aliases before measuring the complete shelf.
+            observed_positions = tuple(intern(entry.message) for entry in self._observed)
+            if type(self.request) is not str or any(type(entry.pending_adoption) is not bool for entry in self._observed):
+                raise AuditIntegrityError("fresh transcript retention changed its owned scalar fields")
+            if materialization is not None and type(materialization) is not CurrentContinuationMessageProducers:
+                raise AuditIntegrityError("transcript capture requires its actual current producer owner")
+            projected: tuple[tuple[OrderedObjectJSON, ContinuationMessageRecipe | None], ...]
+            if materialization is None:
+                if any(PROMPT_GUARD_PROVENANCE_KEYS.intersection(message) for message in shelf):
+                    raise AuditIntegrityError("Continuation requires current producer materialization for guard-bearing messages")
+                projected = tuple((OrderedObjectJSON(message), None) for message in shelf)
+            else:
+                projected = tuple(materialization.retention_message_view(message) for message in shelf)
+            history = self._history
+            if history is not None:
+                RetainedTranscriptHistory(
+                    session_id=history.session_id,
+                    actor_user_id=history.actor_user_id,
+                    request_id=history.request_id,
+                    request_hash=history.request_hash,
+                    events_json=history.events_json,
+                )
+                history_events, history_error = parse_json_strict(history.events_json)
+                if history_error is not None or type(history_events) is not list:
+                    raise AuditIntegrityError("fresh transcript retention lost its strict history event sequence")
+            history_value = (
+                {
+                    "session_id": history.session_id,
+                    "actor_user_id": history.actor_user_id,
+                    "request_id": history.request_id,
+                    "request_hash": history.request_hash,
+                    "events_json": history.events_json,
+                }
+                if history is not None
+                else None
+            )
+            measured = bounded_canonical_json_size(
+                {
+                    "schema_version": "composer.transcript.v1",
+                    "request": self.request,
+                    "history": history_value,
+                    "messages_json": tuple(item[0] for item in projected),
+                    "current_indexes": current,
+                    "excluded_indexes": excluded,
+                    "observed": tuple(
+                        {
+                            "message_index": position,
+                            "event_json": OrderedObjectJSON(entry.event),
+                            "pending_adoption": entry.pending_adoption,
+                        }
+                        for position, entry in zip(observed_positions, self._observed, strict=True)
+                    ),
+                    "producer_recipes": tuple(retained_model_json_view(item[1]) if item[1] is not None else None for item in projected)
+                    if materialization is not None
+                    else (),
+                },
+                limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES,
+            )
+            names = materialization.inventory.names if materialization is not None else frozenset()
+            for message in shelf:
+                require_retention_message_credentials(message, env_ref_names=names)
+            for entry in self._observed:
+                require_retention_message_credentials(entry.event, env_ref_names=names)
+            for text in (self.request, history.events_json if history is not None else ""):
+                require_no_credential_material(
+                    text,
+                    surface="composer_continuation_private_chunk",
+                    env_ref_names=names,
+                    max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+                )
+            expected_bytes = require_retention_capacity(measured, reason="retained_history_bytes")
         observed = tuple(
             RetainedObservedMessage(
                 message_index=intern(entry.message),
@@ -883,14 +963,7 @@ class AdvisorTranscriptOwner:
             )
             for entry in self._observed
         )
-        forbidden = frozenset(
-            {
-                PROMPT_GUARD_TRUST_KEY,
-                PROMPT_GUARD_CONTENT_PARTS_KEY,
-                PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
-                PROMPT_GUARD_THINKING_PARTS_KEY,
-            }
-        )
+        forbidden = PROMPT_GUARD_PROVENANCE_KEYS
         from elspeth.web.composer.continuation_prompt_recipes import ContinuationMessageRecipe
 
         recipes: tuple[ContinuationMessageRecipe | None, ...]
@@ -911,7 +984,7 @@ class AdvisorTranscriptOwner:
             messages_json = tuple(item[0] for item in captured)
             recipes = tuple(item[1] for item in captured)
         history = self._history
-        return MessageShelfSnapshot(
+        snapshot = MessageShelfSnapshot(
             request=self.request,
             history=RetainedTranscriptHistory(
                 session_id=history.session_id,
@@ -928,6 +1001,11 @@ class AdvisorTranscriptOwner:
             excluded_indexes=excluded,
             observed=observed,
         )
+        if expected_bytes is not None:
+            produced = bounded_canonical_json_size(retained_model_json_view(snapshot), limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES)
+            if produced.exceeded or produced.admitted_bytes != expected_bytes:
+                raise AuditIntegrityError("transcript encoding differs from its complete borrowed retention preflight")
+        return snapshot
 
     @classmethod
     def for_continuation(

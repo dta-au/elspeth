@@ -9,6 +9,7 @@ from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
+from uuid import uuid4
 
 import litellm
 import pytest
@@ -37,13 +38,16 @@ from elspeth.web.composer.continuation_next_action import next_continuation_acti
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
+from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, DiagnosticPayload
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
+from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions import continuation_composition_initialization as owner
+from elspeth.web.sessions._persist_payload import RedactedToolRow
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
 from elspeth.web.sessions.continuation import ContinuationCASConflict
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -57,6 +61,7 @@ from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_work
+from tests.helpers.continuation_memo import RetentionMemoTrace
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
@@ -127,7 +132,7 @@ def assert_first_graph(runtime, service, running):
     assert runtime.live.last_validation == catalog.validate_composition_state(runtime.live.state).validation
     cache = decode_continuation_caches(source_chunk(runtime, frame.caches), env_ref_names=runtime.env_ref_names)
     assert cache.capture_count == 1 and len(cache.capture_creators) == 1 and runtime.live.continuation_cache_history == cache
-    retained = decode_turn_evidence(source_chunk(runtime, frame.evidence), env_ref_names=runtime.env_ref_names)
+    retained = decode_turn_evidence(source_chunk(runtime, frame.evidence), env_ref_names=runtime.env_ref_names).snapshot
     assert retained.requires_blob_reader and retained.initial_is_latest
     reader = runtime.graph.evidence.transcript._blob_reader
     assert type(reader) is CurrentTranscriptBlobReader and reader.service is service and reader.context is running.session_operation_context
@@ -147,10 +152,11 @@ def assert_first_graph(runtime, service, running):
         pytest.param(True, False, "Rejected! Title Candidate", id="paid-rejected"),
     ],
 )
-async def test_real_ready_publishes_complete_first_compose_once(operation_store, tmp_path, monkeypatch, paid, bound_base, content):
+async def test_real_ready_publishes_complete_first_compose_once(operation_store, tmp_path, monkeypatch, paid, bound_base, content, request):
     running, service, work, ready, sdk = await ready_case(
         operation_store, tmp_path, monkeypatch, paid=paid, bound_base=bound_base, content=content
     )
+    memo_trace = RetentionMemoTrace(monkeypatch, request)
     try:
         before = dict(recovery_rows(operation_store[0]))
         prior_root = decode_continuation_snapshot(ready.payload_json)
@@ -193,6 +199,7 @@ async def test_real_ready_publishes_complete_first_compose_once(operation_store,
         assert replay.materialization is not runtime.materialization and replay.graph.evidence is not runtime.graph.evidence
         assert len(sdk) == int(paid)
         work.coordinator.assert_completed()
+        memo_trace.finish(stages=2)
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -283,8 +290,9 @@ async def test_ready_cannot_enter_existing_runtime_without_first_compose_publica
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ("after_chunk", "after_append"))
-async def test_initial_compose_publication_rolls_back_complete_sql_then_replays(operation_store, tmp_path, monkeypatch, stage):
+async def test_initial_compose_publication_rolls_back_complete_sql_then_replays(operation_store, tmp_path, monkeypatch, stage, request):
     running, service, work, ready, sdk = await ready_case(operation_store, tmp_path, monkeypatch, paid=True)
+    memo_trace = RetentionMemoTrace(monkeypatch, request)
     marker = RuntimeError("original first Compose transaction failure")
     original_put, original_append = owner.put_chunk, owner.append_complete_snapshot
     reached = []
@@ -314,6 +322,7 @@ async def test_initial_compose_publication_rolls_back_complete_sql_then_replays(
         assert_first_graph(result, service, running)
         assert len(sdk) == 1
         work.coordinator.assert_completed()
+        memo_trace.finish(stages=2)
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -559,9 +568,13 @@ async def test_constructed_first_compose_enters_original_guarded_primary_once(op
     try:
         runtime = await construct(operation_store, running, service, work, ready)
         assert_first_graph(runtime, service, running)
-        with operation_store[0].begin() as conn:
-            grant_test_pipeline_user(conn, identity_id="alice")
-            seed_token_policies(conn, identity_id="alice")
+        if not paid:
+            # The paid path already seeded alice through title_case; re-seeding
+            # would collide on quota_policies.identity_id and would reset the
+            # policy state the paid branch is asserting against.
+            with operation_store[0].begin() as conn:
+                grant_test_pipeline_user(conn, identity_id="alice")
+                seed_token_policies(conn, identity_id="alice")
         settings, requests = _required_guard_settings(tmp_path, monkeypatch)
         service._provider_gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
         primary_calls = []
@@ -651,7 +664,29 @@ async def test_cancelled_ready_cannot_publish_compose_under_owed_relief(operatio
         operation_store[1].release(running.session_operation_context)
 
 
-async def seed_blob_history(store):
+def _digest(text):
+    """The retained-payload digest a private evidence record must carry."""
+    return sha256(text.encode()).hexdigest()
+
+
+async def seed_blob_history(store, *, bound=True):
+    """Seed one historical blob read.
+
+    With ``bound``, the pair is written through ``persist_compose_turn_async``,
+    the production compose-loop path, so the tool row carries the real
+    ``VisibleToolEvent`` envelope that binds the creator operation id the
+    advisor transcript's re-read gate requires. The public ``add_message``
+    cannot express that shape: ``validate_visible_audit_row`` admits a visible
+    companion only on an ``audit`` row carrying exactly two envelopes, so the
+    envelope reaches a ``tool`` row only through the persist path.
+
+    ``bound=False`` keeps the plain ``add_message`` pair, which the gate must
+    go on refusing with ``unavailable_parent_writer_or_operation_binding``.
+
+    ``selected_result`` is deliberately ``None``: a retained selected result
+    short-circuits to ``ordinary_visible_result_secret_redacted_no_blob_reread``
+    before any reader call, and this history exists to exercise the re-read.
+    """
     engine, repository, _authority, sessions_owner, sid = store
     context = repository.acquire(
         session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
@@ -663,25 +698,8 @@ async def seed_blob_history(store):
             engine, Path(sessions_owner._data_dir), session_operation_authority=sessions_owner.session_operation_authority
         )
         blob = await blobs.create_blob(sid, "retained.txt", raw, "text/plain", session_operation_context=context)
-        assistant = await sessions_owner.add_message(
-            sid,
-            "assistant",
-            "",
-            writer_principal="compose_loop",
-            tool_calls=[
-                {
-                    "id": "history-read",
-                    "type": "function",
-                    "function": {
-                        "name": "get_blob_content",
-                        "arguments": canonical_json(
-                            {"blob_id": str(blob.id), "expected_content_hash": blob.content_hash, "offset_chars": 0}
-                        ),
-                    },
-                }
-            ],
-            session_operation_context=context,
-        )
+        arguments = canonical_json({"blob_id": str(blob.id), "expected_content_hash": blob.content_hash, "offset_chars": 0})
+        call = {"id": "history-read", "type": "function", "function": {"name": "get_blob_content", "arguments": arguments}}
         result = {
             "success": True,
             "data": {
@@ -693,14 +711,73 @@ async def seed_blob_history(store):
                 "start_char": 0,
                 "end_char": len(text),
                 "truncated": False,
-                "created_by": "user",
-                "creation_modality": "user_upload",
+                # The created blob's own stored provenance, which is what the
+                # gate compares the recorded result against.
+                "created_by": blob.created_by,
+                "creation_modality": blob.creation_modality.value,
             },
         }
+        serialized = canonical_json(result)
+        if bound:
+            visible = VisibleToolEvent.capture(
+                context=context,
+                request_id=None,
+                tool_call_id="history-read",
+                tool_name="get_blob_content",
+                received_arguments=arguments,
+                effective_arguments=arguments,
+                selected_result=None,
+                display_arguments=arguments,
+                display_result=serialized,
+            )
+            rows = (
+                RedactedToolRow(tool_call_id="history-read", content=serialized, composition_state_payload=None, visible_event=visible),
+            )
+            await sessions_owner.persist_compose_turn_async(
+                session_id=str(sid),
+                assistant_content="",
+                redacted_assistant_tool_calls=(call,),
+                redacted_tool_rows=rows,
+                # No row advances the graph, so the refusal alternate must be
+                # the same tuple object, not an equal copy.
+                revoked_tool_rows=rows,
+                # One private evidence record per persisted tool row, carrying
+                # this operation's own authority.
+                private_tool_evidence=(
+                    ComposerDiagnosticEvidence(
+                        session_id=str(sid),
+                        operation_id=context.fence.operation_id,
+                        operation_epoch=context.fence.operation_epoch,
+                        tool_call_id="history-read",
+                        tool_name="get_blob_content",
+                        status="success",
+                        evidence_id=str(uuid4()),
+                        arguments=DiagnosticPayload(
+                            disposition="retained", encoding="json", content=arguments, retained_sha256=_digest(arguments)
+                        ),
+                        authority_arguments=None,
+                        result=DiagnosticPayload(
+                            disposition="retained", encoding="json", content=serialized, retained_sha256=_digest(serialized)
+                        ),
+                        wire_arguments=DiagnosticPayload(
+                            disposition="retained", encoding="wire_text", content=arguments, retained_sha256=_digest(arguments)
+                        ),
+                    ),
+                ),
+                parent_composition_state_id=None,
+                expected_current_state_id=None,
+                writer_principal="compose_loop",
+                plugin_crash_pending=False,
+                session_operation_context=context,
+            )
+            return blob, text
+        assistant = await sessions_owner.add_message(
+            sid, "assistant", "", writer_principal="compose_loop", tool_calls=[call], session_operation_context=context
+        )
         await sessions_owner.add_message(
             sid,
             "tool",
-            canonical_json(result),
+            serialized,
             writer_principal="compose_loop",
             tool_call_id="history-read",
             parent_assistant_id=assistant.id,
@@ -742,3 +819,31 @@ async def test_initial_capture_retains_actual_reader_and_rechecks_historical_blo
     finally:
         if not released:
             operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_initial_capture_refuses_history_whose_tool_row_binds_no_creator_operation(operation_store, tmp_path, monkeypatch):
+    """Unbound history keeps failing closed, and no blob reader is reached.
+
+    A plain ``add_message`` pair writes a history production never writes: the
+    tool row carries no visible-tool-event envelope, so nothing binds a creator
+    operation id. Refusing it is the guard's contract, not a defect.
+    """
+    blob, text = await seed_blob_history(operation_store, bound=False)
+    running, service, work, ready, _sdk = await ready_case(operation_store, tmp_path, monkeypatch)
+    # Remove the body first: a reader that was reached would report a
+    # read-side failure instead, so the binding label proves the gate fired
+    # ahead of any reader call rather than merely alongside it.
+    Path(blob.storage_path).unlink()
+    try:
+        runtime = await construct(operation_store, running, service, work, ready)
+        assert_first_graph(runtime, service, running)
+        transcript = runtime.graph.evidence.transcript
+
+        snapshot = await asyncio.to_thread(transcript.snapshot)
+
+        assert "unavailable_parent_writer_or_operation_binding" in snapshot.provider_json
+        assert text not in snapshot.provider_json
+        work.coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)

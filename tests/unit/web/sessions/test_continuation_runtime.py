@@ -392,26 +392,32 @@ async def test_runtime_refuses_source_drift_and_counter_reset_after_actual_posit
 
 
 @pytest.mark.asyncio
-async def test_real_committed_provider_cut_recovers_into_fresh_current_runtime(operation_store, tmp_path, monkeypatch):
+@pytest.mark.parametrize("handoff", ("release_then_recover", "live_handover"))
+async def test_real_committed_provider_cut_recovers_into_fresh_current_runtime(operation_store, tmp_path, monkeypatch, handoff):
     kwargs, _produced, _recorder, sdk, result = await publish_actual(operation_store, tmp_path, monkeypatch)
     assert result is not None and len(sdk) == 1
     arguments, old_cache, attachments = await runtime_case(operation_store, provider_input=(kwargs, result))
     original = arguments["inventory"].running
     restored = await restore_continuation_runtime(**arguments)
     arguments["required_work"].coordinator.assert_completed()
-    operation_store[1].release(original.session_operation_context)
+    if handoff == "live_handover":
+        # A live owner's handover writes recovery's exact transition (design §3.4 B).
+        operation_store[1].suspend_composer_segment(original)
+    else:
+        operation_store[1].release(original.session_operation_context)
     current = new_owners(operation_store)
     _engine, repository, authority, sessions, sid = current
-    assert (
-        repository.recover_composer_segment(
-            session_id=sid,
-            operation_id=original.claim.operation_id,
-            expected_generation=original.claim.ownership_generation,
-            actor_user_id="alice",
-            auth_provider_type="local",
+    if handoff == "release_then_recover":
+        assert (
+            repository.recover_composer_segment(
+                session_id=sid,
+                operation_id=original.claim.operation_id,
+                expected_generation=original.claim.ownership_generation,
+                actor_user_id="alice",
+                auth_provider_type="local",
+            )
+            is True
         )
-        is True
-    )
     (claim,) = authority.claim_segment(limit=1)
     context = repository.start_composer_segment(
         claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"

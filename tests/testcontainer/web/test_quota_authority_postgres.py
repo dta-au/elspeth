@@ -20,6 +20,7 @@ import structlog
 from sqlalchemy import insert, select, text
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composition_state import composition_state_data, stored_default_pipeline_metadata
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, FencedSession, seed_token_policies
 
 from elspeth.contracts.blobs import IdentityStorageQuotaExceededError
@@ -64,7 +65,6 @@ from elspeth.web.sessions.models import (
     sessions_table,
     token_usage_ledger_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -143,7 +143,7 @@ async def test_run_sync_quota_callbacks_hold_advisory_lock_until_receipt(pg_fenc
     ) as compose_lease:
         state = await service.save_composition_state(
             session_id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_lease.context,
         )
@@ -523,6 +523,7 @@ def test_container_storage_serializes_cross_identity_output_reservations(pg_fenc
         state_id, run_id = str(uuid.uuid4()), str(uuid.uuid4())
         conn.execute(
             insert(composition_states_table).values(
+                metadata_=stored_default_pipeline_metadata(),
                 id=state_id,
                 session_id=session_id,
                 version=1,

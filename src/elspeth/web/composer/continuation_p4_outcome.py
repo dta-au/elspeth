@@ -7,15 +7,17 @@ an actual writer/authorized reader result, not infer a commit from these bytes.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
 from elspeth.contracts.composer_mutation import ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.composer._compose_loop_carriers import _PersistOutcome
 from elspeth.web.composer.continuation_codec import owned_json
 from elspeth.web.composer.continuation_p4_state_payload import encode_p4_state_payload
@@ -38,24 +40,80 @@ from elspeth.web.sessions.protocol import (
 )
 
 
-class HistoricalCheckpointData(BaseModel):
-    """Full historical row and original inserted cohort, with no witness API."""
+class _HistoricalCheckpointColumns(BaseModel):
+    """Exactly the original JSON column values, including their member order."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    id: UUID
-    session_id: UUID
-    version: int = Field(ge=1)
     source: dict[str, JsonValue] | None
     sources: dict[str, dict[str, JsonValue]] | None
     nodes: list[dict[str, JsonValue]] | None
     edges: list[dict[str, JsonValue]] | None
     outputs: list[dict[str, JsonValue]] | None
-    metadata_: dict[str, JsonValue] | None
-    is_valid: bool
+    metadata_: dict[str, JsonValue]
     validation_errors: list[dict[str, JsonValue]] | None
+    composer_meta: dict[str, JsonValue] | None
+
+
+def _encode_checkpoint_columns(columns: _HistoricalCheckpointColumns) -> str:
+    try:
+        encoded = json.dumps(owned_json(columns.model_dump(mode="python")), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        encoded.encode("utf-8", errors="strict")
+    except (TypeError, ValueError) as error:
+        raise AuditIntegrityError("historical checkpoint columns are not finite UTF-8 JSON") from error
+    return encoded
+
+
+def _decode_checkpoint_columns(encoded: str) -> _HistoricalCheckpointColumns:
+    value, parse_error = parse_json_strict(encoded)
+    if parse_error is not None:
+        raise AuditIntegrityError("historical checkpoint columns are not complete strict JSON")
+    try:
+        # The strict parser alone does not refuse overflow such as 1e400.
+        # Admit finite owned values before the closed model or serialization.
+        columns = _HistoricalCheckpointColumns.model_validate(owned_json(value), strict=True)
+    except ValidationError as error:
+        raise AuditIntegrityError("historical checkpoint columns violate their closed contract") from error
+    if _encode_checkpoint_columns(columns) != encoded:
+        raise AuditIntegrityError("historical checkpoint columns changed their exact ordered encoding")
+    return columns
+
+
+def historical_checkpoint_columns_json(record: CompositionStateRecord) -> str:
+    """Preserve original owned column values, never SQL text or commit authority."""
+    if type(record) is not CompositionStateRecord:
+        raise TypeError("historical columns require their original owned state record")
+    columns = _HistoricalCheckpointColumns.model_validate(
+        {
+            "source": owned_json(record.source),
+            "sources": owned_json(record.sources),
+            "nodes": owned_json(record.nodes),
+            "edges": owned_json(record.edges),
+            "outputs": owned_json(record.outputs),
+            "metadata_": owned_json(record.metadata_),
+            "validation_errors": owned_json(serialize_composition_validation_errors(record.validation_errors)),
+            "composer_meta": owned_json(record.composer_meta),
+        },
+        strict=True,
+    )
+    return _encode_checkpoint_columns(columns)
+
+
+class HistoricalCheckpointData(BaseModel):
+    """Original historical row DATA; the previous nested-column shape refuses.
+
+    The outer canonical envelope must not normalize the original raw columns
+    protected by content publication. This preserves values/order/numeric types,
+    not original SQL JSON whitespace or a current writer witness.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    id: UUID
+    session_id: UUID
+    version: int = Field(ge=1)
+    original_columns_json: str
+    is_valid: bool
     created_at: datetime
     derived_from_state_id: UUID | None
-    composer_meta: dict[str, JsonValue] | None
     review_projection: None
     creator_operation_id: str = Field(min_length=1)
     inserted_state_ids: tuple[UUID, ...]
@@ -104,17 +162,10 @@ def _checkpoint_data(witness: CommittedCheckpointWitness) -> HistoricalCheckpoin
             "id": row.id,
             "session_id": row.session_id,
             "version": row.version,
-            "source": owned_json(row.source),
-            "sources": owned_json(row.sources),
-            "nodes": owned_json(row.nodes),
-            "edges": owned_json(row.edges),
-            "outputs": owned_json(row.outputs),
-            "metadata_": owned_json(row.metadata_),
+            "original_columns_json": historical_checkpoint_columns_json(row),
             "is_valid": row.is_valid,
-            "validation_errors": owned_json(serialize_composition_validation_errors(row.validation_errors)),
             "created_at": row.created_at,
             "derived_from_state_id": row.derived_from_state_id,
-            "composer_meta": owned_json(row.composer_meta),
             "review_projection": None,
             "creator_operation_id": witness.creator_operation_id,
             "inserted_state_ids": witness.inserted_state_ids,
@@ -127,6 +178,9 @@ def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_nam
     """Return only the owned historical row; never construct a commit witness."""
     if type(value) is not HistoricalCheckpointData:
         raise TypeError("historical checkpoint requires its complete data owner")
+    # Validate the inner UTF-8/closed DATA before any outer serializer touches
+    # a malformed string. Its ordered values never pass through canonical JSON.
+    columns = _decode_checkpoint_columns(value.original_columns_json)
     value = _decode_owned(_CHECKPOINT, _dump_owned(_CHECKPOINT, value))
     if value.created_at.utcoffset() != timedelta(0):
         raise AuditIntegrityError("historical checkpoint lost its original aware UTC timestamp")
@@ -136,20 +190,20 @@ def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_nam
         or len(set(value.inserted_state_ids)) != len(value.inserted_state_ids)
     ):
         raise AuditIntegrityError("historical checkpoint lost its exact inserted revision cohort")
-    errors = decode_stored_composition_validation_errors(value.validation_errors)
+    errors = decode_stored_composition_validation_errors(columns.validation_errors)
     # Reuse the actual component-aware payload admission. Its normalized
     # temporary source map is used for inspection only; the row below retains
     # the original source/sources columns separately and exactly.
     data = CompositionStateData(
-        source=value.source,
-        sources=value.sources,
-        nodes=value.nodes,
-        edges=value.edges,
-        outputs=value.outputs,
-        metadata_=value.metadata_,
+        source=columns.source,
+        sources=columns.sources,
+        nodes=columns.nodes,
+        edges=columns.edges,
+        outputs=columns.outputs,
+        metadata_=columns.metadata_,
         is_valid=value.is_valid,
         validation_errors=errors,
-        composer_meta=value.composer_meta,
+        composer_meta=columns.composer_meta,
     )
     encode_p4_state_payload(
         StatePayload(data, None if value.derived_from_state_id is None else str(value.derived_from_state_id)), env_ref_names=env_ref_names
@@ -159,17 +213,17 @@ def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_nam
         id=value.id,
         session_id=value.session_id,
         version=value.version,
-        source=value.source,
-        sources=value.sources,
-        nodes=value.nodes,
-        edges=value.edges,
-        outputs=value.outputs,
-        metadata_=value.metadata_,
+        source=columns.source,
+        sources=columns.sources,
+        nodes=columns.nodes,
+        edges=columns.edges,
+        outputs=columns.outputs,
+        metadata_=columns.metadata_,
         is_valid=value.is_valid,
         validation_errors=errors,
         created_at=value.created_at,
         derived_from_state_id=value.derived_from_state_id,
-        composer_meta=value.composer_meta,
+        composer_meta=columns.composer_meta,
         review_projection=None,
     )
     read_content_publication(record)

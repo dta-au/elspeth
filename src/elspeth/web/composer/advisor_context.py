@@ -20,11 +20,12 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.templates import extract_jinja2_fields
+from elspeth.core.templates import JinjaTemplateSizeExceeded, extract_jinja2_fields
 from elspeth.web.composer.content_views import materialize_composition_value
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.prompt_guard_rendering import json_content_parts
 from elspeth.web.composer.prompts import build_composition_content_view, project_composition_content
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.state import CompositionState, NodeSpec, _well_formed_query_entries
 from elspeth.web.composer.tools.sessions import (
@@ -514,6 +515,12 @@ def fit_advisor_checkpoint_summary(
     if type(char_cap) is not int or char_cap < 0:
         raise InvariantError("Advisor display requires a nonnegative owned budget")
     view = build_composition_content_view(state, content_scope=content_scope, env_ref_names=env_ref_names)
+    # Manual hints use this producer directly, without the checkpoint's
+    # descriptive summary. Apply the same effective-template analysis before
+    # either owner can capture or dispatch its prepared graph.
+    for node in state.nodes:
+        if node.plugin == "llm":
+            _render_interpolated_row_fields_parts(node)
     # Partition ONLY owned identity paths. Equal authored strings elsewhere
     # remain ordinary redaction/inspection data, including marker lookalikes.
     partitions: dict[tuple[str | int, ...], tuple[PromptGuardContentPart, ...]] = {}
@@ -526,7 +533,7 @@ def fit_advisor_checkpoint_summary(
         # privacy policy changes one, refuse this review representation rather
         # than publishing a manifest bound to different paths or bypassing it.
         if any(type(segment) is str and _redact_sensitive_content(segment) != segment for segment in reference.path):
-            raise AdvisorGraphCoverageUnavailable("Advisor reference path cannot retain its identity under the privacy policy")
+            raise ComposerContextUnsupported("graph_coverage_unavailable")
         for key, identity in (("reference_id", reference.reference_id), ("content_hash", reference.content_hash)):
             hashes.add(identity)
             partitions[("content_manifest", "values", index, key)] = (PromptGuardContentPart(identity),)
@@ -538,9 +545,9 @@ def fit_advisor_checkpoint_summary(
             try:
                 parsed = UUID(raw)
             except ValueError:
-                raise AdvisorGraphCoverageUnavailable("Advisor configured source reference is not a canonical identity") from None
+                raise AuditIntegrityError("Advisor configured source reference is not a canonical identity") from None
             if str(parsed) != raw:
-                raise AdvisorGraphCoverageUnavailable("Advisor configured source reference is not a canonical identity")
+                raise AuditIntegrityError("Advisor configured source reference is not a canonical identity")
             uuids[raw] = parsed
             partitions[("data", "sources", name, "options", "blob_ref")] = (PromptGuardContentPart(raw),)
     parts = (
@@ -571,10 +578,19 @@ def fit_advisor_checkpoint_summary(
         reference_ids=tuple(reference.reference_id for reference in view.manifest.values),
         env_ref_names=env_ref_names,
     )
-    if tuple(value.reference for value in values) != view.manifest.values:
-        # Incomplete selected coverage is a specific preparation refusal; the
-        # checkpoint withholds before dispatch rather than review unseen bytes.
-        raise AdvisorGraphCoverageUnavailable("Advisor complete values lack exact resolved coverage")
+    if type(values) is not tuple or any(type(value) is not MaterializedCompleteValue for value in values):
+        raise AuditIntegrityError("Advisor selected coverage lost its owned materializations")
+    resolved_references = tuple(value.reference for value in values)
+    if (
+        len(set(resolved_references)) != len(resolved_references)
+        or any(reference not in view.manifest.values for reference in resolved_references)
+        or resolved_references != tuple(reference for reference in view.manifest.values if reference in resolved_references)
+    ):
+        raise AuditIntegrityError("Advisor selected coverage contains foreign or reordered materializations")
+    if resolved_references != view.manifest.values:
+        # A genuine missing selected value is a preparation refusal. Corrupt
+        # nominal members, stale scope, hashes and order retain integrity errors.
+        raise ComposerContextUnsupported("graph_coverage_unavailable")
     # Appended after the identity spans were fixed, so display offsets stay
     # exact. Path segments and values are authored text: equal strings here
     # acquire no identity exemption and stay under the normal policy.
@@ -1013,7 +1029,7 @@ def _advisor_option_value(value: object, *, key: str | None = None) -> JsonValue
                 raise InvariantError("Advisor graph option keys must be strings")
             redacted_key = cast(str, _advisor_option_value(child_key))
             if redacted_key in projected:
-                raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made option keys ambiguous")
+                raise ComposerContextUnsupported("graph_coverage_unavailable")
             projected[redacted_key] = _advisor_option_value(child, key=child_key)
         return projected
     if isinstance(value, list | tuple):
@@ -1297,7 +1313,7 @@ def _redacted_advisor_string_mapping(mapping: dict[str, str]) -> dict[str, str]:
     for name, value in mapping.items():
         redacted_name = cast(str, _advisor_option_value(name))
         if redacted_name in result:
-            raise AdvisorGraphCoverageUnavailable("Advisor graph redaction made mapping keys ambiguous")
+            raise ComposerContextUnsupported("graph_coverage_unavailable")
         result[redacted_name] = cast(str, _advisor_option_value(value))
     return result
 
@@ -1574,7 +1590,10 @@ def _interpolated_row_fields(prompt_template: str) -> list[str]:
     must render an explicit incomplete-analysis signal. It cannot be treated as
     a successfully parsed prompt with no row fields.
     """
-    return sorted(extract_jinja2_fields(prompt_template))
+    try:
+        return sorted(extract_jinja2_fields(prompt_template))
+    except JinjaTemplateSizeExceeded as exc:
+        raise ComposerContextUnsupported("graph_resource_limit") from exc
 
 
 def _render_interpolated_row_fields_parts(node: NodeSpec) -> tuple[str, ...]:

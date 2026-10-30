@@ -36,7 +36,13 @@ from elspeth.web.composer.continuation import ToolBatchFrame
 from elspeth.web.composer.continuation_batch_data import encode_coupled_batch_chunk
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_response, encode_continuation_snapshot
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
-from elspeth.web.composer.continuation_p4_outcome import capture_p4_outcome, decode_p4_outcome, encode_p4_outcome, require_same_p4_outcome
+from elspeth.web.composer.continuation_p4_outcome import (
+    capture_p4_outcome,
+    decode_p4_outcome,
+    encode_p4_outcome,
+    historical_checkpoint_record,
+    require_same_p4_outcome,
+)
 from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4, encode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_tool_batch import RetainedBatchFailure
 from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
@@ -79,6 +85,7 @@ def completed_cut(
     *,
     graph=False,
     crash_pending=False,
+    primary_failure_kind="plugin_crash",
     initial_state=None,
     call_id="owned-p4-call",
     current_state_id=None,
@@ -102,8 +109,17 @@ def completed_cut(
     )
     validation = ValidationSummary(False, ())
     arguments = {"patch": {"name": "after"}}
+    tool_name = "set_metadata"
+    if crash_pending and primary_failure_kind == "advisor_failure":
+        arguments = {
+            "trigger": "proactive_security_safety",
+            "problem_summary": "Review the current request.",
+            "recent_errors": [],
+            "attempted_actions": [],
+        }
+        tool_name = "request_advisor_hint"
     raw = canonical_json(arguments)
-    call = _AdmittedToolCall(call_id, _AdmittedToolFunction("set_metadata", raw))
+    call = _AdmittedToolCall(call_id, _AdmittedToolFunction(tool_name, raw))
     result = ToolResult(graph, after, validation, (), prior_validation=validation)
     outcome = _ToolOutcome(call, result, None, None, None, before.version, after.version, True, True)
     authoring = PrivateToolAuthoring(call.id, call.function.name, raw, None, raw)
@@ -224,7 +240,8 @@ def completed_cut(
         decoded_args_by_call_id={call.id: arguments},
         private_authorings_by_call={call.id: authoring},
         mutation_success_observed=graph,
-        retained_failure=RetainedBatchFailure(kind="plugin_crash", error_class="RuntimeError") if crash_pending else None,
+        retained_failure=RetainedBatchFailure(kind=primary_failure_kind, error_class="RuntimeError") if crash_pending else None,
+        stop_issued_batch=crash_pending,
     )
     completion = _AdmittedLLMCompletion(
         _AdmittedAssistantMessage("retained prose"),
@@ -376,7 +393,7 @@ def test_actual_p4_commits_rows_complete_receipt_and_root_together(operation_sto
             assert result.historical_effect is not None
             assert result.receipt.inserted_state_ids == audit.checkpoint.inserted_state_ids
             assert len(result.receipt.state_row_hashes) == 1
-            assert result.outcome.checkpoint.composer_meta["content_publication"]
+            assert historical_checkpoint_record(result.outcome.checkpoint).composer_meta["content_publication"]
         else:
             assert audit.checkpoint is None and result.historical_effect is None
             assert len(result.receipt.rejection_ids) == 1
@@ -793,7 +810,7 @@ def test_pending_data_preserves_advisor_failure_vs_timeout_disposition(operation
     running = start_continuation(repository, authority)
     try:
         stack = decode_continuation_snapshot(authority.load_continuation_snapshot(running).payload_json)
-        batch, acc, response, prepared = completed_cut(running, stack)
+        batch, acc, response, prepared = completed_cut(running, stack, crash_pending=crash_pending, primary_failure_kind=kind)
         batch = replace(batch, retained_failure=RetainedBatchFailure(kind=kind, error_class="RuntimeError"))
         prepared = prepared.model_copy(update={"crash_pending": crash_pending})
         pending = replace(batch, phase="p4_pending", p4_input_json=encode_prepared_p4(prepared))

@@ -538,7 +538,7 @@ composition_states_table = Table(
     Column("nodes", JSON, nullable=True),
     Column("edges", JSON, nullable=True),
     Column("outputs", JSON, nullable=True),
-    Column("metadata_", JSON, nullable=True),
+    Column("metadata_", JSON, nullable=False),
     Column("is_valid", Boolean, nullable=False, default=False),
     Column("validation_errors", JSON, nullable=True),
     # Operational/audit metadata produced by the composer pipeline that

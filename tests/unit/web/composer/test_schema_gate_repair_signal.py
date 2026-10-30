@@ -7,8 +7,8 @@ The closed-root S gate (``tools/_dispatch.py``) builds one
 fixed message), the same shape the pydantic canonicaliser emits. A loc names
 only schema-declared properties (or the generic ``field``/``item``/``index``
 tokens), so the model-authored key of an ``additionalProperties`` failure is
-never echoed (plan C10). MCP text and the planner's discovery
-``argument_error`` body stay byte-equal to the base (D19, ruling 9).
+never echoed (plan C10). MCP text stays byte-equal to the base (D19,
+ruling 9).
 
 Plan: ``docs/plans/2026-09-23-composer-strict-tool-contracts-s1.md`` T9.
 """
@@ -34,7 +34,6 @@ from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
-from elspeth.web.composer.provider_discovery_response import argument_error_response
 from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tool_error_payloads import arg_error_payload
@@ -651,16 +650,3 @@ _MCP_PLAIN_TEXT = "Tool error: 'tool arguments' must be an object conforming to 
 async def test_mcp_error_text_is_unchanged(name: str, arguments: dict[str, Any], expected: str) -> None:
     """Characterization: MCP builds its own text and does not render violations."""
     assert await _mcp_error_text(name, arguments) == expected
-
-
-def test_planner_discovery_argument_error_preserves_closed_schema_facts() -> None:
-    """Discovery preserves bounded schema facts without the raw input or message."""
-    with pytest.raises(ToolArgumentError) as caught:
-        require_schema_valid_arguments("list_models", {"limit": 0})
-    assert caught.value.schema_violations  # the exception does carry them
-    assert json.dumps(argument_error_response(caught.value).to_wire()) == (
-        '{"argument_error": {"component": "tool arguments", "severity": "high", '
-        '"error_code": "SCHEMA_VALIDATION", "error_class": "ToolArgumentError", '
-        '"error_category": "schema_shape", "validation_errors": [{"loc": ["limit"], '
-        '"msg": "Value is outside allowed bounds", "type": "out_of_bounds"}]}}'
-    )

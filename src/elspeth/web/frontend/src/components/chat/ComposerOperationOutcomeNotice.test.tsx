@@ -29,4 +29,29 @@ describe("operation outcome notice", () => {
     expect(screen.getByRole("note")).toHaveTextContent("<script>synthetic</script>");
     expect(document.querySelector("script")).toBeNull();
   });
+  it.each([
+    { count: 1, noun: "revision", latest_version: 4 },
+    { count: 3, noun: "revisions", latest_version: 9 },
+  ])("confirms saved Stop changes from the operation's $count attributed revisions", ({ count, noun, latest_version }) => {
+    render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "request_cancelled", saved_revisions: { attribution: "fenced", count, latest_state_id: outcome.operation_id, latest_version } }} />);
+    expect(screen.getByRole("note")).toHaveTextContent("Composition stopped");
+    expect(screen.getByRole("note")).toHaveTextContent(`Saved draft changes remain available. This operation saved ${count} draft ${noun}, last saved version ${latest_version}. Later changes may be newer.`);
+  });
+  it("reports zero attributed Stop revisions without claiming new saved changes", () => {
+    render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "request_cancelled", saved_revisions: { attribution: "fenced", count: 0, latest_state_id: null, latest_version: null } }} />);
+    expect(screen.getByRole("note")).toHaveTextContent("No draft revisions were saved by this operation. Earlier draft changes remain available.");
+    expect(screen.getByRole("note")).not.toHaveTextContent("Saved draft changes remain available.");
+    expect(screen.getByRole("note")).not.toHaveTextContent("last saved version");
+  });
+  it("keeps Stop saved changes uncertain until actual attribution arrives", () => {
+    render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "request_cancelled" }} />);
+    expect(screen.getByRole("note")).toHaveTextContent("Saved progress has not been confirmed");
+    expect(screen.getByRole("note")).not.toHaveTextContent("Saved draft changes remain available.");
+    expect(screen.getByRole("note")).not.toHaveTextContent("last saved version");
+  });
+  it("does not attribute saved changes to a Stop before the operation started", () => {
+    render(<ComposerOperationOutcomeNotice outcome={{ ...outcome, failure_code: "request_cancelled", saved_revisions: { attribution: "unstarted", count: 0, latest_state_id: null, latest_version: null } }} />);
+    expect(screen.getByRole("note")).toHaveTextContent("This request stopped before composing began. No draft revisions were saved by this operation.");
+    expect(screen.getByRole("note")).not.toHaveTextContent("Saved draft changes remain available.");
+  });
 });

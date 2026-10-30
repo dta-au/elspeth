@@ -16,10 +16,10 @@ from sqlalchemy import select, update
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.web.composer.continuation import ComposeFrame
-from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
-from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence, recorder_from_evidence_json
+from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import (
     admit_journal_values,
     append_primary_call_to_evidence,
@@ -121,6 +121,26 @@ async def primary_input(store, tmp_path, monkeypatch):
         model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None
     )
     return kwargs, produced, recorder, requests
+
+
+async def initialized_primary_input(store, tmp_path, monkeypatch):
+    """Enter PRIMARY from the actual complete composition initialization owner."""
+    from tests.helpers.fenced_session import seed_token_policies
+    from tests.unit.web.sessions.test_continuation_composition_initialization import construct, ready_case
+
+    running, service, work, ready, title_sdk = await ready_case(store, tmp_path, monkeypatch)
+    assert not title_sdk
+    runtime = await construct(store, running, service, work, ready)
+    assert runtime.source.selected.stack.semantic_frontier is not None
+    assert runtime.source.selected.stack.frames[0].tools is not None
+    assert runtime.bindings.session_operation_context is running.session_operation_context
+    assert type(runtime.bindings.provider_owner) is ProviderInvocationOwner
+    with store[0].begin() as conn:
+        grant_test_pipeline_user(conn, identity_id="alice")
+        seed_token_policies(conn, identity_id="alice")
+    settings, requests = _required_guard_settings(tmp_path, monkeypatch)
+    service._provider_gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
+    return runtime, work, requests
 
 
 async def post_p4_primary_input(store, tmp_path, monkeypatch):
@@ -422,8 +442,8 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
     original_outcome = ProviderGateway._call_llm_outcome_with_audit
     prepared = []
 
-    def observe(self, messages, tools):
-        actual = original(self, messages, tools)
+    def observe(self, messages, tools, *, user_prompt=None):
+        actual = original(self, messages, tools, user_prompt=user_prompt)
         prepared.append(actual)
         return actual
 
@@ -474,10 +494,21 @@ async def test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_p
 
 @pytest.mark.asyncio
 async def test_primary_input_refuses_changed_selected_message_after_actual_complete_positive(operation_store, tmp_path, monkeypatch):
+    from elspeth.contracts.prompt_guard import PROMPT_GUARD_PROVENANCE_KEYS, detach_prompt_guard_evidence
     from elspeth.web.composer.continuation_primary import _freeze_input
 
-    kwargs, produced, recorder, _requests = await primary_input(operation_store, tmp_path, monkeypatch)
+    kwargs, produced, recorder, requests = await primary_input(operation_store, tmp_path, monkeypatch)
     running = kwargs["inventory"].running
+    raw_bindings = tuple(produced.producers.capture_message(message) for message in produced.messages)
+    reference = detach_prompt_guard_evidence(produced.messages)
+    current = await asyncio.to_thread(produced.producers._require_current)
+    sdk_calls = []
+
+    async def forbidden_sdk(**arguments):
+        sdk_calls.append(arguments)
+        raise AssertionError("input preparation must not enter the SDK")
+
+    monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
     args = {
         "service": kwargs["service"],
         "authority": kwargs["authority"],
@@ -490,13 +521,24 @@ async def test_primary_input_refuses_changed_selected_message_after_actual_compl
     }
     try:
         actual = await asyncio.to_thread(_freeze_input, **args)
-        assert tuple(actual.messages) == tuple(produced.messages)
+        packet = actual.request.provider_input
+        assert canonical_json(actual.messages) == canonical_json(reference.messages)
+        assert packet.evidence.messages == reference.messages
+        assert packet.evidence.trusted_message_indexes == reference.trusted_message_indexes
+        assert packet.evidence.content_parts == reference.content_parts
+        assert packet.evidence.tool_argument_parts == reference.tool_argument_parts
+        assert packet.evidence.thinking_parts == reference.thinking_parts
+        assert packet.genuine_user == current.values.message == REQUEST
+        assert all(not PROMPT_GUARD_PROVENANCE_KEYS.intersection(message) for message in packet.evidence.messages)
+        assert packet.tools is None and "tools" not in actual.request.kwargs
+        assert tuple(produced.producers.capture_message(message) for message in produced.messages) == raw_bindings
         changed = [dict(message) for message in produced.messages]
         changed[-1]["content"] += " changed untrusted request"
         before = stored_rows(operation_store[0])
         with pytest.raises(AuditIntegrityError, match="complete current message producers"):
             await asyncio.to_thread(_freeze_input, **{**args, "messages": changed})
         assert stored_rows(operation_store[0]) == before
+        assert sdk_calls == [] and requests == []
         kwargs["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)
@@ -648,9 +690,12 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         assert result is not None and len(sdk) == 1
         old_frame = kwargs["selected"].stack.frames[0]
         old_chunk = next(chunk for chunk in kwargs["selected"].chunks if chunk.reference == old_frame.evidence)
-        old_evidence = decode_turn_evidence(old_chunk, env_ref_names=kwargs["inventory"].names)
-        assert old_evidence.application_entry is not None and old_evidence.joint_graph_json is None
-        before = require_evidence_application_links(old_evidence, env_ref_names=kwargs["inventory"].names)
+        old_evidence = decode_turn_evidence(old_chunk, env_ref_names=kwargs["inventory"].names, source_chunks=kwargs["selected"].chunks)
+        old_snapshot = old_evidence.snapshot
+        assert old_snapshot.application_entry is not None and old_snapshot.joint_graph_json is None
+        before = require_evidence_application_links(
+            old_snapshot, env_ref_names=kwargs["inventory"].names, recorder_chunk=old_evidence.recorder_chunk, sources=old_evidence.sources
+        )
         assert before is not None and before.cuts and before.selected.batch.phase == "complete"
         work = inventory_work(running)
         selected = await load_selected_continuation(
@@ -668,8 +713,11 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         work.coordinator.assert_completed()
         new_frame = selected.stack.frames[0]
         new_evidence = decode_turn_evidence(
-            next(chunk for chunk in selected.chunks if chunk.reference == new_frame.evidence), env_ref_names=inventory.names
+            next(chunk for chunk in selected.chunks if chunk.reference == new_frame.evidence),
+            env_ref_names=inventory.names,
+            source_chunks=selected.chunks,
         )
+        new_snapshot = new_evidence.snapshot
         projected = append_primary_call_to_evidence(
             old_evidence, call=result.outcome.audit_call, recorder=result.buffer, env_ref_names=inventory.names
         )
@@ -680,12 +728,14 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         assert copied_call == result.outcome.audit_call and copied_call is not result.outcome.audit_call
         with pytest.raises(AuditIntegrityError, match="exact original recorder prefix"):
             append_primary_call_to_evidence(old_evidence, call=copied_call, recorder=result.buffer, env_ref_names=inventory.names)
-        assert new_evidence.application_entry is not None and new_evidence.joint_graph_json is None
-        assert new_evidence.application_entry.applications == old_evidence.application_entry.applications
-        assert new_evidence.historical_application_count == old_evidence.historical_application_count
-        assert new_evidence.effect_locators == old_evidence.effect_locators
-        admit_journal_values(new_evidence.application_entry, env_ref_names=inventory.names)
-        after = require_evidence_application_links(new_evidence, env_ref_names=inventory.names)
+        assert new_snapshot.application_entry is not None and new_snapshot.joint_graph_json is None
+        assert new_snapshot.application_entry.applications == old_snapshot.application_entry.applications
+        assert new_snapshot.historical_application_count == old_snapshot.historical_application_count
+        assert new_snapshot.effect_locators == old_snapshot.effect_locators
+        admit_journal_values(new_snapshot.application_entry, env_ref_names=inventory.names, sources=new_evidence.sources)
+        after = require_evidence_application_links(
+            new_snapshot, env_ref_names=inventory.names, recorder_chunk=new_evidence.recorder_chunk, sources=new_evidence.sources
+        )
         assert after is not None and len(after.cuts) == len(before.cuts)
         assert after.effects is after.cuts[-1].effects_after
         assert after.selected.accumulator is after.cuts[-1].data.accumulator
@@ -724,16 +774,23 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         # Exercise the paired pure joint source using the actual pre-application
         # snapshot. This grants no SDK/right to invoke at that pending cut.
         joint = kwargs["prior_joint_snapshot"]
-        assert joint.joint_graph_json is not None and joint.application_entry is None
-        original_joint = require_evidence_application_links(joint, env_ref_names=inventory.names)
+        assert joint.snapshot.joint_graph_json is not None and joint.snapshot.application_entry is None
+        original_joint = require_evidence_application_links(
+            joint.snapshot, env_ref_names=inventory.names, recorder_chunk=joint.recorder_chunk, sources=joint.sources
+        )
         assert original_joint is not None and not original_joint.cuts
-        original_buffer = recorder_from_evidence_json(joint.recorder_json)
+        original_buffer = decode_recorder_snapshot(joint.recorder_chunk)
         joint_buffer = replace(original_buffer, llm_calls=(*original_buffer.llm_calls, result.outcome.audit_call))
         extended_joint = append_primary_call_to_evidence(
             joint, call=result.outcome.audit_call, recorder=joint_buffer, env_ref_names=inventory.names
         )
-        new_joint = require_evidence_application_links(extended_joint, env_ref_names=inventory.names)
-        assert extended_joint.application_entry is None and extended_joint.joint_graph_json is not None
+        new_joint = require_evidence_application_links(
+            extended_joint.snapshot,
+            env_ref_names=inventory.names,
+            recorder_chunk=extended_joint.recorder_chunk,
+            sources=extended_joint.sources,
+        )
+        assert extended_joint.snapshot.application_entry is None and extended_joint.snapshot.joint_graph_json is not None
         assert new_joint is not None and not new_joint.cuts and new_joint.selected.batch.phase == "p4_pending"
         assert encode_application_graph(original_joint, env_ref_names=inventory.names) == encode_application_graph(
             remove_appended_call(original_joint, new_joint), env_ref_names=inventory.names
@@ -854,5 +911,49 @@ async def test_primary_cold_read_binds_complete_supplied_selection_after_real_po
             await read_continuation_primary(authority=kwargs["authority"], selected=supplied, required_work=work)
         work.coordinator.assert_completed()
         assert stored_rows(operation_store[0]) == before and len(sdk) == 1
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", (False, True), ids=("prepared", "dispatched"))
+async def test_primary_structural_premise_refuses_result_on_real_unresolved_intent(operation_store, tmp_path, monkeypatch, dispatched):
+    from elspeth.web.sessions.composer_operation_errors import worker_lost_error
+
+    runtime, work, _requests = await initialized_primary_input(operation_store, tmp_path, monkeypatch)
+    authority, running = operation_store[2], work.running
+    assert running is not None
+    try:
+        request = runtime.materialization.service._provider_gateway.prepare_continuation_primary(
+            runtime.live.llm_messages, runtime.live.tools
+        )
+        selected = runtime.source.selected
+        prepared = authority.prepare_provider_action(
+            running,
+            family=0,
+            input_sha256=request.input_sha256,
+            snapshot_json=encode_continuation_snapshot(selected.stack),
+            expected_checkpoint_id=selected.checkpoint_id,
+            expected_cursor=selected.stack.cursor,
+            primary_input_json=continuation_provider_input_json(request.kwargs),
+        )
+        if dispatched:
+            authority.begin_continuation_primary(prepared)
+        # The exact native producer first establishes a valid unresolved cut.
+        assert authority.classify_continuation_owner(running, env_ref_names=runtime.env_ref_names) == "unresolved"
+        with operation_store[0].begin() as conn:
+            conn.execute(
+                update(effects)
+                .where(effects.c.effect_key == prepared.binding.effect_key)
+                .values(result_chunk_key=private_chunk_key(selected.chunks[0]))
+            )
+        malformed = stored_rows(operation_store[0])
+        with pytest.raises(AuditIntegrityError, match="contradictory result"):
+            authority.classify_continuation_owner(running, env_ref_names=runtime.env_ref_names)
+        with pytest.raises(AuditIntegrityError, match="contradictory result"):
+            authority.settle_continuation_owner(running, outcome=worker_lost_error(request_id=None), env_ref_names=runtime.env_ref_names)
+        assert stored_rows(operation_store[0]) == malformed
+        current = authority.get_for_turn(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+        assert current is not None and current.status == "running"
     finally:
         operation_store[1].release(running.session_operation_context)

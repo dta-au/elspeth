@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer._compose_loop_carriers import _AdvisorReviewState, _ComposeIterationState
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
@@ -14,7 +14,12 @@ from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameSta
 from elspeth.web.composer.continuation_attachment_history import empty_attachment_history, encode_attachment_history
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
 from elspeth.web.composer.continuation_caches import capture_continuation_caches, encode_continuation_caches
-from elspeth.web.composer.continuation_codec import PrivateChunk, encode_frontier_chunk, encode_private_chunk
+from elspeth.web.composer.continuation_codec import (
+    PrivateChunk,
+    encode_frontier_chunk,
+    encode_mandatory_private_chunk,
+    encode_private_chunk,
+)
 from elspeth.web.composer.continuation_evidence import encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import capture_turn_evidence
 from elspeth.web.composer.continuation_iteration import (
@@ -125,9 +130,6 @@ def capture_initial_composition(owners: InitialCompositionOwners) -> CapturedIni
     if live.discovery_cache or live.runtime_preflight_cache:
         raise AuditIntegrityError("first composition cannot hide preexisting cache observations")
     empty_recorder = encode_recorder_snapshot(BufferingRecorder().snapshot_for_continuation(drained=RecorderDrainCursors()))
-    audit = encode_recorder_snapshot(live.recorder.snapshot_for_continuation(drained=owners.drained))
-    if audit != empty_recorder:
-        raise AuditIntegrityError("first composition cannot reset or import a prior recorder")
     producer_inputs = capture_continuation_producer_inputs((), env_ref_names=source.inventory.names)
     if materialization.snapshot_inputs() != producer_inputs:
         raise AuditIntegrityError("first composition has no schema-call producer history")
@@ -144,7 +146,7 @@ def capture_initial_composition(owners: InitialCompositionOwners) -> CapturedIni
     expected_tail.append({"role": "system", "content": retained_operation_context_message(original.retained_context)})
     if live.llm_messages[len(produced) :] != expected_tail:
         raise AuditIntegrityError("first composition changed original recovery/retained-context message order or bytes")
-    snapshot = capture_turn_evidence(
+    admitted = capture_turn_evidence(
         live.turn_evidence,
         live.llm_messages,
         logical=logical,
@@ -152,17 +154,19 @@ def capture_initial_composition(owners: InitialCompositionOwners) -> CapturedIni
         drained=owners.drained,
         env_ref_names=source.inventory.names,
         materialization=materialization,
+        mandatory_retention=True,
+        expected_recorder=empty_recorder,
     )
-    evidence = encode_turn_evidence(snapshot, env_ref_names=source.inventory.names)
-    transcript = encode_message_shelf(snapshot.transcript)
-    messages = encode_private_chunk(
+    audit = admitted.recorder_chunk
+    evidence = encode_turn_evidence(admitted, env_ref_names=source.inventory.names, mandatory_retention=True)
+    snapshot = admitted.snapshot
+    transcript = encode_message_shelf(snapshot.transcript, mandatory_retention=True, env_ref_names=source.inventory.names)
+    messages = encode_mandatory_private_chunk(
         codec="composer.messages.v1",
-        canonical=canonical_json(
-            {"messages_json": snapshot.transcript.messages_json, "current_indexes": snapshot.transcript.current_indexes}
-        ),
+        value={"messages_json": snapshot.transcript.messages_json, "current_indexes": snapshot.transcript.current_indexes},
         env_ref_names=source.inventory.names,
     )
-    tools = encode_private_chunk(codec="composer.tools.v1", canonical=canonical_json(live.tools), env_ref_names=source.inventory.names)
+    tools = encode_mandatory_private_chunk(codec="composer.tools.v1", value=live.tools, env_ref_names=source.inventory.names)
     state = encode_private_chunk(
         codec="composer.state.v1", canonical=original.snapshot.initial_state_json, env_ref_names=source.inventory.names
     )

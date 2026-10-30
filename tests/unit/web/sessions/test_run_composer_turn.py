@@ -52,7 +52,7 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions import composer_finalization, composer_turn
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import (
@@ -69,6 +69,7 @@ from elspeth.web.sessions.routes._helpers import ComposerRequestLifecycle, compo
 from elspeth.web.sessions.routes.composer import pipeline_settlement
 from elspeth.web.sessions.schemas import MessageWithStateResponse, RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.sessions.test_routes import (
     _EMPTY_STATE,
@@ -2174,7 +2175,7 @@ async def test_turn_refuses_a_head_that_moved_under_its_own_lease(tmp_path: Path
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
         await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=job.lease.context,
         )
@@ -2411,7 +2412,7 @@ async def test_post_compose_runtime_preflight_arm_persists_one_audit_row_per_cal
     # composer_turn imports the helper by name, so this patches only the turn's
     # post-compose call (path 2). partial_state=None skips the handler's own
     # partial-state save; the handler goes straight to its cohort write.
-    monkeypatch.setattr(composer_turn, "_state_data_from_composer_state", _refuse_preflight)
+    monkeypatch.setattr(composer_finalization, "_state_data_from_composer_state", _refuse_preflight)
     async with _running_job(app, service, session.id, kind="compose_message", content="Save it.") as job:
         with pytest.raises(HTTPException) as refused:
             await _run(app, job)
@@ -2922,13 +2923,13 @@ async def test_send_turn_auto_commit_settles_through_the_services_bundle_with_th
     composer.compose.side_effect = compose_with_owned_proposal
     app.state.composer_service = composer
     seen_budgets: list[float] = []
-    real_settle = composer_turn.settle_auto_commit_intent
+    real_settle = composer_finalization.settle_auto_commit_intent
 
     async def _spy_settle(**kwargs: Any) -> Any:
         seen_budgets.append(kwargs["commit_timeout_seconds"])
         return await real_settle(**kwargs)
 
-    monkeypatch.setattr(composer_turn, "settle_auto_commit_intent", _spy_settle)
+    monkeypatch.setattr(composer_finalization, "settle_auto_commit_intent", _spy_settle)
     async with _running_job(app, service, session_id, kind="compose_message", content="Build the pipeline.") as job:
         record = await _run(app, job)
 

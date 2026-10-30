@@ -30,7 +30,7 @@ def test_each_actual_frame_reference_is_retained_in_first_occurrence_order():
     messages = reference("composer.messages.v1", 4)
     initial = reference("composer.state.v1", 5)
     state = reference("composer.state.v1", 6)
-    evidence = reference("composer.evidence.v1", 7)
+    evidence = reference("composer.evidence.v2", 7)
     audit = reference("composer.audit-buffer.v1", 8)
     transcript = reference("composer.transcript.v1", 9)
     caches = reference("composer.caches.v1", 10)

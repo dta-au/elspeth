@@ -30,7 +30,7 @@ Every request is built the way production builds it: the route is resolved
 by :func:`resolve_composer_tool_contract` under the row's **named**
 ``composer_strict_tools`` setting, the tool list is the one for the
 resolved dialect, and the kwargs come from
-``build_composer_loop_request_kwargs`` or ``build_planner_request_kwargs``.
+``build_composer_loop_request_kwargs``.
 A loopback base is a custom endpoint, which resolves to ``none`` under
 ``preferred`` (rows 5 and 8), and hosted OpenAI and Azure are ``none`` under
 ``preferred`` too (ruling 7). So each row that measures adapter forwarding
@@ -67,8 +67,6 @@ import pytest
 import respx
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer.capability_skill import PLANNER_TERMINAL_TOOL_NAME
-from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
 from elspeth.web.composer.provider_gateway import build_composer_loop_request_kwargs, composer_loop_tool_definitions
 from elspeth.web.composer.strict_transport import (
     StrictTransport,
@@ -428,35 +426,6 @@ def test_openrouter_preferred_control_sends_no_strict_key(loopback: _Loopback) -
 
     assert recorded.body["tools"] == request.sent_tools
     _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=46)
-
-
-def test_openrouter_planner_list_forwards_its_stamps(loopback: _Loopback) -> None:
-    """Characterization: the planner's request (``build_planner_request_kwargs``) forwards 23 ``true`` and the terminal ``false``."""
-    settings = _route_settings(_OPENROUTER_MODEL, f"{loopback.base}/api/v1", "forward_to_endpoint")
-    contract = resolve_composer_tool_contract(settings, env=os.environ)
-    assert contract.planner.resolution.transport is StrictTransport.FORWARDING
-    tools = planner_tool_definitions(dialect=contract.planner.dialect)
-    sent = copy.deepcopy(tools)
-    kwargs = build_planner_request_kwargs(
-        model=settings.composer_model,
-        messages=list(_MESSAGES),
-        tools=tools,
-        max_completion_tokens=16,
-        temperature=None,
-        seed=None,
-        reasoning_effort="low",
-        api_base=settings.composer_endpoint_base_url,
-        api_key=_FAKE_KEY,
-    )
-
-    recorded = _send_loopback(loopback, kwargs)
-
-    assert recorded.body["tools"] == sent
-    flags = _strict_flags(_chat_functions(recorded.body))
-    assert flags == _sent_flags(sent)
-    assert flags.pop(PLANNER_TERMINAL_TOOL_NAME) is False
-    assert len(flags) == 23
-    assert set(flags.values()) == {True}
 
 
 def test_openai_prefix_with_an_openrouter_host_resolves_forwarding() -> None:

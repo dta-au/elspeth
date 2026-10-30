@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from hashlib import sha256
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -145,7 +144,7 @@ def _guarded_service(invocation, monkeypatch, *, composer_client=None, advisor_c
 @pytest.mark.asyncio
 async def test_common_primary_preserves_guard_identity_after_prior_calls(invocation, monkeypatch):
     from elspeth.web.dependencies import create_catalog_service
-    from tests.unit.web.composer.test_pipeline_planner import _response_with_call_id, _ScriptedCompletion
+    from tests.unit.web.composer._scripted_sdk import _response_with_call_id, _ScriptedCompletion
 
     engine, sessions, owner, coordinator = invocation
     context = owner.required_work.coordinator.authority.context
@@ -770,121 +769,3 @@ async def test_allow_binds_detached_messages_and_tools_despite_caller_mutation(i
     assert sent[0]["tools"][0]["function"]["description"] == "Original description"
     assert messages[0]["content"] == "Changed after inspection"
     coordinator.assert_completed()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("hatch", [False, True])
-async def test_real_planner_selects_independent_mount_even_with_identical_model_names(tmp_path, tool_context, hatch):
-    from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion
-
-    composer = _Client(PromptGuardDecision("allow", "clean") if hatch else PromptGuardDecision("blocked", "policy_blocked"))
-    advisor = _Client(PromptGuardDecision("blocked", "policy_blocked"))
-    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sinks", {})))
-    recorder = BufferingRecorder()
-    with pytest.raises(PromptGuardRefused) as caught:
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            recorder=recorder,
-            model_overrides={
-                "max_discovery_turns": 1,
-                "model_identifier": "anthropic/claude-planner",
-                "escape_hatch_model": "anthropic/claude-planner",
-                "escape_hatch_provider": "test-provider",
-                "prompt_guard_mode": "required",
-                "prompt_guard_mount": PromptGuardMount(composer),
-                "escape_hatch_prompt_guard_mount": PromptGuardMount(advisor),
-            },
-        )
-    assert len(completion.requests) == (2 if hatch else 0)
-    assert len(advisor.requests) == int(hatch)
-    assert all(request.role == "composer" for request in composer.requests)
-    assert all(request.role == "advisor" for request in advisor.requests)
-    assert caught.value.disposition == "blocked"
-    assert len(recorder.llm_calls) == (2 if hatch else 0)
-
-
-@pytest.mark.asyncio
-async def test_captured_planner_catalog_reference_preserves_complete_untrusted_graph_evidence(tmp_path, tool_context, record_property):
-    from elspeth.web.catalog.policy_view import PolicyCatalogView
-    from elspeth.web.composer.planner_authoring_aids import build_schema_contract_evidence
-    from elspeth.web.composer.prompt_guard_rendering import json_content_parts
-    from elspeth.web.composer.state import NodeSpec
-    from elspeth.web.dependencies import create_catalog_service
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    graph_plugin = "graph_derived_omission_canary"
-    current = _empty_state().with_node(
-        NodeSpec(
-            id="prior_node",
-            node_type="transform",
-            plugin=graph_plugin,
-            input="rows",
-            on_success="out",
-            on_error="discard",
-            options={},
-            condition=None,
-            routes=None,
-            fork_to=None,
-            branches=None,
-            policy=None,
-            merge=None,
-        )
-    )
-    catalog = create_catalog_service()
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    loaded = frozenset({("transform", "passthrough")})
-    expected_schema, _ = build_schema_contract_evidence(policy, schemas_loaded=loaded, referenced={("transform", graph_plugin)})
-    client = _Client(PromptGuardDecision("allow", "clean"))
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=current,
-        schemas_loaded=loaded,
-        policy_override=(policy, snapshot),
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(client.requests) == len(completion.requests) == 1
-    wire = completion.requests[0]
-    parsed = [json.loads(message["content"]) for message in wire["messages"] if message["role"] == "user"]
-    categories = [sorted(payload) for payload in parsed]
-    record_property("wire_user_message_chars", [len(message["content"]) for message in wire["messages"] if message["role"] == "user"])
-    record_property("guard_document_chars", [len(document) for document in client.requests[0].documents])
-    record_property("wire_user_field_categories", categories)
-    references = [payload for payload in parsed if "authoring_aids" in payload and "intent" not in payload]
-    assert len(references) == 1
-    reference = references[0]
-    evidence = next(payload for payload in parsed if "intent" in payload)
-    assert {**reference["schema_contract_evidence"], **evidence["schema_contract_evidence"]} == expected_schema
-    assert reference["schema_contract_evidence"]["schemas"][0]["plugin_id"] == "transform/passthrough"
-    assert "authoring_aids" not in "\n".join(client.requests[0].documents)
-    assert graph_plugin in "\n".join(client.requests[0].documents)
-    assert max(map(len, client.requests[0].documents)) < 10_000
-    assert all(PROMPT_GUARD_TRUST_KEY not in message for message in wire["messages"])
-    hashed = {
-        "role": "composer",
-        "policy_fingerprint": client.policy_fingerprint,
-        "enforce_azure_character_limits": True,
-        "user_prompt": "Build the requested pipeline.",
-        "messages": wire["messages"],
-        "tools": wire["tools"],
-        "trusted_message_indexes": [0, 1],
-        "content_parts": [
-            None,
-            None,
-            [
-                {"text": part.text, "trust": None, "inspection_text": part.inspection_text}
-                for part in json_content_parts(wire["messages"][2]["content"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            ],
-        ],
-        "tool_argument_parts": [None, None, None],
-    }
-    assert (
-        client.requests[0].request_hash
-        == sha256(json.dumps(hashed, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-    )

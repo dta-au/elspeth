@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,29 +16,20 @@ from unittest.mock import AsyncMock
 import litellm
 import pytest
 import structlog
-from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import event, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
-from elspeth.core.canonical import stable_hash
-from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
-from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
-from elspeth.web.composer.pipeline_planner import PlannerCustodyConfig, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.provider_cost import CommonProviderCostBudget
-from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationOwner
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
-from elspeth.web.composer.tools import ToolContext
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -56,8 +47,6 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits, assert_initial_wire
-from tests.helpers.session_fences import acquire_compose_context
-from tests.unit.web.composer.test_pipeline_planner import _plan, _response, _ScriptedCompletion
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -138,7 +127,7 @@ def _terminal_response(data_dir: Path, session_id: str) -> _Response:
                         _ToolCall(
                             id="freeform-terminal",
                             function=_Function(
-                                name="emit_pipeline_proposal",
+                                name="set_pipeline",
                                 arguments=json.dumps({"pipeline": _pipeline(data_dir, session_id)}),
                             ),
                         )
@@ -186,7 +175,7 @@ def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: st
                         _ToolCall(
                             id=f"freeform-routing-{condition}",
                             function=_Function(
-                                name="emit_pipeline_proposal",
+                                name="set_pipeline",
                                 arguments=json.dumps({"pipeline": pipeline}),
                             ),
                         )
@@ -981,191 +970,6 @@ async def _recipe_composer_context(
     return engine, sessions, session, user_message, composer
 
 
-async def _direct_manifest_case(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    outcome: Any,
-    expected_status: ComposerLLMCallStatus,
-    *,
-    pause_insert: Callable[..., None] | None = None,
-) -> tuple[BaseException, AuditIntegrityError]:
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    request = "Build the requested pipeline."
-    engine, sessions, session, user, _composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
-    catalog = create_catalog_service()
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
-    tool_context = ToolContext(catalog=policy, plugin_snapshot=snapshot)
-    origin = PlannerOriginatingMessage(
-        session_id=str(session.id),
-        message_id=str(user.id),
-        content=request,
-        user_id="planner-user",
-    )
-    manifests: list[Any] = []
-    owned: list[list[dict[str, Any]]] = []
-    owned_hashes: list[str] = []
-    integrity_failures: list[AuditIntegrityError] = []
-    real_builder = planner_module.build_planner_capability_manifest
-    real_matcher = planner_module._assert_planner_call_matches_manifest
-
-    def observe_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        manifests.append(manifest)
-        owned.append(kwargs["messages"])
-        return manifest
-
-    def observe_mismatch(call: Any, manifest: Any, recorder: Any) -> None:
-        try:
-            real_matcher(call, manifest, recorder)
-        except AuditIntegrityError as failure:
-            integrity_failures.append(failure)
-            raise
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", observe_manifest)
-    monkeypatch.setattr(planner_module, "_assert_planner_call_matches_manifest", observe_mismatch)
-
-    class MutatingCompletion(_ScriptedCompletion):
-        async def __call__(self, **kwargs: Any) -> Any:
-            assert len(owned) == 1 and self.requests == []
-            assert kwargs["messages"] is not owned[0]
-            original_content = owned[0][0]["content"]
-            kwargs["messages"][0]["content"] += "\nSDK detached mutation"
-            assert owned[0][0]["content"] == original_content
-            owned[0][0]["content"] += "\nactual owned manifest mutation"
-            owned_hashes.append(stable_hash(owned[0]))
-            return await super().__call__(**kwargs)
-
-    completion = MutatingCompletion(outcome)
-    recorder = BufferingRecorder()
-    if pause_insert is not None:
-        event.listen(engine, "before_cursor_execute", pause_insert)
-    try:
-        async with acquire_compose_context(sessions, session.id) as context:
-            custody = PlannerCustodyConfig(
-                data_dir=str(tmp_path),
-                session_engine=engine,
-                max_storage_per_session=1_000_000,
-                secret_service=None,
-                runtime_preflight=None,
-                session_operation_context=context,
-                session_operation_authority=sessions.session_operation_authority,
-            )
-            error: BaseException | None = None
-            try:
-                await _plan(
-                    tmp_path=tmp_path,
-                    tool_context=tool_context,
-                    completion=completion,
-                    recorder=recorder,
-                    originating_message=origin,
-                    custody_config=custody,
-                )
-            except BaseException as failure:
-                error = failure
-            assert error is not None, "controlled owned manifest mutation did not refuse"
-            (integrity,) = integrity_failures
-            assert type(integrity) is AuditIntegrityError
-            assert str(integrity) == "planner call inputs changed after capability manifest construction"
-            assert len(manifests) == len(completion.requests) == len(owned_hashes) == 1
-            assert completion._responses == []
-            (call,) = recorder.llm_calls
-            assert call.status is expected_status
-            assert call.call_id is not None
-            assert call.planner_call_ordinal == 1
-            assert call.messages_hash == owned_hashes[0]
-            assert call.messages_hash != manifests[0].rendered_prompt_hash
-            assert call.tools_spec_hash == manifests[0].effective_tool_hash
-            physical = completion.requests[0]
-            assert [row["role"] for row in physical["messages"]] == ["system", "user", "user"]
-            assert json.loads(physical["messages"][2]["content"])["intent"] == request
-            names = {tool["function"]["name"] for tool in physical["tools"]}
-            assert "emit_pipeline_proposal" in names and "set_pipeline" not in names
-            assert physical["messages"][0]["content"].endswith("\nSDK detached mutation")
-            assert "actual owned manifest mutation" not in physical["messages"][0]["content"]
-
-            persisted = await sessions.get_messages(session.id, limit=None)
-            native = [
-                (row, envelope) for row in persisted for envelope in (row.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
-            ]
-            ((native_row, public_envelope),) = native
-            public_envelope = deep_thaw(public_envelope)
-            assert native_row.role == "audit" and native_row.writer_principal == "compose_loop"
-            assert public_envelope == llm_call_audit_envelope(call)
-            public_call = public_envelope["call"]
-            assert public_call["call_id"] == call.call_id
-            assert public_call["status"] == expected_status.value
-            assert public_call["messages_hash"] == call.messages_hash
-            assert public_call["messages_hash"] != manifests[0].rendered_prompt_hash
-            assert public_call["tools_spec_hash"] == call.tools_spec_hash == manifests[0].effective_tool_hash
-            public_text = json.dumps(public_envelope, sort_keys=True)
-            assert request not in public_text
-            assert "SDK detached mutation" not in public_text
-            assert "actual owned manifest mutation" not in public_text
-
-            with engine.connect() as conn:
-                attempt = dict(
-                    conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == str(session.id)))
-                    .mappings()
-                    .one()
-                )
-                ledger = dict(
-                    conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == str(session.id)))
-                    .mappings()
-                    .one()
-                )
-            assert attempt["attempt_id"] == call.call_id
-            assert attempt["identity_id"] == ledger["identity_id"] == "planner-user"
-            assert attempt["session_id"] == ledger["session_id"] == str(session.id)
-            assert attempt["source"] == ledger["source"] == "composer"
-            assert attempt["operation_id"] == context.fence.operation_id
-            assert attempt["operation_epoch"] == context.fence.operation_epoch
-            assert attempt["lease_token"] == context.fence.lease_token
-            assert attempt["settled_at"] is not None
-            assert attempt["ledger_entry_id"] == ledger["entry_id"]
-            expected_model = call.model_requested if call.model_returned is None else call.model_returned
-            assert ledger["model"] == expected_model
-            assert ledger["prompt_tokens"] == call.prompt_tokens
-            assert ledger["completion_tokens"] == call.completion_tokens
-            if expected_status is ComposerLLMCallStatus.SUCCESS:
-                assert call.provider_cost == 0.01
-                assert call.prompt_tokens == 10 and call.completion_tokens == 5
-            else:
-                assert call.provider_cost is None and call.provider_cost_source == "not_available"
-                assert call.model_returned is None
-                assert call.prompt_tokens is None and call.completion_tokens is None
-
-            private_requests = [
-                (row, envelope)
-                for row in persisted
-                for envelope in (row.tool_calls or ())
-                if envelope.get("_kind") == "composer_diagnostic_evidence" and envelope["evidence"]["status"] == "provider_request"
-            ]
-            ((private_row, private_envelope),) = private_requests
-            assert private_row.role == "audit" and private_row.writer_principal == "compose_loop"
-            evidence = ComposerDiagnosticEvidence.from_envelope(
-                private_envelope,
-                expected_session_id=str(session.id),
-                expected_operation_id=context.fence.operation_id,
-                expected_tool_call_id=call.call_id,
-            )
-            assert evidence.operation_epoch == context.fence.operation_epoch
-            assert evidence.operation_epoch == attempt["operation_epoch"]
-            assert evidence.tool_name == "composer_provider_context" and evidence.status == "provider_request"
-            assert call.private_request is not None and call.private_request.canonical is not None
-            assert evidence.arguments.content is not None
-            assert json.loads(evidence.arguments.content) == json.loads(call.private_request.canonical)
-            assert "SDK detached mutation" not in evidence.arguments.content
-            assert "actual owned manifest mutation" not in evidence.arguments.content
-            assert await sessions.list_composition_proposals(session.id) == []
-            _assert_no_pipeline_side_effects(engine)
-            return error, integrity
-    finally:
-        if pause_insert is not None:
-            event.remove(engine, "before_cursor_execute", pause_insert)
-
-
 @pytest.mark.asyncio
 async def test_freeform_matching_provider_cancellation_persists_once_without_self_cause(
     tmp_path: Path,
@@ -1205,113 +1009,6 @@ async def test_freeform_matching_provider_cancellation_persists_once_without_sel
     assert audit_calls[0]["status"] == ComposerLLMCallStatus.CANCELLED.value
     assert await sessions.list_composition_proposals(session.id) == []
     _assert_no_pipeline_side_effects(engine)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("provider_outcome", "expected_status"),
-    (
-        ("success", ComposerLLMCallStatus.SUCCESS),
-        ("error", ComposerLLMCallStatus.API_ERROR),
-        ("cancel", ComposerLLMCallStatus.CANCELLED),
-    ),
-)
-async def test_direct_planner_manifest_mismatch_is_durable_before_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    provider_outcome: str,
-    expected_status: ComposerLLMCallStatus,
-) -> None:
-    original: BaseException | None = None
-    if provider_outcome == "error":
-        original = LiteLLMAPIError(
-            status_code=503,
-            message="provider unavailable",
-            llm_provider="test-provider",
-            model="anthropic/claude-planner",
-        )
-    elif provider_outcome == "cancel":
-        original = asyncio.CancelledError("actual direct planner provider cancellation")
-    response = _response(("emit_pipeline_proposal", {"pipeline": {}}))
-    error, integrity = await _direct_manifest_case(
-        tmp_path,
-        monkeypatch,
-        response if original is None else original,
-        expected_status,
-    )
-    if original is None:
-        assert error is integrity
-    else:
-        expected_type = ExceptionGroup if provider_outcome == "error" else BaseExceptionGroup
-        assert type(error) is expected_type
-        assert isinstance(error, BaseExceptionGroup)
-        assert error.message == "Provider original body and audit construction outcomes"
-        assert error.exceptions == (original, integrity)
-
-
-@pytest.mark.asyncio
-async def test_direct_manifest_mismatch_checkpoint_defers_original_cancellation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    entered, release = threading.Event(), threading.Event()
-    native_inserts: list[str] = []
-    actual_cancellations: list[asyncio.CancelledError] = []
-    real_raise = ProviderCallCustody.raise_deferred_cancellations
-
-    def observe_deferred(
-        owner: ProviderCallCustody,
-        cancellations: tuple[asyncio.CancelledError, ...],
-    ) -> None:
-        actual_cancellations.extend(cancellations)
-        real_raise(owner, cancellations)
-
-    def pause(
-        _conn: Any,
-        _cursor: Any,
-        statement: str,
-        _parameters: Any,
-        execution_context: Any,
-        many: bool,
-    ) -> None:
-        if not statement.startswith("INSERT INTO chat_messages"):
-            return
-        (bound,) = execution_context.compiled_parameters
-        envelopes = bound["tool_calls"]
-        if bound["role"] != "audit" or not envelopes or envelopes[0].get("_kind") != "llm_call_audit":
-            return
-        assert not many and native_inserts == []
-        native_inserts.append(envelopes[0]["call"]["call_id"])
-        entered.set()
-        assert release.wait(10), "actual native audit worker was not released"
-
-    monkeypatch.setattr(ProviderCallCustody, "raise_deferred_cancellations", observe_deferred)
-    task = asyncio.create_task(
-        _direct_manifest_case(
-            tmp_path,
-            monkeypatch,
-            _response(("emit_pipeline_proposal", {"pipeline": {}})),
-            ComposerLLMCallStatus.SUCCESS,
-            pause_insert=pause,
-        )
-    )
-    try:
-        assert await asyncio.to_thread(entered.wait, 10), "actual native audit insert was not reached"
-        task.cancel("request cancelled during actual native manifest checkpoint")
-        await asyncio.sleep(0)
-        assert not task.done()
-        release.set()
-        error, integrity = await asyncio.wait_for(task, 10)
-    finally:
-        release.set()
-        await asyncio.gather(task, return_exceptions=True)
-    assert len(native_inserts) == 1
-    (cancellation,) = actual_cancellations
-    assert type(cancellation) is asyncio.CancelledError
-    assert cancellation.args == ("request cancelled during actual native manifest checkpoint",)
-    assert type(error) is BaseExceptionGroup
-    assert error.message == "Provider body and required settlement outcomes"
-    assert error.exceptions == (integrity, cancellation)
 
 
 def _assert_no_pipeline_side_effects(engine: Any) -> None:

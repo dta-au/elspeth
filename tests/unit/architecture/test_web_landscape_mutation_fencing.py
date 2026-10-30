@@ -54,15 +54,19 @@ from pathlib import Path
 
 import pytest
 from tests.helpers import required_work_reserve_recipes as _reserve_recipes
+from tests.helpers import web_reserve_batch_data_transfers as _reserve_batch_data_transfers
 from tests.helpers import web_reserve_compose_proposal_transfers as _reserve_compose_proposal_transfers
 from tests.helpers import web_reserve_composer_receiver as _reserve_composer_receiver
+from tests.helpers import web_reserve_continuation_transfers as _reserve_continuation_transfers
 from tests.helpers import web_reserve_dependency_roles as _reserve_dependency_roles
 from tests.helpers import web_reserve_family_contracts as _reserve_family_contracts
 from tests.helpers import web_reserve_proposal_child_transfers as _reserve_proposal_child_transfers
 from tests.helpers import web_reserve_provider_mint_contract as _reserve_provider_mint_contract
+from tests.helpers import web_reserve_retention as _reserve_retention
 from tests.helpers import web_reserve_route_helper as _reserve_route_helper
 from tests.helpers import web_reserve_supplier_contracts as _reserve_supplier_contracts
 from tests.helpers import web_reserve_terminal_sql_transfers as _reserve_terminal_sql_transfers
+from tests.helpers import web_reserve_title_transfers as _reserve_title_transfers
 from tests.helpers import web_reserve_worker_caller as _reserve_worker_caller
 from tests.helpers import web_reserve_worker_six as _reserve_worker_six
 from tests.helpers import web_worker_whole_scope_origin as _reserve_worker_whole_scope_origin
@@ -1238,7 +1242,15 @@ class _Resolver:
 
     @staticmethod
     def _target_names(target: ast.AST) -> set[str]:
-        return {child.id for child in ast.walk(target) if isinstance(child, ast.Name)}
+        match target:
+            case ast.Name(id=name, ctx=ast.Store()) if type(name) is str:
+                return {name}
+            case ast.Tuple(elts=elements) | ast.List(elts=elements):
+                return {name for element in elements for name in _Resolver._target_names(element)}
+            case ast.Starred(value=value):
+                return _Resolver._target_names(value)
+            case _:
+                return set()
 
     def _absolute_import_module(self, node: ast.ImportFrom) -> str:
         module = node.module or ""
@@ -5794,7 +5806,14 @@ _reserve_BINDING = "elspeth.web.required_work.RequiredWorkBinding"
 
 _reserve_LEASE = "elspeth.web.coordination.lifecycle.SessionOperationLease"
 
-_reserve_RESERVE_FAMILY = {"reserve", "reserve_pair", "reserve_audit_work", "begin_proposal_child", "prepare_lease_release"}
+_reserve_RESERVE_FAMILY = {
+    "reserve",
+    "reserve_pair",
+    "reserve_audit_work",
+    "begin_proposal_child",
+    "prepare_lease_release",
+    "prepare_continuation_handoff",
+}
 
 _reserve_PROTECTED = {
     "_authority",
@@ -5876,11 +5895,11 @@ _reserve_FULL_SOURCE_PATHS = (
 )
 
 _reserve_CANCEL_ROUTE_PATH = "src/elspeth/web/sessions/routes/composer/operations.py"
-_reserve_CANCEL_ROUTE_SHA256 = "b9887b44b17dd732ebb21ff07d6eb9eeb1e473839d62c7abfe15e517256d9e12"
+_reserve_CANCEL_ROUTE_SHA256 = "e8e446ebb845e7d006898b3abe6598c0a826d7d30cf8092be1ed03e5ebb6a1d3"
 _reserve_CANCEL_CONSUMERS = {
-    "src/elspeth/web/composer_watch_reads.py": "099b7e92f3617d5d9f39b479c1f21f229375e24e20208d294c822d7099cf6e3f",
-    "src/elspeth/web/sessions/composer_turn.py": "f3bede6fb0a891950b05e8ed8731d93f33fcbc9eb9d8fcb99e9655003908d88b",
-    "src/elspeth/web/sessions/composer_async_worker.py": "cb28e7750821b373a54361e6b422863e7631e3ccee4309c4333c90d9912c1f71",
+    "src/elspeth/web/composer_watch_reads.py": "68e30e0fcf7031e0d286d159baaa5cfcefb840ebb774022250e1b3b8ffcb3b9d",
+    "src/elspeth/web/sessions/composer_turn.py": "b7362a516c6191409e883a188917d7bc8c232985d597f5eb4c18d63c200e4087",
+    "src/elspeth/web/sessions/composer_async_worker.py": "de7b4c604d2f33214a3a954025064d1807de91994bf4e27198d840ffeccec141",
 }
 
 
@@ -5955,7 +5974,14 @@ def _reserve_recipe_failures(units):
     actual = _reserve_recipes.snapshot({p: sources[p] for p in _reserve_recipes.SELECTION})
     if _reserve_json.loads(_reserve_json.dumps(actual)) != expected:
         return ["transitive non-DML recipe or imported bindings changed"]
+    return _reserve_writer_recipe_failures(units)
+
+
+def _reserve_writer_recipe_failures(units):
+    """Check every existing writer binding without the earlier recipe gates."""
     indexed = {u.path: u for u in units}
+    if len(indexed) != len(units):
+        return ["duplicate SourceUnit identity"]
     expected_writers = _reserve_json.loads((_reserve_BASE / "reviewed-writer-recipes.json").read_text())
     failures = []
     for key, expected_dump in expected_writers.items():
@@ -6646,6 +6672,120 @@ def _reserve_authority_receiver_contract(units):
     return []
 
 
+def _reserve_annotation_only_nonwrites(unit, bound):
+    """Same-AST simple annotation targets that assign no namespace value.
+
+    This fact grants no supplier identity, annotation evaluation, value store
+    or field/class admission. All expressions and scope declarations remain
+    scanned. Keep it separate from dataclasses.field's origin-specific local
+    storage receipt, whose function/comprehension cases have other premises.
+    """
+    return {
+        id(node.target): id(owner)
+        for owner in ast.walk(unit.tree)
+        if isinstance(owner, (ast.Module, ast.ClassDef))
+        for node in owner.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == bound
+        and node.simple == 1
+        and node.value is None
+    }
+
+
+def _reserve_owned_source_binding_failures(
+    modules,
+    selected,
+    *,
+    recovery_module=None,
+    recovery_cell_names=frozenset(),
+    recovery_store_ids=frozenset(),
+    recovery_global_ids=frozenset(),
+):
+    """Validate only the actual selected-owned producer/name bindings.
+
+    The caller supplies its unchanged complete selected-root union. Keeping
+    this source prerequisite separate permits genuine scoped calibration; an
+    empty result is not a receipt for any supplier value, consumer or effect.
+    Recovery exceptions retain their original source-owned identity sets.
+    """
+    failures = []
+    for qualified in sorted(selected):
+        if qualified in modules or "." not in qualified:
+            continue
+        owner_module, name = qualified.rsplit(".", 1)
+        owner_unit = modules.get(owner_module)
+        if owner_unit is None:
+            continue
+        nonwrites = _reserve_annotation_only_nonwrites(owner_unit, name)
+
+        def bound_names(statement, nonwrites=nonwrites):
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return [statement.name]
+            if isinstance(statement, ast.TypeAlias) and isinstance(statement.name, ast.Name):
+                return [statement.name.id]
+            if isinstance(statement, ast.Assign):
+                return [target.id for target in statement.targets if isinstance(target, ast.Name)]
+            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and id(statement.target) not in nonwrites:
+                return [statement.target.id]
+            if isinstance(statement, ast.Import):
+                return [alias.asname or alias.name.partition(".")[0] for alias in statement.names]
+            if isinstance(statement, ast.ImportFrom):
+                return [alias.asname or alias.name for alias in statement.names]
+            return []
+
+        definition = [statement for statement in owner_unit.tree.body if name in bound_names(statement)]
+        if len(definition) != 1:
+            failures.append("selected owned origin has no unique source producer " + qualified)
+            continue
+        canonical = definition[0]
+        canonical_stores = {
+            id(target)
+            for target in (
+                canonical.targets
+                if isinstance(canonical, ast.Assign)
+                else [canonical.target]
+                if isinstance(canonical, ast.AnnAssign)
+                else [canonical.name]
+                if isinstance(canonical, ast.TypeAlias)
+                else []
+            )
+            if isinstance(target, ast.Name) and target.id == name
+        }
+        for node in ast.walk(owner_unit.tree):
+            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)):
+                reviewed_recovery_store = (
+                    owner_module == recovery_module
+                    and name in recovery_cell_names
+                    and isinstance(node.ctx, ast.Store)
+                    and id(node) in recovery_store_ids
+                )
+                if id(node) not in canonical_stores and id(node) not in nonwrites and not reviewed_recovery_store:
+                    failures.append("selected owned origin rebound or deleted " + qualified + ":" + str(node.lineno))
+            if (
+                isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node is not canonical
+                and name in bound_names(node)
+            ):
+                failures.append("selected owned origin redeclared " + qualified + ":" + str(node.lineno))
+            if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+                reviewed_recovery_global = (
+                    owner_module == recovery_module
+                    and name in recovery_cell_names
+                    and isinstance(node, ast.Global)
+                    and id(node) in recovery_global_ids
+                )
+                if not reviewed_recovery_global:
+                    failures.append("selected owned origin scope declaration " + qualified + ":" + str(node.lineno))
+            if isinstance(node, ast.ExceptHandler) and node.name == name:
+                failures.append("selected owned origin exception rebinding " + qualified + ":" + str(node.lineno))
+            if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
+                failures.append("selected owned origin match rebinding " + qualified + ":" + str(node.lineno))
+            if isinstance(node, ast.MatchMapping) and node.rest == name:
+                failures.append("selected owned origin match rest rebinding " + qualified + ":" + str(node.lineno))
+    return failures
+
+
 def _reserve_dataclass_field_local_bindings(unit, bound, origin):
     """Prove local stores disjoint from this actual imported supplier binding.
 
@@ -7108,6 +7248,2047 @@ def _reserve_dataclass_field_class_use(node, unit, parents):
     return False
 
 
+def _reserve_typing_global_read(unit, node, name, parents):
+    """Require a module/builtin read, including enclosing closure scopes."""
+    if id(node) not in parents:
+        return False
+    child = node
+    scope = parents[id(node)]
+    skip_classes = False
+    while scope is not None:
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.TypeAlias)) and any(
+            isinstance(parameter, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)) and parameter.name == name
+            for parameter in scope.type_params
+        ):
+            return False
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(child is statement for statement in scope.body):
+            if any(bound == name for bound, _kind, _node in _reserve_composer_receiver.lexical_binding_events(scope)):
+                return False
+            if any(isinstance(statement, (ast.Global, ast.Nonlocal)) and name in statement.names for statement in _walk_same_scope(scope)):
+                return False
+            skip_classes = True
+        elif isinstance(scope, ast.Lambda) and _is_descendant(node, scope.body):
+            # No current production result mint needs a lambda-body fact.
+            return False
+        elif isinstance(scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            first_iter = scope.generators[0].iter if scope.generators else None
+            if first_iter is None or not _is_descendant(node, first_iter):
+                if any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for generator in scope.generators
+                    for target in ast.walk(generator.target)
+                ):
+                    return False
+                skip_classes = True
+        elif isinstance(scope, ast.ClassDef) and not skip_classes and any(child is statement for statement in scope.body):
+            nonwrites = _reserve_annotation_only_nonwrites(unit, name)
+            for statement in _reserve_composer_receiver.immediate(scope):
+                if (
+                    isinstance(statement, ast.Name)
+                    and statement.id == name
+                    and isinstance(statement.ctx, (ast.Store, ast.Del))
+                    and id(statement) not in nonwrites
+                ):
+                    return False
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and statement.name == name:
+                    return False
+                if isinstance(statement, (ast.Import, ast.ImportFrom)) and any(
+                    alias.name == "*" or (alias.asname or alias.name.partition(".")[0]) == name for alias in statement.names
+                ):
+                    return False
+                if isinstance(statement, (ast.Global, ast.Nonlocal)) and name in statement.names:
+                    return False
+                if (
+                    isinstance(statement, ast.Call)
+                    and isinstance(statement.func, ast.Name)
+                    and statement.func.id in {"globals", "locals", "eval", "exec"}
+                ):
+                    return False
+        child = scope
+        scope = parents.get(id(scope))
+    return True
+
+
+def _reserve_typing_implicit_binding(node, name):
+    return (
+        (isinstance(node, ast.ExceptHandler) and node.name == name)
+        or (isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name)
+        or (isinstance(node, ast.MatchMapping) and node.rest == name)
+    )
+
+
+def _reserve_typing_builtin_binding(unit, nodes, name):
+    return _reserve_composer_receiver.builtin_binding(unit.tree, name) and not any(
+        _reserve_typing_implicit_binding(node, name)
+        or (isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names)
+        or (isinstance(node, ast.Name) and node.id == "__builtins__")
+        or (isinstance(node, ast.Import) and any(alias.name == "builtins" for alias in node.names))
+        or (isinstance(node, ast.ImportFrom) and node.module == "builtins")
+        for node in nodes
+    )
+
+
+def _reserve_typing_namespace_veto(node, parents, owner):
+    """The existing namespace veto, independent of any consumer permission."""
+    recovery = {"globals", "locals", "exec", "eval", "__import__", "__builtins__", "import_module"}
+    if isinstance(node, ast.ImportFrom) and node.module in {"builtins", "importlib", "sys"}:
+        return True
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+        if node.id in recovery:
+            return True
+        if node.id == "vars":
+            parent = parents.get(id(node))
+            if not isinstance(parent, ast.Call) or parent.func is not node or not parent.args:
+                return True
+    if isinstance(node, ast.Attribute) and node.attr in {
+        "__dict__",
+        "__globals__",
+        "__builtins__",
+        "modules",
+        "import_module",
+        "globals",
+        "locals",
+        "eval",
+        "exec",
+        "__import__",
+    }:
+        return True
+    if isinstance(node, ast.Import) and any(alias.name == owner or alias.name in {"builtins", "importlib", "sys"} for alias in node.names):
+        return True
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
+        selector = node.args[1]
+        if not isinstance(selector, ast.Constant) or type(selector.value) is not str or selector.value.startswith("__"):
+            return True
+    return bool(
+        isinstance(node, ast.ImportFrom)
+        and (
+            any((node.module or "") + "." + alias.name == owner for alias in node.names)
+            or (
+                node.level
+                and (node.module == owner.rpartition(".")[2] or any(alias.name == owner.rpartition(".")[2] for alias in node.names))
+            )
+        )
+    )
+
+
+def _reserve_typing_namespace_current(unit, nodes, parents, owner):
+    """Withhold local source facts on unresolved namespace recovery/effects."""
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom) and node.module in {"builtins", "importlib", "sys"}:
+            return False
+    return not any(_reserve_typing_namespace_veto(node, parents, owner) for node in nodes)
+
+
+def _reserve_typing_eager_query_namespace_current(unit, query):
+    """Only an earlier original materialization can precede a later body read."""
+    nodes = tuple(ast.walk(unit.tree))
+    if not any(node is query for node in nodes) or not isinstance(query, ast.Call):
+        return False
+    parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    materialization = parents.get(id(query))
+    if (
+        not isinstance(materialization, ast.Call)
+        or not isinstance(materialization.func, ast.Name)
+        or materialization.func.id != "frozenset"
+        or len(materialization.args) != 1
+        or materialization.args[0] is not query
+        or materialization.keywords
+    ):
+        return False
+    statement = parents.get(id(materialization))
+    if not isinstance(statement, (ast.Assign, ast.AnnAssign)) or statement.value is not materialization:
+        return False
+    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+        return False
+    positions = {id(child): index for index, child in enumerate(unit.tree.body)}
+    query_position = positions.get(id(statement))
+    if query_position is None:
+        return False
+    owner = unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+    for node in nodes:
+        if not _reserve_typing_namespace_veto(node, parents, owner):
+            continue
+        if not isinstance(node, ast.Attribute) or node.attr != "__dict__":
+            return False
+        deferred = False
+        child = node
+        parent = parents.get(id(child))
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definition_position = positions.get(id(parent))
+                deferred = (
+                    definition_position is not None
+                    and definition_position > query_position
+                    and any(child is body_statement for body_statement in parent.body)
+                )
+                break
+            if isinstance(parent, (ast.ClassDef, ast.Lambda, ast.TypeAlias)):
+                break
+            child = parent
+            parent = parents.get(id(child))
+        if not deferred:
+            return False
+    return True
+
+
+def _reserve_typing_annotation_source_facts(unit):
+    """Positive original-source facts; none reclassify a descriptor globally."""
+    resolver = _resolver_for_unit(unit)
+    nodes = tuple(ast.walk(unit.tree))
+    parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
+    owner = unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+    current_bindings = {}
+    namespace_current = _reserve_typing_namespace_current(unit, nodes, parents, owner)
+
+    def current(name):
+        if name not in current_bindings:
+            current_bindings[name] = namespace_current and not _reserve_owned_source_binding_failures(
+                {owner: unit}, frozenset({owner + "." + name})
+            )
+        return current_bindings[name]
+
+    import_bindings = {}
+    wildcard = any(isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names) for node in nodes)
+    for statement in unit.tree.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            for alias in statement.names:
+                bound = alias.asname or (alias.name.partition(".")[0] if isinstance(statement, ast.Import) else alias.name)
+                import_bindings.setdefault(bound, []).append((statement, alias))
+    canonical_imports = {
+        name: set()
+        for name in (
+            "typing.get_args",
+            "typing.Literal",
+            "typing.TypedDict",
+        )
+    }
+    positions = {id(statement): index for index, statement in enumerate(unit.tree.body)}
+    # Structural candidates are not published whole-unit import permissions.
+    scalar_imports = {"typing.get_args": {}, "typing.Literal": {}}
+    if not wildcard:
+        for node in nodes:
+            base = node.value if isinstance(node, ast.Attribute) else node
+            if not isinstance(base, ast.Name) or not isinstance(base.ctx, ast.Load):
+                continue
+            definitions = import_bindings.get(base.id, ())
+            if len(definitions) != 1:
+                continue
+            statement, alias = definitions[0]
+            if isinstance(node, ast.Name) and isinstance(statement, ast.ImportFrom) and statement.level == 0:
+                qualified = statement.module + "." + alias.name if statement.module else None
+            elif isinstance(node, ast.Attribute) and isinstance(statement, ast.Import) and alias.name == "typing":
+                qualified = alias.name + "." + node.attr
+            else:
+                continue
+            if qualified in canonical_imports:
+                binding_current = current(base.id)
+                canonical_read = (
+                    not resolver.is_local(base.id, node)
+                    and _reserve_typing_global_read(unit, base, base.id, parents)
+                    and resolver.qualified_name(node, use=node) == qualified
+                )
+                if binding_current and canonical_read:
+                    canonical_imports[qualified].add(id(node))
+                if (
+                    qualified in scalar_imports
+                    and canonical_read
+                    and not _reserve_owned_source_binding_failures({owner: unit}, frozenset({owner + "." + base.id}))
+                ):
+                    scalar_imports[qualified][id(node)] = positions[id(statement)]
+
+    def literal_members(node):
+        return all(
+            isinstance(member, ast.Constant) and type(member.value) is str
+            for member in (node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice])
+        ) and (not isinstance(node.slice, ast.Tuple) or bool(node.slice.elts))
+
+    literal_annotations = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Subscript) and id(node.value) in canonical_imports["typing.Literal"] and literal_members(node)
+    }
+    aliases = {}
+    for statement in unit.tree.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and id(statement.value) in literal_annotations
+            and current(statement.targets[0].id)
+        ):
+            aliases[statement.targets[0].id] = statement.value
+    scalar_literal_annotations = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Subscript) and id(node.value) in scalar_imports["typing.Literal"] and literal_members(node)
+    }
+    scalar_aliases = {}
+    for index, statement in enumerate(unit.tree.body):
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and id(statement.value) in scalar_literal_annotations
+            and scalar_imports["typing.Literal"][id(statement.value.value)] < index
+            and not _reserve_owned_source_binding_failures({owner: unit}, frozenset({owner + "." + statement.targets[0].id}))
+        ):
+            scalar_aliases[statement.targets[0].id] = statement.value
+    alias_reads = set()
+    scalar_alias_reads = set()
+    for node in nodes:
+        if (
+            not isinstance(node, ast.Name)
+            or not isinstance(node.ctx, ast.Load)
+            or (node.id not in aliases and node.id not in scalar_aliases)
+            or resolver.is_local(node.id, node)
+            or not _reserve_typing_global_read(unit, node, node.id, parents)
+        ):
+            continue
+        resolved = resolver.resolve_value(node, use=node)
+        if node.id in aliases and resolved is aliases[node.id]:
+            alias_reads.add(id(node))
+        if node.id in scalar_aliases and resolved is scalar_aliases[node.id]:
+            scalar_alias_reads.add(id(node))
+    candidate_queries = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Call)
+        and id(node.func) in scalar_imports["typing.get_args"]
+        and len(node.args) == 1
+        and not node.keywords
+        and id(node.args[0]) in scalar_alias_reads
+    }
+    future_annotations = any(
+        isinstance(statement, ast.ImportFrom)
+        and statement.level == 0
+        and statement.module == "__future__"
+        and any(alias.name == "annotations" for alias in statement.names)
+        for statement in unit.tree.body
+    )
+
+    def plain(value):
+        if isinstance(value, ast.Constant):
+            return type(value.value) in {str, int, bool, type(None)}
+        if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+            return all(plain(member) for member in value.elts)
+        if isinstance(value, ast.Dict):
+            return all(key is not None and plain(key) and plain(member) for key, member in zip(value.keys, value.values, strict=True))
+        return False
+
+    def ordinary_annotation(value):
+        return (
+            isinstance(value, ast.Subscript)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "frozenset"
+            and isinstance(value.slice, ast.Name)
+            and value.slice.id == "str"
+            and _reserve_typing_builtin_binding(unit, nodes, "str")
+        )
+
+    scalar_query_results = set()
+    safe_statements = set()
+    producer_positions = {
+        name: next(
+            index for index, statement in enumerate(unit.tree.body) if isinstance(statement, ast.Assign) and statement.value is value
+        )
+        for name, value in scalar_aliases.items()
+    }
+    frozen_binding = _reserve_typing_builtin_binding(unit, nodes, "frozenset")
+    for index, statement in enumerate(unit.tree.body):
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(statement.value.value) is str:
+            safe_statements.add(id(statement))
+            continue
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name) or statement.value is None:
+            continue
+        if isinstance(statement, ast.AnnAssign) and not future_annotations and not ordinary_annotation(statement.annotation):
+            continue
+        value = statement.value
+        if plain(value) or (id(value) in scalar_literal_annotations and scalar_imports["typing.Literal"][id(value.value)] < index):
+            safe_statements.add(id(statement))
+            continue
+        if (
+            not frozen_binding
+            or not isinstance(value, ast.Call)
+            or not isinstance(value.func, ast.Name)
+            or value.func.id != "frozenset"
+            or len(value.args) != 1
+            or value.keywords
+        ):
+            continue
+        query = value.args[0]
+        if plain(query):
+            safe_statements.add(id(statement))
+        elif id(query) in candidate_queries:
+            alias_name = query.args[0].id
+            producer = producer_positions[alias_name]
+            if (
+                scalar_imports["typing.get_args"][id(query.func)] < index
+                and producer < index
+                and all(id(intervening) in safe_statements for intervening in unit.tree.body[producer + 1 : index])
+                and _reserve_typing_eager_query_namespace_current(unit, query)
+            ):
+                scalar_query_results.add(id(query))
+                safe_statements.add(id(statement))
+    local_typed_dicts = {}
+    for statement in unit.tree.body:
+        if (
+            isinstance(statement, ast.ClassDef)
+            and len(statement.bases) == 1
+            and id(statement.bases[0]) in canonical_imports["typing.TypedDict"]
+            and not statement.decorator_list
+            and not statement.keywords
+            and not statement.type_params
+            and current(statement.name)
+            and all(
+                (isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant) and type(child.value.value) is str)
+                or (isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name) and child.simple == 1 and child.value is None)
+                for child in statement.body
+            )
+        ):
+            local_typed_dicts[statement.name] = statement
+    builtin_string_binding = _reserve_typing_builtin_binding(unit, nodes, "str")
+    builtin_strings = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Name)
+        and node.id == "str"
+        and isinstance(node.ctx, ast.Load)
+        and resolver.qualified_name(node, use=node) == "str"
+        and not resolver.is_local("str", node)
+        and _reserve_typing_global_read(unit, node, "str", parents)
+        and builtin_string_binding
+    }
+    typed_dict_reads = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in local_typed_dicts
+        and resolver.qualified_name(node, use=node) == owner + "." + node.id
+        and not resolver.is_local(node.id, node)
+        and _reserve_typing_global_read(unit, node, node.id, parents)
+    }
+    annotations = literal_annotations | alias_reads | builtin_strings | typed_dict_reads
+    typed_dict_consumers = {
+        id(node)
+        for node in nodes
+        if isinstance(node, ast.Call)
+        and id(node.func) in canonical_imports["typing.TypedDict"]
+        and len(node.args) == 2
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and type(node.args[0].value) is str
+        and isinstance(node.args[1], ast.Dict)
+        and all(isinstance(key, ast.Constant) and type(key.value) is str for key in node.args[1].keys)
+        and len({key.value for key in node.args[1].keys}) == len(node.args[1].keys)
+        and all(id(value) in annotations for value in node.args[1].values)
+    }
+    return {
+        "scalar_query_results": frozenset(scalar_query_results),
+        "literal_annotations": frozenset(literal_annotations | alias_reads),
+        "typed_dict_consumers": frozenset(typed_dict_consumers),
+        "canonical_imports": {name: frozenset(uses) for name, uses in canonical_imports.items()},
+    }
+
+
+# Reviewed finite contract; implementation below grants no consumer exemption:
+#
+# def _reserve_catalog_returned_config_role_receipt(units, *, producer):
+#     """Describe one conditional catalog role for an original config producer.
+#
+#     `producer` must be the unique, positively bound original LLMSource
+#     ClassDef in `units`, not an asserted receiver value. Reuse owned_binding,
+#     import_origin/owned_origin, lexical binding and canonical-builtin facts.
+#     Bind the actual literal registry classes and their cross-module ancestry,
+#     original discriminated_variants return, both service forwarding calls,
+#     lowerer's formal receiver/call/result, mapping/items and model_fields
+#     projections, and the original FieldInfo helper arguments. A fresh dict
+#     preserves the projected classes; metadata/default/equals projections
+#     preserve their mutable origins. Follow only these finite roles and their
+#     positively resolved import/reexport aliases. Refuse unrecognized receiver,
+#     result, helper, updater, callback, mutation or opaque retained-origin use.
+#
+#     Return a dict with `failures`, `conditional_roles`,
+#     `retained_projections`, `callback_roles`, `unresolved`, `closed_consumers`.
+#     Identity sets contain (source_path, id(original_ast_node)); diagnostics
+#     identify the failed role and original source site. conditional_roles names
+#     the registry/classes/ancestry, source method/return, service and lowering
+#     receivers/calls, item projections, FieldInfo arguments, canonical BaseModel
+#     use and distinct json_schema/from_dict operations. retained_projections
+#     names extras/default/equals without granting DATA or deep detachment.
+#     callback_roles distinguishes the actual schema title callback from
+#     validation callbacks, including SchemaConfig's BeforeValidator. Trust
+#     canonical library operations for these roles; do not execute or demand
+#     purity of validators merely because json_schema sees their descriptors.
+#
+#     The original title callback body must preserve its ignored FieldInfo
+#     parameter, original model_config callback-slot binding and protected
+#     effects. Scalar/None/canonical enum defaults, the original Gateway
+#     required_capabilities default () as an exact empty-tuple value role, and
+#     scalar equals projections can be described. This grants no general
+#     container immutability; mutable projections escaping
+#     through the returned knob schema stay unclosed. Changed helper bodies or
+#     schema hooks require a finite effect contract, not a safe-helper label.
+#     The supplied config_validation companion owns the literal scalar default
+#     OPENROUTER_BASE_URL. Bind its unique original assignment, canonical import
+#     and eager Field default-use identities. An import/name/str annotation alone
+#     supplies no value fact; opaque/non-scalar or substituted bindings refuse.
+#
+#     Generic _knob_schema dispatch has no concrete receiver fact here. Publish
+#     ('catalog receiver origin', service_path, id(original_plugin_cls_arg)) in
+#     unresolved. Also retain ('returned config validation', source_path,
+#     id(original_from_dict_call)); get_config_model/model_validate is separate.
+#     ('schema retained-origin effects', source_path, id(original_adapter_call))
+#     remains unresolved; identifying an operation/title callback is not complete
+#     schema/callback qualification for its retained payload.
+#     Additional unresolved edges must be reported at their original nodes.
+#     closed_consumers stays empty, including on the original source. No result
+#     feeds a favorable guard or changes selected roots, solver, cache or budgets.
+#     On refusal, publish no conditional/projection/callback identity facts.
+#
+# R3 test/design extension only; the current method body is deliberately held:
+# `deferred_retained_uses` records the original QueryDefinition Field default
+# and QuerySpec AnnAssign boundary, owner/field/producer/default-keyword/value
+# identities, and the actual enum class/member declaration identities. Each
+# observation explicitly belongs to the existing schema retained-origin
+# unresolved premise. The supported Field shape has only a canonical unshadowed
+# Field, a direct proved enum member in `default`, and a literal description;
+# no positional/star/opaque/callback/default_factory alternative is covered.
+# Direct AnnAssign and owner/decorator bindings are checked separately. This
+# records retained holders without declaring their effects closed or their
+# results DATA. Known holder/member writes and aliases remain observed/denied;
+# unknown holders/callers cannot disappear from the retained-origin traversal.
+#
+# Separately, `class_info_operands` records the original canonical isinstance/
+# issubclass call/builtin use, nonempty literal tuple operand, original direct
+# Config-class leaves and their declaration identities. Exactly two ordinary
+# arguments and positive builtin/import/ancestry facts are required. No first
+# operand DATA/effect claim is made; all operand subexpressions remain walked.
+# Both new maps are empty on refusal. The exact three unresolved premises and
+# empty closed_consumers remain. This is not the rejected Field exemption and
+# does not authorize the rejected alias/import/tracked-field-list refinements.
+#
+# Holder-use test/design extension only; no method-body change is authorized by
+# this comment. `deferred_holder_uses` separately records the exact original
+# _query_spec_from_definition producer, QuerySpec owner/decorator binding,
+# constructor/callee, explicit response_format keyword and definition projection,
+# and direct Return. That input is UNRESOLVED and the result an UNRESOLVED_HOLDER
+# with the observed class lineage, never the declared STANDARD default member.
+# The same map separately records the original single-holder isinstance call,
+# builtin/class-use identities and QuerySpec declaration without a first-operand
+# DATA/type/effect grant. Both records belong to the exact schema-origin premise.
+# The direct original Return is the stopping boundary; unknown extra holders,
+# wrappers and calls refuse. Local aliases/projections remain live for explicit
+# writes and opaque transfers, and other constructor/query arguments are walked.
+# The prior two deferred-default records and Config tuple map are unchanged.
+# All maps, including this one, stay empty on refusal; all three unresolved
+# anchors and empty closed_consumers stay intact. No heap/constructor purity or
+# interprocedural result theorem follows from these observations.
+#
+# Registration test/design extension only; the method body remains frozen.
+# Explicitly supply contracts/value_source.py as the ninth SourceUnit. Its
+# actual ordinary mutable dict strongly retains the original producer class
+# on normal registration completion. deferred_producer_registrations binds
+# the canonical import/callee, original Call/class/property, actual formals,
+# registry declaration/initializer and read/store/key/value nodes. Outcome,
+# current state, class-hash/descriptor behavior and effects remain UNRESOLVED.
+# Add the separate exact ('retained producer registration', source.path,
+# id(original_call)) premise; preserve the other three anchors and empty
+# closed_consumers. The exact original store is a deferred boundary, not a
+# generic write/registration permission. Registry aliases and all additional
+# writes, reflected effects and opaque transfers remain live for refusal.
+# No companion module or argument subtree is ignored; the downstream reader
+# remains unqualified. All identity maps, including the new map, empty on
+# refusal. No weak-retention, current-empty-state or successful-call fact.
+#     """
+#
+# Root qualified the r2 missing-helper RED before this implementation. The
+# companion tests retain the conditional receiver limitation explicitly.
+
+
+def _reserve_catalog_role_function_shape(node):
+    """Compare finite executable contracts without mutating original ASTs."""
+    if not isinstance(node, ast.FunctionDef):
+        return None
+    body = node.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and type(body[0].value.value) is str:
+        body = body[1:]
+    return (
+        ast.dump(node.args, include_attributes=False),
+        tuple(ast.dump(statement, include_attributes=False) for statement in body),
+        tuple(ast.dump(decorator, include_attributes=False) for decorator in node.decorator_list),
+        ast.dump(node.returns, include_attributes=False) if node.returns is not None else None,
+        tuple(ast.dump(parameter, include_attributes=False) for parameter in node.type_params),
+    )
+
+
+# These are executable-body contracts, not permissions attached to helper names.
+# Every use also needs the original declaration/import/lexical binding below.
+# The recursive model-lowering branch is not granted: actual annotations must
+# prove it unreachable before any conditional role is published.
+_reserve_CATALOG_ROLE_BODIES = {
+    "knobs": "def _unwrap_annotated(annotation: Any) -> Any:\n    while get_origin(annotation) is Annotated:\n        annotation = get_args(annotation)[0]\n    return annotation\n\ndef _unwrap_optional(annotation: Any) -> tuple[Any, bool]:\n    annotation = _unwrap_annotated(annotation)\n    origin = get_origin(annotation)\n    if origin is types.UnionType or origin is Union:\n        args = get_args(annotation)\n        non_none = [arg for arg in args if arg is not type(None)]\n        if len(non_none) == 1 and len(non_none) != len(args):\n            return (_unwrap_annotated(non_none[0]), True)\n    return (annotation, False)\n\ndef _kind_for_scalar(inner: Any) -> tuple[Literal['text', 'number-int', 'number-float', 'checkbox', 'enum', 'json-value'], list[str] | None]:\n    if get_origin(inner) is Literal:\n        values = [str(value) for value in get_args(inner)]\n        return ('enum', values)\n    if isclass(inner) and issubclass(inner, Enum):\n        return ('enum', [str(member.value) for member in inner])\n    if inner in _TYPE_TO_KIND:\n        return (_TYPE_TO_KIND[inner], None)\n    return ('json-value', None)\n\ndef _base_field(*, name: str, info: FieldInfo, kind: FieldKind, nullable: bool) -> KnobField:\n    wire_name = info.alias if info.alias is not None else name\n    field: KnobField = {'name': wire_name, 'label': info.title or wire_name, 'kind': kind, 'tier': 'common', 'required': info.is_required(), 'nullable': nullable}\n    composer_description = _composer_description(info)\n    if composer_description is not None:\n        field['description'] = composer_description\n    elif info.description:\n        field['description'] = info.description\n    placeholder = _composer_placeholder(info)\n    if placeholder is not None:\n        field['placeholder'] = placeholder\n    _attach_default(field, info)\n    _attach_tier(field, info)\n    _attach_required_when(field, info)\n    return field\n\ndef _dual_form_nested_model(annotation: Any) -> tuple[type[BaseModel], bool] | None:\n    annotation = _unwrap_annotated(annotation)\n    origin = get_origin(annotation)\n    if origin is not types.UnionType and origin is not Union:\n        return None\n    args = get_args(annotation)\n    nullable = type(None) in args\n    members = [arg for arg in args if arg is not type(None)]\n    if len(members) < 2:\n        return None\n    models: set[type[BaseModel]] = set()\n    for member in members:\n        model = _member_nested_model(member)\n        if model is None:\n            return None\n        models.add(model)\n    if len(models) != 1:\n        return None\n    return (next(iter(models)), nullable)\n\ndef _lower_field(name: str, info: FieldInfo, *, plugin_kind: str, plugin_name: str) -> KnobField:\n    del plugin_kind, plugin_name\n    dual_form = _dual_form_nested_model(info.annotation)\n    if dual_form is not None:\n        model_cls, nullable = dual_form\n        field = _base_field(name=name, info=info, kind='json-array', nullable=nullable)\n        field['item_schema'] = _lower_nested_model(model_cls, depth=1)\n        return field\n    inner, nullable = _unwrap_optional(info.annotation)\n    origin = get_origin(inner)\n    if origin is list:\n        list_args = get_args(inner)\n        if len(list_args) == 1 and _unwrap_annotated(list_args[0]) is str:\n            field = _base_field(name=name, info=info, kind='string-list', nullable=nullable)\n            field['item_kind'] = 'text'\n            return field\n        return _base_field(name=name, info=info, kind='json-array', nullable=nullable)\n    is_model_cls = isclass(inner) and issubclass(inner, BaseModel)\n    if origin in (dict, Mapping) or is_model_cls:\n        return _base_field(name=name, info=info, kind='json-object', nullable=nullable)\n    kind, enum_values = _kind_for_scalar(inner)\n    field = _base_field(name=name, info=info, kind=kind, nullable=nullable)\n    if enum_values is not None:\n        field['enum'] = enum_values\n    return field\n\ndef _attach_default(field: KnobField, info: FieldInfo) -> None:\n    if info.is_required() or info.default is PydanticUndefined:\n        return\n    default = info.default\n    if isinstance(default, Enum):\n        default = str(default.value)\n    field['default'] = default\n\ndef _composer_extras(info: FieldInfo) -> Mapping[str, Any] | None:\n    extra = info.json_schema_extra\n    if extra is None or callable(extra):\n        return None\n    if type(extra) not in (dict, types.MappingProxyType):\n        raise TypeError(f'json_schema_extra must be a mapping, a callable, or None, got {type(extra).__name__}')\n    return extra\n\ndef _attach_tier(field: KnobField, info: FieldInfo) -> None:\n    tier: FieldTier = 'common'\n    extra = _composer_extras(info)\n    if extra is not None and 'composer_tier' in extra:\n        declared = extra['composer_tier']\n        if declared in ('essential', 'common', 'advanced'):\n            tier = cast(FieldTier, declared)\n    field['tier'] = tier\n\ndef _attach_required_when(field: KnobField, info: FieldInfo) -> None:\n    extra = _composer_extras(info)\n    if extra is None:\n        return\n    if 'composer_required_when' not in extra:\n        return\n    predicate = extra['composer_required_when']\n    if type(predicate) is not dict or frozenset(predicate) != _PREDICATE_KEYS:\n        raise TypeError(f\"json_schema_extra['composer_required_when'] must be a dict with exactly the keys {sorted(_PREDICATE_KEYS)}, got {predicate!r}\")\n    target = predicate['field']\n    if type(target) is not str or not target:\n        raise TypeError(f\"json_schema_extra['composer_required_when']['field'] must be a non-empty str, got {target!r}\")\n    field['required_when'] = {'field': target, 'equals': predicate['equals']}\n\ndef _is_composer_hidden(info: FieldInfo) -> bool:\n    extra = _composer_extras(info)\n    if extra is None:\n        return False\n    if 'composer_hidden' not in extra:\n        return False\n    hidden = extra['composer_hidden']\n    if type(hidden) is not bool:\n        raise TypeError(f\"json_schema_extra['composer_hidden'] must be a bool, got {hidden!r}\")\n    return hidden\n\ndef _composer_str_extra(info: FieldInfo, key: str) -> str | None:\n    extra = _composer_extras(info)\n    if extra is None:\n        return None\n    if key not in extra:\n        return None\n    value = extra[key]\n    if type(value) is not str or not value:\n        raise TypeError(f'json_schema_extra[{key!r}] must be a non-empty str, got {value!r}')\n    return value\n\ndef _composer_description(info: FieldInfo) -> str | None:\n    return _composer_str_extra(info, 'composer_description')\n\ndef _composer_placeholder(info: FieldInfo) -> str | None:\n    return _composer_str_extra(info, 'composer_placeholder')\n\ndef lower_discriminated_to_knob_schema(plugin_cls: type, *, plugin_kind: str, plugin_name: str) -> KnobSchema:\n    try:\n        discriminated_variants = cast(Any, plugin_cls).discriminated_variants\n    except AttributeError as exc:\n        raise KnobSchemaLoweringError(plugin_kind=plugin_kind, plugin_name=plugin_name, field_path='<class>', constraint='plugin lacks discriminated_variants() classmethod required by DiscriminatedPlugin protocol', remediation='Implement discriminated_variants() returning (discriminator_field_name, {literal_value: variant_cls}).') from exc\n    if not callable(discriminated_variants):\n        raise KnobSchemaLoweringError(plugin_kind=plugin_kind, plugin_name=plugin_name, field_path='<class>', constraint='plugin lacks discriminated_variants() classmethod required by DiscriminatedPlugin protocol', remediation='Implement discriminated_variants() returning (discriminator_field_name, {literal_value: variant_cls}).')\n    discriminator, variants = discriminated_variants()\n    fields: list[KnobField] = [{'name': discriminator, 'label': discriminator, 'kind': 'enum', 'enum': list(variants.keys()), 'required': True, 'nullable': False, 'tier': 'common'}]\n    for variant_value, variant_cls in variants.items():\n        for fname, info in variant_cls.model_fields.items():\n            if fname == discriminator:\n                continue\n            if _is_composer_hidden(info):\n                continue\n            inner_field = _lower_field(fname, info, plugin_kind=plugin_kind, plugin_name=plugin_name)\n            inner_field['visible_when'] = {'field': discriminator, 'equals': variant_value}\n            fields.append(inner_field)\n    return {'fields': fields}\n",
+    "source": "@classmethod\ndef get_config_model(cls, config: dict[str, Any] | None=None) -> type[LLMSourceConfig]:\n    provider = config['provider'] if config is not None and 'provider' in config else None\n    if provider is None:\n        return LLMSourceConfig\n    if type(provider) is not str or provider not in SOURCE_PROVIDER_CONFIGS:\n        raise ValueError(f'Unknown LLM provider {provider!r}. Valid providers: {sorted(SOURCE_PROVIDER_CONFIGS)}')\n    return SOURCE_PROVIDER_CONFIGS[provider]\n\n@classmethod\ndef get_config_schema(cls) -> dict[str, Any]:\n    variants = tuple(SOURCE_PROVIDER_CONFIGS.values())\n    union_type = reduce(or_, variants[1:], variants[0])\n    adapter: TypeAdapter[Any] = TypeAdapter(Annotated[union_type, PydanticField(discriminator='provider')])\n    schema: dict[str, Any] = adapter.json_schema(ref_template='#/$defs/{model}')\n    for config_cls in variants:\n        variant_schema = schema['$defs'][config_cls.__name__]\n        required = variant_schema['required']\n        if 'provider' not in required:\n            required.append('provider')\n    return schema\n\n@classmethod\ndef discriminated_variants(cls) -> tuple[str, dict[str, type[BaseModel]]]:\n    return ('provider', dict(SOURCE_PROVIDER_CONFIGS))\n",
+    "service": "def _knob_schema(self, plugin_cls: PluginClass, *, plugin_type: PluginKind, name: str) -> KnobSchema:\n    try:\n        discriminated_variants = cast(Any, plugin_cls).discriminated_variants\n    except AttributeError:\n        config_model = plugin_cls.get_config_model()\n        if config_model is None:\n            return {'fields': []}\n        return lower_model_to_knob_schema(cast(type[BaseModel], config_model), plugin_kind=plugin_type, plugin_name=name)\n    if not callable(discriminated_variants):\n        return lower_discriminated_to_knob_schema(plugin_cls, plugin_kind=plugin_type, plugin_name=name)\n    return lower_discriminated_to_knob_schema(plugin_cls, plugin_kind=plugin_type, plugin_name=name)\n",
+    "base": "def _plugin_config_field_title(field_name: str, _field_info: Any) -> str:\n    words = field_name.removesuffix('_config').replace('_', ' ').split()\n    acronyms = {'api', 'csv', 'http', 'id', 'json', 'jsonl', 'llm', 'rag', 'sql', 'ssl', 'url', 'xml'}\n    return ' '.join((word.upper() if word in acronyms else word.capitalize() for word in words))\n",
+}
+
+
+def _reserve_catalog_returned_config_role_receipt(units, *, producer):
+    """Original conditional catalog roles; never a TypeAdapter/effect permission.
+
+    The query producer is an original AST anchor. Generic catalog dispatch,
+    returned-class validation, retained schema effects and strong producer
+    registration remain unresolved.
+    Body contracts below are finite source contracts, not helper-name grants.
+    """
+    result = {
+        "failures": [],
+        "conditional_roles": {},
+        "retained_projections": {},
+        "callback_roles": {"schema": frozenset(), "validation": frozenset()},
+        "deferred_retained_uses": {},
+        "class_info_operands": {},
+        "deferred_holder_uses": {},
+        "deferred_producer_registrations": {},
+        "unresolved": set(),
+        "closed_consumers": frozenset(),
+    }
+    paths = {
+        "source": "src/elspeth/plugins/sources/llm/source.py",
+        "config": "src/elspeth/plugins/sources/llm/config.py",
+        "base": "src/elspeth/plugins/infrastructure/config_base.py",
+        "service": "src/elspeth/web/catalog/service.py",
+        "knobs": "src/elspeth/web/catalog/knob_schema.py",
+        "schema": "src/elspeth/contracts/schema.py",
+        "enum": "src/elspeth/plugins/transforms/llm/multi_query.py",
+        "defaults": "src/elspeth/plugins/llm/config_validation.py",
+        "registration": "src/elspeth/contracts/value_source.py",
+    }
+    selected = {}
+    for role, path in paths.items():
+        matches = [unit for unit in units if unit.path == path]
+        if len(matches) != 1:
+            result["failures"].append("catalog config module absent or duplicated " + path)
+        else:
+            selected[role] = matches[0]
+    if result["failures"]:
+        return result
+
+    def fail(unit, role, node=None, detail=""):
+        site = ":" + str(node.lineno) if isinstance(node, (ast.stmt, ast.expr, ast.arg, ast.alias)) else ""
+        result["failures"].append("catalog config " + role + " " + unit.path + site + (" " + detail if detail else ""))
+
+    def module(unit):
+        return unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+
+    by_module = {}
+    for unit in units:
+        by_module.setdefault(module(unit), []).append(unit)
+    nodes = {id(unit): tuple(ast.walk(unit.tree)) for unit in units}
+    parents = {id(unit): {id(child): parent for parent in nodes[id(unit)] for child in ast.iter_child_nodes(parent)} for unit in units}
+
+    def owned(unit, name, definition):
+        return definition is not None and _reserve_composer_receiver.owned_binding(unit.tree, name, definition)
+
+    def imported(unit, binding, owner, member):
+        return _reserve_worker_whole_scope_origin.import_origin(unit.tree, binding, owner, member)
+
+    def global_read(unit, expression):
+        return isinstance(expression, ast.Name) and _reserve_typing_global_read(unit, expression, expression.id, parents[id(unit)])
+
+    def builtin(unit, name):
+        return _reserve_typing_builtin_binding(unit, nodes[id(unit)], name)
+
+    def expression(unit, definition, source, role):
+        wanted = ast.dump(ast.parse(source, mode="eval").body, include_attributes=False)
+        matches = (
+            [node for node in ast.walk(definition) if isinstance(node, ast.expr) and ast.dump(node, include_attributes=False) == wanted]
+            if definition is not None
+            else []
+        )
+        if len(matches) != 1:
+            fail(unit, role, definition, source)
+            return None
+        return matches[0]
+
+    def ref(unit, node):
+        return (unit.path, id(node))
+
+    source, config, base = (selected[name] for name in ("source", "config", "base"))
+    knobs, service, schema, enum, defaults = (selected[name] for name in ("knobs", "service", "schema", "enum", "defaults"))
+    registration = selected["registration"]
+    actual_producer = _reserve_node_at(source, "LLMSource")
+    if producer is not actual_producer or not isinstance(producer, ast.ClassDef) or not owned(source, producer.name, producer):
+        fail(source, "producer", actual_producer)
+        return result
+
+    registry = _reserve_node_at(config, "SOURCE_PROVIDER_CONFIGS")
+    if (
+        not isinstance(registry, ast.AnnAssign)
+        or not isinstance(registry.value, ast.Dict)
+        or not registry.value.keys
+        or any(not isinstance(key, ast.Constant) or type(key.value) is not str for key in registry.value.keys)
+        or len({key.value for key in registry.value.keys}) != len(registry.value.keys)
+        or _reserve_owned_source_binding_failures({module(config): config}, {module(config) + ".SOURCE_PROVIDER_CONFIGS"})
+    ):
+        fail(config, "registry binding", registry)
+        return result
+    variants = []
+    for value in registry.value.values:
+        declaration = _reserve_node_at(config, value.id) if isinstance(value, ast.Name) and global_read(config, value) else None
+        if not isinstance(declaration, ast.ClassDef) or not owned(config, declaration.name, declaration):
+            fail(config, "class origin", value)
+        else:
+            variants.append(declaration)
+    if result["failures"]:
+        return result
+
+    ancestry = {}
+    base_model_uses = []
+
+    def ancestors(unit, cls, seen=frozenset()):
+        key = ref(unit, cls)
+        if key in seen or cls.decorator_list or cls.keywords or cls.type_params or len(cls.bases) != 1:
+            fail(unit, "ancestry", cls)
+            return
+        parent = cls.bases[0]
+        if not isinstance(parent, ast.Name) or not global_read(unit, parent):
+            fail(unit, "ancestry binding", cls)
+            return
+        if imported(unit, parent.id, "pydantic", "BaseModel"):
+            base_model_uses.append((unit, parent))
+            return
+        local = _reserve_node_at(unit, parent.id)
+        if isinstance(local, ast.ClassDef) and owned(unit, parent.id, local):
+            parent_unit, parent_class = unit, local
+        else:
+            imports = [
+                (statement, alias)
+                for statement in unit.tree.body
+                if isinstance(statement, ast.ImportFrom) and statement.level == 0
+                for alias in statement.names
+                if (alias.asname or alias.name) == parent.id and imported(unit, parent.id, statement.module, alias.name)
+            ]
+            if len(imports) != 1 or len(by_module.get(imports[0][0].module, ())) != 1:
+                fail(unit, "ancestry binding", cls)
+                return
+            statement, alias = imports[0]
+            parent_unit = by_module[statement.module][0]
+            parent_class = _reserve_node_at(parent_unit, alias.name)
+            if not isinstance(parent_class, ast.ClassDef) or not owned(parent_unit, alias.name, parent_class):
+                fail(unit, "ancestry binding", cls)
+                return
+        ancestry[ref(parent_unit, parent_class)] = (parent_unit, parent_class)
+        ancestors(parent_unit, parent_class, seen | {key})
+
+    for cls in variants:
+        ancestors(config, cls)
+    if result["failures"]:
+        return result
+
+    # A contract's complete executable body and actual binding are both needed.
+    definitions = {}
+    observed = set()
+    for group, body_source in _reserve_CATALOG_ROLE_BODIES.items():
+        unit = selected[group]
+        for expected in ast.parse(body_source).body:
+            symbol = (
+                "LLMSource." + expected.name
+                if group == "source"
+                else "CatalogServiceImpl." + expected.name
+                if group == "service"
+                else expected.name
+            )
+            definition = _reserve_node_at(unit, symbol)
+            definitions[(group, expected.name)] = definition
+            role = (
+                "callback"
+                if group == "base"
+                else "receiver"
+                if group == "service"
+                else "result"
+                if expected.name == "lower_discriminated_to_knob_schema"
+                else "return"
+                if group == "source"
+                else "helper"
+            )
+            if not isinstance(definition, ast.FunctionDef):
+                if group == "source" and expected.name == "discriminated_variants":
+                    members = [node for node in producer.body if isinstance(node, ast.FunctionDef) and node.name == expected.name]
+                    role = "binding" if members else "target"
+                fail(unit, role, producer if group == "source" else None, symbol)
+                continue
+            if group in {"knobs", "base"} and not owned(unit, definition.name, definition):
+                fail(unit, "binding", definition)
+            if _reserve_catalog_role_function_shape(definition) != _reserve_catalog_role_function_shape(expected):
+                if group == "source" and ast.dump(definition.args) != ast.dump(expected.args):
+                    role = "binding"
+                fail(unit, role, definition, symbol)
+            else:
+                observed.update(id(node) for node in ast.walk(definition))
+
+    bindings = {
+        "source": (
+            ("SOURCE_PROVIDER_CONFIGS", module(config), "SOURCE_PROVIDER_CONFIGS"),
+            ("BaseModel", "pydantic", "BaseModel"),
+            ("TypeAdapter", "pydantic", "TypeAdapter"),
+            ("PydanticField", "pydantic", "Field"),
+            ("Annotated", "typing", "Annotated"),
+            ("Any", "typing", "Any"),
+            ("reduce", "functools", "reduce"),
+            ("or_", "operator", "or_"),
+        ),
+        "config": (
+            ("Field", "pydantic", "Field"),
+            ("Literal", "typing", "Literal"),
+            ("Any", "typing", "Any"),
+            ("ClassVar", "typing", "ClassVar"),
+        ),
+        "base": (("Field", "pydantic", "Field"), ("Any", "typing", "Any"), ("ClassVar", "typing", "ClassVar")),
+        "service": (
+            ("lower_discriminated_to_knob_schema", module(knobs), "lower_discriminated_to_knob_schema"),
+            ("cast", "typing", "cast"),
+            ("Any", "typing", "Any"),
+        ),
+        "knobs": (
+            ("cast", "typing", "cast"),
+            ("Any", "typing", "Any"),
+            ("Annotated", "typing", "Annotated"),
+            ("Union", "typing", "Union"),
+            ("Literal", "typing", "Literal"),
+            ("get_args", "typing", "get_args"),
+            ("get_origin", "typing", "get_origin"),
+            ("Mapping", "collections.abc", "Mapping"),
+            ("isclass", "inspect", "isclass"),
+            ("Enum", "enum", "Enum"),
+            ("BaseModel", "pydantic", "BaseModel"),
+            ("FieldInfo", "pydantic.fields", "FieldInfo"),
+            ("PydanticUndefined", "pydantic_core", "PydanticUndefined"),
+        ),
+    }
+    for group, suppliers in bindings.items():
+        for name, owner, member in suppliers:
+            if not imported(selected[group], name, owner, member):
+                fail(selected[group], "binding", detail=name)
+    for group, names in {
+        "source": ("dict", "tuple", "type", "classmethod", "sorted", "ValueError"),
+        "knobs": (
+            "type",
+            "str",
+            "dict",
+            "list",
+            "set",
+            "frozenset",
+            "len",
+            "next",
+            "iter",
+            "isinstance",
+            "issubclass",
+            "callable",
+            "TypeError",
+            "AttributeError",
+        ),
+        "service": ("callable", "AttributeError"),
+    }.items():
+        for name in names:
+            if not builtin(selected[group], name):
+                fail(selected[group], "binding", detail=name)
+    types_imports = [
+        statement
+        for statement in knobs.tree.body
+        if isinstance(statement, ast.Import) and any(alias.name == "types" and alias.asname is None for alias in statement.names)
+    ]
+    if len(types_imports) != 1 or _reserve_owned_source_binding_failures({module(knobs): knobs}, {module(knobs) + ".types"}):
+        fail(knobs, "binding", detail="types")
+    for name, wanted in {
+        "_TYPE_TO_KIND": "{str: 'text', int: 'number-int', float: 'number-float', bool: 'checkbox'}",
+        "_PREDICATE_KEYS": "frozenset({'field', 'equals'})",
+    }.items():
+        declaration = _reserve_node_at(knobs, name)
+        if (
+            not isinstance(declaration, ast.AnnAssign)
+            or ast.dump(declaration.value) != ast.dump(ast.parse(wanted, mode="eval").body)
+            or _reserve_owned_source_binding_failures({module(knobs): knobs}, {module(knobs) + "." + name})
+        ):
+            fail(knobs, "helper binding", declaration, name)
+
+    method = definitions[("source", "discriminated_variants")]
+    lower = definitions[("knobs", "lower_discriminated_to_knob_schema")]
+    forwarding = definitions[("service", "_knob_schema")]
+    expressions = {}
+    for name, unit, definition, shape, role in (
+        ("service_cast", service, forwarding, "cast(Any, plugin_cls)", "receiver"),
+        ("lower_cast", knobs, lower, "cast(Any, plugin_cls)", "receiver"),
+        ("variant_call", knobs, lower, "discriminated_variants()", "target"),
+        ("variant_items", knobs, lower, "variants.items()", "projection"),
+        ("model_fields_items", knobs, lower, "variant_cls.model_fields.items()", "projection"),
+        ("hidden", knobs, lower, "_is_composer_hidden(info)", "argument"),
+        ("lower", knobs, lower, "_lower_field(fname, info, plugin_kind=plugin_kind, plugin_name=plugin_name)", "argument"),
+        (
+            "json_schema",
+            source,
+            definitions[("source", "get_config_schema")],
+            "adapter.json_schema(ref_template='#/$defs/{model}')",
+            "operation",
+        ),
+        (
+            "adapter",
+            source,
+            definitions[("source", "get_config_schema")],
+            "TypeAdapter(Annotated[union_type, PydanticField(discriminator='provider')])",
+            "operation",
+        ),
+        (
+            "validation",
+            source,
+            _reserve_node_at(source, "LLMSource.__init__"),
+            "config_cls.from_dict(provider_config, plugin_name=self.name)",
+            "operation",
+        ),
+    ):
+        expressions[name] = expression(unit, definition, shape, role)
+
+    # A matching Call expression alone does not preserve its local target.
+    # Expose a visible binding violation independently of the complete-body
+    # refusal above; this adds no favorable flow/dominance fact across the Try.
+    target_cast, target_call = expressions["lower_cast"], expressions["variant_call"]
+    if isinstance(lower, ast.FunctionDef) and isinstance(target_cast, ast.Call) and isinstance(target_call, ast.Call):
+        target_projection = parents[id(knobs)].get(id(target_cast))
+        target_assignment = parents[id(knobs)].get(id(target_projection))
+        if (
+            isinstance(method, ast.FunctionDef)
+            and isinstance(target_projection, ast.Attribute)
+            and target_projection.value is target_cast
+            and target_projection.attr == method.name
+            and isinstance(target_assignment, ast.Assign)
+            and target_assignment.value is target_projection
+            and len(target_assignment.targets) == 1
+            and isinstance(target_assignment.targets[0], ast.Name)
+            and isinstance(target_call.func, ast.Name)
+        ):
+            target_alias = target_assignment.targets[0]
+            target_events = [
+                (kind, node) for name, kind, node in _reserve_composer_receiver.lexical_binding_events(lower) if name == target_call.func.id
+            ]
+            if (
+                target_alias.id != target_call.func.id
+                or _lexical_scope(target_alias) is not lower
+                or _lexical_scope(target_call.func) is not lower
+                or target_events != [("STORE_OR_DELETE", target_alias)]
+                or any(
+                    isinstance(node, (ast.Global, ast.Nonlocal)) and target_call.func.id in node.names for node in _walk_same_scope(lower)
+                )
+            ):
+                fail(knobs, "target binding", target_call)
+
+    # One explicit owned literal supplier, canonical import and eager use.
+    scalar = _reserve_node_at(defaults, "OPENROUTER_BASE_URL")
+    scalar_binding = module(defaults) + ".OPENROUTER_BASE_URL"
+    if (
+        not isinstance(scalar, ast.Assign)
+        or len(scalar.targets) != 1
+        or _reserve_owned_source_binding_failures({module(defaults): defaults}, {scalar_binding})
+    ):
+        fail(defaults, "scalar default binding", scalar)
+    elif not isinstance(scalar.value, ast.Constant) or type(scalar.value.value) not in (str, int, float, bool, type(None)):
+        fail(defaults, "scalar default", scalar)
+    scalar_import = imported(config, "OPENROUTER_BASE_URL", module(defaults), "OPENROUTER_BASE_URL")
+    scalar_class = _reserve_node_at(config, "OpenRouterLLMSourceConfig")
+    scalar_use = expression(config, scalar_class, "OPENROUTER_BASE_URL", "default use")
+    if (
+        scalar_import is None
+        or scalar_use is None
+        or not global_read(config, scalar_use)
+        or not isinstance(scalar_class, ast.ClassDef)
+        or scalar_import[0].lineno >= scalar_class.lineno
+    ):
+        fail(config, "scalar default binding", scalar_use)
+    if scalar_use is not None:
+        parent = parents[id(config)].get(id(scalar_use))
+        if not isinstance(parent, ast.keyword) or parent.arg != "default":
+            fail(config, "default use", scalar_use)
+
+    enum_class = _reserve_node_at(enum, "ResponseFormat")
+    enum_values = {}
+    if (
+        not isinstance(enum_class, ast.ClassDef)
+        or not owned(enum, "ResponseFormat", enum_class)
+        or enum_class.decorator_list
+        or enum_class.keywords
+        or enum_class.type_params
+        or len(enum_class.bases) != 1
+        or not isinstance(enum_class.bases[0], ast.Name)
+        or not imported(enum, enum_class.bases[0].id, "enum", "StrEnum")
+    ):
+        fail(enum, "default enum binding", enum_class)
+    else:
+        for statement in enum_class.body:
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and type(statement.value.value) is str:
+                continue
+            if (
+                not isinstance(statement, ast.Assign)
+                or len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+                or not isinstance(statement.value, ast.Constant)
+                or type(statement.value.value) is not str
+            ):
+                fail(enum, "default enum", statement)
+            else:
+                enum_values[statement.targets[0].id] = statement.value
+        if not imported(config, "ResponseFormat", module(enum), "ResponseFormat"):
+            fail(config, "default enum binding", enum_class)
+
+    model_classes = {(module(unit), cls.name): (unit, cls) for unit, cls in ancestry.values()}
+    model_classes.update({(module(config), cls.name): (config, cls) for cls in variants})
+    model_classes[(module(schema), "SchemaConfig")] = (schema, _reserve_node_at(schema, "SchemaConfig"))
+    model_classes[(module(enum), "OutputFieldConfig")] = (enum, _reserve_node_at(enum, "OutputFieldConfig"))
+
+    def annotation(unit, node):
+        if isinstance(node, ast.Constant) and node.value is None:
+            return ("none",)
+        if isinstance(node, ast.Name) and global_read(unit, node):
+            if node.id in {"str", "int", "float", "bool"} and builtin(unit, node.id):
+                return ("scalar", node.id)
+            if imported(unit, node.id, "typing", "Any"):
+                return ("any",)
+            if imported(unit, node.id, module(enum), "ResponseFormat") and enum_values:
+                return ("enum",)
+            for (owner, name), (owner_unit, cls) in model_classes.items():
+                if (
+                    isinstance(cls, ast.ClassDef)
+                    and owned(owner_unit, name, cls)
+                    and ((unit is owner_unit and node.id == name) or imported(unit, node.id, owner, name))
+                ):
+                    return ("model", owner, name)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left, right = annotation(unit, node.left), annotation(unit, node.right)
+            if left is not None and right is not None:
+                return ("union", left, right)
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and global_read(unit, node.value):
+            parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if (
+                imported(unit, node.value.id, "typing", "Literal")
+                and parts
+                and all(isinstance(part, ast.Constant) and type(part.value) in (str, int, float, bool, type(None)) for part in parts)
+            ):
+                return ("literal",)
+            if node.value.id in {"list", "dict", "tuple"} and builtin(unit, node.value.id):
+                values = [
+                    ("ellipsis",) if isinstance(part, ast.Constant) and part.value is Ellipsis else annotation(unit, part) for part in parts
+                ]
+                if values and all(value is not None for value in values):
+                    return (node.value.id, *values)
+        return None
+
+    def union_members(role):
+        if role[0] == "union":
+            return [*union_members(role[1]), *union_members(role[2])]
+        return [] if role[0] == "none" else [role]
+
+    def nested_model(role):
+        if role[0] == "model":
+            return role
+        if role[0] == "list" and len(role) == 2 and role[1][0] == "model":
+            return role[1]
+        if role[0] == "dict" and len(role) == 3 and role[2][0] == "model":
+            return role[2]
+        return None
+
+    fields = []
+    all_config_classes = [(config, cls) for cls in variants] + list(ancestry.values())
+    for unit, cls in all_config_classes:
+        for statement in cls.body:
+            if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
+                continue
+            declared = statement.annotation
+            if (
+                isinstance(declared, ast.Subscript)
+                and isinstance(declared.value, ast.Name)
+                and imported(unit, declared.value.id, "typing", "ClassVar")
+                and global_read(unit, declared.value)
+            ):
+                continue
+            role = annotation(unit, declared)
+            if role is None:
+                fail(unit, "helper annotation", statement)
+                continue
+            members = union_members(role)
+            models = [nested_model(member) for member in members]
+            if len(models) >= 2 and all(model is not None for model in models) and len(set(models)) == 1:
+                fail(unit, "helper nested-model branch unresolved", statement)
+            field = statement.value
+            if (
+                not isinstance(field, ast.Call)
+                or not isinstance(field.func, ast.Name)
+                or not imported(unit, field.func.id, "pydantic", "Field")
+                or not global_read(unit, field.func)
+                or len(field.args) > 1
+                or any(keyword.arg is None for keyword in field.keywords)
+                or len({keyword.arg for keyword in field.keywords}) != len(field.keywords)
+            ):
+                fail(unit, "helper Field binding", statement)
+                continue
+            fields.append((unit, statement, field))
+            values = {keyword.arg: keyword.value for keyword in field.keywords}
+            default = values.get("default", field.args[0] if field.args else None)
+            if "default_factory" in values:
+                fail(unit, "helper default callback", statement)
+            if default is not None:
+                plain = isinstance(default, ast.Constant) and (
+                    default.value is Ellipsis or type(default.value) in (str, int, float, bool, type(None))
+                )
+                empty_tuple = isinstance(default, ast.Tuple) and not default.elts
+                member = (
+                    isinstance(default, ast.Attribute)
+                    and isinstance(default.value, ast.Name)
+                    and imported(unit, default.value.id, module(enum), "ResponseFormat")
+                    and global_read(unit, default.value)
+                    and default.attr in enum_values
+                )
+                if not (plain or empty_tuple or member or default is scalar_use):
+                    fail(unit, "mutable default", default)
+            extras = values.get("json_schema_extra")
+            if extras is not None:
+                if not isinstance(extras, ast.Dict) or any(
+                    not isinstance(key, ast.Constant) or type(key.value) is not str for key in extras.keys
+                ):
+                    fail(unit, "helper metadata callback", extras)
+                else:
+                    for key, value in zip(extras.keys, extras.values, strict=True):
+                        if key.value == "composer_required_when":
+                            if not isinstance(value, ast.Dict) or any(
+                                not isinstance(part, ast.Constant) or type(part.value) is not str for part in value.keys
+                            ):
+                                fail(unit, "mutable equals", value)
+                                continue
+                            predicates = {part.value: member for part, member in zip(value.keys, value.values, strict=True)}
+                            equals = predicates.get("equals")
+                            if not isinstance(equals, ast.Constant) or type(equals.value) not in (str, int, float, bool, type(None)):
+                                fail(unit, "mutable equals", equals)
+            # Only this proved outer Field will be observed below. Its default,
+            # metadata and every other argument remain in the retained walk.
+
+    title = definitions[("base", "_plugin_config_field_title")]
+    title_slots = []
+    for unit, cls in all_config_classes:
+        for statement in cls.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)) and statement.name in {
+                "__get_pydantic_core_schema__",
+                "__get_pydantic_json_schema__",
+            }:
+                fail(unit, "callback", statement)
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if not any(isinstance(target, ast.Name) and target.id == "model_config" for target in targets):
+                continue
+            value = statement.value
+            if not isinstance(value, ast.Dict) or any(
+                not isinstance(key, ast.Constant) or type(key.value) is not str for key in value.keys
+            ):
+                fail(unit, "callback binding", statement)
+                continue
+            for key, member in zip(value.keys, value.values, strict=True):
+                if key.value == "field_title_generator":
+                    if (
+                        unit is not base
+                        or not isinstance(member, ast.Name)
+                        or not isinstance(title, ast.FunctionDef)
+                        or member.id != title.name
+                        or not global_read(unit, member)
+                        or not owned(unit, member.id, title)
+                    ):
+                        fail(unit, "callback binding", statement)
+                    else:
+                        title_slots.append(member)
+                elif (
+                    key.value in {"json_schema_extra", "schema_generator", "model_title_generator"}
+                    or not isinstance(member, ast.Constant)
+                    or type(member.value) not in (str, int, float, bool, type(None))
+                ):
+                    fail(unit, "callback binding", statement)
+            observed.update(id(node) for node in ast.walk(statement))
+    if len(title_slots) != 1:
+        fail(base, "callback binding", title)
+
+    validation_callbacks = set()
+    for unit in (config, base, schema, enum):
+        for node in nodes[id(unit)]:
+            if isinstance(node, ast.FunctionDef):
+                for decorator in node.decorator_list:
+                    if (
+                        isinstance(decorator, ast.Call)
+                        and isinstance(decorator.func, ast.Name)
+                        and any(imported(unit, decorator.func.id, "pydantic", name) for name in ("field_validator", "model_validator"))
+                        and global_read(unit, decorator.func)
+                    ):
+                        validation_callbacks.add(ref(unit, node))
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and imported(unit, node.func.id, "pydantic", "BeforeValidator")
+                and global_read(unit, node.func)
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+            ):
+                callback = _reserve_node_at(unit, node.args[0].id)
+                if isinstance(callback, ast.FunctionDef) and owned(unit, node.args[0].id, callback) and global_read(unit, node.args[0]):
+                    validation_callbacks.add(ref(unit, callback))
+                else:
+                    fail(unit, "validation callback binding", node)
+
+    if result["failures"]:
+        return result
+
+    # These are observations under the still-open schema premise. Only the
+    # exact invocation/assignment boundary is recorded; its children stay live.
+    schema_premise = ("schema retained-origin effects", source.path, id(expressions["adapter"]))
+    field_calls = {id(field) for _unit, _statement, field in fields}
+    deferred = {}
+    deferred_calls = set()
+    deferred_classes = {}
+
+    def enum_member_use(node):
+        if (
+            not isinstance(node, ast.Attribute)
+            or not isinstance(node.value, ast.Name)
+            or node.value.id != enum_class.name
+            or not global_read(enum, node.value)
+            or not global_read(enum, enum_class.bases[0])
+        ):
+            return None
+        declarations = [
+            statement
+            for statement in enum_class.body
+            if isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == node.attr
+        ]
+        return declarations[0] if len(declarations) == 1 and node.attr in enum_values else None
+
+    for owner_name in ("QueryDefinition", "QuerySpec"):
+        cls = _reserve_node_at(enum, owner_name)
+        field = _reserve_node_at(enum, owner_name + ".response_format")
+        if (
+            not isinstance(cls, ast.ClassDef)
+            or not owned(enum, cls.name, cls)
+            or cls.keywords
+            or cls.type_params
+            or not isinstance(field, ast.AnnAssign)
+            or field not in cls.body
+            or not isinstance(field.target, ast.Name)
+            or not isinstance(field.annotation, ast.Name)
+            or field.annotation.id != enum_class.name
+            or not global_read(enum, field.annotation)
+        ):
+            fail(enum, "deferred owner or field binding", cls)
+            continue
+        field_bindings = [
+            node
+            for node in _reserve_composer_receiver.immediate(cls)
+            if (isinstance(node, ast.Name) and node.id == field.target.id and isinstance(node.ctx, (ast.Store, ast.Del)))
+            or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == field.target.id)
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any((alias.asname or alias.name.partition(".")[0]) == field.target.id for alias in node.names)
+            )
+        ]
+        if field_bindings != [field.target]:
+            fail(enum, "deferred field binding", field)
+            continue
+        keyword = None
+        retaining_producer = field
+        if owner_name == "QueryDefinition":
+            call = field.value
+            if (
+                cls.decorator_list
+                or len(cls.bases) != 1
+                or not isinstance(cls.bases[0], ast.Name)
+                or not imported(enum, cls.bases[0].id, "pydantic", "BaseModel")
+                or not global_read(enum, cls.bases[0])
+                or not isinstance(call, ast.Call)
+                or not isinstance(call.func, ast.Name)
+                or not imported(enum, call.func.id, "pydantic", "Field")
+                or not global_read(enum, call.func)
+                or call.args
+                or len(call.keywords) != 2
+                or {part.arg for part in call.keywords} != {"default", "description"}
+            ):
+                fail(enum, "deferred Field boundary", field)
+                continue
+            keyword = next(part for part in call.keywords if part.arg == "default")
+            description = next(part.value for part in call.keywords if part.arg == "description")
+            if not isinstance(description, ast.Constant) or type(description.value) is not str:
+                fail(enum, "deferred Field description", call)
+                continue
+            value = keyword.value
+            retaining_producer = call
+        else:
+            decorator = cls.decorator_list[0] if len(cls.decorator_list) == 1 else None
+            if (
+                cls.bases
+                or not isinstance(decorator, ast.Call)
+                or not isinstance(decorator.func, ast.Name)
+                or not imported(enum, decorator.func.id, "dataclasses", "dataclass")
+                or not global_read(enum, decorator.func)
+                or decorator.args
+                or len(decorator.keywords) != 2
+                or {part.arg for part in decorator.keywords} != {"frozen", "slots"}
+                or any(not isinstance(part.value, ast.Constant) or part.value.value is not True for part in decorator.keywords)
+            ):
+                fail(enum, "deferred dataclass boundary", cls)
+                continue
+            value = field.value
+        member = enum_member_use(value)
+        if member is None:
+            fail(enum, "deferred enum member", field)
+            continue
+        deferred_classes[owner_name] = cls
+        if isinstance(retaining_producer, ast.Call):
+            deferred_calls.add(id(retaining_producer))
+        deferred[owner_name + ".response_format"] = {
+            "owner": ref(enum, cls),
+            "field": ref(enum, field),
+            "retaining_producer": ref(enum, retaining_producer),
+            "default_keyword": ref(enum, keyword) if keyword is not None else None,
+            "value": ref(enum, value),
+            "enum_class": ref(enum, enum_class),
+            "enum_member": ref(enum, member),
+            "unresolved": schema_premise,
+        }
+
+    # Class-info observation proves only the original operand's declarations.
+    # It neither classifies the first argument nor skips its subexpressions.
+    class_info = {}
+    class_info_calls = set()
+    for call in _reserve_composer_receiver.runtime_walk(source.tree):
+        if (
+            not isinstance(call, ast.Call)
+            or id(call) in observed
+            or not isinstance(call.func, ast.Name)
+            or call.func.id not in {"isinstance", "issubclass"}
+            or len(call.args) < 2
+            or not isinstance(call.args[1], ast.Tuple)
+        ):
+            continue
+        leaves = []
+        for leaf in call.args[1].elts:
+            declarations = [
+                cls
+                for cls in variants
+                if isinstance(leaf, ast.Name) and imported(source, leaf.id, module(config), cls.name) and global_read(source, leaf)
+            ]
+            if len(declarations) == 1:
+                leaves.append({"use": ref(source, leaf), "declaration": ref(config, declarations[0])})
+        if (
+            not builtin(source, call.func.id)
+            or not global_read(source, call.func)
+            or len(call.args) != 2
+            or call.keywords
+            or isinstance(call.args[0], ast.Starred)
+            or not leaves
+            or len(leaves) != len(call.args[1].elts)
+        ):
+            fail(source, "class-info operand binding", call)
+            continue
+        class_info_calls.add(id(call))
+        class_info[ref(source, call)] = {
+            "call": ref(source, call),
+            "builtin": ref(source, call.func),
+            "operand": ref(source, call.args[1]),
+            "leaves": tuple(leaves),
+            "unresolved": schema_premise,
+        }
+    if len(class_info) != 1:
+        fail(source, "class-info original operand absent or duplicated", producer)
+
+    holder_uses = {}
+    holder_calls = set()
+    holder_returns = set()
+    holder_checks = set()
+    holder_cls = deferred_classes.get("QuerySpec")
+    holder_producer = _reserve_node_at(enum, "_query_spec_from_definition")
+    holder_resolver = _reserve_node_at(enum, "resolve_queries")
+    if (
+        not isinstance(holder_cls, ast.ClassDef)
+        or not isinstance(holder_producer, ast.FunctionDef)
+        or not owned(enum, holder_producer.name, holder_producer)
+        or holder_producer.decorator_list
+        or holder_producer.type_params
+        or not isinstance(holder_resolver, ast.FunctionDef)
+        or not owned(enum, holder_resolver.name, holder_resolver)
+    ):
+        fail(enum, "holder-use producer binding", holder_producer)
+    else:
+        parameters = holder_producer.args.posonlyargs + holder_producer.args.args + holder_producer.args.kwonlyargs
+        calls = [
+            call
+            for call in _walk_same_scope(holder_producer)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == holder_cls.name
+            and global_read(enum, call.func)
+        ]
+        returns = [node for node in _walk_same_scope(holder_producer) if isinstance(node, ast.Return)]
+        if len(calls) != 1:
+            fail(enum, "holder-use constructor absent or duplicated", holder_producer)
+        else:
+            call = calls[0]
+            keywords = {part.arg: part for part in call.keywords}
+            argument = keywords.get("response_format")
+            value = argument.value if argument is not None else None
+            receiver = value.value if isinstance(value, ast.Attribute) else None
+            formals = [parameter for parameter in parameters if isinstance(receiver, ast.Name) and parameter.arg == receiver.id]
+            events = [
+                (kind, node)
+                for name, kind, node in _reserve_composer_receiver.lexical_binding_events(holder_producer)
+                if isinstance(receiver, ast.Name) and name == receiver.id
+            ]
+            formal = formals[0] if len(formals) == 1 else None
+            formal_owner = deferred_classes.get("QueryDefinition")
+            if (
+                call.args
+                or len(call.keywords) != 8
+                or set(keywords)
+                != {
+                    "name",
+                    "input_fields",
+                    "response_format",
+                    "output_fields",
+                    "template",
+                    "max_tokens",
+                    "structured_output_prefix",
+                    "allow_empty_inputs",
+                }
+                or not isinstance(value, ast.Attribute)
+                or value.attr != "response_format"
+                or not isinstance(receiver, ast.Name)
+                or formal is None
+                or events != [("PARAMETER", formal)]
+                or not isinstance(formal_owner, ast.ClassDef)
+                or not isinstance(formal.annotation, ast.Name)
+                or formal.annotation.id != formal_owner.name
+                or not global_read(enum, formal.annotation)
+            ):
+                fail(enum, "holder-use explicit input binding", call)
+            else:
+                # Private origin survives a local alias even when its later
+                # Return form refuses; it never acquires the declared default.
+                holder_calls.add(id(call))
+                if len(returns) != 1 or returns[0] not in holder_producer.body or returns[0].value is not call:
+                    fail(enum, "holder-use direct return boundary", holder_producer)
+                else:
+                    returned = returns[0]
+                    holder_returns.add(id(returned))
+                    decorator = holder_cls.decorator_list[0]
+                    decorator_import = imported(enum, decorator.func.id, "dataclasses", "dataclass")
+                    holder_uses["QuerySpec.construction_return"] = {
+                        "producer": ref(enum, holder_producer),
+                        "owner": ref(enum, holder_cls),
+                        "decorator": ref(enum, decorator),
+                        "decorator_supplier": ref(enum, decorator_import[1]),
+                        "call": ref(enum, call),
+                        "callee": ref(enum, call.func),
+                        "response_format_keyword": ref(enum, argument),
+                        "response_format_input": ref(enum, value),
+                        "input_receiver": ref(enum, receiver),
+                        "input_parameter": ref(enum, formal),
+                        "input_status": "UNRESOLVED",
+                        "result_status": "UNRESOLVED_HOLDER",
+                        "return": ref(enum, returned),
+                        "unresolved": schema_premise,
+                    }
+        checks = [
+            call
+            for call in _walk_same_scope(holder_resolver)
+            if isinstance(call, ast.Call)
+            and len(call.args) >= 2
+            and isinstance(call.args[1], ast.Name)
+            and call.args[1].id == holder_cls.name
+        ]
+        if len(checks) != 1:
+            fail(enum, "holder-use single class-info absent or duplicated", holder_resolver)
+        else:
+            call = checks[0]
+            if (
+                not isinstance(call.func, ast.Name)
+                or call.func.id != "isinstance"
+                or not builtin(enum, call.func.id)
+                or not global_read(enum, call.func)
+                or not global_read(enum, call.args[1])
+                or len(call.args) != 2
+                or isinstance(call.args[0], ast.Starred)
+                or call.keywords
+            ):
+                fail(enum, "holder-use single class-info binding", call)
+            else:
+                holder_checks.add(id(call))
+                holder_uses["QuerySpec.single_class_info"] = {
+                    "call": ref(enum, call),
+                    "builtin": ref(enum, call.func),
+                    "class_use": ref(enum, call.args[1]),
+                    "owner": ref(enum, holder_cls),
+                    "unresolved": schema_premise,
+                }
+
+    # This exact registration retains a producer key in an ordinary mutable
+    # dictionary. It is an unresolved boundary, including its actual reader;
+    # neither the key nor a dictionary value is a DATA/purity permission.
+    registration_facts = {}
+    registration_formals = {}
+    registration_unresolved = {}
+    registration_calls = set()
+    registration_returns = set()
+    registration_stores = set()
+    registration_registry = _reserve_node_at(registration, "_VALUE_SOURCE_CONFIG_ATTRS")
+    registrar = _reserve_node_at(registration, "register_value_source_plugin")
+    reader = _reserve_node_at(registration, "find_value_source_config")
+    getter = _reserve_node_at(source, producer.name + ".provider_config")
+    registration_candidates = [
+        node
+        for node in nodes[id(source)]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "register_value_source_plugin"
+    ]
+    registration_call = registration_candidates[0] if len(registration_candidates) == 1 else None
+    registration_premise = ("retained producer registration", source.path, id(registration_call)) if registration_call is not None else None
+    registration_start = len(result["failures"])
+    registry_bound = (
+        isinstance(registration_registry, ast.AnnAssign)
+        and isinstance(registration_registry.target, ast.Name)
+        and isinstance(registration_registry.value, ast.Dict)
+        and not registration_registry.value.keys
+        and not _reserve_owned_source_binding_failures(
+            {module(registration): registration}, {module(registration) + "._VALUE_SOURCE_CONFIG_ATTRS"}
+        )
+    )
+    if not registry_bound:
+        fail(registration, "registration registry binding", registration_registry)
+    registrar_expected = ast.parse(
+        "def register_value_source_plugin(plugin_cls: type, *, config_attr: str) -> None:\n"
+        "    if not config_attr:\n"
+        "        raise ValueError('config_attr must be non-empty')\n"
+        "    if plugin_cls in _VALUE_SOURCE_CONFIG_ATTRS:\n"
+        "        existing = _VALUE_SOURCE_CONFIG_ATTRS[plugin_cls]\n"
+        "        if existing != config_attr:\n"
+        "            raise ValueError(f'Plugin {plugin_cls.__qualname__} already registered with config_attr ' "
+        "f'{existing!r}; cannot re-register with {config_attr!r}')\n"
+        "    _VALUE_SOURCE_CONFIG_ATTRS[plugin_cls] = config_attr\n"
+    ).body[0]
+    if (
+        not isinstance(registrar, ast.FunctionDef)
+        or not owned(registration, registrar.name, registrar)
+        or _reserve_catalog_role_function_shape(registrar) != _reserve_catalog_role_function_shape(registrar_expected)
+        or any(not builtin(registration, name) for name in ("type", "str", "ValueError"))
+    ):
+        fail(registration, "registration registrar signature or body", registrar)
+    registrar_import = imported(source, "register_value_source_plugin", module(registration), "register_value_source_plugin")
+    if (
+        registrar_import is None
+        or registration_call is None
+        or not global_read(source, registration_call.func)
+        or not isinstance(parents[id(source)].get(id(registration_call)), ast.Expr)
+        or parents[id(source)][id(registration_call)] not in source.tree.body
+    ):
+        fail(source, "registration original call binding", registration_call)
+    elif (
+        len(registration_call.args) != 1
+        or not isinstance(registration_call.args[0], ast.Name)
+        or registration_call.args[0].id != producer.name
+        or not global_read(source, registration_call.args[0])
+        or len(registration_call.keywords) != 1
+        or registration_call.keywords[0].arg != "config_attr"
+        or not isinstance(registration_call.keywords[0].value, ast.Constant)
+        or type(registration_call.keywords[0].value.value) is not str
+        or not isinstance(getter, ast.FunctionDef)
+        or registration_call.keywords[0].value.value != getter.name
+    ):
+        fail(source, "registration argument", registration_call)
+    getter_expected = ast.parse("@property\ndef provider_config(self):\n    return self._config\n").body[0]
+    if isinstance(getter, ast.FunctionDef):
+        getter_shape = _reserve_catalog_role_function_shape(getter)
+        expected_shape = _reserve_catalog_role_function_shape(getter_expected)
+        # Class execution can bind the same slot from a conditional statement.
+        # Definition headers execute here; unrelated method/nested-class bodies
+        # have their own namespaces and are pruned by the existing scope walk.
+        slot_execution = tuple(node for statement in producer.body for node in _reserve_worker_whole_scope_origin.scope_nodes(statement))
+        getter_bindings = list(_reserve_worker_whole_scope_origin.binding_nodes(slot_execution, getter.name))
+
+        def getter_classes(node):
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+                return [*getter_classes(node.left), *getter_classes(node.right)]
+            return [node]
+
+        getter_leaves = getter_classes(getter.returns)
+        getter_declarations = [
+            cls
+            for leaf in getter_leaves
+            for cls in variants
+            if isinstance(leaf, ast.Name) and imported(source, leaf.id, module(config), cls.name) and global_read(source, leaf)
+        ]
+        getter_bound = (
+            getter in producer.body
+            and getter_bindings == [getter]
+            and not any(isinstance(node, (ast.Global, ast.Nonlocal)) and getter.name in node.names for node in slot_execution)
+            and getter_shape[:3] == expected_shape[:3]
+            and getter_shape[4:] == expected_shape[4:]
+            and len(getter_leaves) == len(getter_declarations) == len(variants)
+            and {id(cls) for cls in getter_declarations} == {id(cls) for cls in variants}
+            and builtin(source, "property")
+            and global_read(source, getter.decorator_list[0])
+        )
+    else:
+        getter_bound = False
+    if not getter_bound:
+        fail(source, "registration property relation", getter)
+
+    reader_expected = ast.parse(
+        "def find_value_source_config(plugin: object) -> object | None:\n"
+        "    for cls in type(plugin).__mro__:\n"
+        "        if cls in _VALUE_SOURCE_CONFIG_ATTRS:\n"
+        "            attr_name = _VALUE_SOURCE_CONFIG_ATTRS[cls]\n"
+        "            result: object = plugin.__getattribute__(attr_name)\n"
+        "            return result\n"
+        "    return None\n"
+    ).body[0]
+    reader_bound = (
+        isinstance(reader, ast.FunctionDef)
+        and owned(registration, reader.name, reader)
+        and _reserve_catalog_role_function_shape(reader) == _reserve_catalog_role_function_shape(reader_expected)
+        and builtin(registration, "type")
+        and builtin(registration, "object")
+    )
+    if not reader_bound:
+        fail(registration, "registration unresolved reader shape", reader)
+
+    if len(result["failures"]) == registration_start:
+        # Canonical body equality above supplies these exact original nodes.
+        # Parameter events prove lexical links, not runtime values or success.
+        plugin_parameter, attr_parameter = registrar.args.args[0], registrar.args.kwonlyargs[0]
+        store = registrar.body[-1]
+        destination = store.targets[0]
+        membership = next(node for node in ast.walk(registrar) if isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.In))
+        existing_read = next(node for node in ast.walk(registrar) if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load))
+        registry_uses = [node for node in ast.walk(registrar) if isinstance(node, ast.Name) and node.id == registration_registry.target.id]
+        for use in registry_uses:
+            if not global_read(registration, use):
+                fail(registration, "registration registry use binding", use)
+        for parameter, origin in ((plugin_parameter, "source"), (attr_parameter, "registration_attribute")):
+            events = [
+                (kind, node) for name, kind, node in _reserve_composer_receiver.lexical_binding_events(registrar) if name == parameter.arg
+            ]
+            if events != [("PARAMETER", parameter)]:
+                fail(registration, "registration formal binding", parameter)
+            else:
+                registration_formals.update(
+                    {
+                        id(node): origin
+                        for node in _walk_same_scope(registrar)
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == parameter.arg
+                    }
+                )
+        for use in ast.walk(registrar):
+            if isinstance(use, ast.Call) and not global_read(registration, use.func):
+                fail(registration, "registration exception binding", use)
+        getter_return = next(node for node in getter.body if isinstance(node, ast.Return))
+
+        def defer_registration(unit, node, role):
+            registration_unresolved[id(node)] = {
+                "node": ref(unit, node),
+                "role": role,
+                "status": "UNRESOLVED",
+                "unresolved": registration_premise,
+            }
+
+        defer_registration(source, registration_call, "producer registration call")
+        defer_registration(registration, destination, "strong dictionary key store")
+        defer_registration(registration, store, "strong dictionary key assignment")
+        registration_calls.add(id(registration_call))
+        registration_stores.update((id(store), id(destination)))
+        for node in ast.walk(registrar):
+            if isinstance(node, ast.Call):
+                defer_registration(registration, node, "registration conflict or empty-attribute exception")
+                registration_calls.add(id(node))
+            elif isinstance(node, (ast.Subscript, ast.Compare)):
+                defer_registration(registration, node, "registration state lookup or comparison")
+        # Values read from the dictionary do not inherit its producer-class
+        # keys. Preserve this actual projection and reflective call as open
+        # operations; arbitrary dictionary-derived calls receive no boundary.
+        for node in ast.walk(reader):
+            if isinstance(node, ast.Subscript):
+                defer_registration(registration, node, "registration value projection")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                defer_registration(registration, node, "unqualified reflective attribute read")
+                registration_calls.add(id(node))
+            elif isinstance(node, ast.Return) and isinstance(node.value, ast.Name):
+                defer_registration(registration, node, "unqualified reader result")
+                registration_returns.add(id(node))
+            elif isinstance(node, ast.Attribute):
+                defer_registration(registration, node, "unqualified reader receiver or callable projection")
+        defer_registration(registration, reader, "unqualified downstream reader")
+        defer_registration(registration, reader.args.args[0], "unqualified downstream receiver formal")
+        keyword = registration_call.keywords[0]
+        registration_facts[ref(source, registration_call)] = {
+            "call": ref(source, registration_call),
+            "callee_use": ref(source, registration_call.func),
+            "registrar_import": ref(source, registrar_import[1]),
+            "producer_argument": ref(source, registration_call.args[0]),
+            "producer": ref(source, producer),
+            "config_attr_keyword": ref(source, keyword),
+            "config_attr_value": ref(source, keyword.value),
+            "property": ref(source, getter),
+            "property_decorator": ref(source, getter.decorator_list[0]),
+            "property_parameter": ref(source, getter.args.args[0]),
+            "property_return": ref(source, getter_return),
+            "property_projection": ref(source, getter_return.value),
+            "registrar": ref(registration, registrar),
+            "plugin_parameter": ref(registration, plugin_parameter),
+            "config_attr_parameter": ref(registration, attr_parameter),
+            "registry": ref(registration, registration_registry),
+            "registry_initializer": ref(registration, registration_registry.value),
+            "registry_uses": tuple(ref(registration, use) for use in registry_uses),
+            "membership": ref(registration, membership),
+            "existing_read": ref(registration, existing_read),
+            "store": ref(registration, store),
+            "destination": ref(registration, destination),
+            "destination_receiver": ref(registration, destination.value),
+            "key": ref(registration, destination.slice),
+            "value": ref(registration, store.value),
+            "argument_bindings": (
+                (ref(source, registration_call.args[0]), ref(registration, plugin_parameter)),
+                (ref(source, keyword.value), ref(registration, attr_parameter)),
+            ),
+            "store_bindings": (
+                (ref(registration, destination.slice), ref(registration, plugin_parameter)),
+                (ref(registration, store.value), ref(registration, attr_parameter)),
+            ),
+            "retention_status": "STRONG_ON_NORMAL_COMPLETION",
+            "outcome_status": "UNRESOLVED",
+            "registry_state_status": "UNRESOLVED",
+            "class_hash_effects_status": "UNRESOLVED",
+            "descriptor_effects_status": "UNRESOLVED",
+            "effects_status": "UNRESOLVED",
+            "unresolved": registration_premise,
+            "config_validation_unresolved": ("returned config validation", source.path, id(expressions["validation"])),
+        }
+
+    # Preserve retained origins through only ordinary aliases, imports, the
+    # exact returned tuple/map, class projections and canonical shallow copies.
+    # These tags are private traversal states, never public DATA permissions.
+    origins = {module(config) + ".SOURCE_PROVIDER_CONFIGS": "registry", module(source) + "." + producer.name: "source"}
+    origins.update({module(unit) + "." + cls.name: "class" for unit, cls in all_config_classes})
+    origins[module(base) + "." + title.name] = "callback"
+    origins[module(enum) + ".ResponseFormat"] = "enum"
+    origins.update({module(enum) + "." + cls.name: "deferred_class" for cls in deferred_classes.values()})
+    if registry_bound:
+        origins[module(registration) + "." + registration_registry.target.id] = "producer_registry"
+    if isinstance(registrar, ast.FunctionDef) and owned(registration, registrar.name, registrar):
+        origins[module(registration) + "." + registrar.name] = "producer_registrar"
+    owner_modules = {name.rpartition(".")[0] for name in origins}
+
+    def qualified_origin(qualified, seen=frozenset()):
+        if qualified in origins:
+            return origins[qualified]
+        if qualified in owner_modules:
+            return "module"
+        if qualified in seen or not qualified or "." not in qualified:
+            return None
+        owner, name = qualified.rsplit(".", 1)
+        candidates = by_module.get(owner, ())
+        if len(candidates) != 1:
+            return None
+        unit = candidates[0]
+        for statement in unit.tree.body:
+            if isinstance(statement, ast.ImportFrom) and statement.level == 0:
+                for alias in statement.names:
+                    if (alias.asname or alias.name) == name and imported(unit, name, statement.module, alias.name):
+                        return qualified_origin(statement.module + "." + alias.name, seen | {qualified})
+        return None
+
+    def alias_value(unit, node):
+        owner = _lexical_scope(node)
+        if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return _admission_unique_binding(node.id, owner, node)
+        if not isinstance(owner, ast.Module):
+            return None
+        matches = [
+            statement
+            for statement in unit.tree.body
+            if isinstance(statement, (ast.Assign, ast.AnnAssign))
+            and (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
+            == [
+                next(
+                    (
+                        target
+                        for target in (statement.targets if isinstance(statement, ast.Assign) else [statement.target])
+                        if isinstance(target, ast.Name) and target.id == node.id
+                    ),
+                    None,
+                )
+            ]
+        ]
+        if (
+            len(matches) != 1
+            or matches[0].lineno >= node.lineno
+            or _reserve_owned_source_binding_failures({module(unit): unit}, {module(unit) + "." + node.id})
+        ):
+            return None
+        return matches[0].value
+
+    def retained(unit, node, seen=frozenset()):
+        if node is None or id(node) in seen:
+            return None
+        seen = seen | {id(node)}
+        if isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)):
+            # Identity returns a boolean, not either operand, and cannot
+            # dispatch overloaded equality. Operand effects still reach the
+            # independent runtime walk; no comparison/effect grant follows.
+            return None
+        if isinstance(node, ast.Name):
+            if id(node) in registration_formals:
+                return registration_formals[id(node)]
+            own = module(unit) + "." + node.id
+            if own in origins and global_read(unit, node):
+                return origins[own]
+            qualified = _resolver_for_unit(unit).qualified_name(node, use=node)
+            found = qualified_origin(qualified)
+            if found is not None:
+                return found
+            value = alias_value(unit, node)
+            return retained(unit, value, seen) if value is not None else None
+        if isinstance(node, ast.Attribute):
+            if id(node) in registration_unresolved:
+                return "registration_projection"
+            qualified = _resolver_for_unit(unit).qualified_name(node, use=node)
+            found = qualified_origin(qualified)
+            if found is not None:
+                return found
+            origin = retained(unit, node.value, seen)
+            if origin == "source" and node.attr == "discriminated_variants":
+                return "variant_method"
+            if origin == "enum" and node.attr in enum_values:
+                return "enum_member"
+            if origin == "enum_member" and node.attr == "value":
+                return None  # The separately proved canonical member has a string value.
+            return "metadata" if origin is not None else None
+        if isinstance(node, ast.Subscript):
+            origin = retained(unit, node.value, seen)
+            if origin == "producer_registry":
+                # Subscriptions project values, not the strongly retained
+                # producer keys. Their values/effects remain unresolved.
+                return "registration_value"
+            if (
+                origin == "returned_tuple"
+                and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int
+                and node.slice.value == 1
+            ):
+                return "registry"
+            return "class" if origin == "registry" else "metadata" if origin is not None else None
+        if isinstance(node, ast.Call):
+            if id(node) in registration_unresolved:
+                return "registration_result"
+            if id(node) in field_calls:
+                return "config_field"
+            if id(node) in deferred_calls:
+                return "deferred_field"
+            if id(node) in holder_calls:
+                return "unresolved_holder"
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "dict"
+                and builtin(unit, "dict")
+                and global_read(unit, node.func)
+                and len(node.args) == 1
+                and not node.keywords
+                and retained(unit, node.args[0], seen) == "registry"
+            ):
+                return "registry"
+            if retained(unit, node.func, seen) == "variant_method" and not node.args and not node.keywords:
+                return "returned_tuple"
+            if id(node) in class_info_calls | holder_checks or (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"isinstance", "issubclass"}
+                and builtin(unit, node.func.id)
+                and global_read(unit, node.func)
+                and len(node.args) == 2
+                and not node.keywords
+                and retained(unit, node.args[0], seen) is None
+                and retained(unit, node.args[1], seen) == "class"
+            ):
+                # A canonical builtin check returns a boolean on normal
+                # completion. This result carries no retained object; nested
+                # effects are still visited and no effect grant is published.
+                return None
+            return (
+                "metadata"
+                if any(
+                    retained(unit, child, seen) is not None
+                    for child in (node.func, *node.args, *(keyword.value for keyword in node.keywords))
+                )
+                else None
+            )
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return "metadata" if any(retained(unit, member, seen) is not None for member in node.elts) else None
+        if isinstance(node, ast.Dict):
+            return (
+                "metadata"
+                if any(retained(unit, member, seen) is not None for member in [*node.keys, *node.values] if member is not None)
+                else None
+            )
+        # Unsupported wrappers never erase a positively identified origin.
+        # This conservative state supplies no favorable expression role and
+        # does not select a branch, execute a callback or solve heap flow.
+        return "metadata" if any(retained(unit, child, seen) is not None for child in ast.iter_child_nodes(node)) else None
+
+    observed.update(id(node) for node in ast.walk(registry))
+    observed.update(id(node) for node in ast.walk(scalar))
+    observed.update(id(node) for node in ast.walk(enum_class))
+    for _unit, cls in all_config_classes:
+        observed.update(id(node) for parent in cls.bases for node in ast.walk(parent))
+    config_model = _reserve_node_at(source, "LLMSource.config_model")
+    if (
+        isinstance(config_model, ast.Assign)
+        and isinstance(config_model.value, ast.Name)
+        and retained(source, config_model.value) == "class"
+    ):
+        observed.update(id(node) for node in ast.walk(config_model))
+    else:
+        fail(source, "retained config-model binding", config_model)
+
+    for unit in units:
+        related_import = False
+        for statement in unit.tree.body:
+            if isinstance(statement, ast.ImportFrom) and statement.level == 0:
+                for alias in statement.names:
+                    if qualified_origin(statement.module + "." + alias.name) is not None:
+                        related_import = True
+                        if not imported(unit, alias.asname or alias.name, statement.module, alias.name):
+                            fail(unit, "retained import binding", statement)
+        for node in _reserve_composer_receiver.runtime_walk(unit.tree):
+            if id(node) in observed:
+                continue
+            if (
+                isinstance(node, (ast.Attribute, ast.Subscript))
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and retained(unit, node.value) is not None
+                and id(node) not in registration_stores
+            ):
+                fail(unit, "retained mutation", node)
+            elif isinstance(node, ast.Call):
+                receiver = retained(unit, node.func)
+                arguments = [
+                    argument
+                    for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
+                    if retained(unit, argument) is not None
+                ]
+                copy_call = retained(unit, node) == "registry" and receiver is None
+                method_call = receiver == "variant_method" and not node.args and not node.keywords
+                check_call = (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in {"isinstance", "issubclass"}
+                    and builtin(unit, node.func.id)
+                    and global_read(unit, node.func)
+                    and len(node.args) == 2
+                    and not node.keywords
+                    and retained(unit, node.args[0]) is None
+                    and retained(unit, node.args[1]) == "class"
+                )
+                observation_call = (
+                    id(node) in field_calls | deferred_calls | class_info_calls | holder_calls | holder_checks | registration_calls
+                )
+                if (receiver is not None or arguments) and not (copy_call or method_call or check_call or observation_call):
+                    fail(unit, "retained call or opaque escape", node)
+                if (
+                    related_import
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in {"globals", "locals", "vars", "eval", "exec", "__import__"}
+                ):
+                    fail(unit, "retained namespace recovery", node)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None and retained(unit, node.value) is not None:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if id(node) not in registration_stores and (len(targets) != 1 or not isinstance(targets[0], ast.Name)):
+                    fail(unit, "retained store escape", node)
+            elif isinstance(node, ast.NamedExpr) and retained(unit, node.value) is not None:
+                fail(unit, "retained unsupported binding", node)
+            elif (
+                isinstance(node, ast.Return)
+                and id(node) not in holder_returns | registration_returns
+                and retained(unit, node.value) is not None
+            ):
+                fail(unit, "retained return escape", node)
+    if result["failures"]:
+        return result
+
+    returns = [node for node in method.body if isinstance(node, ast.Return)]
+    service_calls = [
+        node
+        for node in ast.walk(forwarding)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "lower_discriminated_to_knob_schema"
+    ]
+    # `extra` has several reads; bind its original return rather than their name.
+    extra_returns = [
+        node.value
+        for node in definitions[("knobs", "_composer_extras")].body
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+    ]
+    if len(extra_returns) != 1:
+        fail(knobs, "projection", definitions[("knobs", "_composer_extras")])
+    default_reads = [
+        node.value
+        for node in ast.walk(definitions[("knobs", "_attach_default")])
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) and ast.unparse(node.value) == "info.default"
+    ]
+    equals = expression(knobs, definitions[("knobs", "_attach_required_when")], "predicate['equals']", "projection")
+    if result["failures"] or len(returns) != 1 or len(service_calls) != 2 or len(default_reads) != 1:
+        if not result["failures"]:
+            fail(knobs, "projection")
+        return result
+    result["conditional_roles"] = {
+        "registry": {ref(config, registry)},
+        "scalar_default_supplier": {ref(defaults, scalar)},
+        "scalar_default_import": {ref(config, scalar_import[1])},
+        "scalar_default_use": {ref(config, scalar_use)},
+        "variant_classes": {ref(config, cls) for cls in variants},
+        "config_ancestry": set(ancestry),
+        "source_method": {ref(source, method)},
+        "source_return": {ref(source, returns[0])},
+        "service_calls": {ref(service, call) for call in service_calls},
+        "service_receiver": {ref(service, expressions["service_cast"].args[1])},
+        "lowering_receiver": {ref(knobs, expressions["lower_cast"].args[1])},
+        "variant_call": {ref(knobs, expressions["variant_call"])},
+        "variant_items": {ref(knobs, expressions["variant_items"])},
+        "model_fields_items": {ref(knobs, expressions["model_fields_items"])},
+        "hidden_argument": {ref(knobs, expressions["hidden"].args[0])},
+        "lower_argument": {ref(knobs, expressions["lower"].args[1])},
+        "base_model": {ref(unit, use) for unit, use in base_model_uses},
+        "json_schema_operation": {ref(source, expressions["json_schema"])},
+        "value_validation_operation": {ref(source, expressions["validation"])},
+    }
+    result["retained_projections"] = {
+        "extras": {ref(knobs, extra_returns[0])},
+        "default": {ref(knobs, default_reads[0])},
+        "equals": {ref(knobs, equals)},
+    }
+    result["callback_roles"] = {"schema": {ref(base, title)}, "validation": validation_callbacks}
+    result["deferred_retained_uses"] = deferred
+    result["class_info_operands"] = class_info
+    result["deferred_holder_uses"] = holder_uses
+    result["deferred_producer_registrations"] = registration_facts
+    result["unresolved"] = {
+        ("catalog receiver origin", service.path, id(forwarding.args.args[1])),
+        ("returned config validation", source.path, id(expressions["validation"])),
+        ("schema retained-origin effects", source.path, id(expressions["adapter"])),
+        registration_premise,
+    }
+    return result
+
+
 def _reserve_typing_supplier_mutation_failures(units):
     """Denial-only typing namespace effects using the original lexical resolver.
 
@@ -7117,6 +9298,7 @@ def _reserve_typing_supplier_mutation_failures(units):
     failures = []
     for unit in units:
         resolver = _resolver_for_unit(unit)
+        source_facts = _reserve_typing_annotation_source_facts(unit)
 
         def canonical_builtin(node, name, use, *, resolver=resolver, unit=unit):
             qualified = resolver.qualified_name(node, use=use)
@@ -7128,7 +9310,9 @@ def _reserve_typing_supplier_mutation_failures(units):
                 and not any(isinstance(statement, ast.Global) and name in statement.names for statement in ast.walk(unit.tree))
             )
 
-        def typing_namespace(node, use, seen=frozenset(), *, resolver=resolver, canonical_builtin=canonical_builtin):
+        def typing_namespace(
+            node, use, seen=frozenset(), *, resolver=resolver, canonical_builtin=canonical_builtin, source_facts=source_facts
+        ):
             if id(node) in seen:
                 return False
             seen = seen | {id(node)}
@@ -7152,6 +9336,8 @@ def _reserve_typing_supplier_mutation_failures(units):
                     return any(typing_namespace(part, node, seen) for part in parts)
                 return False
             if isinstance(node, ast.Call):
+                if id(node) in source_facts["scalar_query_results"]:
+                    return False
                 if len(node.args) == 1 and not node.keywords and any(canonical_builtin(node.func, name, node) for name in ("type", "vars")):
                     return typing_namespace(node.args[0], node, seen)
                 target = resolver.qualified_name(node.func, use=node)
@@ -7197,19 +9383,24 @@ def _reserve_typing_supplier_mutation_failures(units):
                     and (target.count(".") > 1 or target.removeprefix("typing.").startswith("_"))
                 ):
                     failures.append("typing supplier implementation call is unclosed " + unit.path + ":" + str(node.lineno))
-                safe_query = target in {
-                    "typing.cast",
-                    "typing.get_origin",
-                    "typing.get_args",
-                    "typing.get_type_hints",
-                } or any(
-                    canonical_builtin(node.func, name, node)
-                    for name in (
-                        "type",
-                        "vars",
-                        "getattr",
-                        "isinstance",
-                        "issubclass",
+                safe_query = (
+                    id(node) in source_facts["typed_dict_consumers"]
+                    or target
+                    in {
+                        "typing.cast",
+                        "typing.get_origin",
+                        "typing.get_args",
+                        "typing.get_type_hints",
+                    }
+                    or any(
+                        canonical_builtin(node.func, name, node)
+                        for name in (
+                            "type",
+                            "vars",
+                            "getattr",
+                            "isinstance",
+                            "issubclass",
+                        )
                     )
                 )
                 if not safe_query and any(
@@ -8414,6 +10605,443 @@ def _reserve_approval_binding_class_use(node, unit, parents, origin_of):
     return False
 
 
+# Deterministic fail-closed net for retention roots and consumer replay.
+# Active graph roots count transfer evaluations. Each consumer independently
+# counts all nested transfers plus partial/full combination attempts, without
+# resetting that aggregate at nested roots. Exceeding either cap emits
+# ``retention budget exceeded at <path>:<line>`` and denies conservatively;
+# unfinished SCC values are unpublished. Host load cannot change this count.
+# Raising the cap is a reviewed code change, with no environment/CLI override.
+#
+# Re-derived on a2e178d94: frozen normal/reverse production runs, 1,083 units,
+# 479,024 roots and 2,408,123 consumers, no graph/consumer budget trips. Weighted
+# consumer nearest-rank p50/p90/p99/p99.9 = 1/1/9/35; max 1,195. Root max 1,194.
+# Eight times the larger observed max is 9,560, rounded upward to 10,000.
+# This is measured headroom, not a universal input/work or wall-time bound.
+# The structural-only 72fef35b7 memo still needs final-source qualification.
+# Corpus proof and limits: docs/release/0.8.10-task0-retention-fixpoint.md.
+_RETENTION_ROOT_EVALUATION_BUDGET: int | None = 10_000
+
+
+class _RetentionBudgetExceeded(BaseException):
+    """Private unwind from an over-budget retention root to that root's boundary.
+
+    A ``BaseException`` so no ``except Exception`` on the way can absorb it; it is
+    always caught at the root that started the count and never leaves the gate.
+    """
+
+
+class _RetentionConsumerBudgetExceeded(BaseException):
+    """Aggregate consumer work exceeded its cap; do not catch at a nested root."""
+
+
+def _reserve_origin_failure_line(unit, node, parents):
+    """Report a source line without changing the failed original node's span."""
+    nearest = "<unavailable>"
+    seen = set()
+    while isinstance(node, ast.AST) and id(node) not in seen:
+        seen.add(id(node))
+        if nearest == "<unavailable>" and "lineno" in node._attributes:
+            nearest = node.lineno
+        if node is unit.tree:
+            return nearest
+        parent = parents.get(id(node))
+        if parent is None or not any(child is node for child in ast.iter_child_nodes(parent)):
+            break
+        node = parent
+    return "<unavailable>"
+
+
+class _reserve_OriginDiagnostics:
+    """Bounded source observations; never an admission input or graph serializer."""
+
+    def __init__(self, units, *, max_events=4096, max_nodes=20000, max_reads=48, max_states=64, max_uses=8192):
+        limits = (max_events, max_nodes, max_reads, max_states, max_uses)
+        if any(type(value) is not int or value < 0 for value in limits):
+            raise ValueError("diagnostic limits must be nonnegative integers")
+        self._units = {id(unit): unit for unit in units}
+        self._limits = dict(zip(("events", "nodes", "reads", "states", "uses"), limits, strict=True))
+        self._events, self._nodes, self._uses, self._stages = [], {}, [], []
+        self._node_ids, self._ordinals = {}, set()
+        self._use_nodes = {}
+        self._truncated = dict.fromkeys(self._limits, False)
+        self._truncated["protected_nodes"] = False
+        self._context = None
+        self._pending, self._states, self._operands = {}, {}, []
+        self._buffer_truncated = {}
+
+    @staticmethod
+    def _origin(origin):
+        if origin is None:
+            return {"status": "computed-none", "kind": None, "identity": None}
+        kinds = {
+            "object",
+            "pure",
+            "module",
+            "member",
+            "instance",
+            "namespace",
+            "loader",
+            "config-entry",
+            "unknown",
+            "unknown-module",
+            "lazy-type",
+            "enum-value",
+            "enum-sequence",
+            "enum-record",
+            "enum-record-sequence",
+            "enum-compound",
+            "enum-recovered-class",
+            "enum-metadata",
+            "supplier-scalar",
+            "supplier-data-instance",
+            "supplier-recovered-class",
+            "supplier-class-metadata",
+            "framework-router",
+            "framework-routes",
+            "framework-route",
+            "framework-model",
+            "retained-supplier-namespace",
+            "type-metadata",
+            "type-fields",
+            "type-field",
+            "schema-node",
+            "schema-nodes",
+            "metadata-query",
+        }
+        if type(origin) is not tuple or len(origin) != 2 or type(origin[0]) is not str or origin[0] not in kinds:
+            return {"status": "unavailable-origin-representation", "kind": None, "identity": None}
+        kind, identity = origin
+        qualified = (
+            type(identity) is str
+            and identity.startswith(("elspeth.", "builtins.", "typing.", "pydantic.", "dataclasses.", "collections.", "enum."))
+            and all(part.isidentifier() for part in identity.split("."))
+        )
+        return {
+            "status": "observed" if qualified else "identity-omitted-not-qualified",
+            "kind": kind,
+            "identity": identity if qualified else None,
+        }
+
+    @staticmethod
+    def _span(node):
+        if "lineno" not in node._attributes:
+            return None
+        return [node.lineno, node.col_offset, node.end_lineno, node.end_col_offset]
+
+    @staticmethod
+    def _edge(parent, node):
+        for field, value in ast.iter_fields(parent):
+            if value is node:
+                return {"field": field, "index": None}
+            if isinstance(value, list):
+                for index, child in enumerate(value):
+                    if child is node:
+                        return {"field": field, "index": index}
+        return None
+
+    def _locator_metadata(self, unit, node, parents, *, truncation="nodes"):
+        if self._units.get(id(unit)) is not unit or not isinstance(node, ast.AST) or (node is not unit.tree and id(node) not in parents):
+            return None
+        parent = parents.get(id(node))
+        owners, cursor = [], parent
+        for _ in range(16):
+            if cursor is None:
+                break
+            if isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                owners.append({"kind": type(cursor).__name__, "name": cursor.name, "span": self._span(cursor)})
+            cursor = parents.get(id(cursor))
+        else:
+            self._truncated[truncation] = True
+        return {
+            "path": unit.path,
+            "kind": type(node).__name__,
+            "declared_name": node.name if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else None,
+            "span": self._span(node),
+            "parent": None
+            if parent is None
+            else {"kind": type(parent).__name__, "span": self._span(parent), "edge": self._edge(parent, node)},
+            "structural_lexical_owners": owners,
+            "execution_owner": "unavailable-not-inferred",
+        }
+
+    def locator(self, unit, node, parents):
+        if self._units.get(id(unit)) is not unit or not isinstance(node, ast.AST) or (node is not unit.tree and id(node) not in parents):
+            return None
+        key = id(unit), id(node)
+        if key in self._node_ids:
+            return self._node_ids[key]
+        if len(self._nodes) >= self._limits["nodes"]:
+            self._truncated["nodes"] = True
+            return None
+        token = "n" + str(len(self._nodes))
+        self._node_ids[key] = token
+        self._nodes[token] = self._locator_metadata(unit, node, parents)
+        return token
+
+    def begin(self, unit, node, parents, start):
+        self._context = unit, node, parents, start
+        self._pending, self._states, self._operands = {}, {}, []
+        self._buffer_truncated = dict.fromkeys(("events", "reads", "states"), False)
+
+    def _role(self, value):
+        _unit, root, parents, _start = self._context
+        edges, cursor = [], value
+        for _ in range(16):
+            if cursor is root:
+                break
+            parent = parents.get(id(cursor))
+            if parent is None:
+                return {"semantic": "unavailable-not-in-this-consumer", "edges": []}
+            edges.append(self._edge(parent, cursor))
+            cursor = parent
+        else:
+            return {"semantic": "unavailable-depth-cap", "edges": []}
+        edges.reverse()
+        semantic = "consumer-root"
+        if edges and edges[0] is not None:
+            field, index = edges[0]["field"], edges[0]["index"]
+            if isinstance(root, ast.Call):
+                semantic = (
+                    "callable"
+                    if field == "func"
+                    else "positional:" + str(index)
+                    if field == "args"
+                    else ("keyword:" + (root.keywords[index].arg or "**") if field == "keywords" else field)
+                )
+            elif isinstance(root, (ast.Return, ast.Yield, ast.YieldFrom)):
+                semantic = "returned-value"
+            elif isinstance(root, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign)):
+                semantic = "storage-value" if field == "value" else "storage-target"
+            elif isinstance(root, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                semantic = "declaration-default-or-capture"
+            else:
+                semantic = field
+        return {"semantic": semantic, "edges": edges}
+
+    def operand(self, value, use, origin, *, role=None, predicate=None):
+        if self._context is None:
+            return
+        if len(self._operands) >= self._limits["reads"]:
+            self._buffer_truncated["reads"] = True
+            return
+        self._operands.append(
+            {
+                "expression": value,
+                "use": use,
+                "role": self._role(value) if role is None else {"semantic": role, "edges": []},
+                "origin": self._origin(origin)
+                if predicate is None
+                else {"status": "unavailable-not-computed", "kind": None, "identity": None},
+                "predicate": predicate,
+            }
+        )
+
+    def retention_state(self, value, use, original, state, *, read_target=False, capture=False):
+        if self._context is None:
+            return
+        key = id(value), id(use), read_target, capture
+        if key not in self._states and len(self._states) >= self._limits["states"]:
+            self._buffer_truncated["states"] = True
+            return
+        origins = sorted(state.origins, key=lambda item: (item is not None, item or ("", "")))
+        if len(origins) > 16:
+            self._buffer_truncated["states"] = True
+        self._states[key] = {
+            "expression": value,
+            "use": use,
+            "read_target": read_target,
+            "capture": capture,
+            "role": {"semantic": "declaration-default-or-capture", "edges": []} if capture else self._role(value),
+            "producer_trace": "unavailable-not-retained-by-current-representation",
+            "direct_origin": self._origin(original)
+            if not capture
+            else {"status": "unavailable-not-computed", "kind": None, "identity": None},
+            "origins": [self._origin(origin) for origin in origins[:16]],
+            "retained": state.retained,
+            "acyclic": state.acyclic,
+            "scope": "alternative-root-summary-not-a-coupled-branch",
+        }
+
+    def observe_consumer(self, consumer):
+        def observed(selected):
+            reads, read_count = [], 0
+            reads_truncated = False
+
+            def observed_selected(value, use, *, read_target=False):
+                nonlocal read_count, reads_truncated
+                origin = selected(value, use, read_target=read_target)
+                read_count += 1
+                if len(reads) < self._limits["reads"]:
+                    reads.append(
+                        {
+                            "expression": value,
+                            "use": use,
+                            "read_target": read_target,
+                            "role": self._role(value),
+                            "origin": self._origin(origin),
+                        }
+                    )
+                else:
+                    reads_truncated = True
+                return origin
+
+            reason = consumer(observed_selected)
+            if reason is not None and reason.rstrip() not in self._pending:
+                if len(self._pending) < self._limits["events"]:
+                    self._pending[reason.rstrip()] = {
+                        "completed": True,
+                        "representative": True,
+                        "read_count": read_count,
+                        "reads": reads,
+                    }
+                    self._buffer_truncated["reads"] |= reads_truncated
+                else:
+                    self._buffer_truncated["events"] = True
+            return reason
+
+        return observed
+
+    def _event(self, ordinal, reason, *, stage, node=None, witness=None, operands=(), states=()):
+        if ordinal in self._ordinals:
+            return
+        if len(self._events) >= self._limits["events"]:
+            self._truncated["events"] = True
+            return
+        self._ordinals.add(ordinal)
+        self._events.append(
+            {
+                "ordinal": ordinal,
+                "stage": stage,
+                "family": reason.partition(" src/")[0].rstrip(),
+                "node": node,
+                "witness": witness,
+                "operands": list(operands),
+                "retention_summaries": list(states),
+                "provenance": "completed-original-consumer" if witness is not None else "partial-observation-or-unavailable",
+            }
+        )
+
+    def end(self, failures):
+        unit, node, parents, start = self._context
+
+        def publish(records):
+            return [
+                {
+                    **record,
+                    "expression": self.locator(unit, record["expression"], parents),
+                    "use": self.locator(unit, record["use"], parents),
+                }
+                for record in records
+            ]
+
+        for index in range(start, len(failures)):
+            if index + 1 in self._ordinals:
+                continue
+            if len(self._events) >= self._limits["events"]:
+                self._truncated["events"] = True
+                break
+            reason = failures[index]
+            family = reason.partition(" src/")[0].rstrip()
+            # Only retained events publish locators. The actual failed root
+            # comes first, followed by its completed witness and observations.
+            root = self.locator(unit, node, parents)
+            witness = self._pending.get(family)
+            if witness is not None:
+                witness = {**witness, "reads": publish(witness["reads"])}
+            operands = publish(self._operands)
+            states = publish(self._states.values())
+            for limit, truncated in self._buffer_truncated.items():
+                self._truncated[limit] |= truncated
+            self._event(
+                index + 1,
+                reason,
+                stage="origin-owner",
+                node=root,
+                witness=witness,
+                operands=operands,
+                states=states,
+            )
+        self._context = None
+        self._pending, self._states, self._operands = {}, {}, []
+        self._buffer_truncated = {}
+
+    def finish(self, stage, failures, start=0):
+        self._stages.append({"name": stage, "first_ordinal": start + 1, "count": len(failures) - start})
+        for index in range(start, len(failures)):
+            self._event(index + 1, failures[index], stage=stage)
+
+    def protected_use(self, unit, node, parents, record):
+        if len(self._uses) >= self._limits["uses"]:
+            self._truncated["uses"] = True
+            return
+        # Keep bounded primitive metadata for this supplemental view. It
+        # cannot allocate from, or retain parent maps for, the failure pool.
+        key = id(unit), id(node)
+        if key not in self._use_nodes:
+            metadata = self._locator_metadata(unit, node, parents, truncation="protected_nodes")
+            if metadata is not None:
+                self._use_nodes[key] = metadata
+        self._uses.append(
+            {
+                "node_key": key,
+                "origin": self._origin(record[2]),
+                "consumer_kind": record[3],
+                "load_role": record[6],
+                "source": "existing-filtered-protected-use-record",
+            }
+        )
+
+    def report(self, failures):
+        # Supplemental links use only the remaining published node capacity.
+        # They never enter self._nodes, so an earlier report cannot consume
+        # capacity needed by a later actual failure.
+        nodes, use_ids, uses = dict(self._nodes), {}, []
+        for record in self._uses:
+            key = record["node_key"]
+            token = self._node_ids.get(key) or use_ids.get(key)
+            if token is None and key in self._use_nodes:
+                if len(nodes) < self._limits["nodes"]:
+                    token = "p" + str(len(use_ids))
+                    use_ids[key] = token
+                    nodes[token] = self._use_nodes[key]
+                else:
+                    self._truncated["protected_nodes"] = True
+            uses.append({name: value for name, value in record.items() if name != "node_key"} | {"node": token})
+        return {
+            "schema": "source-origin-observation-v1",
+            "admission_receipt": False,
+            "failure_count": len(failures),
+            "provenance_complete": False,
+            "complete": len(self._ordinals) == len(failures) and not any(self._truncated.values()),
+            "unobserved_failures": len(failures) - len(self._ordinals),
+            "events": sorted(self._events, key=lambda event: event["ordinal"]),
+            "nodes": nodes,
+            "protected_uses": uses,
+            "stages": self._stages,
+            "truncated": self._truncated,
+            "limitations": [
+                "Representative completed branches only; not an exhaustive producer graph.",
+                "Unqualified origin identities, source literals and runtime DATA are omitted.",
+                "Missing original-node/producer provenance is unavailable; coordinates never grant equivalence.",
+                "Alternative retention summaries are not simultaneous branch choices.",
+                "Supplemental protected-use links use only remaining node capacity after failure publication.",
+            ],
+        }
+
+
+def _reserve_diagnostic_origin(diagnostics, value, use, origin, role=None):
+    if diagnostics is not None:
+        diagnostics.operand(value, use, origin, role=role)
+    return origin
+
+
+def _reserve_diagnostic_predicate(diagnostics, value, use, result):
+    if diagnostics is not None:
+        diagnostics.operand(value, use, None, role="guarded-instance-predicate-origin-unavailable", predicate=result)
+    return result
+
+
 def _reserve_selected_origin_effect_failures(
     units,
     extra_roots=frozenset(),
@@ -8443,6 +11071,7 @@ def _reserve_selected_origin_effect_failures(
     validated_supplier_uses=frozenset(),
     validated_supplier_arguments=frozenset(),
     validated_immediate_lambdas=frozenset(),
+    origin_diagnostics=None,
 ):
     """Find source-visible effects on the finite coordinator/dispatch roots.
 
@@ -8708,7 +11337,8 @@ def _reserve_selected_origin_effect_failures(
         | control_disclosure["roots"]
         | control_options["roots"]
     )
-    new_supplier_roots = (set(additional_supplier_roots) | supplier_role_dependencies) - selected
+    supplier_fact_roots = set(additional_supplier_roots) | supplier_role_dependencies
+    new_supplier_roots = supplier_fact_roots - selected
     selected |= set(additional_supplier_roots) | supplier_role_dependencies
     modules = {}
     for unit in units:
@@ -9006,74 +11636,16 @@ def _reserve_selected_origin_effect_failures(
         if additional_supplier_roots
         else {}
     )
-    for qualified in sorted(selected):
-        if qualified in modules or "." not in qualified:
-            continue
-        owner_module, name = qualified.rsplit(".", 1)
-        owner_unit = modules.get(owner_module)
-        if owner_unit is None:
-            continue
-
-        def bound_names(statement):
-            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                return [statement.name]
-            if isinstance(statement, ast.Assign):
-                return [target.id for target in statement.targets if isinstance(target, ast.Name)]
-            if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                return [statement.target.id]
-            if isinstance(statement, ast.Import):
-                return [alias.asname or alias.name.partition(".")[0] for alias in statement.names]
-            if isinstance(statement, ast.ImportFrom):
-                return [alias.asname or alias.name for alias in statement.names]
-            return []
-
-        definition = [statement for statement in owner_unit.tree.body if name in bound_names(statement)]
-        if len(definition) != 1:
-            source_bindings.append("selected owned origin has no unique source producer " + qualified)
-            continue
-        canonical = definition[0]
-        canonical_stores = {
-            id(target)
-            for target in (
-                canonical.targets
-                if isinstance(canonical, ast.Assign)
-                else [canonical.target]
-                if isinstance(canonical, ast.AnnAssign)
-                else []
-            )
-            if isinstance(target, ast.Name) and target.id == name
-        }
-        for node in ast.walk(owner_unit.tree):
-            if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)):
-                reviewed_recovery_store = (
-                    owner_module == recovery_module
-                    and name in recovery_cell_names
-                    and isinstance(node.ctx, ast.Store)
-                    and id(node) in recovery_store_ids
-                )
-                if id(node) not in canonical_stores and not reviewed_recovery_store:
-                    source_bindings.append("selected owned origin rebound or deleted " + qualified + ":" + str(node.lineno))
-            if (
-                isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                and node is not canonical
-                and name in bound_names(node)
-            ):
-                source_bindings.append("selected owned origin redeclared " + qualified + ":" + str(node.lineno))
-            if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
-                reviewed_recovery_global = (
-                    owner_module == recovery_module
-                    and name in recovery_cell_names
-                    and isinstance(node, ast.Global)
-                    and id(node) in recovery_global_ids
-                )
-                if not reviewed_recovery_global:
-                    source_bindings.append("selected owned origin scope declaration " + qualified + ":" + str(node.lineno))
-            if isinstance(node, ast.ExceptHandler) and node.name == name:
-                source_bindings.append("selected owned origin exception rebinding " + qualified + ":" + str(node.lineno))
-            if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name == name:
-                source_bindings.append("selected owned origin match rebinding " + qualified + ":" + str(node.lineno))
-            if isinstance(node, ast.MatchMapping) and node.rest == name:
-                source_bindings.append("selected owned origin match rest rebinding " + qualified + ":" + str(node.lineno))
+    source_bindings.extend(
+        _reserve_owned_source_binding_failures(
+            modules,
+            selected,
+            recovery_module=recovery_module,
+            recovery_cell_names=recovery_cell_names,
+            recovery_store_ids=recovery_store_ids,
+            recovery_global_ids=recovery_global_ids,
+        )
+    )
     protected_attribute_names = {q.rsplit(".", 1)[-1] for q in selected if q not in modules and "." in q}
 
     def from_module(module, unit, level, name):
@@ -9197,9 +11769,12 @@ def _reserve_selected_origin_effect_failures(
             members.add(statement.targets[0].id)
         return members or None
 
+    # A supplier can already be protected by another receipt. Its checked role
+    # facts still need construction; incremental first-class policy below keeps
+    # using new_supplier_roots, and no arbitrary selected root gains these facts.
     # Denial-only retained identities; never extra authority or namespace grants.
     supplier_enum_classes = {
-        qualified: members for qualified in new_supplier_roots if (members := supplier_enum_members(qualified)) is not None
+        qualified: members for qualified in sorted(supplier_fact_roots) if (members := supplier_enum_members(qualified)) is not None
     }
     supplier_data_classes = {
         qualified
@@ -9208,8 +11783,9 @@ def _reserve_selected_origin_effect_failures(
         if owner_module in modules and isinstance(_reserve_node_at(modules[owner_module], name), ast.ClassDef)
     }
     supplier_enum_record_fields = {}
+    record_fact_failures = list(prompt_part_record["failures"])
     enum_record_owner = "elspeth.contracts.plugin_capabilities.CapabilityDeclaration"
-    if enum_record_owner in new_supplier_roots:
+    if enum_record_owner in supplier_fact_roots:
         owner_module, _, name = enum_record_owner.rpartition(".")
         source = modules.get(owner_module)
         cls = _reserve_node_at(source, name) if source is not None else None
@@ -9224,7 +11800,9 @@ def _reserve_selected_origin_effect_failures(
             and owner_module + ".PluginCapability" in supplier_enum_classes
             and owner_module + ".ControlRole" in supplier_enum_classes
         ):
-            unresolved.append("retained enum carrier constructor/field contract changed " + enum_record_owner)
+            failure = "retained enum carrier constructor/field contract changed " + enum_record_owner
+            unresolved.append(failure)
+            record_fact_failures.append(failure)
         else:
             supplier_enum_record_fields[enum_record_owner] = {
                 "capability": ("enum-value", owner_module + ".PluginCapability"),
@@ -9235,9 +11813,27 @@ def _reserve_selected_origin_effect_failures(
     if prompt_part_record["record"] is not None:
         trust_owner = "elspeth.contracts.prompt_guard.PromptGuardTrust"
         if trust_owner not in supplier_enum_classes:
-            unresolved.append("prompt part actual trust enum supplier is not closed")
+            failure = "prompt part actual trust enum supplier is not closed"
+            unresolved.append(failure)
+            record_fact_failures.append(failure)
         else:
             supplier_enum_record_fields[prompt_part_record["record"]] = prompt_part_record["fields"]
+
+    published_records = {
+        origin[1]
+        for receipt in (prompt_renderer, schema_capability)
+        for origin in receipt["origins"].values()
+        if origin[0] in {"enum-record", "enum-record-sequence"}
+    }
+    if prompt_arguments["owner"] is not None:
+        published_records.add(prompt_arguments["record"])
+    for qualified in sorted(published_records - supplier_enum_record_fields.keys()):
+        record_fact_failures.append("retained enum record fact domain is unclosed " + qualified)
+    if record_fact_failures:
+        # Invalid record prerequisites cannot publish partial facts to a graph
+        # consumer. Preserve all earlier reasons and fail the proof explicitly;
+        # neither a missing field nor unknown source is a scalar/empty success.
+        return sorted(set(unresolved) | set(record_fact_failures))
 
     metadata_selectors = {
         "__annotations__",
@@ -9776,6 +12372,7 @@ def _reserve_selected_origin_effect_failures(
             or (origin[0] == "module" and origin[1] in selected_module_names())
         ):
             continue
+        annotation_nonwrites = _reserve_annotation_only_nonwrites(owner_unit, bound)
         events = [
             node
             for node in owner_unit.tree.body
@@ -9789,7 +12386,7 @@ def _reserve_selected_origin_effect_failures(
                     isinstance(node, ast.AnnAssign)
                     and isinstance(node.target, ast.Name)
                     and node.target.id == bound
-                    and (node.value is not None or origin != ("object", "dataclasses.field"))
+                    and id(node.target) not in annotation_nonwrites
                 )
             )
         ]
@@ -9818,7 +12415,7 @@ def _reserve_selected_origin_effect_failures(
             )
             if isinstance(target, ast.Name) and target.id == bound
         }
-        local_supplier_stores = _reserve_dataclass_field_local_stores(owner_unit, bound, origin)
+        local_supplier_stores = _reserve_dataclass_field_local_stores(owner_unit, bound, origin) | frozenset(annotation_nonwrites)
         if (
             origin[0] in retained_supplier_kinds
             and isinstance(events[0], (ast.Assign, ast.AnnAssign))
@@ -9921,6 +12518,13 @@ def _reserve_selected_origin_effect_failures(
 
     for module, unit in modules.items():
         parents = {id(child): node for node in ast.walk(unit.tree) for child in ast.iter_child_nodes(node)}
+
+        @cache
+        def retained_read_scopes(value, bound, *, parents=parents):
+            # These consumers already exhaust the helper. Cache completed
+            # structural tuples only; first-scope readers below remain lazy.
+            return tuple(_reserve_dataclass_field_read_scopes(value, bound, parents))
+
         parent_fields = {
             id(child): (node, field)
             for node in ast.walk(unit.tree)
@@ -10139,8 +12743,9 @@ def _reserve_selected_origin_effect_failures(
             unit=unit,
             retained_iteration_stores=retained_iteration_stores,
             retained_iteration_targets=retained_iteration_targets,
+            retained_read_scopes=retained_read_scopes,
         ):
-            scopes = list(_reserve_dataclass_field_read_scopes(value, value.id, parents))
+            scopes = list(retained_read_scopes(value, value.id))
             scopes.append(unit.tree)
             for scope in scopes:
                 key = (id(scope), value.id)
@@ -10203,9 +12808,16 @@ def _reserve_selected_origin_effect_failures(
                     retained_destructure_assignments.setdefault((id(scope), retained_leaf.id), []).append(retained_assignment)
 
         def retained_destructure_binding(
-            value, use, seen, *, parents=parents, unit=unit, retained_destructure_assignments=retained_destructure_assignments
+            value,
+            use,
+            seen,
+            *,
+            parents=parents,
+            unit=unit,
+            retained_destructure_assignments=retained_destructure_assignments,
+            retained_read_scopes=retained_read_scopes,
         ):
-            scopes = list(_reserve_dataclass_field_read_scopes(value, value.id, parents))
+            scopes = list(retained_read_scopes(value, value.id))
             scopes.append(unit.tree)
             for scope in scopes:
                 key = (id(scope), value.id)
@@ -10817,24 +13429,33 @@ def _reserve_selected_origin_effect_failures(
             return current
 
         @cache
+        def instance_scope_directives(scope):
+            """Every ``global``/``nonlocal`` this compiler scope itself declares, by name, from one walk."""
+            directives = {}
+            for node in ast.walk(scope):
+                if isinstance(node, (ast.Global, ast.Nonlocal)) and enclosing_instance_scope(node) is scope:
+                    for declared in node.names:
+                        directives.setdefault(declared, set()).add(type(node))
+            return {declared: frozenset(kinds) for declared, kinds in directives.items()}
+
         def instance_scope_directive(scope, name):
-            return frozenset(
-                type(node)
-                for node in ast.walk(scope)
-                if isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names and enclosing_instance_scope(node) is scope
-            )
+            return instance_scope_directives(scope).get(name, frozenset())
 
         @cache
-        def instance_binders(scope, name, *, parents=parents, instance_scopes=instance_scopes):
-            """Find every binder in this compiler scope, including nested branches.
+        def instance_binder_index(scope, *, parents=parents, instance_scopes=instance_scopes):
+            """Every binder in this compiler scope, by bound name, from one walk.
 
             A nested function's stores do not bind its enclosing module.  A
             branch store does bind that module even if the branch is not the
-            direct child of its statement list.
+            direct child of its statement list.  Each name's binders keep the
+            ``ast.walk`` order a per-name walk would produce, so a lookup equals
+            the former per-(scope, name) re-walk exactly; only the repetition is
+            gone (U-46: 37,794 such walks cost 112M node visits per run).
             """
-            bindings = []
+            index = {}
             for node in ast.walk(scope):
-                if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del)):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                    name = node.id
                     lexical = enclosing_instance_scope(node)
                     if lexical is not scope and not (
                         isinstance(lexical, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -10853,14 +13474,20 @@ def _reserve_selected_origin_effect_failures(
                             owner = None
                             break
                         owner = parents.get(id(owner))
-                    bindings.append((node, owner.value if owner is not None and isinstance(node.ctx, ast.Store) else None))
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+                    index.setdefault(name, []).append(
+                        (node, owner.value if owner is not None and isinstance(node.ctx, ast.Store) else None)
+                    )
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     if enclosing_instance_scope(node) is scope:
-                        bindings.append((node, None))
+                        index.setdefault(node.name, []).append((node, None))
                 elif isinstance(node, (ast.Import, ast.ImportFrom)) and enclosing_instance_scope(node) is scope:
-                    if any((alias.asname or alias.name.split(".", 1)[0]) == name for alias in node.names):
-                        bindings.append((node, None))
-            return tuple(bindings)
+                    for bound in dict.fromkeys(alias.asname or alias.name.split(".", 1)[0] for alias in node.names):
+                        index.setdefault(bound, []).append((node, None))
+            return {name: tuple(bindings) for name, bindings in index.items()}
+
+        def instance_binders(scope, name):
+            """Find every binder of ``name`` in this compiler scope, including nested branches."""
+            return instance_binder_index(scope).get(name, ())
 
         def guarded_constructed_instance(value, use, seen=frozenset(), *, parents=parents, unit=unit):
             """Find an owned protected instance before an argument/formal transfer."""
@@ -11930,6 +14557,21 @@ def _reserve_selected_origin_effect_failures(
             "traces": [],
             "inputs": (module, unit, parents, retained_enum_kinds),
         }
+        retained_root_budget = {"evaluations": 0, "consumer_evaluations": None}
+
+        def retained_budgeted_root(node, evaluate, conservative, *, unit=unit, parents=parents, retained_root_budget=retained_root_budget):
+            """Run one retention root under a fresh evaluation count; over budget is fail-closed.
+
+            The count restarts here and nowhere else. An over-budget root returns
+            ``conservative`` (the retained answer) and adds its named failure row;
+            the unwound frames publish nothing because none of them completed.
+            """
+            retained_root_budget["evaluations"] = 0
+            try:
+                return evaluate()
+            except _RetentionBudgetExceeded:
+                unresolved.append(f"retention budget exceeded at {unit.path}:{_reserve_origin_failure_line(unit, node, parents)}")
+                return conservative
 
         def retained_path_contains(identity, seen, *, memo=retained_context_memo):
             if memo["traces"]:
@@ -11965,6 +14607,7 @@ def _reserve_selected_origin_effect_failures(
             parents=parents,
             retained_enum_kinds=retained_enum_kinds,
             memo=retained_context_memo,
+            retained_root_budget=retained_root_budget,
         ):
             """Direct origin plus conservative retention, never an admission.
 
@@ -12000,6 +14643,10 @@ def _reserve_selected_origin_effect_failures(
                             traces[-1]["footprint"].update(footprint)
                         return result
             initial_seen = seen
+            if _RETENTION_ROOT_EVALUATION_BUDGET is not None:
+                retained_root_budget["evaluations"] += 1
+                if retained_root_budget["evaluations"] > _RETENTION_ROOT_EVALUATION_BUDGET:
+                    raise _RetentionBudgetExceeded
             trace = {"footprint": set(), "eligible": eligible}
             traces.append(trace)
             completed = None
@@ -12194,11 +14841,330 @@ def _reserve_selected_origin_effect_failures(
                     else:
                         memo["previous_entries"][key] = (entries[key], displaced)
 
-        # Completed empty-path queries only. Recursive calls retain their own
-        # seen paths and never consult this fresh per-unit/pass cache.
         @cache
-        def retained_empty_root_state(value, *, read_target=False, evaluate=retained_enum_state):
-            return evaluate(value, frozenset(), read_target=read_target)
+        def retained_capture_inputs(
+            owner, *, retained_name_producers=retained_name_producers, retained_callable_defaults=retained_callable_defaults
+        ):
+            local_scope_ids = {id(node) for node in ast.walk(owner)}
+            inputs = [default for _, default in retained_callable_defaults(owner)]
+            bodies = [owner.body] if isinstance(owner, ast.Lambda) else owner.body
+            for body in bodies:
+                for child in ast.walk(body):
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                        binding_scope, _producers = retained_name_producers(child)
+                        if binding_scope not in local_scope_ids:
+                            inputs.append(child)
+            return tuple(dict.fromkeys(inputs))
+
+        @cache
+        def retained_producer_specs(
+            value,
+            *,
+            module=module,
+            unit=unit,
+            parents=parents,
+            retained_name_producers=retained_name_producers,
+            retained_callable_defaults=retained_callable_defaults,
+            scoped_expression=scoped_expression,
+        ):
+            """Static producer rules: (mapping, input nodes, fixed origin)."""
+            _scope, producers = retained_name_producers(value)
+            specs = []
+            for producer in producers:
+                if isinstance(producer, ast.arg):
+                    owner = parents.get(id(producer))
+                    while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        owner = parents.get(id(owner))
+                    defaults = (
+                        ()
+                        if owner is None
+                        else tuple(default for formal, default in retained_callable_defaults(owner) if formal is producer)
+                    )
+                    specs.append(("formal", tuple((default, False, False) for default in defaults), scoped_expression(value, value)))
+                elif isinstance(producer, ast.Import):
+                    alias = next(alias for alias in producer.names if (alias.asname or alias.name.split(".", 1)[0]) == value.id)
+                    specs.append(("fixed", (), ("module", alias.name if alias.asname else alias.name.split(".", 1)[0])))
+                elif isinstance(producer, ast.ImportFrom):
+                    alias = next(alias for alias in producer.names if (alias.asname or alias.name) == value.id)
+                    target = from_module(module, unit, producer.level, producer.module)
+                    origin = None if target is None else bindings.get((target, alias.name))
+                    if target is not None and target + "." + alias.name in modules:
+                        origin = ("module", target + "." + alias.name)
+                    specs.append(("fixed", (), origin))
+                elif isinstance(producer, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    top_level = parents.get(id(producer)) is unit.tree
+                    origin = expression(module, value) if top_level else None
+                    inputs = []
+                    if isinstance(producer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        inputs.extend((default, False, False) for _, default in retained_callable_defaults(producer))
+                        if not top_level:
+                            inputs.append((producer, False, True))
+                    elif not top_level:
+                        inputs.append((producer, False, False))
+                    specs.append(("fixed", tuple(inputs), origin))
+                elif isinstance(producer, ast.ExceptHandler):
+                    specs.append(("fixed", (), None))
+                elif isinstance(producer, (ast.MatchAs, ast.MatchStar, ast.MatchMapping)):
+                    owner = parents.get(id(producer))
+                    while owner is not None and not isinstance(owner, ast.Match):
+                        owner = parents.get(id(owner))
+                    specs.append(("value", ((owner.subject if owner is not None else None, False, False),), None))
+                else:
+                    owner = parents.get(id(producer))
+                    while owner is not None and not isinstance(
+                        owner,
+                        (
+                            ast.Assign,
+                            ast.AnnAssign,
+                            ast.AugAssign,
+                            ast.NamedExpr,
+                            ast.For,
+                            ast.AsyncFor,
+                            ast.comprehension,
+                            ast.withitem,
+                            ast.Module,
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.Lambda,
+                        ),
+                    ):
+                        owner = parents.get(id(owner))
+                    source = None
+                    iteration = isinstance(owner, (ast.For, ast.AsyncFor, ast.comprehension))
+                    if isinstance(owner, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                        source = owner.value
+                    elif iteration:
+                        source = owner.iter
+                    elif isinstance(owner, ast.withitem):
+                        source = owner.context_expr
+                    specs.append(("iteration" if iteration else "value", ((source, False, False),), None))
+            return tuple(specs)
+
+        def retained_dependencies(key, *, retained_capture_inputs=retained_capture_inputs, retained_producer_specs=retained_producer_specs):
+            value, read_target, capture = key
+            if value is None:
+                return ()
+            if capture:
+                return tuple((child, False, False) for child in retained_capture_inputs(value))
+            if isinstance(value, ast.Name):
+                if not isinstance(value.ctx, ast.Load) and not read_target:
+                    return ()
+                return tuple(child for _kind, inputs, _origin in retained_producer_specs(value) for child in inputs)
+            if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return ((value, False, True),)
+            if isinstance(value, ast.Lambda):
+                return ((value, False, True), (value.body, False, False))
+            if isinstance(value, ast.Attribute):
+                return ((value.value, False, False),)
+            if isinstance(value, ast.Call):
+                return tuple((child, False, False) for child in (value.func, *value.args, *(keyword.value for keyword in value.keywords)))
+            return tuple((child, False, False) for child in ast.iter_child_nodes(value))
+
+        def retained_transfer(
+            key,
+            states,
+            acyclic,
+            *,
+            module=module,
+            retained_enum_kinds=retained_enum_kinds,
+            retained_producer_specs=retained_producer_specs,
+            retained_capture_inputs=retained_capture_inputs,
+            scoped_expression=scoped_expression,
+            retained_iteration_element=retained_iteration_element,
+        ):
+            value, read_target, capture = key
+            State = _reserve_retention.RetentionState
+
+            def state(child, *, capture=False):
+                return states[child, False, capture]
+
+            def protected(origins):
+                return any(origin is not None and origin[0] in retained_enum_kinds for origin in origins)
+
+            def exact(result, predicate):
+                return result.acyclic and len(result.origins) == 1 and predicate(next(iter(result.origins)))
+
+            if value is None or (isinstance(value, ast.Name) and not isinstance(value.ctx, ast.Load) and not read_target):
+                return State(frozenset({None}), False, acyclic)
+            if capture:
+                return State(frozenset({None}), any(state(child).retained for child in retained_capture_inputs(value)), acyclic)
+            if isinstance(value, ast.Name):
+                specs = retained_producer_specs(value)
+                if not specs:
+                    origin = expression(module, value)
+                    return State(frozenset({origin}), protected({origin}), acyclic)
+                origins = set()
+                retained = False
+                for kind, inputs, origin in specs:
+                    input_states = [states[child] for child in inputs]
+                    retained = retained or any(result.retained for result in input_states)
+                    if kind == "formal":
+                        if input_states:
+                            defaults = {element for result in input_states for element in result.origins}
+                            origins.update(default if origin is None or origin[0] == "unknown" else origin for default in defaults)
+                        else:
+                            origins.add(origin)
+                        retained = retained or protected({origin})
+                    elif kind == "fixed":
+                        origins.add(origin)
+                        # Function/class producer retention is exactly its
+                        # defaults/captures, as in the reference DFS.
+                        if not inputs:
+                            retained = retained or protected({origin})
+                    else:
+                        origins.update(
+                            retained_iteration_element(element) if kind == "iteration" else element
+                            for result in input_states
+                            for element in result.origins
+                        )
+                if acyclic:
+                    origins = {next(iter(origins)) if len(origins) == 1 else None}
+                elif len(specs) > 1 and len(origins) > 1:
+                    # Distinct producers can make the DFS uniqueness join
+                    # return None even when no producer itself returned None.
+                    # This alternative is needed downstream of an SCC too.
+                    origins.add(None)
+                return State(frozenset(origins), retained, acyclic)
+            if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                retained = state(value, capture=True).retained
+                if isinstance(value, ast.Lambda):
+                    retained = retained or state(value.body).retained
+                return State(frozenset({None}), retained, acyclic)
+            if isinstance(value, ast.Attribute):
+                base = state(value.value)
+                origins = set()
+                for element in base.origins:
+                    origin = retained_supplier_attribute(element, value.attr)
+                    if origin is None and element is not None and element[0] == "module":
+                        target = element[1] + "." + value.attr
+                        origin = bindings.get((element[1], value.attr))
+                        if origin is None and target in selected:
+                            origin = ("object", target)
+                        if target in modules:
+                            origin = ("module", target)
+                    origins.add(origin)
+                scalar = exact(
+                    base,
+                    lambda _origin: len(origins) == 1 and next(iter(origins)) is not None and next(iter(origins))[0] == "supplier-scalar",
+                )
+                return State(frozenset(origins), False if scalar else base.retained or protected(origins), acyclic)
+            if isinstance(value, ast.Call):
+                callee = state(value.func)
+                origins = set()
+                static_callee = scoped_expression(value.func, value)
+                static_call = scoped_expression(value, value)
+                for element in callee.origins:
+                    origin = None
+                    if element is not None and element[0] == "object":
+                        if element[1] in supplier_enum_classes:
+                            origin = ("enum-value", element[1])
+                        elif element[1] in supplier_enum_record_fields:
+                            origin = ("enum-record", element[1])
+                    if element == static_callee and static_call is not None:
+                        origin = static_call
+                    origins.add(origin)
+                class_check = (
+                    exact(callee, lambda origin: origin in {("object", "builtins.isinstance"), ("object", "builtins.issubclass")})
+                    and len(value.args) == 2
+                    and not value.keywords
+                )
+                scalar_str = (
+                    exact(callee, lambda origin: origin == ("object", "builtins.str"))
+                    and len(value.args) == 1
+                    and not value.keywords
+                    and exact(state(value.args[0]), lambda origin: origin is not None and origin[0] == "enum-value")
+                )
+                if class_check or scalar_str:
+                    qualified = next(iter(callee.origins))[1]
+                    return State(frozenset({("supplier-scalar", qualified)}), False, acyclic)
+                static_scalar = exact(
+                    callee,
+                    lambda _origin: len(origins) == 1 and next(iter(origins)) is not None and next(iter(origins))[0] == "supplier-scalar",
+                )
+                retained = (
+                    False
+                    if static_scalar
+                    else (
+                        callee.retained
+                        or protected(origins)
+                        or any(state(argument).retained for argument in (*value.args, *(keyword.value for keyword in value.keywords)))
+                    )
+                )
+                return State(frozenset(origins), retained, acyclic)
+            origin = scoped_expression(value, value) if isinstance(value, ast.expr) else None
+            retained = protected({origin}) or any(state(child).retained for child in ast.iter_child_nodes(value))
+            return State(frozenset({origin}), retained, acyclic)
+
+        retention_graph = _reserve_retention.RetentionGraph(retained_dependencies, retained_transfer)
+
+        def retained_charge(*, retained_root_budget=retained_root_budget):
+            retained_root_budget["evaluations"] += 1
+            if retained_root_budget["consumer_evaluations"] is not None:
+                retained_root_budget["consumer_evaluations"] += 1
+                if (
+                    _RETENTION_ROOT_EVALUATION_BUDGET is not None
+                    and retained_root_budget["consumer_evaluations"] > _RETENTION_ROOT_EVALUATION_BUDGET
+                ):
+                    raise _RetentionConsumerBudgetExceeded
+            if _RETENTION_ROOT_EVALUATION_BUDGET is not None and retained_root_budget["evaluations"] > _RETENTION_ROOT_EVALUATION_BUDGET:
+                raise _RetentionBudgetExceeded
+
+        def retained_fixpoint_state(
+            value,
+            seen=frozenset(),
+            *,
+            read_target=False,
+            capture=False,
+            module=module,
+            unit=unit,
+            parents=parents,
+            retained_enum_kinds=retained_enum_kinds,
+            graph=retention_graph,
+            charge=retained_charge,
+            reference=retained_enum_state,
+            capture_reference=retained_callable_capture,
+            inputs=(module, unit, parents, retained_enum_kinds),
+        ):
+            # The graph is valid only for the fixed inputs that constructed it.
+            # Explicit semantic overrides/path cuts belong to differential
+            # probes and bypass every graph cache, retaining the old eligibility
+            # boundary. Ordinary proof roots always take the graph branch.
+            eligible = (
+                module is inputs[0]
+                and unit is inputs[1]
+                and parents is inputs[2]
+                and retained_enum_kinds is inputs[3]
+                and type(seen) is frozenset
+                and not seen
+                and type(read_target) is bool
+            )
+            if not eligible:
+                if capture:
+                    return _reserve_retention.RetentionState(frozenset({None}), capture_reference(value, seen), False)
+                origin, retained = reference(
+                    value,
+                    seen,
+                    read_target=read_target,
+                    module=module,
+                    unit=unit,
+                    parents=parents,
+                    retained_enum_kinds=retained_enum_kinds,
+                )
+                return _reserve_retention.RetentionState(frozenset({origin}), retained, False)
+            return graph.evaluate((value, read_target, capture), charge)
+
+        # Empty-path roots use the graph; the old DFS above is retained only as
+        # a bounded differential oracle for the reviewed soundness contract.
+        @cache
+        def retained_empty_root_state(value, *, read_target=False, evaluate=retained_fixpoint_state, reference=retained_enum_state):
+            return evaluate(value, read_target=read_target)
+
+        @cache
+        def retained_capture_root(value, *, evaluate=retained_fixpoint_state, reference=retained_callable_capture):
+            state = evaluate(value, capture=True)
+            if origin_diagnostics is not None:
+                origin_diagnostics.retention_state(value, value, None, state, capture=True)
+            return state.retained
 
         def retained_expression(value, use, *, read_target=False, retained_enum_kinds=retained_enum_kinds):
             """Original direct origin plus a denial-only nested-retention tag.
@@ -12208,16 +15174,28 @@ def _reserve_selected_origin_effect_failures(
             consumer predicate still decides its own permissible input roles.
             """
             original = scoped_expression(value, use)
-            direct, retained = retained_empty_root_state(value, read_target=read_target)
-            if retained:
-                if direct is not None and direct[0] in retained_supplier_kinds:
-                    return direct
-                return ("enum-compound", "unclosed nested enum retention")
-            if original is not None and original[0] in retained_enum_kinds:
-                # The lexical walk may prove an actual shadow or scalar member
-                # where the old nearest-function resolver followed an outer name.
-                return direct
-            return original
+            result = retained_budgeted_root(
+                value,
+                lambda: retained_empty_root_state(value, read_target=read_target),
+                _reserve_retention.RetentionState(frozenset({None}), True, False),
+            )
+            if origin_diagnostics is not None:
+                origin_diagnostics.retention_state(value, use, original, result, read_target=read_target)
+            origins = set()
+            for direct in result.origins:
+                branches = (result.retained,) if result.acyclic else ((False, True) if result.retained else (False,))
+                for retained in branches:
+                    if retained:
+                        origins.add(
+                            direct
+                            if direct is not None and direct[0] in retained_supplier_kinds
+                            else ("enum-compound", "unclosed nested enum retention")
+                        )
+                    elif original is not None and original[0] in retained_enum_kinds:
+                        origins.add(direct)
+                    else:
+                        origins.add(original)
+            return frozenset(origins)
 
         def class_check_binding_scope(value, *, parents=parents):
             """Actual execution namespace, not just the nearest function body."""
@@ -12464,7 +15442,9 @@ def _reserve_selected_origin_effect_failures(
                 retained_values = (retained_expression(node.value, node), retained_expression(node.target, node, read_target=True))
                 if any(origin is not None and origin[0] in retained_supplier_kinds for origin in retained_values):
                     return "retained supplier augmentation is unclosed "
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and retained_callable_capture(node):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and retained_budgeted_root(
+                node, lambda: retained_capture_root(node), True
+            ):
                 # An unclosed callable stores eager defaults/free captures
                 # even without a matching Return; importing it cannot erase
                 # their actual custody. No producer exception is added.
@@ -12799,9 +15779,36 @@ def _reserve_selected_origin_effect_failures(
             return None
 
         for node in ast.walk(unit.tree):
-            retained_effect = retained_supplier_effect(node)
-            if retained_effect is not None:
-                unresolved.append(retained_effect + unit.path + ":" + str(node.lineno))
+            if origin_diagnostics is not None:
+                origin_diagnostics.begin(unit, node, parents, len(unresolved))
+            retained_root_budget["consumer_evaluations"] = 0
+
+            def charge_combination(*, retained_root_budget=retained_root_budget):
+                retained_root_budget["consumer_evaluations"] += 1
+                if (
+                    _RETENTION_ROOT_EVALUATION_BUDGET is not None
+                    and retained_root_budget["consumer_evaluations"] > _RETENTION_ROOT_EVALUATION_BUDGET
+                ):
+                    raise _RetentionConsumerBudgetExceeded
+
+            def consumer(selected, node=node):
+                return retained_supplier_effect(node, retained_expression=selected)
+
+            if origin_diagnostics is not None:
+                consumer = origin_diagnostics.observe_consumer(consumer)
+            try:
+                retained_effects = _reserve_retention.consumer_combinations(
+                    consumer,
+                    retained_expression,
+                    charge_combination,
+                )
+            except (_RetentionBudgetExceeded, _RetentionConsumerBudgetExceeded):
+                unresolved.append(f"retention budget exceeded at {unit.path}:{_reserve_origin_failure_line(unit, node, parents)}")
+                retained_effects = ("retained supplier analysis budget exceeded ",)
+            finally:
+                retained_root_budget["consumer_evaluations"] = None
+            for retained_effect in retained_effects:
+                unresolved.append(retained_effect + unit.path + ":" + str(_reserve_origin_failure_line(unit, node, parents)))
             if (
                 class_recovery_candidate_sites is not None
                 and isinstance(node, ast.Call)
@@ -12825,6 +15832,8 @@ def _reserve_selected_origin_effect_failures(
                     class_recovery_candidate_sites.append((unit.path, id(node)))
             if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
                 field_origin = scoped_expression(node, node)
+                if origin_diagnostics is not None:
+                    origin_diagnostics.operand(node, node, field_origin, role="supplier-load")
                 if (
                     additional_supplier_roots
                     and field_origin == ("object", approval_class)
@@ -12929,6 +15938,8 @@ def _reserve_selected_origin_effect_failures(
                             protected_load_role(node),
                         )
                     )
+                    if origin_diagnostics is not None:
+                        origin_diagnostics.protected_use(unit, node, parents, protected_use_nodes[-1])
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 assigned = scoped_expression(node.value, node) if node.value is not None else None
                 if assigned is not None and assigned[0] == "instance" and assigned[1] in selected:
@@ -13052,7 +16063,12 @@ def _reserve_selected_origin_effect_failures(
                     unresolved.append("selected callable or module namespace capability escaped " + unit.path + ":" + str(node.lineno))
             if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and node.value is not None:
                 escaped = any(
-                    (origin := scoped_expression(child, child)) is not None
+                    (
+                        origin := _reserve_diagnostic_origin(
+                            origin_diagnostics, child, child, scoped_expression(child, child), "return-descendant"
+                        )
+                    )
+                    is not None
                     and (
                         origin == ("unknown", "protected-carrier")
                         or (
@@ -13085,7 +16101,12 @@ def _reserve_selected_origin_effect_failures(
                     return expression(module, child)
 
                 lambda_capture = any(
-                    (origin := captured_lambda_origin(nested, child)) is not None
+                    (
+                        origin := _reserve_diagnostic_origin(
+                            origin_diagnostics, child, nested, captured_lambda_origin(nested, child), "lambda-capture"
+                        )
+                    )
+                    is not None
                     and (
                         origin == ("unknown", "protected-carrier")
                         or (
@@ -13111,6 +16132,8 @@ def _reserve_selected_origin_effect_failures(
                     unresolved.append("selected capability escaped by return/yield " + unit.path + ":" + str(node.lineno))
             if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 base = scoped_expression(node.value, node)
+                if origin_diagnostics is not None:
+                    origin_diagnostics.operand(node.value, node, base, role="storage-receiver")
                 if (
                     base is not None
                     and base[0] == "unknown"
@@ -13146,6 +16169,8 @@ def _reserve_selected_origin_effect_failures(
                     unresolved.append("canonical supplier type alias namespace recovery " + unit.path + ":" + str(node.lineno))
             if isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
                 base = scoped_expression(node.value, node)
+                if origin_diagnostics is not None:
+                    origin_diagnostics.operand(node.value, node, base, role="mapping-storage-receiver")
                 if plugin_namespace(node.value) and (not isinstance(node.slice, ast.Constant) or node.slice.value == "PLUGIN_SCAN_CONFIG"):
                     unresolved.append("selected plugin namespace configuration replaced " + unit.path + ":" + str(node.lineno))
                 if base is not None and (
@@ -13179,7 +16204,8 @@ def _reserve_selected_origin_effect_failures(
                 ):
                     unresolved.append("field receiver allocation reflection " + unit.path + ":" + str(node.lineno))
                 if any(
-                    guarded_constructed_instance(argument, node) for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
+                    _reserve_diagnostic_predicate(origin_diagnostics, argument, node, guarded_constructed_instance(argument, node))
+                    for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                 ) and not normal_owned_carrier_call(node):
                     unresolved.append("guarded constructed instance transferred to unreviewed caller " + unit.path + ":" + str(node.lineno))
                 if protected_reflection_candidate_sites is not None and target in {
@@ -13286,7 +16312,8 @@ def _reserve_selected_origin_effect_failures(
                     and (unit.path, id(node)) not in validated_retained_failure_calls
                     and any(
                         (unit.path, id(node), id(argument)) not in validated_supplier_arguments
-                        and (origin := scoped_expression(argument, node)) is not None
+                        and (origin := _reserve_diagnostic_origin(origin_diagnostics, argument, node, scoped_expression(argument, node)))
+                        is not None
                         and (
                             (origin[0] == "module" and origin[1] in selected_modules)
                             or (origin[0] == "namespace" and origin[1] in selected_modules | selected)
@@ -13315,7 +16342,8 @@ def _reserve_selected_origin_effect_failures(
                     }
                     and any(
                         (unit.path, id(node), id(argument)) not in validated_supplier_arguments
-                        and (origin := scoped_expression(argument, node)) is not None
+                        and (origin := _reserve_diagnostic_origin(origin_diagnostics, argument, node, scoped_expression(argument, node)))
+                        is not None
                         and origin in {("object", owner), ("instance", owner)}
                         for argument in [*node.args, *(keyword.value for keyword in node.keywords)]
                         for owner in protected_owners
@@ -13403,10 +16431,14 @@ def _reserve_selected_origin_effect_failures(
                     for q in class_boundary_roots
                 ):
                     unresolved.append("selected class namespace preparation is unproved " + unit.path + ":" + str(node.lineno))
+            if origin_diagnostics is not None:
+                origin_diagnostics.end(unresolved)
     if (
         "elspeth.plugins.infrastructure.discovery" in modules or "elspeth.plugins.infrastructure.manager" in modules
     ) and plugin_call_counts != dict.fromkeys(plugin_call_edges, 1):
         unresolved.append("selected plugin binder call graph is incomplete")
+    if origin_diagnostics is not None:
+        origin_diagnostics.finish("origin-owner", unresolved)
     return unresolved
 
 
@@ -13574,18 +16606,21 @@ def _reserve_coordinator_self_slice_failures(units):
         "reserve_audit_work": 3,
         "begin_proposal_child": 1,
         "prepare_lease_release": 1,
+        "prepare_continuation_handoff": 1,
     }
     expected_caller_statements = {
         "reserve_pair": ((ast.With,), (ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Return)),
         "reserve_audit_work": ((ast.If, ast.With), (ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Return)),
         "begin_proposal_child": ((ast.With,), (ast.Assign, ast.If, ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Assign, ast.Return)),
         "prepare_lease_release": ((ast.With,), (ast.Expr, ast.Assign, ast.Assign, ast.Return)),
+        "prepare_continuation_handoff": ((ast.Expr, ast.With), (ast.Expr, ast.Assign, ast.Return)),
     }
     reviewed_caller_bodies = {
         "reserve_pair": "87444eef109f346dbeb7e45926c6efda56b9c82b16ee0319d5cb8873e1a308db",
         "reserve_audit_work": "7b44412590b0b5470ff318137bb6172c33103e106126edab36e65adba171d0c4",
         "begin_proposal_child": "ca288350d7bc6d5a2e41c24f295b9b2a62e5b46fa089d5e7c0ce4f85866a0611",
         "prepare_lease_release": "5b120824c33109580e3bce07bbf384636ca75bfde53089203bd8f3ebe756c9de",
+        "prepare_continuation_handoff": "ef41d227c12ee23e39955590f334aac7c811294e9fc68fabaa7e71ba5543da96",
     }
     observed_self_calls = {}
     for method in cls.body:
@@ -13627,6 +16662,10 @@ def _reserve_coordinator_self_slice_failures(units):
                 or method.args.posonlyargs
                 or method.args.vararg is not None
                 or method.args.kwarg is not None
+                or (
+                    method.name == "prepare_continuation_handoff"
+                    and (len(method.args.args) != 1 or method.args.kwonlyargs or method.args.defaults or method.args.kw_defaults)
+                )
             ):
                 return ["owned coordinator self reservation caller binding changed"]
             for part in ast.walk(method):
@@ -13653,7 +16692,7 @@ def _reserve_coordinator_self_slice_failures(units):
                 statement = parents.get(id(call))
                 locked = parents.get(id(statement)) if statement is not None else None
                 if (
-                    not isinstance(statement, ast.Assign)
+                    not isinstance(statement, ast.Return if method.name == "prepare_continuation_handoff" else ast.Assign)
                     or statement.value is not call
                     or not isinstance(locked, ast.With)
                     or len(locked.items) != 1
@@ -14741,14 +17780,20 @@ def _reserve_captured_composer_receiver(units, dto_read, compose_call):
 
 
 def _reserve_coordinator_self_call_receipts(units):
-    """Bind the seven internal reserve Calls to the original method receiver."""
+    """Bind every selected internal reserve Call to the original method receiver."""
     path = "src/elspeth/web/required_work.py"
     selected = [unit for unit in units if unit.path == path]
     if len(selected) != 1 or _reserve_coordinator_self_slice_failures(units):
         return ["owned coordinator receiver source is unqualified"], frozenset()
     unit = selected[0]
     owner = _reserve_node_at(unit, "RequiredWorkCoordinator")
-    expected = {"reserve_pair": 2, "reserve_audit_work": 3, "begin_proposal_child": 1, "prepare_lease_release": 1}
+    expected = {
+        "reserve_pair": 2,
+        "reserve_audit_work": 3,
+        "begin_proposal_child": 1,
+        "prepare_lease_release": 1,
+        "prepare_continuation_handoff": 1,
+    }
     if not isinstance(owner, ast.ClassDef):
         return ["owned coordinator receiver class is missing"], frozenset()
     found = set()
@@ -14792,13 +17837,109 @@ def _reserve_coordinator_self_call_receipts(units):
     return [], frozenset(found)
 
 
+_reserve_MANUAL_ALLOWANCE_SOURCE = '"""Process-local reservation ownership for one manual Advisor batch.\n\nOnly the spent count is retained by continuation state. A reservation belongs\nto one live call stage, and must close before that stage can be checkpointed.\nSynchronous reserve/dispatch/close operations make overlapping async callers\nshare the same backstop without acquiring permission from audit-buffer growth.\n"""\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass, field\nfrom typing import Literal\n\nfrom elspeth.contracts.errors import AuditIntegrityError\n\n\n@dataclass(slots=True)\nclass ManualAdvisorAllowance:\n    limit: int\n    used: int\n    _reserved: int = field(default=0, init=False, repr=False)\n    _active: int = field(default=0, init=False, repr=False)\n\n    def __post_init__(self) -> None:\n        if type(self.limit) is not int or type(self.used) is not int or self.limit < 0 or self.used < 0:\n            raise AuditIntegrityError("Manual Advisor allowance requires exact bounded accounting")\n\n    @property\n    def available(self) -> int:\n        # A lowered live policy cannot erase previously spent attempts.\n        return max(0, self.limit - self.used - self._reserved)\n\n    def reserve(self) -> ManualAdvisorReservation | None:\n        if self.available <= 0:\n            return None\n        self._reserved += 1\n        self._active += 1\n        return ManualAdvisorReservation(self)\n\n    def require_settled(self, *, used: int) -> None:\n        """A retained cut cannot erase live dispatch or refund obligations."""\n        if self._active != 0 or self._reserved != 0:\n            raise AuditIntegrityError("Manual Advisor allowance has an active reservation at the retained cut")\n        if type(used) is not int or self.used != used:\n            raise AuditIntegrityError("Manual Advisor allowance differs from its retained spent count")\n\n\n@dataclass(slots=True)\nclass ManualAdvisorReservation:\n    _owner: ManualAdvisorAllowance = field(repr=False)\n    _state: Literal["reserved", "dispatched", "closed"] = field(default="reserved", init=False)\n\n    def dispatch(self) -> None:\n        if self._state != "reserved" or self._owner._reserved <= 0:\n            raise AuditIntegrityError("Manual Advisor reservation cannot dispatch twice or after release")\n        self._owner._reserved -= 1\n        self._owner.used += 1\n        self._state = "dispatched"\n\n    def close(self) -> None:\n        if self._state == "closed":\n            raise AuditIntegrityError("Manual Advisor reservation closed twice")\n        if self._state == "reserved":\n            self._owner._reserved -= 1\n        self._owner._active -= 1\n        self._state = "closed"\n'
+
+
+def _reserve_manual_advisor_allowance_receipt(units):
+    """Classify one original manual allowance call, never required-work authority.
+
+    Complete local supplier/consumer bodies supplement the nominal receiver
+    chain. Cross-module binding and outside effects remain common premises.
+    """
+    path = "src/elspeth/web/composer/tool_batch.py"
+    supplier_path = "src/elspeth/web/composer/manual_advisor_allowance.py"
+    selected = {name: [unit for unit in units if unit.path == name] for name in (path, supplier_path)}
+    if any(len(found) != 1 for found in selected.values()):
+        return ["manual Advisor reservation source is missing or duplicated"], frozenset()
+    unit, supplier = selected[path][0], selected[supplier_path][0]
+    helper = _reserve_composer_receiver
+    if (
+        ast.dump(supplier.tree, include_attributes=False) != ast.dump(ast.parse(_reserve_MANUAL_ALLOWANCE_SOURCE), include_attributes=False)
+        or not helper.imported(supplier.tree, "dataclass", "dataclasses", "dataclass")
+        or not helper.imported(supplier.tree, "field", "dataclasses", "field")
+        or not helper.imported(supplier.tree, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError")
+        or not helper.imported(
+            unit.tree, "ManualAdvisorAllowance", "elspeth.web.composer.manual_advisor_allowance", "ManualAdvisorAllowance"
+        )
+    ):
+        return ["manual Advisor reservation canonical supplier changed"], frozenset()
+    for name in ("ManualAdvisorAllowance", "ManualAdvisorReservation"):
+        declaration = _reserve_node_at(supplier, name)
+        if not isinstance(declaration, ast.ClassDef) or not helper.owned_binding(supplier.tree, name, declaration):
+            return ["manual Advisor reservation class binding changed"], frozenset()
+    execute = _reserve_node_at(unit, "_execute_continuation_call_live")
+    source = ast.get_source_segment(unit.source, execute) if isinstance(execute, ast.AsyncFunctionDef) else None
+    if (
+        source is None
+        or not helper.owned_binding(unit.tree, "_execute_continuation_call_live", execute)
+        or hashlib.sha256(source.encode()).hexdigest() != _reserve_BATCH_HELPER_SOURCE_SHA256["_execute_continuation_call_live"]
+        or ast.dump(execute, include_attributes=False) != ast.dump(ast.parse(source).body[0], include_attributes=False)
+    ):
+        return ["manual Advisor reservation actual dispatch body changed"], frozenset()
+    parents = {id(child): parent for parent in ast.walk(execute) for child in ast.iter_child_nodes(parent)}
+    calls = [
+        node
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "reserve"
+    ]
+    if len(calls) != 1 or ast.unparse(calls[0]) != "allowance.reserve()" or id(calls[0]) not in parents:
+        return ["manual Advisor reservation exact original site inventory changed"], frozenset()
+    call = calls[0]
+    statement = parents[id(call)]
+    block = parents.get(id(statement))
+    if (
+        not isinstance(statement, ast.Assign)
+        or ast.unparse(statement) != "reservation = allowance.reserve()"
+        or not isinstance(block, ast.If)
+        or statement not in block.body
+    ):
+        return ["manual Advisor reservation actual receiver statement changed"], frozenset()
+    expected = (
+        "if batch.manual_advisor_allowance is None:\n"
+        "    batch.manual_advisor_allowance = ManualAdvisorAllowance(limit=budget, used=advisor_calls_used)",
+        "allowance = batch.manual_advisor_allowance",
+        "if type(allowance) is not ManualAdvisorAllowance:\n"
+        '    raise AuditIntegrityError("Manual Advisor admission lost its nominal allowance owner")',
+        'if allowance.limit != budget:\n    raise AuditIntegrityError("Manual Advisor allowance changed during its issued batch")',
+        "reservation = allowance.reserve()",
+        'if reservation is None:\n    raise AuditIntegrityError("Manual Advisor admission lost its reserved allowance")',
+    )
+    positions = []
+    for spelling in expected:
+        shape = ast.dump(ast.parse(spelling).body[0], include_attributes=False)
+        matches = [index for index, node in enumerate(block.body) if ast.dump(node, include_attributes=False) == shape]
+        if len(matches) != 1:
+            return ["manual Advisor reservation nominal receiver chain changed"], frozenset()
+        positions.append(matches[0])
+    if positions != sorted(positions):
+        return ["manual Advisor reservation nominal receiver order changed"], frozenset()
+    for name, index in (("allowance", positions[1]), ("reservation", positions[4])):
+        events = [(kind, node) for bound, kind, node in helper.lexical_binding_events(execute) if bound == name]
+        target = block.body[index].targets[0]
+        if events != [("STORE_OR_DELETE", target)] or not isinstance(target.ctx, ast.Store):
+            return ["manual Advisor reservation local receiver binding changed"], frozenset()
+    dispatches = [node for node in ast.walk(execute) if isinstance(node, ast.keyword) and node.arg == "on_provider_dispatch"]
+    finalizers = [
+        node
+        for node in ast.walk(execute)
+        if isinstance(node, ast.Try)
+        and [ast.unparse(item) for item in node.finalbody] == ["reservation.close()", "advisor_calls_used = allowance.used"]
+    ]
+    if len(dispatches) != 1 or ast.unparse(dispatches[0].value) != "reservation.dispatch" or len(finalizers) != 1:
+        return ["manual Advisor reservation physical dispatch or final close changed"], frozenset()
+    return [], frozenset({(path, id(call))})
+
+
 def _reserve_current_call_inventory(units):
     """Refuse any unaccounted production `.reserve` Call before graph admission."""
     expected_web = {
+        "src/elspeth/web/composer/continuation_initialization.py": 1,
+        "src/elspeth/web/composer/continuation_title_provider.py": 1,
         "src/elspeth/web/composer/provider_quota.py": 2,
         "src/elspeth/web/coordination/lifecycle.py": 2,
         "src/elspeth/web/operator_telemetry.py": 1,
-        "src/elspeth/web/required_work.py": 7,
+        "src/elspeth/web/required_work.py": 8,
+        "src/elspeth/web/composer/tool_batch.py": 1,
         "src/elspeth/web/sessions/composer_async_worker.py": 6,
         "src/elspeth/web/sessions/composer_turn.py": 1,
         "src/elspeth/web/sessions/routes/_helpers.py": 3,
@@ -14809,6 +17950,9 @@ def _reserve_current_call_inventory(units):
         "src/elspeth/engine/executors/sink_effects.py": ("self._effects",),
         "src/elspeth/core/landscape/execution/sink_effects.py": ("self._reservation", "self._reservation"),
     }
+    allowance_failures, allowance_calls = _reserve_manual_advisor_allowance_receipt(units)
+    if allowance_failures:
+        return allowance_failures, {}
     actual = {}
     other = {}
     for unit in units:
@@ -14830,6 +17974,8 @@ def _reserve_current_call_inventory(units):
         path: len(receivers) for path, receivers in expected_other.items()
     }:
         return ["selected Web reserve call inventory changed"], {}
+    if actual["src/elspeth/web/composer/tool_batch.py"] != allowance_calls:
+        return ["selected manual Advisor reserve identity changed"], {}
     return [], actual
 
 
@@ -15355,7 +18501,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "3d9707116754760383df627a49291c0a361f50771f0ab1d1fde711882500849e",
+            "26b51d11536da77f6136233c989200e587c8ec2de8790b831ff446078fb43aba",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",
@@ -15370,7 +18516,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/repository.py",
             "_SessionOperationAuthorityRepository",
-            "7b63c99fc4109fae3f8d95330be8344897b3a1f289f932da4f0bd98df69b4e67",
+            "4e4220e6c40a46fd744124c945d0f391534ba1838a1ce7fd6d9bd39e9eecf575",
         ),
         (
             "src/elspeth/web/coordination/repository.py",
@@ -15854,6 +19000,7 @@ class _ComposeIterationState:
     advisor_repair_context_introduced: bool
     pending_advisor_elision_indices: list[int]
     turn_evidence: TurnEvidence
+    continuation_cache_history: ContinuationCachesSnapshot | None = None
 """
 
 
@@ -15874,9 +19021,27 @@ class _ComposeIterationBindings:
     required_work: RequiredWorkBinding | None
     provider_owner: ProviderInvocationOwner | None
     ingress: CompositionIngressRecord | None
-    chat_ingress_inputs: list[ChatIngressInput] | None
+    chat_ingress_inputs: Sequence[ChatIngressInput] | None
     actor: str
-    session_scope: str"""
+    session_scope: str
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "chat_ingress_inputs")
+"""
+
+
+def _reserve_compose_iteration_method_source_failures(service):
+    """Share the exact selected source seals with the current prerequisite check."""
+    failures = []
+    for name, digest in (
+        ("_compose_loop", "06eb4d3415b5c64fc54b06d1c429d43b04555d1cf74a790a93febe4bda63ed47"),
+        ("_advance_live_compose_iteration", "3a371f34d4b68753fc8db8ef4937e8276c0bc3b520b5e288106a637b38f06498"),
+    ):
+        method = _reserve_node_at(service, "ComposerServiceImpl." + name)
+        source = ast.get_source_segment(service.source, method) if method is not None else None
+        if source is None or hashlib.sha256(source.encode("utf-8")).hexdigest() != digest:
+            failures.append("compose iteration reviewed method source changed " + name)
+    return failures
 
 
 def _reserve_compose_iteration_state_receipt(units):
@@ -15912,6 +19077,10 @@ def _reserve_compose_iteration_state_receipt(units):
     require(helper.owned_binding(service.tree, "ComposerServiceImpl", cls), "service class binding changed")
     require(helper.owned_binding(carrier.tree, "_ComposeIterationState", state_cls), "carrier class binding changed")
     require(helper.imported(carrier.tree, "dataclass", "dataclasses", "dataclass"), "dataclass supplier changed")
+    require(
+        helper.imported(carrier.tree, "freeze_fields", "elspeth.contracts.freeze", "freeze_fields"),
+        "bindings freeze supplier changed",
+    )
     require(helper.owned_binding(carrier.tree, "_ComposeIterationBindings", bindings_cls), "bindings class changed")
     require(
         helper.imported(
@@ -15970,7 +19139,15 @@ def _reserve_compose_iteration_state_receipt(units):
     )
     if failures:
         return failures, {}
-    fields = tuple(statement.target.id for statement in expected_class.body)
+    declared_fields = tuple(
+        statement.target.id
+        for statement in expected_class.body
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+    )
+    # The retained cache history is supplied during restoration and checked by
+    # continuation capture. Ordinary iterations carry and copy back live owners;
+    # the one exact defaulted history field is not one of those transfers.
+    fields = tuple(field for field in declared_fields if field != "continuation_cache_history")
     constructor_text = "iteration_state = _ComposeIterationState(" + ", ".join(field + "=" + field for field in fields) + ")"
     constructor_expected = ast.parse(constructor_text).body[0]
     constructor = loop.body[-3] if len(loop.body) >= 3 else None
@@ -15979,7 +19156,11 @@ def _reserve_compose_iteration_state_receipt(units):
         and ast.dump(constructor, include_attributes=False) == ast.dump(constructor_expected, include_attributes=False),
         "actual constructor or argument binding changed",
     )
-    bindings_fields = tuple(statement.target.id for statement in expected_bindings.body)
+    bindings_fields = tuple(
+        statement.target.id
+        for statement in expected_bindings.body
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+    )
     bindings_expected = ast.parse(
         "iteration_bindings = _ComposeIterationBindings(" + ", ".join(field + "=" + field for field in bindings_fields) + ")"
     ).body[0]
@@ -16087,24 +19268,20 @@ def _reserve_compose_iteration_state_receipt(units):
     # Source bindings close unmodeled reflective/stack effects in the selected
     # bodies. They supplement the constructor/argument/use proof above; they do
     # not authorize a writer, and other module effects remain common obligations.
-    for method, digest in (
-        (loop, "06eb4d3415b5c64fc54b06d1c429d43b04555d1cf74a790a93febe4bda63ed47"),
-        (advance, "3289a087cc1711bedb9ee148f001dee22ddb99900cea8556bdfe10b4ace43e96"),
-    ):
-        source = ast.get_source_segment(service.source, method)
-        require(
-            source is not None and hashlib.sha256(source.encode("utf-8")).hexdigest() == digest,
-            "reviewed method source changed " + method.name,
-        )
+    failures.extend(_reserve_compose_iteration_method_source_failures(service))
     if failures:
         return failures, {}
+    transfer_failures, transfers = _reserve_continuation_transfers.iteration_local_transfers(units)
+    if transfer_failures:
+        return transfer_failures, {}
     return [], {
         "carrier_origin": carrier_origin,
         "bindings_origin": bindings_origin,
         "method_origin": method_origin,
         "call": (service_path, id(call)),
         "state_write": (service_path, id(final[0].targets[0])),
-        "class_uses": frozenset(
+        "class_uses": transfers["class_uses"]
+        | frozenset(
             {
                 (service_path, id(constructor.value.func)),
                 (service_path, id(annotation)),
@@ -16112,47 +19289,12 @@ def _reserve_compose_iteration_state_receipt(units):
                 (service_path, id(bindings_annotation)),
             }
         ),
+        "additional_transfers": transfers,
     }
 
 
 _reserve_BATCH_CARRIER_SOURCES = {
-    "ContinuationBatchState": """@dataclass(slots=True)
-class ContinuationBatchState:
-    state: CompositionState
-    last_validation: ValidationSummary | None
-    last_runtime_preflight: ValidationResult | None
-    advisor_calls_used: int
-    entry_state: CompositionState
-    early_reviewed: bool = False
-    phase: Literal["uninitialized", "call_ready", "call_active", "dispatch_ready", "p4_pending", "p4_result_retained", "complete"] = (
-        "uninitialized"
-    )
-    next_tool_index: int = 0
-    assistant_message_index: int | None = None
-    mixed_abandonment_batch: bool = False
-    provider_model_version: str = ""
-    turn_has_mutation: bool = False
-    turn_has_discovery: bool = False
-    all_cache_hits: bool = True
-    tool_outcomes: list[_ToolOutcome] = field(default_factory=list)
-    plugin_crash: ComposerPluginCrashError | None = None
-    plugin_crash_cause: BaseException | None = None
-    advisor_failure: Exception | None = None
-    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
-    pre_state_id: str | None = None
-    decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)
-    private_authorings_by_call: dict[str, PrivateToolAuthoring] = field(default_factory=dict)
-    proposals_this_turn: int = 0
-    mutation_success_observed: bool = False
-    refused_resources: set[Resource] = field(default_factory=set)
-    promises_by_call: dict[str, frozenset[Resource]] = field(default_factory=dict)
-    current_call: ContinuationCallState | None = None
-    stop_issued_batch: bool = False
-    p4: _PersistOutcome | None = None
-    retained_failure: RetainedBatchFailure | None = None
-    p4_receipt_json: str | None = None
-    p4_input_json: str | None = None
-    p4_verification_failed: bool = False""",
+    "ContinuationBatchState": "@dataclass(slots=True)\nclass ContinuationBatchState:\n    state: CompositionState\n    last_validation: ValidationSummary | None\n    last_runtime_preflight: ValidationResult | None\n    advisor_calls_used: int\n    entry_state: CompositionState\n    early_reviewed: bool = False\n    phase: Literal['uninitialized', 'call_ready', 'call_active', 'dispatch_ready', 'p4_pending', 'p4_result_retained', 'complete'] = 'uninitialized'\n    next_tool_index: int = 0\n    assistant_message_index: int | None = None\n    mixed_abandonment_batch: bool = False\n    provider_model_version: str = ''\n    turn_has_mutation: bool = False\n    turn_has_discovery: bool = False\n    all_cache_hits: bool = True\n    tool_outcomes: list[_ToolOutcome] = field(default_factory=list)\n    plugin_crash: ComposerPluginCrashError | None = None\n    plugin_crash_cause: BaseException | None = None\n    advisor_failure: Exception | None = None\n    advisor_compose_timeout: Literal['pre_call', 'in_flight'] | None = None\n    pre_state_id: str | None = None\n    decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)\n    private_authorings_by_call: dict[str, PrivateToolAuthoring] = field(default_factory=dict)\n    proposals_this_turn: int = 0\n    mutation_success_observed: bool = False\n    refused_resources: set[Resource] = field(default_factory=set)\n    promises_by_call: dict[str, frozenset[Resource]] = field(default_factory=dict)\n    current_call: ContinuationCallState | None = None\n    stop_issued_batch: bool = False\n    p4: _PersistOutcome | None = None\n    retained_failure: RetainedBatchFailure | None = None\n    p4_receipt_json: str | None = None\n    p4_input_json: str | None = None\n    p4_verification_failed: bool = False\n    manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)",
     "ContinuationCallState": """@dataclass(slots=True)
 class ContinuationCallState:
     index: int
@@ -16254,10 +19396,10 @@ _reserve_BATCH_APPEND_SOURCE = """def _append_continuation_tool_outcome(
 _reserve_BATCH_FORWARD_SOURCE = "def _append_tool_outcome(\n    *,\n    response: Any,\n    error_class: str | None,\n    error_category: ToolArgumentErrorCategory | None,\n    error_message: str | None,\n    post_version: int,\n    _batch: ContinuationBatchState = batch,\n    _call: ContinuationCallState = call,\n) -> None:\n    _append_continuation_tool_outcome(\n        _batch,\n        _call,\n        response=response,\n        error_class=error_class,\n        error_category=error_category,\n        error_message=error_message,\n        post_version=post_version,\n    )"
 
 _reserve_BATCH_HELPER_SOURCE_SHA256 = {
-    "_initialize_continuation_batch_live": "5c7f83c17040d1879e229d4d78a154b8decd65bfec84508814a5416b1e6a33cd",
+    "_initialize_continuation_batch_live": "6dd1f94344edcdd450d1fa7be4b60bdbe7d8e5b6985949ca1e9876ca14d18a8e",
     "_append_continuation_tool_outcome": "55c932802c1fddcb5e7528caf267da6d762f7f8262d7b10a3de1697836fed8ab",
-    "_prepare_continuation_call_live": "162c835a368414b74312029c07f0ce939d3451290682d4487382f51d920812bb",
-    "_execute_continuation_call_live": "fa55d9405acb02014671ec6474cd1fc62e4b0c4c142844fefd39d668230d7c60",
+    "_prepare_continuation_call_live": "90f721d921e6221a3f92d97a428a7a67322ff331514d602041a4b56e9a37a88e",
+    "_execute_continuation_call_live": "585471212885e86f59748cbd1d7227dda3a4dcdc6ea85453c5743d2274229af9",
     "_finish_continuation_batch_live": "cf65f88ca2b6f35a2901ff6bf64c7ac55b9ae2db533c86c2ed2be33811dabf2a",
     "run_tool_batch": "3e83918fbd76fee553994ebe8eb5754a28f5feb9ea9eda9d7f2a7e137da9e0c3",
 }
@@ -16266,32 +19408,38 @@ _reserve_BATCH_HELPER_SOURCE_SHA256 = {
 _reserve_BATCH_DATA_BODY_SHA256 = {
     "RestoredBatchData": "946d0d5fa11663f241b6e573f900fde571dd3937b9200dd7feb035b7665f7665",
     "RestoredPreparedBatchData": "a936b775ccf192e2ff2cd65575d1a432203f3e057ab2a9f948e966e9572be273",
+    "RestoredMemoryCompletionBatchData": "01dc03518187f6a5712e33c12df44e0eaa31383d3d220829d2357e83ed7e41e7",
     "_fail": "a27ce096047d2ae619e47a5bfb37b8d0a4c962644124088721a796541dd2f6af",
     "_safe": "31ade9699d478caa899616967e4fb245462ecf2d2bc95300ed7e7d6586db735f",
     "_argument_text": "9c3289488ea8d9407017f8fbd26e73dd629fd07f71e1ae8afae2381fe85895d1",
-    "_joint": "ab758f96f095204b7219147759728fdb5cc9ffa0fe8527fc610372555de4566d",
-    "_members": "ae056ad7981d0e83d57db7c73f9eab78b9df29ab20e4aaad000723dad3c16697",
+    "_joint": "46d77cf2a09d82e6850371ff9f73c5ef711a1ae3dba9de48ec7a8a6be4581df5",
+    "_members": "62b565b238d533c6135eb777eb883e35ae5da638eb632e9c10f3207ec7de65fe",
     "_constructor_shape": "3ecab4acb20974e7a40cfd9a5ef13782205126c9d38746aefa1eb6efdc3729be",
-    "_construct": "ab4c68aee87391101b229bf80af1e0d87c50b7638159de93cf5b5229bdbc6708",
-    "_encode": "d97430959a42397df283195f7825ee1a1fb71531c2389d0c78d22230d13b08ef",
-    "_decode_graph": "ca48730cf1f3ed11ee573b6ac4514293db66920b572c8a8b6a4602a5e9051204",
+    "_construct": "9531f31f1f7414c2143974c855b00f2e6292b2212f20c47c6e17e58fe8b46888",
+    "_encode": "5ab65db4cecdbf7d4c92c9e37383f654b6ba5dd1addeb3c883f48a41e3c13f4b",
+    "_decode_graph": "2c6d5266a828ed6233231a25d5205562945e5e63a2f009fb72ec55220c8a4031",
     "_decode": "6aba78f67fdc36059c3cfa6d7dd1dbca59b51615720b7c10a66f4875238fd747",
     "encode_coupled_batch_data": "d0789b1938f32954f7fbd66a27dab762eccadd8024ee9ae55a365ff34ba38e1f",
     "decode_coupled_batch_data": "2dc4f545c519ac72b9ae51e4906f795010fbada0ffea35d44e21d7df68577e79",
     "encode_coupled_batch_chunk": "94b6d12c44d222e6a2e538bb1a89cfcef9df2fa79531f0cd0791afc3aaf8e005",
     "decode_coupled_batch_chunk": "99dc82b3b3f1ffbd7acab1abdc2d5a852ccd972171ddbc3c14bc1ecd47ca5810",
-    "_check_prepared": "f3b3bc95c2f8d43afc2a7949393ac12b862bcd40fc510bad516fc380387b0c5c",
+    "_check_prepared": "60da77a6668297af64a8020020f6b04abed39bc906667c233a3a0b679bfceb16",
     "encode_prepared_batch_data": "476fc5dd5e26287c7de3c9e22f9c0e0247781cbd6ec5fd306e7baab0a8e81c19",
     "encode_restored_prepared_batch_data": "ca69a828c2ebda74933cc4a0205f8044020e00ad56207dbe52b9e855d05898e9",
     "decode_prepared_batch_data": "81b17d7ed9a0cc3f4b33f43a195ad8ffa48c9a7ad5b92ec9a24a506aa052136f",
     "readmit_prepared_batch_audit": "0cfd54771b1b8f5234497dff8d76aa895b934134fdffa948c51f13ec49f8f2ca",
+    "_check_memory_completion": "cd49546d331d4142f49089d9d4205b50c1e217155333066bb83ccc064eff58f4",
+    "encode_memory_completion_batch_data": "aa5c855e28a09cff112c713f9c605334c657e129cbb80a53df49f6315ae5adfe",
+    "encode_restored_memory_completion_batch_data": "769c23680df32481b754f99ea96a93ee455f731b53aa60899eba09544db10c35",
+    "decode_memory_completion_batch_data": "f51b9ae5d435a72da5e8cd5b0ca2ca23f47db97520a9d0a7290f05c6b1e08560",
+    "require_selected_memory_completion": "76004736f9ddf9608e0867330ff332ec11dfc8c9ec1eab6cfdea98dd2c55029c",
 }
 
 
 # Finite executable suppliers, not permitted reference/call sites. The common
 # effect pass owns canonical supplier mutation and alias/reflection refusal;
 # shadow targets separately cover names that have no local source producer.
-_reserve_BATCH_DATA_IMPORT_SOURCE = "from __future__ import annotations\n\nfrom dataclasses import dataclass\nfrom types import MappingProxyType\nfrom typing import Any, NoReturn\n\nfrom pydantic import TypeAdapter\nfrom pydantic import ValidationError as ModelValidationError\n\nfrom elspeth.contracts.composer_audit import PrivateToolAuthoring, ToolArgumentErrorCategory\nfrom elspeth.contracts.composer_llm_audit import ToolContractDialect\nfrom elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation\nfrom elspeth.contracts.enums import AuditCharacteristic\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.freeze import FrozenJsonArray\nfrom elspeth.contracts.hashing import canonical_json\nfrom elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority\nfrom elspeth.contracts.provider_rejection import SafeRequestRejection\nfrom elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSchemaInfo, PluginSecretRequirement, PluginSummary\nfrom elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome\nfrom elspeth.web.composer.audit import DispatchAudit\nfrom elspeth.web.composer.authority_hashing import composer_authority_canonical_json\nfrom elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, bounded_json_loads\nfrom elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk\nfrom elspeth.web.composer.continuation_dispatch_audit import (\n    PortableDispatchAudit,\n    capture_dispatch_audit,\n    decode_dispatch_audit,\n    encode_dispatch_audit,\n    re_admit_dispatch_audit,\n)\nfrom elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials\nfrom elspeth.web.composer.continuation_tool_batch import (\n    RetainedBatchFailure,\n    _decode_validation,\n    _read_json_value,\n    _state_from_tool_json,\n    _validation_json,\n    encode_tool_result_value,\n)\nfrom elspeth.web.composer.discovery_response import admit_discovery_result\nfrom elspeth.web.composer.pipeline_custody import inline_custody_audit_projection\nfrom elspeth.web.composer.state import CompositionState, ValidationSummary\nfrom elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts\nfrom elspeth.web.composer.tools._common import ToolResult\nfrom elspeth.web.composer.tools._registry import response_contract_for\nfrom elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments\nfrom elspeth.web.credential_guard import require_no_credential_material\nfrom elspeth.web.execution.schemas import (\n    SemanticEdgeContractResponse,\n    ValidationCheck,\n    ValidationError,\n    ValidationReadiness,\n    ValidationReadinessBlocker,\n    ValidationResult,\n    ValidationWarning,\n)"
+_reserve_BATCH_DATA_IMPORT_SOURCE = _reserve_batch_data_transfers.TOP_LEVEL_IMPORT_SOURCE
 _reserve_BATCH_DATA_BUILTINS = (
     "type",
     "tuple",
@@ -16315,6 +19463,70 @@ _reserve_BATCH_DATA_BUILTINS = (
 )
 
 
+def _reserve_batch_retained_field_partition(units, classes):
+    """Omit only the exact settled live reservation owner from the old wire.
+
+    This is a local source fact. Complete supplier/effect closure and every
+    actual registry/projection/constructor check remain separate conjuncts.
+    """
+    path = "src/elspeth/web/composer/tool_batch.py"
+    data_path = "src/elspeth/web/composer/continuation_batch_data.py"
+    selected = {name: [unit for unit in units if unit.path == name] for name in (path, data_path)}
+    prefix = "continuation batch retained partition "
+    if any(len(found) != 1 for found in selected.values()) or set(classes) != set(_reserve_BATCH_CARRIER_SOURCES):
+        return [prefix + "actual carrier source set changed"], {}
+    unit, data = selected[path][0], selected[data_path][0]
+    fields = {}
+    for name, declaration in classes.items():
+        if not isinstance(declaration, ast.ClassDef) or _reserve_node_at(unit, name) is not declaration:
+            return [prefix + "carrier declaration is detached " + name], {}
+        members = [node for node in declaration.body if isinstance(node, ast.AnnAssign)]
+        if any(not isinstance(node.target, ast.Name) for node in members):
+            return [prefix + "carrier field target changed " + name], {}
+        names = tuple(node.target.id for node in members)
+        if len(set(names)) != len(names):
+            return [prefix + "carrier field is duplicated " + name], {}
+        if name == "ContinuationBatchState":
+            transient = [node for node in members if node.target.id == "manual_advisor_allowance"]
+            expected = ast.parse("manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)").body[0]
+            if (
+                len(transient) != 1
+                or members[-1] is not transient[0]
+                or ast.dump(transient[0], include_attributes=False) != ast.dump(expected, include_attributes=False)
+            ):
+                return [prefix + "exact final live-owner declaration changed"], {}
+            members = members[:-1]
+        fields[name] = tuple(node.target.id for node in members)
+    helper = _reserve_composer_receiver
+    if not helper.imported(data.tree, "ManualAdvisorAllowance", "elspeth.web.composer.manual_advisor_allowance", "ManualAdvisorAllowance"):
+        return [prefix + "canonical capture supplier changed"], {}
+    joint = _reserve_node_at(data, "_joint")
+    expected_guard = ast.parse(
+        "if batch.manual_advisor_allowance is not None:\n"
+        "    if type(batch.manual_advisor_allowance) is not ManualAdvisorAllowance:\n"
+        '        _fail("batch manual Advisor allowance lost its nominal live owner")\n'
+        "    batch.manual_advisor_allowance.require_settled(used=batch.advisor_calls_used)"
+    ).body[0]
+    if (
+        not isinstance(joint, ast.FunctionDef)
+        or len(joint.body) < 3
+        or ast.dump(joint.body[2], include_attributes=False) != ast.dump(expected_guard, include_attributes=False)
+    ):
+        return [prefix + "nominal settled capture guard or order changed"], {}
+    source = ast.get_source_segment(data.source, joint)
+    if (
+        source is None
+        or not helper.owned_binding(data.tree, "_joint", joint)
+        or hashlib.sha256(source.encode()).hexdigest() != _reserve_BATCH_DATA_BODY_SHA256["_joint"]
+        or ast.dump(joint, include_attributes=False) != ast.dump(ast.parse(source).body[0], include_attributes=False)
+    ):
+        return [prefix + "complete capture body changed"], {}
+    failures, _ = _reserve_manual_advisor_allowance_receipt(units)
+    if failures:
+        return [prefix + failure for failure in failures], {}
+    return [], fields
+
+
 def _reserve_continuation_batch_data_receipt(units, classes):
     """Close finite DATA references and constructors on the caller's AST only.
 
@@ -16329,6 +19541,9 @@ def _reserve_continuation_batch_data_receipt(units, classes):
         return ["continuation batch DATA source is missing or duplicated"], {}
     unit = sources[0]
     helper = _reserve_composer_receiver
+    transfer_failures, transfers = _reserve_batch_data_transfers.batch_data_local_contracts(units)
+    if transfer_failures:
+        return transfer_failures, {}
     failures = []
 
     def require(condition, detail):
@@ -16368,13 +19583,16 @@ def _reserve_continuation_batch_data_receipt(units, classes):
             binding = alias.asname or alias.name
             require(helper.imported(unit.tree, binding, statement.module, alias.name), "import supplier binding changed " + binding)
             shadow_names.add(binding)
-            # These two names occur only in postponed annotations. Their import
-            # declarations are exact, but they are not executable capabilities.
-            if statement.module != "typing":
+            # Any and NoReturn occur only in postponed annotations. TYPE_CHECKING
+            # is an evaluated module condition and retains its canonical origin.
+            if statement.module != "typing" or alias.name == "TYPE_CHECKING":
                 supplier_origins.add(statement.module + "." + alias.name)
     # Both local imports belong to actual body-bound definitions. Verify the
     # exact source declaration and same-AST owner before protecting each root.
     local_imports = [node for node in ast.walk(unit.tree) if isinstance(node, (ast.Import, ast.ImportFrom)) and node not in actual_imports]
+    actual_local_sites = {(path, id(node)) for node in local_imports}
+    require(transfers["additional_local_imports"] <= actual_local_sites, "additional local supplier receipt is detached")
+    local_imports = [node for node in local_imports if (path, id(node)) not in transfers["additional_local_imports"]]
     local_suppliers = (
         (
             "_argument_text",
@@ -16506,8 +19724,11 @@ def _reserve_continuation_batch_data_receipt(units, classes):
         "complete ordered member gate changed",
     )
     constructor_calls = set()
-    for name, declaration in classes.items():
-        fields = tuple(node.target.id for node in declaration.body if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name))
+    partition_failures, retained_fields = _reserve_batch_retained_field_partition(units, classes)
+    if partition_failures:
+        return partition_failures, {}
+    for name in classes:
+        fields = retained_fields[name]
         entries = [
             value
             for key, value in zip(registry.value.keys, registry.value.values, strict=True)
@@ -16551,9 +19772,11 @@ def _reserve_continuation_batch_data_receipt(units, classes):
     expected_roles = {
         ("RestoredBatchData", "annotation", "ContinuationBatchState"),
         ("RestoredPreparedBatchData", "annotation", "ContinuationBatchState"),
+        ("RestoredMemoryCompletionBatchData", "annotation", "ContinuationBatchState"),
         ("encode_coupled_batch_data", "annotation", "ContinuationBatchState"),
         ("encode_coupled_batch_chunk", "annotation", "ContinuationBatchState"),
         ("encode_prepared_batch_data", "annotation", "ContinuationBatchState"),
+        ("encode_memory_completion_batch_data", "annotation", "ContinuationBatchState"),
         ("_joint", "compare", "type(data.batch) is not ContinuationBatchState"),
         ("_joint", "compare", "type(batch.current_call) is not ContinuationCallState"),
         ("_members", "compare", "type(value) is ContinuationCallState"),
@@ -16566,6 +19789,11 @@ def _reserve_continuation_batch_data_receipt(units, classes):
         ("encode_prepared_batch_data", "compare", "type(batch.current_call) is not ContinuationCallState"),
         ("encode_restored_prepared_batch_data", "compare", "type(value.batch.current_call) is not ContinuationCallState"),
         ("readmit_prepared_batch_audit", "compare", "type(call) is not ContinuationCallState"),
+        ("_check_memory_completion", "compare", "type(call) is not ContinuationCallState"),
+        ("encode_memory_completion_batch_data", "compare", "type(batch) is not ContinuationBatchState"),
+        ("encode_memory_completion_batch_data", "compare", "type(batch.current_call) is not ContinuationCallState"),
+        ("encode_restored_memory_completion_batch_data", "compare", "type(value.batch.current_call) is not ContinuationCallState"),
+        ("require_selected_memory_completion", "compare", "type(call) is not ContinuationCallState"),
         ("_construct", "constructor", "ContinuationCallState(**members)"),
         ("_construct", "constructor", "_CallWireFacts(**members)"),
         ("_construct", "constructor", "ContinuationBatchState(**members)"),
@@ -16627,6 +19855,7 @@ def _reserve_continuation_batch_data_receipt(units, classes):
         "supplier_origins": frozenset(supplier_origins),
         "owned_origins": frozenset(module + "." + name for name in (*definitions, "_FIELDS", "_MAX_NODES", "_MAX_DEPTH")),
         "immutable_supplier_origins": frozenset({scalar_origin}),
+        "additional_transfers": transfers,
     }
 
 
@@ -16686,7 +19915,7 @@ def _reserve_continuation_batch_state_receipt(units):
         "run_tool_batch": ("call_model", "ctx", "acc", "llm_messages"),
         "_initialize_continuation_batch_live": ("call_model", "ctx", "acc", "llm_messages", "batch"),
         "_prepare_continuation_call_live": ("call_model", "ctx", "llm_messages", "batch", "call"),
-        "_execute_continuation_call_live": ("call_model", "ctx", "acc", "llm_messages", "batch", "call"),
+        "_execute_continuation_call_live": ("call_model", "ctx", "acc", "llm_messages", "batch", "call", "retained_attachment"),
         "_finish_continuation_batch_live": ("call_model", "ctx", "acc", "batch"),
         "_append_continuation_tool_outcome": (
             "batch",
@@ -16715,7 +19944,12 @@ def _reserve_continuation_batch_state_receipt(units):
             and [arg.arg for arg in args.args] == positional
             and tuple(helper.parameters(declaration)) == parameters
             and not args.defaults
-            and all(value is None for value in args.kw_defaults)
+            and all(
+                (isinstance(value, ast.Constant) and value.value is None)
+                if name == "_execute_continuation_call_live" and parameter.arg == "retained_attachment"
+                else value is None
+                for parameter, value in zip(args.kwonlyargs, args.kw_defaults, strict=True)
+            )
             and args.vararg is None
             and args.kwarg is None,
             "selected formal/default binding changed " + name,
@@ -16739,6 +19973,9 @@ def _reserve_continuation_batch_state_receipt(units):
     if failures:
         return failures, {}
     forwarder = forwarders[0]
+    attachment_failures, attachment = _reserve_continuation_transfers.attachment_local_transfers(units)
+    if attachment_failures:
+        return attachment_failures, {}
     captured_defaults = {id(value) for value in forwarder.args.kw_defaults if isinstance(value, ast.Name) and value.id in {"batch", "call"}}
     forward_call = forwarder.body[0].value
     require(
@@ -16770,7 +20007,11 @@ def _reserve_continuation_batch_state_receipt(units):
                 parent = parents.get(id(node))
                 field_use = isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in fields[class_name]
                 capture = declaration is execute and id(node) in captured_defaults
-                require(isinstance(node.ctx, ast.Load) and (field_use or capture), "formal receiver escaped " + name + ":" + local)
+                retained_comparison = declaration is execute and (path, id(node)) in attachment["retained_comparison_uses"]
+                require(
+                    isinstance(node.ctx, ast.Load) and (field_use or capture or retained_comparison),
+                    "formal receiver escaped " + name + ":" + local,
+                )
     # The local closure cannot be returned, aliased, rebound, or called with an
     # overriding default. Its body is the ordinary direct append shown above.
     require(
@@ -16799,7 +20040,7 @@ def _reserve_continuation_batch_state_receipt(units):
         and node.func.id in definitions
         and node.func.id != "run_tool_batch"
     ] + [forward_call]
-    expected_references = {(path, id(node.func)) for node in expected_calls}
+    expected_references = {(path, id(node.func)) for node in expected_calls} | attachment["native_uses"]
     helper_names = set(definitions) - {"run_tool_batch"}
     actual_references = {
         (source.path, id(node))
@@ -16873,21 +20114,31 @@ def _reserve_continuation_batch_state_receipt(units):
         "class_origins": frozenset(module + "." + name for name in selected_classes),
         "function_origins": frozenset(module + "." + name for name in definitions),
         "reference_origins": frozenset(module + "." + name for name in selected_classes | selected_functions),
-        "owned_uses": owned_uses | data["owned_uses"],
-        "data_calls": data["calls"],
+        "owned_uses": owned_uses
+        | data["owned_uses"]
+        | attachment["native_uses"]
+        | attachment["batch_typecheck_uses"]
+        | data["additional_transfers"]["batch_uses"],
+        "data_calls": data["calls"] | attachment["data_constructor_calls"] | data["additional_transfers"]["constructor_calls"],
         "data_origins": data["origins"],
         "data_owned_origins": data["owned_origins"],
         "data_supplier_origins": data["supplier_origins"],
         "data_supplier_bindings": data["supplier_bindings"],
         "data_immutable_supplier_origins": data["immutable_supplier_origins"],
-        "calls": frozenset((path, id(node)) for node in expected_calls),
+        "calls": frozenset((path, id(node)) for node in expected_calls) | attachment["native_calls"],
         "factory_calls": frozenset((path, id(node)) for node in factory_calls),
         "state_writes": frozenset(stores),
+        "additional_transfers": attachment,
+        "data_transfers": data["additional_transfers"],
     }
 
 
-def _reserve_supported_boundary(units):
+def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
+    recovery_supplier_failures, recovery_supplier = _reserve_compose_proposal_transfers.recovery_instruction_supplier_contracts(units)
+    policy_supplier_failures, policy_supplier = _reserve_worker_whole_scope_origin.continuation_policy_supplier_contracts(units)
+    initialization_failures, initialization = _reserve_continuation_transfers.initialization_local_transfers(units)
+    title_transfer_failures, title_transfer = _reserve_title_transfers.title_provider_local_contracts(units)
     iteration_failures, iteration = _reserve_compose_iteration_state_receipt(units)
     batch_failures, batch = _reserve_continuation_batch_state_receipt(units)
     audit_failures, audit_recoveries, audit_sink_uses = _reserve_audit_evidence_recovery_receipt(units)
@@ -16902,6 +20153,7 @@ def _reserve_supported_boundary(units):
     whole_worker_failures, whole_worker = _reserve_worker_whole_scope_origin.worker_whole_scope_origin_local_contracts(units)
     recovery_failures, recovery_stores, recovery_globals = _reserve_recovery_cell_contract(units)
     self_call_failures, self_calls = _reserve_coordinator_self_call_receipts(units)
+    allowance_failures, allowance_calls = _reserve_manual_advisor_allowance_receipt(units)
     inventory_failures, reserve_inventory = _reserve_current_call_inventory(units)
     owner_call_failures, owner_calls = _reserve_local_owner_call_receipts(units)
     sink_failures, sink_receipt = _reserve_sink_effect_disjoint_receipts(units)
@@ -16911,6 +20163,10 @@ def _reserve_supported_boundary(units):
     child_failures, child_receipt = _reserve_proposal_child_transfers.proposal_child_local_contracts(units)
     terminal_failures, terminal_receipt = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
     failures = [
+        *recovery_supplier_failures,
+        *policy_supplier_failures,
+        *initialization_failures,
+        *title_transfer_failures,
         *iteration_failures,
         *batch_failures,
         *audit_failures,
@@ -16923,6 +20179,7 @@ def _reserve_supported_boundary(units):
         *whole_worker_failures,
         *recovery_failures,
         *self_call_failures,
+        *allowance_failures,
         *inventory_failures,
         *owner_call_failures,
         *sink_failures,
@@ -16942,9 +20199,45 @@ def _reserve_supported_boundary(units):
     six_calls = frozenset(six_receipt["reserve_calls"])
     child_calls = frozenset(child_receipt["reserve_calls"])
     terminal_calls = frozenset(terminal_receipt["reserve_calls"])
-    if len(recovery_stores) != 2 or len(recovery_globals) != 1 or mint is None or compose is None:
+    if len(recovery_stores) != 2 or len(recovery_globals) != 1 or mint is None or compose is None or title_transfer is None:
         return _reserve_ProtectedBoundary(("selected Web reserve local transfer receipt is incomplete",), (), (), (), ())
     actual_nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    for supplier in (recovery_supplier, policy_supplier):
+        if (
+            supplier is None
+            or not {
+                *supplier["supplier_definitions"],
+                *supplier["supplier_calls"],
+                *supplier["source_origins"],
+            }
+            <= actual_nodes
+        ):
+            return _reserve_ProtectedBoundary(("continuation value supplier receipt is detached from input AST",), (), (), (), ())
+    continuation_receipts = (iteration["additional_transfers"], batch["additional_transfers"], initialization)
+    for receipt in continuation_receipts:
+        if not frozenset().union(*(receipt[key] for key in _reserve_continuation_transfers.SITE_KEYS)) <= actual_nodes:
+            return _reserve_ProtectedBoundary(("continuation ownership receipt is detached from input AST",), (), (), (), ())
+    data_transfers = batch["data_transfers"]
+    if not frozenset().union(*(data_transfers[key] for key in _reserve_batch_data_transfers.SITE_KEYS)) <= actual_nodes:
+        return _reserve_ProtectedBoundary(("batch DATA supplier receipt is detached from input AST",), (), (), (), ())
+    if (
+        not {
+            *title_transfer["selected_definitions"],
+            *title_transfer["reserve_calls"],
+            *title_transfer["validated_transfer_calls"],
+        }
+        <= actual_nodes
+        or any(
+            record[key] not in actual_nodes for record in title_transfer["source_origins"] for key in ("import_statement", "import_alias")
+        )
+        or any(
+            record["supplier_definition"] is not None and record["supplier_definition"] not in actual_nodes
+            for record in title_transfer["source_origins"]
+        )
+    ):
+        return _reserve_ProtectedBoundary(("TITLE ownership receipt is detached from input AST",), (), (), (), ())
+    continuation_calls = initialization["reserve_calls"] | title_transfer["reserve_calls"]
+    continuation_state_writes = iteration["additional_transfers"]["state_writes"]
     transferred = frozenset(compose["validated_transfer_nodes"])
     worker_nodes = tuple(worker[key] for key in _reserve_worker_caller.RECEIPT_KEYS)
     worker_path = "src/elspeth/web/sessions/composer_async_worker.py"
@@ -17278,9 +20571,16 @@ def _reserve_supported_boundary(units):
     if (
         len(transferred) != 3
         or not transferred <= actual_nodes
-        or len(self_calls) != 7
+        or len(self_calls) != 8
         or not self_calls <= actual_nodes
         or self_calls != reserve_inventory["src/elspeth/web/required_work.py"]
+        or len(allowance_calls) != 1
+        or not allowance_calls <= actual_nodes
+        or allowance_calls != reserve_inventory["src/elspeth/web/composer/tool_batch.py"]
+        or bool(
+            allowance_calls
+            & (self_calls | owner_calls | {title_call} | route_calls | six_calls | child_calls | terminal_calls | continuation_calls)
+        )
         or len(owner_calls) != 5
         or not owner_calls <= actual_nodes
         or len(sink_calls) != 3
@@ -17305,7 +20605,21 @@ def _reserve_supported_boundary(units):
         or six_calls != reserve_inventory["src/elspeth/web/sessions/composer_async_worker.py"]
         or child_calls != reserve_inventory["src/elspeth/web/sessions/routes/composer/pipeline_settlement.py"]
         or terminal_calls != reserve_inventory["src/elspeth/web/sessions/service.py"]
-        or len(self_calls | owner_calls | {title_call} | route_calls | six_calls | child_calls | terminal_calls) != 32
+        or initialization["reserve_calls"] != reserve_inventory["src/elspeth/web/composer/continuation_initialization.py"]
+        or title_transfer["reserve_calls"] != reserve_inventory["src/elspeth/web/composer/continuation_title_provider.py"]
+        or title_transfer["validated_transfer_calls"] != title_transfer["reserve_calls"]
+        or (
+            self_calls
+            | owner_calls
+            | {title_call}
+            | route_calls
+            | six_calls
+            | child_calls
+            | terminal_calls
+            | continuation_calls
+            | allowance_calls
+        )
+        != frozenset().union(*reserve_inventory.values())
         or title_call not in reserve_inventory["src/elspeth/web/sessions/composer_turn.py"]
         or sum(
             len(owner_calls & reserve_inventory[path])
@@ -17433,6 +20747,12 @@ def _reserve_supported_boundary(units):
     # New transfer receipts require the same cross-module rebinding/reflection
     # protection as every other selected supplier, not only local body pins.
     origins.update(_reserve_RETAINED_FAILURE_ORIGINS)
+    origins.update(recovery_supplier["protected_origins"])
+    origins.update(policy_supplier["protected_origins"])
+    origins.update(title_transfer["protected_origins"])
+    origins.update(data_transfers["protected_origins"])
+    for receipt in continuation_receipts:
+        origins.update(receipt["origins"])
     origins.update(
         {
             iteration["carrier_origin"],
@@ -17445,6 +20765,16 @@ def _reserve_supported_boundary(units):
     origins.update(batch["class_origins"] | batch["function_origins"] | batch["data_owned_origins"] | {"dataclasses.field", "builtins.set"})
     guarded_classes = {iteration["carrier_origin"], iteration["bindings_origin"], *batch["class_origins"]}
     guarded_functions = set(sink_receipt["read_dependency_origins"]) | set(batch["function_origins"])
+    for supplier in (recovery_supplier, policy_supplier):
+        guarded_classes.update(supplier["class_origins"])
+        guarded_functions.update(supplier["function_origins"])
+    guarded_classes.update(title_transfer["class_origins"])
+    guarded_functions.update(title_transfer["function_origins"])
+    guarded_classes.update(data_transfers["class_origins"])
+    guarded_functions.update(data_transfers["function_origins"])
+    for receipt in continuation_receipts:
+        guarded_classes.update(receipt["class_origins"])
+        guarded_functions.update(receipt["function_origins"])
     guarded_functions.add("elspeth.web.sessions.converters.state_record_from_row")
     guarded_functions.add("elspeth.web.sessions.chat_message_decoder.chat_message_record_from_row")
     guarded_functions.add("elspeth.web.sessions.converters.chat_message_record_from_row")
@@ -17469,6 +20799,11 @@ def _reserve_supported_boundary(units):
                 origins.add(qualified)
                 guarded_functions.add(qualified)
     receivers = {}
+    for owner, members in data_transfers["receiver_members"].items():
+        receivers.setdefault(owner, set()).update(members)
+    for receipt in continuation_receipts:
+        for owner, members in receipt["receiver_members"].items():
+            receivers.setdefault(owner, set()).update(members)
     for typed in (typed_family, typed_supplier):
         origins.update(typed["origin_seeds"])
         for record in typed["receiver_bound_members"]:
@@ -17509,6 +20844,7 @@ def _reserve_supported_boundary(units):
             *mint["owner_constructor_calls"],
             *receiver_nodes,
             iteration["call"],
+            *(site for receipt in continuation_receipts for site in receipt["constructor_calls"]),
             *batch["calls"],
             *batch["factory_calls"],
             (dto_units[0].path, id(dto_return)),
@@ -17542,19 +20878,39 @@ def _reserve_supported_boundary(units):
         protected_use_nodes=protected_uses,
         protected_reflection_candidate_sites=reflection_candidates,
         protected_constructed_classes=frozenset(guarded_classes),
-        protected_supplier_bindings=batch["data_supplier_bindings"] | callbacks["supplier_bindings"] | yaml_adapter["supplier_bindings"],
+        protected_supplier_bindings=batch["data_supplier_bindings"]
+        | callbacks["supplier_bindings"]
+        | yaml_adapter["supplier_bindings"]
+        | data_transfers["supplier_bindings"]
+        | frozenset().union(*(receipt["supplier_bindings"] for receipt in continuation_receipts)),
         immutable_supplier_origins=batch["data_immutable_supplier_origins"] | callbacks["immutable_supplier_origins"],
         validated_nonretaining_calls=callbacks["calls"],
         additional_supplier_roots=batch["data_supplier_origins"] | callbacks["origins"],
-        validated_supplier_uses=callbacks["uses"] | batch["owned_uses"] | yaml_adapter["uses"],
+        validated_supplier_uses=callbacks["uses"]
+        | batch["owned_uses"]
+        | yaml_adapter["uses"]
+        | data_transfers["constructor_uses"]
+        | data_transfers["nominal_uses"]
+        | data_transfers["application_uses"]
+        | data_transfers["external_data_uses"]
+        | frozenset().union(*(receipt["typecheck_uses"] | receipt["data_constructor_uses"] for receipt in continuation_receipts)),
         validated_supplier_arguments=callbacks["argument_calls"],
         validated_immediate_lambdas=callbacks["immediate_lambdas"],
-        validated_local_carrier_calls=frozenset({iteration["call"], *batch["calls"], *batch["data_calls"]}),
+        validated_local_carrier_calls=frozenset({iteration["call"], *batch["calls"], *batch["data_calls"]})
+        | frozenset().union(*(receipt["constructor_calls"] for receipt in continuation_receipts)),
         validated_worker_error_carrier_calls=frozenset(error_carrier_calls | normal_carrier_calls),
         validated_retained_failure_calls=retained_calls,
+        origin_diagnostics=origin_diagnostics,
     )
+    if origin_diagnostics is not None:
+        callback_start = len(origin_failures)
     origin_failures.extend(_reserve_batch_callback_use_failures(units, callbacks, protected_uses))
+    if origin_diagnostics is not None:
+        origin_diagnostics.finish("callback-use-join", origin_failures, callback_start)
+        yaml_start = len(origin_failures)
     origin_failures.extend(_reserve_yaml_serializer_use_failures(yaml_adapter, protected_uses))
+    if origin_diagnostics is not None:
+        origin_diagnostics.finish("yaml-use-join", origin_failures, yaml_start)
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)
     iteration_class_uses = frozenset(
@@ -17562,7 +20918,10 @@ def _reserve_supported_boundary(units):
         for path, node_id, origin, *_ in protected_uses
         if origin in {("object", iteration["carrier_origin"]), ("object", iteration["bindings_origin"])}
     )
-    if iteration_class_uses != iteration["class_uses"] or not {iteration["call"], iteration["state_write"]} <= actual_nodes:
+    if (
+        iteration_class_uses != iteration["class_uses"]
+        or not {iteration["call"], iteration["state_write"], *continuation_state_writes} <= actual_nodes
+    ):
         return _reserve_ProtectedBoundary(("compose iteration constructor references or same-AST receipt changed",), (), (), (), ())
     batch_uses = frozenset(
         (path, node_id) for path, node_id, origin, *_ in protected_uses if origin[0] == "object" and origin[1] in batch["reference_origins"]
@@ -17608,8 +20967,8 @@ def _reserve_supported_boundary(units):
         (*telemetry_reflections, repository_factory_reflection, lazy_type_reflection),
         (integrity_supplier,),
         (registration_call,),
-        route_calls | six_calls,
-        (iteration["state_write"], *batch["state_writes"]),
+        route_calls | six_calls | continuation_calls,
+        (iteration["state_write"], *batch["state_writes"], *continuation_state_writes),
         audit_evidence_recoveries=audit_recoveries,
     )
 
@@ -19722,10 +23081,10 @@ class _reserve_ReserveProof:
             return None
         if (unit.path, id(call)) in self.boundary.validated_transfer_calls:
             return _reserve_Certificate(
-                "reviewed-route-or-worker-transfer",
+                "reviewed-required-work-owner-transfer",
                 (self.point(unit, call, "same-AST required-work transfer and dispatch"),),
                 (
-                    "complete selected route or worker caller/source receipt",
+                    "complete selected caller and source ownership receipt",
                     "current protected origin/effect graph",
                     "normal owned coordinator dispatch",
                 ),
@@ -20014,6 +23373,12 @@ def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
             if isinstance(parent, ast.Call) and parent.func is node:
                 continue
             violations.append(f"{unit.path}:{node.lineno} {_symbol(node)} callable escape .{node.attr}")
+    if reserve_proof.failures and any(row.endswith(" unknown mutation receiver .reserve") for row in violations):
+        # A withdrawn reserve proof turns every web ``.reserve`` site into an
+        # unknown receiver, so one stale pin reads as dozens of innocent call
+        # sites (33 rows at feed6a9e6, root nowhere in them). Name the proof's
+        # own failures first; the verdict is unchanged, only the root is shown.
+        return (*(f"reserve proof withdrawn: {failure}" for failure in reserve_proof.failures), *violations)
     return tuple(violations)
 
 
@@ -26659,6 +30024,40 @@ def test_architecture_scanner_rejects_alias_dynamic_getattr_and_callable_escape(
     violations = _mutation_callable_escapes([unit])
     assert any("callable escape .begin_run" in item for item in violations)
     assert any("dynamic getattr('complete_run')" in item for item in violations)
+
+
+def test_withdrawn_reserve_proof_names_its_root_before_the_cascade() -> None:
+    """One failed reserve proof must not read as only its innocent ``.reserve`` sites (U-46 T2)."""
+    cascading = _parse_source(
+        "src/elspeth/web/example.py",
+        "def use(custody):\n    custody.reserve()\n",
+    )
+    assert _reserve_ReserveProof([cascading]).failures, "a lone synthetic unit cannot satisfy the reviewed recipes"
+    violations = _mutation_callable_escapes([cascading])
+    cascade = [row for row in violations if row.endswith(" unknown mutation receiver .reserve")]
+    roots = [row for row in violations if row.startswith("reserve proof withdrawn: ")]
+    assert cascade and roots, violations
+    assert violations[: len(roots)] == tuple(roots), "the proof's own failures lead, ahead of every cascade row"
+    # No cascade, no root rows: an unrelated escape keeps its exact output.
+    quiet = _parse_source("src/elspeth/web/example.py", "def use(custody):\n    return custody\n")
+    assert _mutation_callable_escapes([quiet]) == ()
+
+
+_RETENTION_BUDGET_CONTROL = "src/elspeth/core/ids.py"  # 4 retention roots, at most 3 evaluations each (U-46 corpus)
+
+
+def test_retention_budget_is_pinned_and_fails_closed_with_a_named_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fail-closed retention net (U-46 (b)): a pinned count, and over budget is a named red row."""
+    # Raising the budget is a reviewed change to this constant, never an override.
+    assert _RETENTION_ROOT_EVALUATION_BUDGET == 10_000
+    control = (_parse_source(_RETENTION_BUDGET_CONTROL, (_repo_root() / _RETENTION_BUDGET_CONTROL).read_text()),)
+    row = re.compile(rf"retention budget exceeded at {re.escape(_RETENTION_BUDGET_CONTROL)}:[0-9]+")
+    assert not [failure for failure in _reserve_selected_origin_effect_failures(control) if failure.startswith("retention budget")]
+    # Mutation control: a budget of one evaluation turns the same real file red,
+    # each over-budget root naming itself in the pinned row format.
+    monkeypatch.setitem(globals(), "_RETENTION_ROOT_EVALUATION_BUDGET", 1)
+    exceeded = [failure for failure in _reserve_selected_origin_effect_failures(control) if failure.startswith("retention budget")]
+    assert exceeded and all(row.fullmatch(failure) for failure in exceeded), exceeded
 
 
 def test_architecture_scanner_rejects_raw_writable_and_cross_database_surfaces() -> None:
@@ -34292,7 +37691,7 @@ def test_compose_iteration_state_receipt_refuses_changed_actual_transfer(before,
     assert not receipt
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("addition", "refusal"),
     [
@@ -34334,7 +37733,7 @@ def test_compose_iteration_state_receipt_refuses_external_origin_effects(additio
     assert not boundary.disjoint_compose_state_writes
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 def test_compose_iteration_receipt_does_not_admit_an_unrelated_state_write():
     units = _production_units()
     path = "src/elspeth/web/execution/service.py"
@@ -34345,11 +37744,14 @@ def test_compose_iteration_receipt_does_not_admit_an_unrelated_state_write():
     assert proof.failures == ["unclosed installation record state writer " + path], proof.failures
 
 
-@pytest.mark.landscape_long_run
-def test_compose_iteration_state_receipt_belongs_to_the_actual_source_ast():
+@pytest.mark.landscape_fencing_regression
+def test_compose_iteration_state_receipt_belongs_to_the_actual_source_ast(record_property: Callable[[str, object], None]):
     units = _production_units()
-    boundary = _reserve_supported_boundary(units)
-    assert not boundary.failures, boundary.failures
+    diagnostics = _reserve_OriginDiagnostics(units)
+    boundary = _reserve_supported_boundary(units, origin_diagnostics=diagnostics)
+    record_property("reserve_supported_boundary_failures", _reserve_json.dumps(boundary.failures))
+    record_property("reserve_supported_boundary_origin_diagnostics", _reserve_json.dumps(diagnostics.report(boundary.failures)))
+    assert not boundary.failures, "\n".join(boundary.failures)
     service = next(unit for unit in units if unit.path == "src/elspeth/web/composer/service.py")
     owner = _reserve_node_at(service, "ComposerServiceImpl._advance_live_compose_iteration")
     stores = [
@@ -34364,7 +37766,19 @@ def test_compose_iteration_state_receipt_belongs_to_the_actual_source_ast():
     assert len(stores) == 1
     batch_failures, batch = _reserve_continuation_batch_state_receipt(units)
     assert not batch_failures, batch_failures
-    assert boundary.disjoint_compose_state_writes == {(service.path, id(stores[0])), *batch["state_writes"]}
+    initialization = next(unit for unit in units if unit.path == "src/elspeth/web/composer/continuation_composition_initialization.py")
+    initialize_owner = _reserve_node_at(initialization, "_bind_first_state_on_connection")
+    initial_stores = [
+        node
+        for node in ast.walk(initialize_owner)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store) and ast.unparse(node) == "runtime.live.state"
+    ]
+    assert len(initial_stores) == 1
+    assert boundary.disjoint_compose_state_writes == {
+        (service.path, id(stores[0])),
+        (initialization.path, id(initial_stores[0])),
+        *batch["state_writes"],
+    }
     detached = _parse_source(service.path, service.source)
     detached_owner = _reserve_node_at(detached, "ComposerServiceImpl._advance_live_compose_iteration")
     detached_store = next(
@@ -34532,7 +37946,7 @@ def test_continuation_batch_state_receipt_refuses_second_foreign_caller():
     units = _production_units()
     normal_failures, normal = _reserve_continuation_batch_state_receipt(units)
     assert not normal_failures, normal_failures
-    assert len(normal["calls"]) == 5
+    _assert_current_batch_receipt_inventory(units, normal)
     path = "src/elspeth/web/execution/service.py"
     source = next(unit for unit in units if unit.path == path)
     changed = _parse_source(
@@ -34547,7 +37961,7 @@ def test_continuation_batch_state_receipt_refuses_second_foreign_caller():
     assert not receipt
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("addition", "refusal"),
     [
@@ -34624,7 +38038,7 @@ def test_continuation_batch_state_receipt_refuses_external_origin_effects(additi
     assert not boundary.disjoint_compose_state_writes
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 def test_continuation_batch_state_receipt_belongs_to_the_actual_source_ast():
     units = _production_units()
     local_failures, receipt = _reserve_continuation_batch_state_receipt(units)
@@ -34655,7 +38069,7 @@ def test_continuation_batch_state_receipt_belongs_to_the_actual_source_ast():
     assert not detached_receipt["state_writes"] & boundary.disjoint_compose_state_writes
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 def test_continuation_batch_receipt_does_not_admit_an_unrelated_state_write():
     units = _production_units()
     path = "src/elspeth/web/execution/service.py"
@@ -34861,7 +38275,7 @@ def test_dataclass_field_class_reference_requires_exact_supported_context(source
     assert not _reserve_dataclass_field_class_use(uses[0], unit, detached_parents)
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 def test_dataclass_field_common_origin_preserves_global_supplier_after_comprehension():
     units = _production_units()
     path = "src/elspeth/field_origin_probe.py"
@@ -34879,7 +38293,7 @@ def test_dataclass_field_common_origin_preserves_global_supplier_after_comprehen
     assert any("selected origin attribute replaced " + path in failure for failure in failures), failures
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("addition", "refusal"),
     [
@@ -34960,7 +38374,7 @@ def test_dataclass_field_actual_eager_list_annotation_has_protected_owner():
     assert not _reserve_dataclass_field_class_use(changed_function.returns.slice, changed, changed_parents)
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("local_import", "factory"),
     [
@@ -34984,7 +38398,7 @@ def test_dataclass_field_common_origin_preserves_local_import_supplier(local_imp
     assert any("selected origin attribute replaced " + path in failure for failure in failures), failures
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("mutation", "refusal"),
     [
@@ -35056,7 +38470,7 @@ def test_dataclass_field_actual_annotation_targets_are_not_supplier_value_writes
         assert received[id(declarations[0].target)] == id(owner)
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     "mutation,refusal",
     [
@@ -35152,7 +38566,7 @@ def test_audit_evidence_recovery_receipt_refuses_changed_sink_caller_and_supplie
     assert failures and not sites and not uses
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -35195,7 +38609,7 @@ def test_audit_evidence_recovery_boundary_refuses_external_mutation_and_capture(
     assert not refused.audit_evidence_recoveries
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     "source",
     [
@@ -35217,7 +38631,7 @@ def test_audit_evidence_recovery_complete_proof_preserves_unrelated_refusals(sou
     assert any(path in failure for failure in refused.failures), refused.failures
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("mutation", "diagnostic"),
     [
@@ -35241,7 +38655,7 @@ def test_audit_evidence_recovery_complete_proof_refuses_module_alias_mutation(mu
     assert diagnostic + " " + path in refused.failures, refused.failures
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("effect", "diagnostic"),
     [
@@ -35283,7 +38697,187 @@ def test_selected_module_reflection_and_frozen_recovery_preserve_nominal_compari
     assert any(diagnostic + path in failure for failure in refused.failures), (effect, refused.failures)
 
 
-@pytest.mark.landscape_long_run
+def _assert_current_batch_receipt_owner(unit, owner):
+    selected = _reserve_composer_receiver.find(unit.tree, owner)
+    assert selected is not None, ("missing or ambiguous exact receipt owner", unit.path, owner)
+    return selected
+
+
+@pytest.mark.landscape_fencing_regression
+@pytest.mark.parametrize(
+    ("source", "owner"),
+    (
+        ("async def outer():\n    def inner():\n        return call()\n", "outer.inner"),
+        ("class Outer:\n    async def inner(self):\n        return call()\n", "Outer.inner"),
+    ),
+    ids=("async-function-owner", "class-owner"),
+)
+def test_current_batch_receipt_inventory_selects_the_exact_qualified_owner(source, owner):
+    unit = _parse_source("src/elspeth/batch_receipt_owner_control.py", source)
+    assert _assert_current_batch_receipt_owner(unit, owner) is unit.tree.body[0].body[0]
+
+
+@pytest.mark.landscape_fencing_regression
+@pytest.mark.parametrize(
+    "source",
+    (
+        "async def outer():\n    pass\n",
+        "async def outer():\n    def inner():\n        pass\n    def inner():\n        pass\n",
+        "async def outer():\n    pass\nclass Other:\n    def inner(self):\n        pass\n",
+    ),
+    ids=("missing-owner", "duplicate-owner", "same-name-under-wrong-owner"),
+)
+def test_current_batch_receipt_inventory_refuses_missing_ambiguous_or_wrong_owners(source):
+    unit = _parse_source("src/elspeth/batch_receipt_owner_control.py", source)
+    with pytest.raises(AssertionError, match="missing or ambiguous exact receipt owner"):
+        _assert_current_batch_receipt_owner(unit, "outer.inner")
+
+
+def _assert_current_batch_receipt_inventory(units, receipt):
+    """Match fixed reviewed owners/expressions, including every actual receipt site."""
+    batch = "src/elspeth/web/composer/tool_batch.py"
+    data = "src/elspeth/web/composer/continuation_batch_data.py"
+    finisher = "src/elspeth/web/composer/continuation_attachment_finisher.py"
+    projection = "src/elspeth/web/composer/continuation_attachment_application.py"
+    index = {unit.path: unit for unit in units}
+
+    def sites(specifications):
+        result = set()
+        for path, owner, expression in specifications:
+            selected = _assert_current_batch_receipt_owner(index[path], owner)
+            expected = ast.dump(ast.parse(expression, mode="eval").body, include_attributes=False)
+            matches = [node for node in ast.walk(selected) if ast.dump(node, include_attributes=False) == expected]
+            assert len(matches) == 1, (path, owner, expression)
+            result.add((path, id(matches[0])))
+        return result
+
+    native = (
+        (
+            batch,
+            "run_tool_batch",
+            "_initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)",
+        ),
+        (
+            batch,
+            "run_tool_batch",
+            "_prepare_continuation_call_live(call_model=call_model, ctx=ctx, llm_messages=llm_messages, batch=batch, call=call)",
+        ),
+        (
+            batch,
+            "run_tool_batch",
+            "_execute_continuation_call_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch, call=call)",
+        ),
+        (batch, "run_tool_batch", "_finish_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, batch=batch)"),
+        (
+            batch,
+            "_execute_continuation_call_live._append_tool_outcome",
+            "_append_continuation_tool_outcome(_batch, _call, response=response, error_class=error_class, error_category=error_category, error_message=error_message, post_version=post_version)",
+        ),
+        (
+            finisher,
+            "finish_current_attachment_result",
+            "_execute_continuation_call_live(call_model=call_model, ctx=ctx, acc=data.accumulator, llm_messages=restored.messages, batch=data.batch, call=call, retained_attachment=bound_source)",
+        ),
+        (
+            projection,
+            "require_attachment_projection",
+            "_append_continuation_tool_outcome(batch, call, response=nominal, error_class=None, error_category=None, error_message=None, post_version=nominal.updated_state.version)",
+        ),
+    )
+    constructors = (
+        *(
+            (data, "_construct", name + "(**members)")
+            for name in (
+                "ContinuationCallState",
+                "_CallWireFacts",
+                "ContinuationBatchState",
+                "PluginSchemaSnapshot",
+                "SchemaSecretRequirement",
+                "JSONSchemaSnapshot",
+                "KnobSchemaSnapshot",
+            )
+        ),
+        (data, "_construct", 'AdmittedDiscoveryResult(members["result"], members["response"], selected_contract)'),
+        (data, "_construct", 'AdmittedPluginSchemaResponse(members["snapshot"], PLUGIN_SCHEMA_RESPONSE_CONTRACT)'),
+        (data, "_decode_graph", "RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)"),
+        (data, "_decode_graph", "ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)"),
+        (data, "_decode_graph", "ApplicationGraph(data, effects, recorder, cuts)"),
+        (data, "encode_memory_completion_batch_data", "RestoredBatchData(batch, accumulator, calls)"),
+        (data, "encode_restored_memory_completion_batch_data", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
+        (data, "require_selected_memory_completion", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
+        (
+            finisher,
+            "finish_current_attachment_result",
+            "RestoredPreparedBatchData(data.batch, data.accumulator, data.calls, restored.selected_audit, restored.selected_dialect)",
+        ),
+        (
+            finisher,
+            "finish_current_attachment_result",
+            "RestoredPreparedBatchData(before_graph.selected.batch, before_graph.selected.accumulator, before_graph.selected.calls, before_graph.selected_audit, before_graph.selected_dialect)",
+        ),
+        (
+            projection,
+            "require_attachment_projection",
+            "RestoredPreparedBatchData(old.selected.batch, old.selected.accumulator, old.selected.calls, old.selected_audit, old.selected_dialect)",
+        ),
+        (projection, "require_attachment_projection", "RestoredBatchData(batch, prepared.accumulator, prepared.calls)"),
+    )
+    assert receipt["calls"] == sites(native)
+    assert receipt["data_calls"] == sites(constructors)
+    native_three = sites(
+        (data, "_construct", name + "(**members)") for name in ("ContinuationCallState", "_CallWireFacts", "ContinuationBatchState")
+    )
+    assert native_three <= receipt["data_calls"]
+
+    annotations = (
+        "RestoredBatchData",
+        "RestoredPreparedBatchData",
+        "RestoredMemoryCompletionBatchData",
+        "encode_coupled_batch_data",
+        "encode_coupled_batch_chunk",
+        "encode_prepared_batch_data",
+        "encode_memory_completion_batch_data",
+    )
+    expected_uses = set()
+    for owner in annotations:
+        selected = _reserve_node_at(index[data], owner)
+        declarations = selected.body if isinstance(selected, ast.ClassDef) else [*selected.args.args, *selected.args.kwonlyargs]
+        matches = [
+            node.annotation
+            for node in declarations
+            if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "batch")
+            or (isinstance(node, ast.arg) and node.arg == "batch")
+        ]
+        assert len(matches) == 1 and isinstance(matches[0], ast.Name) and matches[0].id == "ContinuationBatchState"
+        expected_uses.add((data, id(matches[0])))
+    observations = (
+        ("_joint", "type(data.batch) is not ContinuationBatchState"),
+        ("_joint", "type(batch.current_call) is not ContinuationCallState"),
+        ("_members", "type(value) is ContinuationCallState"),
+        ("_members", "type(value) is _CallWireFacts"),
+        ("_members", "type(value) is ContinuationBatchState"),
+        ("_encode.visit", "type(value) is ContinuationCallState"),
+        ("_check_prepared", "type(call) is not ContinuationCallState"),
+        ("_check_prepared", "type(call.wire) is not _CallWireFacts"),
+        ("encode_prepared_batch_data", "type(batch) is not ContinuationBatchState"),
+        ("encode_prepared_batch_data", "type(batch.current_call) is not ContinuationCallState"),
+        ("encode_restored_prepared_batch_data", "type(value.batch.current_call) is not ContinuationCallState"),
+        ("readmit_prepared_batch_audit", "type(call) is not ContinuationCallState"),
+        ("_check_memory_completion", "type(call) is not ContinuationCallState"),
+        ("encode_memory_completion_batch_data", "type(batch) is not ContinuationBatchState"),
+        ("encode_memory_completion_batch_data", "type(batch.current_call) is not ContinuationCallState"),
+        ("encode_restored_memory_completion_batch_data", "type(value.batch.current_call) is not ContinuationCallState"),
+        ("require_selected_memory_completion", "type(call) is not ContinuationCallState"),
+    )
+    actual = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    for owner, expression in observations:
+        for site in sites(((data, owner, expression),)):
+            expected_uses.add((data, id(actual[site].comparators[0])))
+    expected_uses.update((data, id(actual[site].func)) for site in native_three)
+    assert {site for site in receipt["owned_uses"] if site[0] == data} == expected_uses
+
+
+@pytest.mark.landscape_fencing_regression
 def test_continuation_batch_data_receipt_closes_only_original_ast_nodes():
     units = _production_units()
     normal = _reserve_run(units)
@@ -35291,44 +38885,65 @@ def test_continuation_batch_data_receipt_closes_only_original_ast_nodes():
     assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
     failures, receipt = _reserve_continuation_batch_state_receipt(units)
     assert not failures, failures
-    assert len(receipt["calls"]) == 5
+    _assert_current_batch_receipt_inventory(units, receipt)
     assert len(receipt["state_writes"]) == 3
     path = "src/elspeth/web/composer/continuation_batch_data.py"
     original = next(unit for unit in units if unit.path == path)
     actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
-    assert len(receipt["data_calls"]) == 3
     assert receipt["data_calls"] <= actual
     uses = {site for site in receipt["owned_uses"] if site[0] == path}
-    assert len(uses) == 20 and uses <= actual
+    assert uses <= actual
     missing = next(iter(receipt["data_calls"]))
     assert not receipt["data_calls"] <= actual - {missing}
     detached = _parse_source(path, original.source)
-    other_failures, other = _reserve_continuation_batch_state_receipt(tuple(detached if unit.path == path else unit for unit in units))
+    other_units = tuple(detached if unit.path == path else unit for unit in units)
+    other_failures, other = _reserve_continuation_batch_state_receipt(other_units)
     assert not other_failures, other_failures
-    assert len(other["data_calls"]) == 3
-    assert not other["data_calls"] & actual
+    _assert_current_batch_receipt_inventory(other_units, other)
+    assert not {site for site in other["data_calls"] if site[0] == path} & actual
     assert not {site for site in other["owned_uses"] if site[0] == path} & actual
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
-    ("before", "after", "refusal"),
+    ("before", "after", "refusal", "rebind"),
     [
         (
             "from elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts",
             "from foreign_owner import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts",
-            "carrier supplier changed",
+            "complete top-level imports changed",
+            None,
         ),
-        ("def _members(value: Any)", "type = foreign_type\n\ndef _members(value: Any)", "builtin binding changed"),
-        ("    batch: ContinuationBatchState\n", "    batch: ContinuationBatchState = ContinuationBatchState\n", "reference role changed"),
-        ("type(data.batch) is not ContinuationBatchState", "type(data.batch) is ContinuationBatchState", "reference role changed"),
-        ('"index": value.index,', '"index": value.phase,', "complete direct field projection changed"),
-        ("if kind not in _FIELDS or tuple(members) != _FIELDS[kind]:", "if kind not in _FIELDS:", "complete ordered member gate changed"),
-        ("return ContinuationCallState(**members)", "return ContinuationCallState(**dict(members))", "exact constructor transfer changed"),
-        ("    if len(restored) != len(nodes):", "    if False:", "reviewed graph body changed _decode_graph"),
+        ("def _members(value: Any,", "type = foreign_type\n\ndef _members(value: Any,", "builtin binding changed", None),
+        (
+            "    batch: ContinuationBatchState\n",
+            "    batch: ContinuationBatchState = ContinuationBatchState\n",
+            "reference role changed",
+            None,
+        ),
+        (
+            "type(data.batch) is not ContinuationBatchState",
+            "type(data.batch) is ContinuationBatchState",
+            "reference role changed",
+            "_joint",
+        ),
+        ('"index": value.index,', '"index": value.phase,', "complete direct field projection changed", "_members"),
+        (
+            "if kind not in _FIELDS or tuple(members) != _FIELDS[kind]:",
+            "if kind not in _FIELDS:",
+            "complete nominal member constructor gate changed",
+            "_construct",
+        ),
+        (
+            "return ContinuationCallState(**members)",
+            "return ContinuationCallState(**dict(members))",
+            "exact constructor transfer changed",
+            "_construct",
+        ),
+        ("    if len(restored) != len(nodes):", "    if False:", "reviewed graph body changed _decode_graph", "_decode_graph"),
     ],
 )
-def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, after, refusal):
+def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, after, refusal, rebind, monkeypatch):
     units = _production_units()
     normal = _reserve_run(units)
     assert not normal["global_failures"], normal["global_failures"]
@@ -35337,12 +38952,18 @@ def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, afte
     original = next(unit for unit in units if unit.path == path)
     assert before in original.source
     changed = _parse_source(path, original.source.replace(before, after, 1))
+    if rebind is not None:
+        declaration = _reserve_node_at(changed, rebind)
+        assert declaration is not None
+        monkeypatch.setitem(
+            _reserve_batch_data_transfers.BODY_BINDINGS, (path, rebind), _reserve_continuation_transfers._digest(declaration)
+        )
     failures, receipt = _reserve_continuation_batch_state_receipt(tuple(changed if unit.path == path else unit for unit in units))
     assert any(refusal in failure for failure in failures), failures
     assert not receipt
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     "addition",
     [
@@ -35365,7 +38986,7 @@ def test_continuation_batch_data_receipt_keeps_foreign_effects_unproved(addition
     assert proof.failures
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     "addition",
     [
@@ -35414,10 +39035,9 @@ def test_continuation_batch_data_supplier_closure_refuses_external_effect(additi
     assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
     failures, receipt = _reserve_continuation_batch_state_receipt(units)
     assert not failures, failures
-    assert len(receipt["calls"]) == 5
+    _assert_current_batch_receipt_inventory(units, receipt)
     assert len(receipt["factory_calls"]) == 1
     assert len(receipt["state_writes"]) == 3
-    assert len(receipt["data_calls"]) == 3
     actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
     assert (receipt["calls"] | receipt["factory_calls"] | receipt["state_writes"] | receipt["data_calls"]) <= actual
     path = "src/elspeth/web/execution/service.py"
@@ -35427,11 +39047,11 @@ def test_continuation_batch_data_supplier_closure_refuses_external_effect(additi
     assert proof.failures, addition
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize(
     ("before", "after", "refusal"),
     [
-        ("from pydantic import TypeAdapter", "from foreign_supplier import TypeAdapter", "complete import supplier declarations changed"),
+        ("from pydantic import TypeAdapter", "from foreign_supplier import TypeAdapter", "complete top-level imports changed"),
         ("_MAX_NODES = 100_000", "_MAX_NODES = 100_000\nTypeAdapter = replacement", "import supplier binding changed TypeAdapter"),
         ("_MAX_NODES = 100_000", "_MAX_NODES = 100_001", "graph bound changed _MAX_NODES"),
         ("_MAX_NODES = 100_000", "_MAX_NODES = 100_000\nid = replacement", "builtin binding changed id"),
@@ -35453,7 +39073,7 @@ def test_continuation_batch_data_supplier_closure_refuses_local_change(before, a
     assert not receipt
 
 
-@pytest.mark.landscape_long_run
+@pytest.mark.landscape_fencing_regression
 @pytest.mark.parametrize("replacement", ["True", "1_048_577", "make_bound()"], ids=["bool", "changed-limit", "callable-value"])
 def test_continuation_batch_data_immutable_supplier_requires_actual_integer(replacement):
     units = _production_units()
@@ -35554,10 +39174,25 @@ _reserve_CALLBACK_BODIES.update(
     }
 )
 
+_reserve_CALLBACK_BODIES.update(
+    {
+        (
+            "src/elspeth/web/composer/continuation_p4_outcome.py",
+            "HistoricalCheckpointData",
+        ): 'class HistoricalCheckpointData(BaseModel):\n    """Full historical row and original inserted cohort, with no witness API."""\n\n    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)\n    id: UUID\n    session_id: UUID\n    version: int = Field(ge=1)\n    source: dict[str, JsonValue] | None\n    sources: dict[str, dict[str, JsonValue]] | None\n    nodes: list[dict[str, JsonValue]] | None\n    edges: list[dict[str, JsonValue]] | None\n    outputs: list[dict[str, JsonValue]] | None\n    metadata_: dict[str, JsonValue]\n    is_valid: bool\n    validation_errors: list[dict[str, JsonValue]] | None\n    created_at: datetime\n    derived_from_state_id: UUID | None\n    composer_meta: dict[str, JsonValue] | None\n    review_projection: None\n    creator_operation_id: str = Field(min_length=1)\n    inserted_state_ids: tuple[UUID, ...]\n',
+        (
+            "src/elspeth/web/composer/continuation_p4_outcome.py",
+            "historical_checkpoint_record",
+        ): 'def historical_checkpoint_record(value: HistoricalCheckpointData, *, env_ref_names: frozenset[str] = frozenset()) -> CompositionStateRecord:\n    """Return only the owned historical row; never construct a commit witness."""\n    if type(value) is not HistoricalCheckpointData:\n        raise TypeError("historical checkpoint requires its complete data owner")\n    value = _decode_owned(_CHECKPOINT, _dump_owned(_CHECKPOINT, value))\n    if value.created_at.utcoffset() != timedelta(0):\n        raise AuditIntegrityError("historical checkpoint lost its original aware UTC timestamp")\n    if (\n        not value.inserted_state_ids\n        or value.inserted_state_ids[-1] != value.id\n        or len(set(value.inserted_state_ids)) != len(value.inserted_state_ids)\n    ):\n        raise AuditIntegrityError("historical checkpoint lost its exact inserted revision cohort")\n    errors = decode_stored_composition_validation_errors(value.validation_errors)\n    # Reuse the actual component-aware payload admission. Its normalized\n    # temporary source map is used for inspection only; the row below retains\n    # the original source/sources columns separately and exactly.\n    data = CompositionStateData(\n        source=value.source,\n        sources=value.sources,\n        nodes=value.nodes,\n        edges=value.edges,\n        outputs=value.outputs,\n        metadata_=value.metadata_,\n        is_valid=value.is_valid,\n        validation_errors=errors,\n        composer_meta=value.composer_meta,\n    )\n    encode_p4_state_payload(\n        StatePayload(data, None if value.derived_from_state_id is None else str(value.derived_from_state_id)), env_ref_names=env_ref_names\n    )\n    require_no_credential_material(value.creator_operation_id, surface="retained checkpoint creator", env_ref_names=env_ref_names)\n    record = CompositionStateRecord(\n        id=value.id,\n        session_id=value.session_id,\n        version=value.version,\n        source=value.source,\n        sources=value.sources,\n        nodes=value.nodes,\n        edges=value.edges,\n        outputs=value.outputs,\n        metadata_=value.metadata_,\n        is_valid=value.is_valid,\n        validation_errors=errors,\n        created_at=value.created_at,\n        derived_from_state_id=value.derived_from_state_id,\n        composer_meta=value.composer_meta,\n        review_projection=None,\n    )\n    read_content_publication(record)\n    return record\n',
+    }
+)
+
+
 # Append literal-bodies.py.txt immediately before this snippet in the existing guard.
 # No source execution, import, or additional runner is introduced.
 _reserve_CALLBACK_PREFIX = "src/elspeth/web/composer/"
 _reserve_CALLBACK_ADAPTERS = {
+    "continuation_p4_outcome.py": {"_CHECKPOINT": "HistoricalCheckpointData"},
     "continuation_audit_buffer.py": {"_BUFFER_CODEC": "RecorderSnapshot"},
     "continuation_provider_outcomes.py": {"_PHYSICAL_AUDIT": "ComposerLLMCall"},
     "continuation_tool_batch.py": {
@@ -35607,6 +39242,12 @@ _reserve_CALLBACK_FORMALS = {
 }
 # Actual complete caller expressions and lexical owners, with no additional callers.
 _reserve_CALLBACK_FORWARDING = (
+    ("continuation_p4_outcome.py", "historical_checkpoint_record", "_dump_owned(_CHECKPOINT, value)"),
+    (
+        "continuation_p4_outcome.py",
+        "historical_checkpoint_record",
+        "_decode_owned(_CHECKPOINT, _dump_owned(_CHECKPOINT, value))",
+    ),
     ("continuation_tool_batch.py", "_decode_owned", "_dump_owned(adapter, result)"),
     ("continuation_tool_batch.py", "encode_tool_result_value", "_dump_owned(_RUNTIME, result.runtime_preflight)"),
     ("continuation_tool_batch.py", "decode_tool_result_value", "_decode_owned(_RUNTIME, admitted.runtime_preflight_json)"),
@@ -35640,28 +39281,6 @@ _reserve_CALLBACK_FORWARDING = (
     ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_INVOCATIONS, invocations)"),
     ("continuation_prepared_p4.py", "capture_prepared_p4", "_dump_owned(_P4_AUTHORINGS, authorings)"),
     ("continuation_prepared_p4.py", "decode_prepared_p4", "_decode_owned(_P4_VALUE, encoded)"),
-)
-_reserve_CALLBACK_PROMPT_CALLS = (
-    (
-        "_feedback_content_parts",
-        'json_content_parts(canonical_json(feedback), reference_paths=references, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
-    ),
-    (
-        "_plan_pipeline_inner",
-        'json_content_parts(canonical_json(provider_request), ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
-    ),
-    (
-        "_plan_pipeline_inner._engage_escape_hatch",
-        'json_content_parts(request_text, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
-    ),
-    (
-        "_plan_pipeline_inner",
-        'json_content_parts(not_alone_feedback, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
-    ),
-    (
-        "_plan_pipeline_inner",
-        'json_content_parts(argument_feedback_json, ensure_ascii=False, sort_keys=True, separators=(",", ":"), encoder=_primitive_canonical_json, decoder=canonical_json_loads)',
-    ),
 )
 
 
@@ -35782,6 +39401,83 @@ def _reserve_batch_data_callback_consumers(units):
             supplier_bindings.add(module(path) + "." + name)
     if failures:
         return failures, {}
+
+    # This nominal DATA codec has a complete source contract, not the
+    # generic owned-ClassDef fallback or a deep-immutability certificate.
+    checkpoint_path = _reserve_CALLBACK_PREFIX + "continuation_p4_outcome.py"
+    checkpoint = source(checkpoint_path)
+    if checkpoint is not None:
+        checkpoint_owner = module(checkpoint_path)
+        checkpoint_nodes = tuple(ast.walk(checkpoint.tree))
+        checkpoint_positions = {id(node): index for index, node in enumerate(checkpoint.tree.body)}
+        checkpoint_schema = definitions[checkpoint_path, "HistoricalCheckpointData"]
+        checkpoint_schemas = [
+            node for node in checkpoint.tree.body if isinstance(node, ast.ClassDef) and node.name == "HistoricalCheckpointData"
+        ]
+        checkpoint_declarations = [
+            node
+            for node in checkpoint.tree.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "_CHECKPOINT" for target in node.targets)
+        ]
+        require(
+            len(checkpoint_schemas) == 1
+            and checkpoint_schemas[0] is checkpoint_schema
+            and len(checkpoint_declarations) == 1
+            and checkpoint_positions[id(checkpoint_schema)] < checkpoint_positions[id(checkpoint_declarations[0])],
+            "nominal schema must precede actual adapter constructor " + checkpoint_path + ":_CHECKPOINT",
+        )
+        for binding, supplier, member in (
+            ("BaseModel", "pydantic", "BaseModel"),
+            ("ConfigDict", "pydantic", "ConfigDict"),
+            ("Field", "pydantic", "Field"),
+            ("JsonValue", "pydantic", "JsonValue"),
+            ("TypeAdapter", "pydantic", "TypeAdapter"),
+            ("UUID", "uuid", "UUID"),
+            ("datetime", "datetime", "datetime"),
+            ("timedelta", "datetime", "timedelta"),
+            ("AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError"),
+            ("_decode_owned", "elspeth.web.composer.continuation_tool_batch", "_decode_owned"),
+            ("_dump_owned", "elspeth.web.composer.continuation_tool_batch", "_dump_owned"),
+            ("CompositionStateData", "elspeth.web.sessions.protocol", "CompositionStateData"),
+            ("CompositionStateRecord", "elspeth.web.sessions.protocol", "CompositionStateRecord"),
+            ("decode_stored_composition_validation_errors", "elspeth.web.sessions.protocol", "decode_stored_composition_validation_errors"),
+            ("encode_p4_state_payload", "elspeth.web.composer.continuation_p4_state_payload", "encode_p4_state_payload"),
+            ("StatePayload", "elspeth.web.sessions._persist_payload", "StatePayload"),
+            ("require_no_credential_material", "elspeth.web.credential_guard", "require_no_credential_material"),
+            ("read_content_publication", "elspeth.web.sessions.content_publication", "read_content_publication"),
+        ):
+            imported(checkpoint_path, binding, supplier, member)
+            declarations = [
+                node
+                for node in checkpoint.tree.body
+                if isinstance(node, ast.ImportFrom)
+                and node.level == 0
+                and node.module == supplier
+                and any(alias.name == member and (alias.asname or alias.name) == binding for alias in node.names)
+            ]
+            require(
+                len(declarations) == 1
+                and checkpoint_positions[id(declarations[0])] < checkpoint_positions[id(checkpoint_schema)]
+                and not _reserve_owned_source_binding_failures(
+                    {checkpoint_owner: checkpoint}, frozenset({checkpoint_owner + "." + binding})
+                ),
+                "canonical import changed " + checkpoint_path + ":" + binding,
+            )
+        for binding in ("str", "int", "bool", "dict", "list", "tuple", "frozenset", "type", "TypeError", "len", "set"):
+            builtin(checkpoint_path, binding)
+            require(
+                _reserve_typing_builtin_binding(checkpoint, checkpoint_nodes, binding),
+                "builtin changed " + checkpoint_path + ":" + binding,
+            )
+        for binding in ("HistoricalCheckpointData", "historical_checkpoint_record"):
+            require(
+                not _reserve_owned_source_binding_failures({checkpoint_owner: checkpoint}, frozenset({checkpoint_owner + "." + binding})),
+                "consumer binding changed " + checkpoint_path + ":" + binding,
+            )
+        require(
+            not _reserve_owned_source_binding_failures({checkpoint_owner: checkpoint}, frozenset({checkpoint_owner + "._CHECKPOINT"})),
+            "adapter rebound _CHECKPOINT",
+        )
 
     for filename, adapters in _reserve_CALLBACK_ADAPTERS.items():
         path = _reserve_CALLBACK_PREFIX + filename
@@ -35927,7 +39623,7 @@ def _reserve_batch_data_callback_consumers(units):
         call = expression(path, owning, text)
         if call is None:
             continue
-        if filename == "continuation_prepared_p4.py":
+        if filename in {"continuation_prepared_p4.py", "continuation_p4_outcome.py"}:
             imported(path, call.func.id, "elspeth.web.composer.continuation_tool_batch", call.func.id)
         require(unshadowed(path, call.func, call.func.id), "forwarded helper shadowed " + owning)
         parameter = call.args[0]
@@ -35943,26 +39639,6 @@ def _reserve_batch_data_callback_consumers(units):
         observed_uses.add((path, id(call.func)))
         if parameter.id != "adapter":
             observed_uses.add((path, id(parameter)))
-
-    prompt_path = _reserve_CALLBACK_PREFIX + "pipeline_planner.py"
-    imported(prompt_path, "json_content_parts", "elspeth.web.composer.prompt_guard_rendering", "json_content_parts")
-    imported(prompt_path, "_primitive_canonical_json", "elspeth.contracts.hashing", "canonical_json")
-    imported(prompt_path, "canonical_json_loads", "elspeth.contracts.hashing", "canonical_json_loads")
-    for owning, text in _reserve_CALLBACK_PROMPT_CALLS:
-        call = expression(prompt_path, owning, text)
-        if call is None:
-            continue
-        require(unshadowed(prompt_path, call.func, "json_content_parts"), "prompt receiver shadowed " + owning)
-        for keyword in call.keywords:
-            if keyword.arg in {"encoder", "decoder"}:
-                require(
-                    isinstance(keyword.value, ast.Name) and unshadowed(prompt_path, keyword.value, keyword.value.id),
-                    "prompt callback shadowed " + owning,
-                )
-                argument_calls.add((prompt_path, id(call), id(keyword.value)))
-                uses.add((prompt_path, id(keyword.value)))
-                observed_uses.add((prompt_path, id(keyword.value)))
-        calls.add((prompt_path, id(call)))
 
     # Actual synchronous local closure: tuple exhausts render before returning;
     # no callback is placed in a PromptGuardContentPart or a returned closure.

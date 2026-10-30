@@ -11,10 +11,8 @@ from typing import Any
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import (
-    PROMPT_GUARD_CONTENT_PARTS_KEY,
-    PROMPT_GUARD_THINKING_PARTS_KEY,
+    PROMPT_GUARD_PROVENANCE_KEYS,
     PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY,
-    PROMPT_GUARD_TRUST_KEY,
     PromptGuardToolArgumentParts,
 )
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
@@ -77,9 +75,11 @@ def _ordinary_message(wire: dict[str, Any], indexes: tuple[int, ...]) -> dict[st
 def require_ordinary_argument_parts(message: Mapping[str, Any], indexes: tuple[int, ...]) -> None:
     wire = retained_family_wire(family_message_wire(message))
     rebuilt = _ordinary_message(wire, indexes)
-    if any(
-        key in message for key in (PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY, PROMPT_GUARD_THINKING_PARTS_KEY)
-    ) or message.get(PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY) != rebuilt.get(PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY):
+    # Every provenance key except the tool-argument one, which the next clause
+    # compares against the rebuilt message rather than merely refusing.
+    if any(key in message for key in PROMPT_GUARD_PROVENANCE_KEYS - {PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY}) or message.get(
+        PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY
+    ) != rebuilt.get(PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY):
         raise AuditIntegrityError("ordinary message changed its actual all-untrusted argument provenance")
 
 

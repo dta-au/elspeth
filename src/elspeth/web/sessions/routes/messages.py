@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse
+from fastapi import Response
+
+from elspeth.web.sessions.schemas import ComposerOperationAcceptedResponse, ComposerOperationSnapshotV2
 
 from ._helpers import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
@@ -26,7 +28,7 @@ from ._helpers import (
     get_rate_limiter,
     require_pipeline_user,
 )
-from .composer.operations import admit, parse_message_body
+from .composer.operations import admit, client_version, parse_message_body, with_version
 from .diagnostics import register_diagnostic_routes
 
 
@@ -43,15 +45,21 @@ def _requests_audit_grade_messages_view(
 def register_message_routes(router: APIRouter) -> None:
     register_diagnostic_routes(router)
 
-    @router.post("/{session_id}/messages", response_model=ComposerOperationAcceptedResponse, status_code=202)
+    @router.post("/{session_id}/messages", response_model=ComposerOperationAcceptedResponse | ComposerOperationSnapshotV2, status_code=202)
     async def send_message(
         session_id: UUID,
         request: Request,
+        response: Response,
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         rate_limiter: Annotated[WebRateLimiter, Depends(get_rate_limiter)],
-    ) -> ComposerOperationAcceptedResponse:
-        body = await parse_message_body(request, session_id, user)
-        return await admit(request, session_id, body, user, rate_limiter, "compose_message")
+    ) -> ComposerOperationAcceptedResponse | ComposerOperationSnapshotV2:
+        try:
+            version = client_version(request)
+            body = await parse_message_body(request, session_id, user)
+            return await admit(request, response, session_id, body, user, rate_limiter, "compose_message", version)
+        except HTTPException as exc:
+            # Refusals before admission project the v1 error body.
+            raise with_version(exc, 1) from exc
 
     @router.get(
         "/{session_id}/messages",

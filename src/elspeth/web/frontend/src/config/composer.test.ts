@@ -17,6 +17,11 @@ describe("durable composer observation policy", () => {
     for (const code of [composer.COMPOSE_OUTCOME_UNCONFIRMED, "recompose_saved_proposal", "recompose_already_completed"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(true);
     for (const code of [undefined, "request_cancelled", "stale_compose_state", "admission_refused", "token_accounting_unavailable"]) expect(composer.isComposeRefreshOnlyFailureCode(code)).toBe(false);
   });
+  it("treats an unsupported context as a permanent refusal (U-22 F4)", () => {
+    // Retrying the same graph can never succeed, so Retry must not be offered.
+    expect(composer.isComposePermanentRefusal("context_unsupported")).toBe(true);
+    expect(composer.isComposeRefreshOnlyFailureCode("context_unsupported")).toBe(false);
+  });
   it("distinguishes observation detachment from explicit Stop", () => {
     expect(composer.COMPOSE_TIMEOUT_ABORT_REASON).toBe("compose_timeout");
     expect(composer.COMPOSE_USER_CANCEL_ABORT_REASON).toBe("compose_user_cancel");

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Final, cast, final
+from typing import TYPE_CHECKING, Any, Final, cast, final
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -51,6 +51,40 @@ from elspeth.web.sessions.composer_operations import ComposerOperationError
 
 INVOCATION_AUTHORITY_REVOKED_KEY: Final = "authority_revoked"
 
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedOperationFailureFacts:
+    durable_operation_id: str
+    request_id: str | None
+    context: SessionOperationContext
+    source: RetainedToolFailureSource
+    publication_observation: PrivateFailureFacts | None = None
+
+    def __post_init__(self) -> None:
+        from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+
+        if (
+            type(self.source) is not RetainedToolFailureSource
+            or type(self.context) is not SessionOperationContext
+            or type(self.durable_operation_id) is not str
+            or not self.durable_operation_id
+            or (self.request_id is not None and type(self.request_id) is not str)
+            or (self.publication_observation is not None and type(self.publication_observation) is not PrivateFailureFacts)
+        ):
+            raise AuditIntegrityError("Retained operation failure facts lost their actual closed origins")
+
+    def validate_for(self, *, durable_operation_id: str, request_id: str | None, context: SessionOperationContext) -> None:
+        if (self.durable_operation_id, self.request_id, self.context) != (durable_operation_id, request_id, context):
+            raise AuditIntegrityError("Retained failure publication crossed its current publisher")
+        if (self.source.selected.stack.logical.session_id, self.source.selected.stack.logical.operation_id) != (
+            context.fence.session_id,
+            durable_operation_id,
+        ):
+            raise AuditIntegrityError("Retained failure publication crossed its original logical source")
+
 
 @final
 @dataclass(frozen=True, slots=True)
@@ -77,11 +111,39 @@ class ComposerOperationFailureFacts:
             raise AuditIntegrityError("Operation failure facts belong to another exact request or fence")
 
 
-def private_operation_failure_draft(capture: ComposerOperationFailureFacts, *, failure: ComposerOperationError) -> AuditMessageDraft:
+def private_operation_failure_draft(
+    capture: ComposerOperationFailureFacts | RetainedOperationFailureFacts, *, failure: ComposerOperationError
+) -> AuditMessageDraft:
     """Correlate private captured facts with the actually selected public outcome."""
-    if type(capture) is not ComposerOperationFailureFacts or type(failure) is not ComposerOperationError:
+    if type(capture) not in (ComposerOperationFailureFacts, RetainedOperationFailureFacts) or type(failure) is not ComposerOperationError:
         raise AuditIntegrityError("Operation failure projection is not nominal")
     correlation = "operation:" + capture.durable_operation_id
+    if type(capture) is RetainedOperationFailureFacts:
+        source = capture.source
+        refusal = source.failure.refusal_source
+        facts = source.invocation.private_failure
+        result = source.invocation.result_canonical if refusal is not None else None if facts is None else facts.canonical
+        if result is None:
+            raise AuditIntegrityError("Retained failure publication lacks its actual crash/refusal facts")
+        origin = {
+            "kind": "retained_successful_refusal" if refusal is not None else "retained_crash",
+            "response": source.response.reference.model_dump(mode="json"),
+            "issue": source.issue.model_dump(mode="json"),
+            "evidence": source.evidence.reference.model_dump(mode="json"),
+            "invocation_call_id": source.invocation.tool_call_id,
+            "refusal_kind": None if refusal is None else refusal.kind,
+            "provider_call_id": None if refusal is None else refusal.provider_call_id,
+            **(
+                {"publication_observation": capture.publication_observation.canonical}
+                if capture.publication_observation is not None
+                else {}
+            ),
+        }
+    elif isinstance(capture, ComposerOperationFailureFacts):
+        result = capture.facts.canonical
+        origin = None
+    else:
+        raise AuditIntegrityError("Operation failure facts have no actual closed origin")
     evidence = build_private_tool_evidence(
         session_id=capture.context.fence.session_id,
         operation_id=capture.context.fence.operation_id,
@@ -97,9 +159,10 @@ def private_operation_failure_draft(capture: ComposerOperationFailureFacts, *, f
                 "diagnostic_id": failure.diagnostic_id,
                 "failure_code": failure.failure_code,
                 "correlation_kind": "internal_operation",
+                **({"retained_origin": origin} if origin is not None else {}),
             }
         ),
-        result_canonical=capture.facts.canonical,
+        result_canonical=result,
     )
     return AuditMessageDraft(
         role="audit",

@@ -6,14 +6,14 @@ apply its completion, enforce the tool cap and confirm delivery afterward.
 
 from __future__ import annotations
 
-import asyncio
 import math
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -27,6 +27,7 @@ from elspeth.web.composer.continuation_prompt_producers import CurrentContinuati
 from elspeth.web.composer.continuation_provider_input import continuation_provider_input_json
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.continuation_tool_batch import _state_from_tool_json
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.provider_gateway import PreparedContinuationPrimaryRequest
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -134,7 +135,7 @@ def _freeze_input(
         or type(drained) is not RecorderDrainCursors
     ):
         raise AuditIntegrityError("primary input requires the actual current message/recorder producers")
-    producers._require_current()
+    current_inputs = producers._require_current()
     frame = selected.stack.frames[-1]
     if type(frame) is not ComposeFrame or frame.phase != "action_ready" or frame.pending_response is not None:
         raise AuditIntegrityError("primary input requires its actual action-ready compose owner")
@@ -161,11 +162,19 @@ def _freeze_input(
         raise AuditIntegrityError("primary input changed its selected complete message/shelf join")
     if recorder.snapshot_for_continuation(drained=drained) != decode_recorder_snapshot(by_ref[frame.audit_buffer]):
         raise AuditIntegrityError("primary input changed its complete current recorder prefix")
-    # Owned copies of the admitted input; the invocation record freezes them.
-    owned_messages, owned_tools = deep_thaw(messages), deep_thaw(tools)
-    request = service._provider_gateway.prepare_continuation_primary(owned_messages, owned_tools)
+    # Source checks precede the new request preparation. The finish-once SQL
+    # worker does not carry the async prompt ContextVar; its actual admitted
+    # bootstrap owns the original authenticated human input explicitly.
+    try:
+        request = service._provider_gateway.prepare_continuation_primary(messages, tools, user_prompt=current_inputs.values.message)
+    except ComposerContextUnsupported:
+        producers._require_current()
+        raise
     producers._require_current()
-    return PreparedPrimaryInvocation(request, owned_messages, owned_tools)
+    provider_input = request.provider_input
+    return PreparedPrimaryInvocation(
+        request, provider_input.evidence.messages, provider_input.tools if provider_input.tools is not None else ()
+    )
 
 
 async def run_continuation_primary(
@@ -201,7 +210,15 @@ async def run_continuation_primary(
     policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
     if timeout > policy.actions.primary.total:
         raise AuditIntegrityError("primary invocation cannot renew its retained action allowance")
-    deadline = asyncio.get_running_loop().time() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    deadline_owner = required_work.coordinator.sql_deadline_owner
+    if deadline_owner is not None:
+        if deadline_owner.running is not running:
+            raise AuditIntegrityError("primary invocation changed its actual original timing owner")
+        deadline = min(deadline, started + deadline_owner.remaining_dispatch(monotonic_now=started))
+    if deadline <= started:
+        raise TimeoutError("primary action exhausted its original allowance before input preparation")
     # None is the retained lifecycle-v2 cost contract. An applicable monetary
     # owner needs its separately approved prepared-input/allowance join.
     if provider_owner.cost_budget is not None:
@@ -226,7 +243,7 @@ async def run_continuation_primary(
     invocation = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_READ_SQL, captured)
     if type(invocation) is not PreparedPrimaryInvocation:
         raise AuditIntegrityError("primary input preparation lost its actual request")
-    if asyncio.get_running_loop().time() >= deadline:
+    if time.monotonic() >= deadline:
         raise TimeoutError("primary action allowance expired during actual input preparation")
     sql, projection = required_work.reserve_pair(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
@@ -249,7 +266,7 @@ async def run_continuation_primary(
     prepared = _project(required_work, sql, projection, RequiredWorkSource.CONTINUATION_STATE_SQL, prepared_outcome)
     if type(prepared) is not PreparedContinuationProvider:
         raise AuditIntegrityError("primary preparation lost its actual committed effect")
-    if asyncio.get_running_loop().time() >= deadline:
+    if time.monotonic() >= deadline:
         raise TimeoutError("primary action allowance expired after actual effect preparation")
     sql, projection = required_work.reserve_pair(
         RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
@@ -270,17 +287,27 @@ async def run_continuation_primary(
     # actual current message owner; no environment value is saved or renewed.
     by_ref = {chunk.reference: chunk for chunk in selected.chunks}
     state = _state_from_tool_json(by_ref[frame.state].canonical, env_ref_names=producers.inventory.names)
-    remaining = deadline - asyncio.get_running_loop().time()
+    now = time.monotonic()
+    remaining = deadline - now
+    if deadline_owner is not None:
+        remaining = min(remaining, deadline_owner.remaining_dispatch(monotonic_now=now))
     if remaining <= 0:
         raise TimeoutError("primary action allowance expired before actual provider entry")
+    provider_input = invocation.request.provider_input
+    service._provider_gateway.verify_input(provider_input)
+    if canonical_json(invocation.messages) != canonical_json(provider_input.evidence.messages) or canonical_json(
+        invocation.tools
+    ) != canonical_json(provider_input.tools if provider_input.tools is not None else ()):
+        raise AuditIntegrityError("Primary invocation changed its original admitted wire snapshot")
     actual = await service._provider_gateway._call_llm_outcome_with_audit(
-        deep_thaw(invocation.messages),
-        deep_thaw(invocation.tools),
+        provider_input.evidence.messages,
+        provider_input.tools if provider_input.tools is not None else [],
         timeout=remaining,
         recorder=recorder,
         provider_custody=custody,
         credential_state=state,
         continuation_input_sha256=invocation.request.input_sha256,
+        prepared_input=provider_input,
     )
     snapshot = recorder.snapshot_for_continuation(drained=drained)
     sql, projection = required_work.reserve_pair(

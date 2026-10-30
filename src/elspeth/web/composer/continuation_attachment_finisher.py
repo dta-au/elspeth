@@ -21,7 +21,7 @@ from elspeth.web.composer.continuation_batch_data import (
 from elspeth.web.composer.continuation_codec import encode_continuation_response
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit, re_admit_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, capture_turn_evidence
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -37,8 +37,8 @@ from elspeth.web.sessions.continuation_attachment_result import AttachmentResult
 @dataclass(frozen=True, slots=True)
 class CompletedAttachmentProjection:
     source: AttachmentResultCheckpoint
-    before: TurnEvidenceSnapshot
-    after: TurnEvidenceSnapshot
+    before: AdmittedTurnEvidence
+    after: AdmittedTurnEvidence
     data: RestoredBatchData
     receipt: RetainedToolReceipt
 
@@ -113,9 +113,7 @@ async def finish_current_attachment_result(
         data=prepared,
         materialization=ctx.message_producers,
     )
-    from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
-
-    before_graph = require_evidence_application_links(before, env_ref_names=inventory.names)
+    before_graph = require_admitted_turn_evidence(before, env_ref_names=inventory.names).graph
     if before_graph is None or before_graph.selected_audit is None or before_graph.selected_dialect is None:
         raise AuditIntegrityError("attachment finishing lost its complete original prepared capture")
     selected_json = encode_restored_prepared_batch_data(

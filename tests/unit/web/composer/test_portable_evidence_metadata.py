@@ -7,6 +7,7 @@ from elspeth.web.composer.continuation_evidence import (
     RetainedHistoricalEffect,
     TurnEvidenceSnapshot,
     _require_evidence_metadata,
+    admit_turn_evidence,
     decode_turn_evidence,
     encode_turn_evidence,
 )
@@ -23,7 +24,7 @@ async def test_actual_committed_effect_locator_is_metadata_not_a_credential_slot
     running, _args, values, _audit, _messages = await portable_input(operation_store)
     try:
         bundle = build_portable_p4_application(**values)
-        snapshot = bundle.evidence_after
+        snapshot = bundle.evidence_after.snapshot
         assert len(snapshot.effect_locators) == 1
         actual = snapshot.effect_locators[0]
         assert actual.effect_key == values["result"].receipt.effect_key
@@ -32,7 +33,7 @@ async def test_actual_committed_effect_locator_is_metadata_not_a_credential_slot
         assert actual.creator_operation_id == values["producer"].creator_operation_id
         assert actual.inserted_state_ids == values["result"].receipt.inserted_state_ids
         assert actual.authored_state_hash == values["result"].receipt.authored_state_hash
-        assert decode_turn_evidence(encode_turn_evidence(snapshot), env_ref_names=frozenset()) == snapshot
+        assert decode_turn_evidence(encode_turn_evidence(bundle.evidence_after), env_ref_names=frozenset()).snapshot == snapshot
         _require_evidence_metadata(snapshot, env_ref_names=frozenset())
     finally:
         operation_store[1].release(running.session_operation_context)
@@ -44,8 +45,8 @@ async def test_owned_locator_values_still_reject_actual_credentials(operation_st
     running, _args, values, _audit, _messages = await portable_input(operation_store)
     try:
         bundle = build_portable_p4_application(**values)
-        snapshot = bundle.evidence_after
-        assert decode_turn_evidence(encode_turn_evidence(snapshot), env_ref_names=frozenset()) == snapshot
+        snapshot = bundle.evidence_after.snapshot
+        assert decode_turn_evidence(encode_turn_evidence(bundle.evidence_after), env_ref_names=frozenset()).snapshot == snapshot
         _require_evidence_metadata(snapshot, env_ref_names=frozenset())
         locator_fields = snapshot.effect_locators[0].model_dump(mode="python")
         locator_fields[field] = "https://" + "name:synthetic-private-value@example.test/"
@@ -57,7 +58,7 @@ async def test_owned_locator_values_still_reject_actual_credentials(operation_st
             _require_evidence_metadata(changed, env_ref_names=frozenset())
         assert refused.value.finding.category == "credential_url"
         with pytest.raises((AuditIntegrityError, CredentialMaterialRefused)):
-            encode_turn_evidence(changed)
+            admit_turn_evidence(changed, env_ref_names=frozenset())
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -67,11 +68,11 @@ async def test_other_evidence_metadata_remains_under_original_guard(operation_st
     running, _args, values, _audit, _messages = await portable_input(operation_store)
     try:
         bundle = build_portable_p4_application(**values)
-        assert decode_turn_evidence(bundle.evidence_chunk, env_ref_names=frozenset()) == bundle.evidence_after
+        assert decode_turn_evidence(bundle.evidence_chunk, env_ref_names=frozenset()).snapshot == bundle.evidence_after.snapshot
         snapshot = TurnEvidenceSnapshot.model_validate(
-            {**bundle.evidence_after.model_dump(mode="python"), "actor_user_id": "sk-" + "a" * 24}
+            {**bundle.evidence_after.snapshot.model_dump(mode="python"), "actor_user_id": "sk-" + "a" * 24}
         )
         with pytest.raises(CredentialMaterialRefused):
-            encode_turn_evidence(snapshot)
+            admit_turn_evidence(snapshot, env_ref_names=frozenset())
     finally:
         operation_store[1].release(running.session_operation_context)

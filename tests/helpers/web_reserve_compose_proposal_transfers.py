@@ -6,12 +6,37 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+from tests.helpers import web_reserve_proposal_child_transfers as _supplier_sources
 from tests.helpers.web_reserve_composer_receiver import composer_dispatch_calls
 
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 PROPOSALS = "src/elspeth/web/sessions/routes/composer/proposals.py"
 SETTLEMENT = "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py"
+RECOVERY_MESSAGES = "src/elspeth/web/composer/continuation_message_builders.py"
+RECOVERY_INSTRUCTION_ORIGINS = frozenset(
+    {
+        "elspeth.web.composer.continuation_message_builders.recovery_instruction_message",
+        "elspeth.contracts.prompt_guard.PROMPT_GUARD_TRUST_KEY",
+        "elspeth.contracts.prompt_guard.PromptGuardTrust",
+    }
+)
+RECOVERY_INSTRUCTION_FUNCTION_ORIGINS = frozenset({"elspeth.web.composer.continuation_message_builders.recovery_instruction_message"})
+RECOVERY_INSTRUCTION_CLASS_ORIGINS = frozenset({"elspeth.contracts.prompt_guard.PromptGuardTrust"})
+
+_RECOVERY_INSTRUCTION_SOURCE = """def recovery_instruction_message() -> dict[str, Any]:
+    return {
+        "role": "system",
+        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
+        "content": (
+            "The saved graph could not be decoded. Its payload is unavailable and must not be inferred. "
+            "Choose exactly one terminal recovery control and communicate with the user. "
+            "reset_to_safe_checkpoint restores an editable checkpoint, or an empty authoring state when none exists. "
+            "Saving or capturing the broken graph is not required. Do not claim recovery succeeded before the "
+            "server receipt. Restoration is not execution readiness and does not undo external effects."
+        ),
+    }
+"""
 
 
 def _node(unit, path):
@@ -439,12 +464,12 @@ def _source3_local_transfers(units):
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "36341c16a42e90fb6dc0a80c18aed6515669612ccbef2866255240f389ea3654",
-    SERVICE: "cda69f2a76801539ffd869b14eff179cf4bb34cb5c030827a1f7188237dda367",
+    TURN: "80626ed714e47a544b5a03c79687ace8da645d59c65351dfc685458128080364",
+    SERVICE: "888d117a75a50c8c4bfda3ec1a91d624e3ba82232bdd87e957dd452dc688baac",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
 }
-_REVIEWED_RECOVERY_METHOD_SHAPE = "3ae93045b40c4679440983c32f813a6d0ae75749e63adeaf01f2dffcdb7df89c"
+_REVIEWED_RECOVERY_METHOD_SHAPE = "cb8dea7814eb14cbe8601c402db19eb544781954c26679a6780e378b3d6d35c0"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
 _METHOD_PATHS = {
     TURN: "_run_composer_turn",
@@ -578,6 +603,13 @@ def compose_proposal_local_transfers(units):
     recovery = _node(selected[SERVICE], "ComposerServiceImpl.compose_recovery")
     if recovery is None or _method_shape(recovery) != _REVIEWED_RECOVERY_METHOD_SHAPE:
         return ["composer recovery complete executed method grammar changed"], None
+    if _supplier_sources.import_origin(
+        selected[SERVICE].tree,
+        "recovery_instruction_message",
+        "elspeth.web.composer.continuation_message_builders",
+        "recovery_instruction_message",
+    ) is None or _lexical_bindings(recovery, "recovery_instruction_message"):
+        return ["composer recovery instruction supplier origin changed"], None
     normalized = {}
     for path, unit in selected.items():
         if not any(
@@ -612,3 +644,62 @@ def compose_proposal_local_transfers(units):
     if failures:
         return failures, None
     return [], receipt
+
+
+def recovery_instruction_supplier_contracts(units):
+    """Bind the extracted instruction in supplied ASTs; never read a source file.
+
+    The ordinary transfer receipt validates the consumer import and call. This
+    additional dependency receipt requires the defining source and keeps loader,
+    enum and callable-code behavior conditional on the common proof.
+    """
+    index = {}
+    for unit in units:
+        if unit.path in index:
+            return ["recovery instruction supplier: duplicate source unit"], None
+        index[unit.path] = unit
+    if SERVICE not in index or RECOVERY_MESSAGES not in index:
+        return ["recovery instruction supplier: missing current source"], None
+    source = index[RECOVERY_MESSAGES]
+    if not any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(alias.name == "annotations" for alias in node.names)
+        for node in source.tree.body
+    ):
+        return ["recovery instruction supplier: postponed annotations required"], None
+    method = _node(source, "recovery_instruction_message")
+    if method is None or not _exact(method, _RECOVERY_INSTRUCTION_SOURCE):
+        return ["recovery instruction supplier: complete producer changed"], None
+    if not _supplier_sources.owned_origin(source.tree, "recovery_instruction_message", method):
+        return ["recovery instruction supplier: producer binding changed"], None
+    origins = []
+    for binding in ("PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"):
+        origin = _supplier_sources.import_origin(source.tree, binding, "elspeth.contracts.prompt_guard", binding)
+        if origin is None:
+            return ["recovery instruction supplier: canonical dependency changed " + binding], None
+        origins.append((source.path, id(origin[1])))
+    consumer = index[SERVICE]
+    origin = _supplier_sources.import_origin(
+        consumer.tree,
+        "recovery_instruction_message",
+        "elspeth.web.composer.continuation_message_builders",
+        "recovery_instruction_message",
+    )
+    recovery = _node(consumer, "ComposerServiceImpl.compose_recovery")
+    if origin is None or recovery is None or _lexical_bindings(recovery, "recovery_instruction_message"):
+        return ["recovery instruction supplier: consumer origin changed"], None
+    calls = _calls(recovery, lambda node: isinstance(node.func, ast.Name) and node.func.id == "recovery_instruction_message")
+    if len(calls) != 1 or calls[0].args or calls[0].keywords:
+        return ["recovery instruction supplier: exact consumer call changed"], None
+    if _supplier_sources._executed_protected_loads(
+        source.tree, {"recovery_instruction_message", "PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"}
+    ):
+        return ["recovery instruction supplier: evaluated producer escape"], None
+    return [], {
+        "supplier_definitions": ((source.path, id(method)),),
+        "supplier_calls": ((consumer.path, id(calls[0])),),
+        "source_origins": (*origins, (consumer.path, id(origin[1]))),
+        "protected_origins": RECOVERY_INSTRUCTION_ORIGINS,
+        "function_origins": RECOVERY_INSTRUCTION_FUNCTION_ORIGINS,
+        "class_origins": RECOVERY_INSTRUCTION_CLASS_ORIGINS,
+        "common_unknown": ("runtime prompt-guard enum and callable-code identity", "outside or deferred supplier mutation"),
+    }

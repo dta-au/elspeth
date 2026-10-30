@@ -95,7 +95,7 @@ def reference(codec, number):
 def source_values():
     return nested_source_values(
         state=reference("composer.state.v1", 1),
-        evidence=reference("composer.evidence.v1", 2),
+        evidence=reference("composer.evidence.v2", 2),
         transcript=reference("composer.transcript.v1", 3),
         iteration=reference("composer.iteration.v1", 4),
     )

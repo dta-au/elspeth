@@ -30,9 +30,7 @@ from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.discovery_cache import serialize_tool_result
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
-from elspeth.web.composer.planner_authoring_aids import planner_plugin_contract
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec, ValidationEntry, ValidationSummary
@@ -51,6 +49,7 @@ from elspeth.web.composer.tools._common import (
     _validate_transform_provider_config_path,
     normalize_tool_result_validation,
 )
+from elspeth.web.composer.tools.generation import build_validation_guidance
 from elspeth.web.composer.tools.sources import _options_with_source_blob_review, _resolve_source_blob
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -202,7 +201,7 @@ def test_blob_binding_context_refusal_does_not_report_saved_graph_errors(tmp_pat
 
 
 @pytest.mark.parametrize("surface", ["source", "named_source", "sink", "provider"])
-def test_candidate_path_refusals_keep_server_roots_out_of_tool_history_and_planner(tmp_path: Path, surface: str) -> None:
+def test_candidate_path_refusals_keep_server_roots_out_of_tool_history(tmp_path: Path, surface: str) -> None:
     private_root = tmp_path / "NON-AUTHORED-SERVER-ROOT-CANARY"
     args = _linear_args(private_root)
     args["source"]["options"]["path"] = "blobs/test-session/input.csv"
@@ -245,12 +244,6 @@ def test_candidate_path_refusals_keep_server_roots_out_of_tool_history_and_plann
     assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in ordinary_history_content
     assert "session" in result.validation.errors[0].message
     assert "Use" in result.validation.errors[0].message
-    feedback = _allowlisted_candidate_feedback(result)
-    projected = feedback["validation"]["errors"][0]
-    assert projected["error_code"] == code
-    assert "detail" not in projected
-    assert projected["suggested_fix"]
-    assert "NON-AUTHORED-SERVER-ROOT-CANARY" not in str(feedback)
 
 
 def test_authored_plugin_option_detail_remains_useful(tmp_path: Path) -> None:
@@ -258,13 +251,10 @@ def test_authored_plugin_option_detail_remains_useful(tmp_path: Path) -> None:
     args["nodes"][0]["options"]["AUTHORED-OPTION-CANARY"] = "unsupported"
     context = _trained_context(data_dir=tmp_path)
     result = build_set_pipeline_candidate(args, _empty_state(), context).result
-    projected = _allowlisted_candidate_feedback(
-        result,
-        plugin_contract_resolver=lambda kind, name: planner_plugin_contract(context.catalog.get_schema(kind, name)).to_dict(),
-    )["validation"]["errors"][0]
-    assert projected["error_code"] == "plugin_options_invalid"
-    assert "AUTHORED-OPTION-CANARY" in projected["detail"]
-    assert projected["plugin_contracts"]
+    (entry,) = result.validation.errors
+    assert entry.error_code == "plugin_options_invalid"
+    assert "AUTHORED-OPTION-CANARY" in entry.message
+    assert "AUTHORED-OPTION-CANARY" in serialize_tool_result(result)
 
 
 @pytest.mark.parametrize(
@@ -290,10 +280,11 @@ def test_candidate_retry_policy_classifies_only_unbounded_sequential_queries(
         assert [(entry.error_code, entry.rejected_component) for entry in result.validation.errors] == [
             ("llm_retry_budget_policy", "node:classify")
         ]
-        feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-        assert "detail" not in feedback
-        assert "30 seconds" in feedback["suggested_fix"]
-        assert "pool_size > 1" in feedback["suggested_fix"]
+        guidance = build_validation_guidance(["llm_retry_budget_policy"])
+        assert guidance is not None
+        fix = guidance["codes"]["llm_retry_budget_policy"]["suggested_fix"]
+        assert "30 seconds" in fix
+        assert "pool_size > 1" in fix
 
 
 def test_bound_source_refusal_keeps_the_actual_request_policy_reason(tmp_path: Path) -> None:
@@ -746,9 +737,6 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
 
 @pytest.mark.parametrize("named_sources", [False, True])
 def test_uploaded_observed_guarantee_rejection_has_repair_guidance(tmp_path: Path, named_sources: bool) -> None:
-    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
-    from elspeth.web.composer.tools.generation import build_validation_guidance
-
     args = _linear_args(tmp_path)
     args["source"]["options"]["schema"]["guaranteed_fields"] = ["case_study"]
     if named_sources:
@@ -765,9 +753,6 @@ def test_uploaded_observed_guarantee_rejection_has_repair_guidance(tmp_path: Pat
     assert "guaranteed_fields" in fix
     assert "request_interpretation_review" in fix
     assert "flexible" in fix and "fields" in fix
-    feedback = _allowlisted_candidate_feedback(result)
-    assert feedback["validation"]["errors"][0]["error_code"] == "source_data_contract_required"
-    assert feedback["validation"]["errors"][0]["suggested_fix"] == fix
 
 
 def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
@@ -1356,6 +1341,50 @@ def test_authored_short_form_llm_review_is_canonicalized_not_a_keyerror(tmp_path
     # The canonicalised state must itself re-validate without raising (the
     # success path re-runs CompositionState.validate on the stored NodeSpec).
     assert candidate.result.updated_state.validate() is not None
+
+
+@pytest.mark.parametrize("form", ["short", "full"])
+def test_actual_set_pipeline_executor_preserves_supported_review_forms(tmp_path: Path, form: str) -> None:
+    args = _structured_llm_args(tmp_path)
+    review = _short_form_shield_review()
+    if form == "full":
+        review |= {
+            "id": "prompt_injection_shield_recommendation:classify",
+            "status": "pending",
+            "event_id": None,
+            "accepted_value": None,
+            "accepted_artifact_hash": None,
+            "resolved_prompt_template_hash": None,
+            "display_title": "Review the shield recommendation",
+        }
+    args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [review]
+    before = deepcopy(args)
+    state = _empty_state()
+    context = _trained_context(data_dir=tmp_path)
+    results = [_execute_set_pipeline(args, state, context) for _ in range(2)]
+    assert args == before
+    for result in results:
+        assert result.success is True, result.to_dict()
+        requirements = deep_thaw(result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY])
+        shield = next(item for item in requirements if item["user_term"] == review["user_term"])
+        assert shield["id"] == "prompt_injection_shield_recommendation:classify"
+        assert shield["status"] == "pending"
+        assert all(shield[key] == value for key, value in review.items())
+    assert results[0].updated_state.to_dict() == results[1].updated_state.to_dict()
+
+
+def test_actual_set_pipeline_executor_does_not_normalize_resolved_input_into_pending(tmp_path: Path) -> None:
+    args = _structured_llm_args(tmp_path)
+    args["nodes"][0]["options"][INTERPRETATION_REQUIREMENTS_KEY] = [
+        _short_form_shield_review() | {"id": "unowned-review", "status": "resolved", "event_id": "unowned-event"}
+    ]
+    before = deepcopy(args)
+    state = _empty_state()
+    result = _execute_set_pipeline(args, state, _trained_context(data_dir=tmp_path))
+    assert result.success is False
+    assert result.updated_state is state and args == before
+    assert result.validation.errors[0].error_code == "interpretation_requirements_invalid"
+    assert "resolver-owned" in result.validation.errors[0].message
 
 
 @pytest.mark.parametrize(

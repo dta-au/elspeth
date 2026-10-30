@@ -30,6 +30,7 @@ from elspeth.web.composer.bounded_json import (
 )
 
 _INLINE_CHARACTERS = 2_048
+_MAX_KEY_ENCODED_CHARACTERS = 2_048
 
 
 class CompositionViewUnsupported(ValueError):
@@ -147,7 +148,7 @@ def build_bounded_composition_view(
         if type(item) is dict:
             projected: dict[str, JsonValue] = {}
             for key, child in item.items():
-                if len(_encode(key)) > inline_characters:
+                if len(_encode(key)) > _MAX_KEY_ENCODED_CHARACTERS:
                     raise CompositionViewUnsupported("A complete graph object key exceeds the bounded display envelope")
                 projected[key] = project(child, (*path, key))
             return projected

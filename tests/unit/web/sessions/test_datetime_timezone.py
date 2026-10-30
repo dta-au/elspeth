@@ -19,6 +19,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import default_pipeline_metadata
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -80,7 +81,9 @@ class TestDatetimeTimezoneRoundTrip:
         try:
             state = await service.save_composition_state(
                 session_id=session.id,
-                state=CompositionStateData(source=None, nodes=[], edges=[], outputs=[], metadata_=None, is_valid=False),
+                state=CompositionStateData(
+                    source=None, nodes=[], edges=[], outputs=[], metadata_=default_pipeline_metadata(), is_valid=False
+                ),
                 provenance="session_seed",
                 session_operation_context=compose_context,
             )

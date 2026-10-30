@@ -39,6 +39,9 @@ _VALUE = TypeAdapter(_P4PendingValue)
 
 def _joined(data: RestoredBatchData, *, env_ref_names: frozenset[str]) -> None:
     batch = data.batch
+    from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
+
+    require_retained_failure_links(data)
     if (
         batch.phase != "p4_pending"
         or batch.p4_input_json is None
@@ -50,6 +53,17 @@ def _joined(data: RestoredBatchData, *, env_ref_names: frozenset[str]) -> None:
         raise AuditIntegrityError("P4 pending cut contains an unowned result or incomplete input")
     prepared = decode_prepared_p4(batch.p4_input_json, env_ref_names=env_ref_names)
     members = prepared_p4_members(prepared, env_ref_names=env_ref_names)
+    failure = batch.retained_failure
+    if failure is not None and failure.kind in ("plugin_crash", "advisor_failure"):
+        last = batch.tool_outcomes[-1]
+        matches = tuple(item for item in members.invocations if item.tool_call_id == last.call.id)
+        if len(matches) != 1:
+            raise AuditIntegrityError("P4 failure lost its actual prepared audit suffix")
+        if failure.refusal_source is not None:
+            if matches[0] != failure.refusal_source.invocation:
+                raise AuditIntegrityError("P4 refusal changed its complete original prepared invocation")
+        elif matches[0].private_failure is None or matches[0].error_class != failure.error_class:
+            raise AuditIntegrityError("P4 crash lost its actual original private failure facts")
     # The actual driver treats plugin crashes and Advisor failures as pending
     # primary failures; ordinary argument/business refusals and the separate
     # Advisor timeout signal do not take that SQL-error disposition.
@@ -155,10 +169,7 @@ def decode_p4_pending_batch_data(encoded: str, *, env_ref_names: frozenset[str] 
     batch = replace(decoded.batch, phase="p4_pending", p4_input_json=value.p4_input_json)
     result = RestoredBatchData(batch, decoded.accumulator, decoded.calls)
     _joined(result, env_ref_names=env_ref_names)
-    if (
-        encode_p4_pending_batch_data(batch=batch, accumulator=result.accumulator, calls=result.calls, env_ref_names=env_ref_names)
-        != encoded
-    ):
+    if _dump_owned(_VALUE, _P4PendingValue(coupled_json=value.coupled_json, p4_input_json=value.p4_input_json)) != encoded:
         raise AuditIntegrityError("P4 pending data changed its complete values or alias partition")
     return result
 

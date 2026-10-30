@@ -20,6 +20,7 @@ from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperatio
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.unit.web.composer.test_tools import (
     _STUB_SHA256,
     _attached_notes,
@@ -827,7 +828,7 @@ class TestDeleteBlobActiveRunGuard:
                     nodes=None,
                     edges=None,
                     outputs=None,
-                    metadata_=None,
+                    metadata_=stored_default_pipeline_metadata(),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance
@@ -3389,7 +3390,7 @@ class TestUpdateBlobActiveRunGuard:
                     nodes=None,
                     edges=None,
                     outputs=None,
-                    metadata_=None,
+                    metadata_=stored_default_pipeline_metadata(),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance
@@ -3901,7 +3902,7 @@ class TestUpdateBlobAtomicWrite:
                     nodes=None,
                     edges=None,
                     outputs=None,
-                    metadata_=None,
+                    metadata_=stored_default_pipeline_metadata(),
                     is_valid=False,
                     validation_errors=None,
                     # Plan §2294: composer-tools test fixture; provenance

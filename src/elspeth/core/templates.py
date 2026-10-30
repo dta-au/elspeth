@@ -94,6 +94,7 @@ __all__ = [
     "ROW_API_MISUSE_KINDS",
     "TEMPLATE_ROW_METHODS",
     "Jinja2FieldExtraction",
+    "JinjaTemplateSizeExceeded",
     "describe_dynamic_row_access",
     "describe_row_api_misuse",
     "extract_jinja2_field_usage",
@@ -212,10 +213,14 @@ _ATTRIBUTE_POSITIONAL_FILTERS: frozenset[str] = frozenset({"selectattr", "reject
 MAX_JINJA_TEMPLATE_BYTES = 16 * 1024
 
 
+class JinjaTemplateSizeExceeded(ValueError):
+    """Authored template source exceeds the parser's UTF-8 byte boundary."""
+
+
 def validate_jinja_source(source: str) -> None:
     """Bound parser input before Jinja sees a web or YAML authored template."""
     if len(source) > MAX_JINJA_TEMPLATE_BYTES or len(source.encode("utf-8")) > MAX_JINJA_TEMPLATE_BYTES:
-        raise ValueError(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
+        raise JinjaTemplateSizeExceeded(f"Template exceeds {MAX_JINJA_TEMPLATE_BYTES} UTF-8 bytes")
     if source.count("{%") > 64 or source.count("{{") > 256:
         raise ValueError("Template has too many Jinja expressions or blocks")
     depth = 0

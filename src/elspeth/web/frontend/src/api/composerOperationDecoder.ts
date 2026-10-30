@@ -31,7 +31,7 @@ export function text(value: unknown): string {
   if (typeof value !== "string") throw new ComposerOperationDecodeError("Expected string");
   return value;
 }
-function timestamp(value: unknown): string {
+export function timestamp(value: unknown): string {
   const result = text(value);
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(result) || !Number.isFinite(Date.parse(result))) throw new ComposerOperationDecodeError("Invalid timestamp");
   return result;
@@ -108,7 +108,7 @@ export function validateComposerRecoveryBody(body: unknown, sessionId?: string):
     if (record.partial_state_save_error !== undefined && record.partial_state_save_error !== null) text(record.partial_state_save_error);
   }
 }
-function decodeError(value: unknown, sessionId: string): ComposerOperationError {
+export function decodeError(value: unknown, sessionId: string): ComposerOperationError {
   const record = exactRecord(value, ["http_status", "body", "error_type", "failure_code", "diagnostic_id"]);
   const status = integer(record.http_status, 400);
   if (status > 599) throw new ComposerOperationDecodeError("Invalid HTTP error status");
@@ -255,7 +255,7 @@ export class ComposerSseDecoder {
   }
 }
 
-function pollAfter(value: unknown): number { const result = integer(value, 100); if (result > 60000) throw new ComposerOperationDecodeError("Invalid poll interval"); return result; }
+export function pollAfter(value: unknown): number { const result = integer(value, 100); if (result > 60000) throw new ComposerOperationDecodeError("Invalid poll interval"); return result; }
 export function decodeComposerOperationFrame(value: unknown, sessionId: string, operationId: string): ComposerOperationFrame {
   const base = ["schema_version", "session_id", "operation_id", "sequence", "event"];
   const record = exactRecord(value, [...base, "payload"], base);
@@ -278,7 +278,7 @@ export function decodeComposerOperationFrame(value: unknown, sessionId: string, 
   if (record.event !== "progress") throw new ComposerOperationDecodeError("Unknown stream event");
   const payload = exactRecord(record.payload, ["session_operation_id", "session_operation_epoch", "request_token", "request_id", "phase", "headline", "evidence", "likely_next", "reason", "updated_at"]);
   const phases = ["idle", "starting", "calling_model", "using_tools", "validating", "saving", "complete", "failed", "cancelled"] as const;
-  const reasons = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "admission_refused", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete", "mutation_authority_revoked"] as const;
+  const reasons = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "admission_refused", "context_unsupported", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete", "mutation_authority_revoked"] as const;
   const phase = phases.find((item) => item === payload.phase);
   const reason = payload.reason === null ? null : reasons.find((item) => item === payload.reason);
   if (phase === undefined || reason === undefined || ((phase === "failed" || phase === "cancelled") && reason === null)) throw new ComposerOperationDecodeError("Unknown progress vocabulary");

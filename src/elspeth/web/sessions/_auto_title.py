@@ -28,7 +28,7 @@ import asyncio
 import time
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypedDict
 from uuid import UUID
@@ -42,15 +42,17 @@ from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust, detach_prompt_guard_messages
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, safe_response_model, token_usage_from_response
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.provider_context import capture_provider_context
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.composer.provider_quota import ProviderCallCustody, provider_call_scope, required_provider_audit_scope
+from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
 from elspeth.web.required_work import RequiredWorkRole, RequiredWorkSource
 from elspeth.web.sessions.auto_title_outcome import _AutoTitleCapture
@@ -391,6 +393,7 @@ class PreparedAutoTitleRequest:
 
     kwargs: dict[str, Any]
     audit_messages: list[dict[str, str | PromptGuardTrust]]
+    user_prompt: str = field(repr=False)
 
 
 def prepare_auto_title_request(
@@ -420,7 +423,7 @@ def prepare_auto_title_request(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
-    return PreparedAutoTitleRequest(kwargs, audit_messages)
+    return PreparedAutoTitleRequest(kwargs, audit_messages, user_message)
 
 
 async def maybe_auto_title_session(
@@ -434,6 +437,7 @@ async def maybe_auto_title_session(
     session_operation_context: SessionOperationContext,
     prompt_guard_mount: PromptGuardMount | None,
     prompt_guard_mode: PromptGuardMode,
+    max_prepared_request_bytes: int = DEFAULT_MAX_PREPARED_REQUEST_BYTES,
     api_base: str | None = None,
     api_key: str | None = None,
     provider_custody: ProviderCallCustody | None = None,
@@ -481,6 +485,7 @@ async def maybe_auto_title_session(
         prompt_guard_mount=prompt_guard_mount,
         prompt_guard_mode=prompt_guard_mode,
         user_message=user_message,
+        max_prepared_request_bytes=max_prepared_request_bytes,
         _outcome=_outcome,
     )
 
@@ -499,6 +504,8 @@ async def _maybe_auto_title_session_required(
     prompt_guard_mount: PromptGuardMount | None,
     prompt_guard_mode: PromptGuardMode,
     user_message: str,
+    max_prepared_request_bytes: int = DEFAULT_MAX_PREPARED_REQUEST_BYTES,
+    prepared_input: PreparedProviderInput | None = None,
     _outcome: _AutoTitleCapture | None = None,
 ) -> None:
     if (
@@ -510,8 +517,28 @@ async def _maybe_auto_title_session_required(
     provider_custody.required_work.validate_context(session_operation_context)
     if kwargs["messages"] is not audit_messages:
         raise AuditIntegrityError("Auto-title request and audit messages must share their owned identity")
-    wire_messages, trusted_indexes = detach_prompt_guard_messages(audit_messages)
+    if kwargs["model"] != model:
+        raise AuditIntegrityError("Auto-title request and audit must share their selected model")
+    if prepared_input is None:
+        prepared_input = prepare_provider_input(
+            messages=audit_messages,
+            tools=kwargs["tools"] if "tools" in kwargs else None,
+            tools_present="tools" in kwargs,
+            model=model,
+            role="composer",
+            mount=prompt_guard_mount,
+            mode=prompt_guard_mode,
+            user_prompt=user_message,
+            max_bytes=max_prepared_request_bytes,
+        )
+    elif type(prepared_input) is not PreparedProviderInput or prepared_input.byte_limit != max_prepared_request_bytes:
+        raise AuditIntegrityError("Auto-title changed its actual current input preparation")
+    prepared_input.verify(model=model, role="composer", mount=prompt_guard_mount, mode=prompt_guard_mode, user_prompt=user_message)
+    wire_messages = prepared_input.evidence.messages
+    trusted_indexes = prepared_input.evidence.trusted_message_indexes
     wire_kwargs = {**kwargs, "messages": wire_messages}
+    if prepared_input.tools_present:
+        wire_kwargs["tools"] = prepared_input.tools
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     response: Any = None
@@ -533,7 +560,7 @@ async def _maybe_auto_title_session_required(
                         # The actual detached, marker-free request snapshot,
                         # before the gateway await. Physical receipt remains
                         # the original explicit custody/SDK/audit fact.
-                        durable_audit["private_request"] = capture_provider_context(messages=wire_messages, tools=None)
+                        durable_audit["private_request"] = capture_provider_context(messages=wire_messages, tools=prepared_input.tools)
                     response = await provider_gateway._litellm_acompletion(
                         provider_custody=provider_custody,
                         prompt_guard_mount=prompt_guard_mount,
@@ -541,6 +568,8 @@ async def _maybe_auto_title_session_required(
                         prompt_guard_role="composer",
                         prompt_guard_user_prompt=user_message,
                         prompt_guard_trusted_message_indexes=trusted_indexes,
+                        prepared_input=prepared_input,
+                        max_prepared_request_bytes=max_prepared_request_bytes,
                         **durable_input,
                         **wire_kwargs,
                     )
@@ -593,7 +622,7 @@ async def _maybe_auto_title_session_required(
                         call = build_llm_call_record(
                             model_requested=model,
                             messages=wire_messages,
-                            tools=None,
+                            tools=prepared_input.tools,
                             status=status,
                             started_at=started_at,
                             started_ns=started_ns,

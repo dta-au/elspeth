@@ -12,8 +12,9 @@ from sqlalchemy.exc import OperationalError
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.required_work import RequiredWorkSource
-from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions import composer_finalization, composer_turn
 from elspeth.web.sessions.schemas import SendMessageRequest
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.sessions.test_composer_async_worker import _admit, _file_app, _HeldComposer, _worker
 
 
@@ -138,7 +139,6 @@ async def test_owned_child_failure_outranks_persisted_stop_in_actual_failure_tra
 async def test_completed_terminal_preserves_live_validation_from_exact_saved_state(tmp_path, monkeypatch) -> None:
     from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
-    from elspeth.web.sessions.protocol import CompositionStateData
     from tests.unit.web.sessions.test_routes import _make_app, _make_composer_mock
     from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job
 
@@ -157,9 +157,9 @@ async def test_completed_terminal_preserves_live_validation_from_exact_saved_sta
     )
 
     async def validated_state(*args, **kwargs):
-        return CompositionStateData(is_valid=True), validation
+        return composition_state_data(is_valid=True), validation
 
-    monkeypatch.setattr(composer_turn, "_state_data_from_composer_state", validated_state)
+    monkeypatch.setattr(composer_finalization, "_state_data_from_composer_state", validated_state)
     session = await service.create_session("alice", "Validation custody", "local")
     async with _running_job(app, service, session.id, kind="compose_message", content="Save it.") as job:
         terminal = await _run(app, job)

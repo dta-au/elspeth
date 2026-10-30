@@ -876,3 +876,205 @@ def encode_composer_operation_stream_frame(frame: ComposerOperationStreamFrame) 
     if len(encoded) > COMPOSER_OPERATION_STREAM_FRAME_MAX_BYTES:
         raise ValueError("Composer operation stream frame exceeds encoded byte bound")
     return encoded
+
+
+# --- Composer-Operation-Version 2 (Continuation) projections -------------
+#
+# Design: docs/architecture/design-notes/0.8.10-continuation-protocol-design.md
+# §3.4. Every v2 projection is a complete state snapshot keyed by the parent's
+# SQL ``status_revision``. No claim token, lease token, fence id, checkpoint id
+# or journal cursor appears in any v2 projection.
+
+type ComposerOperationPhaseV2 = Literal["queued", "executing", "continuation_queued", "reconciling", "retry_waiting", "settled"]
+COMPOSER_OPERATION_ACTIVE_PHASES_V2: frozenset[str] = frozenset(
+    {"queued", "executing", "continuation_queued", "reconciling", "retry_waiting"}
+)
+
+
+class ComposerOperationSegmentV2(_StrictResponse):
+    """The live segment of a v2 operation, without any custody secret."""
+
+    sequence: int = Field(ge=1)
+    generation: int = Field(ge=1)
+    state: Literal["queued", "running", "interrupted"]
+    deadline_at: datetime | None
+
+    @model_validator(mode="after")
+    def _validate_deadline(self) -> ComposerOperationSegmentV2:
+        if (self.state == "running") != (self.deadline_at is not None):
+            raise ValueError("Only a running segment has a deadline")
+        if self.deadline_at is not None and self.deadline_at.utcoffset() is None:
+            raise ValueError("Segment deadline must be timezone-aware")
+        return self
+
+
+class ComposerOperationStatusV2(_StrictResponse):
+    """v2 state with no sealed result; the SSE ``status`` payload."""
+
+    protocol_version: Literal[2] = 2
+    operation_id: str = Field(min_length=36, max_length=36)
+    kind: ComposerOperationKind
+    status: ComposerOperationStatus
+    phase: ComposerOperationPhaseV2
+    status_revision: int = Field(ge=0)
+    created_at: datetime
+    observed_at: datetime
+    poll_after_ms: int = Field(ge=100, le=60_000)
+    cancel_requested: bool
+    segment: ComposerOperationSegmentV2 | None
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+    @model_validator(mode="after")
+    def _validate_state_bundle(self) -> ComposerOperationStatusV2:
+        if self.created_at.utcoffset() is None or self.observed_at.utcoffset() is None:
+            raise ValueError("v2 projection times must be timezone-aware")
+        live = self.status in ("queued", "running")
+        if live != (self.phase in COMPOSER_OPERATION_ACTIVE_PHASES_V2):
+            raise ValueError("v2 phase does not match the operation status")
+        if live != (self.segment is not None):
+            raise ValueError("A live v2 operation has exactly one live segment; a terminal one has none")
+        if self.status == "completed" and self.cancel_requested:
+            raise ValueError("A completed operation was never cancelled")
+        return self
+
+
+class ComposerOperationSnapshotV2(ComposerOperationStatusV2):
+    """v2 POST acknowledgement, GET and cancel body: the state plus any sealed result."""
+
+    result: MessageWithStateResponse | None = None
+    error: ComposerOperationError | None = None
+
+    @model_validator(mode="after")
+    def _validate_result_bundle(self) -> ComposerOperationSnapshotV2:
+        if self.status in ("queued", "running"):
+            if self.result is not None or self.error is not None:
+                raise ValueError("A live v2 operation carries no sealed result")
+        elif self.status == "completed":
+            if self.result is None or self.error is not None:
+                raise ValueError("A completed v2 operation carries exactly its result")
+        elif self.error is None or self.result is not None:
+            raise ValueError("A failed v2 operation carries exactly its error")
+        return self
+
+
+class ComposerOperationVersionRequiredDetail(_StrictResponse):
+    """409 body detail: this operation needs a Composer-Operation-Version 2 reader."""
+
+    error_type: Literal["composer_operation_version_required"] = "composer_operation_version_required"
+    detail: str
+    required_version: Literal[2] = 2
+    operation_id: str = Field(min_length=36, max_length=36)
+
+
+class ComposerOperationProgressV2(_StrictResponse):
+    """Public v2 progress: the v1 vocabulary and bounds, bound to a segment, with no fence or token."""
+
+    request_id: str | None = Field(default=None, max_length=128)
+    phase: ComposerProgressPhase
+    headline: str = Field(min_length=1, max_length=180)
+    evidence: tuple[str, ...] = Field(default=(), max_length=4)
+    likely_next: str | None = Field(default=None, min_length=1, max_length=180)
+    reason: ComposerProgressReason | None = None
+    updated_at: datetime
+    segment_sequence: int = Field(ge=1)
+    segment_generation: int = Field(ge=1)
+
+    @field_validator("evidence")
+    @classmethod
+    def _validate_evidence(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not 1 <= len(item) <= 180 for item in value):
+            raise ValueError("Progress evidence must be bounded")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_reason(self) -> ComposerOperationProgressV2:
+        if self.phase in ("failed", "cancelled") and self.reason is None:
+            raise ValueError("Failed/cancelled progress requires a reason")
+        return self
+
+
+class ComposerOperationTerminalV2(_StrictResponse):
+    status: Literal["completed", "failed"]
+    phase: Literal["settled"] = "settled"
+    status_revision: int = Field(ge=0)
+
+
+class _ComposerOperationStreamFrameV2(_StrictResponse):
+    schema_version: Literal["composer-operation-stream.v2"] = "composer-operation-stream.v2"
+    session_id: str = Field(min_length=36, max_length=36)
+    operation_id: str = Field(min_length=36, max_length=36)
+    sequence: int = Field(ge=0)
+
+    @field_validator("session_id", "operation_id")
+    @classmethod
+    def _validate_identity(cls, value: str) -> str:
+        return require_canonical_operation_id(value)
+
+
+class ComposerOperationStreamStatusFrameV2(_ComposerOperationStreamFrameV2):
+    event: Literal["status"] = "status"
+    payload: ComposerOperationStatusV2
+
+
+class ComposerOperationStreamProgressFrameV2(_ComposerOperationStreamFrameV2):
+    event: Literal["progress"] = "progress"
+    payload: ComposerOperationProgressV2
+
+
+class ComposerOperationStreamHeartbeatFrameV2(_ComposerOperationStreamFrameV2):
+    event: Literal["heartbeat"] = "heartbeat"
+
+
+class ComposerOperationStreamTerminalFrameV2(_ComposerOperationStreamFrameV2):
+    event: Literal["terminal"] = "terminal"
+    payload: ComposerOperationTerminalV2
+
+
+class ComposerOperationStreamReconnectFrameV2(_ComposerOperationStreamFrameV2):
+    """The server is about to end a live stream (lifetime or draining); reconnect at once."""
+
+    event: Literal["reconnect"] = "reconnect"
+
+
+type ComposerOperationStreamFrameV2 = (
+    ComposerOperationStreamStatusFrameV2
+    | ComposerOperationStreamProgressFrameV2
+    | ComposerOperationStreamHeartbeatFrameV2
+    | ComposerOperationStreamTerminalFrameV2
+    | ComposerOperationStreamReconnectFrameV2
+)
+
+
+def encode_composer_operation_stream_frame_v2(frame: ComposerOperationStreamFrameV2, *, event_id: int | None = None) -> bytes:
+    """Bound the actual UTF-8 SSE bytes.
+
+    Status and terminal frames carry ``id: <status_revision>``; the caller
+    passes that revision as ``event_id`` and it must match the payload.
+    """
+    exact = type(frame).model_validate(frame.model_dump(mode="python"), strict=True)
+    carries_id = exact.event in ("status", "terminal")
+    if carries_id != (event_id is not None):
+        raise ValueError("Exactly the status and terminal frames carry an SSE id")
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    encoded = f"{prefix}event: {exact.event}\ndata: {exact.model_dump_json()}\n\n".encode()
+    if len(encoded) > COMPOSER_OPERATION_STREAM_FRAME_MAX_BYTES:
+        raise ValueError("Composer operation stream frame exceeds encoded byte bound")
+    return encoded
+
+
+class ComposerActiveOperationResponse(_StrictResponse):
+    """The caller's live Composer operation in a session, for a tab that holds no custody."""
+
+    operation_id: str = Field(min_length=36, max_length=36)
+    kind: ComposerOperationKind
+    lifecycle_version: Literal[1, 2]
+    status: Literal["queued", "running"]
+
+    @field_validator("operation_id")
+    @classmethod
+    def _validate_operation_id(cls, value: str) -> str:
+        return require_canonical_operation_id(value)

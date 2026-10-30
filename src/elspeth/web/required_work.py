@@ -20,6 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.pipeline_publication import (
     PipelineProposalSettlementResult,
     PipelinePublicationSQLResult,
@@ -131,6 +132,7 @@ class RequiredWorkSource(IntEnum):
     CONTINUATION_STATE_PROJECTION = 56
     CONTINUATION_READ_SQL = 57
     CONTINUATION_READ_PROJECTION = 58
+    CONTINUATION_HANDOFF_SQL = 59
 
 
 SOURCE_MAPPING = MappingProxyType(
@@ -202,6 +204,7 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.LEASE_RENEWAL: (ComposerRequiredStage.LEASE_RENEWAL, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.LEASE_CLOSE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.PRODUCER),
         RequiredWorkSource.LEASE_RELEASE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_HANDOFF_SQL: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.CREATION_PURE_PREPARATION: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.PURE_PREPARATION),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.PROJECTION),
@@ -500,8 +503,25 @@ class RequiredWorkIncomplete(AuditIntegrityError):
 class RequiredWorkTicket:
     """One prelaunch reservation; transport supplies actual executor witnesses."""
 
-    def __init__(self, key: RequiredWorkKey, *, coordinator: RequiredWorkCoordinator | None = None) -> None:
+    def __init__(
+        self,
+        key: RequiredWorkKey,
+        *,
+        coordinator: RequiredWorkCoordinator | None = None,
+        sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None,
+    ) -> None:
+        if sql_deadline_owner is not None:
+            if (
+                type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+                or coordinator is None
+                or coordinator.sql_deadline_owner is not sql_deadline_owner
+            ):
+                raise AuditIntegrityError("SQL timing requires its actual ticket coordinator")
+            sql_deadline_owner.validate_context(
+                key.authority.context, operation_id=key.authority.durable_operation_id, attempt=key.authority.claim_attempt
+            )
         self._key = key
+        self._sql_deadline_owner = sql_deadline_owner
         self._lock = RLock()
         self._future: Future[Any] | None = None
         self._complete = False
@@ -538,6 +558,10 @@ class RequiredWorkTicket:
         return self._key
 
     @property
+    def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
+        return self._sql_deadline_owner
+
+    @property
     def permits_process_drain(self) -> bool:
         return self.key.source in (
             RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
@@ -550,6 +574,7 @@ class RequiredWorkTicket:
             RequiredWorkSource.TERMINAL_FAILURE_SQL,
             RequiredWorkSource.LEASE_RENEWAL,
             RequiredWorkSource.LEASE_RELEASE,
+            RequiredWorkSource.CONTINUATION_HANDOFF_SQL,
             RequiredWorkSource.CUSTODY_GENERATION_RECOVERY,
         )
 
@@ -925,14 +950,25 @@ class RequiredWorkCoordinator:
         "_manual_proposal_close",
         "_proposal_children",
         "_release_prepared",
+        "_sql_deadline_owner",
         "_tickets",
         "_unused_metadata",
     )
 
-    def __init__(self, authority: RequiredWorkAuthority) -> None:
+    def __init__(self, authority: RequiredWorkAuthority, *, sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None) -> None:
         if type(authority) is not RequiredWorkAuthority:
             raise AuditIntegrityError("Coordinator requires immutable owned authority")
         self._authority = authority
+        if sql_deadline_owner is not None:
+            if (
+                authority.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+                or type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+            ):
+                raise AuditIntegrityError("SQL timing requires its actual V2 durable coordinator")
+            sql_deadline_owner.validate_context(
+                authority.context, operation_id=authority.durable_operation_id, attempt=authority.claim_attempt
+            )
+        self._sql_deadline_owner = sql_deadline_owner
         self._tickets: dict[RequiredWorkKey, RequiredWorkTicket] = {}
         self._lock = RLock()
         self._release_prepared = False
@@ -949,6 +985,10 @@ class RequiredWorkCoordinator:
     @property
     def authority(self) -> RequiredWorkAuthority:
         return self._authority
+
+    @property
+    def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
+        return self._sql_deadline_owner
 
     def reserve(
         self,
@@ -972,7 +1012,7 @@ class RequiredWorkCoordinator:
         with self._lock:
             if self._release_prepared or key in self._tickets:
                 raise AuditIntegrityError("Required-work registration is duplicate or after release barrier")
-            ticket = RequiredWorkTicket(key, coordinator=self)
+            ticket = RequiredWorkTicket(key, coordinator=self, sql_deadline_owner=self._sql_deadline_owner)
             self._tickets[key] = ticket
             return ticket
 
@@ -1075,6 +1115,24 @@ class RequiredWorkCoordinator:
         with self._lock:
             self._registered(ticket, expected_source)
             self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_compose_checkpoint_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> None:
+        """Verify the actual audit checkpoint bridge, including cancellations."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Checkpoint projection replaced actual finish-once carrier")
+                self._verify_sql_outcome(ticket, actual_outcome)
+
+    def validate_terminal_failure_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> bool:
+        """The failed-terminal owner consumes exactly its registered physical handoff."""
+        with self._lock:
+            self._registered(ticket, RequiredWorkSource.TERMINAL_FAILURE_SQL)
+            with ticket._lock:
+                if ticket._finish_once_handoff is not actual_outcome:
+                    raise AuditIntegrityError("Failed terminal replaced its actual finish-once carrier")
+                return self._verify_sql_outcome(ticket, actual_outcome)
 
     def validate_joined_lifecycle_sql_outcome[T](
         self,
@@ -1547,6 +1605,26 @@ class RequiredWorkCoordinator:
             ticket = self.reserve(RequiredWorkSource.LEASE_RELEASE)
             self._release_prepared = True
             return ticket
+
+    def prepare_continuation_handoff(self) -> RequiredWorkTicket:
+        """Reserve one handoff transaction without sealing: a known refusal leaves the owner live.
+
+        The yield or handover releases the fence inside its own transaction, so
+        the release barrier is set by ``seal_after_continuation_handoff`` only
+        once that transaction commits. A refused attempt (Stop, a moved head)
+        writes nothing, and the owner may still settle or retry, each retry
+        under its own recurrence.
+        """
+        with self._lock:
+            self.assert_completed()
+            attempts = sum(1 for key in self._tickets if key.source is RequiredWorkSource.CONTINUATION_HANDOFF_SQL)
+            return self.reserve(RequiredWorkSource.CONTINUATION_HANDOFF_SQL, recurrence_ordinal=attempts)
+
+    def seal_after_continuation_handoff(self) -> None:
+        """The committed handoff ended this owner's custody: admit no further required work."""
+        with self._lock:
+            self.assert_completed()
+            self._release_prepared = True
 
 
 class RequiredWorkRole(Enum):

@@ -21,10 +21,11 @@ from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import LogicalRequestBinding
-from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData
+from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
-from elspeth.web.composer.continuation_evidence_application_values import PortableP4ApplicationEntry
+from elspeth.web.composer.continuation_evidence_application_values import P4ApplicationSources, PortableP4ApplicationEntry
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
 from elspeth.web.composer.turn_effects import (
@@ -65,7 +66,10 @@ def capture_turn_evidence(
     env_ref_names: frozenset[str],
     data: RestoredBatchData | RestoredPreparedBatchData | None = None,
     materialization: CurrentContinuationMessageProducers | None = None,
-) -> ce.TurnEvidenceSnapshot:
+    mandatory_retention: bool = False,
+    prior_application_entry: PortableP4ApplicationEntry | None = None,
+    expected_recorder: PrivateChunk | None = None,
+) -> ce.AdmittedTurnEvidence:
     if type(owner) is not TurnEvidence or type(recorder) is not BufferingRecorder:
         raise TypeError("evidence capture requires its actual live owners")
     actor = owner._continuation_actor_user_id
@@ -85,9 +89,19 @@ def capture_turn_evidence(
         reader.require_for_evidence(owner)
     from elspeth.web.composer.continuation_evidence_application_data import capture_joint_evidence_graph, journal_effect_locators
 
+    recorder_snapshot = recorder.snapshot_for_continuation(drained=drained)
+    recorder_chunk = encode_recorder_snapshot(recorder_snapshot)
+    if expected_recorder is not None and recorder_chunk != expected_recorder:
+        raise AuditIntegrityError("evidence capture changed its expected original recorder")
     joint_graph_json, application_entry = capture_joint_evidence_graph(
-        owner=owner, recorder=recorder, drained=drained, data=data, env_ref_names=env_ref_names
+        owner=owner,
+        recorder=recorder,
+        drained=drained,
+        data=data,
+        env_ref_names=env_ref_names,
+        recorder_snapshot=recorder_snapshot,
     )
+    sources = P4ApplicationSources(application_entry, owner._portable_p4_sources)
     if application_entry is None and (owner.effects.batches or owner.effects.committed_revision_ids):
         raise AuditIntegrityError("cold evidence requires actual retained P4 provenance for committed history")
     if logical is None or actor is None or owner.session_id is None or owner.operation_id is None or epoch is None:
@@ -210,66 +224,94 @@ def capture_turn_evidence(
         else:
             raise TypeError("evidence page has no owned continuation variant")
     effects = owner.effects
-    transcript_snapshot = owner.transcript.snapshot_for_continuation(messages, materialization=materialization)
-    snapshot = ce.TurnEvidenceSnapshot(
-        logical=logical,
-        actor_user_id=actor,
-        session_id=owner.session_id,
-        physical_operation_id=owner.operation_id,
-        physical_operation_epoch=epoch,
-        request_id=owner.request_id,
-        request_content_hash=owner.request_hash,
-        effects=ce.RetainedTurnEffects(
-            initial_state_json=canonical_json(effects.initial_state.to_dict()),
-            initial_state_id=effects.initial_state_id,
-            latest_verified_state_json=canonical_json(effects.latest_verified_state.to_dict()),
-            latest_verified_state_id=effects.latest_verified_state_id,
-            latest_committed_state_id=effects.latest_committed_state_id,
-            verification=effects.verification,
-            initial_authored_state_hash=effects.initial_authored_state_hash,
-            latest_authored_state_hash=effects.latest_authored_state_hash,
-            net_changed_fields=effects.net_changed_fields,
-            batches=tuple(
-                ce.RetainedBatchEffects(
-                    assistant_message_id=batch.assistant_message_id,
-                    state_id=batch.state_id,
-                    version=batch.version,
-                    tool_call_ids=batch.tool_call_ids,
-                    inserted_state_ids=batch.inserted_state_ids,
-                    authored_state_hash=batch.authored_state_hash,
-                )
-                for batch in effects.batches
+    captured_actor = actor
+    captured_session = owner.session_id
+    captured_operation = owner.operation_id
+    captured_epoch = epoch
+
+    def capture_fields() -> ce.TurnEvidenceFields:
+        return ce.TurnEvidenceFields(
+            logical=logical,
+            actor_user_id=captured_actor,
+            session_id=captured_session,
+            physical_operation_id=captured_operation,
+            physical_operation_epoch=captured_epoch,
+            request_id=owner.request_id,
+            request_content_hash=owner.request_hash,
+            effects=ce.RetainedTurnEffects(
+                initial_state_json=canonical_json(effects.initial_state.to_dict()),
+                initial_state_id=effects.initial_state_id,
+                latest_verified_state_json=canonical_json(effects.latest_verified_state.to_dict()),
+                latest_verified_state_id=effects.latest_verified_state_id,
+                latest_committed_state_id=effects.latest_committed_state_id,
+                verification=effects.verification,
+                initial_authored_state_hash=effects.initial_authored_state_hash,
+                latest_authored_state_hash=effects.latest_authored_state_hash,
+                net_changed_fields=effects.net_changed_fields,
+                batches=tuple(
+                    ce.RetainedBatchEffects(
+                        assistant_message_id=batch.assistant_message_id,
+                        state_id=batch.state_id,
+                        version=batch.version,
+                        tool_call_ids=batch.tool_call_ids,
+                        inserted_state_ids=batch.inserted_state_ids,
+                        authored_state_hash=batch.authored_state_hash,
+                    )
+                    for batch in effects.batches
+                ),
+                committed_revision_ids=effects.committed_revision_ids,
             ),
-            committed_revision_ids=effects.committed_revision_ids,
-        ),
-        transcript=transcript_snapshot,
-        retained_history=owner._retained_history,
-        registration_revision=owner._registration_revision,
-        page_shelf=tuple(page_shelf),
-        registered_pages=registered,
-        quoted_inspections=tuple(quoted),
-        historical_pages=historical,
-        conflicting_page_ids=tuple(sorted(owner._conflicting_page_ids)),
-        deliveries=tuple(deliveries),
-        review_shelf=tuple(review_shelf),
-        abandonment_review=current_review,
-        abandonment_transcript_binding=owner._abandonment_transcript_binding,
-        abandonment_limitations=limitations,
-        effect_locators=() if application_entry is None else journal_effect_locators(application_entry, env_ref_names=env_ref_names),
-        initial_is_latest=effects.initial_state is effects.latest_verified_state,
-        recorder_json=encode_recorder_snapshot(recorder.snapshot_for_continuation(drained=drained)).canonical,
-        historical_application_count=0 if application_entry is None else len(application_entry.applications),
-        joint_graph_json=joint_graph_json,
-        application_entry=application_entry,
-        decision_shelf=tuple(decisions),
-        requires_blob_reader=reader is not None,
+            retained_history=owner._retained_history,
+            registration_revision=owner._registration_revision,
+            page_shelf=tuple(page_shelf),
+            registered_pages=registered,
+            quoted_inspections=tuple(quoted),
+            historical_pages=historical,
+            conflicting_page_ids=tuple(sorted(owner._conflicting_page_ids)),
+            deliveries=tuple(deliveries),
+            review_shelf=tuple(review_shelf),
+            abandonment_review=current_review,
+            abandonment_transcript_binding=owner._abandonment_transcript_binding,
+            abandonment_limitations=limitations,
+            effect_locators=()
+            if application_entry is None
+            else journal_effect_locators(application_entry, env_ref_names=env_ref_names, sources=sources),
+            initial_is_latest=effects.initial_state is effects.latest_verified_state,
+            recorder=recorder_chunk.reference,
+            historical_application_count=0 if application_entry is None else len(application_entry.applications),
+            joint_graph_json=joint_graph_json,
+            application_entry=application_entry,
+            decision_shelf=tuple(decisions),
+            requires_blob_reader=reader is not None,
+        )
+
+    # No transcript, surrogate transcript or borrowed authority is constructed
+    # here. These are the actual complete current non-transcript fields, using
+    # the same scalar/cross-link validator inherited by the retained snapshot.
+    fields = capture_fields() if mandatory_retention or prior_application_entry is not None else None
+    if fields is not None:
+        ce.require_evidence_fields_admission(fields, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+        if prior_application_entry is not None and (
+            fields.application_entry is None
+            or fields.application_entry.applications[: len(prior_application_entry.applications)] != prior_application_entry.applications
+        ):
+            raise AuditIntegrityError("runtime capture lost selected actual application history")
+    transcript_snapshot = owner.transcript.snapshot_for_continuation(
+        messages, materialization=materialization, mandatory_retention=mandatory_retention
     )
-    ce.encode_turn_evidence(snapshot, env_ref_names=env_ref_names)
-    return snapshot
+    if fields is None:
+        fields = capture_fields()
+    snapshot = ce.TurnEvidenceSnapshot(**fields.__dict__, transcript=transcript_snapshot)
+    return ce.admit_turn_evidence(
+        snapshot,
+        env_ref_names=env_ref_names,
+        mandatory_retention=mandatory_retention,
+        source_chunks=(recorder_chunk, *sources.chunks),
+    )
 
 
 def _restore_current_evidence(
-    snapshot: ce.TurnEvidenceSnapshot,
+    evidence: ce.AdmittedTurnEvidence,
     *,
     context: SessionOperationContext,
     reader: CurrentTranscriptBlobReader | None = None,
@@ -277,6 +319,8 @@ def _restore_current_evidence(
     materialization: CurrentContinuationMessageProducers | None = None,
 ) -> RestoredTurnEvidence:
     """Internal graph construction, called only after the actual selected SQL read."""
+    admitted = ce.require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
     owner, initial, latest = _begin_current_evidence(snapshot, context=context)
     request = snapshot.transcript.request
     owner.transcript, messages = AdvisorTranscriptOwner.for_continuation(
@@ -288,7 +332,7 @@ def _restore_current_evidence(
         materialization=materialization,
     )
     return _finish_current_evidence(
-        snapshot,
+        admitted,
         context=context,
         owner=owner,
         initial=initial,
@@ -321,7 +365,7 @@ def _begin_current_evidence(
 
 
 def _finish_current_evidence(
-    snapshot: ce.TurnEvidenceSnapshot,
+    evidence: ce.AdmittedTurnEvidence,
     *,
     context: SessionOperationContext,
     owner: TurnEvidence,
@@ -331,6 +375,8 @@ def _finish_current_evidence(
     reader: CurrentTranscriptBlobReader | None,
     env_ref_names: frozenset[str],
 ) -> RestoredTurnEvidence:
+    admitted = ce.require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
     retained = snapshot.effects
     if snapshot.requires_blob_reader:
         if type(reader) is not CurrentTranscriptBlobReader or reader.context is not context:
@@ -445,17 +491,19 @@ def _finish_current_evidence(
         ),
         committed_revision_ids=retained.committed_revision_ids,
     )
-    from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
-
-    graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names)
+    # Last use of the fixed admission graph: the following reconstruction
+    # transfers its mutable roots to live owners. Later capture admits fresh
+    # bytes through the actual live graph codec, never this old carrier.
+    graph = admitted.take_graph()
     if graph is None:
-        recorder, drained = BufferingRecorder.for_continuation(ce.recorder_from_evidence_json(snapshot.recorder_json))
+        recorder, drained = BufferingRecorder.for_continuation(decode_recorder_snapshot(admitted.recorder_chunk))
         return RestoredTurnEvidence(owner, messages, recorder, drained)
     owner.effects = graph.effects
     recorder, drained = BufferingRecorder.for_continuation(graph.recorder)
     if snapshot.application_entry is not None:
         owner._portable_p4_graph = graph
         owner._portable_p4_entry = snapshot.application_entry
+        owner._portable_p4_sources = admitted.sources.chunks
     return RestoredTurnEvidence(
         owner, messages, recorder, drained, graph.selected, snapshot.application_entry, graph.selected_audit, graph.selected_dialect
     )

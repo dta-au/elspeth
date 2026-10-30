@@ -34,11 +34,12 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
 from elspeth.web.sessions.proposal_projection import project_composition_proposal
-from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
+from elspeth.web.sessions.protocol import ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -1163,7 +1164,7 @@ async def test_accept_composition_proposal_requires_pending_status(service) -> N
                 session_id=session_id,
                 proposal_id=proposal.id,
                 expected_current_state_id=None,
-                state=CompositionStateData(is_valid=True),
+                state=composition_state_data(is_valid=True),
                 actor="user:alice",
                 session_operation_context=context,
             )
@@ -1192,7 +1193,7 @@ async def test_accept_composition_proposal_writes_forward_event(service) -> None
             session_id=session_id,
             proposal_id=proposal.id,
             expected_current_state_id=None,
-            state=CompositionStateData(is_valid=True),
+            state=composition_state_data(is_valid=True),
             actor="user:alice",
             session_operation_context=context,
         )

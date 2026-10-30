@@ -198,14 +198,12 @@ async def test_reply_unknown_large_scalar_remains_closed_and_audited(authority, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["state", "tool_arguments"])
 async def test_actual_json_producers_send_decoded_cjk_to_azure(authority, monkeypatch, surface):
-    from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.catalog.policy_view import PolicyCatalogView
-    from elspeth.web.composer.pipeline_planner import _assistant_tool_calls_message, _parse_response_tool_calls
     from elspeth.web.composer.prompts import build_messages
     from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+    from elspeth.web.composer.tool_batch import _retain_llm_tool_argument_parts
     from elspeth.web.dependencies import create_catalog_service
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from tests.unit.web.composer.test_pipeline_planner import _response
 
     engine, _service, owner, coordinator = authority
     original_text = "界" * 1500
@@ -244,11 +242,15 @@ async def test_actual_json_producers_send_decoded_cjk_to_azure(authority, monkey
             content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
         )
     else:
-        response = _response(("emit_pipeline_proposal", {"pipeline": {"nodes": [{"prompt_template": original_text}]}}))
-        message, calls = _parse_response_tool_calls(
-            response, max_tool_calls=1, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset({"emit_pipeline_proposal"})
-        )
-        messages = [_assistant_tool_calls_message(message, calls), {"role": "user", "content": _USER}]
+        arguments = json.dumps({"pipeline": {"nodes": [{"prompt_template": original_text}]}})
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "set_pipeline", "arguments": arguments}}],
+        }
+        messages = [message, {"role": "user", "content": _USER}]
+        _retain_llm_tool_argument_parts(messages, tool_call_id="call-1")
+        assert PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message
     gateway, inspected = _gateway(monkeypatch)
     sent = []
 
@@ -271,63 +273,6 @@ async def test_actual_json_producers_send_decoded_cjk_to_azure(authority, monkey
     assert "\\u754c" not in documents
     assert [check["disposition"] for check in _checks(engine)] == ["allow"]
     coordinator.assert_completed()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("state_payload", [{"small": 0.00005}, {"\U0001f600": "astral", "\ue000": "private-use"}, {"double": 1e20}])
-async def test_actual_planner_preserves_canonical_number_and_key_wire(tmp_path, tool_context, monkeypatch, state_payload):
-    from elspeth.core.canonical import canonical_json
-    from elspeth.web.composer.state import NodeSpec
-    from tests.unit.web.composer._helpers import _empty_state
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    gateway, inspected = _gateway(monkeypatch)
-    state = _empty_state().with_node(
-        NodeSpec.from_dict(
-            {
-                "id": "review",
-                "node_type": "transform",
-                "plugin": "passthrough",
-                "input": "rows",
-                "on_success": "out",
-                "on_error": "discard",
-                "options": state_payload,
-            }
-        )
-    )
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        current_state=state,
-        provider_current_state=state.to_dict(),
-        model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 1 and inspected
-    payload = completion.requests[0]["messages"][-1]["content"]
-    assert json.loads(payload)["current_state"]["data"]["nodes"][0]["options"] == state_payload
-    assert canonical_json(state_payload) in payload
-
-
-@pytest.mark.asyncio
-async def test_actual_planner_quote_dense_intent_reaches_azure_decoded(tmp_path, tool_context, monkeypatch):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    intent = '"fld",' * 1000 + "x" * 1000
-    assert len(intent) == 7000
-    gateway, inspected = _gateway(monkeypatch)
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        intent=intent,
-        model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 1
-    assert all(request["userPrompt"] == intent for request in inspected)
-    assert intent in "\n".join(document for request in inspected for document in request["documents"])
 
 
 def test_json_string_part_metadata_rejects_missing_wrong_and_overlapping_paths():

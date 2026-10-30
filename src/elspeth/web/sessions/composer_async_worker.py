@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import math
 import threading
 import time
 from collections.abc import Awaitable, Iterable
@@ -18,14 +19,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.applications import Starlette
 
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_required_sql_finish_once, run_sync_in_worker
 from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
 from elspeth.web.composer.private_diagnostic_facts import capture_failure_facts
 from elspeth.web.composer_watch_reads import ComposerOperationWatchReader
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
-from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption, SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.required_executor import RequiredGenerationUnavailable
@@ -42,6 +43,7 @@ from elspeth.web.required_work import (
     required_failure_leaves,
 )
 from elspeth.web.sessions.composer_app_services import ComposerAppServices, composer_app_services
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline, ComposerDrainSignal
 from elspeth.web.sessions.composer_operation_errors import (
     deadline_expired_error,
     operation_failure_diagnostic_id,
@@ -69,6 +71,9 @@ from elspeth.web.sessions.composer_turn import (
     persist_cancelled_turn_audit,
     run_composer_turn,
 )
+from elspeth.web.sessions.continuation import ComposerSegmentStartObservation
+from elspeth.web.sessions.continuation_driver import run_continuation_segment
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.routes._helpers import composer_request_lifecycle
 from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
@@ -284,8 +289,15 @@ class ComposerAsyncWorker:
         owner_instance_id: str,
         process_recovery: ProcessRecovery,
         instance_draining: threading.Event,
+        drain_signal: ComposerDrainSignal | None = None,
     ) -> None:
-        if not 1 <= concurrency <= 16 or scan_interval_seconds <= 0 or drain_seconds <= 0:
+        if (
+            not 1 <= concurrency <= 16
+            or scan_interval_seconds <= 0
+            or isinstance(drain_seconds, bool)
+            or not math.isfinite(drain_seconds)
+            or drain_seconds <= 0
+        ):
             raise ValueError("Invalid composer worker resource limits")
         self._app = app
         self._authority = authority
@@ -296,11 +308,18 @@ class ComposerAsyncWorker:
         self._owner_instance_id = owner_instance_id
         self._process_recovery = process_recovery
         self._instance_draining = instance_draining
+        if drain_signal is not None and (type(drain_signal) is not ComposerDrainSignal or drain_signal.draining is not instance_draining):
+            raise AuditIntegrityError("Composer worker changed its actual process drain signal")
+        self._drain_signal = drain_signal
         self._required_coordinators: dict[tuple[UUID, str], RequiredWorkCoordinator] = {}
         self._recovery_coordinators: dict[tuple[UUID, str], list[RequiredWorkCoordinator]] = {}
         self._adoption_recovery_pending: set[tuple[UUID, str]] = set()
         self._adoption_recovery_cancellations: dict[tuple[UUID, str], list[asyncio.CancelledError]] = {}
         self._stopping = False
+        self._drain_deadline: ComposerDrainDeadline | None = None
+        self._continuation_adoptions: dict[tuple[UUID, str], ContinuationLeaseAdoption] = {}
+        self._continuation_starts: dict[tuple[UUID, str], ComposerSegmentStartObservation] = {}
+        self._prefer_segments = False
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self._jobs: dict[tuple[UUID, str], asyncio.Task[_AdoptionSettlementHandoff | None]] = {}
@@ -308,6 +327,28 @@ class ComposerAsyncWorker:
 
     def notify_work(self) -> None:
         self._wake.set()
+
+    @property
+    def drain_deadline(self) -> ComposerDrainDeadline | None:
+        return self._drain_deadline
+
+    def stop_claiming(self) -> None:
+        """Latch process admission refusal without changing a V1 job budget."""
+        self._instance_draining.set()
+        self._wake.set()
+
+    def begin_drain(self, *, started_at: float | None = None) -> ComposerDrainDeadline:
+        """Latch claim refusal and one deadline on the owning event-loop thread.
+
+        The signal handler supplies its monotonic start, so loop scheduling
+        delay consumes the budget. Repeated calls retain the first deadline.
+        """
+        if self._drain_deadline is None:
+            self._drain_deadline = ComposerDrainDeadline.from_start(
+                started_at=time.monotonic() if started_at is None else started_at, drain_seconds=self._drain_seconds
+            )
+        self.stop_claiming()
+        return self._drain_deadline
 
     def start(self) -> None:
         if self._loop_task is not None or self._stopping:
@@ -320,6 +361,8 @@ class ComposerAsyncWorker:
             return
         # Consume the exception without logging provider/request content.
         failure = None if task.cancelled() else task.exception()
+        if self._drain_deadline is not None and not task.cancelled() and failure is None:
+            return
         slog.error("composer_operation.worker_loop_lost", exc_class=type(failure).__name__)
         self._process_recovery.request_shutdown()
 
@@ -335,20 +378,33 @@ class ComposerAsyncWorker:
         capacity = self._concurrency - len(self._jobs)
         if capacity <= 0 or self._stopping or self._instance_draining.is_set():
             return 0
-        claims = await _owned(run_sync_in_worker(self._authority.claim_next, limit=capacity))
-        if self._stopping or self._instance_draining.is_set():
+        claimers = (
+            (self._authority.claim_segment, self._authority.claim_next)
+            if self._prefer_segments
+            else (self._authority.claim_next, self._authority.claim_segment)
+        )
+        self._prefer_segments = not self._prefer_segments
+        admitted = 0
+        for claimer in claimers:
+            remaining = self._concurrency - len(self._jobs)
+            if remaining <= 0 or self._stopping or self._instance_draining.is_set():
+                break
+            claims = await _owned(run_sync_in_worker(claimer, limit=remaining))
+            if self._stopping or self._instance_draining.is_set():
+                for claim in claims:
+                    await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+                break
             for claim in claims:
-                await _owned(run_sync_in_worker(self._authority.release_claim, claim))
-            return 0
-        for claim in claims:
-            key = (claim.session_id, claim.operation_id)
-            if key in self._jobs:
-                raise AuditIntegrityError("Composer claim duplicates locally owned work")
-            self._local_cancels[key] = asyncio.Event()
-            task = asyncio.create_task(self._job(claim), name="composer-operation")
-            self._jobs[key] = task
-            task.add_done_callback(partial(self._job_finished, key))
-        return len(claims)
+                key = (claim.session_id, claim.operation_id)
+                if key in self._jobs:
+                    raise AuditIntegrityError("Composer claim duplicates locally owned work")
+                self._local_cancels[key] = asyncio.Event()
+                job = self._job(claim) if claim.segment_sequence is None else self._job_v2(claim)
+                task = asyncio.create_task(job, name="composer-operation")
+                self._jobs[key] = task
+                task.add_done_callback(partial(self._job_finished, key))
+                admitted += 1
+        return admitted
 
     def _job_finished(self, key: tuple[UUID, str], task: asyncio.Task[_AdoptionSettlementHandoff | None]) -> None:
         del self._jobs[key]
@@ -357,6 +413,15 @@ class ComposerAsyncWorker:
         result = task.result() if failure is None and not task.cancelled() else None
         coordinator = self._required_coordinators.get(key)
         recovery = self._recovery_coordinators.get(key)
+        adoption = self._continuation_adoptions.get(key)
+        if adoption is not None:
+            if adoption.lease is not None and adoption.lease.continuation_finished and (coordinator is None or coordinator.all_completed):
+                del self._continuation_adoptions[key]
+                self._continuation_starts.pop(key, None)
+            else:
+                self._process_recovery.request_shutdown()
+        elif key in self._continuation_starts:
+            self._process_recovery.request_shutdown()
         if key in self._adoption_recovery_pending:
             cancellations = self._adoption_recovery_cancellations.get(key)
             proved_handoff = (
@@ -417,6 +482,18 @@ class ComposerAsyncWorker:
         tasks = tuple(self._jobs.values())
         if self._loop_task is not None:
             tasks = (*tasks, self._loop_task)
+        if self._drain_deadline is not None:
+            # HTTP shutdown has already spent part of this same budget. V2
+            # jobs own cancellation at their stage cutoff; do not cancel at H.
+            remaining = self._drain_deadline.remaining_seconds(now=time.monotonic())
+            if tasks and remaining > 0:
+                await _owned(asyncio.wait(tasks, timeout=remaining))
+            for task in tasks:
+                if not task.done():
+                    task.cancel(COMPOSER_SHUTDOWN)
+            # Expiry leaves the actual jobs, physical SQL and finish tasks in
+            # custody. It does not grant a second relative drain interval.
+            return
         for task in tasks:
             task.cancel(COMPOSER_SHUTDOWN)
         if tasks:
@@ -426,7 +503,13 @@ class ComposerAsyncWorker:
             # may settle only once the COMPOSE lease has actually lapsed.
 
     def assert_shutdown_complete(self) -> None:
-        if not self._stopping or self._jobs or (self._loop_task is not None and not self._loop_task.done()):
+        if (
+            not self._stopping
+            or self._jobs
+            or self._continuation_adoptions
+            or self._continuation_starts
+            or (self._loop_task is not None and not self._loop_task.done())
+        ):
             raise AuditIntegrityError("Composer worker still owns unfinished shutdown work")
         if self._loop_task is not None and not self._loop_task.cancelled():
             self._loop_task.exception()
@@ -559,6 +642,118 @@ class ComposerAsyncWorker:
             if acquired:
                 lock.release()
         return None
+
+    async def _job_v2(self, claim: ComposerOperationClaim) -> None:
+        services = composer_app_services(self._app)
+        lock = await services.compose_locks.get_lock(str(claim.session_id))
+        acquired = False
+        running: ComposerOperationRunning | None = None
+        context: SessionOperationContext | None = None
+        adoption: ContinuationLeaseAdoption | None = None
+        cancellations: list[asyncio.CancelledError] = []
+        key = (claim.session_id, claim.operation_id)
+        known_unstarted = True
+        started_failure: BaseException | None = None
+        next_renewal = time.monotonic() + self._claim_lease_seconds / 3
+        try:
+            while not acquired:
+                current = await _owned(run_sync_in_worker(self._authority.read_segment_claim, claim))
+                if current is None:
+                    return
+                draining = self._stopping or self._instance_draining.is_set()
+                expired = self._drain_deadline is not None and self._drain_deadline.remaining_seconds(now=time.monotonic()) <= 0
+                if expired or (draining and current.cancel_requested_at is None):
+                    await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+                    return
+                try:
+                    await asyncio.wait_for(lock.acquire(), timeout=min(0.25, self._claim_lease_seconds / 3))
+                    acquired = True
+                except TimeoutError:
+                    if time.monotonic() >= next_renewal:
+                        await _owned(run_sync_in_worker(self._authority.renew_claim, claim))
+                        next_renewal = time.monotonic() + self._claim_lease_seconds / 3
+            observation = ComposerSegmentStartObservation(claim)
+            self._continuation_starts[key] = observation
+            known_unstarted = False
+            start_deadline = self._drain_deadline or ComposerDrainDeadline.from_start(
+                started_at=time.monotonic(), drain_seconds=self._drain_seconds
+            )
+            try:
+                context = await _owned(
+                    run_sync_in_worker(
+                        services.session_service.session_operation_authority.start_composer_segment,
+                        claim,
+                        owner_instance_id=self._owner_instance_id,
+                        lease_seconds=services.session_service.session_operation_lease_seconds,
+                        auth_provider_type=services.settings.auth_provider,
+                        observation=observation,
+                        deadline=start_deadline,
+                    ),
+                    cancellation_observations=cancellations,
+                )
+            except BaseException as original:
+                started_failure = original
+                try:
+                    context = await _owned(
+                        run_sync_in_worker(
+                            services.session_service.session_operation_authority.reconcile_composer_segment_start,
+                            observation,
+                            deadline=self._drain_deadline or start_deadline,
+                        ),
+                        cancellation_observations=cancellations,
+                    )
+                except BaseException as readback:
+                    raise _combine_operation_failures(original, (readback,)) from None
+                if context is None:
+                    known_unstarted = True
+                    self._continuation_starts.pop(key)
+                    raise original
+            running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+            if observation.policy is None or observation.hard_expires_at is None or self._drain_signal is None:
+                raise AuditIntegrityError("V2 start lost its actual retained timing/process signal owners")
+            sql_deadline = ContinuationSQLDeadlineOwner(
+                running,
+                policy=observation.policy,
+                drain_signal=self._drain_signal,
+                drain_seconds=self._drain_seconds,
+                hard_expires_at=observation.hard_expires_at,
+            )
+            coordinator = RequiredWorkCoordinator(
+                RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, claim.operation_id, claim.attempt),
+                sql_deadline_owner=sql_deadline,
+            )
+            self._required_coordinators[key] = coordinator
+            adoption = ContinuationLeaseAdoption(
+                services.session_service.session_operation_authority,
+                context,
+                lease_seconds=services.session_service.session_operation_lease_seconds,
+                required_work=coordinator,
+            )
+            self._continuation_adoptions[key] = adoption
+            adoption.cancellations.extend(cancellations)
+            try:
+                lease = await adoption.join()
+            except BaseException as original:
+                retained_lease = adoption.lease
+                if retained_lease is None:
+                    raise
+                # This V2-specific owner has not implicitly released the fence.
+                # The driver sees the original failure and can hand over only
+                # after current SQL custody/Stop and actual CAS were observed.
+                await run_continuation_segment(self, services, running, retained_lease, adoption_failure=original)
+                raise
+            await run_continuation_segment(self, services, running, lease, adoption_failure=started_failure)
+        except SessionOperationConflictError:
+            if running is not None or not known_unstarted:
+                raise
+            await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+        except BaseException:
+            if running is None and known_unstarted:
+                await _owned(run_sync_in_worker(self._authority.release_claim, claim))
+            raise
+        finally:
+            if acquired:
+                lock.release()
 
     async def _run_started(self, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease) -> None:
         if type(lease) is not SessionOperationLease:

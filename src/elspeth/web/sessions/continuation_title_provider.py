@@ -17,7 +17,6 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.json_parser import parse_json_strict
-from elspeth.contracts.prompt_guard import detach_prompt_guard_messages
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.continuation import ContinuationValue, InitializeFrame, PrivateChunkRef
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
@@ -37,6 +36,7 @@ from elspeth.web.composer.continuation_title_values import (
     DecodedTitleProviderResult,
     decode_title_provider_result,
 )
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.provider_audit_source import ProviderAuditSource, audit_drafts_json
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.quota_authority import ProviderAttempt, begin_provider_attempt_on_connection
@@ -137,6 +137,7 @@ class PreparedTitleProvider:
     input: PrivateChunk
     clock: ContinuationActionClock = field(repr=False)
     timing: ContinuationTimingObservation
+    provider_input: PreparedProviderInput = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +185,9 @@ def require_title_creator(running: ComposerOperationRunning) -> tuple[int, int]:
     return sequence, generation
 
 
-def title_input_descriptor(composer: ComposerServiceImpl, request: PreparedAutoTitleRequest) -> PrivateChunk:
+def title_input_descriptor(
+    composer: ComposerServiceImpl, request: PreparedAutoTitleRequest, *, prepared_input: PreparedProviderInput
+) -> PrivateChunk:
     from elspeth.web.composer.provider_gateway import _apply_openrouter_app_identity, _apply_openrouter_usage_accounting
     from elspeth.web.composer.service import ComposerServiceImpl
 
@@ -192,7 +195,22 @@ def title_input_descriptor(composer: ComposerServiceImpl, request: PreparedAutoT
         raise AuditIntegrityError("TITLE input requires the actual current producer")
     if request.kwargs["messages"] is not request.audit_messages or request.kwargs["timeout"] != 5.0:
         raise AuditIntegrityError("TITLE input changed its original request identity/timeout")
-    wire = {**request.kwargs, "messages": detach_prompt_guard_messages(request.audit_messages)[0]}
+    if (
+        type(prepared_input) is not PreparedProviderInput
+        or prepared_input.byte_limit != composer._settings.composer_max_prepared_request_bytes
+        or ("tools" in request.kwargs) != prepared_input.tools_present
+    ):
+        raise AuditIntegrityError("TITLE input changed its actual current preparation")
+    prepared_input.verify(
+        model=request.kwargs["model"],
+        role="composer",
+        mount=composer.composer_prompt_guard_mount,
+        mode=composer._settings.composer_prompt_guard_mode,
+        user_prompt=request.user_prompt,
+    )
+    wire = {**request.kwargs, "messages": prepared_input.evidence.messages}
+    if prepared_input.tools_present:
+        wire["tools"] = prepared_input.tools
     _apply_openrouter_app_identity(wire)
     _apply_openrouter_usage_accounting(wire)
     mount = composer.composer_prompt_guard_mount
@@ -377,8 +395,6 @@ def prepare_title_provider_on_connection(
         api_base=settings.composer_endpoint_base_url,
         api_key=settings.composer_endpoint_api_key.get_secret_value() if settings.composer_endpoint_api_key is not None else None,
     )
-    descriptor = title_input_descriptor(composer, request)
-    value = _descriptor(descriptor)
     policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
     if clock.policy != policy.actions.title or policy.actions.title.guard is None or policy.actions.title.quota is None:
         raise AuditIntegrityError("TITLE preparation changed its retained action allowance")
@@ -404,6 +420,22 @@ def prepare_title_provider_on_connection(
         is not None
     ):
         raise AuditIntegrityError("TITLE may not reset or reuse its durable family ordinal")
+    # Current source, action policy/timing and ordinal refusal precede a new
+    # ordinary size refusal. No descriptor/request copy or durable preparation
+    # write is needed to establish those existing admissions.
+    provider_input = prepare_provider_input(
+        messages=request.audit_messages,
+        tools=request.kwargs["tools"] if "tools" in request.kwargs else None,
+        tools_present="tools" in request.kwargs,
+        model=request.kwargs["model"],
+        role="composer",
+        mount=composer.composer_prompt_guard_mount,
+        mode=settings.composer_prompt_guard_mode,
+        user_prompt=request.user_prompt,
+        max_bytes=settings.composer_max_prepared_request_bytes,
+    )
+    descriptor = title_input_descriptor(composer, request, prepared_input=provider_input)
+    value = _descriptor(descriptor)
     conn.execute(insert(ordinals).values(session_id=sid, operation_id=operation, family=3, next_ordinal=1))
     conn.execute(
         insert(effects).values(
@@ -431,7 +463,18 @@ def prepare_title_provider_on_connection(
     encoded = _effect_snapshot(encode_continuation_snapshot(following), effect_key="provider:3:0", disposition="prepared", receipt_id=None)
     following_selected = _append(conn, running, selected, encoded, descriptor.reference, "prepared")
     return PreparedTitleProvider(
-        running, following_selected, composer, authority, names, work, snapshot.actor_user_id, request, descriptor, clock, timing
+        running,
+        following_selected,
+        composer,
+        authority,
+        names,
+        work,
+        snapshot.actor_user_id,
+        request,
+        descriptor,
+        clock,
+        timing,
+        provider_input,
     )
 
 
@@ -617,7 +660,7 @@ def admit_title_provider_on_connection(
     frame = _frame(selected)
     if frame.bootstrap is None:
         raise AuditIntegrityError("TITLE physical admission lost its actual bootstrap")
-    if title_input_descriptor(prepared.composer, prepared.request) != prepared.input:
+    if title_input_descriptor(prepared.composer, prepared.request, prepared_input=prepared.provider_input) != prepared.input:
         raise AuditIntegrityError("TITLE original request/guard policy changed before physical admission")
     _, ref, stage, source = _source_chain(conn, running, selected, names=prepared.names)
     if stage != "prepared" or ref != prepared.input.reference or prepared.request.kwargs["model"] != model:

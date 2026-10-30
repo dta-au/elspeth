@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from starlette.websockets import WebSocketDisconnect
 from tests.fixtures.identities import grant_test_pipeline_user
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.execution.test_websocket import FakeBroadcaster, FakeSettings
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -34,7 +35,7 @@ from elspeth.web.execution.schemas import FailedData, ProgressData, RunAccountin
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import run_events_table
-from elspeth.web.sessions.protocol import CompositionStateData, RunRecord, SessionRunEventType
+from elspeth.web.sessions.protocol import RunRecord, SessionRunEventType
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -83,7 +84,7 @@ async def _seed_run(service: SessionServiceImpl, identity_id: str) -> tuple[RunR
     try:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=context,
         )

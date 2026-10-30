@@ -20,6 +20,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -244,7 +245,7 @@ def _seed_run_and_blob(conn, *, run_id: str, blob_id: str) -> None:
             nodes=None,
             edges=None,
             outputs=None,
-            metadata_=None,
+            metadata_=stored_default_pipeline_metadata(),
             is_valid=True,
             validation_errors=None,
             composer_meta=None,

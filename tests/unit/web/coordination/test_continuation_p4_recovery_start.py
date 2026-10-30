@@ -94,7 +94,8 @@ async def current_selected(store, running, *, effect_key=None):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cut", ("pending_application", "applied_application"))
-async def test_released_committed_p4_cut_restarts_through_real_recovery_claim_and_fence(operation_store, cut):
+@pytest.mark.parametrize("handoff", ("release_then_recover", "live_handover"))
+async def test_released_committed_p4_cut_restarts_through_real_recovery_claim_and_fence(operation_store, cut, handoff):
     engine, repository, authority, _sessions, sid = operation_store
     first, selected, inventory, _snapshot, commit = await committed_evidence_case(operation_store, graph=True, joint=True)
     first_released = False
@@ -109,18 +110,24 @@ async def test_released_committed_p4_cut_restarts_through_real_recovery_claim_an
         before = authority.load_continuation_snapshot(first)
         root_before = decode_continuation_snapshot(before.payload_json)
         business = rows(engine)
-        repository.release(first.session_operation_context)
-        first_released = True
-        assert (
-            current_repository.recover_composer_segment(
-                session_id=sid,
-                operation_id=first.claim.operation_id,
-                expected_generation=first.claim.ownership_generation,
-                actor_user_id="alice",
-                auth_provider_type="local",
+        if handoff == "live_handover":
+            # The live owner hands over in one transaction (design §3.4 B); the
+            # landed P4 owner must read it exactly as it reads a recovery.
+            repository.suspend_composer_segment(first)
+            first_released = True
+        else:
+            repository.release(first.session_operation_context)
+            first_released = True
+            assert (
+                current_repository.recover_composer_segment(
+                    session_id=sid,
+                    operation_id=first.claim.operation_id,
+                    expected_generation=first.claim.ownership_generation,
+                    actor_user_id="alice",
+                    auth_provider_type="local",
+                )
+                is True
             )
-            is True
-        )
         after_recovery = recovery_rows(engine)
         assert (
             current_repository.recover_composer_segment(

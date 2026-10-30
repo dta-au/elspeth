@@ -22,6 +22,7 @@ from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.continuation_title_values import decode_title_provider_result
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+from elspeth.web.continuation_retention_memo import current_retention_stage_memo
 from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions import continuation_title_application as owner
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationRunning
@@ -36,6 +37,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.protocol import SessionRecord
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.continuation_inventory import inventory_work
+from tests.helpers.continuation_memo import RetentionMemoTrace
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
@@ -111,9 +113,10 @@ async def reached_or_failure(task, reached):
     ],
 )
 async def test_paid_title_application_preserves_original_result_and_applies_exact_title_once(
-    operation_store, tmp_path, monkeypatch, content, disposition
+    operation_store, tmp_path, monkeypatch, content, disposition, request
 ):
     running, service, work, settled, original, sdk, calls = await paid_title(operation_store, tmp_path, monkeypatch, content)
+    memo_trace = RetentionMemoTrace(monkeypatch, request)
     rejections = []
     real_rejection_metric = application._record_auto_title_rejection
 
@@ -165,6 +168,48 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
         )
         assert next_continuation_action_policy(selected=structural, policy=policy) == policy.actions.session_sql
         work.coordinator.assert_completed()
+        memo_trace.finish(stages=1)
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_title_retention_postwrite_read_error_clears_memo_and_preserves_committed_ready(
+    operation_store, tmp_path, monkeypatch, request
+):
+    running, service, work, settled, original, sdk, _calls = await paid_title(operation_store, tmp_path, monkeypatch)
+    memo_trace = RetentionMemoTrace(monkeypatch, request)
+    real_read = application.read_current_title_application
+    marker = RuntimeError("original post-write TITLE observation failure")
+    read_results = []
+    committed_rows = []
+
+    async def fail_after_real_read(**kwargs):
+        result = await real_read(**kwargs)
+        if current_retention_stage_memo() is not None:
+            assert result.applied and result.result == original.result
+            read_results.append(result)
+            committed_rows.append(recovery_rows(operation_store[0]))
+            raise marker
+        return result
+
+    monkeypatch.setattr(application, "read_current_title_application", fail_after_real_read)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await application.apply_current_title_success(service=service, selected=settled.selected, required_work=work)
+        assert caught.value is marker and len(read_results) == 1
+        assert recovery_rows(operation_store[0]) == committed_rows[0] and len(sdk) == 1
+        work.coordinator.assert_completed()
+        memo_trace.assert_closed(stages=1)
+        retry_work = inventory_work(running)
+        replay = await application.apply_current_title_success(service=service, selected=read_results[0].selected, required_work=retry_work)
+        assert replay.applied and replay.selected == read_results[0].selected
+        assert replay.result == read_results[0].result and replay.decision == read_results[0].decision
+        assert replay.inventory is not read_results[0].inventory
+        assert recovery_rows(operation_store[0]) == committed_rows[0]
+        assert len(sdk) == 1
+        retry_work.coordinator.assert_completed()
+        memo_trace.finish(stages=1)
     finally:
         operation_store[1].release(running.session_operation_context)
 

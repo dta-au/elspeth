@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
@@ -41,8 +42,9 @@ from elspeth.web.coordination.contracts import (
     SessionOperationTerminalOutcomeUnknown,
 )
 from elspeth.web.execution_lease_cleanup import ExecutionAcquisitionObligation
-from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised
+from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource, RequiredWorkTicket
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -384,6 +386,103 @@ async def _join_shielded_task_after_cancellation[T](
     return task.result()
 
 
+class ContinuationLeaseAdoption:
+    """Retain a started V2 context and its physical CAS through every outcome.
+
+    Unlike generic adoption, failure never releases the context implicitly.
+    The worker retains this owner before awaiting ``join`` and must use its
+    exact lease for Stop/handover, or retain LOST/UNKNOWN cleanup custody.
+    Renewal starts before CAS: start_composer_segment already minted the
+    current fence, and a slow CAS must not let that real ownership lapse.
+    """
+
+    def __init__(
+        self,
+        authority: SessionOperationAuthority,
+        context: SessionOperationContext,
+        *,
+        lease_seconds: int,
+        required_work: RequiredWorkCoordinator,
+    ) -> None:
+        if type(context) is not SessionOperationContext or context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise contract_errors.AuditIntegrityError("Continuation adoption requires the exact started COMPOSE context")
+        if type(required_work) is not RequiredWorkCoordinator or required_work.authority.context != context:
+            raise contract_errors.AuditIntegrityError("Continuation adoption lost its exact required-work owner")
+        self.authority = authority
+        self.context = context
+        self.lease_seconds = lease_seconds
+        self.required_work = required_work
+        self.lease: SessionOperationLease | None = None
+        self.task: asyncio.Task[RequiredSQLFinishOnce[None]] | None = None
+        self.outcome: RequiredSQLFinishOnce[None] | None = None
+        self.cancellations: list[asyncio.CancelledError] = []
+
+    async def join(self) -> SessionOperationLease:
+        if self.lease is None:
+            interval = _validate_lifecycle_timing(lease_seconds=self.lease_seconds, renew_interval_seconds=None)
+            # Retain the concrete object before constructor task allocation.
+            self.lease = SessionOperationLease.__new__(SessionOperationLease)
+            SessionOperationLease.__init__(
+                self.lease,
+                self.authority,
+                self.context,
+                lease_seconds=self.lease_seconds,
+                renew_interval_seconds=interval,
+                required_work=self.required_work,
+            )
+        if self.task is None:
+            ticket = self.required_work.reserve(RequiredWorkSource.LEASE_ADOPTION)
+            self.task = asyncio.create_task(
+                run_required_sql_finish_once(ticket, self.authority.compare_and_swap, self.context),
+                name="continuation-adoption-compare-and-swap",
+            )
+        self.outcome = await _join_shielded_task_after_cancellation(self.task, cancellation_observations=self.cancellations)
+        for cancellation in self.outcome.deferred_cancellations:
+            _retain_cancellation(self.cancellations, cancellation)
+        failures = [self.outcome.error] if type(self.outcome) is RequiredSQLRaised else []
+        if type(self.outcome) not in (RequiredSQLReturned, RequiredSQLRaised):
+            raise contract_errors.AuditIntegrityError("Continuation adoption lost its actual physical CAS result")
+        _raise_lifecycle_originals(self.cancellations, failures)
+        return self.lease
+
+
+@dataclass(slots=True, eq=False)
+class ContinuationStage[T]:
+    """The actual phase producer and its originals, separate from Task projection."""
+
+    coroutine: Coroutine[Any, Any, T]
+    task: asyncio.Task[T] | None = None
+    producer: asyncio.Task[T] | None = None
+    conflicts: list[asyncio.Task[T]] = field(default_factory=list)
+    original: BaseException | None = None
+    returned: bool = False
+    observed: bool = False
+
+    def bind_task(self, task: asyncio.Task[T]) -> None:
+        if type(task) is not asyncio.Task:
+            raise contract_errors.AuditIntegrityError("Continuation stage allocation returned a foreign owner")
+        if self.task is not None and self.task is not task:
+            if all(task is not earlier for earlier in self.conflicts):
+                self.conflicts.append(task)
+            raise contract_errors.AuditIntegrityError("Continuation stage allocation replaced its actual producer")
+        self.task = task
+
+    async def produce(self, lease: SessionOperationLease) -> T:
+        try:
+            actual = asyncio.current_task()
+            if type(actual) is not asyncio.Task:
+                raise contract_errors.AuditIntegrityError("Continuation phase has no actual Task producer")
+            self.producer = actual
+            self.bind_task(actual)
+            lease._owned_tasks.add(actual)
+            value = await self.coroutine
+        except BaseException as original:
+            self.original = original
+            raise
+        self.returned = True
+        return value
+
+
 @final
 class SessionOperationLease:
     """Renewable async lifetime around one immutable operation context.
@@ -399,6 +498,7 @@ class SessionOperationLease:
         "_close_task",
         "_closed",
         "_context",
+        "_continuation_stages",
         "_disposition",
         "_execution_obligation",
         "_finish_mode",
@@ -449,6 +549,7 @@ class SessionOperationLease:
         self._renewal_error: BaseException | None = None
         self._renewal_attempt: _RenewalAttemptObservation | None = None
         self._owned_tasks: set[asyncio.Task[Any]] = set()
+        self._continuation_stages: list[ContinuationStage[Any]] = []
         self._close_task: asyncio.Task[None] | None = None
         self._finish_mode: Literal["close", "consume"] | None = None
         self._disposition = SessionOperationLeaseDisposition.ACTIVE
@@ -887,9 +988,86 @@ class SessionOperationLease:
         self._owned_tasks.add(task)
         return task
 
+    def create_continuation_stage[T](self, coroutine: Coroutine[Any, Any, T], *, name: str) -> ContinuationStage[T]:
+        if self._closed or self._close_task is not None or self._context.operation_kind is not SessionOperationKind.COMPOSE:
+            coroutine.close()
+            raise contract_errors.AuditIntegrityError("Continuation phase cannot start after its owner began finishing")
+        stage = ContinuationStage(coroutine)
+        self._continuation_stages.append(stage)
+        stage.bind_task(asyncio.create_task(stage.produce(self), name=name))
+        if stage.task is not None:
+            self._owned_tasks.add(stage.task)
+        return stage
+
+    async def join_continuation_stage[T](self, stage: ContinuationStage[T]) -> T:
+        """Transfer the original producer outcome, retaining caller delivery separately."""
+        if self._context.operation_kind is not SessionOperationKind.COMPOSE or stage not in self._continuation_stages or stage.task is None:
+            raise contract_errors.AuditIntegrityError("Continuation stage lost its registered child owner")
+        task = stage.task
+        cancellations: list[asyncio.CancelledError] = []
+        caller = asyncio.current_task()
+        try:
+            while not task.done():
+                cancelling = caller.cancelling() if caller is not None else 0
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as delivered:
+                    if caller is not None and caller.cancelling() > cancelling:
+                        _retain_cancellation(cancellations, delivered)
+                except BaseException:
+                    break
+            failures: list[BaseException] = []
+            try:
+                task.result()
+            except BaseException as projection:
+                if stage.original is not None:
+                    failures.append(stage.original)
+                elif stage.producer is None and task.cancelled():
+                    # Verified pre-entry cancellation: the real phase never
+                    # ran, so close that unstarted coroutine and retain delivery.
+                    stage.coroutine.close()
+                    failures.append(projection)
+                else:
+                    failures.append(projection)
+            if stage.conflicts or (stage.producer is not None and stage.producer is not task):
+                failures.append(contract_errors.AuditIntegrityError("Continuation phase has conflicting physical Task owners"))
+            if not failures and not stage.returned:
+                failures.append(contract_errors.AuditIntegrityError("Continuation phase Task returned without its actual producer result"))
+            stage.observed = True
+            _raise_lifecycle_originals(cancellations, failures)
+            return task.result()
+        finally:
+            if task.done() and stage.observed and not stage.conflicts:
+                self._owned_tasks.remove(task)
+
     @property
     def required_work(self) -> RequiredWorkCoordinator | None:
         return self._required_work
+
+    @property
+    def continuation_finished(self) -> bool:
+        """Physical finish observation, distinct from ending a failed close Task."""
+        return (
+            self._closed
+            and self._disposition
+            in (
+                SessionOperationLeaseDisposition.RELEASED,
+                SessionOperationLeaseDisposition.CONSUMED,
+                SessionOperationLeaseDisposition.LOST,
+            )
+            and self._close_task is not None
+            and self._close_task.done()
+            and self._renewal_task is not None
+            and self._renewal_task.done()
+            and not self._owned_tasks
+            and all(
+                stage.task is not None
+                and stage.task.done()
+                and (stage.producer is None or stage.producer.done())
+                and all(task.done() for task in stage.conflicts)
+                for stage in self._continuation_stages
+            )
+        )
 
     def bind_required_work(self, coordinator: RequiredWorkCoordinator) -> None:
         if type(coordinator) is not RequiredWorkCoordinator:
@@ -1020,6 +1198,14 @@ class SessionOperationLease:
 
     async def _join_owned_tasks(self) -> tuple[BaseException, ...]:
         """Join every owned child and return each distinct non-cancellation failure."""
+        for stage in self._continuation_stages:
+            # Allocation may have scheduled the producer before throwing.
+            # Retain UNKNOWN until that exact producer binds itself; no second
+            # allocation, guessed release or missing-task cleanup claim.
+            while stage.task is None:
+                await asyncio.sleep(0.01)
+            for conflicting in stage.conflicts:
+                await asyncio.shield(conflicting)
         if not self._owned_tasks:
             return ()
         tasks = tuple(self._owned_tasks)
@@ -1497,7 +1683,25 @@ class SessionOperationLease:
             await _join_shielded_task_after_cancellation(task)
             raise
 
-    async def close(self) -> None:
+    async def _join_continuation_finish(self, task: asyncio.Task[None], deadline: ComposerDrainDeadline) -> None:
+        cancellations: list[asyncio.CancelledError] = []
+        while not task.done():
+            remaining = deadline.remaining_seconds(now=time.monotonic())
+            if remaining <= 0:
+                failure = TimeoutError("Continuation finish still owns work beyond the drain deadline")
+                _raise_lifecycle_originals(cancellations, [failure])
+            try:
+                await asyncio.wait((task,), timeout=remaining)
+            except asyncio.CancelledError as cancellation:
+                _retain_cancellation(cancellations, cancellation)
+        failures: list[BaseException] = []
+        try:
+            task.result()
+        except BaseException as original:
+            failures.append(original)
+        _raise_lifecycle_originals(cancellations, failures)
+
+    async def close(self, *, deadline: ComposerDrainDeadline | None = None) -> None:
         """Join children, stop renewal, and release only known-current authority."""
         obligation = self._execution_obligation
         cancellations: list[asyncio.CancelledError] = []
@@ -1525,7 +1729,10 @@ class SessionOperationLease:
         if close_task is None:
             raise contract_errors.AuditIntegrityError("Lease close lacks its retained Task")
         if obligation is None:
-            await self._join_finish_task(close_task)
+            if deadline is None:
+                await self._join_finish_task(close_task)
+            else:
+                await self._join_continuation_finish(close_task, deadline)
             return
         while not close_task.done():
             try:
@@ -1545,6 +1752,96 @@ class SessionOperationLease:
             for retained_failure in failures:
                 obligation.registry.record_failure(retained_failure)
         _raise_lifecycle_originals(cancellations, failures)
+
+    async def _consume_continuation_handoff[T](self, action: Callable[[], T], outcome: list[T]) -> None:
+        """Run one handoff transaction that releases this lease's own fence.
+
+        The yield and the live-owner handover write the successor state and
+        release the fence in one SQL transaction, which stands in for the
+        ordinary release. It runs under its own drain-admissible ticket and the
+        required-work barrier is sealed only after it commits (design §2.5).
+        A known refusal writes nothing: the owner keeps its fence, renewal
+        resumes and the lease may settle or retry (design §2.6).
+        """
+        from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+        from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
+        from elspeth.web.sessions.continuation import ContinuationCASConflict
+
+        resumed = False
+        try:
+            owned_errors = await self._join_owned_tasks()
+            await self._stop_and_join_renewal()
+            if self._renewal_error is not None:
+                self._disposition = SessionOperationLeaseDisposition.LOST
+                raise _preserve_failures(
+                    self._renewal_error,
+                    owned_errors,
+                    note_prefix="Session-operation handoff child",
+                    group_message="Session operation handoff refused after renewal loss",
+                )
+            if owned_errors:
+                # The handoff needs a quiet cohort. Fall back to the ordinary
+                # release; the segment then waits for lease-expiry recovery.
+                release_error = await self._capture_release_error()
+                failures = [failure for failure in (*owned_errors, release_error) if failure is not None]
+                raise _preserve_failures(
+                    failures[0],
+                    failures[1:],
+                    note_prefix="Session-operation handoff close",
+                    group_message="Session operation handoff children failed",
+                )
+            try:
+                if self._required_work is None:
+                    value = await run_stream_read_in_worker(action)
+                else:
+                    value = await run_required_sql_in_worker(self._required_work.prepare_continuation_handoff(), action)
+            except (SessionOperationFenceLost, ComposerOperationFenceLost):
+                self._disposition = SessionOperationLeaseDisposition.LOST
+                raise
+            except (ComposerOperationCancelledDuringTurn, ContinuationCASConflict, ContinuationCutNotResumable):
+                self._resume_after_refused_handoff()
+                resumed = True
+                raise
+            except BaseException:
+                self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                raise
+            if self._required_work is not None:
+                self._required_work.seal_after_continuation_handoff()
+            self._disposition = SessionOperationLeaseDisposition.CONSUMED
+            outcome.append(value)
+        finally:
+            if not resumed:
+                self._closed = True
+
+    def _resume_after_refused_handoff(self) -> None:
+        """Undo the finish after a no-write refusal: renewal restarts and a later close releases."""
+        self._close_task = None
+        self._finish_mode = None
+        self._stop_renewal.clear()
+        self._renewal_task = asyncio.create_task(self._renew_forever(), name="session-operation-renewal")
+
+    async def consume_continuation_handoff[T](self, action: Callable[[], T], *, deadline: ComposerDrainDeadline | None = None) -> T:
+        """Consume a COMPOSE lease through a handoff that releases its fence itself.
+
+        It runs as the lease's one retained finish task, so a later ``close()``
+        only joins it and can never start a second release (design §2.5,
+        review F9). ``action`` is the bound ``commit_checkpoint_and_successor``
+        or ``suspend_composer_segment`` call; its receipt is returned.
+        """
+        if self._context.operation_kind is not SessionOperationKind.COMPOSE or self._execution_obligation is not None:
+            raise RuntimeError("continuation handoff consumes only a COMPOSE lease")
+        if self._close_task is not None:
+            raise RuntimeError("continuation handoff cannot begin after the lease started finishing")
+        outcome: list[T] = []
+        self._finish_mode = "consume"
+        self._close_task = asyncio.create_task(
+            self._consume_continuation_handoff(action, outcome), name="session-operation-continuation-handoff"
+        )
+        if deadline is None:
+            await self._join_finish_task(self._close_task)
+        else:
+            await self._join_continuation_finish(self._close_task, deadline)
+        return outcome[0]
 
     async def consume_archive(
         self,

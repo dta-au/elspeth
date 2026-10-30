@@ -1,8 +1,8 @@
-"""Selected ST-02 retirement through the real public planner proposal route.
+"""Selected ST-02 retirement through the actual common-loop public route.
 
-The wrong-constant cases deliberately characterize lost automatic correction.
-Passing their admission checks is not a claim of semantic fidelity. SDK and
-Azure HTTP responses are synthetic; no graph is executed.
+Wrong-constant cases characterize lost automatic correction independently of
+structural admission. Physical SDK/Azure responses are synthetic, while common
+Primary/EARLY/END, guards, operation fences, quotas, and settlement are real.
 """
 
 from __future__ import annotations
@@ -20,13 +20,9 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
-from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
 from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
-from elspeth.web.composer.protocol import (
-    COMPOSER_HISTORY_USER_AUTHORED_KEY,
-    COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
-)
+from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, COMPOSER_HISTORY_USER_MESSAGE_ID_KEY
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.prompt_guard_config import PromptGuardSettings
@@ -39,6 +35,8 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     token_usage_ledger_table,
 )
+from tests.helpers.advisor_review import parse_advisor_publication_review
+from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 from tests.helpers.composer_operations import message_body, submit_and_settle
 from tests.integration.web.composer.test_freeform_pipeline_planner import _routing_terminal_response
 from tests.unit.web.sessions.test_routes import _make_app
@@ -58,19 +56,14 @@ def _envelopes(rows, kind, field):
     return [envelope[field] for row in rows if row.role == "audit" for envelope in (row.tool_calls or ()) if envelope["_kind"] == kind]
 
 
-def _planner_payload(messages):
-    candidates = []
-    for message in messages:
-        if message["role"] != "user" or not isinstance(message["content"], str):
-            continue
-        try:
-            value = json.loads(message["content"])
-        except json.JSONDecodeError:
-            continue
-        if type(value) is dict and value.get("instruction") == PLANNER_TERMINAL_INSTRUCTION:
-            candidates.append(value)
-    assert len(candidates) == 1, "The actual SDK request must be the planner terminal-tool request"
-    return candidates[0]
+def _assert_common_history(messages, prior_request):
+    assert {"role": "user", "content": prior_request} in messages
+    assert {"role": "assistant", "content": _ASSISTANT_DISTRACTOR} in messages
+    assert {"role": "user", "content": _CURRENT_REQUEST} in messages
+    assert not any(COMPOSER_HISTORY_USER_AUTHORED_KEY in row or COMPOSER_HISTORY_USER_MESSAGE_ID_KEY in row for row in messages)
+    # Preserve the actual role boundary: assistant interpretation is not a
+    # promoted prior human instruction in the common provider request.
+    assert not any(row["role"] == "user" and row["content"] == _ASSISTANT_DISTRACTOR for row in messages)
 
 
 @pytest.fixture
@@ -108,11 +101,21 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             "composer_advisor_prompt_guard": guard_settings,
         }
     )
-    # Keep the fixture's configured call, repair, byte, cost and deadline limits.
-    settings = app.state.settings
-    shield_payloads = []
-    guard_bindings = []
-    events = []
+    settings = app.state.settings  # Retain configured call, byte, cost, and deadline limits.
+    auto = trust_mode == "auto_commit"
+    expected_families = (
+        (
+            ProviderInvocationFamily.PRIMARY,
+            ProviderInvocationFamily.ADVISOR,
+            ProviderInvocationFamily.PRIMARY,
+            ProviderInvocationFamily.ADVISOR,
+        )
+        if auto
+        else (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR)
+    )
+    expected_guard_roles = ("composer", "advisor", "composer", "advisor") if auto else ("composer", "composer", "advisor")
+    expected_phases = ["early", "end"] if auto else ["end"]
+    shield_payloads, guard_bindings, events = [], [], []
 
     def shield_response(request):
         assert request.url.host == "st02-shield.example.test"
@@ -135,8 +138,9 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         assert real_inspect.__module__ == "elspeth.web.composer.prompt_guard_clients"
 
         async def inspect(request):
-            # Forward to the actual Azure adapter; this observer supplies no verdict.
-            assert any(prior_request in document for document in request.documents)
+            assert request.role == expected_guard_roles[len(guard_bindings)]
+            if request.role == "composer":
+                assert any(prior_request in document for document in request.documents)
             guard_bindings.append(request.request_hash)
             decision = await real_inspect(request)
             assert decision.disposition == "allow"
@@ -153,13 +157,8 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         lambda **kwargs: ComposerAvailability(available=True, provider="test", model=kwargs["model"]),
     )
     composer = ComposerServiceImpl.for_trained_operator(
-        catalog=app.state.catalog_service,
-        settings=settings,
-        sessions_service=sessions,
-        session_engine=engine,
+        catalog=app.state.catalog_service, settings=settings, sessions_service=sessions, session_engine=engine
     )
-    # The planner success/proposal path does not invoke END. Do not substitute a
-    # CLEAN verdict or suppress an unexpected advisor/hatch transition.
     checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
     assert checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
     assert checkpoint.__module__ == "elspeth.web.composer.advisor_checkpoint"
@@ -174,21 +173,23 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
     (tmp_path / "outputs" / str(session.id)).mkdir(parents=True, exist_ok=True)
     prior = await sessions.add_message(session.id, "user", prior_request, writer_principal="route_user_message")
     await sessions.add_message(session.id, "assistant", _ASSISTANT_DISTRACTOR, writer_principal="compose_loop")
-    mint_observations = []
-    sdk_requests = []
-    authored_pipelines = []
-    compose_observations = []
-    real_mint = ProviderInvocationOwner.mint
-    real_compose = composer.compose
-    # A spare identical response lets the old one-nudge path finish with real
-    # rejection evidence. The selected behavior must leave this spare unused;
-    # never script a corrected second graph and call it first-shot fidelity.
-    conditions = (condition, condition)
+    authored_call = _routing_terminal_response(tmp_path, str(session.id), condition=condition).choices[0].message.tool_calls[0]
+    assert authored_call.function.name == "set_pipeline"
+    authored = json.loads(authored_call.function.arguments)["pipeline"]
+    candidate = "The draft was saved." if auto else "The proposed pipeline is waiting for approval."
+    steps = [Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored})]
+    if auto:
+        steps.append(Step("early"))
+    steps.extend((Step("primary", content=candidate), Step("end")))
+    script = CommonSDK(request=_CURRENT_REQUEST, candidate=candidate, steps=tuple(steps), saved=int(auto))
+    script.bind(composer, monkeypatch)
+    mint_observations, sdk_requests, compose_observations = [], [], []
+    real_mint, real_compose = ProviderInvocationOwner.mint, composer.compose
 
     def observe_mint(owner, family):
+        assert family is expected_families[len(mint_observations)]
         custody = real_mint(owner, family)
         assert owner.service is sessions
-        assert family is ProviderInvocationFamily.PLANNER, "No unrelated PRIMARY, TITLE, ADVISOR or hatch is scripted"
         mint_observations.append((owner, custody))
         return custody
 
@@ -196,8 +197,7 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         assert message == _CURRENT_REQUEST
         human = [row for row in messages if COMPOSER_HISTORY_USER_AUTHORED_KEY in row]
         assert len(human) == 1
-        assert human[0]["content"] == prior_request
-        assert human[0][COMPOSER_HISTORY_USER_AUTHORED_KEY] is True
+        assert human[0]["content"] == prior_request and human[0][COMPOSER_HISTORY_USER_AUTHORED_KEY] is True
         assert human[0][COMPOSER_HISTORY_USER_MESSAGE_ID_KEY] == str(prior.id)
         owner = kwargs["provider_owner"]
         assert owner.service is sessions
@@ -209,19 +209,9 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
 
     async def complete(**kwargs):
         ordinal = len(sdk_requests)
-        assert ordinal < len(conditions), "The finite characterization script has no extra response"
-        assert kwargs["model"] == settings.composer_model
-        assert kwargs["messages"][0] == {"role": "system", "content": composer._composer_skill_text}
-        assert "emit_pipeline_proposal" in {tool["function"]["name"] for tool in kwargs["tools"]}
-        assert "response_format" not in kwargs
-        payload = _planner_payload(kwargs["messages"])
-        assert payload["intent"] == _CURRENT_REQUEST
-        assert payload["conversation_context"] == {
-            "prior_user_requests": [{"history_index": 0, "content": prior_request}],
-            "additional_prior_user_requests_omitted": 0,
-            "prior_assistant_messages": [{"history_index": 1, "content": _ASSISTANT_DISTRACTOR}],
-        }
-        assert _ASSISTANT_DISTRACTOR not in json.dumps(payload["conversation_context"]["prior_user_requests"])
+        assert ordinal < len(expected_families), "No unplanned physical provider transition"
+        if expected_families[ordinal] is ProviderInvocationFamily.PRIMARY:
+            _assert_common_history(kwargs["messages"], prior_request)
         assert len(mint_observations) == ordinal + 1
         _owner, custody = mint_observations[-1]
         assert custody.attempt is not None
@@ -236,39 +226,16 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             ).all()
         checks = _envelopes(rows, "prompt_guard_audit", "check")
         assert len(checks) == ordinal + 1
-        assert checks[-1]["mode"] == "required" and checks[-1]["disposition"] == "allow"
-        assert checks[-1]["role"] == "composer" and checks[-1]["request_hash"] == guard_bindings[-1]
-        assert checks[-1]["operation_id"] == pending.operation_id == custody.context.fence.operation_id
-        assert checks[-1]["operation_epoch"] == pending.operation_epoch == custody.context.fence.operation_epoch
-        assert pending.identity_id == "alice" and pending.session_id == str(session.id)
-        assert pending.settled_at is None
+        check = checks[-1]
+        assert check["mode"] == "required" and check["disposition"] == "allow"
+        assert check["role"] == expected_guard_roles[ordinal] and check["request_hash"] == guard_bindings[-1]
+        assert check["operation_id"] == pending.operation_id == custody.context.fence.operation_id
+        assert check["operation_epoch"] == pending.operation_epoch == custody.context.fence.operation_epoch
+        assert pending.identity_id == "alice" and pending.session_id == str(session.id) and pending.settled_at is None
         assert events == [event for _ in range(ordinal) for event in ("guard", "sdk")] + ["guard"]
         events.append("sdk")
         sdk_requests.append((custody.attempt.attempt_id, deepcopy(kwargs)))
-        scripted = _routing_terminal_response(tmp_path, str(session.id), condition=conditions[ordinal])
-        call = scripted.choices[0].message.tool_calls[0]
-        authored_pipelines.append(json.loads(call.function.arguments)["pipeline"])
-        return litellm.ModelResponse(
-            id=f"offline-st02-{ordinal + 1}",
-            model=kwargs["model"],
-            choices=[
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": f"st02-{ordinal + 1}",
-                                "type": "function",
-                                "function": {"name": call.function.name, "arguments": call.function.arguments},
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-        )
+        return await script(**kwargs)
 
     monkeypatch.setattr(ProviderInvocationOwner, "mint", observe_mint)
     monkeypatch.setattr(composer, "compose", observe_compose)
@@ -285,48 +252,29 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             await app.state.composer_async_worker.run_until_idle()
             assert len(sdk_requests) == before_replay
 
-        assert len(compose_observations) == 1
+        script.assert_done()
+        assert script.phases == expected_phases and len(compose_observations) == 1
+        calls = assert_actual_audits(engine, script.requests, ("success",) * len(expected_families), session_id=str(session.id))
         proposals = await sessions.list_composition_proposals(session.id)
-        assert len(proposals) == 1
-        proposal = proposals[0]
-        assert proposal.tool_name == "set_pipeline"
-        assert proposal.pipeline_metadata is not None
-        accepted = deep_thaw(proposal.arguments_json)
-        assert accepted == authored_pipelines[0], "Retain the first exact authored graph, not a corrected replacement"
-        assert accepted["nodes"][0]["condition"] == condition
-        assert len(accepted["nodes"]) == 1 and accepted["nodes"][0]["node_type"] == "gate"
-        assert {output["sink_name"] for output in accepted["outputs"]} == {"high_value", "standard"}
-        if condition == "True":
-            assert accepted["nodes"][0]["routes"] == {"true": "fork", "false": "fork"}
-            assert accepted["nodes"][0]["fork_to"] == ["high_value", "standard"]
-        else:
-            assert accepted["nodes"][0]["routes"] == {"true": "high_value", "false": "standard"}
-        # This fixture's semantic oracle is stated independently of admission.
-        # For the genuine request, a constant fanout is deliberately WRONG even
-        # when real structural checks or the configured trust mode admit it.
-        requested_condition = "row['amount'] > 500" if prior_request == _GENUINE_ROUTING else "True"
-        matches_request = accepted["nodes"][0]["condition"] == requested_condition
-        assert matches_request is semantic_match
-        if not semantic_match:
-            assert prior_request == _GENUINE_ROUTING and condition == "True"
-            assert accepted["nodes"][0]["routes"] != {"true": "high_value", "false": "standard"}
         observed_result = compose_observations[0][1]
         current = await sessions.get_current_state(session.id)
-        if trust_mode == "explicit_approve":
-            assert proposal.status == "pending" and current is None
-            assert proposal.committed_state_id is None and observed_result.pipeline_commit_intent is None
-        else:
-            # Real runtime preflight and normal settlement must authorize this
-            # structurally valid candidate. Neither is semantic proof.
+        assert observed_result.pipeline_commit_intent is None
+        if auto:
+            assert proposals == [] and current is not None
             assert observed_result.runtime_preflight is not None and observed_result.runtime_preflight.is_valid
-            intent = observed_result.pipeline_commit_intent
-            assert intent is not None and intent.proposal_id == proposal.id
-            assert intent.draft_hash == proposal.pipeline_metadata.draft_hash
-            assert proposal.status == "committed" and current is not None
-            assert proposal.committed_state_id == current.id
             saved = state_from_record(current)
             assert saved.nodes[0].condition == condition
-            assert deep_thaw(saved.nodes[0].routes) == accepted["nodes"][0]["routes"]
+            assert deep_thaw(saved.nodes[0].routes) == authored["nodes"][0]["routes"]
+            end = parse_advisor_publication_review(script.requests[-1]["messages"][1]["content"])
+            assert end["saved_effects"]["verification"] == "verified"
+            assert end["saved_effects"]["latest_committed_state_id"] == str(current.id)
+            assert end["saved_effects"]["latest_verified_state_id"] == str(current.id)
+        else:
+            (proposal,) = proposals
+            assert proposal.tool_name == "set_pipeline" and proposal.status == "pending" and current is None
+            assert proposal.committed_state_id is None and proposal.pipeline_metadata.repair_count == 0
+            assert deep_thaw(proposal.arguments_json) == authored
+
         with engine.connect() as connection:
             rows = connection.execute(
                 select(chat_messages_table)
@@ -348,7 +296,9 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             states = connection.execute(
                 select(composition_states_table).where(composition_states_table.c.session_id == str(session.id))
             ).all()
-        assert len(states) == (1 if trust_mode == "auto_commit" else 0)
+        assert len(states) == int(auto)
+        if auto:
+            assert states[0].id == str(current.id) and states[0].provenance == "tool_call"
         assert len(jobs) == 1 and jobs[0].status == "completed"
         assert jobs[0].operation_id == body["operation_id"] and jobs[0].actor_user_id == "alice"
         assert {row.operation_id for row in attempts} == {jobs[0].session_operation_id}
@@ -356,19 +306,16 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         assert fence.released_at is not None
         assert len({id(owner.required_work.coordinator) for owner, _custody in mint_observations}) == 1
         mint_observations[0][0].required_work.coordinator.assert_completed()
-        calls = _envelopes(rows, "llm_call_audit", "call")
-        semantic = _envelopes(rows, "planner_attempt_audit", "attempt")
         checks = _envelopes(rows, "prompt_guard_audit", "check")
-        # This is the causal RED boundary on old source: its exact retired
-        # threshold rejection remains observable, rather than an exhausted fake.
-        assert [entry["rejection_codes"] for entry in semantic] == [[]]
-        assert [entry["outcome"] for entry in semantic] == ["accepted"]
-        assert [entry["led_to"] for entry in semantic] == ["done"]
-        assert proposal.pipeline_metadata.repair_count == 0
-        assert len(sdk_requests) == len(guard_bindings) == 1
-        assert len(shield_payloads) >= 1, "The real Azure adapter may batch one guard inspection across HTTP calls"
-        assert events == ["guard", "sdk"]
-        assert not _envelopes(rows, "advisor_checkpoint_pass_audit", "pass"), "Planner success gains no replacement END stage"
+        passes = _envelopes(rows, "advisor_checkpoint_pass_audit", "pass")
+        assert [entry["phase"] for entry in passes] == expected_phases
+        assert [check["role"] for check in checks] == list(expected_guard_roles)
+        assert len(sdk_requests) == len(guard_bindings) == len(expected_families)
+        assert len(shield_payloads) >= len(expected_families), "The actual Azure adapter may batch one inspection across HTTP calls"
+        assert events == [event for _ in expected_families for event in ("guard", "sdk")]
+        # The removed planner-attempt/candidate projection is not common-loop
+        # evidence. Bind the real tool authoring and original wire instead.
+        assert not _envelopes(rows, "planner_attempt_audit", "attempt")
         private = [
             ComposerDiagnosticEvidence.from_envelope(
                 envelope, expected_session_id=str(session.id), expected_operation_id=jobs[0].session_operation_id
@@ -377,27 +324,35 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             for envelope in row.tool_calls or ()
             if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
-        candidates = [entry for entry in private if entry.tool_name == "emit_pipeline_proposal"]
-        assert len(candidates) == 1 and candidates[0].status == "accepted"
-        assert candidates[0].operation_epoch == jobs[0].session_operation_epoch
-        assert candidates[0].tool_call_id == "st02-1"
-        assert candidates[0].arguments.disposition == "retained" and candidates[0].arguments.content is not None
-        assert json.loads(candidates[0].arguments.content)["pipeline"] == authored_pipelines[0]
-        assert candidates[0].wire_arguments.disposition == "retained" and candidates[0].wire_arguments.content is not None
-        assert json.loads(candidates[0].wire_arguments.content)["pipeline"] == authored_pipelines[0]
+        (authoring,) = [entry for entry in private if entry.tool_name == "set_pipeline" and entry.tool_call_id == "common-tool-1"]
+        assert authoring.status == "success" and authoring.operation_epoch == jobs[0].session_operation_epoch
+        assert authoring.arguments.disposition == "retained" and authoring.arguments.content is not None
+        accepted = json.loads(authoring.arguments.content)
+        assert accepted == authored, "Preserve the first exact authored graph, never a corrected replacement"
+        assert authoring.wire_arguments.disposition == "retained" and authoring.wire_arguments.content is not None
+        assert json.loads(authoring.wire_arguments.content) == {"pipeline": authored}
+        assert accepted["nodes"][0]["condition"] == condition
+        assert len(accepted["nodes"]) == 1 and accepted["nodes"][0]["node_type"] == "gate"
+        assert {output["sink_name"] for output in accepted["outputs"]} == {"high_value", "standard"}
+        if condition == "True":
+            assert accepted["nodes"][0]["routes"] == {"true": "fork", "false": "fork"}
+            assert accepted["nodes"][0]["fork_to"] == ["high_value", "standard"]
+        else:
+            assert accepted["nodes"][0]["routes"] == {"true": "high_value", "false": "standard"}
+        requested_condition = "row['amount'] > 500" if prior_request == _GENUINE_ROUTING else "True"
+        assert (accepted["nodes"][0]["condition"] == requested_condition) is semantic_match
+        if not semantic_match:
+            assert prior_request == _GENUINE_ROUTING and condition == "True"
+            assert accepted["nodes"][0]["routes"] != {"true": "high_value", "false": "standard"}
         assert [check["request_hash"] for check in checks] == guard_bindings
-        assert len(attempts) == len(ledger) == len(calls) == len(sdk_requests)
-        assert (
-            {row.attempt_id for row in attempts}
-            == {call["call_id"] for call in calls}
-            == {attempt_id for attempt_id, _request in sdk_requests}
-        )
+        assert len(attempts) == len(ledger) == len(calls) == len(expected_families)
+        assert {row.attempt_id for row in attempts} == {call["call_id"] for call in calls} == {attempt_id for attempt_id, _ in sdk_requests}
         assert all(row.settled_at is not None and row.ledger_entry_id in {entry.entry_id for entry in ledger} for row in attempts)
         assert all(entry.prompt_tokens == 10 and entry.completion_tokens == 5 for entry in ledger)
-        assert all(call["status"] == "success" for call in calls)
         for attempt_id, request in sdk_requests:
             audit = next(call for call in calls if call["call_id"] == attempt_id)
             assert audit["messages_hash"] == stable_hash(request["messages"])
-            assert audit["tools_spec_hash"] == stable_hash(request["tools"])
+            tools = request.get("tools")
+            assert audit["tools_spec_hash"] == (None if tools is None else stable_hash(tools))
     finally:
         await app.state.composer_async_worker.stop()

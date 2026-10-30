@@ -335,11 +335,11 @@ async def test_actual_end_semantics_and_each_physical_transition(
     app.state.plugin_snapshot_factory = _TestSnapshotFactory(app.state.plugin_snapshot_factory)
     session = await sessions.create_session("alice", "Existing authored session", "local")
     # Correction and saved-blob scenarios exercise the ordinary authoring loop
-    # over an existing output-only draft. Ordinary rootless questions retain
-    # the actual planner surface and its unchanged empty graph.
+    # over an existing output-only draft. Ordinary rootless questions use the
+    # same Primary/END owners over their unchanged empty graph.
     baseline = await _seed_output_only_draft(app, sessions, session.id) if len(primary_replies) > 1 else None
     engine = app.state.session_engine
-    authoring_family = ProviderInvocationFamily.PRIMARY if baseline is not None else ProviderInvocationFamily.PLANNER
+    authoring_family = ProviderInvocationFamily.PRIMARY
     expected_families = [family for _reply in primary_replies for family in (authoring_family, ProviderInvocationFamily.ADVISOR)]
     initial_calls = int(create_blob)
     if create_blob:
@@ -415,8 +415,8 @@ async def test_actual_end_semantics_and_each_physical_transition(
         tool_calls = None
         if family is authoring_family:
             assert kwargs["model"] == app.state.settings.composer_model
-            terminal_tool = "set_pipeline" if family is ProviderInvocationFamily.PRIMARY else "emit_pipeline_proposal"
-            assert terminal_tool in {tool["function"]["name"] for tool in kwargs["tools"]}
+            tool_names = {tool["function"]["name"] for tool in kwargs["tools"]}
+            assert "set_pipeline" in tool_names and "emit_pipeline_proposal" not in tool_names
             assert "response_format" not in kwargs
             if create_blob and index == 0:
                 content = None

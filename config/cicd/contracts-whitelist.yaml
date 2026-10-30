@@ -835,18 +835,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:tools (list)"
   - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._try_terminate_no_tools:llm_messages (list)"
 
-  # Shared pipeline planner provider/tool wire shapes. These are ephemeral
-  # JSON contracts fixed by the OpenAI-compatible chat/tool protocol or by
-  # the registered composer JSON Schemas; they are never durable internal
-  # domain records.
-  - "src/elspeth/web/composer/pipeline_planner.py:planner_terminal_tool_definition:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:planner_tool_definitions:return (list)"
-  - "src/elspeth/web/composer/pipeline_planner.py:_assistant_tool_calls_message:return"
-  # The provider-authored pipeline is open JSON until the canonical
-  # SetPipelineArgumentsModel validates it. This helper only rejects and
-  # reports invalid structure; it never rewrites the candidate.
-  - "src/elspeth/web/composer/pipeline_planner.py:_validate_terminal_payload:payload"
-  - "src/elspeth/web/composer/pipeline_planner.py:_AuditedDiscoveryResult.to_dict:return"
   # Public accessor returns a defensive copy of the registered dynamic JSON
   # Schema; a TypedDict would duplicate and drift from that authority.
   - "src/elspeth/web/composer/tools/schema_contract.py:canonical_set_pipeline_schema:return"
@@ -902,7 +890,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/wire_projection.py:_subschemas:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:_is_container_schema:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:wire_tool_definitions:return (list)"
-  - "src/elspeth/web/composer/tools/wire_projection.py:stamp_planner_terminal:return"
   - "src/elspeth/web/composer/tools/wire_projection.py:WireTool.thawed_function:return"
   - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection._ledger_sentence:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection.project:node"
@@ -1080,6 +1067,28 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/continuation_tool_argument_messages.py:_ordinary_message:return"
   - "src/elspeth/web/composer/continuation_tool_argument_messages.py:_require_ordinary_source:wire"
   - "src/elspeth/web/composer/continuation_tool_argument_messages.py:rebuild_tool_argument_message:return"
+  # Ordinary tool results preserve the actual SDK dictionary, serialized body
+  # and original guard-part identities. Recipes and committed sources stay nominal.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:capture_tool_result_recipe:message"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:rebuild_tool_result_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_result_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_result_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_tool_result_provenance:message"
+  # Feedback reconstruction creates first-party SDK wire outputs; registration
+  # and publication borrow the actual live message/list aliases. Recipes,
+  # calls, outcomes, invocations and provenance remain nominal semantic owners.
+  # These exact boundaries preserve original body and ordered guard-part identities.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:capture_tool_feedback_recipe:message"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:rebuild_tool_feedback_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_feedback_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_feedback_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_feedback_provenance:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_feedback_provenance:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.require_call:messages (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_feedback:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_feedback:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_result:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_result:return"
   # These wrappers forward existing SDK lists and return the nominal original
   # physical-call carrier through the existing deadline/custody/settlement path.
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_outcome_with_audit:messages (list)"
@@ -1170,16 +1179,11 @@ allowed_dict_patterns:
   # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
   - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
-  # Reply-only requests quote tool protocol records within the same external
-  # LiteLLM message shape; persisted history remains nominally typed.
-  - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
   - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.
   # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
   - "src/elspeth/web/composer/provider_gateway.py:build_composer_loop_request_kwargs:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
   - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:messages (list)"
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:tools (list)"

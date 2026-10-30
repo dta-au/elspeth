@@ -9,7 +9,7 @@ from sqlalchemy import Connection, select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, ToolBatchFrame
-from elspeth.web.composer.continuation_application_graph import ApplicationGraph, decode_application_graph, encode_application_graph
+from elspeth.web.composer.continuation_application_graph import ApplicationGraph, encode_application_graph
 from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -18,29 +18,34 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     verify_private_chunk,
 )
-from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot, decode_turn_evidence
+from elspeth.web.composer.continuation_env_inventory import ContinuationEnvSelection, CurrentContinuationEnvInventory
+from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence, decode_turn_evidence, require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import (
     PortableP4ApplicationBundle,
     build_portable_p4_application,
-    require_portable_p4_application,
+    require_admitted_p4_application,
     require_selected_applied_batch_chunk,
     retained_effects,
 )
 from elspeth.web.composer.continuation_evidence_application_values import P4EffectProducerData
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.continuation_owed_evidence import read_owed_p4_evidence_on_connection
 from elspeth.web.composer.continuation_p4_batch import decode_p4_pending_batch_chunk, encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_prepared_p4 import decode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.sessions._persist_payload import AuditOutcome
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
+    ContinuationOwnerCommit,
     StoredContinuationSnapshot,
     _require_current_continuation_running,
     append_complete_snapshot,
+    load_snapshot,
     private_chunk_key,
     put_chunk,
     read_chunk,
+    read_private_chunk,
     require_snapshot_cas,
 )
 from elspeth.web.sessions.continuation_p4 import decode_p4_receipt, verify_p4_immutable_receipt_on_connection
@@ -55,14 +60,59 @@ class StoredP4Application:
     bundle: PortableP4ApplicationBundle
 
 
+@dataclass(frozen=True, slots=True)
+class CommittedContinuationP4:
+    """The actual physical owner's two outputs, published only after commit."""
+
+    audit_outcome: AuditOutcome
+    application: StoredP4Application
+
+
+def apply_committing_p4_application_on_connection(
+    conn: Connection, commit: ContinuationOwnerCommit, *, env_ref_names: frozenset[str]
+) -> StoredP4Application:
+    """Finish the real newly retained receipt inside its existing transaction."""
+    from elspeth.web.sessions.continuation_selection import load_private_chunks
+
+    running = commit.running
+    stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+    root = decode_continuation_snapshot(stored.payload_json)
+    selected = SelectedContinuationState(
+        stored.checkpoint_id,
+        root,
+        load_private_chunks(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, stack=root),
+    )
+    inventory = CurrentContinuationEnvInventory(
+        running, ContinuationEnvSelection(stored.checkpoint_id, stored.cursor, stored.payload_json), env_ref_names
+    )
+    compose = root.frames[_compose_frame_index(selected)]
+    batch = root.frames[-1]
+    if type(compose) is not ComposeFrame or type(batch) is not ToolBatchFrame:
+        raise AuditIntegrityError("committing P4 lost its actual pending phase")
+    chunks = {chunk.reference: chunk for chunk in selected.chunks}
+    return apply_p4_application_on_connection(
+        conn,
+        running,
+        selected=selected,
+        inventory=inventory,
+        expected_evidence_chunk=chunks[compose.evidence],
+        expected_pending_batch_chunk=chunks[batch.accumulator],
+    )
+
+
 def _private_chunk_on_connection(conn: Connection, running: ComposerOperationRunning, reference: PrivateChunkRef) -> PrivateChunk:
+    if not 0 <= reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+        raise AuditIntegrityError("application dependency exceeds its original complete document bound")
+    payload = read_private_chunk(
+        conn,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        reference=reference,
+    )
+    if len(payload) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or len(payload) != reference.byte_length:
+        raise AuditIntegrityError("application dependency changed its complete original byte bound")
     try:
-        text = read_chunk(
-            conn,
-            session_id=str(running.claim.session_id),
-            operation_id=running.claim.operation_id,
-            key=f"value:{reference.codec}:{reference.digest}",
-        ).decode("utf-8", errors="strict")
+        text = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise AuditIntegrityError("application storage is not strict UTF-8") from error
     verify_private_chunk(reference, text)
@@ -81,18 +131,22 @@ def require_p4_application_journal_on_connection(
     running: ComposerOperationRunning,
     *,
     selected: SelectedContinuationState,
-    evidence: TurnEvidenceSnapshot,
+    evidence: AdmittedTurnEvidence,
     env_ref_names: frozenset[str],
 ) -> None:
     """Re-read and recompute every retained application after current admission."""
-    entry = evidence.application_entry
+    admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
+    snapshot = admitted.snapshot
+    entry = snapshot.application_entry
     if entry is None:
-        if evidence.historical_application_count or evidence.effect_locators:
+        if snapshot.historical_application_count or snapshot.effect_locators:
             raise AuditIntegrityError("evidence omitted its actual historical application journal")
         return
-    if evidence.logical != selected.stack.logical or entry.logical != selected.stack.logical:
+    if snapshot.logical != selected.stack.logical or entry.logical != selected.stack.logical:
         raise AuditIntegrityError("application journal changed its current logical owner")
-    graph = decode_application_graph(entry.graph_json, env_ref_names=env_ref_names)
+    graph = admitted.graph
+    if graph is None:
+        raise AuditIntegrityError("application journal lost its admitted graph")
     if len(graph.cuts) != len(entry.applications):
         raise AuditIntegrityError("application journal changed its exact complete cut cohort")
     current_batch = selected.stack.frames[-1]
@@ -160,10 +214,10 @@ def require_p4_application_journal_on_connection(
         response_chunk = _private_chunk_on_connection(conn, running, record.response)
         prepared_chunk = _private_chunk_on_connection(conn, running, record.prepared_input)
         if (
-            result_chunk.canonical != record.result_json
-            or pending_chunk.canonical != record.pending_batch_json
-            or response_chunk.canonical != record.response_json
-            or prepared_chunk.canonical != record.prepared_input_json
+            result_chunk != admitted.sources.chunk(record.result)
+            or pending_chunk != admitted.sources.chunk(record.pending_batch)
+            or response_chunk != admitted.sources.chunk(record.response)
+            or prepared_chunk != admitted.sources.chunk(record.prepared_input)
         ):
             raise AuditIntegrityError("application journal changed immutable input/result bytes")
         pending = decode_p4_pending_batch_chunk(pending_chunk, env_ref_names=env_ref_names)
@@ -231,9 +285,13 @@ def require_p4_application_journal_on_connection(
             or len(old_compose) != 1
         ):
             raise AuditIntegrityError("application predecessor changed its selected frame inputs")
-        before_snapshot = decode_turn_evidence(
-            _private_chunk_on_connection(conn, running, old_compose[0].evidence), env_ref_names=env_ref_names
+        original_audit = _private_chunk_on_connection(conn, running, old_compose[0].audit_buffer)
+        before_admitted = decode_turn_evidence(
+            _private_chunk_on_connection(conn, running, old_compose[0].evidence),
+            env_ref_names=env_ref_names,
+            source_chunks=(original_audit, *admitted.sources.chunks),
         )
+        before_snapshot = before_admitted.snapshot
         cut = graph.cuts[index]
         before_graph = ApplicationGraph(cut.data, cut.effects_before, cut.recorder_before, graph.cuts[:index])
         retained_graph = (
@@ -243,10 +301,11 @@ def require_p4_application_journal_on_connection(
         )
         if (
             before_snapshot.logical != entry.logical
-            or before_snapshot.actor_user_id != evidence.actor_user_id
+            or before_snapshot.actor_user_id != snapshot.actor_user_id
             or retained_graph != encode_application_graph(before_graph, env_ref_names=env_ref_names)
             or before_snapshot.effects != retained_effects(cut.effects_before)
-            or before_snapshot.recorder_json != encode_recorder_snapshot(cut.recorder_before).canonical
+            or before_snapshot.recorder != old_compose[0].audit_buffer
+            or before_admitted.recorder_chunk != encode_recorder_snapshot(cut.recorder_before)
         ):
             raise AuditIntegrityError("application journal changed its actual retained before graph")
         frontier = tuple(item for item in selected.stack.effect_frontier if item.effect_id == record.effect_key)
@@ -255,7 +314,7 @@ def require_p4_application_journal_on_connection(
         producer = P4EffectProducerData(
             effect.creator_sequence, effect.creator_generation, creator.session_operation_id, creator.session_operation_epoch
         )
-        require_portable_p4_application(entry, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
+        require_admitted_p4_application(admitted, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)
 
 
 def apply_p4_application_on_connection(
@@ -290,7 +349,8 @@ def apply_p4_application_on_connection(
         or _private_chunk_on_connection(conn, running, batch.accumulator) != expected_pending_batch_chunk
     ):
         raise AuditIntegrityError("P4 application changed its expected complete selected evidence/batch")
-    require_p4_application_journal_on_connection(conn, running, selected=selected, evidence=checked.snapshot, env_ref_names=inventory.names)
+    # The actual owed reader above owns this same-connection journal proof.
+    # No intervening write or caller-supplied admission flag is involved.
     response = _private_chunk_on_connection(conn, running, batch.response)
     producer = P4EffectProducerData(
         checked.creator_sequence, checked.creator_generation, checked.creator_operation_id, checked.creator_operation_epoch
@@ -307,7 +367,7 @@ def apply_p4_application_on_connection(
         producer=producer,
         env_ref_names=inventory.names,
     )
-    current_state_id = bundle.evidence_after.effects.latest_committed_state_id
+    current_state_id = bundle.evidence_after.snapshot.effects.latest_committed_state_id
     if not checked.result.outcome.unwind_audit_failed and current_state_id != checked.result.outcome.current_state_id:
         raise AuditIntegrityError("P4 application changed its actual persisted state frontier")
     if effect_key in batch.settled_effect_ids:
@@ -322,15 +382,7 @@ def apply_p4_application_on_connection(
     )
     sid, operation_id = str(running.claim.session_id), running.claim.operation_id
     retained = [bundle.evidence_chunk, bundle.batch_chunk, bundle.audit_chunk, bundle.state_chunk]
-    for record in bundle.entry.applications:
-        retained.extend(
-            (
-                PrivateChunk(record.response, record.response_json),
-                PrivateChunk(record.pending_batch, record.pending_batch_json),
-                PrivateChunk(record.prepared_input, record.prepared_input_json),
-                PrivateChunk(record.result, record.result_json),
-            )
-        )
+    retained.extend(bundle.evidence_after.sources.chunks)
     for chunk in retained:
         verify_private_chunk(chunk.reference, chunk.canonical)
         put_chunk(

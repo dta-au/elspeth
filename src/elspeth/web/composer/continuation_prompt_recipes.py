@@ -10,6 +10,8 @@ from elspeth.web.composer.continuation_message_family_recipes import (
     FailureSchemaMessageRecipe,
     NativeThinkingMessageRecipe,
     ToolCallArgumentsMessageRecipe,
+    ToolFeedbackMessageRecipe,
+    ToolResultMessageRecipe,
 )
 
 
@@ -44,6 +46,8 @@ ContinuationMessageRecipe = Annotated[
     | NativeThinkingMessageRecipe
     | ToolCallArgumentsMessageRecipe
     | FailureSchemaMessageRecipe
-    | AttachmentResultMessageRecipe,
+    | AttachmentResultMessageRecipe
+    | ToolResultMessageRecipe
+    | ToolFeedbackMessageRecipe,
     Field(discriminator="kind"),
 ]

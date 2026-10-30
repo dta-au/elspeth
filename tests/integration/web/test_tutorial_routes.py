@@ -32,11 +32,11 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.preferences.routes import create_preferences_router
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import wire_test_pipeline_user_authority
+from tests.helpers.composition_state import composition_state_data
 from tests.integration.web.conftest import (
     _ensure_released_session_operation_fence,
     _make_session,
@@ -117,7 +117,7 @@ def _seed_session_with_state(app: FastAPI) -> UUID:
         _save_composition_state_with_compose_authority(
             app.state.session_service,
             session_id,
-            CompositionStateData(),
+            composition_state_data(),
             provenance="session_seed",
         )
     )
@@ -333,7 +333,7 @@ def test_post_cancel_with_active_run_cancels_via_run_cancel_machinery(tmp_path: 
         _save_composition_state_with_compose_authority(
             app.state.session_service,
             session_id,
-            CompositionStateData(),
+            composition_state_data(),
             provenance="session_seed",
         )
     )

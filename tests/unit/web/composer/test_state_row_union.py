@@ -711,8 +711,8 @@ class TestCompositionStateRowUnion:
         assert not any(error.error_code == "row_union_schema_incompatible" for error in result.errors), result.errors
 
     def test_row_union_flexible_shared_type_conflict_carries_repair_facts(self) -> None:
-        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
         from elspeth.web.composer.tools import ToolResult
+        from elspeth.web.composer.tools.generation import build_validation_guidance
 
         state = self._state()
         nodes = tuple(
@@ -763,14 +763,13 @@ class TestCompositionStateRowUnion:
             validation=result,
             affected_nodes=(),
         )
-        projected = next(
-            error
-            for error in _allowlisted_candidate_feedback(tool_result)["validation"]["errors"]
-            if error["error_code"] == "row_union_schema_incompatible"
+        wire_entry = next(
+            error for error in tool_result.to_dict()["validation"]["errors"] if error["error_code"] == "row_union_schema_incompatible"
         )
-        assert "message" not in projected
-        assert projected["row_union_schema"] == detail.to_dict()
-        assert projected["suggested_fix"]
+        assert wire_entry["row_union_schema"] == detail.to_dict()
+        guidance = build_validation_guidance(["row_union_schema_incompatible"])
+        assert guidance is not None
+        assert guidance["codes"]["row_union_schema_incompatible"]["suggested_fix"]
 
     def _coalesce(self, **overrides: Any) -> NodeSpec:
         defaults: dict[str, Any] = {

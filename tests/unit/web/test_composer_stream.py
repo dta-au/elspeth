@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.types import Message
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamCapacityError, ComposerStreamPermits
 
 
@@ -279,6 +280,44 @@ async def test_writable_stream_closes_after_bounded_io_failure(failure_phase: st
         {"type": "http.response.start", "status": 200, "headers": messages[0]["headers"]},
         {"type": "http.response.body", "body": b"", "more_body": False},
     ]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert permits.occupied == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["first_authorization", "later_authorization", "read"])
+async def test_audit_integrity_error_surfaces_instead_of_closing_quietly(failure_phase: str) -> None:
+    """Our own rows contradicting themselves is a Tier-1 failure: it propagates
+    whether or not the headers went out, and capacity is still released.
+    Control: catch AuditIntegrityError with the bounded I/O failures -> red."""
+    permits = ComposerStreamPermits()
+    permit = permits.acquire("op", "alice")
+    messages: list[Message] = []
+    checks = 0
+
+    async def authorize() -> bool:
+        nonlocal checks
+        checks += 1
+        if (failure_phase == "first_authorization" and checks == 1) or (failure_phase == "later_authorization" and checks > 1):
+            raise AuditIntegrityError("synthetic contradictory operation row")
+        return True
+
+    async def frames():
+        if failure_phase == "read":
+            raise AuditIntegrityError("synthetic contradictory operation row")
+        yield b"data: progress\n\n"
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    response = BoundedComposerStreamResponse(frames=frames(), authorize=authorize, permits=permits, permit=permit)
+    with pytest.raises(AuditIntegrityError, match="synthetic contradictory operation row"):
+        await response({}, receive, send)
+    assert not [message for message in messages if message["type"] == "http.response.body" and message["body"]]
     for _ in range(5):
         await asyncio.sleep(0)
     assert permits.occupied == 0

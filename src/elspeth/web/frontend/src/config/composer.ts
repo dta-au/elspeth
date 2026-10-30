@@ -14,5 +14,5 @@ export const COMPOSE_TIMEOUT_ABORT_REASON = "compose_timeout";
 export const COMPOSE_USER_CANCEL_ABORT_REASON = "compose_user_cancel";
 
 export function isComposePermanentRefusal(code: string | undefined): boolean {
-  return ["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch"].includes(code ?? "");
+  return ["policy_blocked", "admission_refused", "token_accounting_unavailable", "composer_operation_conflict", "recompose_user_message_mismatch", "context_unsupported"].includes(code ?? "");
 }

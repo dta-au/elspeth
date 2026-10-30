@@ -127,7 +127,7 @@ class VisibleToolEvent:
                 continue
             if type(value) is not str:
                 raise AuditIntegrityError("Visible tool evidence requires exact serialized strings")
-            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+            if tool_name == "set_pipeline":
                 value, gap = _inline_custody_safe_text(value)
                 if gap is not None:
                     content[name] = None
@@ -135,7 +135,7 @@ class VisibleToolEvent:
                     continue
                 assert value is not None
             redacted = _redact_sensitive_content(value)
-            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+            if tool_name == "set_pipeline":
                 projected_redacted, gap = _inline_custody_safe_text(redacted)
                 if gap is not None:
                     content[name] = None
@@ -298,7 +298,7 @@ class VisibleToolEvent:
                 gap.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise AuditIntegrityError("Visible tool event stored payload contains text that is not valid UTF-8") from exc
-        if result.tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+        if result.tool_name == "set_pipeline":
             for name in ("received_arguments", "effective_arguments", "selected_result"):
                 original = payload[name]
                 if original is not None:

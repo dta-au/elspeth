@@ -331,7 +331,7 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
     ),
     AuthoritySymbol(
         "src/elspeth/web/coordination/composer_operation_authority.py",
-        "ComposerAsyncOperationAuthority.request_cancel",
+        "_request_cancel_on_connection",
         "ComposerAsyncOperationAuthority",
     ),
     AuthoritySymbol(
@@ -357,6 +357,59 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
     AuthoritySymbol(
         "src/elspeth/web/coordination/composer_operation_authority.py",
         "settle_composer_operation_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_operation_authority.py",
+        "_request_continuation_cancel_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    # Rule R-G (continuation runtime design §1.8): each continuation-table write
+    # lives in one connection body here, entered from a transaction that already
+    # holds the session lock and, on the live paths, the operation fence.
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "initialize_continuation",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "put_chunk",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "append_complete_snapshot",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "recover_segment_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "settle_segment_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "yield_segment_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "start_segment_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "prepare_effect_on_connection",
+        "ComposerAsyncOperationAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/sessions/continuation.py",
+        "prepare_provider_effect_on_connection",
         "ComposerAsyncOperationAuthority",
     ),
     AuthoritySymbol(
@@ -1503,6 +1556,127 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
 _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
     # Durable output bytes are reserved and reclaimed by the fenced blob facet.
     WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.admit",
+        table="composer_async_operations",
+        operation="insert",
+        fingerprint="8e40189a9b86fb93",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=736,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.claim_segment",
+        table="<sessions-write-connection>",
+        operation="write_connection",
+        fingerprint="6cba6cd3ccd1d389",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1365,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.claim_segment",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="53d5fb30e1c41fd3",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1421,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.claim_segment",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="53d5fb30e1c41fd3",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1404,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.release_claim",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="560a30d49db67510",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1564,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.release_claim",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="560a30d49db67510",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1556,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.renew_claim",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="e596b760da221597",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1534,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="ComposerAsyncOperationAuthority.renew_claim",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="e596b760da221597",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1523,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="_request_cancel_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="917d342e8bd8a3ae",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=433,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="_request_continuation_cancel_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="2454378a45ef38be",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=391,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/composer_operation_authority.py",
+        symbol="_request_continuation_cancel_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="2454378a45ef38be",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=403,
+        connection_escape=False,
+    ),
+    WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
         symbol="_RepositoryBlobMutations.commit_blob_replacement",
         table="output_storage_reservations",
@@ -1510,7 +1684,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="eeb24b28f3f2ab1c",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2541,
+        line=2548,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
@@ -1520,7 +1694,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d723c4f6c791eec",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3541,
+        line=3548,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
@@ -1530,7 +1704,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d723c4f6c791eec",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3543,
+        line=3550,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
@@ -1540,7 +1714,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8c40ff41aedf8438",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3869,
+        line=3876,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
@@ -1550,7 +1724,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8c40ff41aedf8438",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3872,
+        line=3879,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/repository.py",
@@ -1560,7 +1734,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4cfeafb2df7dcb9d",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3877,
+        line=3884,
     ),
     WriterIdentity(
         path="src/elspeth/web/coordination/auth_session_authority.py",
@@ -1636,7 +1810,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d3d44124ea706a23",
         1,
         "SessionComposerMutationAuthority",
-        line=9607,
+        line=9609,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1646,7 +1820,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "d3d44124ea706a23",
         1,
         "SessionComposerMutationAuthority",
-        line=9618,
+        line=9620,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1656,7 +1830,304 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "31d3aae13a5ff8a2",
         1,
         "SessionComposerMutationAuthority",
-        line=9640,
+        line=9642,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/repository.py",
+        symbol="_SessionOperationAuthorityRepository._release_fence_on_connection",
+        table="session_operation_fences",
+        operation="update",
+        fingerprint="793fd5bdba50446b",
+        ordinal=1,
+        authority="SessionOperationAuthority",
+        line=6147,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/coordination/repository.py",
+        symbol="_SessionOperationAuthorityRepository.release",
+        table="session_read_admissions",
+        operation="delete",
+        fingerprint="fb7cf6997d5efd5a",
+        ordinal=1,
+        authority="SessionOperationAuthority",
+        line=6129,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="append_complete_snapshot",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="00e16ce60fb20687",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=434,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="append_complete_snapshot",
+        table="composer_continuation_checkpoints",
+        operation="insert",
+        fingerprint="544e161c8ff207ad",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=422,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="append_complete_snapshot",
+        table="composer_continuation_events",
+        operation="insert",
+        fingerprint="72f095a882df2cb1",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=407,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="initialize_continuation",
+        table="composer_continuation_checkpoints",
+        operation="insert",
+        fingerprint="f2b0e26d7041d784",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=230,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="initialize_continuation",
+        table="composer_operation_segments",
+        operation="insert",
+        fingerprint="9402e5664a88d08a",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=242,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="prepare_effect_on_connection",
+        table="composer_continuation_effects",
+        operation="insert",
+        fingerprint="420a8e1f98e71f3e",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1714,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="prepare_effect_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="2f7d0ae355d393a3",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1732,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="prepare_provider_effect_on_connection",
+        table="composer_continuation_provider_ordinals",
+        operation="insert",
+        fingerprint="94de14cd6a4b5e49",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1832,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="prepare_provider_effect_on_connection",
+        table="composer_continuation_provider_ordinals",
+        operation="update",
+        fingerprint="94de14cd6a4b5e49",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1835,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="prepare_provider_effect_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="b8e28b118ebd7b5a",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1851,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="put_chunk",
+        table="composer_continuation_chunks",
+        operation="insert",
+        fingerprint="923b916c65e23647",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=299,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="recover_segment_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="a2306afccff66f9a",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=664,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="recover_segment_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="31af60147cb2f651",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=641,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="recover_segment_on_connection",
+        table="composer_segment_attempts",
+        operation="update",
+        fingerprint="68a3d2fc7bf07178",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=626,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="settle_segment_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="8c5f935640b18df0",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=796,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="settle_segment_on_connection",
+        table="composer_continuation_effects",
+        operation="update",
+        fingerprint="c5e45d4264c1b92d",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=755,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="settle_segment_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="fea974291e427f12",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=783,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="settle_segment_on_connection",
+        table="composer_segment_attempts",
+        operation="update",
+        fingerprint="f1b3421bc6b67df0",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=768,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="start_segment_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="40fc0a621127d843",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1389,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="start_segment_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="18f948cf7bcf3000",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1346,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="start_segment_on_connection",
+        table="composer_segment_attempts",
+        operation="insert",
+        fingerprint="7d1bd9f344317912",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1374,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="yield_segment_on_connection",
+        table="composer_async_operations",
+        operation="update",
+        fingerprint="066d765061637a37",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=1008,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="yield_segment_on_connection",
+        table="composer_operation_segments",
+        operation="insert",
+        fingerprint="ec732c6ff9d5d224",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=991,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="yield_segment_on_connection",
+        table="composer_operation_segments",
+        operation="update",
+        fingerprint="241346377b01d814",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=965,
+        connection_escape=False,
+    ),
+    WriterIdentity(
+        path="src/elspeth/web/sessions/continuation.py",
+        symbol="yield_segment_on_connection",
+        table="composer_segment_attempts",
+        operation="update",
+        fingerprint="9ab4469f80ca5c14",
+        ordinal=1,
+        authority="ComposerAsyncOperationAuthority",
+        line=948,
+        connection_escape=False,
     ),
     WriterIdentity(
         path="src/elspeth/web/sessions/service.py",
@@ -1666,7 +2137,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="15bc250bcfdb1eee",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=652,
+        line=653,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1677,7 +2148,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="bee8d1dcc17badb4",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=4283,
+        line=4285,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1688,7 +2159,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="bee8d1dcc17badb4",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=4294,
+        line=4296,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1699,7 +2170,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ebfdb28c357d5286",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=4547,
+        line=4549,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -1996,18 +2467,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="45786d5be9653eac",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1677,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/composer_operation_authority.py",
-        symbol="ComposerAsyncOperationAuthority.admit",
-        table="composer_async_operations",
-        operation="insert",
-        fingerprint="89ce6d0de8e34aff",
-        ordinal=1,
-        authority="ComposerAsyncOperationAuthority",
-        line=615,
+        line=1832,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2018,7 +2478,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d8984d4640ff2836",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1327,
+        line=1452,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2029,40 +2489,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="9652339aee7fd423",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1364,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/composer_operation_authority.py",
-        symbol="ComposerAsyncOperationAuthority.release_claim",
-        table="composer_async_operations",
-        operation="update",
-        fingerprint="a877c067c7fb9b34",
-        ordinal=1,
-        authority="ComposerAsyncOperationAuthority",
-        line=1417,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/composer_operation_authority.py",
-        symbol="ComposerAsyncOperationAuthority.renew_claim",
-        table="composer_async_operations",
-        operation="update",
-        fingerprint="fa1b54bc87c1e912",
-        ordinal=1,
-        authority="ComposerAsyncOperationAuthority",
-        line=1396,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/composer_operation_authority.py",
-        symbol="ComposerAsyncOperationAuthority.request_cancel",
-        table="composer_async_operations",
-        operation="update",
-        fingerprint="f46c53eaff5fb60a",
-        ordinal=1,
-        authority="ComposerAsyncOperationAuthority",
-        line=1443,
+        line=1489,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2073,7 +2500,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4896373fe8a61618",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1499,
+        line=1654,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2084,7 +2511,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2cea0ab45c22d2ef",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1985,
+        line=2140,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2095,7 +2522,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b503d2bcd2964b30",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=2025,
+        line=2193,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -2106,7 +2533,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="434ff299521e74c7",
         ordinal=1,
         authority="ComposerAsyncOperationAuthority",
-        line=1746,
+        line=1901,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3272,7 +3699,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b3fcd50e04854888",
         ordinal=1,
         authority="SessionForkChildMutations",
-        line=4260,
+        line=4268,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3283,7 +3710,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="a20e7856361bd56b",
         ordinal=1,
         authority="SessionForkChildMutations",
-        line=4207,
+        line=4215,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3294,7 +3721,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="93116a46895f86ed",
         ordinal=1,
         authority="SessionForkParentReceiptMutations",
-        line=4389,
+        line=4397,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3305,7 +3732,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d8e2ea36cf4bd35c",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3681,
+        line=3688,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3316,7 +3743,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8c66fbb679cf7fa3",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3225,
+        line=3232,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3327,7 +3754,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4f9e61b1cf7247b0",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3580,
+        line=3587,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3338,7 +3765,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="75415f0d12b7a661",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2600,
+        line=2607,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3349,7 +3776,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="32bd4fca1428b085",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3493,
+        line=3500,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3360,7 +3787,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="87f41b9adb5c8772",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3500,
+        line=3507,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3371,7 +3798,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2ecd759927d60392",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2506,
+        line=2513,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3382,7 +3809,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d2ea73ee0e8472e4",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2514,
+        line=2521,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3393,7 +3820,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="0e357be387ddc260",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2927,
+        line=2934,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3404,7 +3831,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d2eb84d546dbcdd2",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2703,
+        line=2710,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3415,7 +3842,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4c42110eaa7c5994",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=4049,
+        line=4056,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3426,7 +3853,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="05fd90838bf9a030",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3605,
+        line=3612,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3437,7 +3864,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="afe03ed89b5a16c7",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3452,
+        line=3459,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3448,7 +3875,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3fd8ace829dbb08b",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2898,
+        line=2905,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3459,7 +3886,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="6128417bd9a69f02",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2447,
+        line=2454,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3470,7 +3897,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="f7b3307ef1e90c89",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3966,
+        line=3973,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3481,7 +3908,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="a2e525368ada9268",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3938,
+        line=3945,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3492,7 +3919,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="850298970c19565f",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3302,
+        line=3309,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3503,7 +3930,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="bca2ee74a8a93022",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2384,
+        line=2391,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3514,7 +3941,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d112eae374c9b904",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2820,
+        line=2827,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3525,7 +3952,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d4eba14bc84728e8",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2773,
+        line=2780,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3536,7 +3963,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c997a216a1a51351",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2619,
+        line=2626,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3547,7 +3974,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d22b3792b721f8ac",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2994,
+        line=3001,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3558,7 +3985,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2f1a2d64948bf4b7",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3403,
+        line=3410,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3569,7 +3996,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4f9e61b1cf7247b0",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=3562,
+        line=3569,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3580,7 +4007,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="75415f0d12b7a661",
         ordinal=1,
         authority="SessionBlobMutationAuthority",
-        line=2580,
+        line=2587,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3591,7 +4018,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b0eb63d6e0d9027b",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=6332,
+        line=6392,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3602,7 +4029,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2e42be4b632cb581",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=6356,
+        line=6416,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3613,7 +4040,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ac69541fd42b27b5",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=906,
+        line=912,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3621,10 +4048,10 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         symbol="_RepositoryInterpretationMutations._create_pending",
         table="composition_states",
         operation="insert",
-        fingerprint="4df0393d948ef9d7",
+        fingerprint="c19b288534d6d28f",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1361,
+        line=1368,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3635,7 +4062,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="0a4fa2d4c69e1069",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1282,
+        line=1288,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3646,7 +4073,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="146bbcd39bedce3b",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1310,
+        line=1316,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3657,7 +4084,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b62dec99662793d2",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1205,
+        line=1211,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3668,7 +4095,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="9cb6f5b7f0c9310b",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1496,
+        line=1503,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3679,7 +4106,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b12fb9db66a3bddd",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1437,
+        line=1444,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3690,7 +4117,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3966641511f4795d",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1465,
+        line=1472,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3701,7 +4128,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="569666d773a0b112",
         ordinal=1,
         authority="SessionInterpretationAuthority",
-        line=1554,
+        line=1561,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3712,7 +4139,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="5009526a773c2d16",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1976,
+        line=1983,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3723,7 +4150,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ab417310ef40b484",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1755,
+        line=1762,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3734,7 +4161,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="46b7dd19a3e250fc",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1677,
+        line=1684,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3745,7 +4172,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="6e3fcabf86bb6ffa",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1660,
+        line=1667,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3756,7 +4183,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="46b7dd19a3e250fc",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1681,
+        line=1688,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3767,7 +4194,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="1822dba79eb9ed3d",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1798,
+        line=1805,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3778,7 +4205,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="6613984de3a26bff",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1817,
+        line=1824,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3789,7 +4216,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="911ff034cb757589",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1782,
+        line=1789,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3800,7 +4227,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="f926157e24accee8",
         ordinal=1,
         authority="SessionRunMutationAuthority",
-        line=1877,
+        line=1884,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3811,7 +4238,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="2aec308084effcf4",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=851,
+        line=856,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3822,7 +4249,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="44e58336446946af",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=685,
+        line=690,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3833,7 +4260,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="e0386cbdb277f0b0",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=720,
+        line=725,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3844,7 +4271,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="016ef4c50b5e5390",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=659,
+        line=664,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3855,7 +4282,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="feed562da5394634",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=754,
+        line=759,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3866,7 +4293,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8cf4bc5cc87457bd",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5328,
+        line=5373,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3877,7 +4304,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="8cf4bc5cc87457bd",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5336,
+        line=5381,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3888,7 +4315,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="4ad5425d08f127f8",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=4985,
+        line=4993,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3899,7 +4326,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="ff923dcba8b3e8e7",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5454,
+        line=5499,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3910,7 +4337,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d5ab9aa3497d191a",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5861,
+        line=5913,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3921,7 +4348,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="7326f9c03db2a1c7",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5875,
+        line=5927,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3932,7 +4359,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b964b22650d92b97",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5846,
+        line=5898,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3943,7 +4370,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="988ac755147ef9bc",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5936,
+        line=5988,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3954,7 +4381,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="66cc108182d86009",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=6112,
+        line=6172,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3965,7 +4392,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d19f2b10e4f6a34",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=4849,
+        line=4857,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3976,7 +4403,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d19f2b10e4f6a34",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=4863,
+        line=4871,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3987,7 +4414,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="3d19f2b10e4f6a34",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=4839,
+        line=4847,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -3998,29 +4425,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="7b84539400c1c53a",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5982,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/repository.py",
-        symbol="_SessionOperationAuthorityRepository.release",
-        table="session_operation_fences",
-        operation="update",
-        fingerprint="bafc06df8fd8905b",
-        ordinal=1,
-        authority="SessionOperationAuthority",
-        line=6087,
-        connection_escape=False,
-    ),
-    WriterIdentity(
-        path="src/elspeth/web/coordination/repository.py",
-        symbol="_SessionOperationAuthorityRepository.release",
-        table="session_read_admissions",
-        operation="delete",
-        fingerprint="bafc06df8fd8905b",
-        ordinal=1,
-        authority="SessionOperationAuthority",
-        line=6077,
+        line=6034,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4031,7 +4436,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d41bbaef242667cd",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5533,
+        line=5585,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4042,7 +4447,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d41bbaef242667cd",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5520,
+        line=5572,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4053,7 +4458,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="b268c9591db479c5",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=5637,
+        line=5689,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4691,7 +5096,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="53042278a36c4c3d",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1602,
+        line=1603,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4702,7 +5107,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="cead0bcc3bfd62ba",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1803,
+        line=1805,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4713,7 +5118,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="7bca5022ef616220",
         ordinal=1,
         authority="SessionMutationAuthority",
-        line=1639,
+        line=1640,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4724,7 +5129,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="abd3e4a95b9c72ed",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=8469,
+        line=8471,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4735,7 +5140,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="abd3e4a95b9c72ed",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=8458,
+        line=8460,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4746,7 +5151,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9182,
+        line=9184,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4757,7 +5162,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=2,
         authority="SessionForkAuthority",
-        line=9213,
+        line=9215,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4768,7 +5173,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9193,
+        line=9195,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4779,7 +5184,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="c459564fff2f29ce",
         ordinal=1,
         authority="SessionForkAuthority",
-        line=9225,
+        line=9227,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4790,7 +5195,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d5680f947ebd5f95",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=3363,
+        line=3365,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4801,7 +5206,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         fingerprint="d5680f947ebd5f95",
         ordinal=1,
         authority="SessionComposerMutationAuthority",
-        line=3378,
+        line=3380,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -4953,7 +5358,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4bb364b6aaae806f",
         1,
         None,
-        line=6962,
+        line=6964,
     ),
     # Graph-recovery reads currently reach the continuation COMPOSE guard.
     # Their connection flows are refused by the containment proof, so no
@@ -5142,7 +5547,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="a7fbf8af54359567",
         ordinal=1,
         authority=None,
-        line=1552,
+        line=1707,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5153,7 +5558,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="372fadb1c4791e25",
         ordinal=1,
         authority=None,
-        line=688,
+        line=813,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5164,7 +5569,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="c73e6b7d09fec744",
         ordinal=1,
         authority=None,
-        line=681,
+        line=806,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5175,7 +5580,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="30e1fb504b7db733",
         ordinal=1,
         authority=None,
-        line=1510,
+        line=1665,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5186,7 +5591,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="e3a126d406e651fd",
         ordinal=1,
         authority=None,
-        line=1527,
+        line=1682,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5461,7 +5866,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="f98bc6d74193a045",
         ordinal=1,
         authority="SessionOperationAuthority",
-        line=4894,
+        line=4902,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5637,7 +6042,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="c514e5bde4f595c7",
         ordinal=1,
         authority=None,
-        line=7913,
+        line=7915,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5648,7 +6053,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="3a0d4f58a95545b6",
         ordinal=1,
         authority=None,
-        line=9298,
+        line=9300,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5659,7 +6064,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="397c36aee21eb535",
         ordinal=1,
         authority=None,
-        line=6574,
+        line=6576,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5670,7 +6075,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="e2674828bb9717c7",
         ordinal=1,
         authority=None,
-        line=8313,
+        line=8315,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5681,7 +6086,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="23b76e499150501f",
         ordinal=1,
         authority=None,
-        line=3281,
+        line=3283,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5692,7 +6097,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="447fd94563656d10",
         ordinal=1,
         authority=None,
-        line=7309,
+        line=7311,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5703,7 +6108,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="461d8ee922fa0a3b",
         ordinal=1,
         authority=None,
-        line=6532,
+        line=6534,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5714,7 +6119,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="ca8f655fc0ca3318",
         ordinal=1,
         authority=None,
-        line=1309,
+        line=1310,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5725,7 +6130,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="e55c3bb74cb8ef7c",
         ordinal=1,
         authority=None,
-        line=4756,
+        line=4758,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5736,7 +6141,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="5bc478ef3c0f3159",
         ordinal=1,
         authority=None,
-        line=8154,
+        line=8156,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5747,7 +6152,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="060f65def285276f",
         ordinal=1,
         authority=None,
-        line=8123,
+        line=8125,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5758,7 +6163,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="3082b284dcdde398",
         ordinal=1,
         authority=None,
-        line=2756,
+        line=2758,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5769,7 +6174,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="d6a0fbd187f898c4",
         ordinal=1,
         authority=None,
-        line=2746,
+        line=2748,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5780,7 +6185,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="e24adb8cb182f817",
         ordinal=1,
         authority=None,
-        line=8337,
+        line=8339,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5791,7 +6196,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="79cbcb06fa877308",
         ordinal=1,
         authority=None,
-        line=10444,
+        line=10446,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5802,7 +6207,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="227880bc8eb4fb5a",
         ordinal=1,
         authority=None,
-        line=7334,
+        line=7336,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5813,7 +6218,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="18a44c2f30b08436",
         ordinal=1,
         authority=None,
-        line=6672,
+        line=6674,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5824,7 +6229,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="fd1953dc5c4daaaa",
         ordinal=1,
         authority=None,
-        line=10467,
+        line=10469,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5835,7 +6240,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="68b7373dab65abcf",
         ordinal=1,
         authority=None,
-        line=5933,
+        line=5935,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5846,7 +6251,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="af0aa9fb126f5b07",
         ordinal=1,
         authority=None,
-        line=8651,
+        line=8653,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5857,7 +6262,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="7017fa5ec317a4b4",
         ordinal=1,
         authority=None,
-        line=5250,
+        line=5252,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5868,7 +6273,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="3d5bacc9c0cc086c",
         ordinal=1,
         authority=None,
-        line=8218,
+        line=8220,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5879,7 +6284,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="0b7e7759f27b0141",
         ordinal=1,
         authority=None,
-        line=8169,
+        line=8171,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -5890,7 +6295,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="f21d3063ecae59cf",
         ordinal=1,
         authority=None,
-        line=2891,
+        line=2893,
         connection_escape=False,
     ),
     WriterIdentity(
@@ -6701,7 +7106,7 @@ _IDENTITY_LIFECYCLE_REGISTRY_SHA256 = "67f72b7de915319ba67966d764851268b122c9bde
 # a scalar decision only. Changing either source withdraws this grant.
 # These pins require semantic review and adversarial runtime controls;
 # computing a new hash alone does not review a changed transfer.
-_COMPOSER_QUOTA_CALLER_SHA256 = "5a1a0c3cbed464e490b61a8294aecbe295dbe32d902f31bdd41d296969a755da"
+_COMPOSER_QUOTA_CALLER_SHA256 = "b102aa8521d4b86b45cf6cb16414c78c59f43926c88af16de4ae2acc8fba1f81"
 _COMPOSER_QUOTA_MODULE_SHA256 = "6765f0f780f171b1acadc2122e93515eea7aac150e2d79c247a67d1fa11ecfa3"
 _STORAGE_READ_HOP_FINGERPRINT = "2a7323eaf645d96a"
 # Session settings a probe may set on its own connection (P4-D6 family K):
@@ -21951,12 +22356,13 @@ def test_composer_async_operation_writers_are_exact_typed_boundaries(
         "ComposerAsyncOperationAuthority.claim_segment": "update",
         "ComposerAsyncOperationAuthority.renew_claim": "update",
         "ComposerAsyncOperationAuthority.release_claim": "update",
-        "ComposerAsyncOperationAuthority.request_cancel": "update",
+        "_request_cancel_on_connection": "update",
         "ComposerAsyncOperationAuthority.settle_unstarted": "update",
         "ComposerAsyncOperationAuthority._settle_recovery": "update",
         "start_composer_operation_on_connection": "update",
         "bind_composer_operation_user_message_on_connection": "update",
         "settle_composer_operation_on_connection": "update",
+        "_request_continuation_cancel_on_connection": "update",
     }
     assert {(site.symbol, site.operation) for site in dml} == set(expected.items())
     assert len(dml) == len(expected)
@@ -21989,3 +22395,51 @@ def test_composer_async_operation_writers_are_exact_typed_boundaries(
     assert all(site.authority is None for site in segment_refused)
     assert authority_policy_violations(segment_writers, _TABLE_POLICIES) == (segment_writers, [])
     assert connection_authority_violations(segment_connections) == segment_connections
+
+    cancel_marker = "def _request_cancel_on_connection("
+    assert source_text.count(cancel_marker) == 1
+    source.write_text(source_text.replace(cancel_marker, "def _request_cancel_on_connection_replacement(", 1))
+    cancel_renamed = scan_production_writers([source], anchor=tmp_path)
+    cancel_refused = [site for site in cancel_renamed if site.symbol == "_request_cancel_on_connection_replacement"]
+    assert len(cancel_refused) == 1 and cancel_refused[0].authority is None
+    assert authority_policy_violations(cancel_refused, _TABLE_POLICIES) == (cancel_refused, [])
+
+
+def test_continuation_connection_bodies_are_exact_composer_authority_writers(tmp_path: Path) -> None:
+    """Rule R-G: every continuation-table write is a bound body in sessions/continuation.py."""
+    root = _repo_root()
+    path = "src/elspeth/web/sessions/continuation.py"
+    live = scan_production_writers([root / path], anchor=root)
+    assert {site.symbol for site in live} == {
+        "initialize_continuation",
+        "put_chunk",
+        "append_complete_snapshot",
+        "recover_segment_on_connection",
+        "settle_segment_on_connection",
+        "yield_segment_on_connection",
+        "start_segment_on_connection",
+        "prepare_effect_on_connection",
+        "prepare_provider_effect_on_connection",
+    }
+    assert all(site.authority == "ComposerAsyncOperationAuthority" and not site.connection_escape for site in live)
+    assert authority_policy_violations(live, _TABLE_POLICIES) == ([], [])
+    assert connection_authority_violations(live) == []
+    reviewed = [site for site in _REVIEWED_WRITERS if site.path == path]
+    assert inventory_drift(live, reviewed) == ([], [])
+
+    source_text = (root / path).read_text(encoding="utf-8")
+    marker = "def yield_segment_on_connection("
+    assert source_text.count(marker) == 1
+    source = tmp_path / path
+    source.parent.mkdir(parents=True)
+    source.write_text(source_text.replace(marker, "def yield_segment_on_connection_replacement(", 1), encoding="utf-8")
+    renamed = scan_production_writers([source], anchor=tmp_path)
+    refused = [site for site in renamed if site.symbol == "yield_segment_on_connection_replacement"]
+    assert {(site.table, site.operation) for site in refused} == {
+        ("composer_segment_attempts", "update"),
+        ("composer_operation_segments", "update"),
+        ("composer_operation_segments", "insert"),
+        ("composer_async_operations", "update"),
+    }
+    assert all(site.authority is None for site in refused)
+    assert authority_policy_violations(refused, _TABLE_POLICIES) == (refused, [])

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_THINKING_PARTS_KEY,
     PromptGuardContentPart,
@@ -19,15 +20,14 @@ _INSPECTION_UNIT_CHARACTERS = 8_000
 _INSPECTION_OVERLAP_CHARACTERS = 1_000
 
 
-def parse_native_thinking_blocks(value: object) -> list[dict[str, str]]:
-    """Parse the closed native shape without imposing diagnostic JSON limits.
+def validate_native_thinking_blocks(value: object) -> None:
+    """Validate the complete closed native grammar without copying its blocks.
 
     Provider thinking has no documented per-field character ceiling. Its
     grammar has fixed depth, so it needs no generic recursive artifact walk.
     """
     if type(value) not in (list, tuple):
         raise ComposerAdmissionRefused("Provider thinking state is not a complete native block list.")
-    result: list[dict[str, str]] = []
     for block in cast(list[object] | tuple[object, ...], value):
         if not isinstance(block, Mapping):
             raise ComposerAdmissionRefused("Provider thinking state contains an invalid block.")
@@ -41,28 +41,41 @@ def parse_native_thinking_blocks(value: object) -> list[dict[str, str]]:
             raise ComposerAdmissionRefused("Provider thinking state has incomplete native fields.")
         try:
             for key in fields:
-                block[key].encode("utf-8")
+                utf8_size(block[key])
         except UnicodeEncodeError:
             raise ComposerAdmissionRefused("Provider thinking state contains invalid UTF-8 text.") from None
         opaque_key = "signature" if block["type"] == "thinking" else "data"
         if not block[opaque_key]:
             raise ComposerAdmissionRefused("Provider thinking state is missing its opaque replay data.")
-        result.append({key: cast(str, block[key]) for key in block})
-    return result
 
 
-def native_thinking_blocks(value: object) -> list[dict[str, str]]:
-    """Admit complete blocks and credential-scan each complete native field."""
-    blocks = parse_native_thinking_blocks(value)
-    for block in blocks:
+def parse_native_thinking_blocks(value: object) -> list[dict[str, str]]:
+    """Materialize the existing detached native wire after grammar admission."""
+    validate_native_thinking_blocks(value)
+    return [{key: block[key] for key in block} for block in cast(Sequence[Mapping[str, str]], value)]
+
+
+def scan_native_thinking_blocks(value: object) -> None:
+    """Preserve complete grammar/credential admission before request copying."""
+    validate_native_thinking_blocks(value)
+    for block in cast(Sequence[Mapping[str, str]], value):
+        # Grammar admission fixes each block to two or three string fields.
+        # Preserve the detector's exact-dict boundary for accepted Mapping
+        # implementations without cloning the complete native block list.
+        current = {key: block[key] for key in block}
         # The schema is already closed. Scan complete strings, including token
         # and URL seams, with the same detector rather than a local size cap.
         require_no_credential_material(
-            block,
+            current,
             surface="composer_provider_thinking",
-            max_string_bytes=max(len(text.encode("utf-8")) for text in block.values()),
+            max_string_bytes=max(utf8_size(text) for text in current.values()),
         )
-    return blocks
+
+
+def native_thinking_blocks(value: object) -> list[dict[str, str]]:
+    """Admit and detach complete native blocks under the existing policy."""
+    scan_native_thinking_blocks(value)
+    return parse_native_thinking_blocks(value)
 
 
 def attach_provider_thinking(message: dict[str, Any], value: object) -> dict[str, Any]:

@@ -11,6 +11,7 @@ from elspeth.web.composer.continuation_p4_state_payload import decode_p4_state_p
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError
+from tests.helpers.composition_state import composition_state_data
 
 
 def actual_payload():
@@ -63,7 +64,7 @@ def test_complete_actual_payload_preserves_frozen_values_and_sql_lineage():
 
 
 def test_nullable_sql_columns_remain_distinct_from_empty_containers():
-    absent = StatePayload(CompositionStateData())
+    absent = StatePayload(composition_state_data())
     empty = StatePayload(
         CompositionStateData(sources={}, nodes=(), edges=(), outputs=(), metadata_={}, validation_errors=(), composer_meta={})
     )
@@ -77,7 +78,7 @@ def test_nullable_sql_columns_remain_distinct_from_empty_containers():
 
 def test_legacy_source_constructor_alias_is_retained_as_actual_owned_sources():
     payload = StatePayload(
-        CompositionStateData(
+        composition_state_data(
             source={"plugin": "csv", "options": {"path": "rows.csv"}, "on_success": "rows", "on_validation_failure": "discard"}
         )
     )
@@ -87,12 +88,22 @@ def test_legacy_source_constructor_alias_is_retained_as_actual_owned_sources():
     assert json.loads(encoded)["data"]["sources"] == {"source": dict(payload.data.sources["source"])}
 
 
-@pytest.mark.parametrize("member", ["sources", "nodes", "edges", "outputs", "metadata_", "validation_errors", "composer_meta", "is_valid"])
+@pytest.mark.parametrize("member", ["sources", "nodes", "edges", "outputs", "validation_errors", "composer_meta", "is_valid"])
 def test_missing_defaulted_owned_field_cannot_silently_normalize(member):
     encoded = encode_p4_state_payload(actual_payload(), env_ref_names=frozenset({"DB_URL"}))
     value = json.loads(encoded)
     del value["data"][member]
     with pytest.raises(AuditIntegrityError, match="lost or normalized"):
+        decode_p4_state_payload(canonical_json(value), env_ref_names=frozenset({"DB_URL"}))
+
+
+def test_missing_required_metadata_is_refused_by_the_owned_contract():
+    # Pipeline metadata is required on every stored state, so a payload that
+    # lost it fails the owned model itself rather than normalizing to a default.
+    encoded = encode_p4_state_payload(actual_payload(), env_ref_names=frozenset({"DB_URL"}))
+    value = json.loads(encoded)
+    del value["data"]["metadata_"]
+    with pytest.raises(AuditIntegrityError, match="violates its owned contract"):
         decode_p4_state_payload(canonical_json(value), env_ref_names=frozenset({"DB_URL"}))
 
 

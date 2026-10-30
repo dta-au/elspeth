@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
+from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.credential_material import CredentialTraversalPolicy
 from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web import credential_guard as guard
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderCallCustody, ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     credential_material_tool_arguments_projection,
@@ -169,9 +174,19 @@ def test_owned_field_mapper_labels_cover_identity_bearing_tool_domains(tool: str
     arguments = (
         {"predecessor_id": "source", "successor_id": "output", "node": {"plugin": node["plugin"], "options": node["options"]}}
         if tool == "splice_transform"
+        else {"nodes": [node]}
+        if tool == "set_pipeline"
         else {"pipeline": {"nodes": [node]}}
     )
-    require_no_credential_material_in_tool_wire(tool, json.dumps(arguments), surface="test")
+    wire = {"pipeline": arguments} if tool == "set_pipeline" else arguments
+    if tool == "emit_pipeline_proposal":
+        # A retired tool no longer owns a credential-detector exception.
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material_in_tool_wire(tool, json.dumps(wire), surface="test")
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material_for_tool(tool, arguments, surface="test")
+        return
+    require_no_credential_material_in_tool_wire(tool, json.dumps(wire), surface="test")
     require_no_credential_material_for_tool(tool, arguments, surface="test")
 
 
@@ -580,3 +595,255 @@ def test_pipeline_data_and_sink_modules_do_not_import_control_plane_guard() -> N
         source = module.read_text(encoding="utf-8")
         assert "credential_guard" not in source
         assert "find_credential_material" not in source
+
+
+def test_retention_generic_scan_reuses_exact_inputs_and_rechecks_mutation(monkeypatch):
+    original = guard.find_credential_material
+    work = []
+
+    def detect(value, policy):
+        work.append((value, policy))
+        return original(value, policy)
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    value = {"ordinary": [None, True, False, 7, 1.25, {"last": "safe"}]}
+    with retention_stage_memo_scope() as memo:
+        require_no_credential_material(value, surface="memo-control")
+        require_no_credential_material(value, surface="memo-control")
+        assert len(work) == 1 and memo.cached_entry_count == 1
+        value["ordinary"][-1]["last"] = "changed"
+        require_no_credential_material(value, surface="memo-control")
+        assert len(work) == 2
+    require_no_credential_material(value, surface="memo-control")
+    require_no_credential_material(value, surface="memo-control")
+    assert len(work) == 4 and memo.cached_entry_count == 0
+
+
+def test_retention_scan_snapshots_mutable_policy_and_raises_fresh_refusals(monkeypatch):
+    original = guard.find_credential_material
+    work = []
+
+    def detect(value, policy):
+        work.append(policy)
+        return original(value, policy)
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    names = set()
+    value = {"api_key": "${CURRENT_KEY}"}
+    refusals = []
+    with retention_stage_memo_scope():
+        for _ in range(2):
+            with pytest.raises(CredentialMaterialRefused) as caught:
+                require_no_credential_material(value, surface="memo-control", env_ref_names=names)
+            refusals.append(caught.value)
+        assert refusals[0] is not refusals[1] and refusals[0].finding is refusals[1].finding
+        assert len(work) == 1
+        names.add("CURRENT_KEY")
+        require_no_credential_material(value, surface="memo-control", env_ref_names=names)
+        assert len(work) == 2 and work[0].env_ref_names == frozenset()
+        names.clear()
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            require_no_credential_material(value, surface="memo-control", env_ref_names=names)
+        assert caught.value is not refusals[0] and caught.value.finding is refusals[0].finding
+        assert len(work) == 2
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("env_ref_names", {"CURRENT_KEY"}),
+        ("additional_credential_fields", {"ordinary"}),
+        ("max_depth", 1),
+        ("max_nodes", 2),
+        ("max_width", 1),
+        ("max_string_bytes", 16),
+    ],
+)
+def test_retention_scan_key_changes_execute_real_detector_for_each_policy_input(monkeypatch, field, changed):
+    original = guard.find_credential_material
+    value = {"ordinary": "safe"}
+    policy = CredentialTraversalPolicy()
+    other = replace(policy, **{field: changed})
+    expected = original(value, other)
+    work = []
+
+    def detect(value, policy):
+        work.append(policy)
+        return original(value, policy)
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    with retention_stage_memo_scope():
+        for current in (policy, policy, other, other):
+            result = guard._retention_credential_finding(value, policy=current, surface="memo-control", scanner_role="generic")
+        assert result == expected and len(work) == 2
+
+
+def test_retention_scan_key_captures_the_current_detector_binding(monkeypatch):
+    original = guard.find_credential_material
+    work = []
+
+    def one(value, policy):
+        work.append("one")
+        return original(value, policy)
+
+    def two(value, policy):
+        work.append("two")
+        return original(value, policy)
+
+    with retention_stage_memo_scope():
+        for detector in (one, two):
+            monkeypatch.setattr(guard, "find_credential_material", detector)
+            for _ in range(2):
+                require_no_credential_material({"ordinary": "safe"}, surface="memo-control")
+    assert work == ["one", "two"]
+
+
+def test_retention_scan_descriptor_preserves_order_types_and_container_boundaries():
+    value = {"first": (True, 1, 1.0, -0.0), "second": [None, '{"json":true}']}
+    policy = CredentialTraversalPolicy()
+    key = guard._credential_scan_key(value, policy=policy, surface="memo-control", scanner_role="generic")
+    assert key is not None
+    restored = guard._credential_input_from_tokens(key.content)
+    assert restored == value and list(restored) == ["first", "second"]
+    assert type(restored["first"]) is tuple and type(restored["second"]) is list
+    assert tuple(type(item) for item in restored["first"]) == (bool, int, float, float)
+    assert restored["first"][-1].hex() == "-0x0.0p+0"
+    reordered = guard._credential_scan_key(
+        dict(reversed(list(value.items()))), policy=policy, surface="memo-control", scanner_role="generic"
+    )
+    assert reordered != key
+
+
+def test_retention_proxy_fallback_keeps_live_backing_and_never_preaccesses_a_later_proxy(monkeypatch):
+    original = guard.find_credential_material
+    received = []
+    accesses = []
+
+    def detect(value, policy):
+        received.append(value)
+        return original(value, policy)
+
+    class ForeignBacking(dict):
+        def __len__(self):
+            accesses.append("len")
+            raise AssertionError("later proxy length must not be accessed")
+
+        def items(self):
+            accesses.append("items")
+            raise AssertionError("later proxy items must not be accessed")
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    backing = {"ordinary": "safe"}
+    proxy = MappingProxyType(backing)
+    later = MappingProxyType(ForeignBacking())
+    with retention_stage_memo_scope() as memo:
+        require_no_credential_material(proxy, surface="memo-control")
+        backing["api_key"] = "literal"
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material(proxy, surface="memo-control")
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material({"api_key": "literal", "later": later}, surface="memo-control")
+        assert memo.cached_entry_count == 0
+    assert received[0] is received[1] is proxy and accesses == []
+
+
+@pytest.mark.parametrize("field", ["env_ref_names", "additional_credential_fields"])
+def test_retention_foreign_policy_collection_falls_back_without_new_access(field):
+    class ForeignCollection(Collection[str]):
+        def __iter__(self):
+            raise AssertionError("ordinary scalar scan never iterates this collection")
+
+        def __len__(self):
+            raise AssertionError("ordinary scalar scan never sizes this collection")
+
+        def __contains__(self, value):
+            raise AssertionError("ordinary scalar scan never searches this collection")
+
+    with retention_stage_memo_scope() as memo:
+        require_no_credential_material("ordinary content", surface="memo-control", **{field: ForeignCollection()})
+        assert memo.cached_entry_count == 0
+
+
+def test_retention_unhashable_surface_preserves_the_original_credential_refusal():
+    surface = []
+    with retention_stage_memo_scope() as memo:
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            require_no_credential_material({"api_key": "literal"}, surface=surface)
+        assert caught.value.surface is surface and memo.cached_entry_count == 0
+
+
+def test_retention_unsupported_or_over_bound_tail_keeps_the_earlier_refusal(monkeypatch):
+    original = guard.find_credential_material
+    work = []
+    cyclic = []
+    cyclic.append(cyclic)
+
+    class ForeignValue:
+        def __repr__(self):
+            raise AssertionError("foreign tail must not be rendered")
+
+    def detect(value, policy):
+        work.append(value)
+        return original(value, policy)
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    tails = [ForeignValue(), 1 << 100_000, "x" * 262_145, [None] * 513, cyclic, float("nan")]
+    with retention_stage_memo_scope() as memo:
+        for tail in tails:
+            for _ in range(2):
+                with pytest.raises(CredentialMaterialRefused) as caught:
+                    require_no_credential_material({"api_key": "literal", "later": tail}, surface="memo-control")
+                assert caught.value.finding.category == "credential_field"
+        assert memo.cached_entry_count == 0
+    assert len(work) == len(tails) * 2
+
+
+def test_retention_field_mapper_finding_preserves_original_options_and_skips_validation(monkeypatch):
+    from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
+
+    original = guard.find_credential_material
+    work = []
+
+    def detect(value, policy):
+        work.append(policy)
+        return original(value, policy)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("credential finding must return before model validation")
+
+    monkeypatch.setattr(guard, "find_credential_material", detect)
+    monkeypatch.setattr(FieldMapperConfig, "model_validate", forbidden)
+    options = _field_mapper_node({"customer_key": "customer_id"})["options"] | {"tail": {"api_key": "literal"}}
+    with retention_stage_memo_scope():
+        assert guard.field_mapper_credential_options_projection(options) is options
+        assert guard.field_mapper_credential_options_projection(options) is options
+    assert len(work) == 1 and work[0] is not guard.DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
+    assert work[0] == guard.DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
+
+
+@pytest.mark.parametrize("whole_refusal", [True, False], ids=["whole-state", "first-component"])
+def test_retention_state_scan_does_not_resolve_later_policies_after_refusal(monkeypatch, whole_refusal):
+    state_data = _field_mapper_state().to_dict()
+    state_data["sources"] = {
+        "source": {
+            "plugin": "csv",
+            "options": {"api_key" if whole_refusal else "extra": "literal"},
+            "on_success": "rows",
+            "on_validation_failure": "discard",
+        }
+    }
+    state = CompositionState.from_dict(state_data)
+    policies = []
+
+    def policy(component, plugin):
+        policies.append((component, plugin))
+        if component != "source":
+            raise AssertionError("later component policy must not be resolved")
+        return frozenset({"extra"})
+
+    monkeypatch.setattr(guard, "allowed_secret_ref_fields", policy)
+    with retention_stage_memo_scope():
+        for _ in range(2):
+            with pytest.raises(CredentialMaterialRefused):
+                require_no_credential_material_in_state(state, surface="memo-control")
+    assert policies == ([] if whole_refusal else [("source", "csv")] * 2)

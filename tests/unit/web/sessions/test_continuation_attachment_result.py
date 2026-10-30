@@ -13,14 +13,23 @@ from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
-from elspeth.web.composer.continuation_attachment_history import empty_attachment_history, encode_attachment_history
+from elspeth.web.composer.continuation_attachment_history import (
+    RetainedAttachmentInspection,
+    empty_attachment_history,
+    encode_attachment_history,
+)
 from elspeth.web.composer.continuation_attachment_result import apply_attachment_history, read_attachment_result, run_attachment_result
 from elspeth.web.composer.continuation_attachment_result_data import decode_attachment_history_batch
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_codec import encode_continuation_response, encode_continuation_snapshot, encode_private_chunk
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
+from elspeth.web.composer.continuation_evidence import encode_turn_evidence
+from elspeth.web.composer.continuation_evidence_graph import capture_turn_evidence
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.tools import blobs
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
@@ -29,6 +38,8 @@ from elspeth.web.sessions.continuation import (
     private_chunk_key,
     put_chunk,
 )
+from elspeth.web.sessions.continuation_attachment_result import _retained_history
+from elspeth.web.sessions.continuation_owner_results import ContinuationReadOwnerResult
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
@@ -60,6 +71,29 @@ async def result_case(store, monkeypatch, *, raw=b"Complete customer prose", too
     state = encode_private_chunk(codec="composer.state.v1", canonical=canonical_json(batch.state.to_dict()))
     root = reader["selected"].stack
     history = encode_attachment_history(empty_attachment_history(session_id=str(sid), operation_id=root.logical.operation_id))
+    # The actual selected_case request/actor and prepared state bind these
+    # closed DATA sources; this does not claim initialized runtime dispatch.
+    request = "Preserve café and exact context"
+    evidence_owner = TurnEvidence(
+        session_id=str(sid),
+        session_operation_context=running.session_operation_context,
+        request_id=root.logical.original_user_message_id,
+        request=request,
+        initial_state_id=root.logical.base_state_id,
+        initial_state=batch.state,
+        actor_user_id="alice",
+    )
+    messages = [{"role": "user", "content": request}]
+    evidence_owner.transcript.begin_messages(messages)
+    admitted = capture_turn_evidence(
+        evidence_owner,
+        messages,
+        logical=root.logical,
+        recorder=BufferingRecorder(),
+        drained=RecorderDrainCursors(),
+        env_ref_names=reader["inventory"].names,
+    )
+    evidence = encode_turn_evidence(admitted, env_ref_names=reader["inventory"].names)
     opaque = encode_private_chunk(codec="composer.messages.v1", canonical='{"unconsumed_test_input":"outside_attachment_owner"}')
     compose = ComposeFrame(
         phase="response_retained",
@@ -69,8 +103,8 @@ async def result_case(store, monkeypatch, *, raw=b"Complete customer prose", too
         tools=None,
         initial_state=state.reference,
         state=state.reference,
-        evidence=opaque.reference,
-        audit_buffer=opaque.reference,
+        evidence=evidence.reference,
+        audit_buffer=admitted.recorder_chunk.reference,
         transcript=opaque.reference,
         caches=opaque.reference,
         attachment_admissions=history.reference,
@@ -103,7 +137,7 @@ async def result_case(store, monkeypatch, *, raw=b"Complete customer prose", too
 
     def install():
         with locked_session_transaction(engine, str(sid)) as conn:
-            for chunk in (prepared, response, state, history, opaque):
+            for chunk in (prepared, response, state, history, opaque, evidence, *admitted.dependency_chunks):
                 put_chunk(
                     conn,
                     session_id=str(sid),
@@ -427,3 +461,26 @@ async def test_retained_source_corruption_refuses_after_positive(operation_store
         await read_attachment_result(**without_service(kwargs))
     assert recovery_rows(operation_store[0]) == before
     kwargs["required_work"].coordinator.assert_completed()
+
+
+def test_retained_history_refuses_a_read_from_another_session():
+    """Before extend_attachment_history this returned a history holding another
+    session's read. Control: build with model_copy -> red."""
+    foreign = RetainedAttachmentInspection(
+        session_id="other",
+        blob_id="blob",
+        content_hash="a" * 64,
+        size_bytes=1,
+        detector_version="detector",
+        policy_fingerprint="b" * 64,
+    )
+    result = ContinuationReadOwnerResult(
+        tool_name="read_attachment",
+        arguments_json="{}",
+        response_json="{}",
+        tool_result_json="{}",
+        blob_versions=(),
+        attachment_inspections=(foreign,),
+    )
+    with pytest.raises(ValueError, match="another session"):
+        _retained_history(empty_attachment_history(session_id="session", operation_id="operation"), "read:one", result)

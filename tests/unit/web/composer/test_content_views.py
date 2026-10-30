@@ -104,6 +104,16 @@ def test_unsupported_complete_key_and_oversized_view_do_not_trigger_slicing(scop
         build_bounded_composition_view(scope, large)
 
 
+@pytest.mark.parametrize("inline_characters", [8, 2_048, 10_000])
+@pytest.mark.parametrize("key", ["k" * 2_046, "雪" * 2_046, '"' * 1_023])
+def test_key_support_boundary_is_independent_of_value_display_threshold(scope, inline_characters, key):
+    assert len(json.dumps(key, ensure_ascii=False)) == 2_048
+    view = build_bounded_composition_view(scope, {key: "complete value"}, inline_characters=inline_characters)
+    assert list(json.loads(view.serialized)["data"]) == [key]
+    with pytest.raises(CompositionViewUnsupported, match="object key"):
+        build_bounded_composition_view(scope, {key + "k": "complete value"}, inline_characters=inline_characters)
+
+
 def test_display_refuses_under_byte_cap_structural_exhaustion(scope):
     empty = build_bounded_composition_view(scope, {})
     manifest = json.dumps(empty.manifest.to_payload(), separators=(",", ":"))

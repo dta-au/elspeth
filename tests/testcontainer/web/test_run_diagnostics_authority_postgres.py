@@ -13,6 +13,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine, event, func, select
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 
 import elspeth.web.coordination.run_diagnostics_authority as run_diagnostics_authority_module
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
@@ -22,7 +23,6 @@ from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.protocol import (
-    CompositionStateData,
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuthorityLostError,
     RunRecord,
@@ -92,7 +92,7 @@ async def _create_pending_run(service: SessionServiceImpl, engine: Engine) -> Ru
     try:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_context,
         )

@@ -1,4 +1,4 @@
-/* animations.css — @keyframes (composing-bounce, progress-stripe, spin) plus
+/* animations.css — @keyframes (composing-bounce, progress-stripe, spin, pulse-dot) plus
    the rules that consume them (.composing-dot, .progress-bar*, .spinner)
    plus the global @media (prefers-reduced-motion: reduce) that silences
    them. */
@@ -143,6 +143,27 @@
 /* ---------------------------------------------------------------------------
    Reduced Motion — respect OS-level motion preferences
    --------------------------------------------------------------------------- */
+/* Cancel-pending pulse dot (design/readme.md § Motion): a Stop that is sent
+   but not yet settled. Consumed by .chat-input-cancel-btn--pending. */
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: currentColor;
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .composing-dot {
     animation: none;
@@ -165,6 +186,11 @@
 
   .react-flow__edge.animated path {
     animation: none;
+  }
+
+  .pulse-dot {
+    animation: none;
+    opacity: 0.7;
   }
 
 }

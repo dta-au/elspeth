@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Literal
 
 from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationSegmentPolicy
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope, without_retention_stage_memo
 
 
 class SegmentFit(Enum):
@@ -159,8 +160,9 @@ class ContinuationActionClock:
             raise ValueError("an inapplicable action stage cannot execute")
         self._seen.add(stage)
         deadline = min(self.deadline, asyncio.get_running_loop().time() + seconds)
-        async with asyncio.timeout_at(deadline) as timeout:
-            result = await operation()
-            if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("continuation stage expired while its actual owner was joined")
-            return result
+        with retention_stage_memo_scope() if stage == "retention" else without_retention_stage_memo():
+            async with asyncio.timeout_at(deadline) as timeout:
+                result = await operation()
+                if timeout.expired() or asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("continuation stage expired while its actual owner was joined")
+                return result

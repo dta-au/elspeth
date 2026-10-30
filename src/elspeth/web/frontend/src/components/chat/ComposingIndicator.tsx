@@ -8,6 +8,7 @@ import type {
   CompositionState,
   ToolCall,
 } from "@/types/api";
+import type { ComposerOperationStatusV2 } from "@/types/composerOperations";
 import {
   COMPLETION_OUTCOME_LABELS,
   type CompletionOutcome,
@@ -45,6 +46,80 @@ interface ComposingIndicatorProps {
   onRetryInterruptedRequest?: () => void;
   retryDisabledReason?: string | null;
   lastRejection?: ToolCall["rejection"];
+  /** Latest Composer-Operation-Version 2 state (Continuation); null for v1. */
+  operationStatus?: ComposerOperationStatusV2 | null;
+  /** Two live-update connects failed; the request may still be running. */
+  liveUpdatesInterrupted?: boolean;
+  /** Stop was pressed and the server has not confirmed it yet. */
+  stopPending?: boolean;
+}
+
+export const SUCCESSOR_NOTICE = "Still working on this request.";
+export const SUCCESSOR_NOTICE_MS = 5_000;
+export const LIVE_UPDATES_INTERRUPTED = "Live updates interrupted. Reconnecting.";
+
+interface ContinuationView { label: string; headline: string }
+
+/**
+ * Design §4.2 copy for v2 states. Executing keeps the ordinary backend
+ * progress view; Stop takes precedence over phase. Never says "saved": a
+ * checkpoint is internal, not a saved pipeline revision.
+ */
+export function continuationView(
+  status: ComposerOperationStatusV2 | null | undefined,
+  stopPending: boolean,
+): ContinuationView | null {
+  const live = status?.status === "queued" || status?.status === "running";
+  if (stopPending && !(status?.cancel_requested ?? false) && (status == null || live)) {
+    return { label: "Stopping", headline: "Stop requested. Waiting for the server to confirm." };
+  }
+  if (status == null || !live) return null;
+  if (status.cancel_requested) {
+    return { label: "Stopping", headline: "Stop confirmed. The composer is finishing its current step and will not start another." };
+  }
+  switch (status.phase) {
+    case "queued":
+      return { label: "Queued", headline: "Waiting for a composer worker to start this request." };
+    case "continuation_queued":
+      return { label: "Continuing", headline: "The composer reached a checkpoint. The next step of this request is queued." };
+    case "retry_waiting":
+      return { label: "Waiting to retry", headline: "A service the composer depends on did not respond. The composer will retry this request automatically." };
+    case "reconciling":
+      return { label: "Recovering", headline: "The server running this request stopped. Another server is resuming it." };
+    default:
+      return null;
+  }
+}
+
+/** Shows the successor notice once per operation and segment, never on first attach or reload. */
+function useSuccessorNotice(status: ComposerOperationStatusV2 | null | undefined, cleared: boolean): boolean {
+  // baseline: the last segment already started when first seen (never announced);
+  // announced: the last successor already announced as running.
+  const seen = useRef<{ operation: string; baseline: number; announced: number } | null>(null);
+  const [shownFor, setShownFor] = useState<string | null>(null);
+  const segment = status?.segment ?? null;
+  const operation = status?.operation_id ?? null;
+  useEffect(() => {
+    if (operation === null || segment === null) return;
+    const previous = seen.current;
+    if (previous === null || previous.operation !== operation) {
+      // A segment already running at attach is history; one first seen queued
+      // (or interrupted) has not started, so its start is still announced.
+      const baseline = segment.state === "running" ? segment.sequence : segment.sequence - 1;
+      seen.current = { operation, baseline, announced: baseline };
+      return;
+    }
+    if (segment.state === "running" && segment.sequence > previous.announced && segment.sequence > previous.baseline) {
+      seen.current = { ...previous, announced: segment.sequence };
+      setShownFor(`${operation}:${segment.sequence}`);
+    }
+  }, [operation, segment]);
+  useEffect(() => {
+    if (shownFor === null) return;
+    const timer = setTimeout(() => setShownFor(null), SUCCESSOR_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [shownFor]);
+  return shownFor !== null && !cleared;
 }
 
 interface WorkingView {
@@ -168,10 +243,15 @@ export function ComposingIndicator({
   onRetryInterruptedRequest,
   retryDisabledReason = null,
   lastRejection,
+  operationStatus = null,
+  liveUpdatesInterrupted = false,
+  stopPending = false,
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
     waitingWorkingView(compositionState);
+  const continuation = continuationView(operationStatus, stopPending);
+  const successorNotice = useSuccessorNotice(operationStatus, stopPending || (operationStatus?.cancel_requested ?? false));
   const isTerminal = isTerminalPhase(composerProgress?.phase);
   const progressKey = latestRequest ?? composerProgress?.request_id ?? "idle";
   const toolLogCaptionId = `${useId()}-tool-log`;
@@ -205,23 +285,29 @@ export function ComposingIndicator({
                 "Last composer update"
               ) : (
                 <>
-                  {composerProgress?.phase === "calling_model"
+                  {continuation !== null
+                    ? continuation.label
+                    : composerProgress?.phase === "calling_model"
                     ? "Waiting for model response"
                     : "Working on..."}
                   <ElapsedReadout
                     key={composerProgress?.phase === "calling_model"
                       ? `${composerProgress.request_id}:${composerProgress.updated_at}`
+                      : operationStatus !== null
+                      ? `operation:${operationStatus.operation_id}`
                       : progressKey}
                     startedAt={composerProgress?.phase === "calling_model"
                       ? composerProgress.updated_at
-                      : undefined}
+                      : operationStatus?.created_at}
                   />
                 </>
               )}
             </div>
             <div className="composing-title">
-              {workingView.headline}
+              {continuation !== null && !isTerminal ? continuation.headline : workingView.headline}
             </div>
+            {successorNotice && !isTerminal && <div className="composing-text">{SUCCESSOR_NOTICE}</div>}
+            {liveUpdatesInterrupted && !isTerminal && <div className="composing-text">{LIVE_UPDATES_INTERRUPTED}</div>}
             {composerProgress?.phase === "cancelled" && (
               <div className="composing-text">
                 {compositionState !== null

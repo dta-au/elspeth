@@ -9,8 +9,8 @@ import pytest
 from elspeth.contracts.composer_content import ComposerContentScope, MaterializedCompleteValue
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer import advisor_context
 from elspeth.web.composer.advisor_context import (
-    AdvisorGraphCoverageUnavailable,
     build_advisor_user_message,
     fit_advisor_checkpoint_summary,
     materialize_advisor_complete_values,
@@ -18,11 +18,12 @@ from elspeth.web.composer.advisor_context import (
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX, build_composition_content_view, build_messages
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.redaction import REDACTED_SENSITIVE_NO_SUMMARIZER, redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import execute_tool, get_tool_definitions
-from elspeth.web.composer.tools._common import materialize_pipeline_state_value, prepare_bounded_pipeline_state
+from elspeth.web.composer.tools._common import materialize_pipeline_state_value
 from elspeth.web.composer.tools.sessions import _GET_COMPLETE_PIPELINE_VALUE_DECLARATION, _GET_PIPELINE_STATE_DECLARATION
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.credential_guard import CredentialMaterialRefused
@@ -177,8 +178,10 @@ def test_final_advisor_render_preserves_only_owned_reference_identity_positions(
 @pytest.mark.parametrize("key", [str(UUID(int=1)), "person@example.com"])
 def test_advisor_refuses_reference_paths_that_the_privacy_policy_would_change(graph, key):
     graph = replace(graph, nodes=(replace(graph.nodes[0], options={key: "x" * 3_000}),))
-    with pytest.raises(AdvisorGraphCoverageUnavailable, match="path"):
+    with pytest.raises(ComposerContextUnsupported) as refused:
         fit_advisor_checkpoint_summary(graph, {}, 0, content_scope=_scope(graph))
+    assert refused.value.reason == "graph_coverage_unavailable"
+    assert key not in str(refused.value) and key not in json.dumps(refused.value.to_payload())
 
 
 @pytest.mark.parametrize("reference", ["not-a-uuid", "ABCDEF01-2345-6789-ABCD-EF0123456789"])
@@ -191,7 +194,45 @@ def test_advisor_refuses_malformed_configured_source_identity(graph, reference):
             )
         },
     )
-    with pytest.raises(AdvisorGraphCoverageUnavailable, match="canonical identity"):
+    with pytest.raises(AuditIntegrityError, match="canonical identity"):
+        fit_advisor_checkpoint_summary(graph, {}, 0, content_scope=_scope(graph))
+
+
+def test_advisor_preparation_refuses_missing_selected_coverage(graph, monkeypatch):
+    graph = replace(graph, nodes=(replace(graph.nodes[0], options={"first": "a" * 3_000, "second": "b" * 3_000}),))
+    materialize = advisor_context.materialize_advisor_complete_values
+    selections = []
+
+    def omit_last_value(*args, **kwargs):
+        complete = materialize(*args, **kwargs)
+        selections.append(complete)
+        return complete[:-1]
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", omit_last_value)
+    with pytest.raises(ComposerContextUnsupported) as refused:
+        fit_advisor_checkpoint_summary(graph, {}, 0, content_scope=_scope(graph))
+    assert len(selections) == 1 and len(selections[0]) == 2
+    assert refused.value.reason == "graph_coverage_unavailable"
+    assert "a" * 3_000 not in str(refused.value) and "b" * 3_000 not in json.dumps(refused.value.to_payload())
+
+
+@pytest.mark.parametrize("corruption", ["foreign", "reordered", "duplicate", "nominal_member"])
+def test_advisor_preparation_keeps_corrupt_selected_coverage_as_integrity(graph, monkeypatch, corruption):
+    graph = replace(graph, nodes=(replace(graph.nodes[0], options={"first": "a" * 3_000, "second": "b" * 3_000}),))
+    materialize = advisor_context.materialize_advisor_complete_values
+
+    def corrupt_selected_values(*args, **kwargs):
+        complete = materialize(*args, **kwargs)
+        if corruption == "foreign":
+            return (MaterializedCompleteValue.from_value(replace(_scope(graph), session_id=UUID(int=2)), ("first",), "a" * 3_000),)
+        if corruption == "reordered":
+            return tuple(reversed(complete))
+        if corruption == "duplicate":
+            return (complete[0], complete[0])
+        return (object(),)
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", corrupt_selected_values)
+    with pytest.raises(AuditIntegrityError, match="selected coverage"):
         fit_advisor_checkpoint_summary(graph, {}, 0, content_scope=_scope(graph))
 
 
@@ -209,7 +250,7 @@ def test_complete_value_is_offered_as_noncacheable_hash_only_discovery(graph, li
     assert set(definition["parameters"]["properties"]) == {"reference_id"}
     assert definition["parameters"]["additionalProperties"] is False
     assert _GET_COMPLETE_PIPELINE_VALUE_DECLARATION.cacheable is False
-    view = prepare_bounded_pipeline_state(graph, live_context)
+    view = build_composition_content_view(graph, content_scope=_scope(graph, UUID(live_context.session_id)))
     reference = view.manifest.values[0]
     first, second = (_dispatch(reference.reference_id, graph, live_context) for _ in range(2))
     assert first.success and second.success
@@ -278,7 +319,7 @@ def test_complete_value_response_refuses_private_or_incomplete_shapes(graph):
 
 
 def test_identical_reference_cannot_reuse_released_operation_authority(graph, live_context):
-    view = prepare_bounded_pipeline_state(graph, live_context)
+    view = build_composition_content_view(graph, content_scope=_scope(graph, UUID(live_context.session_id)))
     reference = view.manifest.values[0].reference_id
     first = materialize_pipeline_state_value(reference, graph, live_context)
     second = materialize_pipeline_state_value(reference, graph, live_context)
@@ -291,7 +332,9 @@ def test_identical_reference_cannot_reuse_released_operation_authority(graph, li
 
 
 def test_canonical_wire_keeps_full_value_while_public_audit_redacts_it(graph, live_context):
-    reference = prepare_bounded_pipeline_state(graph, live_context).manifest.values[0].reference_id
+    reference = (
+        build_composition_content_view(graph, content_scope=_scope(graph, UUID(live_context.session_id))).manifest.values[0].reference_id
+    )
     result = _dispatch(reference, graph, live_context)
     admitted = admit_discovery_result("get_complete_pipeline_value", result)
     serialized = serialize_admitted_discovery_result(admitted)
@@ -305,7 +348,9 @@ def test_canonical_wire_keeps_full_value_while_public_audit_redacts_it(graph, li
 
 @pytest.mark.parametrize("missing", ["user", "operation", "authority", "foreign_session"])
 def test_materialization_refuses_missing_or_foreign_actual_context(graph, live_context, missing):
-    reference = prepare_bounded_pipeline_state(graph, live_context).manifest.values[0].reference_id
+    reference = (
+        build_composition_content_view(graph, content_scope=_scope(graph, UUID(live_context.session_id))).manifest.values[0].reference_id
+    )
     changes = {
         "user": {"user_id": None},
         "operation": {"session_operation_context": None},
@@ -317,7 +362,9 @@ def test_materialization_refuses_missing_or_foreign_actual_context(graph, live_c
 
 
 def test_stale_foreign_and_unsupported_references_never_fall_back_to_raw_graph(graph, live_context):
-    reference = prepare_bounded_pipeline_state(graph, live_context).manifest.values[0].reference_id
+    reference = (
+        build_composition_content_view(graph, content_scope=_scope(graph, UUID(live_context.session_id))).manifest.values[0].reference_id
+    )
     changed = replace(graph, nodes=(replace(graph.nodes[0], options={"prompt": "changed" * 1_000}),), version=graph.version + 1)
     result = _dispatch(reference, changed, live_context)
     assert not result.success

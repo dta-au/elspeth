@@ -38,21 +38,9 @@ from tests.helpers.tree_gate import iter_gate_files
 
 _COMPOSER = Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web" / "composer"
 
-# Planner-facing labels and redaction echoes that are not audit ``error_class``
+# Redaction echoes that are not audit ``error_class``
 # fields, keyed by (file under web/composer, enclosing function, label).
 _OUT_OF_SCOPE: dict[tuple[str, str, str], str] = {
-    ("pipeline_planner.py", "_compile_candidate_feedback", "ValidationError"): (
-        "planner feedback entry label for a closed validation code; sent to the planner, never an audit field"
-    ),
-    ("pipeline_planner.py", "_compile_planner_feedback", "SchemaValidationError"): (
-        "planner feedback entry label for a canonical-schema rejection; sent to the planner, never an audit field"
-    ),
-    ("provider_discovery_response.py", "to_wire", "ToolArgumentError"): (
-        "_ArgumentErrorResponse is built only from a ToolArgumentError (_argument_error_response); planner-facing projection"
-    ),
-    ("pipeline_planner.py", "_assistant_tool_calls_message", "ToolArgumentError"): (
-        "closed provider replay placeholder for a call with a retained wire_error; redacts rejected arguments, never an audit field"
-    ),
     ("redaction.py", "redact_failure_response", "CancelledError"): (
         "echoes the input only when it already equals CancelledError; otherwise a fixed sentinel"
     ),

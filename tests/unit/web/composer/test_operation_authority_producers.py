@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from pathlib import Path
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 
@@ -16,14 +14,8 @@ from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
 from elspeth.web.composer.tools.generation import ProofNotApplicable
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-from tests.unit.web.composer.test_pipeline_planner import (
-    _custody,
+from tests.unit.web.composer._scripted_sdk import (
     _empty_state,
-    _inline_pipeline,
-    _plan,
-    _response,
-    _ScriptedCompletion,
-    _session_context,
 )
 
 
@@ -73,53 +65,4 @@ def test_dispatch_preserves_operation_context_and_authority(
         assert observed[0].session_operation_context is context
         assert observed[0].session_operation_authority is authority
     finally:
-        engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_planner_preserves_authority_through_discovery_and_inline_publication(
-    tmp_path: Path,
-    tool_context: ToolContext,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    engine, origin = await _session_context()
-    authority = SQLiteLocalSessionOperationAuthority(engine)
-    context = authority.acquire(
-        session_id=UUID(origin.session_id),
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id="producer-regression",
-        lease_seconds=120,
-    )
-    observed: list[ToolContext] = []
-    discovery = pipeline_planner.execute_discovery_tool_with_context
-
-    def observe(
-        tool_name: str, arguments: dict[str, Any], state: pipeline_planner.CompositionState, request_context: ToolContext
-    ) -> ToolResult:
-        observed.append(request_context)
-        return discovery(tool_name, arguments, state, request_context)
-
-    monkeypatch.setattr(pipeline_planner, "execute_discovery_tool_with_context", observe)
-    try:
-        proposal = await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=_ScriptedCompletion(
-                _response(("list_blobs", {})),
-                _response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})),
-            ),
-            originating_message=origin,
-            custody_config=replace(
-                _custody(tmp_path),
-                session_engine=engine,
-                session_operation_context=context,
-                session_operation_authority=authority,
-            ),
-        )
-        assert observed
-        assert all(item.session_operation_context is context for item in observed)
-        assert all(item.session_operation_authority is authority for item in observed)
-        assert proposal.proposal.to_dict()["pipeline"]["source"]["blob_id"]
-    finally:
-        authority.release(context)
         engine.dispose()

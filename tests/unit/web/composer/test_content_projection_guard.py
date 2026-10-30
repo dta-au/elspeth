@@ -1,20 +1,23 @@
 """Complete-value reuse enters the existing audited guard on each actual use."""
 
 from dataclasses import replace
+from uuid import UUID
 
 import litellm
 import pytest
 
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import PromptGuardDecision
 from elspeth.web.composer import prompt_guard, provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardRefused, prompt_guard_user_scope
+from elspeth.web.composer.prompts import build_composition_content_view
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.composer.state import PipelineMetadata
-from elspeth.web.composer.tools._common import prepare_bounded_pipeline_state
 from tests.unit.web.composer._helpers import _empty_state, _make_settings
 from tests.unit.web.composer.test_content_projection import _dispatch
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
@@ -50,7 +53,10 @@ async def test_each_complete_value_use_is_freshly_inspected_and_audited(invocati
     )
     complete = "x" * (25_000 if oversized else 3_000)
     graph = replace(_empty_state(), metadata=PipelineMetadata(description=complete))
-    reference = prepare_bounded_pipeline_state(graph, context).manifest.values[0].reference_id
+    view = build_composition_content_view(
+        graph, content_scope=ComposerContentScope(UUID(context.session_id), composition_content_hash(graph))
+    )
+    reference = view.manifest.values[0].reference_id
     inspected_messages = []
     actual_sdk = []
     make_request = prompt_guard._request

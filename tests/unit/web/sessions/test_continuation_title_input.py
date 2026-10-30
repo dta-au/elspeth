@@ -123,24 +123,30 @@ async def test_title_source_refuses_reserved_phase_without_promoting_its_input(o
 
 
 @pytest.mark.asyncio
-async def test_actual_title_source_new_claim_uses_same_ingress_and_refuses_old_claim(operation_store):
+@pytest.mark.parametrize("handoff", ("release_then_recover", "live_handover"))
+async def test_actual_title_source_new_claim_uses_same_ingress_and_refuses_old_claim(operation_store, handoff):
     running, completed, service = await inserted_case(operation_store)
     work = inventory_work(running)
     before = await load_current_title_input(service=service, selected=completed.snapshot, required_work=work)
     work.coordinator.assert_completed()
-    operation_store[1].release(running.session_operation_context)
+    if handoff == "live_handover":
+        # A live owner's handover writes recovery's exact transition (design §3.4 B).
+        operation_store[1].suspend_composer_segment(running)
+    else:
+        operation_store[1].release(running.session_operation_context)
     current = new_owners(operation_store)
     engine, repository, authority, _sessions, sid = current
-    assert (
-        repository.recover_composer_segment(
-            session_id=sid,
-            operation_id=running.claim.operation_id,
-            expected_generation=running.claim.ownership_generation,
-            actor_user_id="alice",
-            auth_provider_type="local",
+    if handoff == "release_then_recover":
+        assert (
+            repository.recover_composer_segment(
+                session_id=sid,
+                operation_id=running.claim.operation_id,
+                expected_generation=running.claim.ownership_generation,
+                actor_user_id="alice",
+                auth_provider_type="local",
+            )
+            is True
         )
-        is True
-    )
     (claim,) = authority.claim_segment(limit=1)
     context = repository.start_composer_segment(
         claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"

@@ -13,6 +13,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
+from elspeth.web.composer.continuation_evidence import require_admitted_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, _restore_current_evidence
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
 from elspeth.web.composer.continuation_owed_p4 import _require_current_read_owners
@@ -86,8 +87,9 @@ async def apply_selected_p4_to_cold_evidence(
             if type(outcome.value) is not StoredP4Application:
                 raise AuditIntegrityError("cold application replaced its actual committed SQL result")
             stored = outcome.value
+            admitted = require_admitted_turn_evidence(stored.bundle.evidence_after, env_ref_names=inventory.names)
             reader = None
-            if stored.bundle.evidence_after.requires_blob_reader:
+            if admitted.snapshot.requires_blob_reader:
                 if service is None:
                     raise AuditIntegrityError("cold application requires its actual current reader service")
                 _require_current_reader_service(service, authority)
@@ -95,7 +97,7 @@ async def apply_selected_p4_to_cold_evidence(
                     service, session_id=str(running.claim.session_id), context=running.session_operation_context
                 )
             restored = _restore_current_evidence(
-                stored.bundle.evidence_after,
+                admitted,
                 context=running.session_operation_context,
                 reader=reader,
                 env_ref_names=inventory.names,

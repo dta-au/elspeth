@@ -25,7 +25,7 @@ REVIEWED_GRAMMARS = {
     "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
     "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
     "ComposerAsyncWorker._run_started_under_lease": "a2897fd9340d2b0fac5ae8d83a1e5af1c692f3c69bc79850835b558448b995b5",
-    "_create_app": "cdd9a13db9d3bd1de87bab8a645f48bacf2bca3c0a97215fe3255b202bac486f",
+    "_create_app": "d885e4c335b48c7db438899512557934dd193e6e402ba745147fd724ee2cea5c",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (

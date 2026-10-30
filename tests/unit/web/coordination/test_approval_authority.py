@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import event, insert, select, update
 from sqlalchemy.dialects import postgresql
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.web.coordination.approval_authority import (
@@ -100,6 +101,7 @@ def _seed(fenced_session) -> None:
         )
     conn.execute(
         insert(composition_states_table).values(
+            metadata_=stored_default_pipeline_metadata(),
             id="state-1",
             session_id=fenced_session.session_id,
             version=1,
@@ -264,7 +266,13 @@ def test_failed_rejection_audit_batch_rolls_back_decision_and_retirement(tmp_pat
         conn.execute(insert(sessions_table).values(id="session-1", user_id="alice", title="approval", created_at=NOW, updated_at=NOW))
         conn.execute(
             insert(composition_states_table).values(
-                id="state-1", session_id="session-1", version=1, is_valid=True, provenance="session_seed", created_at=NOW
+                metadata_=stored_default_pipeline_metadata(),
+                id="state-1",
+                session_id="session-1",
+                version=1,
+                is_valid=True,
+                provenance="session_seed",
+                created_at=NOW,
             )
         )
     authority = ApprovalTransactionAuthority(engine)
@@ -405,6 +413,7 @@ def test_inbox_includes_role_eligible_requests_with_addressed_first(tmp_path) ->
             )
             conn.execute(
                 insert(composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=f"state-{session_id}",
                     session_id=session_id,
                     version=1,

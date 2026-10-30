@@ -273,7 +273,6 @@ async def test_original_advisor_continuation_budget_charges_same_retained_call_o
     budget.validate_for(
         session_id=str(operation_store[4]), request_id="advisor-budget", request=USER, provider_owner=provider, evidence_owner=evidence
     )
-    assert budget.reserve_attempt(now=time.perf_counter())
 
     async def completion(**kwargs):
         _assert_required_guard_admitted(operation_store[0], context, requests, role="advisor", user_prompt=USER)

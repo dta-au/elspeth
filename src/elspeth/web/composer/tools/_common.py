@@ -70,7 +70,7 @@ from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._producer_resolver import published_success_connection
 from elspeth.web.composer._validation_probe import is_inline_content_reference
-from elspeth.web.composer.content_views import BoundedCompositionView, build_bounded_composition_view, materialize_composition_value
+from elspeth.web.composer.content_views import build_bounded_composition_view, materialize_composition_value
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.plugin_policy_disclosure import (
     WEB_PROHIBITED_PLUGIN_EXPLANATION,
@@ -3843,12 +3843,6 @@ def _current_composition_content_projection(state: CompositionState, context: To
         else frozenset()
     )
     return project_composition_content(state, env_ref_names=names)
-
-
-def prepare_bounded_pipeline_state(state: CompositionState, context: ToolContext) -> BoundedCompositionView:
-    """Separate diagnostic display from get_pipeline_state's canonical response."""
-    scope = _current_composition_content_scope(state, context)
-    return build_bounded_composition_view(scope, _current_composition_content_projection(state, context))
 
 
 def materialize_pipeline_state_value(

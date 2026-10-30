@@ -23,8 +23,8 @@ from elspeth.web.composer._compose_loop_carriers import _ComposeIterationBinding
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.continuation import ComposeFrame, ContinuationFrameStack, PrivateChunkRef, ToolBatchFrame
-from elspeth.web.composer.continuation_attachment_history import ContinuationAttachmentHistory, decode_attachment_history
-from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
+from elspeth.web.composer.continuation_attachment_history import ContinuationAttachmentHistory
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import (
     RestoredBatchData,
     RestoredPreparedBatchData,
@@ -37,11 +37,11 @@ from elspeth.web.composer.continuation_caches import (
     encode_continuation_caches,
     restore_continuation_caches,
 )
-from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, verify_private_chunk
+from elspeth.web.composer.continuation_codec import PrivateChunk, encode_mandatory_private_chunk, encode_private_chunk, verify_private_chunk
 from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
 from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_audit
 from elspeth.web.composer.continuation_env_inventory import CurrentContinuationEnvInventory
-from elspeth.web.composer.continuation_evidence import encode_turn_evidence, recorder_from_evidence_json
+from elspeth.web.composer.continuation_evidence import encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence, capture_turn_evidence
 from elspeth.web.composer.continuation_iteration import capture_continuation_iteration, encode_continuation_iteration, iteration_values
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
@@ -59,6 +59,7 @@ from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource,
 from elspeth.web.sessions.continuation_selection import nested_private_chunks, required_private_chunks
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
     from elspeth.web.composer.service import ComposerServiceImpl
 
 
@@ -72,6 +73,16 @@ class RestoredContinuationRuntime:
     drained: RecorderDrainCursors
     attachments: ContinuationAttachmentHistory
     env_ref_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentPhaseRead:
+    """One phase's actual read cohort; every use still re-enters SQL proof."""
+
+    runtime: RestoredContinuationRuntime
+    selected: SelectedContinuationState
+    inventory: CurrentContinuationEnvInventory
+    finish_read: ContinuationFinishRead | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +183,7 @@ def _restore_live(
     materialization: CurrentContinuationMessageProducers,
     monotonic_before_read: float,
     progress: ComposerProgressSink | None,
+    finish_read: ContinuationFinishRead | None = None,
 ) -> RestoredContinuationRuntime:
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
 
@@ -232,12 +244,7 @@ def _restore_live(
     if cache_history.session_id != selected.stack.logical.session_id:
         raise AuditIntegrityError("runtime cache history belongs to another session")
     caches = restore_continuation_caches(cache_history, env_ref_names=names)
-    attachments = decode_attachment_history(
-        runtime_chunk(selected, frame.attachment_admissions),
-        session_id=selected.stack.logical.session_id,
-        operation_id=selected.stack.logical.operation_id,
-        env_ref_names=names,
-    )
+    attachments = source.attachments
     if (frame.persisted_assistant_message_id is None) != (frame.persisted_assistant_content is None):
         raise AuditIntegrityError("runtime lost its paired persisted assistant identity/content")
     if any(type(index) is not int or not 0 <= index < len(graph.messages) for index in frame.pending_advisor_elision_indices):
@@ -299,7 +306,11 @@ def _restore_live(
     )
     # A later read can only shorten admission; never use its newer remaining
     # observation to renew the monotonic anchor or original logical budgets.
-    authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+    if finish_read is None:
+        authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+    else:
+        finish_read.require_selection(selected, inventory)
+        finish_read.read_runtime(authority)
     service._schema_disclosure.restore_session_for_continuation(
         source.iteration.disclosure,
         session_id=selected.stack.logical.session_id,
@@ -318,6 +329,7 @@ async def restore_continuation_runtime(
     required_work: RequiredWorkBinding,
     provider_owner: ProviderInvocationOwner,
     progress: ComposerProgressSink | None = None,
+    finish_read: ContinuationFinishRead | None = None,
 ) -> RestoredContinuationRuntime:
     from elspeth.web.composer.service import ComposerServiceImpl
 
@@ -330,15 +342,25 @@ async def restore_continuation_runtime(
     ):
         raise AuditIntegrityError("runtime lost actual current service/provider-work custody")
     monotonic_before_read = time.monotonic()
+    if finish_read is not None:
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+        if type(finish_read) is not ContinuationFinishRead:
+            raise AuditIntegrityError("runtime restore received a foreign owed-finish facet")
+        finish_read.require_selection(selected, inventory)
     source = await _registered_read(
         required_work,
         ContinuationRuntimeSource,
-        lambda: authority.read_continuation_runtime(running, selected=selected, inventory=inventory),
+        lambda: (
+            authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+            if finish_read is None
+            else finish_read.read_runtime(authority)
+        ),
     )
     if type(source) is not ContinuationRuntimeSource:
         raise AuditIntegrityError("runtime source returned another nominal owner")
     production = await load_current_message_producers(
-        service=service, authority=authority, selected=selected, inventory=inventory, required_work=required_work
+        service=service, authority=authority, selected=selected, inventory=inventory, required_work=required_work, finish_read=finish_read
     )
     graph = await restore_current_turn_evidence(
         service=service,
@@ -363,6 +385,7 @@ async def restore_continuation_runtime(
             materialization=production.producers,
             monotonic_before_read=monotonic_before_read,
             progress=progress,
+            finish_read=finish_read,
         ),
     )
     if type(result) is not RestoredContinuationRuntime:
@@ -371,7 +394,10 @@ async def restore_continuation_runtime(
 
 
 async def build_runtime_tool_batch_context(
-    runtime: RestoredContinuationRuntime, *, cancellation_requested: asyncio.Event
+    runtime: RestoredContinuationRuntime,
+    *,
+    cancellation_requested: asyncio.Event,
+    phase_read: _CurrentPhaseRead | None = None,
 ) -> ToolBatchContext:
     if type(runtime) is not RestoredContinuationRuntime or type(cancellation_requested) is not asyncio.Event:
         raise AuditIntegrityError("runtime dispatch context requires its actual owners")
@@ -380,24 +406,49 @@ async def build_runtime_tool_batch_context(
     work = bindings.required_work
     if type(work) is not RequiredWorkBinding:
         raise AuditIntegrityError("runtime context lost its required-work binding")
-    running = _work_owners(runtime.materialization.authority, runtime.materialization.inventory, work)
+    authority = runtime.materialization.authority
+    selected, inventory = runtime.source.selected, runtime.materialization.inventory
+    finish_read: ContinuationFinishRead | None = None
+    if phase_read is not None:
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+        if (
+            type(phase_read) is not _CurrentPhaseRead
+            or phase_read.runtime is not runtime
+            or phase_read.selected is not selected
+            or type(phase_read.inventory) is not CurrentContinuationEnvInventory
+        ):
+            raise AuditIntegrityError("runtime context replaced its actual phase read cohort")
+        inventory, finish_read = phase_read.inventory, phase_read.finish_read
+        if finish_read is not None:
+            if type(finish_read) is not ContinuationFinishRead:
+                raise AuditIntegrityError("runtime context received a foreign owed-read facet")
+            finish_read.require_selection(selected, inventory)
+    running = _work_owners(authority, inventory, work)
+    if (
+        bindings.session_operation_context is not running.session_operation_context
+        or bindings.session_id != str(running.claim.session_id)
+        or selected.stack.logical.session_id != str(running.claim.session_id)
+        or selected.stack.logical.operation_id != running.claim.operation_id
+        or (finish_read is not None and finish_read.running is not running)
+    ):
+        raise AuditIntegrityError("runtime context crossed its actual phase session/current owner")
+
+    def read_source() -> ContinuationRuntimeSource:
+        if finish_read is not None:
+            finish_read.require_selection(selected, inventory)
+            source = finish_read.read_runtime(authority)
+        else:
+            source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+        if type(source) is not ContinuationRuntimeSource or source.selected is not selected:
+            raise AuditIntegrityError("runtime context lost its actual selected SQL read")
+        return source
+
     sessions = service._require_sessions_service()
-    await _registered_read(
-        work,
-        ContinuationRuntimeSource,
-        lambda: runtime.materialization.authority.read_continuation_runtime(
-            running, selected=runtime.source.selected, inventory=runtime.materialization.inventory
-        ),
-    )
+    await _registered_read(work, ContinuationRuntimeSource, read_source)
     sid = UUID(runtime.source.selected.stack.logical.session_id)
     preferences = await sessions.get_composer_preferences(sid)
-    await _registered_read(
-        work,
-        ContinuationRuntimeSource,
-        lambda: runtime.materialization.authority.read_continuation_runtime(
-            running, selected=runtime.source.selected, inventory=runtime.materialization.inventory
-        ),
-    )
+    await _registered_read(work, ContinuationRuntimeSource, read_source)
     ceiling = bindings.mutation_ceiling
     if ceiling is None or bindings.session_operation_context is not running.session_operation_context:
         raise AuditIntegrityError("runtime context lost its original mutation ceiling/current fence")
@@ -520,7 +571,9 @@ def _capture_owners(
     if live.continuation_cache_history is None:
         raise AuditIntegrityError("runtime capture cannot replace complete retained cache history")
     names = inventory.names
-    current_recorder = recorder_from_evidence_json(source.evidence.recorder_json)
+    if source.admitted_evidence.snapshot is not source.evidence:
+        raise AuditIntegrityError("runtime source lost its resolved original evidence cohort")
+    current_recorder = decode_recorder_snapshot(source.admitted_evidence.recorder_chunk)
     actual_recorder = live.recorder.snapshot_for_continuation(drained=runtime.drained)
     if (
         len(actual_recorder.invocations) < len(current_recorder.invocations)
@@ -597,7 +650,7 @@ def _capture_owners(
             raise AuditIntegrityError("runtime capture lost its actual prepared call")
         portable = runtime.graph.selected_audit if call.audit is None else capture_dispatch_audit(call.audit, env_ref_names=names)
         captured_data = RestoredPreparedBatchData(data.batch, data.accumulator, data.calls, portable, runtime.graph.selected_dialect)
-    shelf = capture_turn_evidence(
+    admitted = capture_turn_evidence(
         live.turn_evidence,
         live.llm_messages,
         logical=root.logical,
@@ -606,23 +659,20 @@ def _capture_owners(
         env_ref_names=names,
         data=captured_data,
         materialization=runtime.materialization,
+        mandatory_retention=True,
+        prior_application_entry=source.evidence.application_entry,
     )
-    old_applications = source.evidence.application_entry
-    if old_applications is not None and (
-        shelf.application_entry is None
-        or shelf.application_entry.applications[: len(old_applications.applications)] != old_applications.applications
-    ):
-        raise AuditIntegrityError("runtime capture lost selected actual application history")
-    evidence = encode_turn_evidence(shelf, env_ref_names=names)
-    transcript = encode_message_shelf(shelf.transcript)
-    messages = encode_private_chunk(
+    shelf = admitted.snapshot
+    evidence = encode_turn_evidence(admitted, env_ref_names=names, mandatory_retention=True)
+    transcript = encode_message_shelf(shelf.transcript, mandatory_retention=True, env_ref_names=names)
+    messages = encode_mandatory_private_chunk(
         codec="composer.messages.v1",
-        canonical=canonical_json({"messages_json": shelf.transcript.messages_json, "current_indexes": shelf.transcript.current_indexes}),
+        value={"messages_json": shelf.transcript.messages_json, "current_indexes": shelf.transcript.current_indexes},
         env_ref_names=names,
     )
-    tools = encode_private_chunk(codec="composer.tools.v1", canonical=canonical_json(live.tools), env_ref_names=names)
-    state = encode_private_chunk(codec="composer.state.v1", canonical=canonical_json(live.state.to_dict()), env_ref_names=names)
-    audit = encode_recorder_snapshot(live.recorder.snapshot_for_continuation(drained=runtime.drained))
+    tools = encode_mandatory_private_chunk(codec="composer.tools.v1", value=live.tools, env_ref_names=names)
+    state = encode_mandatory_private_chunk(codec="composer.state.v1", value=live.state.to_dict(), env_ref_names=names)
+    audit = admitted.recorder_chunk
     caches = encode_continuation_caches(
         capture_continuation_caches(
             discovery=live.discovery_cache,
@@ -681,9 +731,7 @@ def _capture_owners(
     added: tuple[PrivateChunk, ...] = (messages, tools, state, evidence, transcript, audit, caches, iteration)
     batch_indexes = tuple(i for i, value in enumerate(frames) if type(value) is ToolBatchFrame)
     if batch_indexes and data is not None and data.batch.phase not in ("p4_pending", "complete"):
-        from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
-
-        captured_graph = require_evidence_application_links(shelf, env_ref_names=names)
+        captured_graph = admitted.graph
         if captured_graph is None:
             raise AuditIntegrityError("runtime capture lost its actual encoded shared batch graph")
         projected = captured_graph.selected
@@ -743,8 +791,27 @@ async def capture_continuation_runtime_owners(
     running = _work_owners(authority, inventory, work)
 
     def capture() -> CapturedContinuationRuntime:
+        from elspeth.web.composer.continuation_evidence import state_from_evidence_json
+        from elspeth.web.composer.protocol import ComposerContextUnsupported
+
         source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
-        captured = _capture_owners(runtime, source=source, inventory=inventory)
+        try:
+            captured = _capture_owners(runtime, source=source, inventory=inventory)
+        except ComposerContextUnsupported as refused:
+            try:
+                authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+            except BaseException as failure:
+                raise BaseExceptionGroup("Retention refusal and final current-source admission", [refused, failure]) from None
+            # Carry only work the actual recorder has not drained. Prior
+            # committed effects and the last valid checkpoint stay in place.
+            live = runtime.live
+            raise refused.with_evidence(
+                state=live.state,
+                initial_version=state_from_evidence_json(source.evidence.effects.latest_verified_state_json).version,
+                tool_invocations=live.recorder.invocations[runtime.drained.invocations :],
+                llm_calls=live.recorder.llm_calls[runtime.drained.llm_calls :],
+                failed_turn=live.failed_turn,
+            ) from refused
         authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
         return captured
 

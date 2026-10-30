@@ -18,6 +18,7 @@ from elspeth.web.sessions.composer_operations import (
 from elspeth.web.sessions.continuation import ContinuationCASConflict, load_snapshot
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.schemas import SendMessageRequest
+from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.unit.web.coordination import test_composer_operation_authority
 
@@ -70,7 +71,7 @@ def start_continuation(repository, authority):
     context = repository.start_composer_segment(
         claim,
         owner_instance_id="test-owner",
-        lease_seconds=30,
+        lease_seconds=OWNER_LEASE_SECONDS,
         auth_provider_type="local",
     )
     return ComposerOperationRunning(claim=claim, session_operation_context=context)

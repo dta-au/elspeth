@@ -53,7 +53,7 @@ def full_rows(engine):
         )
 
 
-async def prepared_runtime(store, tmp_path, monkeypatch):
+async def prepared_runtime(store, tmp_path, monkeypatch, *, tool_calls=None):
     with store[0].begin() as conn:
         grant_test_pipeline_user(conn, identity_id="alice")
     arguments, _cache, _attachments = await runtime_case(store)
@@ -77,11 +77,11 @@ async def prepared_runtime(store, tmp_path, monkeypatch):
             model="test/model",
             choices=[
                 {
-                    "finish_reason": "stop",
+                    "finish_reason": "tool_calls" if tool_calls else "stop",
                     "message": {
                         "role": "assistant",
                         "content": f"Actual native reply {number}",
-                        "tool_calls": None,
+                        "tool_calls": tool_calls,
                         "thinking_blocks": [
                             {
                                 "type": "thinking",

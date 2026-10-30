@@ -108,13 +108,13 @@ async def committed_evidence_case(
     )
     evidence = encode_turn_evidence(snapshot, env_ref_names=inventory.names)
     audit = encode_recorder_snapshot(restored.recorder.snapshot_for_continuation(drained=restored.drained))
-    transcript = encode_message_shelf(snapshot.transcript)
+    transcript = encode_message_shelf(snapshot.snapshot.transcript)
     messages = encode_private_chunk(
         codec="composer.messages.v1",
         canonical=canonical_json(
             {
-                "messages_json": snapshot.transcript.messages_json,
-                "current_indexes": snapshot.transcript.current_indexes,
+                "messages_json": snapshot.snapshot.transcript.messages_json,
+                "current_indexes": snapshot.snapshot.transcript.current_indexes,
             }
         ),
     )
@@ -249,8 +249,8 @@ async def test_actual_owed_evidence_restores_before_result_without_repeating_wri
                     recorder=actual.restored.recorder,
                     drained=actual.restored.drained,
                     env_ref_names=inventory.names,
-                )
-                == expected
+                ).snapshot
+                == expected.snapshot
             )
             work.coordinator.assert_completed()
         assert (stored_rows(engine), rows(engine)) == before
@@ -351,7 +351,7 @@ async def test_owed_restore_rebuilds_required_reader_and_refuses_missing_service
         reader = actual.restored.evidence.transcript._blob_reader
         assert type(reader) is CurrentTranscriptBlobReader
         assert reader.service is service and reader.context is running.session_operation_context
-        assert actual.checked.snapshot.requires_blob_reader
+        assert actual.checked.snapshot.snapshot.requires_blob_reader
         if cancelled:
             with pytest.raises(ComposerOperationCancelledDuringTurn):
                 await asyncio.to_thread(reader, str(uuid4()))

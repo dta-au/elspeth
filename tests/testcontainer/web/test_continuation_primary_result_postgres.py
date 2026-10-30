@@ -16,6 +16,7 @@ from tests.unit.web.sessions.test_continuation_primary_result import (
     test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive,
     test_primary_publication_preserves_recorder_prefix_and_rolls_back_all_result_bytes,
     test_primary_publishes_actual_original_response_audit_ledger_and_complete_recorder_once,
+    test_primary_structural_premise_refuses_result_on_real_unresolved_intent,
 )
 
 pytestmark = pytest.mark.testcontainer
@@ -36,4 +37,5 @@ __all__ = [
     "test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive",
     "test_primary_publication_preserves_recorder_prefix_and_rolls_back_all_result_bytes",
     "test_primary_publishes_actual_original_response_audit_ledger_and_complete_recorder_once",
+    "test_primary_structural_premise_refuses_result_on_real_unresolved_intent",
 ]

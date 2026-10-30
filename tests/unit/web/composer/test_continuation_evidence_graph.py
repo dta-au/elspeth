@@ -12,7 +12,7 @@ from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_success
 from elspeth.web.composer.continuation import LogicalRequestBinding
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, encode_recorder_snapshot
-from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
+from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_graph import _restore_current_evidence, capture_turn_evidence
 from elspeth.web.composer.protocol import RetainedOperationContext
 from elspeth.web.composer.state import CompositionState
@@ -123,7 +123,7 @@ def test_complete_graph_values_aliases_pending_and_private_recorder_roundtrip():
     evidence, messages, recorder, logical, _policy = rich_evidence()
     original = snapshot(evidence, messages, recorder, logical)
     chunk = encode_turn_evidence(original)
-    decoded = decode_turn_evidence(chunk, env_ref_names=frozenset())
+    decoded = decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=original.dependency_chunks)
     restored = _restore_current_evidence(decoded, context=CONTEXT)
     owner = restored.evidence
     assert owner is not evidence and restored.recorder is not recorder
@@ -147,9 +147,10 @@ def test_complete_graph_values_aliases_pending_and_private_recorder_roundtrip():
     assert restored.recorder.visible_tool_events[0][0] is restored.recorder.invocations[0]
     assert restored.recorder._lock is not recorder._lock
     assert (
-        encode_recorder_snapshot(restored.recorder.snapshot_for_continuation(drained=restored.drained)).canonical == original.recorder_json
+        encode_recorder_snapshot(restored.recorder.snapshot_for_continuation(drained=restored.drained)).canonical
+        == original.recorder_chunk.canonical
     )
-    assert snapshot(owner, restored.messages, restored.recorder, logical) == original
+    assert snapshot(owner, restored.messages, restored.recorder, logical).snapshot == original.snapshot
     assert encode_turn_evidence(snapshot(owner, restored.messages, restored.recorder, logical)) == chunk
 
 
@@ -159,8 +160,11 @@ def test_distinct_equal_initial_latest_are_not_merged_by_json_equality():
     assert equal == evidence.effects.initial_state and equal is not evidence.effects.initial_state
     evidence.effects = replace(evidence.effects, latest_verified_state=equal)
     retained = snapshot(evidence, messages, recorder, logical)
-    assert not retained.initial_is_latest
-    restored = _restore_current_evidence(decode_turn_evidence(encode_turn_evidence(retained), env_ref_names=frozenset()), context=CONTEXT)
+    assert not retained.snapshot.initial_is_latest
+    restored = _restore_current_evidence(
+        decode_turn_evidence(encode_turn_evidence(retained), env_ref_names=frozenset(), source_chunks=retained.dependency_chunks),
+        context=CONTEXT,
+    )
     assert restored.evidence.effects.initial_state == restored.evidence.effects.latest_verified_state
     assert restored.evidence.effects.initial_state is not restored.evidence.effects.latest_verified_state
 
@@ -205,21 +209,24 @@ def test_missing_complete_field_cannot_default_on_decode(field):
 
     evidence, messages, recorder, logical, _policy = rich_evidence()
     retained = snapshot(evidence, messages, recorder, logical)
-    assert decode_turn_evidence(encode_turn_evidence(retained), env_ref_names=frozenset()) == retained
-    payload = retained.model_dump(mode="json")
-    del payload[field]
-    chunk = encode_private_chunk(codec="composer.evidence.v1", canonical=canonical_json(payload))
+    assert (
+        decode_turn_evidence(encode_turn_evidence(retained), env_ref_names=frozenset(), source_chunks=retained.dependency_chunks).snapshot
+        == retained.snapshot
+    )
+    payload = retained.snapshot.model_dump(mode="json")
+    del payload["recorder" if field == "recorder_json" else field]
+    chunk = encode_private_chunk(codec="composer.evidence.v2", canonical=canonical_json(payload))
     with pytest.raises(AuditIntegrityError):
-        decode_turn_evidence(chunk, env_ref_names=frozenset())
+        decode_turn_evidence(chunk, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
 
 
 def test_new_metadata_credentials_refuse_after_real_positive():
     evidence, messages, recorder, logical, _policy = rich_evidence()
     retained = snapshot(evidence, messages, recorder, logical)
     encode_turn_evidence(retained)
-    bad = retained.model_copy(update={"actor_user_id": "postgresql://user:secret@host/db"})  # secret-scan: allow-this-line
+    bad = retained.snapshot.model_copy(update={"actor_user_id": "postgresql://user:secret@host/db"})  # secret-scan: allow-this-line
     with pytest.raises(CredentialMaterialRefused):
-        encode_turn_evidence(bad)
+        admit_turn_evidence(bad, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
 
 
 def test_committed_history_refuses_without_erasing_its_actual_ids():
@@ -248,6 +255,8 @@ def test_model_copy_cannot_skip_complete_owned_frontier_admission():
     evidence, messages, recorder, logical, _policy = rich_evidence()
     retained = snapshot(evidence, messages, recorder, logical)
     encode_turn_evidence(retained)
-    corrupt = retained.model_copy(update={"effects": retained.effects.model_copy(update={"net_changed_fields": ("invented",)})})
+    corrupt = retained.snapshot.model_copy(
+        update={"effects": retained.snapshot.effects.model_copy(update={"net_changed_fields": ("invented",)})}
+    )
     with pytest.raises(AuditIntegrityError, match="complete owned DATA contract"):
-        encode_turn_evidence(corrupt)
+        admit_turn_evidence(corrupt, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)

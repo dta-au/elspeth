@@ -19,6 +19,7 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.application_finalizers import _FINALIZER_PHYSICAL_ISSUER_SEAL, ApplicationFinalizerCapability, ApplicationFinalizerOwner
 from elspeth.web.composer_watch_reads import _WATCH_REFUSAL_ISSUER_SEAL, ComposerOperationWatchReader
+from elspeth.web.continuation_retention_memo import prepare_retention_sql_callable
 from elspeth.web.execution_lease_cleanup import _EXECUTION_SQL_BRIDGE_ISSUER_SEAL, ExecutionLeaseSQLSubmission
 from elspeth.web.required_executor import (
     InvocationGate,
@@ -31,7 +32,7 @@ from elspeth.web.required_executor import (
     RequiredGenerationDrainExpired as RequiredGenerationDrainExpired,
 )
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
-from elspeth.web.required_work import RequiredWorkTicket
+from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 
 #: Threads in the process-wide worker pool.
 MAX_WORKERS: Final[int] = 16
@@ -404,8 +405,29 @@ async def run_required_sql_finish_once[**P, T](
     """Hand off a known actual SQL outcome without discarding it on cancellation."""
     _validate_finish_once_ticket(ticket)
     cancellations: list[asyncio.CancelledError] = []
+    operation = functools.partial(func, *args, **kwargs)
+    deadline_owner = ticket.sql_deadline_owner
+    if deadline_owner is not None:
+        from elspeth.web.sessions.locking import continuation_sql_deadline_scope
+
+        def invoke_with_deadline() -> T:
+            deadline_owner.validate_context(
+                ticket.key.authority.context,
+                operation_id=ticket.key.authority.durable_operation_id,
+                attempt=ticket.key.authority.claim_attempt,
+            )
+            with continuation_sql_deadline_scope(
+                deadline_owner,
+                lifecycle=ticket.key.source
+                in (RequiredWorkSource.LEASE_RENEWAL, RequiredWorkSource.LEASE_RELEASE, RequiredWorkSource.CONTINUATION_HANDOFF_SQL),
+            ):
+                return operation()
+
+        physical = invoke_with_deadline
+    else:
+        physical = operation
     try:
-        future = await _submit_shared(functools.partial(func, *args, **kwargs), ticket, deferred_cancellations=cancellations)
+        future = await _submit_shared(prepare_retention_sql_callable(physical), ticket, deferred_cancellations=cancellations)
     except BaseException as error:
         if not ticket.complete:
             # Unknown physical custody is never a successful service handoff.

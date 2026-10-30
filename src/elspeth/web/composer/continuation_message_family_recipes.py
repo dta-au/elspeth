@@ -63,3 +63,34 @@ class ToolCallArgumentsMessageRecipe(ContinuationValue):
         if self.argument_indexes != tuple(sorted(set(self.argument_indexes))) or any(index < 0 for index in self.argument_indexes):
             raise ValueError("ordinary argument positions must retain their original unique order")
         return self
+
+
+class ToolResultMessageRecipe(ContinuationValue):
+    """Original issued-call result selector; contains no saved prompt trust."""
+
+    kind: Literal["tool_result"] = "tool_result"
+    response: PrivateChunkRef
+    tool_index: int = Field(ge=0)
+    tool_call_id: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_complete_source(self) -> ToolResultMessageRecipe:
+        if self.response.codec != "composer.response.v1":
+            raise ValueError("tool result requires its original complete paid response")
+        return self
+
+
+class ToolFeedbackMessageRecipe(ContinuationValue):
+    """Issued feedback locator; the committed invocation supplies semantics."""
+
+    kind: Literal["tool_feedback"] = "tool_feedback"
+    response: PrivateChunkRef
+    tool_index: int = Field(ge=0)
+    tool_call_id: str = Field(min_length=1)
+    source: Literal["arg_error", "advisor_success"]
+
+    @model_validator(mode="after")
+    def require_complete_source(self) -> ToolFeedbackMessageRecipe:
+        if self.response.codec != "composer.response.v1":
+            raise ValueError("issued feedback requires its original complete paid response")
+        return self

@@ -38,6 +38,7 @@ from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.titles import format_default_session_title
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.continuation_inventory import inventory_work
+from tests.helpers.continuation_memo import RetentionMemoTrace
 from tests.helpers.continuation_policy import minimal_continuation_policy
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
@@ -124,9 +125,17 @@ async def publish(store, running, completed, service, work=None):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("eligible,bound_base", ((True, False), (False, True)))
 async def test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_preparation(
-    operation_store, monkeypatch, eligible, bound_base
+    operation_store, monkeypatch, eligible, bound_base, request
 ):
     running, completed, service, prior, base = await bootstrap_case(operation_store, eligible=eligible, bound_base=bound_base)
+    memo_trace = RetentionMemoTrace(
+        monkeypatch,
+        request,
+        require_snapshot_artifacts=True,
+        require_chunk_artifacts=True,
+        require_catalog_schema=True,
+        catalog=service._policy_context._catalog,
+    )
     sid = str(operation_store[4])
     # Seed the real in-memory disclosure owner as retained session DATA; this
     # test claims no new schema inspection/provider grant from that DATA.
@@ -187,6 +196,7 @@ async def test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_
         )
         replay_work.coordinator.assert_completed()
         assert replay == result and recovery_rows(operation_store[0]) == before
+        memo_trace.finish(stages=1, snapshot_artifact_budget=True, chunk_artifact_budget=True, catalog_schema_budget=True)
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -194,22 +204,30 @@ async def test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("eligible", (True, False))
 @pytest.mark.parametrize("cut", ("inserted", "published"))
-async def test_published_bootstrap_fresh_claim_uses_original_history_and_refuses_old_owner(operation_store, monkeypatch, eligible, cut):
+@pytest.mark.parametrize("handoff", ("release_then_recover", "live_handover"))
+async def test_published_bootstrap_fresh_claim_uses_original_history_and_refuses_old_owner(
+    operation_store, monkeypatch, eligible, cut, handoff
+):
     running, completed, service, _prior, _base = await bootstrap_case(operation_store, eligible=eligible)
     result = await publish(operation_store, running, completed, service) if cut == "published" else None
-    operation_store[1].release(running.session_operation_context)
+    if handoff == "live_handover":
+        # A live owner's handover writes recovery's exact transition (design §3.4 B).
+        operation_store[1].suspend_composer_segment(running)
+    else:
+        operation_store[1].release(running.session_operation_context)
     current = new_owners(operation_store)
     engine, repository, authority, _sessions, sid = current
-    assert (
-        repository.recover_composer_segment(
-            session_id=sid,
-            operation_id=running.claim.operation_id,
-            expected_generation=running.claim.ownership_generation,
-            actor_user_id="alice",
-            auth_provider_type="local",
+    if handoff == "release_then_recover":
+        assert (
+            repository.recover_composer_segment(
+                session_id=sid,
+                operation_id=running.claim.operation_id,
+                expected_generation=running.claim.ownership_generation,
+                actor_user_id="alice",
+                auth_provider_type="local",
+            )
+            is True
         )
-        is True
-    )
     (claim,) = authority.claim_segment(limit=1)
     context = repository.start_composer_segment(
         claim, owner_instance_id=authority._owner_instance_id, lease_seconds=30, auth_provider_type="local"
@@ -423,9 +441,10 @@ async def test_pretitle_cancel_joins_original_skill_preparation_without_publishi
 
 
 @pytest.mark.asyncio
-async def test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_original_failure(operation_store, monkeypatch):
+async def test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_original_failure(operation_store, monkeypatch, request):
     running, completed, service, _prior, _base = await bootstrap_case(operation_store)
     await service._maybe_upsert_skill_markdown_history()
+    memo_trace = RetentionMemoTrace(monkeypatch, request)
     original_append = sql_owner.append_complete_snapshot
     original = RuntimeError("failure after actual complete append")
     appended = []
@@ -446,6 +465,7 @@ async def test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_or
         assert appended[0].cursor == completed.snapshot.cursor + 1
         assert recovery_rows(operation_store[0]) == before
         work.coordinator.assert_completed()
+        memo_trace.finish(stages=1)
     finally:
         operation_store[1].release(running.session_operation_context)
 

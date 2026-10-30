@@ -26,9 +26,9 @@ from elspeth.web.sessions._persist_payload import (
     RejectionRecord,
     StatePayload,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_persist_compose_turn import _make_session, _test_compose_context
 
@@ -144,7 +144,7 @@ def test_rejection_record_links_to_state_current_at_rejection(service):
                 tool_call_id="tc_ok",
                 content='{"ok": true}',
                 composition_state_payload=StatePayload(
-                    data=CompositionStateData(),
+                    data=composition_state_data(),
                     derived_from_state_id=None,
                 ),
             ),

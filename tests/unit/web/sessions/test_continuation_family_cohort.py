@@ -30,7 +30,7 @@ async def actual_native_case(store, tmp_path, monkeypatch):
     published = await history.publish(store, arguments, runtime)
     current, cold = await history.append_actual_native_and_capture(store, arguments, runtime, published)
     assert len(sdk_calls) == 1
-    assert cold.source.evidence.recorder_json == cold.materialization.inputs.evidence.recorder_json
+    assert cold.source.admitted_evidence.recorder_chunk.canonical == cold.materialization.inputs.admitted_evidence.recorder_chunk.canonical
     return {
         "kwargs": {name: current[name] for name in ("service", "authority", "selected", "inventory", "required_work")},
         "shelf": cold.source.evidence.transcript,

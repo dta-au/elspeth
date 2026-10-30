@@ -13,6 +13,7 @@ import structlog
 from sqlalchemy import delete, inspect, select, update
 from sqlalchemy.exc import IntegrityError
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import composition_state_data
 
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -874,8 +875,12 @@ def test_v2_admission_disabled_exact_replay_ignores_new_seed_policy_and_current_
         changed = request.model_copy(update={"content": "changed", "state_id": uuid4()})
         with pytest.raises(ComposerOperationConflictError):
             admit(old_authority, sid, changed, lifecycle_version=2)
+        # D-2: the same bytes retried under the other lifecycle are the same
+        # request, matched by the stored row's own lifecycle hash.
+        replay_v1, fresh_v1 = admit(old_authority, sid, request)
+        assert not fresh_v1 and replay_v1 == first
         with pytest.raises(ComposerOperationConflictError):
-            admit(old_authority, sid, request)
+            admit(old_authority, sid, changed)
     finally:
         event.remove(engine, "before_cursor_execute", no_mode_read)
     assert _admission_rows(engine) == before
@@ -1337,12 +1342,13 @@ def test_v2_admission_actual_insert_conflict_replay_preserves_existing_bundle(op
     monkeypatch.setattr(module, "_read", initial_miss)
     event.listen(engine, "handle_error", capture_unique_refusal)
     try:
-        if lifecycle == 1:
-            with pytest.raises(ComposerOperationConflictError):
-                admit(authority, sid, request)
-        else:
-            replay, fresh = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
-            assert not fresh and replay == original
+        # D-2: a retry under either lifecycle replays the stored V2 bundle.
+        replay, fresh = (
+            admit(authority, sid, request)
+            if lifecycle == 1
+            else admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+        )
+        assert not fresh and replay == original
     finally:
         event.remove(engine, "handle_error", capture_unique_refusal)
     assert reads == [True, True] and errors == [False]
@@ -1401,21 +1407,20 @@ def failed():
 
 @pytest.mark.asyncio
 async def test_failure_history_counts_only_exact_session_fence_revisions(operation_store):
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     _engine, repository, authority, service, sid = operation_store
     initial = repository.acquire(
         session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
     )
     initial_state = await service.save_composition_state(
-        sid, CompositionStateData(), provenance="session_seed", session_operation_context=initial
+        sid, composition_state_data(), provenance="session_seed", session_operation_context=initial
     )
     repository.release(initial)
     record, running = start(operation_store, SendMessageRequest(operation_id=str(uuid4()), content="Build", state_id=initial_state.id))
     assert record.operation_id != running.session_operation_context.fence.operation_id
     for _ in range(2):
         last_owned = await service.save_composition_state(
-            sid, CompositionStateData(), provenance="session_seed", session_operation_context=running.session_operation_context
+            sid, composition_state_data(), provenance="session_seed", session_operation_context=running.session_operation_context
         )
     await service.fail_composer_async_operation(running, failure=failed())
     repository.release(running.session_operation_context)
@@ -1423,7 +1428,7 @@ async def test_failure_history_counts_only_exact_session_fence_revisions(operati
         session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
     )
     later_state = await service.save_composition_state(
-        sid, CompositionStateData(), provenance="session_seed", session_operation_context=later
+        sid, composition_state_data(), provenance="session_seed", session_operation_context=later
     )
     repository.release(later)
     (outcome,), cursor = authority.list_failure_outcomes(session_id=sid, actor_user_id="alice")
@@ -1922,7 +1927,6 @@ async def test_real_schema_cross_session_and_cross_operation_bindings_are_reject
     from sqlalchemy import insert
 
     from elspeth.web.sessions.models import message_ingress_receipts_table
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     engine, repository, authority, service, sid = operation_store
     other = repository.create_session_with_initial_fence(
@@ -1935,7 +1939,7 @@ async def test_real_schema_cross_session_and_cross_operation_bindings_are_reject
         other.id, "user", "Foreign", writer_principal="route_user_message", session_operation_context=foreign_context
     )
     state = await service.save_composition_state(
-        other.id, CompositionStateData(), provenance="session_seed", session_operation_context=foreign_context
+        other.id, composition_state_data(), provenance="session_seed", session_operation_context=foreign_context
     )
     repository.release(foreign_context)
     state_id = state.id
@@ -2230,14 +2234,14 @@ async def test_stop_between_fresh_read_and_retry_lock_refuses_success(operation_
 async def test_new_job_actor_and_base_foreign_keys_have_unmasked_negative_controls(operation_store):
     from sqlalchemy import insert
 
-    from elspeth.web.sessions.protocol import CompositionStateData
-
     engine, repository, authority, service, sid = operation_store
     parent, _fresh = admit(authority, sid)
     context = repository.acquire(
         session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
     )
-    state = await service.save_composition_state(sid, CompositionStateData(), provenance="session_seed", session_operation_context=context)
+    state = await service.save_composition_state(
+        sid, composition_state_data(), provenance="session_seed", session_operation_context=context
+    )
     repository.release(context)
     with engine.connect() as conn:
         template = dict(conn.execute(select(jobs).where(jobs.c.operation_id == parent.operation_id)).mappings().one())
@@ -2306,13 +2310,14 @@ async def test_final_job_base_delete_is_restricted_but_session_cascade_succeeds(
     from sqlalchemy import delete
 
     from elspeth.web.sessions.models import composition_states_table, sessions_table
-    from elspeth.web.sessions.protocol import CompositionStateData
 
     engine, repository, authority, service, sid = operation_store
     context = repository.acquire(
         session_id=sid, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="test-owner", lease_seconds=30
     )
-    state = await service.save_composition_state(sid, CompositionStateData(), provenance="session_seed", session_operation_context=context)
+    state = await service.save_composition_state(
+        sid, composition_state_data(), provenance="session_seed", session_operation_context=context
+    )
     repository.release(context)
     record, fresh = admit(authority, sid, SendMessageRequest(operation_id=str(uuid4()), content="Build", state_id=state.id))
     assert fresh and record.base_state_id == state.id

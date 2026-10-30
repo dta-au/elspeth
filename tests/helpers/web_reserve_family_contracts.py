@@ -499,6 +499,9 @@ def _provider_contracts():
                 assign(s("_admitted_ns"), c(0)),
                 assign(s("_undispatched_recurrence"), c(0)),
                 assign(s("_settlements"), c(0)),
+                annotate(s("continuation_title"), union(n("PreparedTitleProvider"), c(None)), c(None)),
+                annotate(s("continuation_title_selected"), union(n("StoredContinuationSnapshot"), c(None)), c(None)),
+                annotate(s("continuation_title_result"), union(n("TitleAuditSettlementRequest"), c(None)), c(None)),
             ],
         ),
         "ProviderCallCustody.required_work": (("self",), (), (), (), False, ("property",), [ret(s("_required_work"))]),
@@ -559,6 +562,20 @@ def _provider_contracts():
             [
                 iff(cmp(s("attempt"), ast.Is, c(None)), [ret()]),
                 iff(either(neg(s("_sdk_entered")), cmp(s("call"), ast.Is, c(None))), [raising(n("AuditIntegrityError"))]),
+                annotate(n("current_title"), union(n("TitleAuditSettlementRequest"), c(None)), c(None)),
+                iff(
+                    cmp(s("continuation_title_result"), ast.IsNot, c(None)),
+                    [
+                        ast.ImportFrom(
+                            module="elspeth.web.composer.continuation_title_provider",
+                            names=[ast.alias(name="refresh_current_title_settlement")],
+                            level=0,
+                        ),
+                        ast.ImportFrom(module="elspeth.web.sessions.service", names=[ast.alias(name="SessionServiceImpl")], level=0),
+                        iff(cmp(call("type", s("service")), ast.IsNot, n("SessionServiceImpl")), [raising(n("AuditIntegrityError"))]),
+                        assign(n("current_title"), await_(call("refresh_current_title_settlement", n("self")))),
+                    ],
+                ),
                 assign(n("binding"), s("required_work")),
                 annotate(n("projection"), ast.BinOp(left=n("RequiredWorkTicket"), op=ast.BitOr(), right=c(None)), c(None)),
                 iff(
@@ -581,20 +598,52 @@ def _provider_contracts():
                 (
                     "try",
                     [
-                        assign(
-                            seq(n("_"), n("cancellations")),
-                            await_(
-                                call(
-                                    s("_join"),
-                                    call(
-                                        a(s("service"), "finish_provider_attempt"),
-                                        session_operation_context=s("context"),
-                                        call=s("call"),
-                                        required_work=n("sql"),
+                        iff(
+                            cmp(s("continuation_title_result"), ast.Is, c(None)),
+                            [
+                                assign(
+                                    seq(n("_"), n("cancellations")),
+                                    await_(
+                                        call(
+                                            s("_join"),
+                                            call(
+                                                a(s("service"), "finish_provider_attempt"),
+                                                session_operation_context=s("context"),
+                                                call=s("call"),
+                                                required_work=n("sql"),
+                                            ),
+                                        )
                                     ),
-                                )
-                            ),
-                        )
+                                ),
+                            ],
+                            [
+                                ast.ImportFrom(
+                                    module="elspeth.web.sessions.service", names=[ast.alias(name="SessionServiceImpl")], level=0
+                                ),
+                                iff(
+                                    either(
+                                        cmp(call("type", s("service")), ast.IsNot, n("SessionServiceImpl")),
+                                        cmp(n("current_title"), ast.Is, c(None)),
+                                    ),
+                                    [raising(n("AuditIntegrityError"))],
+                                ),
+                                assign(
+                                    seq(n("_"), n("cancellations")),
+                                    await_(
+                                        call(
+                                            s("_join"),
+                                            call(
+                                                a(s("service"), "finish_provider_attempt"),
+                                                session_operation_context=s("context"),
+                                                call=a(n("current_title"), "audit_call"),
+                                                required_work=n("sql"),
+                                                continuation_title=n("current_title"),
+                                            ),
+                                        )
+                                    ),
+                                ),
+                            ],
+                        ),
                     ],
                     [
                         iff(
@@ -1630,6 +1679,8 @@ def _owned_method_definition_failures(unit, cls, method, slots):
         ("ProviderCallCustody", "_join"): "R",
         ("ProviderCallCustody", "join_title_update"): "R",
         ("SessionOperationLease", "create_task"): "T",
+        ("SessionOperationLease", "_consume_continuation_handoff"): "T",
+        ("SessionOperationLease", "consume_continuation_handoff"): "T",
     }.get((cls.name, method.name))
     supported_parameters = (
         not method.type_params
@@ -1640,8 +1691,26 @@ def _owned_method_definition_failures(unit, cls, method, slots):
         and method.type_params[0].bound is None
         and getattr(method.type_params[0], "default_value", None) is None
     )
+    handoff_header = {
+        ("SessionOperationLease", "_consume_continuation_handoff"): (
+            "async def _consume_continuation_handoff[T](self, action: Callable[[], T], outcome: list[T]) -> None:\n    pass\n"
+        ),
+        ("SessionOperationLease", "consume_continuation_handoff"): (
+            "async def consume_continuation_handoff[T](self, action: Callable[[], T]) -> T:\n    pass\n"
+        ),
+    }.get((cls.name, method.name))
+    supported_handoff_header = True
+    if handoff_header is not None:
+        expected = ast.parse(handoff_header).body[0]
+        supported_handoff_header = (
+            type(method) is ast.AsyncFunctionDef
+            and not method.decorator_list
+            and _same(method.args, expected.args)
+            and _same(method.returns, expected.returns)
+        )
     if (
         not supported_parameters
+        or not supported_handoff_header
         or method.type_comment is not None
         or not _postponed_annotations(unit)
         or method.name in set(slots) | {"__slots__"} | descriptor_names | default_names
@@ -1900,6 +1969,9 @@ def family_local_contracts(units):
                     "_undispatched_recurrence",
                     "attempt",
                     "call",
+                    "continuation_title",
+                    "continuation_title_result",
+                    "continuation_title_selected",
                 ),
             )
         )
@@ -1960,6 +2032,15 @@ def family_local_contracts(units):
             "elspeth.web.composer.provider_quota.ProviderCallCustody._join",
             "elspeth.web.composer.provider_quota.ProviderCallCustody.context",
             "elspeth.web.composer.provider_quota.ProviderCallCustody.service",
+            "elspeth.web.composer.provider_quota.ProviderCallCustody.continuation_title",
+            "elspeth.web.composer.provider_quota.ProviderCallCustody.continuation_title_selected",
+            "elspeth.web.composer.provider_quota.ProviderCallCustody.continuation_title_result",
+            "elspeth.web.sessions.continuation_title_provider.PreparedTitleProvider",
+            "elspeth.web.sessions.continuation_title_provider.TitleProviderAdmission",
+            "elspeth.web.sessions.continuation_title_provider.TitleAuditSettlementRequest",
+            "elspeth.web.composer.continuation_clock.ContinuationActionClock",
+            "elspeth.web.composer.continuation_title_provider.retain_current_title_success",
+            "elspeth.web.composer.continuation_title_provider.refresh_current_title_settlement",
         }
     )
     roots.update(

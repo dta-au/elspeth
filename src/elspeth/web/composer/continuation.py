@@ -72,7 +72,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.messages.v1",
         "composer.tools.v1",
         "composer.state.v1",
-        "composer.evidence.v1",
+        "composer.evidence.v2",
         "composer.audit-buffer.v1",
         "composer.transcript.v1",
         "composer.tool-batch.v1",
@@ -172,6 +172,12 @@ class ComposeFrame(ContinuationProviderFrame):
     advisor_repair_context_introduced: bool
     pending_advisor_elision_indices: tuple[int, ...]
     pending_response: PrivateChunkRef | None
+
+    @model_validator(mode="after")
+    def require_evidence_recorder_codecs(self) -> ComposeFrame:
+        if self.evidence.codec != "composer.evidence.v2" or self.audit_buffer.codec != "composer.audit-buffer.v1":
+            raise ValueError("Compose frame changed its closed evidence/recorder source roles")
+        return self
 
 
 class ToolBatchFrame(ContinuationValue):

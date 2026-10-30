@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
-from hashlib import sha256
 
-from sqlalchemy import Connection, select
+from sqlalchemy import Connection
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import (
     AdvisorFrame,
@@ -23,14 +23,15 @@ from elspeth.web.composer.continuation_codec import (
     encode_continuation_snapshot,
     verify_private_chunk,
 )
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     StoredContinuationSnapshot,
     _require_current_continuation_running,
     load_snapshot,
+    read_private_chunk,
 )
-from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 
 
 def required_private_chunks(stack: ContinuationFrameStack) -> tuple[PrivateChunkRef, ...]:
@@ -98,7 +99,7 @@ def required_private_chunks(stack: ContinuationFrameStack) -> tuple[PrivateChunk
 
 
 def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
-    """Only the installed closed END/Advisor schemas introduce E1 edges.
+    """Only the closed END/Advisor and application-record schemas add edges.
 
     Their admitted edge codecs exclude END and Advisor, so self/cross cycles
     cannot be expressed by valid source values. Never discover refs by walking
@@ -109,6 +110,26 @@ def nested_private_chunks(chunk: PrivateChunk) -> tuple[PrivateChunkRef, ...]:
 
     if type(chunk) is not PrivateChunk:
         raise AuditIntegrityError("nested private selection requires its actual chunk")
+    if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
+        utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
+    ):
+        raise AuditIntegrityError("nested private source exceeds its complete document bound")
+    if chunk.reference.codec == "composer.evidence.v2":
+        from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
+
+        try:
+            snapshot = TurnEvidenceSnapshot.model_validate_json(chunk.canonical)
+        except (ValueError, TypeError) as error:
+            raise AuditIntegrityError("private evidence dependency walk lost its closed original schema") from error
+        entry = snapshot.application_entry
+        return (
+            snapshot.recorder,
+            *tuple(
+                reference
+                for record in (() if entry is None else entry.applications)
+                for reference in (record.response, record.pending_batch, record.prepared_input, record.result)
+            ),
+        )
     if chunk.reference.codec == "composer.end.v1":
         candidate = decode_end_candidate(chunk)
         refs = [candidate.response, candidate.state, candidate.evidence, candidate.iteration]
@@ -139,6 +160,8 @@ def require_private_chunk_closure(stack: ContinuationFrameStack, values: tuple[P
     position = 0
     while pending:
         reference = pending.popleft()
+        if not 0 <= reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            raise AuditIntegrityError("selected private source exceeds its complete document bound")
         key = reference.codec, reference.digest
         previous = seen.get(key)
         if previous is not None:
@@ -150,6 +173,8 @@ def require_private_chunk_closure(stack: ContinuationFrameStack, values: tuple[P
         chunk = values[position]
         if type(chunk) is not PrivateChunk or chunk.reference != reference:
             raise AuditIntegrityError("selected DATA substituted its ordered chunk reference")
+        if utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != reference.byte_length:
+            raise AuditIntegrityError("selected DATA changed its bounded original bytes")
         verify_private_chunk(reference, chunk.canonical)
         seen[key] = reference
         position += 1
@@ -211,26 +236,17 @@ def load_private_chunks(conn: Connection, *, session_id: str, operation_id: str,
     pending = deque(required_private_chunks(stack))
     while pending:
         ref = pending.popleft()
+        if not 0 <= ref.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
+            raise AuditIntegrityError("selected private source exceeds its complete document bound")
         identity = ref.codec, ref.digest
         previous = loaded.get(identity)
         if previous is not None:
             if previous.reference != ref:
                 raise AuditIntegrityError("nested private reference changed its exact retained byte bound")
             continue
-        key = f"value:{ref.codec}:{ref.digest}"
-        row = conn.execute(
-            select(chunks).where(chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == key)
-        ).one_or_none()
-        if (
-            row is None
-            or row.codec != ref.codec
-            or type(row.payload) is not bytes
-            or row.byte_length != len(row.payload)
-            or row.sha256 != sha256(row.payload).hexdigest()
-        ):
-            raise AuditIntegrityError("selected private chunk SQL binding mismatch")
+        payload = read_private_chunk(conn, session_id=sid, operation_id=operation_id, reference=ref)
         try:
-            canonical = row.payload.decode("utf-8", errors="strict")
+            canonical = payload.decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise AuditIntegrityError("selected private chunk is not strict UTF-8") from error
         verify_private_chunk(ref, canonical)

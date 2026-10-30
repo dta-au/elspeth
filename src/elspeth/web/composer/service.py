@@ -19,15 +19,18 @@ import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, NoReturn, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.sessions.protocol import (
         SessionServiceProtocol,
     )
@@ -37,7 +40,7 @@ import structlog
 from openai import OpenAIError
 from opentelemetry import metrics
 from sqlalchemy import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from elspeth.contracts.blobs import BlobServiceProtocol
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
@@ -51,10 +54,13 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
+    PROMPT_GUARD_THINKING_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
+    GuardedProviderMessage,
     PromptGuardContentPart,
+    PromptGuardTrust,
     detach_prompt_guard_evidence,
-    detach_prompt_guard_messages,
+    validate_prompt_guard_messages,
 )
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -116,6 +122,7 @@ from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
 )
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.progress import (
     convergence_progress_event,
     emit_progress,
@@ -129,6 +136,8 @@ from elspeth.web.composer.prompts import (
 )
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_MESSAGE_ID_KEY,
+    ComposerAdmissionRefused,
+    ComposerContextUnsupported,
     ComposerConvergenceError,
     ComposerHistoryMessage,
     ComposerMutationAuthorityRevoked,
@@ -317,16 +326,19 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
 
 
 _REPLY_ONLY_HISTORY_PREFIX = "Historical tool protocol record (quoted data):\n"
+_REPLY_ONLY_HISTORY_SUFFIX = "\n[End historical tool evidence; this was not a current assistant reply.]"
 
 
-def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: TurnEvidence | None = None) -> list[dict[str, Any]]:
+def _reply_only_messages(
+    llm_messages: Sequence[GuardedProviderMessage], *, turn_evidence: TurnEvidence | None = None
+) -> list[GuardedProviderMessage]:
     """Retain attributed tool evidence as quoted data when no tools are advertised."""
     # Native thinking belongs to the original complete assistant/tool exchange.
     # The caller's explicit recovery-only palette still controls new actions.
-    native_evidence = detach_prompt_guard_evidence(llm_messages)
-    if any(entry is not None for entry in native_evidence.thinking_parts):
+    validate_prompt_guard_messages(llm_messages)
+    if any(PROMPT_GUARD_THINKING_PARTS_KEY in message and message[PROMPT_GUARD_THINKING_PARTS_KEY] is not None for message in llm_messages):
         return list(llm_messages)
-    messages: list[dict[str, Any]] = []
+    messages: list[GuardedProviderMessage] = []
     for historical_message in llm_messages:
         if historical_message["role"] != "tool" and "tool_calls" not in historical_message:
             messages.append(historical_message)
@@ -338,13 +350,15 @@ def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: T
         if content_parts is not None:
             string_parts[("content",)] = content_parts
         elif evidence.trusted_message_indexes and "content" in wire and type(wire["content"]) is str:
-            string_parts[("content",)] = (PromptGuardContentPart(wire["content"], historical_message[PROMPT_GUARD_TRUST_KEY]),)
+            string_parts[("content",)] = (
+                PromptGuardContentPart(wire["content"], cast(PromptGuardTrust, historical_message[PROMPT_GUARD_TRUST_KEY])),
+            )
         arguments = evidence.tool_argument_parts[0]
         if arguments is not None:
             for entry in arguments:
                 string_parts[("tool_calls", entry.tool_call_index, "function", "arguments")] = entry.parts
         serialized = json.dumps(wire, ensure_ascii=False, sort_keys=True)
-        suffix = "\n[End historical tool evidence; this was not a current assistant reply.]"
+        suffix = _REPLY_ONLY_HISTORY_SUFFIX
         quoted_parts = (
             PromptGuardContentPart(_REPLY_ONLY_HISTORY_PREFIX),
             *json_content_parts(serialized, ensure_ascii=False, sort_keys=True, string_parts=string_parts),
@@ -361,7 +375,7 @@ def _reply_only_messages(llm_messages: list[dict[str, Any]], *, turn_evidence: T
             turn_evidence.register_quoted_inspection(
                 tool_call_id=wire["tool_call_id"],
                 original_content=wire["content"],
-                quoted_role=quoted_role,
+                quoted_role="user",
                 quoted_content=quoted_content,
             )
         messages.append({"role": quoted_role, "content": quoted_content, PROMPT_GUARD_CONTENT_PARTS_KEY: quoted_parts})
@@ -596,16 +610,13 @@ class ComposerServiceImpl:
         )
         self._chargeable_admission = ComposerChargeableAdmission(sessions_service)
         self._model = settings.composer_model
-        # The tool-contract dialect of each route, resolved once from the
+        # The compose loop's tool-contract dialect, resolved once from the
         # settings and the process environment (S1 T8, D20; the boot probe
         # resolves through the same helper). ``_planner_dialect`` is the single
-        # resolution point for the compose loop and the pipeline planner's
-        # ordinary turns: the loop builds the list it sends and decode reads
-        # the dialect from this one value. The planner's escape-hatch
-        # (advisor) route has its own.
+        # resolution point for the compose loop: the loop builds the list it
+        # sends and decode reads the dialect from this one value.
         tool_contract = resolve_composer_tool_contract(settings, env=os.environ)
         self._planner_dialect = tool_contract.planner.dialect
-        self._hatch_dialect = tool_contract.hatch.dialect
         loop_tools = composer_loop_tool_definitions(self._planner_dialect)
         self._tool_contract_summary = ComposerToolContractSummary(
             contract=tool_contract,
@@ -620,9 +631,6 @@ class ComposerServiceImpl:
             planner_transport=tool_contract.planner.resolution.transport.value,
             planner_dialect=tool_contract.planner.dialect.value,
             planner_diagnostic=_diagnostic_value(tool_contract.planner.resolution.diagnostic),
-            hatch_transport=tool_contract.hatch.resolution.transport.value,
-            hatch_dialect=tool_contract.hatch.dialect.value,
-            hatch_diagnostic=_diagnostic_value(tool_contract.hatch.resolution.diagnostic),
             loop_strict_tool_count=self._tool_contract_summary.loop_strict_tool_count,
             loop_tool_count=self._tool_contract_summary.loop_tool_count,
         )
@@ -1342,7 +1350,7 @@ class ComposerServiceImpl:
                     ),
                 )
                 raise
-            except PromptGuardRefused:
+            except (PromptGuardRefused, ComposerContextUnsupported):
                 # Each invocation owner captured its exact undrained evidence.
                 # A completed planner drain must remain empty here.
                 raise
@@ -1405,27 +1413,49 @@ class ComposerServiceImpl:
         tools: list[dict[str, Any]],
         recorder: BufferingRecorder,
         turn_evidence: TurnEvidence | None,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None]:
+        state: CompositionState,
+        failed_turn: FailedTurnMetadata | None,
+        reply_only: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], BlobDeliveryAttempt | None, PreparedProviderInput]:
         """Freeze the selected input and derive the gateway's exact marked hash."""
-        from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
-
-        selected_messages, selected_tools = deepcopy(messages), deepcopy(tools)
         delivery = None
         if turn_evidence is not None:
             turn_evidence.transcript.observe_messages(messages)
-            marked_messages, marked_tools = selected_messages, selected_tools
-            if supports_anthropic_prompt_cache_markers(self._model):
-                marked_messages, marked_tools_or_none = apply_anthropic_cache_markers(
-                    selected_messages, selected_tools, mark_history_tail=True
+        try:
+            if reply_only:
+                prepared, framed = self._provider_gateway.prepare_reply_input(
+                    messages,
+                    tools,
+                    instruction=reply_instruction_message(),
+                    prefix=_REPLY_ONLY_HISTORY_PREFIX,
+                    suffix=_REPLY_ONLY_HISTORY_SUFFIX,
+                    frame_one=lambda message: _reply_only_messages((message,))[0],
+                    frame_all=lambda: _reply_only_messages(messages, turn_evidence=turn_evidence),
                 )
-                marked_tools = marked_tools_or_none if marked_tools_or_none is not None else selected_tools
+                if turn_evidence is not None:
+                    turn_evidence.transcript.observe_messages(framed)
+            else:
+                prepared = self._provider_gateway.prepare_loop_input(messages, tools)
+        except ComposerContextUnsupported as refused:
+            # This owner now prepares before the physical audit/deadline
+            # wrapper. Retain its existing persisted-state baseline and exact
+            # physical calls without replaying completed tool effects.
+            raise refused.with_evidence(
+                state=state, initial_version=state.version, llm_calls=recorder.llm_calls, failed_turn=failed_turn
+            ) from refused
+        except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as refused:
+            attach_llm_calls(refused, recorder)
+            raise
+        selected_messages = prepared.evidence.messages
+        selected_tools = prepared.tools if prepared.tools is not None else []
+        if turn_evidence is not None:
             delivery = turn_evidence.prepare_delivery(
-                detach_prompt_guard_messages(marked_messages)[0],
+                selected_messages,
                 previous_calls=recorder.llm_calls,
-                tools=marked_tools or None,
+                tools=prepared.tools,
                 scope="primary",
             )
-        return selected_messages, selected_tools, delivery
+        return selected_messages, selected_tools, delivery, prepared
 
     async def _call_model_turn(
         self,
@@ -1459,8 +1489,8 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        selected_messages, selected_tools, delivery = self._prepare_primary_delivery(
-            messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+        selected_messages, selected_tools, delivery, prepared_input = self._prepare_primary_delivery(
+            messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence, state=state, failed_turn=failed_turn
         )
         if provider_owner is None:
             # Existing completion hooks remain the warm/legacy boundary.
@@ -1475,6 +1505,7 @@ class ComposerServiceImpl:
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
                 provider_owner=provider_owner,
+                prepared_input=prepared_input,
             )
             outcome = _CallModelOutcome(completion=completion)
         else:
@@ -1489,6 +1520,7 @@ class ComposerServiceImpl:
                 discovery_turns_used=discovery_turns_used,
                 failed_turn=failed_turn,
                 provider_owner=provider_owner,
+                prepared_input=prepared_input,
             )
             completion = outcome.completion
         assistant_tool_calls = completion.tool_batch.calls
@@ -1537,6 +1569,7 @@ class ComposerServiceImpl:
         advisor_repair_context_introduced: bool = False,
         required_work: RequiredWorkBinding | None = None,
         turn_evidence: TurnEvidence | None = None,
+        continuation: ContinuationLiveP4 | None = None,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
         from elspeth.web.composer.turn_audit import persist_turn_audit
@@ -1582,6 +1615,7 @@ class ComposerServiceImpl:
             assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
             required_work=required_work,
             turn_evidence=turn_evidence,
+            continuation=continuation,
         )
 
     async def _dispatch_tool_batch(
@@ -1988,14 +2022,15 @@ class ComposerServiceImpl:
                 # blocks on providers such as Bedrock Converse. Preserve each
                 # complete historical record as attributed text instead; the
                 # planning/audit history stays unchanged and no tool is enabled.
-                reply_messages = _reply_only_messages(llm_messages, turn_evidence=turn_evidence)
-                reply_messages.append(reply_instruction_message())
                 provider_failures: tuple[type[Exception], ...] = (TimeoutError, _BadRequestLLMError, *advisor_provider_failure_types())
-                selected_reply_messages, selected_reply_tools, reply_delivery = self._prepare_primary_delivery(
-                    messages=reply_messages,
+                selected_reply_messages, selected_reply_tools, reply_delivery, reply_input = self._prepare_primary_delivery(
+                    messages=llm_messages,
                     tools=recovery_tool_definitions(self._planner_dialect),
                     recorder=recorder,
                     turn_evidence=turn_evidence,
+                    state=state,
+                    failed_turn=failed_turn,
+                    reply_only=True,
                 )
                 if remaining > 0:
                     await emit_progress(
@@ -2014,6 +2049,7 @@ class ComposerServiceImpl:
                             timeout=remaining,
                             recorder=recorder,
                             provider_custody=self._new_primary_custody(provider_owner),
+                            prepared_input=reply_input,
                         )
                     except provider_failures:
                         # The call audit retains the failure; a trusted notice
@@ -2187,8 +2223,8 @@ class ComposerServiceImpl:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
                 await emit_progress(progress, model_call_progress_event(message))
-                selected_final_messages, selected_final_tools, final_delivery = self._prepare_primary_delivery(
-                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence
+                selected_final_messages, selected_final_tools, final_delivery, final_input = self._prepare_primary_delivery(
+                    messages=llm_messages, tools=tools, recorder=recorder, turn_evidence=turn_evidence, state=state, failed_turn=failed_turn
                 )
                 completion = await self._call_llm_before_deadline(
                     selected_final_messages,
@@ -2203,6 +2239,7 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                     provider_owner=provider_owner,
+                    prepared_input=final_input,
                 )
                 recovery_result = self._terminal_recovery_result(
                     completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
@@ -2639,6 +2676,28 @@ class ComposerServiceImpl:
             if result is not None:
                 return result
 
+    async def advance_continuation_phase(
+        self,
+        *,
+        owner: ContinuationLivePhases,
+        authority: ComposerAsyncOperationAuthority,
+        selected: SelectedContinuationState,
+        work: RequiredWorkBinding,
+        provider_owner: ProviderInvocationOwner,
+    ) -> None:
+        """Enter the retained phase owner without re-entering legacy PRIMARY."""
+        from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+
+        if (
+            type(owner) is not ContinuationLivePhases
+            or owner.service is not self
+            or owner.authority is not authority
+            or owner.work is not work
+            or owner.provider_owner is not provider_owner
+        ):
+            raise AuditIntegrityError("continuation service dispatch changed its actual live owners")
+        await owner.advance(selected)
+
     async def _advance_live_compose_iteration(
         self,
         live: _ComposeIterationState,
@@ -2946,30 +3005,85 @@ class ComposerServiceImpl:
                         # checkpoint failure propagates after this mandatory work.
                         early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
                         turn_evidence.transcript.observe_messages(llm_messages)
-                        persist_result = await self._persist_turn_audit(
-                            tool_outcomes=dispatch_result.tool_outcomes,
-                            mutation_ceiling=mutation_ceiling,
-                            authority_revocation=dispatch_result.authority_revocation,
-                            base_state=_state,
-                            decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
-                            private_authorings=dispatch_result.private_authorings,
-                            private_invocations=dispatch_result.private_invocations,
-                            assistant_message=dispatch_result.assistant_message,
-                            raw_assistant_content=dispatch_result.raw_assistant_content,
-                            assistant_tool_calls=dispatch_result.assistant_tool_calls,
-                            crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
-                            session_id=session_id,
-                            session_operation_context=session_operation_context,
-                            current_state_id=_current_state_id,
-                            persisted_tool_call_turn=_persisted_tool_call_turn,
-                            persisted_assistant_message_id=_persisted_assistant_message_id,
-                            persisted_assistant_content=_persisted_assistant_content,
-                            ingress=ingress,
-                            chat_ingress_inputs=chat_ingress_inputs,
-                            advisor_repair_context_introduced=_advisor_repair_context_introduced,
-                            required_work=required_work,
-                            turn_evidence=turn_evidence,
-                        )
+                        try:
+                            persist_result = await self._persist_turn_audit(
+                                tool_outcomes=dispatch_result.tool_outcomes,
+                                mutation_ceiling=mutation_ceiling,
+                                authority_revocation=dispatch_result.authority_revocation,
+                                base_state=_state,
+                                decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
+                                private_authorings=dispatch_result.private_authorings,
+                                private_invocations=dispatch_result.private_invocations,
+                                assistant_message=dispatch_result.assistant_message,
+                                raw_assistant_content=dispatch_result.raw_assistant_content,
+                                assistant_tool_calls=dispatch_result.assistant_tool_calls,
+                                crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
+                                session_id=session_id,
+                                session_operation_context=session_operation_context,
+                                current_state_id=_current_state_id,
+                                persisted_tool_call_turn=_persisted_tool_call_turn,
+                                persisted_assistant_message_id=_persisted_assistant_message_id,
+                                persisted_assistant_content=_persisted_assistant_content,
+                                ingress=ingress,
+                                chat_ingress_inputs=chat_ingress_inputs,
+                                advisor_repair_context_introduced=_advisor_repair_context_introduced,
+                                required_work=required_work,
+                                turn_evidence=turn_evidence,
+                            )
+                        except (AuditIntegrityError, IntegrityError) as p4_direct_failure:
+                            refused = dispatch_result.advisor_failure
+                            if not isinstance(refused, ComposerContextUnsupported):
+                                raise
+                            if isinstance(p4_direct_failure, IntegrityError):
+                                # The SQL transaction owner rethrows this native
+                                # constraint failure only after rollback. Retain
+                                # that exact SQL error under integrity primacy.
+                                current_publication_failure = AuditIntegrityError(
+                                    "Advisor failure audit row could not be persisted",
+                                    failed_turn=FailedTurnMetadata(
+                                        assistant_message_id=None,
+                                        tool_calls_attempted=len(dispatch_result.assistant_tool_calls),
+                                        tool_responses_persisted=0,
+                                    ),
+                                )
+                                previous_cause: BaseException | None = p4_direct_failure
+                                unpublished = True
+                            else:
+                                current_publication_failure = p4_direct_failure
+                                previous_cause = p4_direct_failure.__cause__
+                                failed_publication = p4_direct_failure.failed_turn
+                                unpublished = (
+                                    isinstance(previous_cause, SQLAlchemyError)
+                                    and type(failed_publication) is FailedTurnMetadata
+                                    and failed_publication.assistant_message_id is None
+                                    and failed_publication.tool_responses_persisted == 0
+                                )
+                            current_publication_failure.__cause__ = (
+                                refused
+                                if previous_cause is None
+                                else BaseExceptionGroup("Advisor refusal and original P4 failure", (refused, previous_cause))
+                            )
+                            if not unpublished:
+                                # A throw alone does not prove rollback. In
+                                # particular, never replay a committed P4 after
+                                # a later outcome/projection validation failure,
+                                # or infer rollback from forensic metadata alone.
+                                raise
+                            # Native SQL failure plus the P4 owner's zero-row
+                            # disposition preserve the exact current suffix for
+                            # the existing audit-only recovery consumer.
+                            current_invocations = recorder.invocations[invocation_start:]
+                            if tuple(item.tool_call_id for item in current_invocations) != tuple(
+                                outcome.call.id for outcome in dispatch_result.tool_outcomes
+                            ):
+                                raise InvariantError(
+                                    "Advisor publication failure lost its exact current invocation cohort"
+                                ) from p4_direct_failure
+                            raise ComposerToolFailure(
+                                current_publication_failure,
+                                tool_invocations=current_invocations,
+                                llm_calls=recorder.llm_calls,
+                            ) from current_publication_failure
                         if diagnostics is not None:
                             diagnostics.redacted_assistant_tool_calls = persist_result.redacted_assistant_tool_calls
                             diagnostics.redacted_tool_rows = persist_result.redacted_tool_rows
@@ -3126,16 +3240,43 @@ class ComposerServiceImpl:
                 if dispatch.advisor_failure is not None:
                     # The advisor boundary deliberately preserves unclassified
                     # controlled-code faults instead of laundering them into a
-                    # provider outage. P3 has already recorded PLUGIN_CRASH and
-                    # P4 has published that tool row. A failed unwind publication
-                    # is a new Tier-1 integrity fault and therefore takes primacy;
-                    # otherwise re-raise the exact original exception object.
+                    # provider outage. P3 closed the current invocation, and P4
+                    # reported its publication disposition. Failed publication
+                    # is a Tier-1 integrity fault that takes primacy while the
+                    # audit-only recovery owner retains unpublished evidence.
                     if persist.unwind_audit_failed:
-                        raise AuditIntegrityError(
+                        publication_failure = AuditIntegrityError(
                             "Advisor failure audit row could not be persisted",
                             failed_turn=failed_turn,
-                        ) from dispatch.advisor_failure
-                    if isinstance(dispatch.advisor_failure, PromptGuardRefused):
+                        )
+                        if isinstance(dispatch.advisor_failure, ComposerContextUnsupported):
+                            # P4 explicitly rolled back this issued batch. The
+                            # recorder is request-cumulative, so recover only
+                            # the current dispatch's original invocation cohort.
+                            # The audit-only route consumer must never replay a
+                            # previous successful P4 or save rolled-back state.
+                            current_invocations = dispatch.private_invocations
+                            if tuple(item.tool_call_id for item in current_invocations) != tuple(
+                                outcome.call.id for outcome in dispatch.tool_outcomes
+                            ):
+                                raise InvariantError("Advisor rollback lost its exact current invocation cohort")
+                            retained_failures: tuple[BaseException, ...] = (dispatch.advisor_failure,)
+                            if persist.effect_verification_failure is not None:
+                                retained_failures += (persist.effect_verification_failure,)
+                            if deferred_cancel is not None:
+                                retained_failures += (deferred_cancel,)
+                            publication_failure.__cause__ = (
+                                retained_failures[0]
+                                if len(retained_failures) == 1
+                                else BaseExceptionGroup("Advisor refusal and P4 rollback outcomes", retained_failures)
+                            )
+                            raise ComposerToolFailure(
+                                publication_failure,
+                                tool_invocations=current_invocations,
+                                llm_calls=recorder.llm_calls,
+                            ) from publication_failure
+                        raise publication_failure from dispatch.advisor_failure
+                    if isinstance(dispatch.advisor_failure, (PromptGuardRefused, ComposerContextUnsupported)):
                         advisor_refusal = dispatch.advisor_failure.with_evidence(
                             state=state,
                             initial_version=state.version,
@@ -3143,6 +3284,21 @@ class ComposerServiceImpl:
                             llm_calls=recorder.llm_calls,
                             failed_turn=failed_turn,
                         )
+                        advisor_refusal.__cause__ = dispatch.advisor_failure
+                        if deferred_cancel is not None and isinstance(advisor_refusal, ComposerContextUnsupported):
+                            # Required P4 work has completed, but an input
+                            # refusal cannot consume the caller's cancellation.
+                            # Keep the refusal and required-effect failure in
+                            # its cause, where integrity reduction still wins.
+                            attach_llm_calls(deferred_cancel, recorder)
+                            cancellation_causes: tuple[BaseException, ...] = (advisor_refusal,)
+                            if persist.effect_verification_failure is not None:
+                                cancellation_causes += (persist.effect_verification_failure,)
+                            if deferred_cancel.__cause__ is not None:
+                                cancellation_causes += (deferred_cancel.__cause__,)
+                            raise deferred_cancel from BaseExceptionGroup(
+                                "Manual Advisor context refusal and deferred cancellation outcomes", cancellation_causes
+                            )
                         if persist.effect_verification_failure is not None:
                             advisor_refusal.__cause__ = dispatch.advisor_failure
                             raise BaseExceptionGroup(
@@ -3175,7 +3331,7 @@ class ComposerServiceImpl:
                     raise deferred_cancel
 
                 if early_checkpoint_failure is not None:
-                    if isinstance(early_checkpoint_failure, PromptGuardRefused):
+                    if isinstance(early_checkpoint_failure, (PromptGuardRefused, ComposerContextUnsupported)):
                         early_refusal = early_checkpoint_failure.with_evidence(
                             state=state,
                             initial_version=state.version,
@@ -3418,6 +3574,7 @@ class ComposerServiceImpl:
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         """Preserve the completion-returning deadline boundary."""
         outcome = await self._call_llm_outcome_before_deadline(
@@ -3431,6 +3588,7 @@ class ComposerServiceImpl:
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
             provider_owner=provider_owner,
+            prepared_input=prepared_input,
         )
         return outcome.completion
 
@@ -3447,6 +3605,7 @@ class ComposerServiceImpl:
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
         provider_owner: ProviderInvocationOwner | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _CallModelOutcome:
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -3500,9 +3659,18 @@ class ComposerServiceImpl:
                     failed_turn=failed_turn,
                 )
             try:
+                if attempt and prepared_input is not None:
+                    prepared_input = self._provider_gateway.reprepare_input(prepared_input)
+                    messages = prepared_input.evidence.messages
+                    tools = prepared_input.tools if prepared_input.tools is not None else []
                 if provider_custody is None:
                     completion = await self._provider_gateway._call_llm_with_audit(
-                        messages, tools, timeout=remaining, recorder=recorder, credential_state=state
+                        messages,
+                        tools,
+                        timeout=remaining,
+                        recorder=recorder,
+                        credential_state=state,
+                        prepared_input=prepared_input,
                     )
                     return _CallModelOutcome(completion=completion)
                 return await self._provider_gateway._call_llm_outcome_with_audit(
@@ -3512,8 +3680,9 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     provider_custody=provider_custody,
                     credential_state=state,
+                    prepared_input=prepared_input,
                 )
-            except PromptGuardRefused as exc:
+            except (PromptGuardRefused, ComposerContextUnsupported) as exc:
                 raise exc.with_evidence(
                     state=state,
                     initial_version=state.version,
@@ -3552,6 +3721,11 @@ class ComposerServiceImpl:
                 # A previous failed physical attempt has already been settled
                 # before the retry admission decision. Preserve its buffered
                 # audit sidecar without inventing a new call for the refusal.
+                attach_llm_calls(exc, recorder)
+                raise
+            except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as exc:
+                # Retry preparation is outside the gateway audit body. Its
+                # credential/native refusal still retains earlier attempts.
                 attach_llm_calls(exc, recorder)
                 raise
             except OpenAIError as exc:

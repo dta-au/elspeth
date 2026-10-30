@@ -46,7 +46,7 @@ class ContinuationAdvisorInvocation(ContinuationValue):
     def require_closed_source(self) -> Self:
         expected = (
             (self.state, "composer.state.v1"),
-            (self.evidence, "composer.evidence.v1"),
+            (self.evidence, "composer.evidence.v2"),
             (self.transcript, "composer.transcript.v1"),
             (self.iteration, "composer.iteration.v1"),
         )

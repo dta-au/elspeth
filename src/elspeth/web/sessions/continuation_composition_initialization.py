@@ -345,8 +345,8 @@ def _require_first_values(source: CurrentCompositionInitializationSource) -> Non
         or frame.bootstrap != source.bootstrap.reference
     ):
         raise AuditIntegrityError("first Compose changed its exact original state/reference relation")
-    evidence = decode_turn_evidence(_chunk(selected, frame.evidence), env_ref_names=names)
-    _require_first_values_from_evidence(source, evidence)
+    evidence = decode_turn_evidence(_chunk(selected, frame.evidence), env_ref_names=names, source_chunks=selected.chunks)
+    _require_first_values_from_evidence(source, evidence.snapshot)
 
 
 def _require_first_values_from_evidence(source: CurrentCompositionInitializationSource, evidence: TurnEvidenceSnapshot) -> None:
@@ -369,7 +369,7 @@ def _require_first_values_from_evidence(source: CurrentCompositionInitialization
     ):
         raise AuditIntegrityError("first Compose changed its exact original state/reference relation")
     empty_audit = encode_recorder_snapshot(BufferingRecorder().snapshot_for_continuation(drained=RecorderDrainCursors()))
-    if _chunk(selected, frame.audit_buffer) != empty_audit or evidence.recorder_json != empty_audit.canonical:
+    if _chunk(selected, frame.audit_buffer) != empty_audit or evidence.recorder != empty_audit.reference:
         raise AuditIntegrityError("first Compose has a prior recorder or changed drain history")
     effects = evidence.effects
     if (
