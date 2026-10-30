@@ -265,6 +265,16 @@ def parse_findings(payload: str, *, tree_root: Path) -> list[FindingRecord]:
     return findings
 
 
+def validate_scan_result(payload: str, *, returncode: int, tree_root: Path) -> list[FindingRecord]:
+    """Require a complete JSON corpus whose severity agrees with the native exit."""
+    if returncode not in (0, 1):
+        raise RatchetError(f"elspeth-lints check exited {returncode} in {tree_root}")
+    findings = parse_findings(payload, tree_root=tree_root)
+    if returncode != int(any(finding.gates for finding in findings)):
+        raise RatchetError("lint exit status disagrees with the measured JSON finding corpus")
+    return findings
+
+
 def lint_environment() -> dict[str, str]:
     """Pinned keyless mode; never forward an operator key into either scan."""
     if OPERATOR_KEY_ENV in os.environ:
@@ -319,11 +329,10 @@ def run_tier_model_check(tree_root: Path, *, python: str) -> tuple[list[FindingR
         text=True,
         check=False,
     )
-    if completed.returncode not in (0, 1):
-        raise RatchetError(f"elspeth-lints check exited {completed.returncode} in {tree_root}:\n{completed.stderr}")
-    findings = parse_findings(completed.stdout, tree_root=tree_root)
-    if completed.returncode != int(any(finding.gates for finding in findings)):
-        raise RatchetError("lint exit status disagrees with the measured JSON finding corpus")
+    try:
+        findings = validate_scan_result(completed.stdout, returncode=completed.returncode, tree_root=tree_root)
+    except RatchetError as exc:
+        raise RatchetError(f"{exc}\n{completed.stderr}") from exc
     return findings, completed.stderr
 
 

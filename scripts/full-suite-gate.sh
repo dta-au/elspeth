@@ -21,8 +21,9 @@
 #   contracts     scripts/check_contracts.py + generate_skill_inventory.py --check
 #   lints         elspeth-lints check --rules all --root src/elspeth, keyless
 #                 (shape-only verification). The corpus is EXPECTED to be non-zero
-#                 while signing is suspended (AGENTS.md), so this stage records
-#                 the advisory count and actual exit, nonfatal unless --lints-strict.
+#                 while signing is suspended (AGENTS.md), so complete, valid
+#                 finding corpora are advisory unless --lints-strict. Invalid
+#                 output or a failed scan makes the gate incomplete/nonzero.
 #                 Compare keyless finding sets before and after a change, not counts
 #                 or zero; this stage does not establish signature clearance.
 #   pytest        pytest tests/ — the default selection = CI's "Test" job. The
@@ -54,6 +55,7 @@
 # Output: one directory per run under --log-dir (default
 # $ELSPETH_GATE_LOG_DIR or $ROOT/.claude/lanes/full-suite-gates), containing
 #   preflight.txt · <stage>.log · <stage>-<ordinal>.exit (observed stage rc)
+#   lints.json (raw JSON stdout; lints.log retains stderr/validation errors)
 #   pytest-junit.xml · summary.txt · driver.exit · .done (last, driver terminal
 #   receipt only; read stage exit and frozen status before qualifying a run)
 #   supervisor.json · supervisor.exit (actual supervisor CLI exit, published
@@ -90,7 +92,7 @@
 #   -h, --help
 #
 # Exit codes:  0 fatal stages passed, tree frozen and outer cleanup complete
-#              1 a fatal stage failed, or the tree moved during the run
+#              1 a fatal stage failed, a scan was incomplete, or the tree moved
 #              2 preflight refused, or usage error
 #              124 aggregate deadline; 125 abandoned/incomplete group cleanup
 #              128+signal cancellation (or a signalled supervisor CLI)
@@ -423,7 +425,7 @@ declare -A CMD_OF=()
 CMD_OF[ruff]="$ROOT/.venv/bin/ruff check ${RUFF_PATHS[*]} && $ROOT/.venv/bin/ruff format --check ${RUFF_PATHS[*]}"
 CMD_OF[mypy]="$ROOT/.venv/bin/mypy src/ elspeth-lints/src/"
 CMD_OF[contracts]="$PY scripts/check_contracts.py && $PY scripts/cicd/generate_skill_inventory.py --check"
-CMD_OF[lints]="ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing $PY -m elspeth_lints.core.cli check --rules all --root src/elspeth"
+CMD_OF[lints]="ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing $PY -m elspeth_lints.core.cli check --rules all --root src/elspeth --format json"
 CMD_OF[pytest]="$PY -m pytest tests/ -n $WORKERS -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml $PYTEST_ARGS"
 CMD_OF[testcontainer]="$PY -m pytest tests/ -m testcontainer -n 0 -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/testcontainer-junit.xml"
 
@@ -450,6 +452,7 @@ SUMMARY="$RUN_DIR/summary.txt"
 note() { printf '%s\n' "$*" | tee -a "$SUMMARY"; }
 RESULT=0
 MONITOR_FAILED=0
+LINTS_INCOMPLETE=0
 STAGE_SEQ=0
 CURRENT_STAGE="none"
 CURRENT_PHASE="setup"
@@ -529,6 +532,27 @@ trap 'record_driver_exit "$?"' EXIT
 note "run_dir=$RUN_DIR"
 note "tree=$ROOT head=$(git rev-parse HEAD) before=$BEFORE"
 
+validate_lint_result() {
+    # Reuse the pure validator beside this runner, without invoking a scan,
+    # exporting source, or changing the measured tree's import roots.
+    "$PY" -B - "$(dirname "$SELF")" "$ROOT" "$RUN_DIR/lints.json" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from trust_tier_ratchet import RatchetError, validate_scan_result
+
+try:
+    findings = validate_scan_result(
+        Path(sys.argv[3]).read_text(), returncode=int(sys.argv[4]), tree_root=Path(sys.argv[2])
+    )
+except (OSError, UnicodeError, RatchetError) as exc:
+    print(f"lint measurement incomplete: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+print(len(findings))
+PY
+}
+
 run_stage() { # run_stage <name> <fatal 0|1> <command string>
     local name="$1" fatal="$2" cmd="$3" log="$RUN_DIR/$1.log" t0 t1 rc watch_rc monitor attempt
     local watch_ready watch_stop watch_done stage_exit_file
@@ -579,14 +603,26 @@ run_stage() { # run_stage <name> <fatal 0|1> <command string>
         return 1
     fi
     CURRENT_PHASE="stage"
-    if bash -c "$cmd" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    if [ "$name" = lints ]; then
+        if bash -c "$cmd" >"$RUN_DIR/lints.json" 2>"$log"; then rc=0; else rc=$?; fi
+    else
+        if bash -c "$cmd" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    fi
     OBSERVED_STAGE_RC="$rc"
     # Preserve the actual child result before fallible watcher/log cleanup.
     printf '%s\n' "$rc" >"$stage_exit_file"
     t1="$(date +%s)"
-    local extra=""
+    local extra="" lint_count
     case "$name" in
-        lints)  extra=" findings=$(grep -cE '^[^ ].*:[0-9]+:' "$log" || true)" ;;
+        lints)
+            CURRENT_PHASE="lint_validation"
+            if lint_count="$(validate_lint_result "$rc" 2>>"$log")"; then
+                extra=" lint_status=complete findings=$lint_count"
+            else
+                LINTS_INCOMPLETE=1
+                RESULT=1
+                extra=" lint_status=INCOMPLETE"
+            fi ;;
         pytest|testcontainer) extra=" $(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$log" | tail -n 1 | tr -d '=' | sed 's/^ *//; s/ *$//' || true)" ;;
     esac
     note "stage=$name exit=$rc seconds=$((t1 - t0)) fatal=$fatal$extra"
@@ -639,7 +675,7 @@ elif [ "$MONITOR_FAILED" = 1 ]; then
 else
     note "after=$AFTER frozen=yes"
 fi
-if [ "$MONITOR_FAILED" = 1 ]; then
+if [ "$MONITOR_FAILED" = 1 ] || [ "$LINTS_INCOMPLETE" = 1 ]; then
     note "RESULT=INCOMPLETE"
 else
     note "RESULT=$([ "$RESULT" = 0 ] && echo PASS || echo FAIL)"

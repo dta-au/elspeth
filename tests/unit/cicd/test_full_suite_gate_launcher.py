@@ -84,6 +84,46 @@ if os.environ.get('GATE_CAPACITY_BARRIER') == '1':
         time.sleep(0.01)
 """
 
+LINT_CLI = """import json, os, signal, sys
+from pathlib import Path
+cache = Path('.pytest_cache')
+spec = json.loads((cache / 'lint-result.json').read_text())
+(cache / 'lint-argv.json').write_text(json.dumps(sys.argv[1:]))
+sys.stderr.write('controlled lint stderr\\n')
+if spec['payload'] is None:
+    Path(os.readlink('/proc/self/fd/1')).unlink()
+else:
+    sys.stdout.write(spec['payload'])
+    sys.stdout.flush()
+if spec['status'] < 0:
+    os.kill(os.getpid(), -spec['status'])
+raise SystemExit(spec['status'])
+"""
+
+
+def _lint_result(root: Path, payload: str | None, status: int) -> None:
+    core = root / "elspeth-lints/src/elspeth_lints/core"
+    core.mkdir()
+    (core / "__init__.py").write_text("")
+    (core / "cli.py").write_text(LINT_CLI)
+    (root / ".pytest_cache/lint-result.json").write_text(json.dumps({"payload": payload, "status": status}))
+
+
+def _lint_finding(*, severity: str = "error", rule_id: str = "trust_tier.tier_model") -> str:
+    return json.dumps(
+        [
+            {
+                "file_path": "source.py",
+                "rule_id": rule_id,
+                "message": "controlled finding",
+                "line": 1,
+                "column": 0,
+                "severity": severity,
+                "fingerprint": "controlled-fingerprint",
+            }
+        ]
+    )
+
 
 def _inventory(root: Path) -> Path:
     return root / ".pytest_cache/sibling-inventory"
@@ -216,6 +256,7 @@ def _start(
     timeout: str = "30",
     workers: int | None = 0,
     stage: str = "pytest",
+    lints_strict: bool = False,
     capacity_barrier: bool = False,
     inventory: str | None = None,
 ):
@@ -235,6 +276,8 @@ def _start(
         command.extend(("--workers", str(workers)))
     if detached:
         command.append("--detach")
+    if lints_strict:
+        command.append("--lints-strict")
     env = _environment(root, mode, inventory=inventory)
     if capacity_barrier:
         env["GATE_CAPACITY_BARRIER"] = "1"
@@ -322,6 +365,95 @@ def test_public_foreground_and_detached_preserve_driver_and_outer_status(project
     assert f"driver_exit={expected}" in (run / "driver.exit").read_text()
     assert int((run / "pytest-1.exit").read_text()) == expected
     assert "frozen=yes" in (run / "summary.txt").read_text()
+
+
+@pytest.mark.parametrize("detached", (False, True))
+@pytest.mark.parametrize(
+    "payload,status,findings",
+    (("[]", 0, 0), (_lint_finding(severity="note"), 0, 1), (_lint_finding(), 1, 1)),
+    ids=("empty", "note", "gating-finding"),
+)
+def test_lints_complete_corpus_remains_advisory(project, detached, payload, status, findings):
+    _lint_result(project, payload, status)
+    process, run = _start(project, "pass", detached=detached, stage="lints")
+    assert _finish(process, run, detached) == 0
+    _report(run, 0)
+    assert int((run / "lints-1.exit").read_text()) == status
+    assert (run / "lints.json").read_text() == payload
+    assert "controlled lint stderr" in (run / "lints.log").read_text()
+    summary = (run / "summary.txt").read_text()
+    assert f"stage=lints exit={status}" in summary
+    assert f"lint_status=complete findings={findings}" in summary
+    assert "frozen=yes" in summary and "RESULT=PASS" in summary
+    assert "driver_exit=0" in (run / "driver.exit").read_text()
+    assert json.loads((project / ".pytest_cache/lint-argv.json").read_text())[-2:] == ["--format", "json"]
+
+
+@pytest.mark.parametrize(
+    "payload,status",
+    (
+        (None, 0),
+        ("", 0),
+        ('[{"rule_id":', 1),
+        ("{}", 0),
+        ("[] []", 0),
+        ('[{"rule_id":"controlled"}]', 1),
+        (_lint_finding(rule_id="parse-error"), 1),
+        (_lint_finding(rule_id="read-error"), 1),
+        (_lint_finding(), 0),
+        ("[]", 1),
+        (_lint_finding(severity="note"), 1),
+        ("[]", 2),
+    ),
+    ids=(
+        "missing-output",
+        "empty-output",
+        "truncated-json",
+        "wrong-document-shape",
+        "multiple-json-documents",
+        "incomplete-record",
+        "parse-error",
+        "read-error",
+        "zero-with-gating-finding",
+        "one-without-findings",
+        "one-with-notes-only",
+        "configuration-error-with-json",
+    ),
+)
+def test_lints_invalid_scan_cannot_pass_advisory_gate(project, payload, status):
+    _lint_result(project, payload, status)
+    process, run = _start(project, "pass", stage="lints")
+    assert _finish(process, run, False) == 1
+    _report(run, 1)
+    assert int((run / "lints-1.exit").read_text()) == status
+    summary = (run / "summary.txt").read_text()
+    assert f"stage=lints exit={status}" in summary
+    assert "lint_status=INCOMPLETE" in summary and "RESULT=INCOMPLETE" in summary
+    assert "RESULT=PASS" not in summary and "frozen=yes" in summary
+    assert "driver_exit=1" in (run / "driver.exit").read_text()
+    assert (run / ".done").is_file()
+
+
+@pytest.mark.parametrize("detached", (False, True))
+def test_lints_native_crash_cannot_pass_with_complete_json(project, detached):
+    _lint_result(project, "[]", -signal.SIGTERM)
+    process, run = _start(project, "pass", detached=detached, stage="lints")
+    assert _finish(process, run, detached) == 1
+    _report(run, 1)
+    assert int((run / "lints-1.exit").read_text()) == 128 + signal.SIGTERM
+    assert (run / "lints.json").read_text() == "[]"
+    assert "RESULT=INCOMPLETE" in (run / "summary.txt").read_text()
+
+
+def test_lints_strict_keeps_complete_gating_findings_fatal(project):
+    _lint_result(project, _lint_finding(), 1)
+    process, run = _start(project, "pass", stage="lints", lints_strict=True)
+    assert _finish(process, run, False) == 1
+    _report(run, 1)
+    summary = (run / "summary.txt").read_text()
+    assert "lint_status=complete findings=1" in summary
+    assert "RESULT=FAIL" in summary and "RESULT=INCOMPLETE" not in summary
+    assert int((run / "lints-1.exit").read_text()) == 1
 
 
 @pytest.mark.parametrize("detached", (False, True))
