@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -12,6 +14,44 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "work-at-risk.sh"
 THIRTEEN_HOURS = 13 * 3600
+
+
+def _fail_report_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str) -> Path:
+    """Fail a real producer after emitting its otherwise successful output."""
+    command = "git" if operation in {"ignored-directories", "worktree-inventory"} else "find"
+    binary = shutil.which(command)
+    assert binary is not None
+    predicate = {
+        "ignored-directories": "'ls-files' in args and '--ignored' in args",
+        "worktree-inventory": "'worktree' in args and 'list' in args and inventory_call == 2",
+        "source-walk": "'-name' in args and '__init__.py' in args",
+        "lanes-walk": "'-printf' in args",
+    }[operation]
+    marker = tmp_path / "failed-read-observed"
+    counter = tmp_path / "inventory-read-count"
+    bin_dir = tmp_path / "controlled-bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / command
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\nfrom pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        f"counter = Path({str(counter)!r})\n"
+        "inventory_call = 0\n"
+        "if 'worktree' in args and 'list' in args:\n"
+        "    inventory_call = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+        "    counter.write_text(str(inventory_call))\n"
+        f"result = subprocess.run([{binary!r}, *args], check=False)\n"
+        f"if {predicate}:\n"
+        "    assert result.returncode == 0\n"
+        f"    Path({str(marker)!r}).write_text('real output then exit 79')\n"
+        "    raise SystemExit(79)\n"
+        "raise SystemExit(result.returncode)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    return marker
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +113,7 @@ def test_clean_worktrees_report_no_work_at_risk(repo: Path) -> None:
     result = _report(repo)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "[WARN]" not in result.stdout
-    assert "no work at risk" in result.stdout
+    assert "no configured probe warnings" in result.stdout
     # The report runs from the main checkout, so its own process makes that tree IN-USE.
     for tree, use_expected in ((repo, "yes"), (_lane(repo), "-")):
         state, use, dirty, _oldest, _commit, copies, _lanes = _row(result.stdout, tree)[:7]
@@ -185,6 +225,81 @@ def test_failed_git_status_is_unknown_and_warns(repo: Path) -> None:
     assert result.returncode == 1, result.stdout + result.stderr
     assert _row(result.stdout, _lane(repo))[0] == "UNKNOWN"
     assert f"[WARN] {_lane(repo)} — git status failed" in result.stdout
+
+
+def test_failed_ignored_directory_read_is_unknown_even_after_real_output(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ordinary = repo / "snap/ordinary.txt"
+    ordinary.parent.mkdir()
+    ordinary.write_text("ignored notes, not a source copy\n", encoding="utf-8")
+    assert "snap/" in _git(repo, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory")
+    positive = _report(repo)
+    assert positive.returncode == 0, positive.stdout + positive.stderr
+    assert _row(positive.stdout, repo)[5] == "0"
+    indexes = [repo / ".git/index", repo / ".git/worktrees/lane/index"]
+    before = [path.read_bytes() for path in indexes]
+
+    with monkeypatch.context() as controlled:
+        marker = _fail_report_read(tmp_path, controlled, "ignored-directories")
+        failed = _report(repo)
+
+    assert marker.read_text() == "real output then exit 79"
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert "[WARN]" in failed.stdout
+    assert _row(failed.stdout, repo)[5] == "UNKNOWN"
+    assert "no work at risk" not in failed.stdout
+    assert [path.read_bytes() for path in indexes] == before
+    assert ordinary.read_text() == "ignored notes, not a source copy\n"
+
+
+def test_worktree_inventory_error_cannot_qualify_output_or_a_missing_inventory(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert str(_lane(repo)) in _git(repo, "worktree", "list", "--porcelain")
+    with monkeypatch.context() as controlled:
+        marker = _fail_report_read(tmp_path, controlled, "worktree-inventory")
+        result = _report(repo)
+
+    if marker.exists():
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "no work at risk" not in result.stdout
+    else:
+        # Reusing one successfully captured inventory removes the second
+        # producer entirely. It must still report both actual worktrees.
+        assert (tmp_path / "inventory-read-count").read_text() == "1"
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _row(result.stdout, repo)[0] == "CLEAN"
+        assert _row(result.stdout, _lane(repo))[0] == "CLEAN"
+
+
+@pytest.mark.parametrize("operation", ["source-walk", "lanes-walk"])
+def test_failed_walk_does_not_publish_partial_numbers_as_a_complete_probe(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    if operation == "source-walk":
+        source = repo / "snap/v1/src/elspeth/__init__.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("", encoding="utf-8")
+        field = 5
+    else:
+        notes = repo / ".claude/lanes/run/notes.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("small retained notes\n", encoding="utf-8")
+        field = 6
+    positive = _report(repo)
+    assert positive.returncode == (1 if operation == "source-walk" else 0), positive.stdout + positive.stderr
+    assert _row(positive.stdout, repo)[field] == ("1" if operation == "source-walk" else "0.0G")
+
+    with monkeypatch.context() as controlled:
+        marker = _fail_report_read(tmp_path, controlled, operation)
+        failed = _report(repo)
+
+    assert marker.read_text() == "real output then exit 79"
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert "[WARN]" in failed.stdout
+    assert _row(failed.stdout, repo)[field] == "UNKNOWN"
+    assert "no work at risk" not in failed.stdout
 
 
 def test_missing_worktree_is_reported_without_warning(repo: Path) -> None:

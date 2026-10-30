@@ -35,6 +35,9 @@
 #     .venv, node_modules, __pycache__ and .git by name.
 #   - A `git status` that FAILS classifies UNKNOWN and WARNs, never CLEAN:
 #     empty output from a failed command is not evidence.
+#   - Failed ignored-directory or traversal reads report UNKNOWN and WARN.
+#     Copy caps and lane-size cutoffs remain honest lower bounds; only an
+#     observed cutoff can admit its producer's expected SIGPIPE.
 #   - Every git read goes through `git --no-optional-locks`, so the report does
 #     not rewrite any worktree's index stat-cache.
 #   - LANES is a sum of apparent file sizes that stops at the 10 GB limit and
@@ -77,7 +80,11 @@ done
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "not inside a git repository" >&2; exit 2; }
 # The first entry of `git worktree list` is always the main checkout.
 # (awk reads the whole listing: an early `exit` would SIGPIPE git under pipefail)
-MAIN="$(git --no-optional-locks worktree list --porcelain | awk 'NR==1 && $1=="worktree" {sub(/^worktree /, ""); print}')"
+if ! WORKTREE_INVENTORY="$(git --no-optional-locks worktree list --porcelain)"; then
+    echo "cannot read the registered worktree inventory; report is incomplete" >&2
+    exit 2
+fi
+MAIN="$(awk 'NR==1 && $1=="worktree" {sub(/^worktree /, ""); print}' <<<"$WORKTREE_INVENTORY")"
 [ -d "$MAIN" ] || { echo "cannot resolve the main checkout" >&2; exit 2; }
 
 NOW="$(date +%s)"
@@ -93,7 +100,7 @@ while IFS= read -r line; do
         "worktree "*) cur="${line#worktree }"; WTS+=("$cur") ;;
         prunable*)    PRUNABLE["$cur"]=1 ;;
     esac
-done < <(git --no-optional-locks -C "$MAIN" worktree list --porcelain)
+done <<<"$WORKTREE_INVENTORY"
 
 hours() { echo $(( ($1) / 3600 )); }
 
@@ -105,11 +112,13 @@ oldest_mtime() {
 
 # source_copies <tree>: count src/elspeth/__init__.py under the tree's ignored dirs.
 source_copies() {
-    local tree="$1" entry
+    local tree="$1" entry listing_pid count read_rc
     local -a starts=() prune=()
     while IFS= read -r -d '' entry; do
         [[ "$entry" == */ ]] && starts+=("$tree/${entry%/}")
-    done < <(git --no-optional-locks -C "$tree" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null || true)
+    done < <(git --no-optional-locks -C "$tree" ls-files -z --others --ignored --exclude-standard --directory 2>/dev/null)
+    listing_pid=$!
+    if ! wait "$listing_pid"; then return 1; fi
     [ ${#starts[@]} -gt 0 ] || { echo 0; return; }
     # The listing can name a directory and its children (`.claude/` and
     # `.claude/lanes/`); walking both counts every copy twice. Keep only
@@ -137,22 +146,48 @@ source_copies() {
         if [ "$inner" = 1 ]; then nested+=("$s"); else plain+=("$s"); fi
     done
     local -a names=(-name .venv -o -name node_modules -o -name __pycache__ -o -name .git)
-    local -a match=(-name __init__.py -path '*/src/elspeth/__init__.py' -print)
+    # One byte per match makes the cap/count independent of filename newlines.
+    local -a match=(-name __init__.py -path '*/src/elspeth/__init__.py' -printf '.')
     local -a limit=(cat)
-    [ "$COPY_CAP" -gt 0 ] && limit=(head -n "$COPY_CAP")
-    # `head` closing the pipe ends find with SIGPIPE; `|| true` absorbs that exit.
-    {
-        [ ${#plain[@]} -eq 0 ] || find "${plain[@]}" -type d \( "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || true
-        [ ${#nested[@]} -eq 0 ] || find "${nested[@]}" -type d \( "${prune[@]}" "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || true
-    } | "${limit[@]}" | grep -c . || true
+    [ "$COPY_CAP" -gt 0 ] && limit=(head -c "$COPY_CAP")
+    if count="$(
+        {
+            if [ ${#plain[@]} -gt 0 ]; then
+                find "${plain[@]}" -type d \( "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || exit "$?"
+            fi
+            if [ ${#nested[@]} -gt 0 ]; then
+                find "${nested[@]}" -type d \( "${prune[@]}" "${names[@]}" \) -prune -o "${match[@]}" 2>/dev/null || exit "$?"
+            fi
+        } | "${limit[@]}" | wc -c
+    )"; then
+        printf '%s\n' "$count"
+    else
+        read_rc=$?
+        # Only this expected downstream cutoff preserves a measured lower
+        # bound. An arbitrary producer error stays incomplete even at the cap.
+        if [ "$read_rc" = 141 ] && [ "$COPY_CAP" -gt 0 ] && [ "$count" -ge "$COPY_CAP" ]; then
+            printf '%s\n' "$count"
+        else
+            return 1
+        fi
+    fi
 }
 
 # lanes_bytes <tree>: apparent size of .claude/lanes, stopping once past the limit.
 lanes_bytes() {
-    local dir="$1/.claude/lanes"
+    local dir="$1/.claude/lanes" measured read_rc
     [ -d "$dir" ] || { echo 0; return; }
-    { find "$dir" -type f -printf '%s\n' 2>/dev/null || true; } \
-        | awk -v lim="$LANES_LIMIT_BYTES" '{ s += $1; if (s > lim) { print s; exit } } END { if (s <= lim) print s + 0 }'
+    if measured="$(find "$dir" -type f -printf '%s\n' 2>/dev/null \
+        | awk -v lim="$LANES_LIMIT_BYTES" '{ s += $1; if (s > lim) { print s; exit } } END { if (s <= lim) print s + 0 }')"; then
+        printf '%s\n' "$measured"
+    else
+        read_rc=$?
+        if [ "$read_rc" = 141 ] && [ -n "$measured" ] && [ "$measured" -gt "$LANES_LIMIT_BYTES" ]; then
+            printf '%s\n' "$measured"
+        else
+            return 1
+        fi
+    fi
 }
 
 gb() { awk -v b="$1" 'BEGIN { printf "%.1fG", b / 1073741824 }'; }
@@ -198,18 +233,26 @@ for wt in "${WTS[@]}"; do
         commit_h="$(hours $(( NOW - ct )))"
     fi
 
-    copies="$(source_copies "$wt")"
-    if [ "$copies" -gt 0 ]; then
-        [ "$COPY_CAP" -gt 0 ] && [ "$copies" -ge "$COPY_CAP" ] && copies="${COPY_CAP}+"
-        warn "$wt" "$copies src/elspeth/__init__.py under gitignored paths (source outside git)" \
-            "git ls-files --others --ignored --directory; find"
+    if copies="$(source_copies "$wt")"; then
+        if [ "$copies" -gt 0 ]; then
+            [ "$COPY_CAP" -gt 0 ] && [ "$copies" -ge "$COPY_CAP" ] && copies="${COPY_CAP}+"
+            warn "$wt" "$copies src/elspeth/__init__.py under gitignored paths (source outside git)" \
+                "git ls-files --others --ignored --directory; find"
+        fi
+    else
+        copies="UNKNOWN"
+        warn "$wt" "ignored-source-copy probe failed; count UNKNOWN" "git ls-files --others --ignored --directory; find"
     fi
 
-    lb="$(lanes_bytes "$wt")"
-    lanes="$(gb "$lb")"
-    if [ "$lb" -gt "$LANES_LIMIT_BYTES" ]; then
-        lanes=">$(gb "$LANES_LIMIT_BYTES")"
-        warn "$wt" ".claude/lanes exceeds $(gb "$LANES_LIMIT_BYTES")" "find -printf %s"
+    if lb="$(lanes_bytes "$wt")"; then
+        lanes="$(gb "$lb")"
+        if [ "$lb" -gt "$LANES_LIMIT_BYTES" ]; then
+            lanes=">$(gb "$LANES_LIMIT_BYTES")"
+            warn "$wt" ".claude/lanes exceeds $(gb "$LANES_LIMIT_BYTES")" "find -printf %s"
+        fi
+    else
+        lanes="UNKNOWN"
+        warn "$wt" ".claude/lanes size probe failed; size UNKNOWN" "find -printf %s"
     fi
 
     printf '%-8s %-6s %6s %8s %8s %10s %8s  %s\n' "$state" "$use" "$ndirty" "$oldest_h" "$commit_h" "$copies" "$lanes" "$wt"
@@ -217,7 +260,7 @@ done
 
 echo
 if [ ${#WARNS[@]} -eq 0 ]; then
-    echo "summary: ${#WTS[@]} worktree(s), no work at risk"
+    echo "summary: ${#WTS[@]} worktree(s), no configured probe warnings"
     exit 0
 fi
 printf '%s\n' "${WARNS[@]}"

@@ -86,11 +86,10 @@ will read again, are both waste.
 
 ## Judge-signature seam: how the maintainer's agents use it
 
-The seam itself is product and is specified in `AGENTS.md` and
-[`docs/judge-signature-handoff.md`](../judge-signature-handoff.md). The
-maintainer's convention on top of it: judging — including the final signature
-verdict — runs on the Codex CLI harness with read-only tool access
-(`--judge-transport codex-cli --judge-tools readonly`), so the judge explores
-the tree before ruling. The legacy `agent` transport is accepted with
-read-only tools but is not the normal signing path. The `judge-signature-workflow`
-skill carries the step-by-step procedure.
+The seam itself is product. Follow
+[`AGENTS.md` § Operator signature verification](../../AGENTS.md#operator-signature-verification-tier-model-allowlist-signing)
+and [`docs/judge-signature-handoff.md`](../judge-signature-handoff.md) for its
+current custody and transport rules. Signing is suspended. Key-free judge calls
+require the installed judge supervisor and the `agent` transport with read-only
+tools; they refuse when the supervisor is unavailable. There is no local
+Codex/SDK fallback. The `judge-signature-workflow` skill carries the procedure.
