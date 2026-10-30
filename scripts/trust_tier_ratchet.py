@@ -12,15 +12,18 @@ site replacement or coordinate churn; that summary is not occurrence clearance.
 This single-rule measurement does not replace A4's complete ``--rules all``
 base/tip review. No signatures, baseline advancement or approval store is used.
 
-HEAD's rule, source and allowlists are read together from a temporary archive
+HEAD's source and allowlists are read from an exact-object temporary archive
 inside the worktree cache. Working-tree scans include unstaged bytes. Both runs
-verify their lint import root and pin keyless shape verification; an operator
-key in the environment is refused rather than forwarded.
+use the same current engine, prove its package/CLI/taxonomy paths, confine data
+policy to the selected tree, and check that engine source stays unchanged.
+Keyless shape verification is pinned; an operator key in the environment is
+refused rather than forwarded.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -36,6 +39,13 @@ from pathlib import Path
 RULE_ID = "trust_tier.tier_model"
 SCAN_ROOT = "src/elspeth"
 LINTS_SOURCE_ROOT = "elspeth-lints/src"
+_ENGINE_MODULES = (
+    ("elspeth", "src/elspeth/__init__.py"),
+    ("elspeth_lints", f"{LINTS_SOURCE_ROOT}/elspeth_lints/__init__.py"),
+    ("lint CLI", f"{LINTS_SOURCE_ROOT}/elspeth_lints/core/cli.py"),
+    ("tier-model rule", f"{LINTS_SOURCE_ROOT}/elspeth_lints/rules/trust_tier/tier_model/rule.py"),
+    ("exception taxonomy", f"{LINTS_SOURCE_ROOT}/elspeth_lints/rules/trust_tier/tier_model/exception_taxonomy.py"),
+)
 VERIFY_MODE_ENV = "ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE"
 VERIFY_MODE = "shape-only-when-key-missing"
 NON_GATING_SEVERITY = "note"
@@ -190,7 +200,7 @@ def format_report(result: RatchetResult, *, head_sha: str, report_only: bool = F
     return "\n".join(lines) + "\n"
 
 
-def normalise_path(raw: str, *, tree_root: Path) -> str:
+def normalise_path(raw: str, *, tree_root: Path, engine_root: Path | None = None) -> str:
     """Make an absolute path under ``tree_root`` tree-relative; leave relative paths as emitted."""
     if not os.path.isabs(raw):
         return raw
@@ -198,6 +208,10 @@ def normalise_path(raw: str, *, tree_root: Path) -> str:
     root = Path(os.path.realpath(tree_root))
     if resolved.is_relative_to(root):
         return resolved.relative_to(root).as_posix()
+    if engine_root is not None:
+        engine = Path(os.path.realpath(engine_root))
+        if resolved.is_relative_to(engine):
+            return resolved.relative_to(engine).as_posix()
     return raw
 
 
@@ -225,7 +239,7 @@ def _invalid_json_constant(value: str) -> None:
     raise RatchetError(f"lint JSON contains a non-JSON numeric constant: {value}")
 
 
-def parse_findings(payload: str, *, tree_root: Path) -> list[FindingRecord]:
+def parse_findings(payload: str, *, tree_root: Path, engine_root: Path | None = None) -> list[FindingRecord]:
     """Parse the CLI's ``--format json`` document into owned records."""
     try:
         document = json.loads(payload, parse_constant=_invalid_json_constant)
@@ -245,7 +259,7 @@ def parse_findings(payload: str, *, tree_root: Path) -> list[FindingRecord]:
             raise RatchetError(f"lint scan did not analyze an input: {record!r}")
         try:
             raw_json = json.dumps(
-                {**record, "file_path": normalise_path(_string_field(record, "file_path"), tree_root=tree_root)},
+                {**record, "file_path": normalise_path(_string_field(record, "file_path"), tree_root=tree_root, engine_root=engine_root)},
                 sort_keys=True,
                 allow_nan=False,
             )
@@ -253,7 +267,7 @@ def parse_findings(payload: str, *, tree_root: Path) -> list[FindingRecord]:
             raise RatchetError("lint JSON occurrence contains a non-finite value") from exc
         findings.append(
             FindingRecord(
-                path=normalise_path(_string_field(record, "file_path"), tree_root=tree_root),
+                path=normalise_path(_string_field(record, "file_path"), tree_root=tree_root, engine_root=engine_root),
                 rule_id=_string_field(record, "rule_id"),
                 message=_string_field(record, "message"),
                 line=_int_field(record, "line"),
@@ -265,37 +279,44 @@ def parse_findings(payload: str, *, tree_root: Path) -> list[FindingRecord]:
     return findings
 
 
-def validate_scan_result(payload: str, *, returncode: int, tree_root: Path) -> list[FindingRecord]:
+def validate_scan_result(payload: str, *, returncode: int, tree_root: Path, engine_root: Path | None = None) -> list[FindingRecord]:
     """Require a complete JSON corpus whose severity agrees with the native exit."""
     if returncode not in (0, 1):
         raise RatchetError(f"elspeth-lints check exited {returncode} in {tree_root}")
-    findings = parse_findings(payload, tree_root=tree_root)
+    findings = parse_findings(payload, tree_root=tree_root, engine_root=engine_root)
     if returncode != int(any(finding.gates for finding in findings)):
         raise RatchetError("lint exit status disagrees with the measured JSON finding corpus")
     return findings
 
 
-def lint_environment() -> dict[str, str]:
+def lint_environment(engine_root: Path | None = None) -> dict[str, str]:
     """Pinned keyless mode; never forward an operator key into either scan."""
     if OPERATOR_KEY_ENV in os.environ:
         raise RatchetError("keyless trust-tier measurement refuses an operator-key environment")
+    engine = (engine_root if engine_root is not None else Path.cwd()).resolve()
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(("src", LINTS_SOURCE_ROOT))
+    env["PYTHONPATH"] = os.pathsep.join((str(engine / "src"), str(engine / LINTS_SOURCE_ROOT)))
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     env[VERIFY_MODE_ENV] = VERIFY_MODE
     return env
 
 
-def verify_lints_import_path(tree_root: Path, *, python: str) -> Path:
-    """Prove the rule code the run will import lives inside ``tree_root``."""
+def verify_lints_import_path(tree_root: Path, *, python: str, engine_root: Path | None = None) -> Path:
+    """Prove current engine imports and per-data-tree policy confinement."""
+    engine = (engine_root if engine_root is not None else tree_root).resolve()
     probe = subprocess.run(
         [
             python,
             "-c",
-            "import json, os, elspeth, elspeth_lints; "
-            "print(json.dumps([os.path.realpath(elspeth.__file__), os.path.realpath(elspeth_lints.__file__)]))",
+            "import json, os, elspeth, elspeth_lints; from pathlib import Path; "
+            "from elspeth_lints.core import cli; "
+            "from elspeth_lints.rules.trust_tier.tier_model import rule, exception_taxonomy; "
+            "print(json.dumps([os.path.realpath(module.__file__) "
+            "for module in (elspeth, elspeth_lints, cli, rule, exception_taxonomy)] "
+            "+ [os.path.realpath(rule._default_allowlist_path(Path('src/elspeth').resolve()))]))",
         ],
         cwd=tree_root,
-        env=lint_environment(),
+        env=lint_environment(engine),
         capture_output=True,
         text=True,
         check=False,
@@ -306,47 +327,70 @@ def verify_lints_import_path(tree_root: Path, *, python: str) -> Path:
         paths = json.loads(probe.stdout)
     except json.JSONDecodeError as exc:
         raise RatchetError("import-root probe did not return JSON evidence") from exc
-    if not isinstance(paths, list) or len(paths) != 2 or not all(isinstance(path, str) for path in paths):
-        raise RatchetError("import-root probe did not return both module paths")
-    imported_source, imported = map(Path, paths)
-    if not imported_source.is_relative_to(Path(os.path.realpath(tree_root)) / "src"):
-        raise RatchetError(f"elspeth imported from {imported_source}, expected source under {tree_root / 'src'}")
-    expected = Path(os.path.realpath(tree_root)) / LINTS_SOURCE_ROOT
-    if not imported.is_relative_to(expected):
-        raise RatchetError(f"elspeth_lints imported from {imported}, expected a module under {expected}")
-    return imported
+    if not isinstance(paths, list) or len(paths) != len(_ENGINE_MODULES) + 1 or not all(isinstance(path, str) for path in paths):
+        raise RatchetError("import-root probe did not return all engine module and data policy paths")
+    for imported, (label, relative) in zip(paths[:-1], _ENGINE_MODULES, strict=True):
+        expected = (engine / relative).resolve()
+        if not expected.is_relative_to(engine) or Path(imported) != expected:
+            raise RatchetError(f"{label} imported from {imported}, expected current engine file {expected}")
+    policy = Path(paths[-1])
+    if not policy.is_absolute() or not policy.resolve().is_relative_to(tree_root.resolve()):
+        raise RatchetError(f"tier-model policy outside data tree {tree_root}: {policy}")
+    return Path(paths[1])
 
 
-def run_tier_model_check(tree_root: Path, *, python: str) -> tuple[list[FindingRecord], str]:
+def run_tier_model_check(tree_root: Path, *, python: str, engine_root: Path | None = None) -> tuple[list[FindingRecord], str]:
     """Run the rule exactly as the previous hook entry did; return findings and the run's stderr."""
     if not (tree_root / SCAN_ROOT).is_dir():
         raise RatchetError(f"lint scan root is missing: {tree_root / SCAN_ROOT}")
     completed = subprocess.run(
         [python, "-m", "elspeth_lints.core.cli", "check", "--rules", RULE_ID, "--root", SCAN_ROOT, "--format", "json"],
         cwd=tree_root,
-        env=lint_environment(),
+        env=lint_environment(engine_root if engine_root is not None else tree_root),
         capture_output=True,
         text=True,
         check=False,
     )
     try:
-        findings = validate_scan_result(completed.stdout, returncode=completed.returncode, tree_root=tree_root)
+        findings = validate_scan_result(completed.stdout, returncode=completed.returncode, tree_root=tree_root, engine_root=engine_root)
     except RatchetError as exc:
         raise RatchetError(f"{exc}\n{completed.stderr}") from exc
     return findings, completed.stderr
 
 
 def export_head(repo_root: Path, destination: Path) -> str:
-    """Extract ``git archive HEAD`` into ``destination``; return HEAD's sha."""
-    head = subprocess.run(["git", "-C", str(repo_root), "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
+    """Resolve HEAD once, then archive that exact commit into ``destination``."""
+    head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD^{commit}"], capture_output=True, text=True, check=False
+    )
     if head.returncode != 0:
         raise RatchetError(f"git rev-parse HEAD failed in {repo_root}:\n{head.stderr}")
-    archive = subprocess.run(["git", "-C", str(repo_root), "archive", "--format=tar", "HEAD"], capture_output=True, check=False)
+    head_sha = head.stdout.strip()
+    if len(head_sha) not in (40, 64) or any(character not in "0123456789abcdef" for character in head_sha):
+        raise RatchetError("git rev-parse HEAD did not return a full commit object")
+    archive = subprocess.run(["git", "-C", str(repo_root), "archive", "--format=tar", head_sha], capture_output=True, check=False)
     if archive.returncode != 0:
         raise RatchetError(f"git archive HEAD failed in {repo_root}:\n{archive.stderr.decode(errors='replace')}")
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
         tar.extractall(destination, filter="data")
-    return head.stdout.strip()
+    return head_sha
+
+
+def _engine_source_identity(engine_root: Path) -> tuple[tuple[str, str], ...]:
+    """Bind both selected import roots to their exact Python source bytes."""
+    records: list[tuple[str, str]] = []
+    try:
+        for relative in ("src", LINTS_SOURCE_ROOT):
+            source_root = engine_root / relative
+            if not source_root.is_dir():
+                raise RatchetError(f"current engine source root is missing: {source_root}")
+            for path in sorted(source_root.rglob("*.py")):
+                if path.is_symlink():
+                    raise RatchetError(f"current engine source must not be a symbolic link: {path}")
+                records.append((path.relative_to(engine_root).as_posix(), hashlib.sha256(path.read_bytes()).hexdigest()))
+    except OSError as exc:
+        raise RatchetError(f"could not bind current engine source: {exc}") from exc
+    return tuple(records)
 
 
 def _repo_root_from_cwd() -> Path:
@@ -357,19 +401,30 @@ def _repo_root_from_cwd() -> Path:
 
 
 def ratchet(repo_root: Path, *, python: str) -> tuple[RatchetResult, str]:
-    """Run both sides and compare; returns the result and HEAD's sha."""
-    lint_environment()
+    """Compare HEAD/working data using one unchanged current engine."""
+    repo_root = repo_root.resolve()
+    lint_environment(repo_root)
+    engine_before = _engine_source_identity(repo_root)
+
+    def require_same_engine() -> None:
+        if _engine_source_identity(repo_root) != engine_before:
+            raise RatchetError("current engine source changed during comparison")
+
     cache = repo_root / ".pytest_cache"
     cache.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="trust-tier-ratchet-head-", dir=cache) as scratch:
         head_tree = Path(scratch) / "head"
         head_tree.mkdir()
         head_sha = export_head(repo_root, head_tree)
-        verify_lints_import_path(head_tree, python=python)
-        head_findings, head_stderr = run_tier_model_check(head_tree, python=python)
+        verify_lints_import_path(head_tree, python=python, engine_root=repo_root)
+        require_same_engine()
+        head_findings, head_stderr = run_tier_model_check(head_tree, python=python, engine_root=repo_root)
+        require_same_engine()
         sys.stderr.write(head_stderr)
-    verify_lints_import_path(repo_root, python=python)
-    staged_findings, staged_stderr = run_tier_model_check(repo_root, python=python)
+    verify_lints_import_path(repo_root, python=python, engine_root=repo_root)
+    require_same_engine()
+    staged_findings, staged_stderr = run_tier_model_check(repo_root, python=python, engine_root=repo_root)
+    require_same_engine()
     sys.stderr.write(staged_stderr)
     return compare_corpora(head_findings, staged_findings), head_sha
 

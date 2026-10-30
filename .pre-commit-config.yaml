@@ -199,10 +199,11 @@ repos:
         # reports complete raw occurrence additions/removals, and prints
         # REVIEW REQUIRED for additions. Unreviewed additions still block
         # release/landing under master-plan A4; this hook does not adjudicate.
-        # Compares the actual working tree (including unstaged bytes) with
-        # HEAD's rule/source/allowlists. This single-rule report is not A4's
-        # complete --rules all comparison. Default/--strict CLI remains a
-        # normalized multiplicity ratchet. Invalid/failed scans stay nonzero.
+        # Compares actual working source/policy (including unstaged bytes) with
+        # exact HEAD source/policy using the same unchanged current engine.
+        # Both imports and per-tree policy paths are checked. This single-rule
+        # report is not A4's complete --rules all comparison. Default/--strict
+        # remains a normalized multiplicity ratchet. Invalid scans stay nonzero.
         # Both runs use keyless shape verification. Signing is suspended;
         # agents must never hold an operator key, and the reporter refuses one.
         # NO `types:` filter. pre-commit ANDs `types` with `files`; adding

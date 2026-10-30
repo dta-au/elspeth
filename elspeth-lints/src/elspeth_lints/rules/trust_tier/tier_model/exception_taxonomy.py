@@ -111,6 +111,14 @@ class _ClassRef:
     node_id: int
 
 
+# An expression identity (int) and a binding name (str) are distinct states.
+# One map belongs to one synchronous query against one module's current facts.
+_OriginMemo = dict[
+    tuple[int, int | str, frozenset[tuple[int, str]], bool],
+    tuple[frozenset[str | _ClassRef], bool],
+]
+
+
 @dataclass(frozen=True)
 class _Binding:
     node: ast.AST
@@ -598,8 +606,27 @@ class _Module:
         seen: frozenset[tuple[int, str]] = frozenset(),
         *,
         member_write: bool = False,
+        _work: _OriginMemo | None = None,
     ) -> tuple[set[str | _ClassRef], bool]:
         """Veto origins; member writes alone retain subscript-container facts."""
+        work = {} if _work is None else _work
+        key = (id(scope.node), id(value), seen, member_write)
+        cached = work.get(key)
+        if cached is None:
+            roots, unknown = self._uncached_value_origins(scope, value, seen, member_write=member_write, work=work)
+            cached = (frozenset(roots), unknown)
+            work[key] = cached
+        return set(cached[0]), cached[1]
+
+    def _uncached_value_origins(
+        self,
+        scope: _Scope,
+        value: ast.expr,
+        seen: frozenset[tuple[int, str]],
+        *,
+        member_write: bool,
+        work: _OriginMemo,
+    ) -> tuple[set[str | _ClassRef], bool]:
         if id(value) in self.factory_values:
             return {self.factory_values[id(value)]}, True
         if id(value) in self.namespace_values or id(value) in self.unknown_read_values:
@@ -607,12 +634,12 @@ class _Module:
             prefix = _NAMESPACE_ORIGIN if id(value) in self.namespace_values else _UNKNOWN_READ_ORIGIN
             roots: set[str | _ClassRef] = {f"{prefix}{id(value)}" + (f".{kind}" if kind else "") for kind in kinds or {""}}
             for default in self.read_defaults.get(id(value), ()):
-                possible, _unknown = self.possible_value_origins(scope, default, seen, member_write=member_write)
+                possible, _unknown = self.possible_value_origins(scope, default, seen, member_write=member_write, _work=work)
                 roots.update(possible)
             if member_write and isinstance(value, ast.Subscript):
                 # Only a later member write consumes this container evidence.
                 # Ordinary read results never inherit their receiver origins.
-                possible, _unknown = self.possible_value_origins(scope, value.value, seen, member_write=True)
+                possible, _unknown = self.possible_value_origins(scope, value.value, seen, member_write=True, _work=work)
                 roots.update(possible)
             return roots, True
         current = value
@@ -621,12 +648,12 @@ class _Module:
             suffix.append(current.attr)
             current = current.value
             if id(current) in self.namespace_values or id(current) in self.unknown_read_values:
-                origins, _unknown = self.possible_value_origins(scope, current, seen, member_write=member_write)
+                origins, _unknown = self.possible_value_origins(scope, current, seen, member_write=member_write, _work=work)
                 return {".".join((self._origin_name(origin), *reversed(suffix))) for origin in origins}, True
         dotted = _dotted_name(value)
         if dotted is not None:
             name, attributes = dotted
-            roots, unknown = self.possible_mutation_roots(scope, name, seen, member_write=member_write)
+            roots, unknown = self.possible_mutation_roots(scope, name, seen, member_write=member_write, _work=work)
             if attributes:
                 return {".".join((self._origin_name(root), *attributes)) for root in roots}, unknown
             return roots, unknown
@@ -641,7 +668,7 @@ class _Module:
         )
         transferred: set[str | _ClassRef] = set()
         for child in values:
-            possible, _unknown = self.possible_value_origins(scope, child, seen, member_write=member_write)
+            possible, _unknown = self.possible_value_origins(scope, child, seen, member_write=member_write, _work=work)
             transferred.update(possible)
         return transferred, True
 
@@ -655,8 +682,29 @@ class _Module:
         seen: frozenset[tuple[int, str]] = frozenset(),
         *,
         member_write: bool = False,
+        _work: _OriginMemo | None = None,
     ) -> tuple[set[str | _ClassRef], bool]:
         """Possible import/class origins widen vetoes, never positive proofs."""
+        # Facts can grow between calls and closure passes. Share completed
+        # states only down this query, including its full path-sensitive guard.
+        work = {} if _work is None else _work
+        key = (id(scope.node), name, seen, member_write)
+        cached = work.get(key)
+        if cached is None:
+            roots, unknown = self._uncached_mutation_roots(scope, name, seen, member_write=member_write, work=work)
+            cached = (frozenset(roots), unknown)
+            work[key] = cached
+        return set(cached[0]), cached[1]
+
+    def _uncached_mutation_roots(
+        self,
+        scope: _Scope,
+        name: str,
+        seen: frozenset[tuple[int, str]],
+        *,
+        member_write: bool,
+        work: _OriginMemo,
+    ) -> tuple[set[str | _ClassRef], bool]:
         key = (id(scope.node), name)
         if key in seen or len(seen) >= _MAX_VETO_DEPTH:
             return set(), True
@@ -679,7 +727,7 @@ class _Module:
                     if value is None:
                         unknown = True
                     else:
-                        possible, ambiguous = self.possible_value_origins(candidate, value, seen, member_write=member_write)
+                        possible, ambiguous = self.possible_value_origins(candidate, value, seen, member_write=member_write, _work=work)
                         roots.update(possible)
                         unknown = unknown or ambiguous
             if name not in self.declared_mutable:
