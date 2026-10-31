@@ -44,9 +44,11 @@ from sqlalchemy.sql.elements import (
     BinaryExpression,
     BindParameter,
     BooleanClauseList,
+    Case,
     ClauseList,
     False_,
     Grouping,
+    Label,
     Null,
     True_,
     UnaryExpression,
@@ -389,7 +391,19 @@ _STRUCTURE_VISITOR_NAMES: Final = (
     "visit_null",
     "visit_true",
     "visit_false",
+    # Projection forms of the bounded private-chunk reader on PostgreSQL. The
+    # absent per-name dispatch slot is recorded too, so defining it is refused.
+    "visit_label",
+    "visit_case",
+    "visit_function",
+    "function_argspec",
+    "visit_clauselist",
+    "visit_octet_length_func",
 )
+# Generic (unregistered) SQL functions the closed read grammar admits, by name.
+# The SQLite reader branch, length(CAST(...)), runs under no structure-observed
+# test, so Cast and length stay outside the grammar until one observes it.
+_STRUCTURE_READ_FUNCTION_NAMES: Final = ("octet_length",)
 _STRUCTURE_COMPILER_MROS = tuple((compiler, compiler.__mro__) for compiler in (SQLiteCompiler, PGCompiler_psycopg))
 _STRUCTURE_COMPILER_OWNERS = tuple(dict.fromkeys(owner for _compiler, mro in _STRUCTURE_COMPILER_MROS for owner in mro))
 _STRUCTURE_VISITOR_GUARDS = tuple(
@@ -1867,6 +1881,43 @@ def _structure_sql_shape(trace, owner: _StructureInvocation, context) -> Structu
                 return ("unary", modifier, expression(node.element, depth + 1))
             if node_type in (Null, True_, False_):
                 return ("null" if node_type is Null else "true" if node_type is True_ else "false",)
+            if node_type is Label:
+                if type(node.name) is not str:
+                    raise ValueError("unsupported label")
+                return ("label", node.name, expression(node.element, depth + 1))
+            if node_type is sql_functions.Function:
+                function = next(
+                    (index for index, known in enumerate(_STRUCTURE_READ_FUNCTION_NAMES) if type(node.name) is str and node.name == known),
+                    None,
+                )
+                if (
+                    function is None
+                    or type(node.packagenames) is not tuple
+                    or node.packagenames
+                    or node._with_ordinality is not False
+                    or type(node.clause_expr) is not Grouping
+                    or type(node.clause_expr.element) is not ClauseList
+                ):
+                    raise ValueError("unsupported SQL function")
+                arguments = node.clause_expr.element
+                if (
+                    arguments.operator is not _STRUCTURE_STORE_COMMA
+                    or type(arguments.clauses) is not list
+                    or len(arguments.clauses) != 1
+                    or arguments.group is not True
+                    or arguments.group_contents is not True
+                ):
+                    raise ValueError("unsupported SQL function arguments")
+                return ("function", function, tuple(expression(clause, depth + 1) for clause in arguments.clauses))
+            if node_type is Case:
+                if node.value is not None or node.else_ is not None or type(node.whens) is not list or not node.whens:
+                    raise ValueError("unsupported SQL case")
+                if any(type(pair) is not tuple or len(pair) != 2 for pair in node.whens):
+                    raise ValueError("unsupported SQL case branch")
+                return (
+                    "case",
+                    tuple((expression(when, depth + 1), expression(result, depth + 1)) for when, result in node.whens),
+                )
             raise ValueError("unsupported SQL expression")
 
         if type(invoked) is Select:
