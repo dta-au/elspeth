@@ -4521,6 +4521,7 @@ class TestIDORCoverageDrift:
             "send_message",
             "recompose",
             "get_composer_operation",
+            "get_active_composer_operation",
             "list_composer_operation_failures",
             "cancel_composer_operation",
             "stream_operation",
@@ -4645,7 +4646,16 @@ class TestIDORCoverageDrift:
         assert "await _verify_session_ownership(session_id, user, request)" in inspect.getsource(operations._owned_json_body)
         assert "await _owned_json_body(request, session_id, user)" in inspect.getsource(operations.parse_message_body)
         assert "await _owned_json_body(request, session_id, user)" in inspect.getsource(operations.parse_recompose_body)
-        assert "await _verify_session_ownership(session_id, user, request)" in inspect.getsource(operations.admit)
+        # admit delegates to _admit (refusals are re-projected as v1 bodies);
+        # _admit's first statement is the ownership check.
+        assert "return await _admit(request, response, session_id, body, user, rate_limiter, kind, version)" in inspect.getsource(
+            operations.admit
+        )
+        import ast
+        import textwrap
+
+        admit_body = ast.parse(textwrap.dedent(inspect.getsource(operations._admit))).body[0].body
+        assert ast.unparse(admit_body[0]) == "await _verify_session_ownership(session_id, user, request)"
         auth_source = inspect.getsource(ComposerStreamAuthServices.authorize)
         assert "session.user_id == principal.user_id" in auth_source
         assert "session.auth_provider_type == self.provider_type" in auth_source
@@ -4656,7 +4666,7 @@ class TestIDORCoverageDrift:
         found = set()
         for routes_module in (sessions, state, proposals, compose, messages, runs, interpretation):
             found.update(_collect_ownership_call_site_identities(routes_module, "_verify_session_ownership"))
-        found.update(_collect_ownership_call_site_identities(operations, "_verify_session_ownership") - {"_owned_json_body", "admit"})
+        found.update(_collect_ownership_call_site_identities(operations, "_verify_session_ownership") - {"_owned_json_body", "_admit"})
         for module in (messages, compose, operations):
             found.update(_collect_composer_ownership_paths(inspect.getsource(module)))
         self._assert_inventory("sessions/routes/", "owned session admission/auth", self.EXPECTED_SESSIONS_OWNERSHIP_ENDPOINTS, found)
