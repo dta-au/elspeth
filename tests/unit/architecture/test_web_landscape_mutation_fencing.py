@@ -6837,6 +6837,24 @@ def _reserve_proof_memo_scope(fn):
     return scoped
 
 
+_reserve_recovery_cell_contract_uncached = _reserve_recovery_cell_contract
+
+
+def _reserve_recovery_cell_contract(units):
+    """The same pure contract, computed once per exact unit tuple while one proof call is open."""
+    scope = _reserve_PROOF_MEMO
+    units = tuple(units)
+    if scope is None:
+        return _reserve_recovery_cell_contract_uncached(units)
+    key = ("recovery_cell", tuple(map(id, units)))
+    hit = scope.get(key)
+    if hit is None or any(held is not unit for held, unit in zip(hit[0], units, strict=True)):
+        hit = (units, _reserve_recovery_cell_contract_uncached(units))
+        scope[key] = hit
+    failures, stores, globals_ = hit[1]
+    return failures[:], stores, globals_
+
+
 def _reserve_annotation_only_nonwrites(unit, bound):
     """Same-AST simple annotation targets that assign no namespace value.
 
@@ -21632,6 +21650,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
 
 
 class _reserve_ReserveProof:
+    @_reserve_proof_memo_scope
     def __init__(self, units):
         self.units = tuple(units)
         self.indexed = {u.path: u for u in units}
@@ -23879,6 +23898,7 @@ class _reserve_ReserveProof:
         return None
 
 
+@_reserve_proof_memo_scope
 def _reserve_run(units):
     proof = _reserve_ReserveProof(units)
     rows = []
