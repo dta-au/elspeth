@@ -283,6 +283,41 @@ async def test_current_graph_refuses_stop_after_actual_reconstruction(operation_
 
 
 @pytest.mark.asyncio
+async def test_live_advance_to_a_compose_cut_surfaces_durable_stop_as_cancellation(operation_store):
+    """ContinuationLivePhases refreshes a warm producer onto a later Compose cut.
+
+    A Stop that becomes durable before the advance's own current-input read is
+    the outcome: a Compose top owes no issued/completed tool work, so no owed
+    read may replace the cancellation with an integrity refusal.
+    """
+    kwargs, evidence, recorder, snapshot, iteration, _actors = await producer_case(operation_store)
+    running = kwargs["inventory"].running
+    try:
+        production = await load_current_message_producers(**kwargs, initial=True)
+        owner = production.producers
+        transcript = evidence.transcript
+        transcript.begin_messages(list(production.messages))
+        following, _shelf = await save_produced_shelf(
+            operation_store, kwargs, snapshot, iteration, transcript, list(production.messages), owner, recorder=recorder
+        )
+        kwargs["required_work"].coordinator.assert_completed()
+        after = following["selected"]
+        assert type(after.stack.frames[-1]) is producers.ComposeFrame
+        assert after.stack.cursor > owner.selected.stack.cursor
+        before = (owner.selected, owner.inventory, owner.inputs, owner.finish_read)
+        with operation_store[0].begin() as conn:
+            conn.execute(
+                update(jobs).where(jobs.c.operation_id == running.claim.operation_id).values(cancel_requested_at=database_now(conn))
+            )
+        with pytest.raises(ComposerOperationCancelledDuringTurn):
+            owner.advance_current(after, following["inventory"])
+        # A refused advance leaves every old binding intact.
+        assert (owner.selected, owner.inventory, owner.inputs, owner.finish_read) == before
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
 async def test_started_graph_worker_cancellation_is_delivered_after_completion(operation_store, monkeypatch):
     from elspeth.web.composer import continuation_current_evidence as bridge
 

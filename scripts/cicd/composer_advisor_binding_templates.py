@@ -5619,6 +5619,8 @@ OWNER_TEMPLATES: dict[str, str] = {
         try:
             actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
         except ComposerOperationCancelledDuringTurn:
+            if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                raise
             finish_read = ContinuationFinishRead(inventory.running, selected, inventory)
             actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
         if (
