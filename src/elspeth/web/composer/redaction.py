@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, TypeAliasType, Union, cast, get_args, get_origin
+from typing import Annotated, Any, Final, Literal, TypeAliasType, Union, cast, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -53,6 +53,10 @@ from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
+
+# Public attachment selectors must fit the existing control-plane traversal.
+# The blob_rows persisted-storage contract has its own independent limit.
+MAX_SOURCE_BLOB_IDS: Final[int] = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_width
 
 
 @trust_boundary(
@@ -1611,7 +1615,7 @@ class SetSourceFromBlobsArgumentsModel(BaseModel):
     key outright.
     """
 
-    blob_ids: list[str] = Field(min_length=1, max_length=1000)
+    blob_ids: list[str] = Field(min_length=1, max_length=MAX_SOURCE_BLOB_IDS)
     on_success: str
     source_name: str = "source"
     on_validation_failure: str | None = None
@@ -1790,10 +1794,10 @@ class _InlineBlobModel(BaseModel):
 class _SetPipelineNamedSourceModel(BaseModel):
     """Typed fields shared by every named ``set_pipeline.sources`` root.
 
-    Named sources deliberately exclude ``blob_id`` and ``inline_blob``:
-    those custody-bearing fields are supported only by the legacy singular
-    ``source`` branch. Keeping a distinct runtime model makes that semantic
-    boundary visible to the advertised-schema compatibility guard.
+    Every root accepts a scalar attachment or ordered document attachments.
+    Named sources exclude inline creation; only the default source accepts
+    ``inline_blob``. Non-null selector ambiguity is a recoverable binding
+    refusal in the handler, separate from malformed argument shapes.
     """
 
     plugin: str
@@ -1804,6 +1808,8 @@ class _SetPipelineNamedSourceModel(BaseModel):
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
     description: str | None = None
+    blob_id: str | None = None
+    blob_ids: list[str] | None = Field(default=None, min_length=1, max_length=MAX_SOURCE_BLOB_IDS)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1840,12 +1846,11 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     the named-source model. Full replacement cannot borrow an old choice;
     empty values are rejected by semantic admission without choosing discard.
 
-    ``blob_id`` / ``inline_blob`` exclusivity
+    ``blob_id`` / ``blob_ids`` / ``inline_blob`` exclusivity
     ------------------------------------------
-    The JSON schema does NOT encode "exactly one of (blob_id, inline_blob)
-    or neither" (JSON Schema's ``oneOf`` is not used here); the handler at
-    :func:`_execute_set_pipeline` (``tools.py:4039``) rejects the
-    both-supplied case at runtime.  We deliberately do NOT replicate the
+    The JSON schema does NOT encode selector exclusivity with ``oneOf``;
+    the handler rejects multiple non-null selectors at runtime. Omitted or
+    null selectors are absent. We deliberately do NOT replicate the
     exclusivity at the Pydantic model layer — the handler's existing check
     produces a recoverable ``_failure_result`` with a repair hint that the
     LLM can act on, whereas a Pydantic-level rejection would surface as a
@@ -1853,7 +1858,6 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     shapes (type vs semantic).
     """
 
-    blob_id: str | None = None
     inline_blob: _InlineBlobModel | None = None
 
 

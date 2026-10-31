@@ -244,8 +244,8 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
 | Family | Fields |
 | --- | --- |
 | pipeline | `source`, `sources`, `nodes`, `edges`, `outputs`, `metadata` |
-| source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
-| named_source | `plugin`, `options`, `on_success`, `on_validation_failure`, `description` |
+| source | `plugin`, `blob_id`, `blob_ids`, `options`, `on_success`, `on_validation_failure`, `description`, `inline_blob` |
+| named_source | `plugin`, `blob_id`, `blob_ids`, `options`, `on_success`, `on_validation_failure`, `description` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
 | node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds`, `description`, `scope_name`, `scope_opener`, `scope_policy` |
 | trigger | `count`, `timeout_seconds`, `condition` |
@@ -253,6 +253,38 @@ inspection records, not a substitute for exact `set_pipeline_arguments`.
 | output | `sink_name`, `plugin`, `options`, `on_write_failure`, `description` |
 | metadata | `name`, `description` |
 <!-- canonical-field-inventory:end -->
+
+### Attachment roots
+
+Choose each source plugin explicitly from live discovery. Default `source`
+and every named `sources.<name>` root can bind one READY session attachment
+through `blob_id`, retaining that chosen plugin and its options. For document
+rows, choose `plugin="blob_rows"` and supply ordered `blob_ids`, with one to
+512 IDs. Even a one-element list means one document-custody row; it does not
+select scalar CSV or text parsing. The server resolves each entry's identity,
+hash, filename, MIME type and size from current owned records. Discovery or
+inspection supplies facts; it does not bind a root or choose a plugin.
+
+Omitted or null selectors are absent. A default root can choose at most one
+non-null `blob_id`, `blob_ids`, or `inline_blob`; named roots can choose at most
+one non-null `blob_id` or `blob_ids` and do not accept `inline_blob`, even null.
+No selector means ordinary plugin options. An empty ID is malformed, and an
+empty list is invalid. Do not place storage paths, `blob_ref`, `blobs`, or
+source-authoring custody inside options to bypass these selectors.
+
+Plural bindings accept current READY user-verbatim attachments. LLM-authored
+attachments require the supported scalar review flow; never relabel their
+provenance or omit review. IDs and canonical content must be distinct within
+each list; separate roots may reuse an attachment. List order becomes source
+row order. A later invalid member or root refuses the whole replacement.
+Keep the complete requested graph and its explicit routes when repairing it.
+
+Where offered, `get_pipeline_state(component="set_pipeline_arguments")`
+projects a reconstructible current graph to scalar `blob_id` or ordered
+`blob_ids`, without stored custody fields. Reapply that public document to its
+current saved owner so binding rechecks current ownership, readiness and
+metadata. Historical rows are not current clearance. An unrepresentable graph
+refuses projection rather than truncating attachments or dropping review facts.
 <!-- taught:end -->
 
 Named sources use the same routing semantics as the singular source without

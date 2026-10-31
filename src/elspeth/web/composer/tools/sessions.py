@@ -45,6 +45,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.redaction import (
+    MAX_SOURCE_BLOB_IDS,
     SetPipelineArgumentsModel,
     _OmittableString,
     redact_source_storage_path,
@@ -150,6 +151,7 @@ from elspeth.web.composer.tools.sources import (
     _reject_manual_source_blob_ref,
     _reject_manual_source_blobs,
     _resolve_source_blob,
+    _resolve_source_blobs,
     _ResolvedSourceBlob,
     _source_authoring_options,
     _source_component_id,
@@ -1069,12 +1071,13 @@ def build_set_pipeline_candidate(
                 legacy_src_options,
             )
         source_blob_id = legacy_source_model.blob_id
+        source_blob_ids = legacy_source_model.blob_ids
         inline_blob = legacy_source_model.inline_blob
         src_on_vf = source_failure_routes["source"]
-        if source_blob_id is not None and inline_blob is not None:
+        if sum(choice is not None for choice in (source_blob_id, source_blob_ids, inline_blob)) > 1:
             return _failure_result(
                 state,
-                "set_pipeline source must use either an existing blob_id or inline_blob, not both.",
+                "set_pipeline source must choose at most one non-null blob_id, blob_ids, or inline_blob binding.",
                 error_code="source_binding_ambiguous",
                 rejected_component="source",
             )
@@ -1084,7 +1087,9 @@ def build_set_pipeline_candidate(
             guarantee_stamp_error = _planner_guarantee_stamp_error(
                 legacy_src_options,
                 stored_options=stored_legacy_options,
-                llm_authored=stored_legacy_options is not None and SOURCE_AUTHORING_KEY in stored_legacy_options,
+                llm_authored=source_blob_ids is None
+                and stored_legacy_options is not None
+                and SOURCE_AUTHORING_KEY in stored_legacy_options,
                 tool_name="set_pipeline",
             )
             if guarantee_stamp_error is not None:
@@ -1118,6 +1123,29 @@ def build_set_pipeline_candidate(
             resolved_source_blob = resolved
             src_plugin = resolved.plugin
             legacy_src_options = resolved.options
+        if source_blob_ids is not None:
+            if src_plugin != "blob_rows":
+                return _failure_result(
+                    state,
+                    "set_pipeline source.blob_ids requires the provider to select plugin='blob_rows'.",
+                    error_code="source_blob_plugin_mismatch",
+                    rejected_component="source",
+                )
+            resolved_plural = _resolve_source_blobs(
+                blob_ids=source_blob_ids,
+                caller_options=legacy_src_options,
+                on_validation_failure=src_on_vf,
+                state=state,
+                context=context,
+                session_engine=session_engine,
+                session_id=session_id,
+                source_name="source",
+                rejection_operation=_RejectionOperation.CANDIDATE,
+                tool_name="set_pipeline",
+            )
+            if isinstance(resolved_plural, ToolResult):
+                return _candidate(resolved_plural)
+            legacy_src_options, _payloads = resolved_plural
         if inline_blob is not None:
             if session_engine is None or session_id is None:
                 return _failure_result(
@@ -1311,11 +1339,25 @@ def build_set_pipeline_candidate(
             src_plugin = source_model.plugin
             src_options = dict(source_model.options)
             src_on_vf = source_failure_routes[source_name]
-            reviewed_options = _reviewed_source_options(
-                source_name=source_name,
-                plugin=src_plugin,
-                options=src_options,
-                on_validation_failure=src_on_vf,
+            if source_model.blob_id is not None and source_model.blob_ids is not None:
+                _record_component_rejection(
+                    _failure_result(
+                        state,
+                        "set_pipeline named source must choose at most one non-null blob_id or blob_ids binding.",
+                        error_code="source_binding_ambiguous",
+                        rejected_component=source_ref,
+                    )
+                )
+                continue
+            reviewed_options = (
+                _reviewed_source_options(
+                    source_name=source_name,
+                    plugin=src_plugin,
+                    options=src_options,
+                    on_validation_failure=src_on_vf,
+                )
+                if source_model.blob_id is None and source_model.blob_ids is None
+                else None
             )
             reviewed_source = reviewed_options is not None
             if reviewed_source:
@@ -1410,6 +1452,16 @@ def build_set_pipeline_candidate(
                     )
                 )
                 continue
+            if source_model.blob_ids is not None and src_plugin != "blob_rows":
+                _record_component_rejection(
+                    _failure_result(
+                        state,
+                        "set_pipeline named source.blob_ids requires the provider to select plugin='blob_rows'.",
+                        error_code="source_blob_plugin_mismatch",
+                        rejected_component=source_ref,
+                    )
+                )
+                continue
             plugin_error = _validate_plugin_name(context, "source", src_plugin)
             if plugin_error is not None:
                 _record_component_rejection(_plugin_policy_failure(state, plugin_error, rejected_component=source_ref))
@@ -1430,11 +1482,13 @@ def build_set_pipeline_candidate(
                 continue
             guarantee_stamp_error = (
                 None
-                if reviewed_source
+                if reviewed_source or source_model.blob_id is not None
                 else _planner_guarantee_stamp_error(
                     src_options,
                     stored_options=stored_source_options,
-                    llm_authored=stored_source_options is not None and SOURCE_AUTHORING_KEY in stored_source_options,
+                    llm_authored=source_model.blob_ids is None
+                    and stored_source_options is not None
+                    and SOURCE_AUTHORING_KEY in stored_source_options,
                     tool_name="set_pipeline",
                 )
             )
@@ -1449,6 +1503,43 @@ def build_set_pipeline_candidate(
                     _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=source_ref)
                 )
                 continue
+            if source_model.blob_id is not None:
+                resolved = _resolve_source_blob(
+                    blob_id=source_model.blob_id,
+                    explicit_plugin=src_plugin,
+                    caller_options=src_options,
+                    rejection_operation=_RejectionOperation.CANDIDATE,
+                    on_validation_failure=src_on_vf,
+                    state=state,
+                    context=context,
+                    session_engine=session_engine,
+                    session_id=session_id,
+                    tool_name="set_pipeline",
+                    source_name=source_name,
+                    existing_options=stored_source_options,
+                )
+                if isinstance(resolved, ToolResult):
+                    _record_component_rejection(_candidate(resolved))
+                    continue
+                src_options = dict(resolved.options)
+            elif source_model.blob_ids is not None:
+                resolved_plural = _resolve_source_blobs(
+                    blob_ids=source_model.blob_ids,
+                    caller_options=src_options,
+                    on_validation_failure=src_on_vf,
+                    state=state,
+                    context=context,
+                    session_engine=session_engine,
+                    session_id=session_id,
+                    source_name=source_name,
+                    rejection_operation=_RejectionOperation.CANDIDATE,
+                    tool_name="set_pipeline",
+                )
+                if isinstance(resolved_plural, ToolResult):
+                    _record_component_rejection(_candidate(resolved_plural))
+                    continue
+                resolved_options, _payloads = resolved_plural
+                src_options = dict(resolved_options)
             credential_error = _candidate_credential_wiring_contract_failure(
                 state,
                 component_id=_source_component_id(source_name),
@@ -2140,9 +2231,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "type": "object",
                 "additionalProperties": False,
                 "description": (
-                    "Source configuration. Use blob_id to bind an already uploaded session blob, or "
-                    "inline_blob to materialize user-provided literal data atomically with the pipeline. "
-                    "null carries NO meaning — it is not 'keep the existing source'. Every call must "
+                    "Source configuration. Choose a non-null blob_id for one ready session attachment, "
+                    "blob_ids with plugin='blob_rows' for ordered document rows, or inline_blob to materialize "
+                    "literal data atomically with the pipeline. Omitted/null selectors are absent; competing "
+                    "non-null selectors are refused. A null source block is not 'keep the existing source'. Every call must "
                     "supply source or sources as a real object: on a full rebuild, re-supply the "
                     "complete existing source block, including blob_id only when that block carries one."
                 ),
@@ -2151,6 +2243,13 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "blob_id": {
                         "type": ["string", "null"],
                         "description": "Existing ready session blob ID to bind as this source (resolved exactly like set_source_from_blob).",
+                    },
+                    "blob_ids": {
+                        "type": ["array", "null"],
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": MAX_SOURCE_BLOB_IDS,
+                        "description": "Ordered READY user-verbatim session blob IDs; requires plugin='blob_rows'. Duplicate identity/content within this list is refused.",
                     },
                     "options": {
                         "type": "object",
@@ -2197,7 +2296,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "type": "object",
                 "description": (
                     "Named source roots keyed by stable source name; use instead of source for multi-source "
-                    "pipelines. Values share source's shape minus blob_id/inline_blob. null carries NO "
+                    "pipelines. Each root supports blob_id or ordered blob_ids with plugin='blob_rows'; "
+                    "omitted/null selectors are absent and competing non-null selectors are refused. "
+                    "Named inline_blob is unsupported. A null sources block carries NO "
                     "meaning; every call must supply source or sources as a real object."
                 ),
                 "additionalProperties": {
@@ -2205,6 +2306,17 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "additionalProperties": False,
                     "properties": {
                         "plugin": {"type": "string"},
+                        "blob_id": {
+                            "type": ["string", "null"],
+                            "description": "Existing ready session blob ID to bind to this named source using its explicit plugin.",
+                        },
+                        "blob_ids": {
+                            "type": ["array", "null"],
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": MAX_SOURCE_BLOB_IDS,
+                            "description": "Ordered READY user-verbatim session blob IDs; requires plugin='blob_rows'. Duplicate identity/content within this list is refused.",
+                        },
                         "options": {
                             "type": "object",
                             "description": "Plugin-specific source config." + _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE,

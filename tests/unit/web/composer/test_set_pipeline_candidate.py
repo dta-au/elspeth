@@ -387,11 +387,14 @@ def test_admitted_blob_source_schema_failure_propagates_without_effects(
     assert Path(blob.storage_path).read_bytes() == b"name\nAda\n"
 
 
-def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Path) -> None:
+@pytest.mark.parametrize("nullable_companions", [False, True], ids=("omitted", "null"))
+def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Path, nullable_companions: bool) -> None:
     engine, session_id, message_id = _session_with_user_message()
     args = _linear_args(tmp_path)
     args["source"]["options"] = {"schema": {"mode": "observed"}}
     args["source"]["inline_blob"] = {"filename": "data.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
+    if nullable_companions:
+        args["source"].update(blob_id=None, blob_ids=None)
     args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "result.json")
     state = _empty_state()
     context = _trained_context(
@@ -485,8 +488,8 @@ def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Pat
             },
             "named `sources` map",
             False,
-            True,
-            id="named-blob-backed-round-trip-unavailable",
+            False,
+            id="named-blob-bound",
         ),
         pytest.param(
             {
@@ -510,8 +513,26 @@ def test_postbuilder_inline_quota_refusal_has_no_candidate_effects(tmp_path: Pat
             },
             "named `sources` map",
             False,
+            False,
+            id="multiple-sources-with-blob",
+        ),
+        pytest.param(
+            {
+                "orders": SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={
+                        "path": "blobs/session/orders.csv",
+                        "blob_ref": {"id": "11111111-1111-4111-8111-111111111111"},
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            "named `sources` map",
+            False,
             True,
-            id="multiple-sources-with-blob-round-trip-unavailable",
+            id="named-widened-blob-identity-unavailable",
         ),
     ],
 )
@@ -2558,7 +2579,8 @@ def test_explicit_tool_context_keeps_real_authority_loss_observable(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_path: Path) -> None:
+@pytest.mark.parametrize("nullable_companions", [False, True], ids=("omitted", "null"))
+async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_path: Path, nullable_companions: bool) -> None:
     engine, session_id, message_id = _session_with_user_message()
     content = "name,score\nada,42\n"
     args = {
@@ -2578,6 +2600,8 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         "outputs": [],
         "metadata": {"name": "inline"},
     }
+    if nullable_companions:
+        args["source"].update(blob_id=None, blob_ids=None)
     state = _empty_state()
     before_state = deepcopy(state.to_dict())
     before_files = tuple((tmp_path / "blobs").rglob("*")) if (tmp_path / "blobs").exists() else ()

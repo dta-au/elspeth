@@ -14,6 +14,7 @@ import { currentAuthGeneration, isCurrentAuthGeneration } from "./authSession";
 import { ComposerObservationDetached, ComposerSessionMissing } from "./composerObserverErrors";
 import { ComposerSseDecoderV2, decodeComposerOperationFrameV2 } from "./composerOperationDecoderV2";
 import { validateComposerRecoveryBody } from "./composerOperationDecoder";
+import { ComposerObservationFault, deliverComposerObservation } from "./composerObservationFault";
 import { clearComposerSessionCustody, clearComposerStop, composerCustodyScope, composerStopRequested, recordComposerProtocolVersion, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
 import type { ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
 import type { ComposerOperationStatusV2, OperationCustody } from "@/types/composerOperations";
@@ -115,7 +116,7 @@ export async function observeComposerOperationV2(descriptor: OperationCustody, o
     let fresh: boolean;
     try { fresh = gate.accept(status); } catch { trustStream = false; return false; }
     if (fresh) {
-      options.status?.(status);
+      deliverComposerObservation(() => options.status?.(status));
       if (status.cancel_requested) { stopAcknowledged = true; options.stopUnconfirmed?.(false); }
     }
     return fresh;
@@ -166,13 +167,14 @@ export async function observeComposerOperationV2(descriptor: OperationCustody, o
               deadlineTimer = setTimeout(() => { consumedDeadlines.add(deadlineKey); deadlineFired = true; close(); }, delay);
             }
           } else if (frame.event === "progress") {
-            options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 } as ComposerProgressSnapshot);
+            deliverComposerObservation(() => options.progress?.({ ...frame.payload, session_id: descriptor.sessionId, inflight_requests: 1 } as ComposerProgressSnapshot));
           } else if (frame.event === "terminal") return "terminal";
           else if (frame.event === "reconnect") return "reconnect";
         }
       }
       return deadlineFired ? "deadline" : "failed";
-    } catch {
+    } catch (error) {
+      if (error instanceof ComposerObservationFault) throw error;
       return deadlineFired ? "deadline" : "failed";
     } finally {
       clearTimeout(idle); clearTimeout(lifetime); if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
@@ -231,7 +233,7 @@ export async function observeComposerOperationV2(descriptor: OperationCustody, o
           }
         } catch (error) {
           check();
-          if (error instanceof ComposerSessionMissing) throw error;
+          if (error instanceof ComposerObservationFault || error instanceof ComposerSessionMissing) throw error;
           if (typeof error === "object" && error !== null && "status" in error && error.status === 409
             && "error_type" in error && error.error_type === "composer_continuation_stop_unavailable") {
             clearComposerStop(descriptor);
@@ -272,6 +274,7 @@ export async function observeComposerOperationV2(descriptor: OperationCustody, o
           }
         } catch (error) {
           check();
+          if (error instanceof ComposerObservationFault) throw error;
           if (isFinal(error)) throw error;
           if (api.isDefinitiveComposerRefusal(error)) throw error; // custody is kept: a refused read proves nothing
         }

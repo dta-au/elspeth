@@ -4,12 +4,13 @@ import { ComposerSseDecoder, validateComposerRecoveryBody, decodeComposerOperati
 import { COMPOSER_CUSTODY_LIFETIME_MS, acquireComposerOperationCustody, composerProtocolVersion, composerStopRequested, requestComposerStop, attachComposerObserver, clearComposerSessionCustody, composerCustodyScope, findComposerOperationCustody, recordComposerProtocolVersion, samePrincipal, settleComposerCustody } from "@/stores/composerOperationCustody";
 import { detachComposerObserversV2, observeComposerOperationV2, wakeComposerObserverV2 } from "./composerOperationObserverV2";
 import { composerAdmissionVersion } from "@/config/composerProtocol";
+import { ComposerObservationFault, deliverComposerObservation } from "./composerObservationFault";
 import { COMPOSE_CLIENT_GRACE_MS, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
 import type { ApiError, ComposerProgressSnapshot, MessageWithStateResponse } from "@/types/index";
 import type { ComposerOperationStatusV2, OperationCustody, SubmittedCustody } from "@/types/composerOperations";
 
 import { ComposerObservationDetached, ComposerSessionMissing } from "./composerObserverErrors";
-export { ComposerObservationDetached, ComposerSessionMissing };
+export { ComposerObservationDetached, ComposerObservationFault, ComposerSessionMissing };
 /** The winner's authenticated terminal is separate from the refused submission. */
 export class ComposerActiveAttachment extends Error {
   constructor(readonly terminal: { status: "completed"; result: MessageWithStateResponse } | { status: "failed"; error: ApiError }) {
@@ -126,7 +127,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
         try {
           const ack = await api.submitComposerOperation(owner.descriptor);
           check();
-          if (ack.operation_id !== owner.descriptor.operationId || ack.kind !== owner.descriptor.kind) throw new Error("Composer acknowledgement identity mismatch");
+          if (ack.operation_id !== owner.descriptor.operationId || ack.kind !== owner.descriptor.kind) throw new ComposerObservationFault("ack_identity_mismatch", new Error("Composer acknowledgement identity mismatch"));
           ambiguous = false;
           // Custody records the version the server echoed (a missing echo is 1).
           const echoed = ack.protocolVersion ?? 1;
@@ -135,6 +136,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
           delegateToV2 = echoed === 2;
         } catch (error) {
           check();
+          if (error instanceof ComposerObservationFault) throw error;
           const active = api.composerActiveOperation(error);
           if (active !== null) {
             if (!ambiguous) { settleComposerCustody(owner.descriptor); if (owner.stopTarget?.operationId === owner.descriptor.operationId) owner.stop = false; }
@@ -157,9 +159,9 @@ export async function observeComposerOperation(initial: OperationCustody, option
           // A missing read cannot prove the earlier admission thread stopped.
           // Keep retrying cancellation if that thread commits later.
           if (cancelled.kind === "session_missing") { clearComposerSessionCustody(initial.scope, initial.sessionId); throw new ComposerSessionMissing(); }
-          if (cancelled.kind !== "operation_missing" && cancelled.kind !== owner.stopTarget!.kind) throw new Error("Cancellation kind mismatch");
+          if (cancelled.kind !== "operation_missing" && cancelled.kind !== owner.stopTarget!.kind) throw new ComposerObservationFault("cancel_kind_mismatch", new Error("Cancellation kind mismatch"));
           owner.stop = cancelled.kind === "operation_missing" || ((cancelled.status === "queued" || cancelled.status === "running") && !cancelled.cancel_requested);
-        } catch (error) { check(); if (error instanceof ComposerSessionMissing) throw error; }
+        } catch (error) { check(); if (error instanceof ComposerObservationFault || error instanceof ComposerSessionMissing) throw error; }
       }
       if (!streamAttempted && !ambiguous) {
         streamAttempted = true;
@@ -179,7 +181,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
           if (ambiguous && replayAgeEligible(owner.descriptor) && owner.descriptor.mode === "submitted" && options.submit === true && !owner.stopRequested && options.reconciliationOnly !== true) shouldSubmit = true;
           await sleep(backoff, owner.controller.signal); backoff = Math.min(backoff * 2, 8000); continue;
         }
-        if (snapshot.kind !== owner.descriptor.kind) throw new Error("Operation kind mismatch");
+        if (snapshot.kind !== owner.descriptor.kind) throw new ComposerObservationFault("snapshot_kind_mismatch", new Error("Operation kind mismatch"));
         // A bound authoritative snapshot establishes admission permanently
         // for this observation, even if a later read is missing.
         ambiguous = false;
@@ -206,6 +208,7 @@ export async function observeComposerOperation(initial: OperationCustody, option
         await sleep(Math.max(100, Math.min(snapshot.poll_after_ms, 60000)), owner.controller.signal);
       } catch (error) {
         check();
+        if (error instanceof ComposerObservationFault) throw error;
         if (isVersionRequired(error) && !durableTerminal) {
           // The attached (or restored) operation is lifecycle 2: read it as v2.
           owner.descriptor = recordComposerProtocolVersion(owner.descriptor, 2);
@@ -261,10 +264,13 @@ async function readStream(owner: ObserverOwner, current: () => boolean, tightenD
         clearTimeout(timer); timer = setTimeout(close, 15000);
         if (frame.event === "status") tightenDeadline(frame.payload.deadline_remaining_ms);
         if (frame.event === "terminal") return;
-        if (frame.event === "progress") progress?.({ ...frame.payload, session_id: frame.session_id, inflight_requests: 1 });
+        if (frame.event === "progress") deliverComposerObservation(() => progress?.({ ...frame.payload, session_id: frame.session_id, inflight_requests: 1 }));
       }
     }
-  } catch { /* One authenticated durable GET observer handles every fallback. */ }
+  } catch (error) {
+    if (error instanceof ComposerObservationFault) throw error;
+    // One authenticated durable GET observer handles transport/decode fallback.
+  }
   finally {
     clearTimeout(timer); clearTimeout(lifetimeTimer); controller.abort(); owner.controller.signal.removeEventListener("abort", close);
     if (reader !== undefined) { await reader.cancel().catch(() => undefined); reader.releaseLock(); }

@@ -202,6 +202,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "source_blob_encoding_invalid",
         "source_blob_identity_invalid",
         "source_blob_plugin_required",
+        "source_blob_plugin_mismatch",
         "source_blob_review_required",
         "source_blob_unavailable",
         "source_name_invalid",

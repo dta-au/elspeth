@@ -1,5 +1,5 @@
 import { currentAuthGeneration, isCurrentAuthGeneration } from "@/api/authSession";
-import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerSessionMissing } from "@/api/composerOperationObserver";
+import { observeComposerOperation, submitAndObserveComposerOperation, cancelObservedComposerOperation, detachComposerObservers, ComposerActiveAttachment, ComposerObservationDetached, ComposerObservationFault, ComposerSessionMissing } from "@/api/composerOperationObserver";
 import { adoptComposerObserver, composerCustodySessionIds, composerCustodyRecoveryNotice, composerStopPersistenceLimited, composerCustodyScope, findComposerOperationCustody, samePrincipal, composerStopRequested } from "./composerOperationCustody";
 import type { ComposerOperationStatusV2, OperationCustody, SubmittedCustody, ComposerOperationFailureNotice } from "@/types/composerOperations";
 import { setComposerAdmissionVersion } from "@/config/composerProtocol";
@@ -448,12 +448,23 @@ function mergeComposerFailureOutcomes(existing: ComposerOperationFailureNotice[]
 /** §4.2: the 409 composer_continuation_disabled refusal keeps the draft (the failed local message). */
 export const COMPOSER_CONTINUATION_DISABLED_COPY = "The composer's settings changed while this message was sending, so it was not sent. Use Retry to send it again.";
 export const COMPOSER_STOP_UNAVAILABLE_COPY = "Stopping this request is not available in this build. Updates will continue.";
+const COMPOSER_OBSERVATION_PENDING_COPY = "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending.";
+
+function composerObservationPendingNotice(): string {
+  return [composerCustodyRecoveryNotice(), COMPOSER_OBSERVATION_PENDING_COPY].filter((notice) => notice !== null).join(" ");
+}
+function reportComposerObservationFault(fault: ComposerObservationFault): void {
+  console.warn(fault.code);
+}
 
 async function runDurableComposerTurn(descriptor: OperationCustody, localMessageId: string | null, signal: AbortSignal | undefined, submit: boolean, reconciliationOnly = false): Promise<void> {
   const sessionId = descriptor.sessionId;
   const generation = sessionPublicationGeneration;
   const authGeneration = currentAuthGeneration();
-  const current = () => isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation);
+  const current = () => {
+    const scope = composerCustodyScope();
+    return isCurrentAuthGeneration(authGeneration) && sessionPublicationIsCurrent(sessionId, generation) && scope !== null && samePrincipal(scope, descriptor.scope);
+  };
   const beforeVersion = useSessionStore.getState().compositionState?.version ?? null;
   let result: import("@/types/index").MessageWithStateResponse | null = null;
   let failure: unknown = null;
@@ -476,7 +487,7 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
       timeout: () => {
         if (!current()) return;
         useSessionStore.setState({
-          error: [composerCustodyRecoveryNotice(), "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending."].filter((notice) => notice !== null).join(" "),
+          error: composerObservationPendingNotice(),
           errorDetails: null,
           composerProgress: null,
         });
@@ -487,6 +498,11 @@ async function runDurableComposerTurn(descriptor: OperationCustody, localMessage
       : await observeComposerOperation(descriptor, options);
   } catch (error) {
     if (!current() || error instanceof ComposerObservationDetached) return;
+    if (error instanceof ComposerObservationFault) {
+      reportComposerObservationFault(error);
+      if (!reconciliationOnly) useSessionStore.setState({ error: composerObservationPendingNotice(), errorDetails: null, composerProgress: null });
+      return;
+    }
     if (error instanceof ComposerSessionMissing) { useSessionStore.getState().unbindMissingSession(sessionId); return; }
     if (error instanceof ComposerActiveAttachment && error.terminal.status === "completed") result = error.terminal.result;
     failure = error;
@@ -1370,20 +1386,27 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async reconcileInactiveComposerCustody() {
     const authGeneration = currentAuthGeneration();
+    const generation = sessionPublicationGeneration;
     const scope = composerCustodyScope();
     if (scope === null) return;
     try {
       const [principal, config] = await Promise.all([api.fetchCurrentUser({ logoutOnUnauthorized: false }), api.fetchAuthConfig()]);
       const fresh = composerCustodyScope();
-      if (!isCurrentAuthGeneration(authGeneration) || fresh === null || !samePrincipal(fresh, scope) || principal.user_id !== scope.principalId || config.provider !== scope.authProvider) return;
+      if (!isCurrentAuthGeneration(authGeneration) || sessionPublicationGeneration !== generation || fresh === null || !samePrincipal(fresh, scope) || principal.user_id !== scope.principalId || config.provider !== scope.authProvider) return;
       const notice = composerCustodyRecoveryNotice();
       if (notice !== null) set({ error: notice });
       for (const sessionId of composerCustodySessionIds(scope)) {
         if (sessionId === get().activeSessionId) continue;
         const record = findComposerOperationCustody(scope, sessionId);
         for (const descriptor of [...record.unresolvedSubmissions.values(), ...(record.foreground === null ? [] : [record.foreground])]) {
-          void observeComposerOperation(descriptor, { reconciliationOnly: true, current: () => get().activeSessionId !== sessionId }).catch(() => undefined).finally(() => {
-            if (isCurrentAuthGeneration(authGeneration) && notice !== null && get().error === notice) set({ error: composerCustodyRecoveryNotice() });
+          const current = () => {
+            const fresh = composerCustodyScope();
+            return isCurrentAuthGeneration(authGeneration) && sessionPublicationGeneration === generation && fresh !== null && samePrincipal(fresh, scope) && get().activeSessionId !== sessionId;
+          };
+          void observeComposerOperation(descriptor, { reconciliationOnly: true, current }).catch((error: unknown) => {
+            if (current() && error instanceof ComposerObservationFault) reportComposerObservationFault(error);
+          }).finally(() => {
+            if (current() && notice !== null && get().error === notice) set({ error: composerCustodyRecoveryNotice() });
           });
         }
       }

@@ -30,6 +30,7 @@ from elspeth.web.composer.authority_hashing import project_composer_authority_pa
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
+    MAX_SOURCE_BLOB_IDS,
     PatchSourceOptionsArgumentsModel,
     SetSourceArgumentsModel,
     SetSourceFromBlobArgumentsModel,
@@ -61,6 +62,7 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
+    _candidate_plugin_policy_failure,
     _canonical_interpretation_requirement_error,
     _canonicalize_authored_interpretation_requirements,
     _discovery_result,
@@ -116,7 +118,7 @@ _INLINE_CSV_CANDIDATE_SCAN_LIMIT = 50
 _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     " Server/resolver-owned source option roots are not settable: "
     + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
-    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, source.blob_id, or source.inline_blob."
+    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, a source root's blob_id/blob_ids, or source.inline_blob."
     + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
 )
 
@@ -849,7 +851,7 @@ def _resolve_source_blob(
         return _failure_result(state, f"Blob is not ready (status: {blob['status']}).", error_code="source_blob_unavailable")
 
     mime_extra: dict[str, str] = {}
-    if explicit_plugin:
+    if explicit_plugin is not None:
         plugin = explicit_plugin
     elif blob["mime_type"] not in _MIME_TO_SOURCE:
         return _failure_result(
@@ -1344,6 +1346,8 @@ def _resolve_source_blobs(
     session_engine: Engine | None,
     session_id: str | None,
     source_name: str,
+    rejection_operation: _RejectionOperation,
+    tool_name: str,
 ) -> tuple[Mapping[str, Any], tuple[SourceBlobPayload, ...]] | ToolResult:
     """Resolve a bounded blob-id list into authoritative blob_rows options.
 
@@ -1355,45 +1359,54 @@ def _resolve_source_blobs(
     UTF-8 decoded here; no content is read at all (run admission re-resolves
     the records and web execution stages the bytes for the payload store).
     """
-    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
+    if type(rejection_operation) is not _RejectionOperation:
+        raise AuditIntegrityError("Plural source resolver requires an owned rejection operation")
+
+    def _failure_result(
+        rejected_state: CompositionState,
+        message: str,
+        *,
+        error_code: str,
+        plugin_identity: tuple[str, str] | None = None,
+    ) -> ToolResult:
+        return rejection_operation.reject(
+            rejected_state,
+            message,
+            error_code=error_code,
+            rejected_component=_source_component_id(source_name),
+            plugin_identity=plugin_identity,
+        )
+
+    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
     if manual_authoring_error is not None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             manual_authoring_error,
             error_code="interpretation_requirements_invalid",
-            rejected_component=_source_component_id(source_name),
         )
-    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name="set_source_from_blobs")
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name=tool_name)
     if manual_blob_ref_error is not None:
-        return _saved_graph_rejection_result(
-            state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
-        )
-    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name="set_source_from_blobs")
+        return _failure_result(state, manual_blob_ref_error, error_code="plugin_options_invalid")
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name=tool_name)
     if manual_blobs_error is not None:
-        return _saved_graph_rejection_result(
-            state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
-        )
+        return _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid")
     if session_engine is None or session_id is None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             "Blob tools require session context.",
             error_code="source_binding_context_unavailable",
-            rejected_component=_source_component_id(source_name),
         )
     seen_ids: set[str] = set()
     for blob_id in blob_ids:
         blob_id_error = _blob_id_uuid_validation_error(blob_id)
         if blob_id_error is not None:
-            return _saved_graph_rejection_result(
-                state, blob_id_error, error_code="source_blob_identity_invalid", rejected_component=_source_component_id(source_name)
-            )
+            return _failure_result(state, blob_id_error, error_code="source_blob_identity_invalid")
         normalized = blob_id.lower()
         if normalized in seen_ids:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Duplicate blob id '{blob_id}' in blob_ids.",
                 error_code="source_blob_duplicate",
-                rejected_component=_source_component_id(source_name),
             )
         seen_ids.add(normalized)
 
@@ -1403,18 +1416,16 @@ def _resolve_source_blobs(
     for blob_id in blob_ids:
         blob = _sync_get_blob(session_engine, blob_id, session_id)
         if blob is None:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' not found.",
                 error_code="source_blob_unavailable",
-                rejected_component=_source_component_id(source_name),
             )
         if blob["status"] != "ready":
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' is not ready (status: {blob['status']}).",
                 error_code="source_blob_unavailable",
-                rejected_component=_source_component_id(source_name),
             )
         content_hash_value = blob["content_hash"]
         if content_hash_value is None:
@@ -1428,19 +1439,17 @@ def _resolve_source_blobs(
             # serves the authenticated upload/paste flow, whose blobs are
             # always user-verbatim; admitting LLM-authored blobs here
             # without an equivalent review shape would bypass human review.
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' is LLM-authored; use a supported set_source_from_blob flow to stage its interpretation review. "
                 "If its content is not representable there, preserve the intended artifact and report the limitation.",
                 error_code="source_blob_review_required",
-                rejected_component=_source_component_id(source_name),
             )
         if content_hash_value in seen_hashes:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' has the same content as blob '{seen_hashes[content_hash_value]}'; entries must be unique documents.",
                 error_code="source_blob_duplicate",
-                rejected_component=_source_component_id(source_name),
             )
         seen_hashes[content_hash_value] = blob["id"]
         entries.append(
@@ -1469,13 +1478,15 @@ def _resolve_source_blobs(
         merged_options = dict(stamped)
     elif "schema" not in merged_options and "schema_config" not in merged_options:
         merged_options["schema"] = {"mode": "observed"}
-    canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name="set_source_from_blobs")
+    canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name=tool_name)
     if canonical_error is not None:
-        return _saved_graph_rejection_result(
-            state, canonical_error, error_code="interpretation_requirements_invalid", rejected_component=_source_component_id(source_name)
-        )
+        return _failure_result(state, canonical_error, error_code="interpretation_requirements_invalid")
     plugin_error = _plugin_selection_violation(context, "source", "blob_rows")
     if plugin_error is not None:
+        if rejection_operation is _RejectionOperation.CANDIDATE:
+            return _candidate_plugin_policy_failure(
+                state, plugin_error, component=None, rejected_component=_source_component_id(source_name)
+            )
         return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=_source_component_id(source_name))
     context.catalog.get_schema("source", "blob_rows")
     prevalidation_error = _prevalidate_source_for_context(
@@ -1486,11 +1497,10 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
-            rejected_component=_source_component_id(source_name),
             plugin_identity=("source", "blob_rows"),
         )
     return merged_options, tuple(payloads)
@@ -1586,6 +1596,8 @@ def _execute_set_source_from_blobs(
         session_engine=context.session_engine,
         session_id=context.session_id,
         source_name=source_name,
+        rejection_operation=_RejectionOperation.SAVED_GRAPH,
+        tool_name="set_source_from_blobs",
     )
     if isinstance(resolved, ToolResult):
         return resolved
@@ -1635,7 +1647,7 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
                 "type": "array",
                 "items": {"type": "string", "description": "Ready session blob ID."},
                 "minItems": 1,
-                "maxItems": 1000,
+                "maxItems": MAX_SOURCE_BLOB_IDS,
                 "description": "Blob IDs in authoring order (becomes source-row order). No duplicates.",
             },
             "source_name": {

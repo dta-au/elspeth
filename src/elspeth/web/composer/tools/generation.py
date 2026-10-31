@@ -1743,7 +1743,8 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "source_binding_ambiguous",
         "The candidate supplies competing source bindings. No replacement was applied.",
         "Keep the intended input and supply exactly one source or named sources map. For a blob-backed source, choose "
-        "either an existing blob_id or new inline_blob content, never both.",
+        "one non-null blob_id or ordered blob_ids per root. Only the default source also supports inline_blob. "
+        "Omitted/null selectors are absent; do not combine non-null selectors.",
     ),
     DirectValidationGuidance(
         "source_binding_locked",
@@ -1853,6 +1854,13 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "The plural binding contains LLM-authored content whose interpretation review is not established by this flow.",
         "Use a supported set_source_from_blob flow to stage the intended artifact's review where its content is "
         "representable. Otherwise preserve the artifact and report the limitation; never relabel provenance or drop review.",
+    ),
+    DirectValidationGuidance(
+        "source_blob_plugin_mismatch",
+        "The plural attachment binding requires the provider to select the document-row source plugin.",
+        "Use plugin='blob_rows' with ordered blob_ids for document rows, including a one-element list. "
+        "For scalar parsing, choose the intended source plugin explicitly and supply blob_id instead. "
+        "Preserve the intended attachments and topology; the server does not substitute a plugin.",
     ),
     DirectValidationGuidance(
         "source_blob_plugin_required",
