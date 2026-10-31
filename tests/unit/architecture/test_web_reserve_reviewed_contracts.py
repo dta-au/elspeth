@@ -1288,7 +1288,7 @@ def test_common_cost_capture_binds_original_identity_and_closed_receiver_prefix(
     block = method.body[36].body
     prefix = block[4:18] + block[19:24]
     assert receiver.receiver_transfer_prefix(prefix)
-    route_units = (units[0], *_source_units((route.HELPERS,)))
+    route_units = (units[0], *_source_units((route.HELPERS, route.FINALIZATION)))
     assert route.route_helper_local_contracts(route_units)[0] == []
     if fault is None:
         return
@@ -1406,7 +1406,7 @@ def test_reviewed_turn_grammar_matches_live_source_and_refuses_reserve_drift(con
         check = compose.compose_proposal_local_transfers
         expected = "composer complete executed method grammar changed " + TURN
     else:
-        units = _source_units((TURN, route.HELPERS))
+        units = _source_units((TURN, route.HELPERS, route.FINALIZATION))
         check = route.route_helper_local_contracts
         expected = "route helpers: complete finite grammar changed _run_composer_turn"
     failures, _ = check(units)
@@ -11240,7 +11240,7 @@ def test_receiving_context_handler_role_preserves_audit_and_closed_order(fault):
 )
 def test_receiving_compose_and_route_shapes_bind_the_accepted_context_branch(owner, fault):
     if owner == "route_turn":
-        units = _source_units((TURN, route.HELPERS))
+        units = _source_units((TURN, route.HELPERS, route.FINALIZATION))
         check = route.route_helper_local_contracts
     else:
         units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
