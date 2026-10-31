@@ -64,7 +64,7 @@ from elspeth.contracts import bounded_serialization, credential_material, hashin
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.plugins.transforms.llm.transform import LLMTransform
-from elspeth.web import async_workers, credential_guard
+from elspeth.web import async_workers, credential_guard, validation
 from elspeth.web import continuation_retention_memo as retention_memo
 from elspeth.web.catalog import service as catalog_service
 from elspeth.web.composer import (
@@ -91,8 +91,8 @@ from elspeth.web.coordination import database_clock
 from elspeth.web.required_executor import RequiredInvocationWitness
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredWorkTicket
+from elspeth.web.sessions import _auto_title, continuation_selection, continuation_title_application
 from elspeth.web.sessions import continuation as stored_continuation
-from elspeth.web.sessions import continuation_selection
 from elspeth.web.sessions import engine as session_engine
 from elspeth.web.sessions import locking as session_locking
 
@@ -152,8 +152,18 @@ _CONTEXT_CONTENT = provider_context._message_content.__code__
 _CONTEXT_MESSAGES = provider_context._check_messages.__code__
 _CONTEXT_POLICY = provider_context._POLICY
 _CONTEXT_VALIDATOR_NAME: Final = "provider_context_message_text"
-_UNCACHED_VALIDATORS: Final = (_METADATA_VALIDATOR_NAME, _CONTEXT_VALIDATOR_NAME)
-UncachedValidator = Literal["diagnostic_correlation_metadata", "provider_context_message_text"]
+# Ready replay re-derives the applied TITLE decision from its paid source and
+# compares it with the recorded event (continuation_title_application module
+# docstring). Only that read's decision call is this validator's carrier.
+_TITLE_VALIDATOR = continuation_title_application.title_application_decision.__code__
+_TITLE_READ = continuation_title_application.read_applied_title_ready_immutable_data_on_connection.__code__
+_TITLE_ADMIT = _auto_title._admit_title_candidate.__code__
+_TITLE_SHAPE = validation.reject_credential_shaped_content.__code__
+_TITLE_REJECT = validation.reject_credential_material.__code__
+_TITLE_POLICY = credential_material.DEFAULT_CREDENTIAL_TRAVERSAL_POLICY
+_TITLE_VALIDATOR_NAME: Final = "applied_title_decision"
+_UNCACHED_VALIDATORS: Final = (_METADATA_VALIDATOR_NAME, _CONTEXT_VALIDATOR_NAME, _TITLE_VALIDATOR_NAME)
+UncachedValidator = Literal["diagnostic_correlation_metadata", "provider_context_message_text", "applied_title_decision"]
 _BYTE_CHANNELS: Final = ("strict_parse", "canonical", "chunk_length", "chunk_digest", "scanner_size", "scanner_extent", "key_preparation")
 _FIND_FUNCTION = credential_material._find
 _REFERENCE_FUNCTION = credential_material._allowed_reference_finding
@@ -2790,6 +2800,11 @@ _CONTEXT_CONTENT_SITE = _direct_call_site(_CONTEXT_CONTENT, "_text", loads_expec
 _CONTEXT_MESSAGES_SITE = _direct_call_site(_CONTEXT_MESSAGES, "_message_content", arguments=1)
 _CONTEXT_CAPTURE_SITE = _direct_call_site(_CONTEXT_VALIDATOR, "_check_messages", arguments=2)
 _CONTEXT_CANONICAL_SITE = _direct_call_site(_CONTEXT_VALIDATOR, "canonical_json", arguments=1)
+_TITLE_READ_SITE = _direct_call_site(_TITLE_READ, "title_application_decision", arguments=1)
+_TITLE_ADMIT_SITE = _direct_call_site(_TITLE_VALIDATOR, "_admit_title_candidate", arguments=1)
+_TITLE_SHAPE_SITE = _direct_call_site(_TITLE_ADMIT, "reject_credential_shaped_content", arguments=1)
+_TITLE_REJECT_SITE = _direct_call_site(_TITLE_SHAPE, "reject_credential_material", arguments=1)
+_TITLE_FIND_SITE = _direct_call_site(_TITLE_REJECT, "find_credential_material", arguments=1)
 _SNAPSHOT_SOURCE_SITE = _direct_call_site(_LOAD_SNAPSHOT, "decode_continuation_snapshot", arguments=1, load_op="LOAD_FAST")
 _CHUNK_SOURCE_SITE = _direct_call_site(_LOAD_CHUNKS, "verify_private_chunk", arguments=2)
 _CHUNK_PARSE_SITE = _direct_call_site(continuation_codec._verify_private_chunk_canonical.__code__, "parse_json_strict", arguments=1)
@@ -6542,7 +6557,7 @@ class RetentionMemoTrace:
         code = frame.f_code
         high = code is _SNAPSHOT_REQUEST or code is _CHUNK_REQUEST or code is _CREDENTIAL_REQUEST or code is _STATE_REQUEST
         if event == "return":
-            if high or code is _METADATA_VALIDATOR or code is _CONTEXT_VALIDATOR:
+            if high or code is _METADATA_VALIDATOR or code is _CONTEXT_VALIDATOR or code is _TITLE_VALIDATOR:
                 with self._lock:
                     self._frames.pop(id(frame), None)
                     invocation = self._validator_frames.pop(id(frame), None)
@@ -6577,6 +6592,7 @@ class RetentionMemoTrace:
             high
             or code is _METADATA_VALIDATOR
             or code is _CONTEXT_VALIDATOR
+            or code is _TITLE_VALIDATOR
             or id(code) in self._query_codes
             or id(code) in _LOW_CODES
             or code is _PARSE
@@ -6597,8 +6613,15 @@ class RetentionMemoTrace:
                 ):
                     self.errors.append("target work carried an unobserved stage")
                 return
-            if code is _METADATA_VALIDATOR or code is _CONTEXT_VALIDATOR:
+            if code is _METADATA_VALIDATOR or code is _CONTEXT_VALIDATOR or code is _TITLE_VALIDATOR:
                 if code is _METADATA_VALIDATOR and type(frame.f_locals.get("self")) is not diagnostic_evidence.ComposerDiagnosticEvidence:
+                    return
+                if code is _TITLE_VALIDATOR and (
+                    self.require_native_bytes or frame.f_back is None or not self._at_site(frame.f_back, _TITLE_READ, _TITLE_READ_SITE)
+                ):
+                    # Only ready replay's re-derivation carries this validator,
+                    # and never under native-byte observation (no byte carrier);
+                    # any other decision call keeps its ordinary attribution.
                     return
                 if expected_id is not None and expected_id != id(actual):
                     # Refusals can exit before their first detector call.
@@ -6609,7 +6632,11 @@ class RetentionMemoTrace:
                     actual,
                     len(self.uncached_validations) + 1,
                     get_ident(),
-                    validator=_METADATA_VALIDATOR_NAME if code is _METADATA_VALIDATOR else _CONTEXT_VALIDATOR_NAME,
+                    validator=_METADATA_VALIDATOR_NAME
+                    if code is _METADATA_VALIDATOR
+                    else _CONTEXT_VALIDATOR_NAME
+                    if code is _CONTEXT_VALIDATOR
+                    else _TITLE_VALIDATOR_NAME,
                     expected_memo_id=expected_id,
                 )
                 self.uncached_validations.append(invocation)
@@ -6672,6 +6699,8 @@ class RetentionMemoTrace:
                             ancestor = ancestor.f_back
                         self._byte_detector_frames[id(frame)] = self._validator_frames[id(ancestor)]
                     return
+                if self._uncached_title_attempt(frame, actual, expected_id):
+                    return
                 if self._uncached_validator_ancestor(frame.f_back):
                     # A changed validator path/policy cannot borrow an outer
                     # memo request to turn failed uncached attribution green.
@@ -6696,8 +6725,53 @@ class RetentionMemoTrace:
                 return False
             if frame.f_code is _METADATA_VALIDATOR or frame.f_code is _CONTEXT_VALIDATOR:
                 return True
+            if frame.f_code is _TITLE_VALIDATOR and id(frame) in self._validator_frames:
+                return True
             frame = frame.f_back
         return False
+
+    def _uncached_title_attempt(self, frame: FrameType, actual: RetentionStageMemo, expected_id: int | None) -> bool:
+        """Attribute one detector call to ready replay's TITLE re-derivation.
+
+        Exact ancestry only: find_credential_material <- reject_credential_material
+        <- reject_credential_shaped_content <- _admit_title_candidate <- the
+        registered title_application_decision frame called by
+        read_applied_title_ready_immutable_data_on_connection. Native-byte
+        observation has no carrier for this validator, so it stays orphaned there.
+        """
+        if self.require_native_bytes or (expected_id is not None and expected_id != id(actual)):
+            return False
+        ancestry = []
+        ancestor = frame.f_back
+        for code, site in (
+            (_TITLE_REJECT, _TITLE_FIND_SITE),
+            (_TITLE_SHAPE, _TITLE_REJECT_SITE),
+            (_TITLE_ADMIT, _TITLE_SHAPE_SITE),
+            (_TITLE_VALIDATOR, _TITLE_ADMIT_SITE),
+        ):
+            if ancestor is None or not self._at_site(ancestor, code, site):
+                return False
+            ancestry.append(MemoCallSite(code.co_filename, code.co_qualname, code.co_firstlineno, ancestor.f_lineno))
+            validator_frame = ancestor
+            ancestor = ancestor.f_back
+        invocation = self._validator_frames.get(id(validator_frame))
+        policy = frame.f_locals.get("policy")
+        value = frame.f_locals.get("value")
+        if (
+            invocation is None
+            or invocation.validator != _TITLE_VALIDATOR_NAME
+            or invocation.memo is not actual
+            or invocation.thread_id != get_ident()
+            or invocation.expected_memo_id != expected_id
+            or policy is not _TITLE_POLICY
+            or type(value) is not str
+        ):
+            return False
+        policy_key = _policy_data(policy)
+        if policy_key is None:
+            return False
+        invocation.attempts.append(UncachedValidationAttempt(ancestry[0], id(policy), policy_key, "str", len(value), tuple(ancestry)))
+        return True
 
     def _uncached_metadata_attempt(self, frame: FrameType, actual: RetentionStageMemo, expected_id: int | None) -> bool:
         caller = frame.f_back

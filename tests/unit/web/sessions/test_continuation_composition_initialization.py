@@ -86,23 +86,40 @@ def _paid_uncached_budgets(*stages):
     first-Compose retention; the nonpaid arms measure zero and declare
     nothing. Each value is the exact count measured on Python 3.13 on
     2026-11-01 (invocations, attempts, input characters), never padded; all
-    four paid READY arms measured identical totals, as did both rollback
-    arms. Re-measure if the paid TITLE fixture or its audit changes.
+    four paid READY arms measured identical metadata/context totals, as did
+    both rollback arms. ``applied_title_decision`` is ready replay's
+    re-derivation of the applied TITLE decision: every paid arm invokes it,
+    but only an accepted title reaches its credential scan (a rejected,
+    empty or absent title stops before it), so it is budgeted per arm.
+    Re-measure if the paid TITLE fixture or its audit changes.
     """
     return tuple(
         budget
-        for stage, (metadata, context) in enumerate(stages, 1)
+        for stage, (metadata, context, title) in enumerate(stages, 1)
         for budget in (
             UncachedValidationBudget(stage, *metadata, validator="diagnostic_correlation_metadata"),
             UncachedValidationBudget(stage, *context, validator="provider_context_message_text"),
+            UncachedValidationBudget(stage, *title, validator="applied_title_decision"),
         )
     )
 
 
-# First construction plus its read-only replay: two retention stages.
-_PAID_READY_BUDGETS = _paid_uncached_budgets(((24, 144, 5520), (8, 16, 6576)), ((15, 90, 3450), (5, 10, 4110)))
-# Rolled-back first construction plus its complete replay.
-_PAID_ROLLBACK_BUDGETS = _paid_uncached_budgets(((6, 36, 1380), (2, 4, 1644)), ((24, 144, 5520), (8, 16, 6576)))
+# First construction plus its read-only replay: two retention stages. An
+# accepted title (27 characters) is scanned once per decision invocation.
+_PAID_READY_ACCEPTED_BUDGETS = _paid_uncached_budgets(
+    ((24, 144, 5520), (8, 16, 6576), (8, 8, 216)), ((15, 90, 3450), (5, 10, 4110), (5, 5, 135))
+)
+_PAID_READY_UNSCANNED_BUDGETS = _paid_uncached_budgets(
+    ((24, 144, 5520), (8, 16, 6576), (8, 0, 0)), ((15, 90, 3450), (5, 10, 4110), (5, 0, 0))
+)
+# Rolled-back first construction plus its complete replay (accepted title).
+_PAID_ROLLBACK_BUDGETS = _paid_uncached_budgets(((6, 36, 1380), (2, 4, 1644), (2, 2, 54)), ((24, 144, 5520), (8, 16, 6576), (8, 8, 216)))
+
+
+def _paid_ready_budgets(paid, content):
+    if not paid:
+        return ()
+    return _PAID_READY_ACCEPTED_BUDGETS if content == "Original Café Session Title" else _PAID_READY_UNSCANNED_BUDGETS
 
 
 async def ready_case(store, tmp_path, monkeypatch, *, paid=False, bound_base=False, content="Original Café Session Title"):
@@ -235,7 +252,7 @@ async def test_real_ready_publishes_complete_first_compose_once(operation_store,
         assert replay.materialization is not runtime.materialization and replay.graph.evidence is not runtime.graph.evidence
         assert len(sdk) == int(paid)
         work.coordinator.assert_completed()
-        memo_trace.finish(stages=2, uncached_validation_limits=_PAID_READY_BUDGETS if paid else ())
+        memo_trace.finish(stages=2, uncached_validation_limits=_paid_ready_budgets(paid, content))
     finally:
         operation_store[1].release(running.session_operation_context)
 
