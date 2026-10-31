@@ -19668,6 +19668,93 @@ _reserve_BATCH_APPEND_SOURCE = """def _append_continuation_tool_outcome(
 
 _reserve_BATCH_FORWARD_SOURCE = "def _append_tool_outcome(\n    *,\n    response: Any,\n    error_class: str | None,\n    error_category: ToolArgumentErrorCategory | None,\n    error_message: str | None,\n    post_version: int,\n    _batch: ContinuationBatchState = batch,\n    _call: ContinuationCallState = call,\n) -> None:\n    _append_continuation_tool_outcome(\n        _batch,\n        _call,\n        response=response,\n        error_class=error_class,\n        error_category=error_category,\n        error_message=error_message,\n        post_version=post_version,\n    )"
 
+# Reviewed 2026-11-01: batch-carrier references outside tool_batch.py that the
+# live-phase refactor introduced. Each one constructs a carrier in its reviewed
+# owner, annotates a formal, or is an exact `type(x) is [not] C` check; none
+# transfers or mutates a carrier. Keyed (path, enclosing qualname, name, role)
+# with an exact count. The receipt's two-sided equality against actual
+# protected uses still refuses any other reference.
+_reserve_BATCH_EXTERNAL_REVIEWED_USES = {
+    (
+        "src/elspeth/web/composer/continuation_live_phases.py",
+        "ContinuationLivePhases._initialize_batch",
+        "ContinuationBatchState",
+        "constructor",
+    ): 1,
+    (
+        "src/elspeth/web/composer/continuation_live_phases.py",
+        "ContinuationLivePhases._execute_one_owned",
+        "ContinuationCallState",
+        "constructor",
+    ): 1,
+    ("src/elspeth/web/composer/continuation_p4_batch.py", "encode_p4_pending_batch_data", "ContinuationBatchState", "annotation"): 1,
+    ("src/elspeth/web/composer/continuation_p4_batch.py", "encode_p4_pending_batch_data", "ContinuationBatchState", "exact-type"): 1,
+    ("src/elspeth/web/composer/continuation_p4_batch.py", "encode_p4_pending_batch_chunk", "ContinuationBatchState", "annotation"): 1,
+    (
+        "src/elspeth/web/composer/continuation_prompt_producers.py",
+        "ContinuationToolMessagePublication.require_call",
+        "ContinuationBatchState",
+        "exact-type",
+    ): 1,
+    (
+        "src/elspeth/web/composer/continuation_prompt_producers.py",
+        "ContinuationToolMessagePublication.require_call",
+        "ContinuationCallState",
+        "exact-type",
+    ): 1,
+}
+
+
+def _reserve_batch_external_reviewed_uses(units, table=None):
+    """Return (failures, uses) for the reviewed external batch-carrier references."""
+    table = _reserve_BATCH_EXTERNAL_REVIEWED_USES if table is None else table
+    indexed = {unit.path: unit for unit in units}
+    found = Counter()
+    uses = set()
+    for path in sorted({key[0] for key in table}):
+        unit = indexed.get(path)
+        if unit is None:
+            continue
+        parents = {id(child): parent for parent in ast.walk(unit.tree) for child in ast.iter_child_nodes(parent)}
+
+        def visit(node, scope, path=path, parents=parents):
+            for child in ast.iter_child_nodes(node):
+                inner = (*scope, child.name) if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else scope
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    parent = parents.get(id(child))
+                    if isinstance(parent, ast.Call) and parent.func is child:
+                        role = "constructor"
+                    elif isinstance(parent, ast.arg) and parent.annotation is child:
+                        role = "annotation"
+                    elif (
+                        isinstance(parent, ast.Compare)
+                        and len(parent.ops) == 1
+                        and isinstance(parent.ops[0], (ast.Is, ast.IsNot))
+                        and parent.comparators[0] is child
+                        and isinstance(parent.left, ast.Call)
+                        and isinstance(parent.left.func, ast.Name)
+                        and parent.left.func.id == "type"
+                        and len(parent.left.args) == 1
+                        and not parent.left.keywords
+                    ):
+                        role = "exact-type"
+                    else:
+                        role = None
+                    key = (path, ".".join(scope), child.id, role)
+                    if key in table:
+                        found[key] += 1
+                        uses.add((path, id(child)))
+                visit(child, inner, path, parents)
+
+        visit(unit.tree, ())
+    failures = [
+        f"continuation batch reviewed external use changed {path}:{qualname}:{name}:{role} reviewed {count} found {found[(path, qualname, name, role)]}"
+        for (path, qualname, name, role), count in sorted(table.items())
+        if path in indexed and found[(path, qualname, name, role)] != count
+    ]
+    return failures, frozenset(uses)
+
+
 _reserve_BATCH_HELPER_SOURCE_SHA256 = {
     "_initialize_continuation_batch_live": "11ac4cceb8a8b0cb94bf3d199b1160bf01f1e6b634c6eb6f65b86f1831fabb6a",
     "_append_continuation_tool_outcome": "55c932802c1fddcb5e7528caf267da6d762f7f8262d7b10a3de1697836fed8ab",
@@ -20409,6 +20496,9 @@ def _reserve_continuation_batch_state_receipt(units):
     data_failures, data = _reserve_continuation_batch_data_receipt(units, classes)
     if data_failures:
         return data_failures, {}
+    external_failures, external_uses = _reserve_batch_external_reviewed_uses(units)
+    if external_failures:
+        return external_failures, {}
     selected_classes = set(classes)
     selected_functions = set(definitions) - {"run_tool_batch"}
     owned_uses = frozenset(
@@ -20430,6 +20520,7 @@ def _reserve_continuation_batch_state_receipt(units):
         "function_origins": frozenset(module + "." + name for name in definitions),
         "reference_origins": frozenset(module + "." + name for name in selected_classes | selected_functions),
         "owned_uses": owned_uses
+        | external_uses
         | data["owned_uses"]
         | attachment["native_uses"]
         | custody["native_uses"]
@@ -40501,6 +40592,24 @@ def test_closure_allowlist_drops_only_exact_reviewed_counts() -> None:
         "closure allowlist entry is stale: cat a src/elspeth/x.py:None reviewed 2 observed 1",
     ]
     assert _reserve_apply_closure_allowlist(reviewed[2:], frozenset({"src/elspeth/y.py"}), allowlist) == []
+
+
+def test_batch_external_reviewed_uses_match_exactly() -> None:
+    units = _production_units()
+    failures, uses = _reserve_batch_external_reviewed_uses(units)
+    assert failures == [] and len(uses) == sum(_reserve_BATCH_EXTERNAL_REVIEWED_USES.values()) == 7
+    path = "src/elspeth/web/composer/continuation_p4_batch.py"
+    unit = next(unit for unit in units if unit.path == path)
+    check = "type(batch) is not ContinuationBatchState"
+    assert unit.source.count(check) == 1
+    # A second reviewed-role reference in a reviewed owner changes the count.
+    doubled = _parse_source(path, unit.source.replace(check, f"{check} or {check}"))
+    doubled_failures, _ = _reserve_batch_external_reviewed_uses(tuple(doubled if u.path == path else u for u in units))
+    assert any("encode_p4_pending_batch_data:ContinuationBatchState:exact-type reviewed 1 found 2" in f for f in doubled_failures)
+    # A reference in an unreviewed scope is never matched, so it stays unowned.
+    extra = _parse_source(path, unit.source + "\ndef _unreviewed(x):\n    return type(x) is ContinuationBatchState\n")
+    extra_failures, extra_uses = _reserve_batch_external_reviewed_uses(tuple(extra if u.path == path else u for u in units))
+    assert extra_failures == [] and len(extra_uses) == 7
 
 
 def test_closure_allowlist_data_is_reviewed_and_unique() -> None:
