@@ -66,7 +66,12 @@ from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.sessions.test_continuation_ingress import recovery_rows
-from tests.unit.web.sessions.test_continuation_initialization import _reclaim_pretitle, bootstrap_case, publish
+from tests.unit.web.sessions.test_continuation_initialization import (
+    _reclaim_pretitle,
+    bootstrap_case,
+    publish,
+    seed_observed_sql_trial_policy,
+)
 from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 from tests.unit.web.sessions.test_continuation_title_application import paid_title, reached_or_failure
 from tests.unit.web.sessions.test_continuation_title_provider import actual_title_update
@@ -132,7 +137,11 @@ def assert_first_graph(runtime, service, running):
     assert runtime.live.last_validation == catalog.validate_composition_state(runtime.live.state).validation
     cache = decode_continuation_caches(source_chunk(runtime, frame.caches), env_ref_names=runtime.env_ref_names)
     assert cache.capture_count == 1 and len(cache.capture_creators) == 1 and runtime.live.continuation_cache_history == cache
-    retained = decode_turn_evidence(source_chunk(runtime, frame.evidence), env_ref_names=runtime.env_ref_names).snapshot
+    # As every production decoder does, admit evidence with its selected
+    # dependency cohort: the recorder chunk is a separate original source.
+    retained = decode_turn_evidence(
+        source_chunk(runtime, frame.evidence), env_ref_names=runtime.env_ref_names, source_chunks=runtime.source.selected.chunks
+    ).snapshot
     assert retained.requires_blob_reader and retained.initial_is_latest
     reader = runtime.graph.evidence.transcript._blob_reader
     assert type(reader) is CurrentTranscriptBlobReader and reader.service is service and reader.context is running.session_operation_context
@@ -153,6 +162,7 @@ def assert_first_graph(runtime, service, running):
     ],
 )
 async def test_real_ready_publishes_complete_first_compose_once(operation_store, tmp_path, monkeypatch, paid, bound_base, content, request):
+    seed_observed_sql_trial_policy(monkeypatch)
     running, service, work, ready, sdk = await ready_case(
         operation_store, tmp_path, monkeypatch, paid=paid, bound_base=bound_base, content=content
     )
@@ -291,6 +301,7 @@ async def test_ready_cannot_enter_existing_runtime_without_first_compose_publica
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ("after_chunk", "after_append"))
 async def test_initial_compose_publication_rolls_back_complete_sql_then_replays(operation_store, tmp_path, monkeypatch, stage, request):
+    seed_observed_sql_trial_policy(monkeypatch)
     running, service, work, ready, sdk = await ready_case(operation_store, tmp_path, monkeypatch, paid=True)
     memo_trace = RetentionMemoTrace(monkeypatch, request)
     marker = RuntimeError("original first Compose transaction failure")

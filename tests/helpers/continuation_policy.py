@@ -27,6 +27,15 @@ from elspeth.web.continuation_settings import ContinuationActionBoundsSettings, 
 # up to a whole minute. Re-derive it if observer cost or trial content changes.
 OBSERVED_SQL_TRIAL_RETENTION_SECONDS: Final = 120.0
 
+# Session-SQL physical allowance for observer trials whose window also spans
+# the physical stage (a RetentionMemoTrace opened before the first-Compose
+# construction in tests/unit/web/sessions/test_continuation_composition_initialization.py).
+# Measured 2026-11-01 on Python 3.13 at -n 3, host load about 14: that observed
+# physical stage took up to 6.7 s (4.6 s serial) against the production 5 s
+# bound. Same rule as above: twice the measured maximum, rounded up to a whole
+# minute. Re-derive it if observer cost or trial content changes.
+OBSERVED_SQL_TRIAL_PHYSICAL_SECONDS: Final = 60.0
+
 
 def continuation_test_settings(**overrides: Any) -> WebSettings:
     """Minimal valid WebSettings; continuation fields keep their production defaults."""
@@ -47,21 +56,26 @@ def minimal_continuation_policy(**setting_overrides: Any) -> ContinuationAdmissi
     return policy
 
 
-def observed_sql_trial_policy() -> ContinuationAdmissionPolicy:
-    """The production policy with only session-SQL retention widened for observer trials.
+def observed_sql_trial_policy(*, physical_seconds: float | None = None) -> ContinuationAdmissionPolicy:
+    """The production policy with session-SQL retention widened for observer trials.
 
     Built through the same settings mapping and validators as production. The
     nominal segment grows by exactly the added first-segment chain time (three
     session-SQL actions), so the production chain-fit check still applies.
+    ``physical_seconds`` also widens the session-SQL physical stage, for trials
+    whose observed window spans that stage too; omitted, it stays production.
     """
     defaults = continuation_test_settings()
     production = defaults.composer_continuation_action_bounds.session_sql
+    physical = production.physical if physical_seconds is None else physical_seconds
     widened = ContinuationLocalStageSettings(
         preparation=production.preparation,
-        physical=production.physical,
+        physical=physical,
         retention=OBSERVED_SQL_TRIAL_RETENTION_SECONDS,
     )
-    added_chain = _FIRST_SEGMENT_SESSION_SQL_ACTIONS * (OBSERVED_SQL_TRIAL_RETENTION_SECONDS - production.retention)
+    added_chain = _FIRST_SEGMENT_SESSION_SQL_ACTIONS * (
+        (OBSERVED_SQL_TRIAL_RETENTION_SECONDS - production.retention) + (physical - production.physical)
+    )
     return minimal_continuation_policy(
         composer_continuation_action_bounds=ContinuationActionBoundsSettings(session_sql=widened),
         composer_continuation_segment_nominal_seconds=defaults.composer_continuation_segment_nominal_seconds + added_chain,

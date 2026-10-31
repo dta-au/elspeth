@@ -39,7 +39,7 @@ from elspeth.web.sessions.titles import format_default_session_title
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.continuation_inventory import inventory_work
 from tests.helpers.continuation_memo import RetentionMemoTrace
-from tests.helpers.continuation_policy import minimal_continuation_policy
+from tests.helpers.continuation_policy import OBSERVED_SQL_TRIAL_PHYSICAL_SECONDS, minimal_continuation_policy, observed_sql_trial_policy
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
 from tests.unit.web.sessions.test_continuation_cold_restore import start_continuation
@@ -47,6 +47,20 @@ from tests.unit.web.sessions.test_continuation_ingress import begin, ingress, mu
 from tests.unit.web.sessions.test_continuation_prompt_producers import current_service
 
 operation_store = operations.operation_store
+
+
+def seed_observed_sql_trial_policy(monkeypatch):
+    """Admit the next ``bootstrap_case`` seed under the observer-trial policy.
+
+    The retained admission policy, not service settings, clocks every later
+    stage. A RetentionMemoTrace trial runs that session-SQL work under the
+    observer's profile hook, so it needs the measured observer allowances
+    (tests/helpers/continuation_policy.py) instead of the production 5 s bounds.
+    """
+    monkeypatch.setattr(
+        f"{__name__}.minimal_continuation_policy",
+        lambda: observed_sql_trial_policy(physical_seconds=OBSERVED_SQL_TRIAL_PHYSICAL_SECONDS),
+    )
 
 
 async def bootstrap_case(store, *, eligible=True, bound_base=False):
@@ -127,6 +141,7 @@ async def publish(store, running, completed, service, work=None):
 async def test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_preparation(
     operation_store, monkeypatch, eligible, bound_base, request
 ):
+    seed_observed_sql_trial_policy(monkeypatch)
     running, completed, service, prior, base = await bootstrap_case(operation_store, eligible=eligible, bound_base=bound_base)
     memo_trace = RetentionMemoTrace(
         monkeypatch,
@@ -180,7 +195,9 @@ async def test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_
             next_continuation_action_policy(
                 selected=SelectedContinuationState(result.selected.checkpoint_id, root, (result.bootstrap,)), policy=policy
             )
-            == policy.actions.session_sql
+            # A title_pending cut sizes its fresh TITLE provider action; the
+            # TITLE preparer refuses any other clock (continuation_next_action).
+            == (policy.actions.title if eligible else policy.actions.session_sql)
         )
 
         async def unexpected(*_args, **_kwargs):
@@ -442,6 +459,7 @@ async def test_pretitle_cancel_joins_original_skill_preparation_without_publishi
 
 @pytest.mark.asyncio
 async def test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_original_failure(operation_store, monkeypatch, request):
+    seed_observed_sql_trial_policy(monkeypatch)
     running, completed, service, _prior, _base = await bootstrap_case(operation_store)
     await service._maybe_upsert_skill_markdown_history()
     memo_trace = RetentionMemoTrace(monkeypatch, request)
