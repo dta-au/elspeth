@@ -80,6 +80,10 @@ _INVENTORY: dict[tuple[str, str], dict[str, str]] = {
     },
     ("sessions", "blobs"): {"content_hash": "hex64", "creating_composer_skill_hash": "hex64", "creating_arguments_hash": "hex64"},
     ("sessions", "composer_completion_events"): {"payload_digest": "prefixed64"},
+    # Continuation storage (fa9e91575): each column uses _lower_sha256_constraints.
+    ("sessions", "composer_continuation_chunks"): {"sha256": "hex64"},
+    ("sessions", "composer_continuation_effects"): {"input_sha256": "hex64", "graph_sha256": "hex64"},
+    ("sessions", "composer_operation_segments"): {"policy_sha256": "hex64"},
     ("sessions", "composition_proposals"): {"composer_skill_hash": "hex64", "tool_arguments_hash": "hex64"},
     ("sessions", "interpretation_events"): {
         "composer_skill_hash": "hex64",
