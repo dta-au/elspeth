@@ -140,7 +140,11 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
         async def inspect(request):
             assert request.role == expected_guard_roles[len(guard_bindings)]
             if request.role == "composer":
-                assert any(prior_request in document for document in request.documents)
+                # A history message is inspected as its JSON shadow unit
+                # (prompt_guard._request, ensure_ascii=False), so a quoted
+                # prior request appears JSON-escaped there.
+                escaped = json.dumps(prior_request, ensure_ascii=False)[1:-1]
+                assert any(prior_request in document or escaped in document for document in request.documents)
             guard_bindings.append(request.request_hash)
             decision = await real_inspect(request)
             assert decision.disposition == "allow"
@@ -320,7 +324,10 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             ComposerDiagnosticEvidence.from_envelope(
                 envelope, expected_session_id=str(session.id), expected_operation_id=jobs[0].session_operation_id
             )
+            # Private evidence lives only on audit rows; assistant rows carry
+            # the provider tool calls, which have no _kind (as in _envelopes).
             for row in rows
+            if row.role == "audit"
             for envelope in row.tool_calls or ()
             if envelope["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
