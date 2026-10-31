@@ -22,6 +22,7 @@ from elspeth.contracts.prompt_guard import (
     detach_prompt_guard_evidence,
     thaw_guarded_messages,
 )
+from tests.helpers.tree_gate import iter_gate_files
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[3] / "src" / "elspeth"
 _CANONICAL_DEFINITION = _SOURCE_ROOT / "contracts" / "prompt_guard.py"
@@ -327,9 +328,7 @@ def test_the_duplicate_enumeration_detector_discriminates() -> None:
 
 def test_exactly_one_module_defines_the_canonical_set() -> None:
     """The exemption keys off this name, so a second definition would shadow it."""
-    definitions = [
-        path for path in sorted(_SOURCE_ROOT.rglob("*.py")) if _canonical_assignments(ast.parse(path.read_text(encoding="utf-8")))
-    ]
+    definitions = [path for path in iter_gate_files(_SOURCE_ROOT) if _canonical_assignments(ast.parse(path.read_text(encoding="utf-8")))]
 
     assert definitions == [_CANONICAL_DEFINITION], f"the canonical set is defined in {definitions}"
 
@@ -343,7 +342,7 @@ def test_no_module_enumerates_the_guard_keys_outside_the_canonical_assignment() 
     """
     offenders: dict[str, list[int]] = {}
     scanned = 0
-    for path in sorted(_SOURCE_ROOT.rglob("*.py")):
+    for path in iter_gate_files(_SOURCE_ROOT):
         scanned += 1
         lines = _duplicate_enumerations(ast.parse(path.read_text(encoding="utf-8")))
         if lines:

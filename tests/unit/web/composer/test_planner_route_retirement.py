@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_files
+
 _SRC = Path(__file__).resolve().parents[4] / "src" / "elspeth"
 
 RETIRED_NAMES = frozenset(
@@ -66,7 +68,7 @@ def retired_references(tree: ast.AST, names: frozenset[str], strings: frozenset[
 
 @cache
 def _source_trees() -> tuple[tuple[str, ast.AST], ...]:
-    return tuple((str(path.relative_to(_SRC)), ast.parse(path.read_text(encoding="utf-8"))) for path in sorted(_SRC.rglob("*.py")))
+    return tuple((str(path.relative_to(_SRC)), ast.parse(path.read_text(encoding="utf-8"))) for path in iter_gate_files(_SRC))
 
 
 def test_no_source_defines_or_references_the_retired_planner_route() -> None:
