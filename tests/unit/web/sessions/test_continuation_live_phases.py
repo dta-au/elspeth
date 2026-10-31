@@ -31,7 +31,7 @@ from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost
+from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import _assert_required_guard_admitted, initialized_primary_input, stored_rows
@@ -40,7 +40,9 @@ operation_store = _operation_store
 
 
 @asynccontextmanager
-async def _phase_case(store, tmp_path, monkeypatch, *, tool_call: tuple[str, str, dict[str, Any]] | None = None):
+async def _phase_case(
+    store, tmp_path, monkeypatch, *, tool_call: tuple[str, str, dict[str, Any]] | None = None, before_batch_initialization=None
+):
     runtime, work, requests = await initialized_primary_input(store, tmp_path, monkeypatch)
     service, authority = runtime.materialization.service, store[2]
     running = work.running
@@ -125,6 +127,8 @@ async def _phase_case(store, tmp_path, monkeypatch, *, tool_call: tuple[str, str
             runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
         owner.accept_primary(primary)
         selected = await load_selected_continuation(authority=authority, running=running, selected=primary.snapshot, required_work=work)
+        if before_batch_initialization is not None:
+            before_batch_initialization(owner, running)
         await service.advance_continuation_phase(owner=owner, authority=authority, selected=selected, work=work, provider_owner=provider)
         assert owner.runtime.bindings is runtime.bindings and owner.runtime.live is runtime.live
         assert owner.runtime.graph.evidence is runtime.graph.evidence and owner.runtime.graph.recorder is runtime.graph.recorder
@@ -935,6 +939,42 @@ async def test_real_stop_reads_and_publishes_only_the_actual_completed_prefix(op
         with operation_store[0].connect() as conn:
             issued = conn.execute(select(effects.c.effect_key).where(effects.c.owner == "tool_dispatch")).scalars().all()
         assert issued == [f"tool:{primary.response.reference.digest}:0"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("when", ("before_inventory", "after_inventory"))
+async def test_durable_stop_before_refresh_onto_a_compose_cut_surfaces_as_cancellation(operation_store, tmp_path, monkeypatch, when):
+    """The warm owner refreshes onto the retained-response Compose cut.
+
+    A Stop already durable when that refresh starts owes no issued/completed
+    tool work, so it surfaces as the cancellation itself. ``before_inventory``
+    reaches the inventory fallback, ``after_inventory`` the runtime-source read.
+    """
+    from elspeth.web.composer import continuation_live_phases as phases
+
+    def stop(owner, running):
+        owner.authority.request_cancel(
+            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+        )
+
+    def before_batch_initialization(owner, running):
+        if when == "before_inventory":
+            stop(owner, running)
+            return
+        actual = phases.materialize_continuation_env_inventory
+
+        async def materialize_then_stop(**kwargs):
+            inventory = await actual(**kwargs)
+            stop(owner, running)
+            return inventory
+
+        monkeypatch.setattr(phases, "materialize_continuation_env_inventory", materialize_then_stop)
+
+    before = None
+    with pytest.raises(ComposerOperationCancelledDuringTurn):
+        async with _phase_case(operation_store, tmp_path, monkeypatch, before_batch_initialization=before_batch_initialization):
+            before = "entered"
+    assert before is None
 
 
 @pytest.mark.asyncio

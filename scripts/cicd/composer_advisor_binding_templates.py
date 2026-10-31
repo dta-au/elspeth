@@ -6523,6 +6523,8 @@ class FirstRuntimeGraph:
             advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
         )
     except ComposerOperationCancelledDuringTurn:
+        if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+            raise
         names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
         inventory = CurrentContinuationEnvInventory(
             running,
@@ -6538,6 +6540,8 @@ class FirstRuntimeGraph:
         try:
             return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
         except ComposerOperationCancelledDuringTurn:
+            if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                raise
             finish_read = ContinuationFinishRead(running, selected, inventory)
             return finish_read.read_runtime(self.authority)
 
@@ -8067,6 +8071,8 @@ class ContinuationLivePhases:
                 advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
             )
         except ComposerOperationCancelledDuringTurn:
+            if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                raise
             names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
             inventory = CurrentContinuationEnvInventory(
                 running,
@@ -8082,6 +8088,8 @@ class ContinuationLivePhases:
             try:
                 return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
             except ComposerOperationCancelledDuringTurn:
+                if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                    raise
                 finish_read = ContinuationFinishRead(running, selected, inventory)
                 return finish_read.read_runtime(self.authority)
 

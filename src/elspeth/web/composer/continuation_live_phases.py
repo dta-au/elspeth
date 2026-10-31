@@ -203,6 +203,10 @@ class ContinuationLivePhases:
                 advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
             )
         except ComposerOperationCancelledDuringTurn:
+            if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                # No issued/completed tool work is owed at this cut; the
+                # durable Stop itself is the outcome, not an owed read.
+                raise
             names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
             inventory = CurrentContinuationEnvInventory(
                 running,
@@ -218,6 +222,8 @@ class ContinuationLivePhases:
             try:
                 return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
             except ComposerOperationCancelledDuringTurn:
+                if type(selected.stack.frames[-1]) is not ToolBatchFrame:
+                    raise
                 finish_read = ContinuationFinishRead(running, selected, inventory)
                 return finish_read.read_runtime(self.authority)
 
