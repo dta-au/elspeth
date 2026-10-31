@@ -2591,12 +2591,15 @@ def test_sink_callback_repository_binding_refuses_changed_recovery_body() -> Non
     ]
     assert len(transitions) == 1
     transition = transitions[0]
+    # The reviewed recovery now reads its parent/segment/history/time from the
+    # validated unavailable-segment record.
     assert ast.unparse(transition) == (
         "recover_segment_on_connection(conn, session_id=str(session_id), operation_id=operation_id, "
-        "parent=parent, segment=segment, history=history, now=now, next_eligible_at=now)"
+        "parent=unavailable.parent, segment=unavailable.segment, history=unavailable.history, "
+        "now=unavailable.now, next_eligible_at=unavailable.now)"
     )
     histories = [keyword for keyword in transition.keywords if keyword.arg == "history"]
-    assert len(histories) == 1 and ast.unparse(histories[0].value) == "history"
+    assert len(histories) == 1 and ast.unparse(histories[0].value) == "unavailable.history"
     histories[0].value = ast.Name(id="foreign_history", ctx=ast.Load())
     changed = _receiving_reparse_mutated_unit(changed)
     mutated = tuple(changed if unit.path == path else unit for unit in units)
