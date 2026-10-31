@@ -11,6 +11,10 @@ APP = "elspeth.web.app"
 OWNER = "elspeth.web.application_finalizers.ApplicationFinalizerOwner"
 RECOVERY = "elspeth.web.process_recovery.ProcessRecovery"
 DRAIN = "elspeth.web.sessions.composer_drain.ComposerDrainSignal"
+# The producer classes create_app constructs. Every class-, namespace- and
+# instance-protection check below derives from this one set, so a newly
+# protected producer cannot be added to some checks and missed by others.
+CONSTRUCTED = frozenset({OWNER, RECOVERY, DRAIN})
 CELLS = {"_APPLICATION_FINALIZER_OWNER", "_INSTANCE_DRAINING"}
 PROTECTED_MODULES = {
     WORKER,
@@ -393,12 +397,7 @@ def _namespace_effects(units, configured_function):
                 if original not in PROTECTED_BINDINGS:
                     continue
                 canonical = node is configured_function
-                canonical |= (
-                    scope is unit.tree
-                    and isinstance(node, ast.ClassDef)
-                    and original in {OWNER, RECOVERY, DRAIN}
-                    and node in unit.tree.body
-                )
+                canonical |= scope is unit.tree and isinstance(node, ast.ClassDef) and original in CONSTRUCTED and node in unit.tree.body
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     imports = {
                         a.asname or (a.name.partition(".")[0] if isinstance(node, ast.Import) else a.name): (
@@ -432,8 +431,8 @@ def _namespace_effects(units, configured_function):
                 return env.get(value.id, frozenset({module + "." + value.id}))
             if isinstance(value, ast.Attribute):
                 roots = qualify(value.value, env)
-                if value.attr == "__dict__" and roots & (PROTECTED_MODULES | {OWNER, RECOVERY}):
-                    return frozenset(root + ".__namespace__" for root in roots & (PROTECTED_MODULES | {OWNER, RECOVERY}))
+                if value.attr == "__dict__" and roots & (PROTECTED_MODULES | CONSTRUCTED):
+                    return frozenset(root + ".__namespace__" for root in roots & (PROTECTED_MODULES | CONSTRUCTED))
                 if value.attr == "__globals__" and WORKER + ".configure_required_executor_recovery" in roots:
                     return frozenset({WORKER + ".__namespace__"})
                 return frozenset(root + "." + value.attr for root in roots if root.count(".") < 8)
@@ -443,8 +442,8 @@ def _namespace_effects(units, configured_function):
                 return qualify(value.value, env)
             if isinstance(value, ast.Call):
                 operator = qualify(value.func, env)
-                if operator & {OWNER, RECOVERY, "threading.Event"}:
-                    return frozenset(root + ".__instance__" for root in operator & {OWNER, RECOVERY, "threading.Event"})
+                if operator & (CONSTRUCTED | {"threading.Event"}):
+                    return frozenset(root + ".__instance__" for root in operator & (CONSTRUCTED | {"threading.Event"}))
                 if isinstance(value.func, ast.Name) and value.func.id in {"globals", "locals"} and not value.args and module == WORKER:
                     return frozenset({WORKER + ".__namespace__"})
                 if operator == frozenset({"builtins.vars"}) and len(value.args) == 1:
@@ -621,7 +620,7 @@ def _namespace_effects(units, configured_function):
                 or any(qualified == WORKER + "." + cell or qualified.startswith(WORKER + "." + cell + ".") for cell in CELLS)
                 or any(
                     qualified.startswith(owner + ".")
-                    for owner in {OWNER, RECOVERY, "threading.Event", WORKER + ".configure_required_executor_recovery"}
+                    for owner in CONSTRUCTED | {"threading.Event", WORKER + ".configure_required_executor_recovery"}
                 )
             )
 
@@ -643,7 +642,7 @@ def _namespace_effects(units, configured_function):
                             root.removesuffix(".__namespace__") == WORKER
                             and (selector is None or selector in CELLS or protected(WORKER + "." + str(selector)))
                         )
-                        or (root.removesuffix(".__namespace__") in {OWNER, RECOVERY})
+                        or (root.removesuffix(".__namespace__") in CONSTRUCTED)
                         or (selector is None or protected(root.removesuffix(".__namespace__") + "." + str(selector)))
                     )
                     for root in roots
@@ -668,7 +667,7 @@ def _namespace_effects(units, configured_function):
                     field = node.args[1].value if isinstance(node.args[1], ast.Constant) else None
                     roots = qualify(node.args[0], env)
                     if any(
-                        (root in PROTECTED_MODULES and (field is None or protected(root + "." + str(field)))) or root in {OWNER, RECOVERY}
+                        (root in PROTECTED_MODULES and (field is None or protected(root + "." + str(field)))) or root in CONSTRUCTED
                         for root in roots
                     ):
                         failures.append("recovery producer reflected replacement " + unit.path)
