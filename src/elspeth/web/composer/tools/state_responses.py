@@ -387,12 +387,15 @@ def _authoring_source(value: object) -> AuthoringSource:
         _require(blob_id is None or blob_ids is None)
         return AuthoringSource(_source(value.source), blob_id, blob_ids)
     wire = dict(_mapping(value))
-    blob_id = _optional_text(wire.pop("blob_id", None))
-    _require(blob_id is None or bool(blob_id.strip()))
-    raw_blob_ids = wire.pop("blob_ids", None)
+    # The encoder omits an absent binding; it never emits null. A present key
+    # therefore carries a real value, and an explicit null is refused.
+    blob_id = None
+    if "blob_id" in wire:
+        blob_id = _text(wire.pop("blob_id"))
+        _require(bool(blob_id.strip()))
     blob_ids = None
-    if raw_blob_ids is not None:
-        blob_ids = tuple(_text(item) for item in _array(raw_blob_ids))
+    if "blob_ids" in wire:
+        blob_ids = tuple(_text(item) for item in _array(wire.pop("blob_ids")))
         _require(1 <= len(blob_ids) <= MAX_SOURCE_BLOB_IDS)
         _require(all(item.strip() for item in blob_ids))
     _require(blob_id is None or blob_ids is None)
@@ -486,11 +489,17 @@ def parse_pipeline_state_response(value: object) -> PipelineStateResponse:
 
 def _authoring_source_wire(value: AuthoringSource) -> JsonValue:
     source = _serialize_source(value.source)
-    if value.blob_id is not None:
-        source["blob_id"] = value.blob_id
-    elif value.blob_ids is not None:
-        source["blob_ids"] = list(value.blob_ids)
-    return _json(source)
+    if value.blob_id is None and value.blob_ids is None:
+        return _json(source)
+    # Keep the provider-visible legacy byte order: the binding follows
+    # on_success, ahead of options.
+    binding: dict[str, JsonValue] = {"blob_id": value.blob_id} if value.blob_id is not None else {"blob_ids": list(value.blob_ids or ())}
+    ordered: dict[str, JsonValue] = {}
+    for key, item in source.items():
+        ordered[key] = item
+        if key == "on_success":
+            ordered.update(binding)
+    return _json(ordered)
 
 
 def _encode(value: PipelineStateResponse) -> JsonValue:
