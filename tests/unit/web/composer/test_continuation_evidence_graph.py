@@ -258,5 +258,8 @@ def test_model_copy_cannot_skip_complete_owned_frontier_admission():
     corrupt = retained.snapshot.model_copy(
         update={"effects": retained.snapshot.effects.model_copy(update={"net_changed_fields": ("invented",)})}
     )
-    with pytest.raises(AuditIntegrityError, match="complete owned DATA contract"):
+    # The retention preflight revalidates every nested owned model before the
+    # graph/encode path, so the copied frontier is refused at that first owner.
+    with pytest.raises(AuditIntegrityError, match="retention preflight found invalid complete owned model data") as refused:
         admit_turn_evidence(corrupt, env_ref_names=frozenset(), source_chunks=retained.dependency_chunks)
+    assert "changed its complete admitted base frontier" in str(refused.value.__cause__)
