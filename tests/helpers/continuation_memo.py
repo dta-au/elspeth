@@ -1036,10 +1036,11 @@ def _structure_parameter_arities(parameters, executemany: bool) -> tuple[int, ..
     if type(executemany) is not bool:
         raise ValueError("unknown parameter mode")
     if executemany:
-        if type(parameters) not in (list, tuple) or any(type(row) not in (list, tuple, dict) for row in parameters):
+        if type(parameters) not in (list, tuple) or any(type(row) not in (list, tuple, dict, immutabledict) for row in parameters):
             raise ValueError("unknown parameter rows")
         return tuple(len(row) for row in parameters)
-    if type(parameters) not in (list, tuple, dict):
+    # PostgreSQL (psycopg) driver frames carry SQLAlchemy's immutabledict.
+    if type(parameters) not in (list, tuple, dict, immutabledict):
         raise ValueError("unknown parameter row")
     return (len(parameters),)
 
