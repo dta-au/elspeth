@@ -84,6 +84,17 @@ if os.environ.get('GATE_CAPACITY_BARRIER') == '1':
         time.sleep(0.01)
 """
 
+PROVENANCE_LATE_FAILURE = """import atexit, os, sys
+
+def fail_after_path_output():
+    sys.stdout.flush()
+    sys.stderr.write('controlled provenance shutdown failure exit=79\\n')
+    sys.stderr.flush()
+    os._exit(79)
+
+atexit.register(fail_after_path_output)
+"""
+
 LINT_CLI = """import json, os, signal, sys
 from pathlib import Path
 cache = Path('.pytest_cache')
@@ -365,6 +376,61 @@ def test_public_foreground_and_detached_preserve_driver_and_outer_status(project
     assert f"driver_exit={expected}" in (run / "driver.exit").read_text()
     assert int((run / "pytest-1.exit").read_text()) == expected
     assert "frozen=yes" in (run / "summary.txt").read_text()
+
+
+@pytest.mark.parametrize("detached", (False, True), ids=("foreground", "detached"))
+@pytest.mark.parametrize("native_exit,expected", ((0, 0), (79, 2)), ids=("healthy", "late-failure"))
+def test_public_provenance_requires_success_after_actual_path_output(project, detached, native_exit, expected):
+    linked_environment = project / ".venv"
+    assert linked_environment.is_symlink()
+    environment_target = linked_environment.resolve()
+    assert environment_target == (REPO_ROOT / ".venv").resolve()
+    if native_exit:
+        # Change only this disposable package, never the linked interpreter.
+        package_init = project / "elspeth-lints/src/elspeth_lints/__init__.py"
+        assert not package_init.is_symlink() and package_init.resolve().is_relative_to(project)
+        package_init.write_text(PROVENANCE_LATE_FAILURE)
+    producer = "import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)"
+    measured = subprocess.run(
+        [str(linked_environment / "bin/python"), "-B", "-c", producer],
+        cwd=project,
+        env=_environment(project, "pass"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    expected_paths = [str(project / "src/elspeth/__init__.py"), str(project / "elspeth-lints/src/elspeth_lints/__init__.py")]
+    assert measured.returncode == native_exit
+    assert measured.stdout.splitlines() == expected_paths
+    if native_exit:
+        assert measured.stderr == "controlled provenance shutdown failure exit=79\n"
+    else:
+        assert measured.stderr == ""
+
+    process, run = _start(project, "pass", detached=detached)
+    actual = _finish(process, run, detached)
+    report = _report(run, actual)
+    assert report["child_returncode"] == actual
+    assert linked_environment.is_symlink() and linked_environment.resolve() == environment_target
+    assert actual == expected, "valid printed paths cannot qualify a failed provenance interpreter"
+    if native_exit:
+        output = (run / ("driver.log" if detached else "launcher-output.txt")).read_text()
+        assert "preflight REFUSED; nothing run" in output
+        assert not (run / "pytest-1.exit").exists()
+        assert not (run / "pytest-junit.xml").exists()
+        assert not (run / "summary.txt").exists()
+        assert not (run / "driver.exit").exists()
+        assert not (run / ".done").exists()
+        assert not (project / ".pytest_cache/pytest-temp").exists()
+    else:
+        preflight = (run / "preflight.txt").read_text()
+        assert f"provenance  : elspeth -> {expected_paths[0]}" in preflight
+        assert f"              elspeth_lints -> {expected_paths[1]}" in preflight
+        assert int((run / "pytest-1.exit").read_text()) == 0
+        assert "driver_exit=0" in (run / "driver.exit").read_text()
+        summary = (run / "summary.txt").read_text()
+        assert "frozen=yes" in summary and "RESULT=PASS" in summary
+        assert (run / ".done").is_file()
 
 
 @pytest.mark.parametrize("detached", (False, True))

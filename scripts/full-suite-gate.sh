@@ -280,13 +280,18 @@ if [ ! -x "$PY" ]; then
     REFUSE=1
 else
     export PYTHONPATH="$ROOT/src:$ROOT/elspeth-lints/src"
-    PROV="$("$PY" -B -c 'import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1 || true)"
-    E_FILE="$(sed -n 1p <<<"$PROV")"; L_FILE="$(sed -n 2p <<<"$PROV")"
-    if [[ "$E_FILE" == "$ROOT/src/"* && "$L_FILE" == "$ROOT/elspeth-lints/src/"* ]]; then
-        pre "provenance  : elspeth -> $E_FILE"
-        pre "              elspeth_lints -> $L_FILE"
+    if PROV="$("$PY" -B -c 'import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1)"; then
+        E_FILE="$(sed -n 1p <<<"$PROV")"; L_FILE="$(sed -n 2p <<<"$PROV")"
+        if [[ "$E_FILE" == "$ROOT/src/"* && "$L_FILE" == "$ROOT/elspeth-lints/src/"* ]]; then
+            pre "provenance  : elspeth -> $E_FILE"
+            pre "              elspeth_lints -> $L_FILE"
+        else
+            pre "REFUSED     : imports resolve outside this tree: $(tr '\n' ' ' <<<"$PROV")"
+            REFUSE=1
+        fi
     else
-        pre "REFUSED     : imports resolve outside this tree: $(tr '\n' ' ' <<<"$PROV")"
+        PROV_STATUS=$?
+        pre "REFUSED     : provenance interpreter exited $PROV_STATUS: $(tr '\n' ' ' <<<"$PROV")"
         REFUSE=1
     fi
 fi
