@@ -504,10 +504,6 @@ class CurrentContinuationMessageProducers:
             try:
                 actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
             except ComposerOperationCancelledDuringTurn:
-                if type(selected.stack.frames[-1]) is not ToolBatchFrame:
-                    # No issued/completed tool work is owed at this cut; the
-                    # durable Stop itself is the outcome, not an owed read.
-                    raise
                 finish_read = ContinuationFinishRead(inventory.running, selected, inventory)
                 actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
             if (
