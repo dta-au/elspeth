@@ -1243,6 +1243,8 @@ export interface ApiError {
   secret_guard?: ExecutionSecretGuard;
   provider_detail?: string;
   provider_status_code?: number;
+  /** Closed safe evidence of a primary provider request rejection, when retained. */
+  request_rejection?: SafeRequestRejection;
   validation_errors?: ValidationError[];
   errors?: ApiStructuredError[];
   snapshot_fingerprint?: string;

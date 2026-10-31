@@ -759,6 +759,8 @@ def _litellm_error_detail(
         "error_type": error_type,
         "detail": type(exc).__name__,
     }
+    if type(exc) is _BadRequestLLMError and exc.request_rejection is not None:
+        detail["request_rejection"] = exc.request_rejection.to_wire()
     if not expose_provider_error:
         return detail
 

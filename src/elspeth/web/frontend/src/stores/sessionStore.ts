@@ -32,6 +32,7 @@ import {
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
+import { formatRequestRejection } from "./requestRejection";
 import {
   acquireSessionOperationRetry,
   clearAllSessionOperationRetries,
@@ -400,6 +401,7 @@ function formatProviderDiagnostic(apiErr: ApiError): string {
 }
 
 function formatLlmUnavailableError(apiErr: ApiError): string {
+  if (apiErr.request_rejection !== undefined) return formatRequestRejection(apiErr.request_rejection, "composer");
   return `${apiErr.guidance ?? LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
 }
 

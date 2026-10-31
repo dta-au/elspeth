@@ -25,6 +25,7 @@ from elspeth.contracts.prompt_guard import (
     PromptGuardThinkingParts,
     PromptGuardToolArgumentParts,
 )
+from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.contracts.readonly_json import JsonValue
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
@@ -315,10 +316,33 @@ class _BadRequestLLMError(ComposerServiceError):
         *,
         provider_detail: str | None = None,
         provider_status_code: int | None = None,
+        request_rejection: SafeRequestRejection | None = None,
     ) -> None:
         super().__init__(message)
         self.provider_detail = provider_detail
         self.provider_status_code = provider_status_code
+        self.request_rejection = request_rejection
+
+    def _bind_retained_request_rejection(self, call: ComposerLLMCall, custody: ProviderCallCustody) -> None:
+        """Name this exact retained failure; the enclosing scope still owes settlement."""
+        rejection = self.request_rejection
+        if rejection is None:
+            return
+        if (
+            custody.call is not call
+            or custody.attempt is None
+            or call.call_id is None
+            or call.call_id != custody.attempt.attempt_id
+            or call.status is not ComposerLLMCallStatus.BAD_REQUEST_ERROR
+            or call.private_failure is None
+        ):
+            raise AuditIntegrityError("Primary rejection lost its exact retained provider failure")
+        from elspeth.web.composer.diagnostic_evidence import diagnostic_evidence_identity
+
+        reference = diagnostic_evidence_identity("provider-failure", call.call_id)
+        if rejection.diagnostic_reference not in (None, reference):
+            raise AuditIntegrityError("Primary rejection reference names another provider failure")
+        self.request_rejection = rejection.model_copy(update={"diagnostic_reference": reference})
 
 
 def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
@@ -938,10 +962,12 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            failure = classify_provider_failure(exc)
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
                 provider_status_code=exc.status_code,
+                request_rejection=failure.request_rejection if failure is not None else None,
             ) from exc
         completion = _admit_composer_llm_completion(
             response,
@@ -1011,10 +1037,12 @@ class ProviderGateway:
                 **kwargs,
             )
         except LiteLLMBadRequestError as exc:
+            failure = classify_provider_failure(exc)
             raise _BadRequestLLMError(
                 f"LLM request rejected ({type(exc).__name__})",
                 provider_detail=str(exc) or None,
                 provider_status_code=exc.status_code,
+                request_rejection=failure.request_rejection if failure is not None else None,
             ) from exc
         if not response.choices:
             empty_response_metadata = admit_llm_provider_metadata(
@@ -1339,6 +1367,8 @@ class ProviderGateway:
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                        if provider_custody is not None and type(failure_to_capture) is _BadRequestLLMError:
+                            failure_to_capture._bind_retained_request_rejection(call, provider_custody)
                         original_call = call
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
@@ -1503,6 +1533,8 @@ class ProviderGateway:
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                        if provider_custody is not None and type(failure_to_capture) is _BadRequestLLMError:
+                            failure_to_capture._bind_retained_request_rejection(call, provider_custody)
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
                         attach_llm_calls(current_exc, recorder)

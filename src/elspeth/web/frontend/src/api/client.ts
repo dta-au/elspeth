@@ -11,7 +11,7 @@ import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwns
 // in development; same-origin serving works in production.
 // ============================================================================
 
-import { isValidationCheck, isValidationReadiness } from "./validationReadiness";
+import { isSafeRequestRejection, isValidationCheck, isValidationReadiness } from "./validationReadiness";
 import type {
   ApiError,
   ApiStructuredError,
@@ -42,6 +42,7 @@ import type {
   RunOutputsResponse,
   WebSocketTicketResponse,
   SecretInventoryItem,
+  SafeRequestRejection,
   Session,
   AdminGeneratedPassword,
   AdminUserSummary,
@@ -313,7 +314,34 @@ export async function parseResponse<T>(
   return response.json() as Promise<T>;
 }
 
+function requestRejectionFromBody(errorBody: unknown): SafeRequestRejection | undefined {
+  let retained: SafeRequestRejection | undefined;
+  for (const envelope of [errorBody, ownField(errorBody, "detail")]) {
+    if (typeof envelope !== "object" || envelope === null || Array.isArray(envelope) ||
+        !Object.prototype.hasOwnProperty.call(envelope, "request_rejection")) continue;
+    const candidate = ownField(envelope, "request_rejection");
+    if (!isSafeRequestRejection(candidate)) throw new Error("Invalid provider request rejection descriptor");
+    // The shared guard fixes category, exception_type and retryable. Compare
+    // all remaining admitted scalar fields without depending on wire key order.
+    if (retained !== undefined && (
+      retained.reason_code !== candidate.reason_code ||
+      retained.reason_disposition !== candidate.reason_disposition ||
+      retained.reason_source !== candidate.reason_source ||
+      retained.diagnostic_reference !== candidate.diagnostic_reference
+    )) throw new Error("Conflicting provider request rejection descriptors");
+    retained = {
+      category: candidate.category, exception_type: candidate.exception_type,
+      reason_code: candidate.reason_code, reason_disposition: candidate.reason_disposition,
+      reason_source: candidate.reason_source, diagnostic_reference: candidate.diagnostic_reference,
+      retryable: candidate.retryable,
+    };
+  }
+  return retained;
+}
+
 function buildApiError(status: number, errorBody: unknown, statusText: string, snapshotHeader?: string): ApiError {
+    // A present malformed descriptor must escape the compatibility fallback.
+    const requestRejection = requestRejectionFromBody(errorBody);
     // Parse the error envelope into one ApiError contract. Canonical backend
     // fields are `error_type`, `detail`, and optional `errors`; `kind` and
     // `message` remain accepted as compatibility aliases for older execution
@@ -562,6 +590,7 @@ function buildApiError(status: number, errorBody: unknown, statusText: string, s
       secret_guard: secretGuard,
       provider_detail: providerDetail,
       provider_status_code: providerStatusCode,
+      ...(requestRejection === undefined ? {} : { request_rejection: requestRejection }),
       validation_errors: validationErrors,
       errors,
       snapshot_fingerprint:
