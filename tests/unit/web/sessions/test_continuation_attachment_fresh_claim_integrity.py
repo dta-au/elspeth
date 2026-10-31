@@ -98,7 +98,9 @@ async def test_fresh_claim_preserves_prior_p4_proofs_after_complete_attachment_p
                 ),
             )
             latest = {**latest, "selected": changed}
-            message = "cold evidence changed the complete selected root"
+            # The completed-prefix reader compares the selected root with its
+            # stored snapshot before evidence restore, so it refuses first.
+            message = "runtime prefix changed its actual current selected source"
         else:
             record = prior.applications[0]
             with current[0].begin() as conn:
@@ -124,7 +126,8 @@ async def test_fresh_claim_preserves_prior_p4_proofs_after_complete_attachment_p
                         )
                         .values(payload=raw, byte_length=len(raw), sha256=sha256(raw).hexdigest())
                     )
-                    message = "private chunk bytes differ from their binding"
+                    # read_private_chunk checks the reference digest before decode.
+                    message = "private chunk complete byte bound or SQL binding mismatch"
                 assert changed.rowcount == 1
         before = recovery_rows(current[0])
         with pytest.raises(AuditIntegrityError, match=message):

@@ -297,12 +297,12 @@ async def test_recovery_refuses_exact_owned_corruption_without_partial_transitio
         if channel.startswith("history")
         else "actual previous physical fence"
         if channel == "physical_token"
-        else "strict UTF-8"
+        # The reference digest is checked before decode (read_private_chunk),
+        # so the coherently replaced row is refused as a binding mismatch.
+        else "private chunk complete byte bound or SQL binding mismatch"
     )
-    with pytest.raises(AuditIntegrityError, match=message) as caught:
+    with pytest.raises(AuditIntegrityError, match=message):
         recover(peer, first)
-    if channel == "private_utf8":
-        assert type(caught.value.__cause__) is UnicodeDecodeError
     assert (recovery_rows(engine), rows(engine)) == before
 
 

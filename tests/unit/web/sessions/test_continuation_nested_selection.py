@@ -191,10 +191,12 @@ async def test_nested_sql_bytes_cannot_be_replaced_or_omitted_after_positive(ope
                     update(chunks).where(predicate).values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
                 )
         before = rows(operation_store)
-        with pytest.raises(AuditIntegrityError) as caught:
+        # A replaced payload with a self-consistent row digest still differs
+        # from the reference digest, which read_private_chunk checks before any
+        # decode, so no replacement (UTF-8 or bytes) reaches the decoder.
+        match = None if change == "missing" else "private chunk complete byte bound or SQL binding mismatch"
+        with pytest.raises(AuditIntegrityError, match=match):
             await select_current(operation_store, running, stored)
-        if change == "coherent_utf8":
-            assert type(caught.value.__cause__) is UnicodeDecodeError
         assert rows(operation_store) == before
     finally:
         operation_store[1].release(running.session_operation_context)

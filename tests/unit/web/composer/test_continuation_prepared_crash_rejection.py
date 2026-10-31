@@ -237,9 +237,13 @@ async def test_actual_crash_diagnostic_preserves_full_credentials_and_late_defec
                 prepared_p4_members(changed, env_ref_names=phase.inventory.names)
         # Unknown env references remain credential-policy failures even when
         # an earlier large lawful field and a closed diagnostic are present.
-        reference = _source(value, members, replace(invocation, actor="${DB_URL}"))
+        # The policy checks inventory only under a credential field (a bare
+        # reference is literal metadata; test_continuation_prepared_p4_metadata),
+        # so the reference sits in the decoded actor's credential slot.
+        slotted = canonical_json({"password": "${DB_URL}"})
+        reference = _source(value, members, replace(invocation, actor=slotted))
         names = phase.inventory.names | frozenset({"DB_URL"})
-        assert prepared_p4_members(reference, env_ref_names=names).invocations[0].actor == "${DB_URL}"
+        assert prepared_p4_members(reference, env_ref_names=names).invocations[0].actor == slotted
         with pytest.raises(CredentialMaterialRefused):
             prepared_p4_members(reference, env_ref_names=phase.inventory.names - frozenset({"DB_URL"}))
         assert len(sdk) == 1

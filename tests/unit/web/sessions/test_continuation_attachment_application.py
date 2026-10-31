@@ -721,7 +721,9 @@ async def test_prior_real_p4_journal_survives_active_and_applied_attachment_and_
                     ),
                 )
                 latest = {**latest, "selected": changed}
-                message = "cold evidence changed the complete selected root"
+                # The completed-prefix reader compares the selected root with its
+                # stored snapshot before evidence restore, so it refuses first.
+                message = "runtime prefix changed its actual current selected source"
             else:
                 record = prior.applications[0]
                 with locked_session_transaction(operation_store[0], str(operation_store[4])) as conn:
@@ -747,7 +749,8 @@ async def test_prior_real_p4_journal_survives_active_and_applied_attachment_and_
                             )
                             .values(payload=raw, byte_length=len(raw), sha256=sha256(raw).hexdigest())
                         )
-                        message = "private chunk bytes differ from their binding"
+                        # read_private_chunk checks the reference digest before decode.
+                        message = "private chunk complete byte bound or SQL binding mismatch"
                     assert changed.rowcount == 1
             # Scope is explicit: this negative exercises the real registered
             # SQL reader, not the whole asynchronous cold materialization.
