@@ -15,8 +15,8 @@ from elspeth.plugins.infrastructure.manager import PluginManager, PluginNotFound
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_response
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerAvailability
@@ -279,9 +279,6 @@ def _assert_discovery_refusal(
     assert wire["success"] is False and wire["version"] == state.version
     assert wire["validation"]["errors"][0]["error_code"] == code
     assert not {"data", "plugin_schemas", "validation_guidance", "prior_validation", "validation_delta"} & wire.keys()
-    feedback = _allowlisted_candidate_feedback(result)["validation"]["errors"]
-    assert len(feedback) == 1 and feedback[0]["error_code"] == code
-    assert feedback[0]["component"] == "rejected_mutation" and "detail" not in feedback[0]
 
 
 @pytest.mark.parametrize("surface", ["handler", "dispatch", "readonly"])
@@ -450,7 +447,7 @@ def test_discovery_invalid_arguments_remain_typed_before_requested_access(
     assert calls == []
 
 
-def test_discovery_feedback_excludes_private_saved_diagnostics_but_authenticated_raw_keeps_them() -> None:
+def test_discovery_redaction_excludes_private_saved_diagnostics_but_authenticated_raw_keeps_them() -> None:
     state, context = _saved_state(), _context()
     canary = "PRIVATE-DISCOVERY-SAVED-ROUTE-CANARY"
     source = state.sources["source"]
@@ -460,9 +457,6 @@ def test_discovery_feedback_excludes_private_saved_diagnostics_but_authenticated
     assert any(entry.component == "source" and canary in entry.message for entry in result.validation.warnings)
     raw = serialize_admitted_discovery_result(admit_discovery_result("diff_pipeline", result))
     assert canary in raw
-    feedback = _allowlisted_candidate_feedback(result)
-    assert canary not in repr(feedback)
-    assert len(feedback["validation"]["errors"]) == 1 and "detail" not in feedback["validation"]["errors"][0]
     redacted = redact_tool_call_response("diff_pipeline", result.to_dict(), telemetry=NoopRedactionTelemetry())
     assert canary not in repr(redacted)
 
@@ -518,7 +512,7 @@ async def test_discovery_outer_fault_preserves_prior_success_and_completed_refus
             {"id": "discovery_fault", "name": tool, "arguments": args},
         ]
     )
-    llm = create_autospec(service._provider_gateway._call_llm, return_value=response)
+    llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
     monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
     monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)
     with pytest.raises(ComposerPluginCrashError) as caught:
@@ -761,13 +755,14 @@ class TestToolRegistry:
         What this test DOES pin, and what would actually go red:
 
         1. The forbidden set exists as named data, not a comment.
-        2. Its contents name exactly the three stateful discovery tools
-           (``diff_pipeline``, ``get_pipeline_state``, ``preview_pipeline``).
+        2. Its contents name exactly the four stateful discovery tools
+           (``diff_pipeline``, ``get_complete_pipeline_value``,
+           ``get_pipeline_state``, ``preview_pipeline``).
            This is the load-bearing line: a new DISCOVERY-kind declaration
            that omits ``cacheable=True`` lands in the complement and fails
            here, forcing a deliberate classification instead of a silent
            default; a declaration that sets ``cacheable=True`` on one of the
-           three named tools removes it from the complement and fails here
+           four named tools removes it from the complement and fails here
            too.
 
         Neither import-time guard reaches this set.
@@ -780,7 +775,7 @@ class TestToolRegistry:
         from the other side. Item 2 above, together with the ``not in
         cacheable`` assertions in
         ``test_tool_declarations.py::test_cacheable_subset_is_correct``, is
-        the ONLY thing keeping the three stateful tools out of the cache.
+        the ONLY thing keeping the four stateful tools out of the cache.
 
         Replaces the prior subtraction-shape assertion which mirrored
         the opt-OUT pattern the production code deliberately moved away
@@ -793,9 +788,12 @@ class TestToolRegistry:
         # 1. the forbidden set exists as named data.
         assert isinstance(_SESSION_MUTABLE_DISCOVERY_TOOL_NAMES, frozenset)
 
-        # 2. the forbidden set names exactly the three stateful tools. A
-        # fourth, or a reclassification of one of these, must land here.
-        assert frozenset({"diff_pipeline", "get_pipeline_state", "preview_pipeline"}) == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        # 2. the forbidden set names exactly the four stateful tools. A
+        # fifth, or a reclassification of one of these, must land here.
+        assert (
+            frozenset({"diff_pipeline", "get_complete_pipeline_value", "get_pipeline_state", "preview_pipeline"})
+            == _SESSION_MUTABLE_DISCOVERY_TOOL_NAMES
+        )
 
     def test_cacheable_is_subset_of_discovery(self) -> None:
         from elspeth.web.composer.tools import (

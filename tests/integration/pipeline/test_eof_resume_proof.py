@@ -16,7 +16,7 @@ leaves the run resumable as *source-exhausted engine work*:
 - an INTERRUPTED (non-exhausted) source still fails resume safely with
   ``IncompleteSourceResumeError`` instead of fabricating completion.
 
-Two run paths are covered:
+Run paths include:
 
 1. ``test_exhausted_source_eof_aggregation_resumes_without_source_replay`` —
    synthetic (interruption reshaped into the exhausted+crashed state via DB
@@ -38,6 +38,7 @@ mocked.
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Iterator
 from typing import Any
@@ -58,7 +59,7 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import run_sources_table, runs_table, token_outcomes_table, token_work_items_table
+from elspeth.core.landscape.schema import node_states_table, run_sources_table, runs_table, token_outcomes_table, token_work_items_table
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -79,19 +80,19 @@ class _LoadCountingSource(_TestSourceBase):
         on_success: str,
         shutdown_event: threading.Event | None = None,
         interrupt_after: int | None = None,
+        interrupt_before_yield: bool = False,
     ) -> None:
         super().__init__()
         self._rows = rows
         self.on_success = on_success
         self._event = shutdown_event
         self._interrupt_after = interrupt_after
+        self._interrupt_before_yield = interrupt_before_yield
         self.load_invocations = 0
 
     def load(self, ctx: Any) -> Iterator[SourceRow]:
         self.load_invocations += 1
         for source_row_index, row in enumerate(self._rows):
-            if self._event is not None and self._interrupt_after is not None and source_row_index + 1 >= self._interrupt_after:
-                self._event.set()
             fields = tuple(
                 FieldContract(
                     normalized_name=key,
@@ -104,7 +105,17 @@ class _LoadCountingSource(_TestSourceBase):
             )
             contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
             self._schema_contract = contract
+            interrupt = self._event is not None and self._interrupt_after is not None and source_row_index + 1 >= self._interrupt_after
+            if interrupt and self._interrupt_before_yield:
+                assert self._event is not None
+                self._event.set()
             yield SourceRow.valid(row, contract=contract, source_row_index=source_row_index)
+            # Stop after the requested row has reached the engine. Setting
+            # the event before yielding would cancel its barrier admission.
+            if interrupt:
+                assert self._event is not None
+                self._event.set()
+                return
 
 
 class _FailOnceEOFBatchTransform(BaseTransform):
@@ -203,6 +214,84 @@ def _single_run_id(db: LandscapeDB) -> str:
 @pytest.mark.timeout(120)
 class TestExhaustedSourceEOFResume:
     """elspeth-b2142988b4: real-path EOF resume after source exhaustion."""
+
+    def test_shutdown_before_source_yield_preserves_unstarted_row_without_fabricating_exhaustion(self, tmp_path: Any) -> None:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        event = threading.Event()
+        source = _LoadCountingSource(
+            [{"value": 10}, {"value": 20}, {"value": 30}, {"value": 40}],
+            on_success="batch_in",
+            shutdown_event=event,
+            interrupt_after=3,
+            interrupt_before_yield=True,
+        )
+        transform = _FailOnceEOFBatchTransform(fail_first_batch=False)
+        config, graph, output_sink = _build_eof_aggregation_pipeline(source, transform)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+
+        with pytest.raises(GracefulShutdownError):
+            orchestrator.run(config, graph=graph, payload_store=payload_store, shutdown_event=event)
+
+        run_id = _single_run_id(db)
+        with db.read_only_connection() as conn:
+            work = conn.execute(
+                select(token_work_items_table.c.token_id, token_work_items_table.c.status, token_work_items_table.c.row_payload_json)
+                .where(token_work_items_table.c.run_id == run_id)
+                .order_by(token_work_items_table.c.ingest_sequence)
+            ).all()
+            failures = conn.execute(
+                select(token_outcomes_table.c.token_id).where(
+                    token_outcomes_table.c.run_id == run_id, token_outcomes_table.c.outcome == "failure"
+                )
+            ).all()
+            shutdown_failures = conn.execute(
+                select(node_states_table.c.state_id).where(
+                    node_states_table.c.run_id == run_id, node_states_table.c.error_json.like("%shutdown_requested%")
+                )
+            ).all()
+            unstarted_outcomes = conn.execute(
+                select(token_outcomes_table.c.outcome, token_outcomes_table.c.path, token_outcomes_table.c.completed).where(
+                    token_outcomes_table.c.run_id == run_id, token_outcomes_table.c.token_id == work[-1].token_id
+                )
+            ).all()
+            unstarted_aggregation = conn.execute(
+                select(node_states_table.c.state_id).where(
+                    node_states_table.c.run_id == run_id,
+                    node_states_table.c.token_id == work[-1].token_id,
+                    node_states_table.c.node_id == str(transform.node_id),
+                )
+            ).all()
+        assert [item.status for item in work] == ["blocked", "blocked", "failed"]
+        assert [json.loads(item.row_payload_json)["row"]["data"]["value"] for item in work] == [10, 20, 30]
+        assert failures == shutdown_failures == []
+        # Incomplete-source finalization may mark an undecided token abandoned;
+        # it must not fabricate a completed or buffered decision for this row.
+        assert all(
+            outcome is None and path == TerminalPath.ABANDONED.value and not completed for outcome, path, completed in unstarted_outcomes
+        )
+        assert unstarted_aggregation == []
+        assert _run_sources_states(db, run_id) == {"primary": "interrupted"}
+        assert output_sink.results == []
+        assert transform.batch_calls == 0
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        assert recovery.can_resume(run_id, graph).can_resume is False
+        checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert checkpoint is not None
+        with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
+            orchestrator.resume(
+                resume_point=ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number),
+                config=config,
+                graph=graph,
+                payload_store=payload_store,
+            )
+        assert source.load_invocations == 1
+        assert output_sink.results == []
+        assert transform.batch_calls == 0
 
     def test_exhausted_source_eof_aggregation_resumes_without_source_replay(self, tmp_path: Any) -> None:
         """A FAILED run with an exhausted source and pending EOF work resumes cleanly.

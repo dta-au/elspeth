@@ -1,0 +1,122 @@
+"""U-46 structural counts for scripts/fencing_inventory.py (load-independent).
+
+Usage: U46_OUT=<json> python u46count.py <tree>
+
+Counts, per top-level gate phase called by ``measure``: full-file AST passes
+(``ast.walk`` called on an ``ast.Module``), all ``ast.walk`` calls,
+whole-tree proof constructions (``_AuthorityProof``, ``_reserve_ReserveProof``)
+and nested scanner calls. Run from the tree's root.
+"""
+
+from __future__ import annotations
+
+import ast
+import collections
+import importlib.util
+import json
+import os
+import sys
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+OUT = Path(os.environ["U46_OUT"])
+COUNTS: collections.Counter[tuple[str, str]] = collections.Counter()
+STATE = {"phase": "-"}
+_walk = ast.walk
+
+
+def _counting_walk(node: ast.AST) -> Iterator[ast.AST]:
+    COUNTS[(STATE["phase"], "ast.walk")] += 1
+    if isinstance(node, ast.Module):
+        COUNTS[(STATE["phase"], "full-file pass")] += 1
+    return _walk(node)
+
+
+ast.walk = _counting_walk
+
+PHASES = (
+    "_production_units",
+    "scan_dml_identities",
+    "scan_production_calls",
+    "scan_coordination_production_calls",
+    "scan_internal_landscape_wrapper_edges",
+    "_subordinate_helper_edges",
+    "_mutation_callable_escapes",
+    "_internal_coordination_authority_violations",
+    "_dml_callable_escape_violations",
+    "_unknown_or_raw_execution_violations",
+    "_raw_write_surface_violations",
+    "_cross_database_violations",
+    "_caller_authority_violations",
+    "_coordination_caller_authority_violations",
+    "_api_authority_violations",
+    "_transaction_order_violations",
+)
+NESTED = ("_transaction_order_violations", "_reserve_run", "_caller_authority_violations")
+
+
+def _instrument(gate: ModuleType) -> None:
+    for name in PHASES:
+        original = gate.__dict__[name]
+
+        def phase_wrapper(*args: Any, __original: Any = original, __name: str = name, **kwargs: Any) -> Any:
+            outer = STATE["phase"]
+            if outer == "-":
+                STATE["phase"] = __name
+            else:
+                COUNTS[(outer, "nested call " + __name)] += 1
+            started = time.process_time()
+            try:
+                return __original(*args, **kwargs)
+            finally:
+                if outer == "-":
+                    COUNTS[(__name, "cpu ms")] += int((time.process_time() - started) * 1000)
+                    STATE["phase"] = outer
+
+        gate.__dict__[name] = phase_wrapper
+    for cls_name in ("_AuthorityProof", "_reserve_ReserveProof"):
+        cls = gate.__dict__[cls_name]
+        original_init = cls.__init__
+
+        def init_wrapper(self: Any, *args: Any, __init: Any = original_init, __cls: str = cls_name, **kwargs: Any) -> None:
+            COUNTS[(STATE["phase"], "construct " + __cls)] += 1
+            __init(self, *args, **kwargs)
+
+        cls.__init__ = init_wrapper
+
+
+def main() -> None:
+    tree = Path(sys.argv[1]).resolve()
+    spec = importlib.util.spec_from_file_location("u46_fencing_inventory", tree / "scripts" / "fencing_inventory.py")
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    original_load = tool.load_gate
+
+    def load_gate(path: Path) -> ModuleType:
+        gate = original_load(path)
+        _instrument(gate)
+        return gate
+
+    tool.load_gate = load_gate
+    started = time.process_time()
+    result = tool.measure(tree)
+    rows = sorted(([phase, metric, value] for (phase, metric), value in COUNTS.items()))
+    resolver = sys.modules[next(name for name in sys.modules if name.startswith("fencing_gate_"))]._resolver_for_unit
+    OUT.write_text(
+        json.dumps(
+            {
+                "cpu_s": time.process_time() - started,
+                "counts": rows,
+                "resolver_cache": str(resolver.cache_info()),
+                "violation_counts": {name: entry["count"] for name, entry in result["violations"].items()},
+            },
+            indent=1,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

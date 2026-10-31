@@ -21,7 +21,7 @@ from elspeth.web.composer.prompt_guard import PromptGuardMount
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.provider_quota import ProviderCallCustody
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions import composer_finalization, composer_turn
 from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table, session_operation_fences_table
@@ -147,7 +147,7 @@ async def test_postprovider_invariant_fault_outweighs_caller_cancel(tmp_path, mo
         gate.park_sql()
         raise original_invariant
 
-    monkeypatch.setattr(composer_turn, "_message_with_state_response", fail_after_cancel)
+    monkeypatch.setattr(composer_finalization, "_message_with_state_response", fail_after_cancel)
     try:
         async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
             session_id = (await client.post("/api/sessions", json={"title": "fault priority"})).json()["id"]
@@ -324,7 +324,7 @@ async def test_response_projection_fault_cannot_publish_false_complete(
     def fail_projection(*args, **kwargs):
         raise failure("first-party response projection failed")
 
-    monkeypatch.setattr(composer_turn, "_message_with_state_response", fail_projection)
+    monkeypatch.setattr(composer_finalization, "_message_with_state_response", fail_projection)
     try:
         async with AsyncClient(transport=ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
             session_id = (await client.post("/api/sessions", json={"title": "projection fault"})).json()["id"]
@@ -557,14 +557,14 @@ class _ActualCustodyGate:
 
             monkeypatch.setattr(service, "_write_audit_cohort_on_connection", gated_cohort)
         elif site == "projection":
-            real = composer_turn._message_with_state_response
+            real = composer_finalization._message_with_state_response
 
             def gated_projection(*args, **kwargs):
                 value = real(*args, **kwargs)
                 self.park_sql()
                 return value
 
-            monkeypatch.setattr(composer_turn, "_message_with_state_response", gated_projection)
+            monkeypatch.setattr(composer_finalization, "_message_with_state_response", gated_projection)
         else:
             real = composer_turn._publish_progress
 
@@ -775,7 +775,7 @@ async def test_postprovider_invariant_fault_retains_three_actual_owner_cancellat
         gate.park_sql()
         raise original_invariant
 
-    monkeypatch.setattr(composer_turn, "_message_with_state_response", fail_after_cancel)
+    monkeypatch.setattr(composer_finalization, "_message_with_state_response", fail_after_cancel)
     drive = None
     cancellation_markers = (
         "caller cancelled before child fault",

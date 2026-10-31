@@ -54,6 +54,8 @@ _FREE_TEXT_DISPOSITIONS = {
     "src/elspeth/web/blobs/schemas.py:CreateInlineBlobRequest.filename": "route_guard",
     "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.model": "server_configuration_probe",
     "src/elspeth/web/composer/pipeline_planner.py:PlannerPriorUserRequest.content": "provider_boundary_guard",
+    # Server-computed continuation_provider_input_hash(kwargs), never caller text.
+    "src/elspeth/web/composer/provider_gateway.py:PreparedContinuationPrimaryRequest.input_sha256": "structural_identifier",
     "src/elspeth/web/composer/tools/sessions.py:_AdvisorHintRequest.problem_summary": "provider_boundary_guard",
     "src/elspeth/web/execution/schemas.py:ExecuteRequest.fanout_ack_token": "execution_acknowledgement",
     "src/elspeth/web/execution/schemas.py:ExecuteRequest.secret_ack_token": "execution_acknowledgement",
@@ -325,6 +327,8 @@ _PROVIDER_CALL_DISPOSITIONS = {
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": "request_guard",
+    # TITLE clock wrapper around the same SDK call; the function's request guard runs first.
+    "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.title_physical.acompletion": "request_guard",
     "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": "admitted_title_only",
 }
 _PROVIDER_GUARD_OWNERS = {
@@ -344,13 +348,16 @@ _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": (
         ("ProviderGateway._call_llm", "require_no_credential_material_in_tool_wire"),
         ("ProviderGateway._call_llm", "_require_no_credential_material_in_completion"),
-        ("ProviderGateway._call_llm_with_audit_body", "_require_no_credential_material_in_completion"),
+        ("ProviderGateway._call_llm_outcome_with_audit_body", "_require_no_credential_material_in_completion"),
         ("_require_no_credential_material_in_completion_fields", "require_no_credential_material_in_llm_metadata"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": (
         ("ProviderGateway._call_text_llm", "_require_no_credential_material_in_completion_fields"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": (
+        ("_litellm_acompletion", "require_no_credential_material"),
+    ),
+    "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.title_physical.acompletion": (
         ("_litellm_acompletion", "require_no_credential_material"),
     ),
     "src/elspeth/web/sessions/_auto_title.py:_maybe_auto_title_session_required._litellm_acompletion": (
@@ -587,7 +594,10 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
 
 _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/composer_mcp/server.py:_dispatch_tool": "mcp_dispatch",
+    # TC-018: a saved session file is admitted before load adopts it.
+    "src/elspeth/composer_mcp/server.py:_dispatch_session_tool": "mcp_loaded_state",
     "src/elspeth/web/composer/graph_recovery.py:qualify_editable_checkpoint": "recovery_checkpoint",
+    "src/elspeth/web/composer/prompts.py:project_composition_content": "provider_disclosure",
     "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose": "provider_serialization",
     "src/elspeth/web/composer/tools/sessions.py:_execute_get_pipeline_state": "provider_disclosure",
     "src/elspeth/web/execution/service.py:ExecutionServiceImpl._execute_locked": "execution",
@@ -596,6 +606,16 @@ _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/web/sessions/routes/composer/state.py:seed_state_from_runtime_yaml": "yaml_persistence",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.fork_entry": "library_fork",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.publish_entry": "library_publication",
+    # Continuation payload codecs and owner capture/restore refuse credential-bearing state.
+    "src/elspeth/web/composer/continuation_bootstrap.py:encode_continuation_bootstrap": "continuation_payload",
+    "src/elspeth/web/composer/continuation_codec.py:encode_private_chunk": "continuation_payload",
+    "src/elspeth/web/composer/continuation_composition_initialization.py:_build_owners": "continuation_payload",
+    "src/elspeth/web/composer/continuation_evidence.py:encode_turn_evidence": "continuation_payload",
+    "src/elspeth/web/composer/continuation_initialization.py:prepare_pretitle_bootstrap.prepare": "continuation_payload",
+    "src/elspeth/web/composer/continuation_p4_state_payload.py:decode_p4_state_payload": "continuation_payload",
+    "src/elspeth/web/composer/continuation_runtime.py:_capture_owners": "continuation_payload",
+    "src/elspeth/web/composer/continuation_runtime.py:_restore_live": "continuation_payload",
+    "src/elspeth/web/composer/continuation_tool_batch.py:_state_from_tool_json": "continuation_payload",
 }
 _STATE_MATERIALIZATION_DISPOSITIONS = {
     # The nominal committed witness is checked against this session/fence;
@@ -606,7 +626,20 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._graph_review_on_connection.read_state.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._validate_terminal_graph_review.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/graph_recovery.py:read_editable_checkpoint.state_from_record": "recovery_checkpoint_guard",
-    "src/elspeth/web/sessions/service.py:SessionServiceImpl.load_graph_recovery_context._sync.state_from_record": "recovery_checkpoint_guard",
+    "src/elspeth/web/sessions/service.py:SessionServiceImpl._load_graph_recovery_context_on_connection.state_from_record": "recovery_checkpoint_guard",
+    # Continuation restore hydrates committed state only to compare or hash it
+    # against retained evidence; none of these dispatches or publishes it.
+    "src/elspeth/web/composer/continuation_evidence_restore.py:read_selected_turn_evidence_graph_on_connection.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/composer/continuation_p4_application.py:_project_effects.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/continuation.py:_authored_row_hash.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/continuation_bootstrap_source.py:_require_current_pretitle_value_equality.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/continuation_composition_initialization.py:_require_original_values.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/continuation_p4.py:decode_p4_receipt.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/sessions/continuation_p4.py:retain_p4_result_on_connection.state_from_record": "committed_checkpoint_comparison",
+    # Admission hydrates the base only to refuse an undecodable one.
+    "src/elspeth/web/coordination/composer_operation_authority.py:ComposerAsyncOperationAuthority.admit.state_from_record": "committed_checkpoint_comparison",
+    # The TITLE source reaches the provider only through _litellm_acompletion's request guard.
+    "src/elspeth/web/sessions/continuation_title_source.py:read_title_source_on_connection.state_from_record": "provider_guard_downstream",
     "src/elspeth/web/sessions/service.py:SessionServiceImpl.read_current_composition_graph._sync.state_from_record": "recovery_checkpoint_guard",
     "src/elspeth/web/audit_readiness/routes.py:create_audit_readiness_router.explain.state_from_record": "provider_guard_downstream",
     "src/elspeth/web/audit_readiness/service.py:ReadinessService.compute_snapshot._state_from_record": "read_only_diagnostics",
@@ -628,6 +661,7 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/routes/composer/state.py:_surface_reverted_interpretation_reviews._state_from_record": "interpretation_internal",
     "src/elspeth/web/sessions/routes/composer/state.py:get_current_state._state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/composer/state.py:get_state_yaml._state_from_record": "authenticated_state_response",
+    "src/elspeth/web/sessions/routes/_helpers.py:_state_response._state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/composer/state.py:seed_state_from_runtime_yaml.composition_state_from_runtime_yaml": "direct_state_guard",
     "src/elspeth/web/sessions/routes/workflow/inspect.py:create_workflow_inspect_router.inspect_workflow_state.state_from_record": "authenticated_state_response",
     "src/elspeth/web/sessions/routes/workflow/library.py:create_library_router.fork_entry.composition_state_from_runtime_yaml": "direct_state_guard",

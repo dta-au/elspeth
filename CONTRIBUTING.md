@@ -57,6 +57,80 @@ The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
 `pyproject.toml` and test suite; if you change it, run its tests from
 `gateway/` as well.
 
+For unattended full-tree checks, use the canonical launcher:
+
+```bash
+scripts/full-suite-gate.sh --execute --detach --workers 12 --stages ruff,mypy,contracts,pytest
+```
+
+Choose the explicit worker count from capacity you have established (12 in
+the example). `--workers N`, including 0 for serial pytest, bypasses all sibling
+discovery and reports siblings as unobserved. Omitting it uses automatic host
+discovery: 8 workers with matching sibling suites, otherwise 12. Automatic
+observation requires permission to inspect that host's process inventory.
+Explicit testcontainer runs still use serial pytest and require the caller
+to establish exclusive capacity; an unobserved host is not a contention-free host.
+
+Both foreground and detached execution supervise the actual foreground
+driver, including provenance imports, source sampling, stages and watcher
+cleanup. Logs default to `.claude/lanes/full-suite-gates/` inside the target
+project. `--run-timeout-seconds N` selects a finite positive aggregate
+deadline, independently of the per-item pytest timeout. Its default is
+10800 seconds (three hours), a finite capacity budget, not a proven suite
+duration bound. A fixed 10-second grace applies per cleanup escalation, so
+cleanup can extend beyond the aggregate deadline. Task 0's earlier
+5400-second base-duration authorization was a separate diagnostic budget.
+
+Wait for `launcher.exit`, then read it alongside the actual CLI status in
+`supervisor.exit`, `supervisor.json`, `summary.txt`, stage exits and `driver.exit`.
+The helper's actual status is preserved if later launcher cancellation
+returns `128 + signal`; cancellation during publication suppresses the
+qualifying launcher receipt. Qualification requires both outer statuses zero,
+complete cleanup, and a passing frozen driver. The existing `.done` remains
+driver-only. A driver PASS cannot
+qualify an outer timeout, failed cleanup or missing terminal receipt.
+The detached command's initial exit0 means launch accepted. To cancel,
+TERM only the recorded `supervisor.pid` after verifying its start identity
+in `supervisor.start-stat` and the target cwd/command. `launcher.pid` names
+the waiting owner; its signal handler forwards cancellation. A launcher
+that exits without the terminal receipt leaves incomplete evidence.
+
+The existing Linux supervisor owns ordinary descendants in the driver's
+process group, not deliberate session/group escapes or external services.
+Its heartbeat establishes liveness, not test progress. A timeout around
+only a detached launcher does not contain the detached run.
+
+Bare `pytest` does not acquire that process-group cleanup or a collection
+deadline. Wrap a direct pytest command with the existing supervisor when
+those guarantees are needed:
+
+```bash
+mkdir -p .claude/lanes/direct-test
+export PYTHONPATH="$PWD/src:$PWD/elspeth-lints/src"
+.venv/bin/python scripts/ci_proof_progress.py --nodeid direct-test \
+  --timeout-seconds 2400 --grace-seconds 10 \
+  --report .claude/lanes/direct-test/supervisor.json -- \
+  .venv/bin/python -m pytest tests/path.py -n 0 \
+  -o "pythonpath=$PWD/src $PWD/elspeth-lints/src"
+```
+
+Use a unique log directory and both worktree import roots for each run.
+The default per-item timeout is 600 seconds, including setup, body and
+teardown, using pytest-timeout's `thread` method. Task 0's completed base
+diagnostic measured a slowest ordinary passing item of 212.772218031 seconds;
+doubling it and rounding upward to a five-minute block gives 600. That run
+excluded the two known hang files and had existing failures, so it establishes
+timing headroom rather than acceptance. See the
+[measured policy and limits](docs/release/0.8.10-task0-retention-fixpoint.md#measured-timeout-policy).
+Explicit per-test timeout marks and command-line overrides still apply.
+`--timeout-disable-debugger-detection` in `addopts` keeps debugger attachment
+from disabling the guard; when debugging, explicitly select `--timeout=0`
+under a bounded outer supervisor. `--max-worker-restart=0` prevents xdist from
+silently replacing a worker terminated by the thread timer. Thread timeout
+can abort a worker without fixture cleanup; the external supervisor is still
+required. These controls do not retire KNOWN HANG instructions or establish
+Task 0 acceptance.
+
 GitHub Actions uses self-hosted runners for every workflow. Automated CI,
 release, website and mutation-testing jobs use the local labels
 `self-hosted, Linux, X64, nyx-ci, trusted`; there is no GitHub-hosted fallback.
@@ -427,15 +501,16 @@ JSON-escaped, so grep the bare hex token), then any
   (`EXPECTED_COUNTS`, `EXPECTED_VARIANT_COUNT`),
   `tests/golden/state_engine/plugin_lifecycle_matrix.json`,
   `tests/unit/plugins/test_state_engine_plugin_matrix.py`, and the PB-09
-  cases in **both** `docs/architecture/state_engine/proof-catalog/v2` and
-  `v3` (`catalog.json`, `evidence_selectors.json`). The five matrix fields
+  cases in the maintained `docs/architecture/state_engine/proof-catalog/v3`
+  (`catalog.json`, `evidence_selectors.json`). The five matrix fields
   are derived field-by-field from the existing corpus, never guessed and
-  never clustered; the inventory edit is a mirror sweep across both
-  catalogs (surgical text edits — a `json.dumps` round-trip reflows v2),
-  then `CANONICAL_V2_LEGS_SHA256`, `CANONICAL_V2_EXECUTION_PROFILES_SHA256`
-  (`scripts/state_engine_assessment_lib/common.py`), the case-count pin, and
-  `tests/unit/architecture/test_state_engine_catalog_contract.py::V2_CATALOG_SHA256`
-  **last**.
+  never clustered. Update the current inventory, PB-09 cases, selectors and
+  `CANONICAL_V3_EXECUTION_PROFILES_SHA256`
+  (`scripts/state_engine_assessment_lib/common.py`), then
+  `tests/unit/architecture/test_state_engine_catalog_contract.py::V3_CATALOG_SHA256`
+  **last**. Frozen v1/v2 bytes, vocabulary, profiles and historical pins stay
+  unchanged. New profile-case identities require an explicit applicability
+  policy for their cells as well as the current support-policy amendment.
 - `src/elspeth/web/audit_readiness/boundary_expectations.py`
   (`EXPECTED_TRANSFORM_DETERMINISMS`); editing it requires the commit trailer
   `telemetry-backfill: audit-readiness`.
@@ -940,7 +1015,8 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   trusting a result; `elspeth_lints` lives in a separate source root.
 - Do not use `git stash`; use a worktree or a commit. This is a convention, not
   an enforced gate — nothing blocks it. (The old `.git/hooks/pre-stash` never
-  ran: git has no `pre-stash` hook. Removed 2026-09-02.)
+  ran: git has no `pre-stash` hook. The claim was dropped 2026-09-02 and the
+  file removed 2026-10-24.)
 - `.agents/skills/**/*.py` is production code to every whole-tree test gate
   but is not under the `--root src/elspeth` tier gate; ruff `T20` is ignored
   there, as under `scripts/`. `.claude/skills/` holds compatibility symlinks

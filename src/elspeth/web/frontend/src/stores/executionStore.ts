@@ -11,6 +11,7 @@
 // ============================================================================
 
 import { create } from "zustand";
+import { formatRequestRejection } from "./requestRejection";
 import type {
   Run,
   RunDiagnostics,
@@ -1433,7 +1434,9 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         },
         diagnosticsErrorByRunId: {
           ...state.diagnosticsErrorByRunId,
-          [runId]: apiErr.detail ?? "Failed to explain run diagnostics.",
+          [runId]: apiErr.request_rejection === undefined
+            ? apiErr.detail ?? "Failed to explain run diagnostics."
+            : formatRequestRejection(apiErr.request_rejection, "run_diagnostics"),
         },
       }));
     }

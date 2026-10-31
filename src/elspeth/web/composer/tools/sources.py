@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import codecs
 import csv
-import hashlib
 import io
 import json
 from collections.abc import Iterator, Mapping, Sequence
@@ -26,15 +25,18 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.sources.blob_rows import _ROW_FIELDS as _BLOB_ROWS_ROW_FIELDS
 from elspeth.plugins.sources.field_normalization import declarable_field_name
+from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError, BlobStateError
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.inventory_response_contracts import PLUGIN_INVENTORY_RESPONSE_CONTRACT
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
+    MAX_SOURCE_BLOB_IDS,
     PatchSourceOptionsArgumentsModel,
     SetSourceArgumentsModel,
     SetSourceFromBlobArgumentsModel,
     SetSourceFromBlobsArgumentsModel,
 )
+from elspeth.web.composer.source_inspection import _MAX_BYTES as _INSPECT_SOURCE_MAX_BYTES
 from elspeth.web.composer.source_inspection import (
     SOURCE_INSPECTION_RESPONSE_CONTRACT,
     delimiter_for_filename,
@@ -60,6 +62,7 @@ from elspeth.web.composer.tools._common import (
     ToolResult,
     _apply_merge_patch,
     _attach_post_call_hints,
+    _candidate_plugin_policy_failure,
     _canonical_interpretation_requirement_error,
     _canonicalize_authored_interpretation_requirements,
     _discovery_result,
@@ -87,10 +90,10 @@ from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _blob_id_uuid_validation_error,
     _blob_row_to_tool_dict,
+    _fenced_blob_reader,
     _locked_read_ready_blob,
     _PreparedBlobCreate,
     _sync_get_blob,
-    _verify_blob_content_hash,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -108,8 +111,6 @@ from elspeth.web.provider_config_policy import (
 )
 from elspeth.web.sessions.models import blobs_table
 
-_INSPECT_SOURCE_MAX_BYTES = 8 * 1024
-_BLOB_HASH_CHUNK_BYTES = 1024 * 1024
 _INLINE_CSV_HEADER_READ_BYTES = 64 * 1024
 _CSV_FIELD_MAX_CHARS = 64 * 1024
 _CSV_MAX_COLUMNS = 4096
@@ -117,7 +118,7 @@ _INLINE_CSV_CANDIDATE_SCAN_LIMIT = 50
 _SOURCE_OPTIONS_OWNERSHIP_SCHEMA_NOTE: Final[str] = (
     " Server/resolver-owned source option roots are not settable: "
     + ", ".join(sorted(_SERVER_OWNED_SOURCE_OPTION_KEYS))
-    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, source.blob_id, or source.inline_blob."
+    + ". Bind blobs through set_source_from_blob, set_source_from_blobs, a source root's blob_id/blob_ids, or source.inline_blob."
     + _INTERPRETATION_REQUIREMENTS_OWNERSHIP_SCHEMA_NOTE
 )
 
@@ -850,7 +851,7 @@ def _resolve_source_blob(
         return _failure_result(state, f"Blob is not ready (status: {blob['status']}).", error_code="source_blob_unavailable")
 
     mime_extra: dict[str, str] = {}
-    if explicit_plugin:
+    if explicit_plugin is not None:
         plugin = explicit_plugin
     elif blob["mime_type"] not in _MIME_TO_SOURCE:
         return _failure_result(
@@ -1345,6 +1346,8 @@ def _resolve_source_blobs(
     session_engine: Engine | None,
     session_id: str | None,
     source_name: str,
+    rejection_operation: _RejectionOperation,
+    tool_name: str,
 ) -> tuple[Mapping[str, Any], tuple[SourceBlobPayload, ...]] | ToolResult:
     """Resolve a bounded blob-id list into authoritative blob_rows options.
 
@@ -1356,45 +1359,54 @@ def _resolve_source_blobs(
     UTF-8 decoded here; no content is read at all (run admission re-resolves
     the records and web execution stages the bytes for the payload store).
     """
-    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
+    if type(rejection_operation) is not _RejectionOperation:
+        raise AuditIntegrityError("Plural source resolver requires an owned rejection operation")
+
+    def _failure_result(
+        rejected_state: CompositionState,
+        message: str,
+        *,
+        error_code: str,
+        plugin_identity: tuple[str, str] | None = None,
+    ) -> ToolResult:
+        return rejection_operation.reject(
+            rejected_state,
+            message,
+            error_code=error_code,
+            rejected_component=_source_component_id(source_name),
+            plugin_identity=plugin_identity,
+        )
+
+    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name=tool_name)
     if manual_authoring_error is not None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             manual_authoring_error,
             error_code="interpretation_requirements_invalid",
-            rejected_component=_source_component_id(source_name),
         )
-    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name="set_source_from_blobs")
+    manual_blob_ref_error = _reject_manual_source_blob_ref(caller_options, tool_name=tool_name)
     if manual_blob_ref_error is not None:
-        return _saved_graph_rejection_result(
-            state, manual_blob_ref_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
-        )
-    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name="set_source_from_blobs")
+        return _failure_result(state, manual_blob_ref_error, error_code="plugin_options_invalid")
+    manual_blobs_error = _reject_manual_source_blobs(caller_options, tool_name=tool_name)
     if manual_blobs_error is not None:
-        return _saved_graph_rejection_result(
-            state, manual_blobs_error, error_code="plugin_options_invalid", rejected_component=_source_component_id(source_name)
-        )
+        return _failure_result(state, manual_blobs_error, error_code="plugin_options_invalid")
     if session_engine is None or session_id is None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             "Blob tools require session context.",
             error_code="source_binding_context_unavailable",
-            rejected_component=_source_component_id(source_name),
         )
     seen_ids: set[str] = set()
     for blob_id in blob_ids:
         blob_id_error = _blob_id_uuid_validation_error(blob_id)
         if blob_id_error is not None:
-            return _saved_graph_rejection_result(
-                state, blob_id_error, error_code="source_blob_identity_invalid", rejected_component=_source_component_id(source_name)
-            )
+            return _failure_result(state, blob_id_error, error_code="source_blob_identity_invalid")
         normalized = blob_id.lower()
         if normalized in seen_ids:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Duplicate blob id '{blob_id}' in blob_ids.",
                 error_code="source_blob_duplicate",
-                rejected_component=_source_component_id(source_name),
             )
         seen_ids.add(normalized)
 
@@ -1404,18 +1416,16 @@ def _resolve_source_blobs(
     for blob_id in blob_ids:
         blob = _sync_get_blob(session_engine, blob_id, session_id)
         if blob is None:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' not found.",
                 error_code="source_blob_unavailable",
-                rejected_component=_source_component_id(source_name),
             )
         if blob["status"] != "ready":
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' is not ready (status: {blob['status']}).",
                 error_code="source_blob_unavailable",
-                rejected_component=_source_component_id(source_name),
             )
         content_hash_value = blob["content_hash"]
         if content_hash_value is None:
@@ -1429,19 +1439,17 @@ def _resolve_source_blobs(
             # serves the authenticated upload/paste flow, whose blobs are
             # always user-verbatim; admitting LLM-authored blobs here
             # without an equivalent review shape would bypass human review.
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' is LLM-authored; use a supported set_source_from_blob flow to stage its interpretation review. "
                 "If its content is not representable there, preserve the intended artifact and report the limitation.",
                 error_code="source_blob_review_required",
-                rejected_component=_source_component_id(source_name),
             )
         if content_hash_value in seen_hashes:
-            return _saved_graph_rejection_result(
+            return _failure_result(
                 state,
                 f"Blob '{blob_id}' has the same content as blob '{seen_hashes[content_hash_value]}'; entries must be unique documents.",
                 error_code="source_blob_duplicate",
-                rejected_component=_source_component_id(source_name),
             )
         seen_hashes[content_hash_value] = blob["id"]
         entries.append(
@@ -1470,13 +1478,15 @@ def _resolve_source_blobs(
         merged_options = dict(stamped)
     elif "schema" not in merged_options and "schema_config" not in merged_options:
         merged_options["schema"] = {"mode": "observed"}
-    canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name="set_source_from_blobs")
+    canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name=tool_name)
     if canonical_error is not None:
-        return _saved_graph_rejection_result(
-            state, canonical_error, error_code="interpretation_requirements_invalid", rejected_component=_source_component_id(source_name)
-        )
+        return _failure_result(state, canonical_error, error_code="interpretation_requirements_invalid")
     plugin_error = _plugin_selection_violation(context, "source", "blob_rows")
     if plugin_error is not None:
+        if rejection_operation is _RejectionOperation.CANDIDATE:
+            return _candidate_plugin_policy_failure(
+                state, plugin_error, component=None, rejected_component=_source_component_id(source_name)
+            )
         return _saved_graph_plugin_policy_failure(state, plugin_error, component=None, rejected_component=_source_component_id(source_name))
     context.catalog.get_schema("source", "blob_rows")
     prevalidation_error = _prevalidate_source_for_context(
@@ -1487,11 +1497,10 @@ def _resolve_source_blobs(
         source_name=source_name,
     )
     if prevalidation_error is not None:
-        return _saved_graph_rejection_result(
+        return _failure_result(
             state,
             prevalidation_error[0],
             error_code=prevalidation_error[1],
-            rejected_component=_source_component_id(source_name),
             plugin_identity=("source", "blob_rows"),
         )
     return merged_options, tuple(payloads)
@@ -1587,6 +1596,8 @@ def _execute_set_source_from_blobs(
         session_engine=context.session_engine,
         session_id=context.session_id,
         source_name=source_name,
+        rejection_operation=_RejectionOperation.SAVED_GRAPH,
+        tool_name="set_source_from_blobs",
     )
     if isinstance(resolved, ToolResult):
         return resolved
@@ -1636,7 +1647,7 @@ _SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
                 "type": "array",
                 "items": {"type": "string", "description": "Ready session blob ID."},
                 "minItems": 1,
-                "maxItems": 1000,
+                "maxItems": MAX_SOURCE_BLOB_IDS,
                 "description": "Blob IDs in authoring order (becomes source-row order). No duplicates.",
             },
             "source_name": {
@@ -1782,22 +1793,6 @@ def _is_header_only_csv(content: str) -> tuple[str, ...] | None:
     return header
 
 
-def _read_inspection_prefix_and_hash(path: Path) -> tuple[bytes, str]:
-    """Read the bounded inspection prefix while hashing the full file."""
-    digest = hashlib.sha256()
-    prefix = bytearray()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(_BLOB_HASH_CHUNK_BYTES)
-            if not chunk:
-                break
-            digest.update(chunk)
-            remaining = _INSPECT_SOURCE_MAX_BYTES - len(prefix)
-            if remaining > 0:
-                prefix.extend(chunk[:remaining])
-    return bytes(prefix), digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class _InlineCsvSourceRefusal:
     error_code: Literal["inline_source_csv_inspection_failed", "inline_source_comparison_incomplete", "inline_source_content_conflict"]
@@ -1886,11 +1881,14 @@ def _execute_inspect_source(
 ) -> ToolResult:
     """Inspect a blob-backed source and return bounded structural facts.
 
-    Mirrors the lifecycle and integrity guards of ``_execute_get_blob_content``
-    (only ``ready`` blobs are readable; SHA-256 verified; UnicodeDecodeError
-    surfaced as tool-failure) but returns ``SourceInspectionFacts`` rather
-    than raw content. Inspects at most an 8 KiB prefix and parses at most
-    100 rows; streams the full file to verify its integrity hash.
+    Reads through the blob service's shared fenced reader, the same custody,
+    deletion and storage-version recovery and post-read metadata comparison
+    as every content read. It streams the whole file to verify its hash and
+    keeps only an 8 KiB prefix, then parses at most 100 rows. It returns
+    ``SourceInspectionFacts`` rather than raw content.
+
+    Not-found, non-ready and already-missing storage are repairable tool
+    failures. Integrity, fence and other I/O faults propagate.
 
     Never returns raw row content — only summary facts (headers, inferred
     types, URL candidates, warnings, redacted identity).
@@ -1912,31 +1910,31 @@ def _execute_inspect_source(
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(context.session_engine, blob_id, context.session_id)
-    if blob is None:
+    service, operation = _fenced_blob_reader(
+        context.session_engine,
+        context.session_id,
+        data_dir=context.data_dir,
+        session_operation_context=context.session_operation_context,
+        session_operation_authority=context.session_operation_authority,
+    )
+    try:
+        verified = service.read_blob_content_prefix_verified_sync(UUID(blob_id), operation, prefix_bytes=_INSPECT_SOURCE_MAX_BYTES)
+    except BlobNotFoundError:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
-
-    blob_status = blob["status"]
-    if blob_status != "ready":
-        return _failure_result(
-            state,
-            f"Blob '{blob_id}' is not readable — status is '{blob_status}', expected 'ready'.",
-        )
-
-    storage_path = Path(blob["storage_path"])
-    if not storage_path.exists():
+    except BlobStateError as exc:
+        return _failure_result(state, str(exc))
+    except BlobContentMissingError:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
 
-    data, actual_hash = _read_inspection_prefix_and_hash(storage_path)
-    _verify_blob_content_hash(blob, actual_hash)
-
+    record = verified.record
+    data = verified.prefix
     facts = inspect_blob_content(
         content=data,
-        filename=blob["filename"],
-        mime_type=blob["mime_type"],
-        blob_id=UUID(blob_id),
-        content_hash=blob["content_hash"],
-        total_size_bytes=blob["size_bytes"],
+        filename=record.filename,
+        mime_type=record.mime_type,
+        blob_id=record.id,
+        content_hash=verified.verified_content_hash,
+        total_size_bytes=verified.total_size_bytes,
     )
     if validated.encoding is not None:
         if facts.source_kind != "csv":
@@ -1951,13 +1949,13 @@ def _execute_inspect_source(
             return _failure_result(state, "CSV inspection requires a supported text encoding.")
         facts = inspect_csv_source_content(
             content=data,
-            filename=blob["filename"],
-            mime_type=blob["mime_type"],
-            delimiter=delimiter_for_filename(blob["filename"]) or ",",
+            filename=record.filename,
+            mime_type=record.mime_type,
+            delimiter=delimiter_for_filename(record.filename) or ",",
             skip_rows=0,
-            blob_id=UUID(blob_id),
-            content_hash=blob["content_hash"],
-            total_size_bytes=blob["size_bytes"],
+            blob_id=record.id,
+            content_hash=verified.verified_content_hash,
+            total_size_bytes=verified.total_size_bytes,
             encoding=encoding,
         )
         facts = replace(

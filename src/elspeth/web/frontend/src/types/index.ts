@@ -265,6 +265,8 @@ export interface CompositionState {
   id: string;
   session_id: string;
   version: number;
+  /** Server-authored content identity; absent only on responses from older servers. */
+  composition_content_hash?: string;
   sources: Record<string, SourceSpec>;
   nodes: NodeSpec[];
   edges: EdgeSpec[];
@@ -389,7 +391,10 @@ export type ComposerProgressReason =
   // retryable — deliberately not part of the provider_* family.
   | "planner_repair_exhausted"
   | "service_setup_failed"
+  | "mutation_authority_revoked"
   | "admission_refused"
+  // U-22 F4: prepared provider context outside the supported envelope.
+  | "context_unsupported"
   | "accounting_unavailable"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.
@@ -1238,6 +1243,8 @@ export interface ApiError {
   secret_guard?: ExecutionSecretGuard;
   provider_detail?: string;
   provider_status_code?: number;
+  /** Closed safe evidence of a primary provider request rejection, when retained. */
+  request_rejection?: SafeRequestRejection;
   validation_errors?: ValidationError[];
   errors?: ApiStructuredError[];
   snapshot_fingerprint?: string;
@@ -1296,6 +1303,11 @@ export interface SystemStatus {
    * server always sends it.
    */
   composer_timeout_seconds?: number;
+  /**
+   * The Composer-Operation-Version a new submission should request: 2 only
+   * when the server admits Continuation. Missing (older servers) means 1.
+   */
+  composer_operation_admission_version?: 1 | 2;
   /**
    * False when the deployment runs in locked-down server-only mode
    * (ELSPETH_WEB__USER_SECRETS_ENABLED=false): users cannot add their own

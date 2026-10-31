@@ -3237,7 +3237,8 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     # Epoch 75 combines graph recovery with durable authentication families and bound tickets.
     # Epoch 76 requires effective graph-review facts from committed terminal cohorts.
     # Epoch 78 binds quota custody and output storage reservations, retaining blob_read.
-    assert SESSION_SCHEMA_EPOCH == 78
+    # Epoch 79 retains Composer continuation segments, chunks, journal and snapshots.
+    assert SESSION_SCHEMA_EPOCH == 79
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

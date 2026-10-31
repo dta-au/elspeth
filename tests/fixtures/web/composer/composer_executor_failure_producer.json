@@ -1,0 +1,94 @@
+{
+  "generation": {
+    "terminal": {
+      "operation_id": "7a33459e-df22-442d-bae9-0db9615d2031",
+      "kind": "compose_message",
+      "status": "failed",
+      "poll_after_ms": 1000,
+      "cancel_requested": false,
+      "deadline_at": "2026-10-31T00:08:50Z",
+      "deadline_remaining_ms": 0,
+      "result": null,
+      "error": {
+        "http_status": 503,
+        "failure_code": "http_error",
+        "error_type": "executor_unavailable",
+        "body": {
+          "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+          "error_type": "executor_unavailable",
+          "request_id": "correlation"
+        },
+        "diagnostic_id": null
+      }
+    },
+    "history": {
+      "session_id": "5a73f156-00f6-49a3-a1e5-0d964069f460",
+      "items": [
+        {
+          "session_id": "5a73f156-00f6-49a3-a1e5-0d964069f460",
+          "operation_id": "7a33459e-df22-442d-bae9-0db9615d2031",
+          "kind": "compose_message",
+          "user_message_id": null,
+          "settled_at": "2026-10-31T00:05:50Z",
+          "failure_code": "http_error",
+          "error_type": "executor_unavailable",
+          "diagnostic_id": null,
+          "request_id": "correlation",
+          "saved_revisions": {
+            "attribution": "fenced",
+            "count": 0,
+            "latest_state_id": null,
+            "latest_version": null
+          }
+        }
+      ],
+      "next_cursor": null
+    }
+  },
+  "admission": {
+    "terminal": {
+      "operation_id": "624b34aa-4d8f-4040-8e46-36a25cf7b1ca",
+      "kind": "compose_message",
+      "status": "failed",
+      "poll_after_ms": 1000,
+      "cancel_requested": false,
+      "deadline_at": "2026-10-31T00:08:51Z",
+      "deadline_remaining_ms": 0,
+      "result": null,
+      "error": {
+        "http_status": 503,
+        "failure_code": "http_error",
+        "error_type": "executor_unavailable",
+        "body": {
+          "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+          "error_type": "executor_unavailable",
+          "request_id": "correlation"
+        },
+        "diagnostic_id": null
+      }
+    },
+    "history": {
+      "session_id": "9e80e28a-80c9-4afd-ba8d-10e63c73fdf2",
+      "items": [
+        {
+          "session_id": "9e80e28a-80c9-4afd-ba8d-10e63c73fdf2",
+          "operation_id": "624b34aa-4d8f-4040-8e46-36a25cf7b1ca",
+          "kind": "compose_message",
+          "user_message_id": null,
+          "settled_at": "2026-10-31T00:05:51Z",
+          "failure_code": "http_error",
+          "error_type": "executor_unavailable",
+          "diagnostic_id": null,
+          "request_id": "correlation",
+          "saved_revisions": {
+            "attribution": "fenced",
+            "count": 0,
+            "latest_state_id": null,
+            "latest_version": null
+          }
+        }
+      ],
+      "next_cursor": null
+    }
+  }
+}

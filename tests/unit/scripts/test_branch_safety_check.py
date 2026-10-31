@@ -1,7 +1,9 @@
-"""Exercise merge completion preflight against actual Git index states."""
+"""Exercise operation completion preflight against actual Git index states."""
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +11,35 @@ from pathlib import Path
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "branch-safety-check.sh"
+
+
+def _fail_staged_git_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str) -> Path:
+    """Keep real output, but fail the selected producer after it finishes."""
+    binary = shutil.which("git")
+    assert binary is not None
+    predicate = {
+        "staged-paths": "'diff' in args and '--cached' in args and '--name-only' in args and '-z' in args",
+        "staged-blob": "'show' in args and any(arg.startswith(':') for arg in args)",
+    }[operation]
+    marker = tmp_path / "failed-read-observed"
+    bin_dir = tmp_path / "controlled-bin"
+    bin_dir.mkdir()
+    wrapper = bin_dir / "git"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\nfrom pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        f"result = subprocess.run([{binary!r}, *args], check=False)\n"
+        f"if {predicate}:\n"
+        "    assert result.returncode == 0\n"
+        f"    Path({str(marker)!r}).write_text('real output then exit 79')\n"
+        "    raise SystemExit(79)\n"
+        "raise SystemExit(result.returncode)\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ["PATH"])
+    return marker
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +73,10 @@ def merging_repo(tmp_path: Path) -> Path:
     python = repo / ".venv/bin/python"
     python.parent.mkdir(parents=True)
     python.symlink_to(sys.executable)
+    scanner = repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
+    scanner.parent.mkdir(parents=True)
+    scanner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    scanner.chmod(0o755)
     tracked = repo / "conflict.txt"
     tracked.write_text("base\n", encoding="utf-8")
     _git(repo, "add", "conflict.txt")
@@ -66,6 +101,106 @@ def _resolve(repo: Path) -> None:
 
 def _preflight(repo: Path, intent: str, *options: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["bash", str(SCRIPT), "--intent", intent, *options], cwd=repo, capture_output=True, text=True, check=False)
+
+
+@pytest.fixture
+def picking_repo(merging_repo: Path) -> Path:
+    _git(merging_repo, "merge", "--abort")
+    _git(merging_repo, "-c", "rerere.enabled=false", "cherry-pick", "other", expected=1)
+    assert (merging_repo / ".git/CHERRY_PICK_HEAD").is_file()
+    assert not (merging_repo / ".git/sequencer").exists()
+    assert _git(merging_repo, "ls-files", "--unmerged")
+    return merging_repo
+
+
+@pytest.fixture
+def sequenced_pick_repo(merging_repo: Path) -> Path:
+    _git(merging_repo, "merge", "--abort")
+    first = _git(merging_repo, "rev-parse", "other").strip()
+    _git(merging_repo, "checkout", "--quiet", "other")
+    (merging_repo / "later.txt").write_text("later\n", encoding="utf-8")
+    _git(merging_repo, "add", "later.txt")
+    _git(merging_repo, "commit", "--quiet", "-m", "later")
+    later = _git(merging_repo, "rev-parse", "HEAD").strip()
+    _git(merging_repo, "checkout", "--quiet", "task")
+    _git(merging_repo, "-c", "rerere.enabled=false", "cherry-pick", first, later, expected=1)
+    assert (merging_repo / ".git/CHERRY_PICK_HEAD").is_file()
+    assert (merging_repo / ".git/sequencer/todo").is_file()
+    assert _git(merging_repo, "ls-files", "--unmerged")
+    return merging_repo
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+def test_unresolved_single_cherry_pick_refused(picking_repo: Path, intent: str) -> None:
+    result = _preflight(picking_repo, intent)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    assert "unmerged index entries remain" in result.stdout
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+def test_resolved_single_cherry_pick_only_allows_completion(picking_repo: Path, intent: str) -> None:
+    _resolve(picking_repo)
+    before = _git(picking_repo, "rev-parse", "HEAD", "CHERRY_PICK_HEAD")
+    staged = _git(picking_repo, "diff", "--cached", "--name-status")
+
+    result = _preflight(picking_repo, intent)
+
+    assert result.returncode == (0 if intent == "commit" else 1), result.stdout + result.stderr
+    if intent == "commit":
+        assert "[PASS] in-progress" in result.stdout
+        assert "resolved single cherry-pick ready for completion" in result.stdout
+    else:
+        assert "[FAIL] in-progress" in result.stdout
+        assert "CHERRY_PICK_HEAD" in result.stdout
+    assert _git(picking_repo, "rev-parse", "HEAD", "CHERRY_PICK_HEAD") == before
+    assert _git(picking_repo, "diff", "--cached", "--name-status") == staged
+
+
+@pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
+@pytest.mark.parametrize("resolved", [False, True])
+def test_cherry_pick_sequencer_remains_refused(sequenced_pick_repo: Path, intent: str, resolved: bool) -> None:
+    if resolved:
+        _resolve(sequenced_pick_repo)
+    result = _preflight(sequenced_pick_repo, intent)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    if resolved:
+        assert "unfinished:" in result.stdout
+        assert "sequencer" in result.stdout
+    else:
+        assert "unmerged index entries remain" in result.stdout
+
+
+@pytest.mark.parametrize("operation", ["MERGE_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge", "rebase-apply", "sequencer"])
+def test_resolved_single_cherry_pick_does_not_hide_another_operation(picking_repo: Path, operation: str) -> None:
+    _resolve(picking_repo)
+    marker = picking_repo / ".git" / operation
+    if operation in {"rebase-merge", "rebase-apply", "sequencer"}:
+        marker.mkdir()
+    else:
+        marker.write_text(_git(picking_repo, "rev-parse", "HEAD"), encoding="utf-8")
+    result = _preflight(picking_repo, "commit")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[FAIL] in-progress" in result.stdout
+    assert "unfinished:" in result.stdout
+
+
+def test_resolved_single_cherry_pick_keeps_blob_and_secret_checks(picking_repo: Path) -> None:
+    _resolve(picking_repo)
+    (picking_repo / "conflict.txt").write_text(str(Path.home()) + "\n", encoding="utf-8")
+    _git(picking_repo, "add", "conflict.txt")
+    scanner = picking_repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
+    scanner.parent.mkdir(parents=True, exist_ok=True)
+    scanner.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    scanner.chmod(0o755)
+
+    result = _preflight(picking_repo, "commit")
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[PASS] in-progress" in result.stdout
+    assert "[FAIL] home-paths" in result.stdout
+    assert "[FAIL] secrets" in result.stdout
 
 
 @pytest.mark.parametrize("intent", ["commit", "merge", "rebase", "push"])
@@ -117,6 +252,85 @@ def test_ordinary_commit_remains_allowed(merging_repo: Path) -> None:
     assert "[PASS] in-progress" in result.stdout
 
 
+@pytest.mark.parametrize("operation", ["staged-paths", "staged-blob"])
+def test_failed_staged_git_read_cannot_report_clean_blobs(
+    merging_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    _resolve(merging_repo)
+    assert _git(merging_repo, "diff", "--cached", "--name-only", "-z", "--diff-filter=AMRC")
+    assert _git(merging_repo, "show", ":conflict.txt") == "resolved\n"
+    positive = _preflight(merging_repo, "commit")
+    assert positive.returncode == 0, positive.stdout + positive.stderr
+    assert "[PASS] home-paths" in positive.stdout and "[PASS] secrets" in positive.stdout
+    index = merging_repo / ".git/index"
+    before = index.read_bytes(), (merging_repo / "conflict.txt").read_bytes()
+
+    with monkeypatch.context() as controlled:
+        marker = _fail_staged_git_read(tmp_path, controlled, operation)
+        failed = _preflight(merging_repo, "commit")
+
+    assert marker.read_text() == "real output then exit 79"
+    assert failed.returncode == 1, failed.stdout + failed.stderr
+    assert "[FAIL] home-paths" in failed.stdout
+    assert "[PASS] home-paths" not in failed.stdout
+    assert (index.read_bytes(), (merging_repo / "conflict.txt").read_bytes()) == before
+
+
+@pytest.mark.parametrize("scanner_state", ["missing", "not-executable"])
+def test_missing_required_secret_scan_is_not_a_clean_preflight(merging_repo: Path, scanner_state: str) -> None:
+    _resolve(merging_repo)
+    scanner = merging_repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
+    positive = _preflight(merging_repo, "commit")
+    assert positive.returncode == 0 and "[PASS] secrets" in positive.stdout
+    if scanner_state == "missing":
+        scanner.unlink()
+    else:
+        scanner.chmod(0o644)
+
+    refused = _preflight(merging_repo, "commit")
+
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "[FAIL] secrets" in refused.stdout
+    assert "[PASS] secrets" not in refused.stdout
+
+
+def test_failed_provenance_probe_cannot_pass_after_printing_valid_paths(merging_repo: Path, tmp_path: Path) -> None:
+    _resolve(merging_repo)
+    positive = _preflight(merging_repo, "commit")
+    assert positive.returncode == 0, positive.stdout + positive.stderr
+    assert "[PASS] provenance" in positive.stdout
+    index = merging_repo / ".git/index"
+    before = index.read_bytes(), (merging_repo / "conflict.txt").read_bytes()
+    marker = tmp_path / "failed-provenance-output"
+    python = merging_repo / ".venv/bin/python"
+    assert python.is_symlink()
+    # Replace only the fixture's link, never write through it to the actual
+    # interpreter. The real probe must succeed and print its real paths first.
+    python.unlink()
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\nfrom pathlib import Path\n"
+        f"result = subprocess.run([{sys.executable!r}, *sys.argv[1:]], capture_output=True, text=True, check=False)\n"
+        "assert result.returncode == 0\n"
+        "sys.stdout.write(result.stdout)\nsys.stderr.write(result.stderr)\n"
+        f"Path({str(marker)!r}).write_text(result.stdout)\n"
+        "raise SystemExit(79)\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+    refused = _preflight(merging_repo, "commit")
+
+    assert marker.read_text().splitlines() == [
+        str(merging_repo / "src/elspeth/__init__.py"),
+        str(merging_repo / "elspeth-lints/src/elspeth_lints/__init__.py"),
+    ]
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "[FAIL] provenance" in refused.stdout
+    assert "[PASS] provenance" not in refused.stdout
+    assert (index.read_bytes(), (merging_repo / "conflict.txt").read_bytes()) == before
+
+
 def test_rotation_manifest_is_allowed(merging_repo: Path) -> None:
     _git(merging_repo, "merge", "--abort")
     manifest = merging_repo / ".elspeth/rotations.log"
@@ -152,7 +366,7 @@ def test_rotation_manifest_still_checks_blob_and_secrets(merging_repo: Path) -> 
     manifest.write_text(str(Path.home()) + "\n", encoding="utf-8")
     _git(merging_repo, "add", ".elspeth/rotations.log")
     scanner = merging_repo / "scripts/git-hooks/pre-commit-secret-scan.sh"
-    scanner.parent.mkdir(parents=True)
+    scanner.parent.mkdir(parents=True, exist_ok=True)
     scanner.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     scanner.chmod(0o755)
 

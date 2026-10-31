@@ -8,16 +8,40 @@ import importlib.util
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import Connection
+from sqlalchemy.engine.interfaces import DBAPICursor, ExecutionContext
 
 from elspeth.contracts.advisory_locks import ELSPETH_BLOB_CUSTODY_LOCK_CLASSID, ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
+from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+
+_CONTINUATION_SQL_DEADLINE: ContextVar[tuple[ContinuationSQLDeadlineOwner, bool] | None] = ContextVar(
+    "continuation_sql_deadline", default=None
+)
+
+
+@contextlib.contextmanager
+def continuation_sql_deadline_scope(owner: ContinuationSQLDeadlineOwner, *, lifecycle: bool = False) -> Iterator[None]:
+    if type(owner) is not ContinuationSQLDeadlineOwner:
+        raise AuditIntegrityError("physical SQL deadline scope requires its actual V2 owner")
+    previous = _CONTINUATION_SQL_DEADLINE.get()
+    if previous is not None and previous != (owner, lifecycle):
+        raise AuditIntegrityError("physical SQL cannot replace another operation's deadline")
+    token = _CONTINUATION_SQL_DEADLINE.set((owner, lifecycle))
+    try:
+        yield
+    finally:
+        _CONTINUATION_SQL_DEADLINE.reset(token)
+
 
 _fcntl: Any
 if os.name == "posix" and importlib.util.find_spec("fcntl") is not None:
@@ -296,8 +320,58 @@ def transaction_session_lock(conn: Connection, engine: Engine, session_id: str) 
 
 
 @contextlib.contextmanager
-def locked_session_transaction(engine: Engine, session_id: str) -> Iterator[Connection]:
+def continuation_connection_deadline_scope(
+    conn: Connection, session_id: str, *, deadline: ComposerDrainDeadline | None = None
+) -> Iterator[None]:
+    """Install one canonical PG bound before the caller's first SQL/lock."""
+    current = _CONTINUATION_SQL_DEADLINE.get()
+    owner, lifecycle = current if current is not None else (None, False)
+    if conn.dialect.name != "postgresql" or (deadline is None and owner is None):
+        yield
+        return
+
+    def bound_statement(
+        connection: Connection,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: object,
+        context: ExecutionContext,
+        executemany: bool,
+    ) -> None:
+        if owner is not None:
+            remaining = owner.remaining_statement(session_id=session_id, deadline=deadline, lifecycle=lifecycle)
+        elif deadline is not None:
+            remaining = deadline.remaining_seconds(now=time.monotonic())
+        else:
+            raise AuditIntegrityError("SQL deadline listener lost its actual timing owner")
+        if remaining <= 0:
+            raise TimeoutError("Continuation transaction exhausted its absolute drain deadline")
+        # Raw cursor setup avoids re-entering this event hook. Transaction-local
+        # settings restore on commit/rollback and zero must never disable them.
+        timeout = f"{max(1, int(remaining * 1000))}ms"
+        cursor.execute(
+            "SELECT pg_catalog.set_config('lock_timeout', %s, true), pg_catalog.set_config('statement_timeout', %s, true)",
+            (timeout, timeout),
+        )
+
+    event.listen(conn, "before_cursor_execute", bound_statement)
+    try:
+        yield
+    finally:
+        event.remove(conn, "before_cursor_execute", bound_statement)
+
+
+@contextlib.contextmanager
+def locked_session_transaction(engine: Engine, session_id: str, *, deadline: ComposerDrainDeadline | None = None) -> Iterator[Connection]:
     """Acquire process exclusion before opening a same-session transaction."""
+    if engine.dialect.name == "postgresql" and (deadline is not None or _CONTINUATION_SQL_DEADLINE.get() is not None):
+        with (
+            engine.begin() as conn,
+            continuation_connection_deadline_scope(conn, session_id, deadline=deadline),
+            transaction_session_lock(conn, engine, session_id),
+        ):
+            yield conn
+        return
     with process_session_lock(engine, session_id), engine.begin() as conn, transaction_session_lock(conn, engine, session_id):
         yield conn
 

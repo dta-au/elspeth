@@ -1,0 +1,22 @@
+"""Original Advisor observation on real serial PostgreSQL custody and accounting."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.composer.test_advisor_invocation_outcome import (
+    test_advisor_observer_refuses_foreign_owner_before_any_effect as test_advisor_observer_refuses_foreign_owner_before_any_effect,
+)
+from tests.unit.web.composer.test_advisor_invocation_outcome import (
+    test_original_advisor_cancellation_identity_after_real_settlement as test_original_advisor_cancellation_identity_after_real_settlement,
+)
+from tests.unit.web.composer.test_advisor_invocation_outcome import (
+    test_original_advisor_continuation_budget_charges_same_retained_call_once as test_original_advisor_continuation_budget_charges_same_retained_call_once,
+)
+from tests.unit.web.composer.test_advisor_invocation_outcome import (
+    test_original_advisor_outcome_identity_and_accounting as test_original_advisor_outcome_identity_and_accounting,
+)
+from tests.unit.web.composer.test_advisor_invocation_outcome import (
+    test_original_advisor_partial_failure_retains_attempt_and_original_error as test_original_advisor_partial_failure_retains_attempt_and_original_error,
+)
+
+pytestmark = pytest.mark.testcontainer

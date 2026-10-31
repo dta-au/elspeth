@@ -126,7 +126,7 @@ def test_decode_rejects_malformed_framing_and_preserves_null_semantics(
     assert _semantic(decode_wire_arguments("list_models", STRICT, {"provider": None, "x": None})) == {"x": None}
 
 
-# One minimal S-valid call for each of the 33 strict-capable tools: the
+# One minimal S-valid call for each of the 34 strict-capable tools: the
 # flat-required keys only. The promoted positions are filled from
 # ``_PROMOTED_VALUES`` below.
 _SEEDS: dict[str, dict[str, Any]] = {
@@ -143,6 +143,7 @@ _SEEDS: dict[str, dict[str, Any]] = {
     "clear_source": {},
     "inspect_source": {"blob_id": "blob-1"},
     "get_pipeline_state": {},
+    "get_complete_pipeline_value": {"reference_id": "a" * 64},
     "get_plugin_schema": {"plugin_type": "source", "name": "csv"},
     "get_expression_grammar": {},
     "explain_validation_error": {"error_text": "unknown node_type"},
@@ -239,9 +240,9 @@ def _semantic(decoded: DecodedArguments) -> dict[str, Any]:
 # ---------------------------------------------------------------- the seeds
 
 
-def test_the_seeds_cover_exactly_the_33_strict_capable_tools_and_17_promoted_positions() -> None:
+def test_the_seeds_cover_exactly_the_34_strict_capable_tools_and_17_promoted_positions() -> None:
     assert set(_SEEDS) == _strict_capable_names()
-    assert len(_SEEDS) == 33
+    assert len(_SEEDS) == 34
     promoted = {(name, path) for name in _SEEDS for path in _WIRE_TOOL_DEFS[STRICT][name].promoted_paths}
     assert set(_PROMOTED_VALUES) == promoted
     assert len(promoted) == 17
@@ -253,6 +254,24 @@ def test_every_seed_and_its_full_call_are_s_valid(tool: str) -> None:
     assert _s_valid(tool, _SEEDS[tool])
     assert _s_valid(tool, _full_call(tool))
     require_schema_valid_arguments(tool, _full_call(tool))
+
+
+@pytest.mark.parametrize("dialect", [NONE, STRICT])
+@pytest.mark.parametrize(
+    "raw",
+    [{}, {"reference_id": None}, {"reference_id": "a" * 64, "extra": True}],
+    ids=["missing-reference", "null-reference", "extra-key"],
+)
+def test_complete_value_reference_remains_required_non_null_and_closed(dialect: ToolContractDialect, raw: dict[str, Any]) -> None:
+    snapshot = deepcopy(raw)
+
+    decoded = decode_wire_arguments("get_complete_pipeline_value", dialect, raw)
+
+    assert decoded.wire_conformant is False
+    assert _semantic(decoded) == raw == snapshot
+    assert not _s_valid("get_complete_pipeline_value", _semantic(decoded))
+    with pytest.raises(ToolArgumentError):
+        require_schema_valid_arguments("get_complete_pipeline_value", _semantic(decoded))
 
 
 # ---------------------------------------------------------------- STRIP_NULL

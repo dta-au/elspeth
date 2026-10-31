@@ -1,7 +1,7 @@
-"""Complete structural Advisor evidence precedes optional authored prose.
+"""Bounded Advisor graph views retain complete values without granting review.
 
 All graphs and field names in this module are synthetic public fixtures.
-These tests exercise projection and refusal, never a provider or a graph run.
+Real session/audit owners use synthetic SDK replies; no provider or graph runs.
 """
 
 from __future__ import annotations
@@ -9,31 +9,42 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
+from uuid import UUID
 
+import litellm
 import pytest
+from sqlalchemy import select
 
+from elspeth.contracts.composer_content import ComposerContentScope
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_MAX_TEXT_CHARACTERS, PromptGuardContentPart
-from elspeth.web.composer import advisor_checkpoint
+from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase
 from elspeth.web.composer.advisor_context import (
     ADVISOR_CHARS_PER_TOKEN,
-    AdvisorGraphCoverageUnavailable,
     AdvisorSummaryParts,
-    _pipeline_advisor_summary_units,
-    advisor_checkpoint_summary_chars,
     advisor_user_content_parts,
     build_advisor_user_message,
+    materialize_advisor_complete_values,
     summarize_pipeline_for_advisor,
 )
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
-from elspeth.web.composer.prompt_guard import _request
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.prompt_guard import _request, prompt_guard_user_scope
+from elspeth.web.composer.protocol import ComposerContextUnsupported
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.turn_effects import TurnEvidence
+from elspeth.web.credential_guard import CredentialMaterialRefused
+from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table, token_usage_ledger_table
+from elspeth.web.sessions.protocol import SessionServiceProtocol
 from tests.unit.web.composer._helpers import _make_settings
 
+pytest_plugins = ("tests.unit.web.composer.test_prompt_guard_wiring",)
 
-def _owner(*, allowance: int = 4000) -> AdvisorCheckpointOwner:
+
+def _owner(*, allowance: int = 4000, sessions: SessionServiceProtocol | None = None) -> AdvisorCheckpointOwner:
     settings = _make_settings(
         composer_advisor_max_prompt_tokens=allowance,
         composer_prompt_guard_mode="debug-when-unconfigured",
@@ -44,9 +55,65 @@ def _owner(*, allowance: int = 4000) -> AdvisorCheckpointOwner:
         composer_skill_text="Synthetic Advisor policy.",
         advisor_endpoint_base_url=None,
         advisor_endpoint_api_key=None,
-        sessions_service=None,
-        chargeable_admission=ComposerChargeableAdmission(None),
+        sessions_service=sessions,
+        chargeable_admission=ComposerChargeableAdmission(sessions),
     )
+
+
+def _checkpoint_arguments(*, phase: AdvisorCheckpointPhase, state: CompositionState, allowance: int = 4000):
+    return _owner(allowance=allowance)._build_checkpoint_arguments(
+        phase=phase, state=state, content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state))
+    )
+
+
+def _diagnostic_graph(arguments):
+    prefix = "Diagnostic graph view; complete-value references are not reviewed content.\n"
+    summary = arguments["schema_excerpt"]
+    assert summary.startswith(prefix)
+    # The display is one JSON document; U-22's complete-review section follows it.
+    view, end = json.JSONDecoder().raw_decode(summary, len(prefix))
+    assert summary[end:] == "" or summary[end:].startswith("\nComplete values behind each complete_value_ref above")
+    assert view["schema_version"] == "composer.bounded-view.v1"
+    return view
+
+
+def _complete_values(arguments, state):
+    summary = arguments["_elspeth_advisor_summary_parts"]
+    manifest = summary.content_manifest
+    assert manifest is not None and manifest.values
+    values = materialize_advisor_complete_values(
+        summary, state, content_scope=manifest.scope, reference_ids=tuple(item.reference_id for item in manifest.values)
+    )
+    assert tuple(item.reference for item in values) == manifest.values
+    for item in values:
+        assert item.reference.utf8_bytes == len(json.dumps(item.to_value(), ensure_ascii=False, separators=(",", ":")).encode())
+    # U-22 F1: the producer itself carries the same complete values, in manifest
+    # order, and renders each whole into the review excerpt; coverage is exact.
+    assert summary.complete_values == values
+    for item in values:
+        assert json.dumps(item.to_value(), ensure_ascii=False) in arguments["schema_excerpt"]
+    AdvisorCheckpointOwner._require_complete_graph_summary(summary)
+    assert all(part.trust is None for part in summary.values)
+    return {item.reference.path: item.to_value() for item in values}
+
+
+async def _publication_review(sessions, context, state, request):
+    message = await sessions.add_message(
+        UUID(context.fence.session_id),
+        "user",
+        request,
+        writer_principal="route_user_message",
+        session_operation_context=context,
+    )
+    return TurnEvidence(
+        session_id=context.fence.session_id,
+        session_operation_context=context,
+        request_id=str(message.id),
+        request=request,
+        initial_state_id=None,
+        initial_state=state,
+        actor_user_id="alice",
+    ).review_candidate(candidate="Review the supplied graph.", request=request, current_state=state)
 
 
 def _field_names() -> tuple[str, ...]:
@@ -135,11 +202,6 @@ def _component(summary: str, identity: str) -> str:
     return next(line for line in summary.splitlines() if line.startswith(f"  - {identity}:"))
 
 
-def _optional_summary_chars(arguments, state: CompositionState) -> int:
-    required = "\n".join("".join(part.text for part in unit) for unit in _pipeline_advisor_summary_units(state, include_optional=False))
-    return advisor_checkpoint_summary_chars(arguments) - advisor_checkpoint_summary_chars({**arguments, "schema_excerpt": required})
-
-
 def _canonical(text: str) -> str:
     """Ignore serialization whitespace/quotes, preserving synthetic value order."""
     compact = re.sub(r"\s+", "", text.replace('"', "'"))
@@ -166,21 +228,33 @@ def _assert_mapper_contract(summary: str, *, reordered: bool = False) -> None:
     assert "additional_fields_withheld" not in mapper + sink
 
 
+def _assert_diagnostic_mapper_contract(arguments, *, reordered: bool = False) -> None:
+    view = _diagnostic_graph(arguments)
+    assert view["content_manifest"]["values"] == []
+    names = _field_names()
+    ordered = (*(name for name in names if name != "field_11"), "field_11") if reordered else names
+    mapper = view["data"]["nodes"][0]["options"]
+    assert mapper["schema"] == _schema(ordered)
+    assert tuple(mapper["mapping"]) == tuple(f"input_{name[-2:]}" for name in ordered)
+    assert tuple(mapper["mapping"].values()) == ordered
+    assert mapper["mapping"]["input_11"] == "field_11" and "field_11" not in mapper["mapping"]
+    assert mapper["select_only"] is True
+    sink = view["data"]["outputs"][0]["options"]
+    assert sink["schema"] == _schema(ordered)
+    assert sink["headers"] == {name: f"Column {name[-2:]}" for name in ordered}
+    assert tuple(sink["headers"]) == ordered
+
+
 @pytest.mark.parametrize("phase", ["early", "end"])
 def test_checkpoint_keeps_every_component_before_optional_prompt_prose(phase: AdvisorCheckpointPhase) -> None:
     state = _graph(many=True)
     assert len(state.nodes) == 10 and len(state.outputs) == 2
-    owner = _owner()
-    arguments = owner._build_checkpoint_arguments(phase=phase, state=state)
-    excerpt = arguments["schema_excerpt"]
-    assert "Source: plugin=csv" in excerpt
-    for node in state.nodes:
-        assert f"  - {node.id}:" in excerpt, f"Advisor lost node {node.id}"
-    for output in state.outputs:
-        assert f"  - {output.name}:" in excerpt, f"Advisor lost sink {output.name}"
-    assert 0 <= _optional_summary_chars(arguments, state) <= 4000 * ADVISOR_CHARS_PER_TOKEN
-    assert "additional_evidence_lines_withheld" not in excerpt
-    _assert_mapper_contract(excerpt)
+    arguments = _checkpoint_arguments(phase=phase, state=state)
+    data = _diagnostic_graph(arguments)["data"]
+    assert data["sources"]["source"]["plugin"] == "csv"
+    assert tuple(node["id"] for node in data["nodes"]) == tuple(node.id for node in state.nodes)
+    assert tuple(output["name"] for output in data["outputs"]) == tuple(output.name for output in state.outputs)
+    _assert_diagnostic_mapper_contract(arguments)
     message = build_advisor_user_message(arguments)
     assert "'input_11':'field_11'" in _canonical(message)
     assert "Column11" in _canonical(message)
@@ -194,8 +268,8 @@ def test_checkpoint_preserves_field_eleven_type_and_csv_header_beyond_eight_fiel
 
 @pytest.mark.parametrize("phase", ["early", "end"])
 def test_checkpoint_preserves_a_wrong_order_instead_of_normalizing_to_expected_position(phase: AdvisorCheckpointPhase) -> None:
-    arguments = _owner()._build_checkpoint_arguments(phase=phase, state=_graph(many=True, reordered=True))
-    _assert_mapper_contract(arguments["schema_excerpt"], reordered=True)
+    arguments = _checkpoint_arguments(phase=phase, state=_graph(many=True, reordered=True))
+    _assert_diagnostic_mapper_contract(arguments, reordered=True)
 
 
 def test_checkpoint_includes_complete_structural_flow_and_explicit_edge_records() -> None:
@@ -254,46 +328,58 @@ def test_gate_evidence_preserves_condition_route_bindings_and_fork_order() -> No
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_required_graph_larger_than_optional_allowance_reaches_advisor_complete(
-    monkeypatch: pytest.MonkeyPatch, phase: AdvisorCheckpointPhase
+    invocation, monkeypatch: pytest.MonkeyPatch, phase: AdvisorCheckpointPhase
 ) -> None:
-    owner = _owner(allowance=1)
-    calls: list[object] = []
-    completed_passes: list[object] = []
-
+    engine, sessions, provider_owner, coordinator = invocation
+    context = coordinator.authority.context
+    owner = _owner(allowance=1, sessions=sessions)
+    calls = []
     state = _graph()
+    request = "Review this graph."
+    review = await _publication_review(sessions, context, state, request)
 
-    async def dispatch(self: AdvisorCheckpointOwner, arguments, **kwargs):
-        calls.append(arguments)
-        _assert_mapper_contract(arguments["schema_excerpt"])
-        assert advisor_checkpoint_summary_chars(arguments) > ADVISOR_CHARS_PER_TOKEN
-        assert 0 <= _optional_summary_chars(arguments, state) <= ADVISOR_CHARS_PER_TOKEN
-        kwargs["on_provider_dispatch"]()
+    async def dispatch(**kwargs):
+        calls.append(kwargs)
+        text = kwargs["messages"][1]["content"]
+        prefix = "Diagnostic graph view; complete-value references are not reviewed content.\n"
+        _before, separator, diagnostic = text.partition(prefix)
+        assert separator
+        view, _end = json.JSONDecoder().raw_decode(diagnostic)
+        _assert_diagnostic_mapper_contract({"schema_excerpt": prefix + json.dumps(view)})
+        assert len(diagnostic) > ADVISOR_CHARS_PER_TOKEN
         reply = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
         if phase == "end":
             reply["publication_verdict"] = "ADMIT"
-        return json.dumps(reply), None
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": json.dumps(reply)}}],
+        )
 
-    monkeypatch.setattr(AdvisorCheckpointOwner, "_call_advisor_with_audit", dispatch)
-
-    async def record_completed_pass(**kwargs: object) -> None:
-        completed_passes.append(kwargs)
-
-    monkeypatch.setattr(advisor_checkpoint, "persist_advisor_checkpoint_pass", record_completed_pass)
-    review = TurnEvidence(
-        session_id=None,
-        session_operation_context=None,
-        request_id="large-required-graph",
-        request="Review this graph.",
-        initial_state_id=None,
-        initial_state=state,
-    ).review_candidate(candidate="Review the supplied graph.", request="Review this graph.", current_state=state)
-    verdict = await owner._run_advisor_checkpoint(
-        phase=phase, state=state, session_id=None, recorder=None, publication_review=review if phase == "end" else None
-    )
-    assert len(calls) == len(completed_passes) == 1
+    monkeypatch.setattr(litellm, "acompletion", dispatch)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(request):
+        verdict = await owner._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            session_id=context.fence.session_id,
+            session_operation_context=context,
+            provider_owner=provider_owner,
+            recorder=recorder,
+            publication_review=review if phase == "end" else None,
+        )
+    assert len(calls) == len(recorder.llm_calls) == 1
+    with engine.connect() as conn:
+        passes = [
+            row
+            for row in conn.execute(select(chat_messages_table)).all()
+            if row.tool_calls and row.tool_calls[0].get("_kind") == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        ]
+        assert len(passes) == 1
     assert verdict.ok and not verdict.blocking
     if phase == "end":
         assert verdict.publication_verdict == "ADMIT" and verdict.publication_binding == review.binding
+    coordinator.assert_completed()
 
 
 def test_projection_redacts_credentials_and_preserves_authored_locations_and_csv_headers() -> None:
@@ -314,10 +400,17 @@ def test_projection_redacts_credentials_and_preserves_authored_locations_and_csv
             ),
         ),
     )
-    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    with pytest.raises(CredentialMaterialRefused):
+        _checkpoint_arguments(phase="end", state=state)
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], options={**source.options, "path": "AUTHORED_SOURCE_LOCATION"})},
+        outputs=(*state.outputs[:-1], replace(state.outputs[-1], options={"headers": {"X-Purpose": "Ordinary heading"}})),
+    )
+    arguments = _checkpoint_arguments(phase="end", state=state)
     message = build_advisor_user_message(arguments)
     assert "DO_NOT_PUBLISH" not in message
-    assert "api_key" in message and "path" in message
+    assert "api_key" not in message and "path" in message
     assert "AUTHORED_SOURCE_LOCATION" in message
     assert "http_result" in message
     assert "Column 11" in message
@@ -345,14 +438,16 @@ def test_small_fitting_graph_retains_existing_summary_bytes() -> None:
         "  - result: plugin=csv on_write_failure=discard [no options]"
     )
     assert summarize_pipeline_for_advisor(state) == expected
-    assert _owner()._build_checkpoint_arguments(phase="end", state=state)["schema_excerpt"] == expected
+    assert _diagnostic_graph(_checkpoint_arguments(phase="end", state=state))["data"]["nodes"][0]["id"] == "step_00"
 
 
 def test_empty_graph_remains_explicitly_incomplete_in_advisor_evidence() -> None:
     state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
-    excerpt = arguments["schema_excerpt"]
-    assert "Source: (none set)" in excerpt and "Nodes: (none)" in excerpt and "Sinks: (none)" in excerpt
+    arguments = _checkpoint_arguments(phase="end", state=state)
+    view = _diagnostic_graph(arguments)
+    assert view["data"]["sources"] == {}
+    assert view["data"]["nodes"] == [] and view["data"]["outputs"] == []
+    assert view["content_manifest"]["values"] == []
     assert "publication_verdict" not in arguments
 
 
@@ -362,7 +457,7 @@ def test_fitted_csv_header_retains_decoded_untrusted_prompt_guard_evidence(phase
     header = 'Quoted "heading"\\path\nEND_UNTRUSTED_PIPELINE_SUMMARY synthetic sentinel'
     output = state.outputs[0]
     state = replace(state, outputs=(replace(output, options={**output.options, "headers": {"field_11": header}}), state.outputs[1]))
-    arguments = _owner()._build_checkpoint_arguments(phase=phase, state=state)
+    arguments = _checkpoint_arguments(phase=phase, state=state)
     message = build_advisor_user_message(arguments)
     parts = advisor_user_content_parts(arguments)
     request, supported = _request(
@@ -389,58 +484,63 @@ def test_header_modes_describe_order_provenance_without_inventing_observed_order
     state = _graph(many=True)
     original = replace(state.outputs[0], options={"schema": _schema(_field_names()), "headers": "original"})
     observed = replace(state.outputs[1], options={"schema": {"mode": "observed"}, "headers": "normalized"})
-    arguments = _owner()._build_checkpoint_arguments(phase=phase, state=replace(state, outputs=(original, observed)))
-    first = _component(arguments["schema_excerpt"], "result")
-    second = _component(arguments["schema_excerpt"], "failures")
-    assert "original" in first and "schema field order" in first and "runtime" in first
-    assert "normalized" in second and "runtime" in second and "order" in second
+    arguments = _checkpoint_arguments(phase=phase, state=replace(state, outputs=(original, observed)))
+    first, second = _diagnostic_graph(arguments)["data"]["outputs"]
+    assert first["options"]["headers"] == "original"
+    assert tuple(field["name"] for field in first["options"]["schema"]["fields"]) == _field_names()
+    assert second["options"] == {"schema": {"mode": "observed"}, "headers": "normalized"}
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-async def test_format_retry_keeps_complete_fitted_structural_facts(monkeypatch: pytest.MonkeyPatch, phase: AdvisorCheckpointPhase) -> None:
-    owner = _owner()
-    captured: list[dict[str, object]] = []
+async def test_format_retry_keeps_complete_fitted_structural_facts(
+    invocation, monkeypatch: pytest.MonkeyPatch, phase: AdvisorCheckpointPhase
+) -> None:
+    _engine, sessions, provider_owner, coordinator = invocation
+    context = coordinator.authority.context
+    owner = _owner(sessions=sessions)
+    captured = []
     state = _graph(many=True)
     request = "Review this synthetic graph."
-    review = TurnEvidence(
-        session_id=None,
-        session_operation_context=None,
-        request_id="synthetic-graph-format-retry",
-        request=request,
-        initial_state_id=None,
-        initial_state=state,
-    ).review_candidate(candidate="Review remains subject to validation.", request=request, current_state=state)
+    review = await _publication_review(sessions, context, state, request)
 
-    async def reply(self: AdvisorCheckpointOwner, arguments: dict[str, object], **kwargs: object) -> tuple[str, None]:
-        captured.append(arguments)
-        callback = kwargs["on_provider_dispatch"]
-        assert callable(callback)
-        callback()
-        if len(captured) == 1:
-            return "invalid JSON", None
+    async def reply(**kwargs):
+        captured.append(kwargs["messages"][1]["content"])
         response = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None}
         if phase == "end":
             response["publication_verdict"] = "ADMIT"
-        return json.dumps(response), None
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": "invalid JSON" if len(captured) == 1 else json.dumps(response)}}],
+        )
 
-    monkeypatch.setattr(AdvisorCheckpointOwner, "_call_advisor_with_audit", reply)
-    verdict = await owner._run_advisor_checkpoint(
-        phase=phase,
-        state=state,
-        session_id=None,
-        recorder=None,
-        user_message=request,
-        publication_review=review if phase == "end" else None,
-    )
+    monkeypatch.setattr(litellm, "acompletion", reply)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(request):
+        verdict = await owner._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            session_id=context.fence.session_id,
+            session_operation_context=context,
+            provider_owner=provider_owner,
+            recorder=recorder,
+            user_message=request,
+            publication_review=review if phase == "end" else None,
+        )
     assert verdict.ok and len(captured) == 2
-    for arguments in captured:
-        excerpt = arguments["schema_excerpt"]
-        assert isinstance(excerpt, str)
-        _assert_mapper_contract(excerpt)
-        assert "  - step_09:" in excerpt and "  - failures:" in excerpt
-        assert 0 <= _optional_summary_chars(arguments, state) <= 4000 * ADVISOR_CHARS_PER_TOKEN
-        assert "".join(part.text for part in advisor_user_content_parts(arguments)) == build_advisor_user_message(arguments)
+    graphs = []
+    for text in captured:
+        prefix = "Diagnostic graph view; complete-value references are not reviewed content.\n"
+        _before, separator, diagnostic = text.partition(prefix)
+        assert separator
+        view, _end = json.JSONDecoder().raw_decode(diagnostic)
+        _assert_diagnostic_mapper_contract({"schema_excerpt": prefix + json.dumps(view)})
+        assert tuple(node["id"] for node in view["data"]["nodes"]) == tuple(node.id for node in state.nodes)
+        assert tuple(output["name"] for output in view["data"]["outputs"]) == ("result", "failures")
+        graphs.append(view)
+    assert graphs[0] == graphs[1] and len(recorder.llm_calls) == 2
+    coordinator.assert_completed()
 
 
 @pytest.mark.parametrize("phase", ["early", "end"])
@@ -453,19 +553,26 @@ def test_configured_prompts_are_complete_required_evidence_beyond_optional_allow
         nodes=(replace(_node(0), plugin="llm", options={"prompt_template": prompt, "system_prompt": system}),),
         metadata=PipelineMetadata(name="Long authored graph", description="OPTIONAL_COMMENTARY " * 2000),
     )
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase=phase, state=state)
+    arguments = _checkpoint_arguments(phase=phase, state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     assert len(prompt) > 1000 and len(system) > 1000 and len(prompt) + len(system) > 16000
+    # U-22 F1: complete values beyond the display threshold are required review
+    # evidence, retained beyond the optional allowance (allowance=1 here).
     assert prompt in message and system in message
-    assert "OPTIONAL_COMMENTARY" not in message
-    assert "optional_prose_units_withheld" not in message or "optional_prose_units_withheld=1" in message
-    assert 0 <= _optional_summary_chars(arguments, state) <= ADVISOR_CHARS_PER_TOKEN
+    assert state.metadata.description in message
+    values = _complete_values(arguments, state)
+    assert values[("nodes", 0, "options", "prompt_template")] == prompt
+    assert values[("nodes", 0, "options", "system_prompt")] == system
+    assert values[("metadata", "description")] == state.metadata.description
     assert "values withheld: prompt_template" not in message and "values withheld: system_prompt" not in message
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == message
     assert all(part.trust is None for part in parts)
     inspection = "\n".join(part.inspection_text or part.text for part in parts)
     assert prompt in inspection and system in inspection
+    # Each complete value is one indivisible inspection unit, never sliced.
+    assert any(prompt in (part.inspection_text or part.text) for part in parts)
+    assert any(system in (part.inspection_text or part.text) for part in parts)
 
 
 def test_all_authored_semantic_options_keep_values_and_named_source_identity() -> None:
@@ -486,7 +593,7 @@ def test_all_authored_semantic_options_keep_values_and_named_source_identity() -
         sources={"named_records": replace(source, options={**source.options, "path": "named-input.csv", "profile": "SOURCE_PROFILE"})},
         nodes=(replace(_node(0), options=options),),
     )
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     for marker in (
         "LOOKUP_VALUE",
@@ -502,7 +609,7 @@ def test_all_authored_semantic_options_keep_values_and_named_source_identity() -
         "SOURCE_PROFILE",
     ):
         assert marker in message, marker
-    assert "Source 'named_records'" in message
+    assert tuple(_diagnostic_graph(arguments)["data"]["sources"]) == ("named_records",)
     assert "values withheld" not in arguments["schema_excerpt"]
 
 
@@ -512,12 +619,13 @@ def test_nested_llm_queries_keep_complete_semantics_and_effective_interpolation(
     system = "Interpret this record. " + "guidance " * 1800 + " NESTED_SYSTEM_TAIL"
     nested = {"system_prompt": system, "queries": {"review": {"input_fields": {"record": "field_11"}, "template": template}}}
     state = replace(state, nodes=(replace(_node(0), plugin="llm", options={"options": nested}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
-    assert template in message and system in message
+    assert template in message and system in message  # U-22 F1: complete values are reviewed
     assert '"record":"field_11"' in message or "'record': 'field_11'" in message
-    assert "named row field references: [field_11]" in message
-    assert "named row field references: NONE" not in message
+    values = _complete_values(arguments, state)
+    assert values[("nodes", 0, "options", "options", "queries", "review", "template")] == template
+    assert values[("nodes", 0, "options", "options", "system_prompt")] == system
 
 
 def test_graph_redacts_nested_credentials_preserving_ordinary_values_and_blob_identity() -> None:
@@ -535,12 +643,20 @@ def test_graph_redacts_nested_credentials_preserving_ordinary_values_and_blob_id
         },
         nodes=(replace(_node(0), plugin="llm", options=options),),
     )
-    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    with pytest.raises(CredentialMaterialRefused):
+        _checkpoint_arguments(phase="end", state=state)
+    safe_options = {
+        "profile": {"label": "ORDINARY_PROFILE_CANARY"},
+        "lookup": {"ordinary": "ORDINARY_LOOKUP_CANARY"},
+        "prompt_template": "Review {{ row.field_01 }}. END_PROMPT_CANARY",
+    }
+    state = replace(state, nodes=(replace(state.nodes[0], options=safe_options),))
+    arguments = _checkpoint_arguments(phase="end", state=state)
     message = build_advisor_user_message(arguments)
     assert "PRIVATE_" not in message
     for marker in ("ORDINARY_PROFILE_CANARY", "ORDINARY_LOOKUP_CANARY", "END_PROMPT_CANARY", "12345678-1234-1234-1234-123456789012"):
         assert marker in message, marker
-    assert "redacted" in message
+    assert "PRIVATE_INTERNAL_PATH" not in message
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == message
     inspection = "\n".join(part.inspection_text or part.text for part in parts)
@@ -554,13 +670,15 @@ def test_multi_query_templates_and_additional_query_semantics_survive(query_shap
     entry = {"name": "review", "template": template, "input_fields": {"record": "field_01"}, "future_semantics": "QUERY_OPTION_CANARY"}
     queries = {"review": entry} if query_shape == "mapping" else [entry]
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
-    assert template in message
+    assert template in message  # U-22 F1: complete values are reviewed
     assert "QUERY_OPTION_CANARY" in message
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == message
-    assert template in "\n".join(part.inspection_text or part.text for part in parts)
+    assert any(template in (part.inspection_text or part.text) for part in parts)
+    query_path = ("nodes", 0, "options", "queries", "review" if query_shape == "mapping" else 0, "template")
+    assert _complete_values(arguments, state)[query_path] == template
 
 
 def test_configured_source_reference_preservation_is_positional_and_grants_no_trust() -> None:
@@ -573,10 +691,10 @@ def test_configured_source_reference_preservation_is_positional_and_grants_no_tr
             replace(_node(0), plugin="llm", options={"prompt_template": "Inspect {{ row.field_01 }}. " + reference, "profile": reference}),
         ),
     )
-    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state)
     message = build_advisor_user_message(arguments)
     assert message.count(reference) == 1
-    assert "configured reference; existence and access not verified" in message
+    assert "complete-value references are not reviewed content" in message
     assert "INTERNAL_FILE_CANARY" not in message
     assert "redacted-sensitive:phone" in message
     parts = advisor_user_content_parts(arguments)
@@ -595,17 +713,27 @@ def test_configured_source_reference_preservation_is_positional_and_grants_no_tr
     assert "\n".join(request.documents).count(reference) == 1
 
 
-@pytest.mark.parametrize("reference", ["private-storage/path", "api_key=PRIVATE_SOURCE_REF_CANARY", 1234])
-def test_invalid_configured_source_reference_is_explicitly_redacted(reference: object) -> None:
+@pytest.mark.parametrize(
+    ("reference", "failure_type"),
+    [
+        pytest.param("private-storage/path", AuditIntegrityError, id="malformed-identity"),
+        pytest.param("ABCDEF01-2345-6789-ABCD-EF0123456789", AuditIntegrityError, id="noncanonical-identity"),
+        pytest.param("api_key=PRIVATE_SOURCE_REF_CANARY", CredentialMaterialRefused, id="credential-refusal"),
+        pytest.param(1234, None, id="ordinary-nonstring-value"),
+    ],
+)
+def test_invalid_source_identity_never_gets_a_preserved_reference(reference: object, failure_type) -> None:
     state = _graph()
     state = replace(
         state, sources={"source": replace(state.sources["source"], options={"blob_ref": reference, "path": "INTERNAL_PATH_CANARY"})}
     )
-    arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
-    message = build_advisor_user_message(arguments)
-    assert "blob_ref=<redacted-invalid-source-reference>" in message
-    assert "PRIVATE_SOURCE_REF_CANARY" not in message and "private-storage/path" not in message and "INTERNAL_PATH_CANARY" not in message
-    assert "".join(part.text for part in advisor_user_content_parts(arguments)) == message
+    if failure_type is not None:
+        with pytest.raises(failure_type):
+            _checkpoint_arguments(phase="end", state=state)
+    else:
+        arguments = _checkpoint_arguments(phase="end", state=state)
+        assert _diagnostic_graph(arguments)["data"]["sources"]["source"]["options"]["blob_ref"] == reference
+        assert all(part.trust is None for part in advisor_user_content_parts(arguments))
 
 
 def test_real_cross_unit_credential_redaction_preserves_exact_opaque_fallback() -> None:
@@ -632,10 +760,10 @@ def test_real_cross_unit_credential_redaction_preserves_exact_opaque_fallback() 
 def test_existing_guard_limit_preserves_or_refuses_complete_configured_prompt(extra_characters: int, expected_supported: bool) -> None:
     prompt = "Describe {{ row.field_01 }}. " + "x" * (PROMPT_GUARD_MAX_TEXT_CHARACTERS + extra_characters) + " GUARD_TAIL_CANARY"
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"prompt_template": prompt}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
-    message = build_advisor_user_message(arguments)
-    parts = advisor_user_content_parts(arguments)
-    assert prompt in message and "".join(part.text for part in parts) == message
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
+    assert _complete_values(arguments, state)[("nodes", 0, "options", "prompt_template")] == prompt
+    message = prompt
+    parts = (PromptGuardContentPart(prompt),)
     request, supported = _request(
         policy_fingerprint="synthetic-policy",
         role="advisor",
@@ -664,10 +792,13 @@ def test_redaction_never_silently_merges_authored_mapping_values(surface: str, a
             state, nodes=(replace(_node(0), plugin="field_mapper" if surface == "mapping" else "passthrough", options={surface: values}),)
         )
     if ambiguous:
-        with pytest.raises(AdvisorGraphCoverageUnavailable, match=r"redaction.*ambiguous"):
-            _owner()._build_checkpoint_arguments(phase="end", state=state)
+        with pytest.raises(ComposerContextUnsupported) as refusal:
+            _checkpoint_arguments(phase="end", state=state)
+        assert refusal.value.reason == "graph_coverage_unavailable"
+        assert refusal.value.llm_calls == ()
+        assert all(key not in json.dumps(refusal.value.to_payload()) for key in keys)
     else:
-        arguments = _owner()._build_checkpoint_arguments(phase="end", state=state)
+        arguments = _checkpoint_arguments(phase="end", state=state)
         message = build_advisor_user_message(arguments)
         assert "FIRST_MAPPING_VALUE" in message and "SECOND_MAPPING_VALUE" in message
 
@@ -682,7 +813,7 @@ def test_malformed_query_entries_and_bindings_remain_visible_for_review(shape: s
     else:
         queries = {"review": {**entry, "input_fields": "MALFORMED_QUERY_CANARY"}}
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     assert "MALFORMED_QUERY_CANARY" in message and "VALID_QUERY_CANARY" in message
     parts = advisor_user_content_parts(arguments)
@@ -692,24 +823,80 @@ def test_malformed_query_entries_and_bindings_remain_visible_for_review(shape: s
 
 @pytest.mark.parametrize("surface", ["mapping", "field_mapping", "headers", "schema-malformed", "schema-unknown"])
 def test_special_option_interpretation_retains_complete_authored_values(surface: str) -> None:
-    value = {"authored_option": ["MALFORMED_OPTION_CANARY"], "api_key": "PRIVATE_OPTION_CANARY"}
-    state = _graph()
-    if surface == "field_mapping":
-        state = replace(state, sources={"source": replace(state.sources["source"], options={surface: value})})
-    elif surface == "headers":
-        state = replace(state, outputs=(replace(state.outputs[0], options={surface: value}),))
-    elif surface.startswith("schema"):
-        schema = {"mode": "observed", **value} if surface == "schema-unknown" else value
-        state = replace(state, nodes=(replace(_node(0), options={"schema": schema}),))
-    else:
-        state = replace(state, nodes=(replace(_node(0), plugin="field_mapper", options={surface: value}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    def with_value(value):
+        original = _graph()
+        if surface == "field_mapping":
+            return replace(original, sources={"source": replace(original.sources["source"], options={surface: value})})
+        if surface == "headers":
+            return replace(original, outputs=(replace(original.outputs[0], options={surface: value}),))
+        if surface.startswith("schema"):
+            schema = {"mode": "observed", **value} if surface == "schema-unknown" else value
+            return replace(original, nodes=(replace(_node(0), options={"schema": schema}),))
+        return replace(original, nodes=(replace(_node(0), plugin="field_mapper", options={surface: value}),))
+
+    unsafe = with_value({"authored_option": ["MALFORMED_OPTION_CANARY"], "api_key": "PRIVATE_OPTION_CANARY"})
+    with pytest.raises(CredentialMaterialRefused):
+        _checkpoint_arguments(phase="end", state=unsafe, allowance=1)
+    state = with_value({"authored_option": ["MALFORMED_OPTION_CANARY"], "literal_field": "ORDINARY_OPTION_CANARY"})
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     assert "MALFORMED_OPTION_CANARY" in message
-    assert "PRIVATE_OPTION_CANARY" not in message
+    assert "ORDINARY_OPTION_CANARY" in message
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == message
     assert all(part.trust is None for part in parts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_unresolved_complete_values_never_dispatch_or_publish_a_clean_pass(invocation, monkeypatch, phase):
+    """Incomplete selected coverage refuses before dispatch or publication.
+
+    A long value is now resolved and reviewed (F1). If resolution covers less
+    than the manifest, the checkpoint raises the exact preparation refusal
+    with zero provider calls and no clean pass.
+    """
+    from elspeth.web.composer import advisor_context
+
+    engine, sessions, provider_owner, coordinator = invocation
+    context = coordinator.authority.context
+    owner = _owner(sessions=sessions)
+    state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"prompt_template": "x" * 4000 + " EXACT_TAIL"}),))
+    request = "Review the complete current graph."
+    review = await _publication_review(sessions, context, state, request)
+    resolve = advisor_context.materialize_advisor_complete_values
+
+    def drop_last_value(*args, **kwargs):
+        values = resolve(*args, **kwargs)
+        assert values, "the fixture must reference at least one complete value"
+        return values[:-1]
+
+    monkeypatch.setattr(advisor_context, "materialize_advisor_complete_values", drop_last_value)
+
+    async def forbidden_sdk(**_kwargs):
+        raise AssertionError("Incomplete complete-value coverage is not reviewed evidence")
+
+    monkeypatch.setattr(litellm, "acompletion", forbidden_sdk)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(request), pytest.raises(ComposerContextUnsupported) as refusal:
+        await owner._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            session_id=context.fence.session_id,
+            session_operation_context=context,
+            provider_owner=provider_owner,
+            recorder=recorder,
+            publication_review=review if phase == "end" else None,
+        )
+    assert refusal.value.reason == "graph_coverage_unavailable"
+    assert refusal.value.partial_state is None
+    assert refusal.value.llm_calls == () and refusal.value.tool_invocations == ()
+    assert recorder.llm_calls == ()
+    with engine.connect() as conn:
+        assert conn.execute(select(quota_provider_attempts_table)).all() == []
+        assert conn.execute(select(token_usage_ledger_table)).all() == []
+        assert all(not row.tool_calls for row in conn.execute(select(chat_messages_table)).all())
+    coordinator.assert_completed()
 
 
 def test_malformed_query_values_do_not_overwrite_authored_extra_options() -> None:
@@ -722,7 +909,7 @@ def test_malformed_query_values_do_not_overwrite_authored_extra_options() -> Non
         }
     }
     state = replace(_graph(), nodes=(replace(_node(0), plugin="llm", options={"queries": queries}),))
-    arguments = _owner(allowance=1)._build_checkpoint_arguments(phase="end", state=state)
+    arguments = _checkpoint_arguments(phase="end", state=state, allowance=1)
     message = build_advisor_user_message(arguments)
     for canary in (
         "MALFORMED_TEMPLATE_CANARY",

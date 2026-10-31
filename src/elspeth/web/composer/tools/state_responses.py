@@ -12,7 +12,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import FrozenJsonArray, freeze_fields
-from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.redaction import MAX_SOURCE_BLOB_IDS, SetPipelineArgumentsModel
 from elspeth.web.composer.response_contracts import AdmittedResponse, ResponseContract
 from elspeth.web.composer.state import EdgeSpec, EdgeType, NodeSpec, NodeType, OutputSpec, SourceSpec
 from elspeth.web.composer.tools._common import (
@@ -72,6 +72,7 @@ class FullStateResponse:
 class AuthoringSource:
     source: SourceSpec
     blob_id: str | None
+    blob_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,24 +373,34 @@ def _owned_sources(value: object) -> Mapping[str, SourceSpec]:
     return _sources(value)
 
 
-def _authoring_source(value: object, *, named: bool) -> AuthoringSource:
+def _authoring_source(value: object) -> AuthoringSource:
     if type(value) is AuthoringSource:
         _require(type(value.source) is SourceSpec)
-        _require(value.blob_id is None or not named)
         blob_id = _optional_text(value.blob_id)
         _require(blob_id is None or bool(blob_id.strip()))
-        return AuthoringSource(_source(value.source), blob_id)
+        blob_ids = value.blob_ids
+        if blob_ids is not None:
+            _require(type(blob_ids) is tuple)
+            _require(1 <= len(blob_ids) <= MAX_SOURCE_BLOB_IDS)
+            blob_ids = tuple(_text(item) for item in blob_ids)
+            _require(all(item.strip() for item in blob_ids))
+        _require(blob_id is None or blob_ids is None)
+        return AuthoringSource(_source(value.source), blob_id, blob_ids)
     wire = dict(_mapping(value))
-    blob_id = None
-    if "blob_id" in wire:
-        _require(not named)
-        blob_id = _text(wire.pop("blob_id"))
-        _require(bool(blob_id.strip()))
-    return AuthoringSource(_source(wire), blob_id)
+    blob_id = _optional_text(wire.pop("blob_id", None))
+    _require(blob_id is None or bool(blob_id.strip()))
+    raw_blob_ids = wire.pop("blob_ids", None)
+    blob_ids = None
+    if raw_blob_ids is not None:
+        blob_ids = tuple(_text(item) for item in _array(raw_blob_ids))
+        _require(1 <= len(blob_ids) <= MAX_SOURCE_BLOB_IDS)
+        _require(all(item.strip() for item in blob_ids))
+    _require(blob_id is None or blob_ids is None)
+    return AuthoringSource(_source(wire), blob_id, blob_ids)
 
 
 def _authoring_sources(value: object) -> Mapping[str, AuthoringSource]:
-    return MappingProxyType({name: _authoring_source(item, named=True) for name, item in _mapping(value).items()})
+    return MappingProxyType({name: _authoring_source(item) for name, item in _mapping(value).items()})
 
 
 def _parse(value: object) -> PipelineStateResponse:
@@ -431,7 +442,7 @@ def _parse(value: object) -> PipelineStateResponse:
             tuple(_edge(item) for item in value.edges),
             tuple(_output(item) for item in value.outputs),
             _metadata(value.metadata),
-            None if value.source is None else _authoring_source(value.source, named=False),
+            None if value.source is None else _authoring_source(value.source),
             None if value.sources is None else _authoring_sources(value.sources),
         )
         SetPipelineArgumentsModel.model_validate(_encode(result), strict=True)
@@ -459,7 +470,7 @@ def _parse(value: object) -> PipelineStateResponse:
         tuple(_edge(item) for item in _array(wire["edges"])),
         tuple(_output(item) for item in _array(wire["outputs"])),
         _metadata(wire["metadata"]),
-        _authoring_source(wire["source"], named=False) if "source" in wire else None,
+        _authoring_source(wire["source"]) if "source" in wire else None,
         _authoring_sources(wire["sources"]) if "sources" in wire else None,
     )
     SetPipelineArgumentsModel.model_validate(_encode(result), strict=True)
@@ -475,18 +486,11 @@ def parse_pipeline_state_response(value: object) -> PipelineStateResponse:
 
 def _authoring_source_wire(value: AuthoringSource) -> JsonValue:
     source = _serialize_source(value.source)
-    if value.blob_id is None:
-        return _json(source)
-    return _json(
-        {
-            "plugin": source["plugin"],
-            "on_success": source["on_success"],
-            "blob_id": value.blob_id,
-            "options": source["options"],
-            "on_validation_failure": source["on_validation_failure"],
-            "description": source["description"],
-        }
-    )
+    if value.blob_id is not None:
+        source["blob_id"] = value.blob_id
+    elif value.blob_ids is not None:
+        source["blob_ids"] = list(value.blob_ids)
+    return _json(source)
 
 
 def _encode(value: PipelineStateResponse) -> JsonValue:

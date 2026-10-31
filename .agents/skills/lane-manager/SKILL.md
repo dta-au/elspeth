@@ -6,8 +6,9 @@ description: >
   lanes landed, which are blocked, and what order to merge them in. Triggers:
   "fan out N tickets", "run these as lanes", a lane reports "done", an idle
   notification arrives for a lane, a lane has gone quiet, or a previous
-  orchestrator session died and you must resume its run from .lanes/. Harness-
-  neutral; Claude Code users also read claude-code.md in this directory.
+  dispatching session died and you must resume its run from
+  .claude/lanes/<run-id>/. Harness-neutral; Claude Code users also read
+  claude-code.md in this directory.
 ---
 
 # lane-manager — durable lanes, evidence-gated verification, serial merge
@@ -15,7 +16,7 @@ description: >
 **A lane's completion message is a claim, not a result.** The only things that
 count are on disk and in git: the lane's `status.json`, its `report.md`, the
 commits on its branch, and the exit codes `verify` measured in throwaway
-worktrees. All of it survives the orchestrator being killed.
+worktrees. All of it survives the dispatching session being killed.
 
 This file is the **harness-neutral procedure**. It assumes only that your
 harness gives you three primitives, whatever they are called:
@@ -28,8 +29,8 @@ harness gives you three primitives, whatever they are called:
 
 Everything else is the CLI `python .agents/skills/lane-manager/lane_manager.py`
 (`--help` for flags), plain Python + git, and it is the contract. Its state is
-documented JSON and markdown under `.lanes/`; any agent, script or human can
-read it, and a fresh session can resume from it.
+documented JSON and markdown under `.claude/lanes/<run-id>/`; any agent,
+script or human can read it, and a fresh session can resume from it.
 
 **Running in Claude Code?** Read `claude-code.md` next to this file — it maps
 the three primitives to concrete tools and adds harness-specific handling.
@@ -37,17 +38,20 @@ the three primitives to concrete tools and adds harness-specific handling.
 ## The durable layout
 
 ```
-.lanes/<run-id>.run.json         base ref, suite command, lane ids, merges (in order)
-.lanes/<lane-id>/plan.md         what the lane must do (rendered from the ticket)
-.lanes/<lane-id>/status.json     state + heartbeat + attempts + every verification/liveness check
-.lanes/<lane-id>/report.md       WRITTEN BY THE WORKER: one-line summary, then findings
+L=.claude/lanes/<run-id>
+$L/<run-id>.run.json         base ref, lane ids, merges (in order)
+$L/<lane-id>/plan.md         what the lane must do (rendered from the ticket)
+$L/<lane-id>/status.json     state + heartbeat + attempts + every verification/liveness check
+$L/<lane-id>/report.md       WRITTEN BY THE WORKER: one-line summary, then findings
 ```
 
 `state` is one of `pending` → `running` → `verified` → `merged`, with `failed`
 reachable from `running` (a verification that disproved the lane, or the
 ladder's block rung). Every write is an atomic replace: a kill at any instant
-leaves the old file or the new one, never a torn one. `.lanes/` is working
-state — keep it out of git.
+leaves the old file or the new one, never a torn one. `.claude/lanes/` is
+gitignored working state: notes and logs only, never source or `.db` copies
+(AGENTS.md § Subagent Reporting). The lane's work lives in commits on its
+branch.
 
 Each lane has a dedicated git worktree on branch `lane/<ticket>` (created by
 `dispatch`, reused by every re-dispatch). Worktree discipline from AGENTS.md
@@ -69,18 +73,17 @@ review) carrying the same evidence discipline — never a lower standard.
 ## Phase 1 — Init
 
 ```bash
-L=.lanes; R=<run-id>
+R=<run-id>; L=.claude/lanes/$R
 python .agents/skills/lane-manager/lane_manager.py init --lanes-dir $L --run-id $R \
-  --base-ref <branch you will merge into> --suite-command "pytest tests/" --tickets tickets.json
+  --base-ref <branch you will merge into> --tickets tickets.json
 # tickets.json: [{"ticket":"elspeth-…","title":"…","description":"…",
 #   "files":["src/…"],"test_files":["tests/…"],"test_command":"pytest tests/… -n 4 -q"}]
 ```
 
 `files` is the *expected artifact* — read the ticket and name the files a
 correct fix must touch. `test_files` are where the lane's failing test must
-land. `test_command` is what `verify` runs RED then GREEN; `--suite-command`
-is the full suite it runs on the merged tree. None of these are the lane's to
-choose.
+land. `test_command` is what `verify` runs RED then GREEN. None of these are
+the lane's to choose.
 
 ## Phase 2 — Dispatch
 
@@ -93,7 +96,7 @@ python .agents/skills/lane-manager/lane_manager.py brief    --lanes-dir $L --lan
 **spawn** the worker with the brief exactly as printed: it names the worktree
 CWD, the branch, the files, the test files, the test command, the heartbeat
 command to run before each step, and the delivery channel — **write findings
-to `.lanes/<lane-id>/report.md` and return exactly one line.** A chat message
+to `$L/<lane-id>/report.md` and return exactly one line.** A chat message
 can be truncated; the file cannot. Never read a lane's result from its
 message; read `report.md` (the `report` command surfaces each summary line).
 
@@ -108,9 +111,11 @@ python .agents/skills/lane-manager/lane_manager.py verify --lanes-dir $L --lane 
 ```
 
 `verify` never runs in the lane's working directory. It reads git evidence
-(branch exists, commits ahead of base, expected files AND test files in the
-diff), then in throwaway worktrees it proves the lane went **red → green**
-with the **full suite** passing:
+(branch exists, **commits ahead of base**, expected files AND test files in
+the diff), then in throwaway worktrees it proves the lane went
+**red → green**. It does not run the full suite per lane (that cost 32 min a
+lane, serially); run the full-suite gate once on the final merged tree
+(Phase 6).
 
 1. **RED** — base commit + only the lane's test files: the test command must
    FAIL AT AN ASSERTION, as recorded by the RUNNER. `verify` launches pytest
@@ -133,9 +138,8 @@ with the **full suite** passing:
    way the lane is `failed` and nothing further is credited.
 2. **GREEN** — base merged with the branch (`--no-commit`): the test command
    must exit 0. A conflict here is a failure with the conflict recorded.
-3. **SUITE** — the same merged tree: the suite command must exit 0.
 
-Only all three advance the lane to `verified`; the verification records the
+Only both advance the lane to `verified`; the verification records the
 base SHA and branch SHA it measured, and that binding is what the merge gate
 checks. Exit 1 means `failed`; the JSON `reasons` say why. A lane that says
 "done" and verifies to exit 1 has lied or misunderstood — escalate (Phase 5).
@@ -164,8 +168,8 @@ with `--redispatch` records a resumed attempt for the killed lanes only and
 prints their briefs — **spawn** one worker per brief and nothing else. Alive
 lanes keep running, pending lanes go through Phase 2 normally, verified/
 failed/merged lanes are left alone. Pass `--listed` with the names your
-**list-live** call returned in this same step; after an orchestrator crash
-that is usually nothing, which is fine — the heartbeat and worktree signals
+**list-live** call returned in this same step; after the dispatching session
+crashed that is usually nothing, which is fine — the heartbeat and worktree signals
 still decide. A resumed worker finds its branch, worktree and partial edits
 exactly where the killed one left them.
 
@@ -177,7 +181,7 @@ python .agents/skills/lane-manager/lane_manager.py escalate --lanes-dir $L --lan
 
 | Rung | Printed action | You do |
 |------|----------------|--------|
-| 1 | `nudge` | **message** the lane: name the missing evidence (branch, test files, red/green/suite exit codes), ask for the fix on the same branch. Wait for its next message, then `verify` again. |
+| 1 | `nudge` | **message** the lane: name the missing evidence (branch, commits ahead, test files, red/green exit codes), ask for the fix on the same branch. Wait for its next message, then `verify` again. |
 | 2 | `redispatch` | `dispatch` again and **spawn** a fresh worker on the same branch/worktree with the brief plus the verification `reasons`; `verify` again. |
 | 3 | `block` | Lane is `failed` with the ladder and every check recorded. **Continue with the remaining lanes.** |
 
@@ -186,7 +190,7 @@ Each rung fires once. The ladder cannot be reset by a persuasive message.
 ## Phase 6 — Merge serially, gated
 
 ```bash
-python .agents/skills/lane-manager/lane_manager.py report --lanes-dir $L --run-id $R --out .lanes/$R.report.md
+python .agents/skills/lane-manager/lane_manager.py report --lanes-dir $L --run-id $R --out $L/$R.report.md
 python .agents/skills/lane-manager/lane_manager.py merge  --lanes-dir $L --lane <lane-id>   # exit 0 = merged
 ```
 
@@ -195,9 +199,11 @@ checked out, but only through the gate: the lane is `verified`, and the base
 and branch SHAs are the ones its verification measured. After a merge the base
 has moved, so the next lane's verification is stale by construction: `verify`
 it again (against the tree that now contains the previous lane), then `merge`.
-That loop — verify, merge, verify, merge — is the serial gate; the suite ran
-on exactly the tree each merge produces, so there is nothing left to run
-after it. Take the order from the report (disjoint file sets first).
+That loop — verify, merge, verify, merge — is the serial gate. After the last
+merge, run the full suite once on the merged tree with
+`scripts/full-suite-gate.sh --execute --detach` and explicit `--stages`, plus
+the testcontainer stage when any lane touched schema, SQL or locks. Take the
+order from the report (disjoint file sets first).
 
 ## Rationalizations that lose runs
 

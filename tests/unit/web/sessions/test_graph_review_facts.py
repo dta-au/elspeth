@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.advisor_audit import (
@@ -38,6 +39,7 @@ from elspeth.web.sessions.models import chat_messages_table, composition_states_
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes._helpers import _composer_conversation_tool_or_llm_audit_messages
 from elspeth.web.sessions.schemas import SendMessageRequest
+from tests.helpers.content_publication import split_content_publication
 from tests.unit.web.coordination.test_composer_operation_authority import response, start
 
 pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
@@ -845,7 +847,9 @@ async def test_selected_recovery_retains_only_negative_effective_review(operatio
     assert terminal.status == "completed"
     restored = await store[3].get_current_state(store[4])
     assert restored.id == recovery.state_id and restored.review_projection is None and not restored.is_valid
-    assert restored.composer_meta == recovery.data.composer_meta
+    publication, preserved = split_content_publication(restored)
+    assert preserved == (dict(deep_thaw(recovery.data.composer_meta)) if recovery.data.composer_meta is not None else {})
+    assert publication.state_id == restored.id
     assert len(facts(store)) == (1 if prior is not None else 0), "recovery does not copy private authoritative facts"
 
 

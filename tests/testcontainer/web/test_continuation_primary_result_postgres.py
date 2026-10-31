@@ -1,0 +1,41 @@
+"""The same original primary result publication and fresh-claim reads on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target, operation_store
+from tests.unit.web.sessions.test_continuation_primary_result import (
+    test_actual_prepared_input_refuses_coherently_rehashed_foreign_wire_after_positive,
+    test_actual_primary_input_descriptor_preserves_existing_hash_and_transport_exclusions,
+    test_committed_primary_survives_real_release_recovery_new_claim_and_never_reenters_sdk,
+    test_failed_or_cancelled_primary_remains_unresolved_and_cannot_retry,
+    test_next_actual_primary_extends_real_applied_p4_history_and_cold_current_graph,
+    test_owned_primary_utf8_failure_keeps_original_cause_after_real_positive,
+    test_prepared_primary_intent_cannot_dispatch_twice_or_escape_its_actual_owner,
+    test_primary_cold_read_binds_complete_supplied_selection_after_real_positive,
+    test_primary_current_reader_refuses_one_corrupted_source_after_actual_positive,
+    test_primary_input_refuses_changed_selected_message_after_actual_complete_positive,
+    test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive,
+    test_primary_publication_preserves_recorder_prefix_and_rolls_back_all_result_bytes,
+    test_primary_publishes_actual_original_response_audit_ledger_and_complete_recorder_once,
+    test_primary_structural_premise_refuses_result_on_real_unresolved_intent,
+)
+
+pytestmark = pytest.mark.testcontainer
+
+__all__ = [
+    "operation_postgres_target",
+    "operation_store",
+    "test_actual_prepared_input_refuses_coherently_rehashed_foreign_wire_after_positive",
+    "test_actual_primary_input_descriptor_preserves_existing_hash_and_transport_exclusions",
+    "test_committed_primary_survives_real_release_recovery_new_claim_and_never_reenters_sdk",
+    "test_failed_or_cancelled_primary_remains_unresolved_and_cannot_retry",
+    "test_next_actual_primary_extends_real_applied_p4_history_and_cold_current_graph",
+    "test_owned_primary_utf8_failure_keeps_original_cause_after_real_positive",
+    "test_prepared_primary_intent_cannot_dispatch_twice_or_escape_its_actual_owner",
+    "test_primary_cold_read_binds_complete_supplied_selection_after_real_positive",
+    "test_primary_current_reader_refuses_one_corrupted_source_after_actual_positive",
+    "test_primary_input_refuses_changed_selected_message_after_actual_complete_positive",
+    "test_primary_physical_input_mismatch_refuses_before_sdk_after_actual_preparation_positive",
+    "test_primary_publication_preserves_recorder_prefix_and_rolls_back_all_result_bytes",
+    "test_primary_publishes_actual_original_response_audit_ledger_and_complete_recorder_once",
+    "test_primary_structural_premise_refuses_result_on_real_unresolved_intent",
+]

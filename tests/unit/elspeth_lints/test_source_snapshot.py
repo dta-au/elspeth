@@ -180,7 +180,9 @@ def test_capture_source_snapshot_supports_linked_worktree_metadata(tmp_path: Pat
 
 def test_capture_source_snapshot_wraps_input_read_oserror(tmp_path: Path) -> None:
     _repo_path, source_root, allowlist_dir = _repo(tmp_path)
-    original = Path.read_bytes
+    from elspeth_lints.core.trusted_git import read_regular_file
+
+    original = read_regular_file
 
     def fail_widget(path: Path) -> bytes:
         if path.name == "widget.py":
@@ -188,7 +190,7 @@ def test_capture_source_snapshot_wraps_input_read_oserror(tmp_path: Path) -> Non
         return original(path)
 
     with (
-        patch.object(Path, "read_bytes", fail_widget),
+        patch("elspeth_lints.core.source_snapshot.read_regular_file", fail_widget),
         pytest.raises(SourceSnapshotError, match=r"cannot read scanner input.*widget.py"),
     ):
         capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
@@ -198,7 +200,7 @@ def test_capture_source_snapshot_wraps_git_launch_oserror(tmp_path: Path) -> Non
     _repo_path, source_root, allowlist_dir = _repo(tmp_path)
 
     with (
-        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        patch("elspeth_lints.core.trusted_git.subprocess.Popen", side_effect=OSError("git unavailable")),
         pytest.raises(SourceSnapshotError, match="cannot execute Git"),
     ):
         capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
@@ -249,3 +251,166 @@ def test_capture_source_snapshot_rejects_roots_in_different_repositories(tmp_pat
 
     with pytest.raises(SourceSnapshotError, match="same Git repository"):
         capture_source_snapshot(source_root=source_root, allowlist_dir=other_allowlist)
+
+
+def test_capture_source_snapshot_does_not_use_candidate_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    expected = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "executed"
+    fake_git = bin_dir / "git"
+    fake_git.write_text(f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 1\n", encoding="utf-8")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir) == expected
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("callback", ("core.fsmonitor", "filter.hostile.clean", "filter.hostile.process"))
+def test_capture_source_snapshot_never_runs_repository_callbacks(tmp_path: Path, callback: str) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    marker = tmp_path / "callback-executed"
+    callback_script = tmp_path / "callback"
+    callback_script.write_text(f"#!/bin/sh\nprintf attacked > '{marker}'\nexit 1\n", encoding="utf-8")
+    callback_script.chmod(0o755)
+    _git(repo, "config", callback, str(callback_script))
+    if callback.startswith("filter."):
+        (repo / ".gitattributes").write_text("*.py filter=hostile\n", encoding="utf-8")
+    (source_root / "widget.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    if callback.startswith("filter."):
+        with pytest.raises(SourceSnapshotError, match="attributes"):
+            capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+    else:
+        assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir).source_dirty
+    assert not marker.exists()
+
+
+def test_capture_source_snapshot_refuses_config_includes_without_opening_target(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    include = tmp_path / "private-config"
+    _git(repo, "config", "include.path", str(include))
+
+    with pytest.raises(SourceSnapshotError, match="includes"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+@pytest.mark.parametrize("change", ("staged", "deleted", "staged-deleted", "mode", "non-python", "utf8"))
+def test_capture_source_snapshot_observes_whole_tracked_source(tmp_path: Path, change: str) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    if change in {"non-python", "utf8"}:
+        target = source_root / ("résumé.txt" if change == "utf8" else "schema.json")
+        target.write_bytes(b"initial\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "track auxiliary source")
+        target.write_bytes(b"changed\n")
+    elif change == "mode":
+        (source_root / "widget.py").chmod(0o755)
+    elif change in {"deleted", "staged-deleted"}:
+        (source_root / "widget.py").unlink()
+        if change == "staged-deleted":
+            _git(repo, "add", "-u")
+    else:
+        (source_root / "widget.py").write_text("VALUE = 2\n", encoding="utf-8")
+        _git(repo, "add", ".")
+
+    assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir).source_dirty
+
+
+def test_capture_source_snapshot_preserves_net_head_dirty_semantics(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    widget = source_root / "widget.py"
+    original = widget.read_bytes()
+    widget.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    widget.write_bytes(original)
+
+    assert subprocess.run(["/usr/bin/git", "-C", str(repo), "diff", "--quiet", "HEAD"], check=False).returncode == 0
+    assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir).source_dirty is False
+
+
+def test_capture_source_snapshot_children_get_only_closed_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    monkeypatch.setenv("OBSERVER_SYNTHETIC_SECRET", "synthetic-test-value")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "candidate-imports"))
+    original_popen = subprocess.Popen
+    with patch("subprocess.Popen", wraps=original_popen) as run:
+        assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir).source_dirty is False
+
+    assert run.call_args_list
+    for call in run.call_args_list:
+        assert call.args[0][0] == "/usr/bin/git"
+        child_env = call.kwargs["env"]
+        assert "OBSERVER_SYNTHETIC_SECRET" not in child_env
+        assert "PYTHONPATH" not in child_env
+        assert "PATH" in child_env
+        assert call.kwargs["close_fds"] is True
+
+
+@pytest.mark.parametrize("attribute", ("text", "eol=crlf", "ident", "working-tree-encoding=UTF-16"))
+def test_capture_source_snapshot_refuses_byte_transform_attributes(tmp_path: Path, attribute: str) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    (repo / ".gitattributes").write_text(f"*.py {attribute}\n", encoding="utf-8")
+
+    with pytest.raises(SourceSnapshotError, match="attributes"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_staged_delete_with_untracked_replacement_is_dirty(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    widget = source_root / "widget.py"
+    original = widget.read_bytes()
+    widget.unlink()
+    _git(repo, "add", "-u")
+    widget.write_bytes(original)
+
+    with pytest.raises(SourceSnapshotError, match="tracked Git path"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+@pytest.mark.parametrize("flag", ("--skip-worktree", "--assume-unchanged"))
+def test_capture_source_snapshot_refuses_index_flags_that_hide_source_changes(tmp_path: Path, flag: str) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    _git(repo, "update-index", flag, "src/elspeth/widget.py")
+    (source_root / "widget.py").write_text("VALUE = 99\n", encoding="utf-8")
+
+    with pytest.raises(SourceSnapshotError, match="index"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_refuses_object_alternates(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    (repo / ".git" / "objects" / "info" / "alternates").write_text(str(tmp_path / "private-objects") + "\n", encoding="utf-8")
+
+    with pytest.raises(SourceSnapshotError, match="alternates"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_refuses_configured_newline_transforms(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    _git(repo, "config", "core.autocrlf", "true")
+
+    with pytest.raises(SourceSnapshotError, match="autocrlf"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_refuses_intent_to_add(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    (source_root / "pending.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _git(repo, "add", "--intent-to-add", "src/elspeth/pending.py")
+
+    with pytest.raises(SourceSnapshotError, match="intent-to-add"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+@pytest.mark.parametrize("suffix", ("py", "txt"))
+def test_capture_source_snapshot_staged_addition_removed_again_is_net_clean(tmp_path: Path, suffix: str) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    pending = source_root / f"pending.{suffix}"
+    pending.write_text("VALUE = 2\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    pending.unlink()
+
+    assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir).source_dirty is False

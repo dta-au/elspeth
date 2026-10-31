@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 import httpx
 import litellm
@@ -15,9 +16,11 @@ import pytest
 from pydantic import SecretStr
 
 from elspeth.contracts import prompt_guard as guard_contracts
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import prompt_guard
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.prompts import build_context_string, build_messages, build_run_diagnostics_messages
@@ -30,6 +33,14 @@ from elspeth.web.prompt_guard_config import PromptGuardSettings
 from tests.unit.web.composer.test_prompt_guard_wiring import _guarded_service
 
 pytest_plugins = ("tests.unit.web.composer.test_prompt_guard_wiring",)
+
+
+def _display_view(excerpt: str) -> dict:
+    """Parse the bounded display document; U-22's complete-review section may follow it."""
+    view, end = json.JSONDecoder().raw_decode(excerpt, excerpt.index("\n") + 1)
+    assert excerpt[end:] == "" or excerpt[end:].startswith("\nComplete values behind each complete_value_ref above")
+    return view
+
 
 _USER = "Preserve the neutral record fields."
 
@@ -67,6 +78,49 @@ def _empty():
     return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
 
+def _current_scope(invocation, state):
+    context = invocation[2].required_work.coordinator.authority.context
+    return ComposerContentScope(UUID(context.fence.session_id), composition_content_hash(state))
+
+
+def _selected_complete_value_message(invocation, state, path):
+    """Read one explicitly selected current value through its real tool owner."""
+    from elspeth.web.composer.discovery_cache import tool_result_content_parts
+    from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
+    from elspeth.web.composer.prompts import build_composition_content_view
+    from elspeth.web.composer.tools import execute_tool
+
+    _engine, sessions, owner, _coordinator = invocation
+    context = owner.required_work.coordinator.authority.context
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    view = build_composition_content_view(state, content_scope=_current_scope(invocation, state))
+    selected = next(reference for reference in view.manifest.values if reference.path == path)
+    result = execute_tool(
+        "get_complete_pipeline_value",
+        {"reference_id": selected.reference_id},
+        state,
+        policy,
+        plugin_snapshot=snapshot,
+        session_id=context.fence.session_id,
+        user_id="alice",
+        session_operation_context=context,
+        session_operation_authority=sessions.session_operation_authority,
+        validate_arguments=True,
+    )
+    assert result.success
+    admitted = admit_discovery_result("get_complete_pipeline_value", result)
+    serialized = serialize_admitted_discovery_result(admitted)
+    assert json.loads(serialized)["data"]["reference_id"] == selected.reference_id
+    return {
+        "role": "tool",
+        "tool_call_id": "selected-complete-value",
+        "content": serialized,
+        guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(admitted, serialized),
+    }
+
+
 async def _inspect(azure, messages, *, user=_USER, role="composer"):
     client, sent = azure
     evidence = guard_contracts.detach_prompt_guard_evidence(messages)
@@ -89,8 +143,9 @@ async def test_compose_loaded_llm_schema_preserves_wire_and_graph_omission_evide
     policy, snapshot = catalog
     state = _empty()
     loaded = frozenset({("transform", "llm")})
-    original = build_context_string(state, policy, plugin_snapshot=snapshot, schemas_loaded=loaded)
-    messages = build_messages([], state, _USER, policy, plugin_snapshot=snapshot, schemas_loaded=loaded)
+    scope = ComposerContentScope(UUID(int=1), composition_content_hash(state))
+    original = build_context_string(state, policy, plugin_snapshot=snapshot, schemas_loaded=loaded, content_scope=scope)
+    messages = build_messages([], state, _USER, policy, plugin_snapshot=snapshot, schemas_loaded=loaded, content_scope=scope)
     assert messages[-2]["content"] == original
     decision, request, evidence, sent = await _inspect(azure, messages)
     assert decision.disposition == "allow"
@@ -106,8 +161,6 @@ async def test_compose_loaded_llm_schema_preserves_wire_and_graph_omission_evide
 async def test_patched_large_scalar_survives_storage_and_short_followup_without_wire_changes(
     invocation, monkeypatch, tmp_path, catalog, azure, mode, configured
 ):
-    from uuid import UUID
-
     from elspeth.web.composer import provider_gateway
     from elspeth.web.composer.provider_quota import ProviderInvocationFamily
     from elspeth.web.composer.tools._common import ToolContext
@@ -163,11 +216,45 @@ async def test_patched_large_scalar_survives_storage_and_short_followup_without_
     restored = _state_from_record(reloaded)
     assert restored.nodes[0].options["operations"][0]["expression"] == expression
     followup = "Keep the saved draft."
-    messages = build_messages([], restored, followup, policy, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    messages = build_messages(
+        [],
+        restored,
+        followup,
+        policy,
+        plugin_snapshot=snapshot,
+        schemas_loaded=frozenset(),
+        content_scope=ComposerContentScope(UUID(context.fence.session_id), composition_content_hash(restored)),
+    )
     evidence = guard_contracts.detach_prompt_guard_evidence(messages)
     graph_parts = evidence.content_parts[-2]
     assert graph_parts is not None and "".join(part.text for part in graph_parts) == messages[-2]["content"]
-    scalar_parts = [part for part in graph_parts if part.inspection_text == expression]
+    view = _display_view(messages[-2]["content"])["current_state"]
+    assert expression not in messages[-2]["content"]
+    assert [reference["path"] for reference in view["content_manifest"]["values"]] == [
+        ["nodes", 0, "options", "operations", 0, "expression"]
+    ]
+    selected = _selected_complete_value_message(invocation, restored, ("nodes", 0, "options", "operations", 0, "expression"))
+    assert json.loads(selected["content"])["data"]["value"] == expression
+    messages.insert(
+        -1,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": selected["tool_call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": "get_complete_pipeline_value",
+                        "arguments": json.dumps({"reference_id": json.loads(selected["content"])["data"]["reference_id"]}),
+                    },
+                }
+            ],
+        },
+    )
+    messages.insert(-1, selected)
+    evidence = guard_contracts.detach_prompt_guard_evidence(messages)
+    scalar_parts = [part for part in selected[guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY] if part.inspection_text == expression]
     assert len(scalar_parts) == 1 and scalar_parts[0].trust is None
     client, sent = azure
     monkeypatch.setattr(provider_gateway, "build_prompt_guard_mount", lambda _settings: PromptGuardMount(client) if configured else None)
@@ -283,31 +370,9 @@ async def test_default_fifty_token_diagnostics_preserve_all_pretty_wire_evidence
 
 
 @pytest.mark.asyncio
-async def test_real_planner_discovery_keeps_registered_contract_on_sdk_wire(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    client, sent = azure
-    completion = _ScriptedCompletion(
-        _response(("get_plugin_schema", {"plugin_type": "transform", "name": "llm"})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 2
-    tools = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert "json_schema" in tools[0]["content"]
-    assert "json_schema" not in "\n".join(document for body in sent for document in body["documents"])
-    assert all(guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY not in message for message in completion.requests[1]["messages"])
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("checkpoint", [False, True], ids=["manual", "end-twelve-nodes"])
 async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch, azure, checkpoint):
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -333,7 +398,9 @@ async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch
                     merge=None,
                 )
             )
-        arguments = advisor._build_checkpoint_arguments(phase="end", state=state, user_message=_USER)
+        arguments = advisor._build_checkpoint_arguments(
+            phase="end", state=state, content_scope=_current_scope(invocation, state), user_message=_USER
+        )
     else:
         arguments = {
             "trigger": "proactive_security_safety",
@@ -358,7 +425,7 @@ async def test_real_advisor_uses_lossless_producer_parts(invocation, monkeypatch
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
-@pytest.mark.parametrize("shape", ["queries", "required_fields", "interpolated_fields"])
+@pytest.mark.parametrize("shape", ["queries", "required_fields", "required_fields_supported", "interpolated_fields"])
 async def test_real_advisor_inspects_individual_evidence_values_without_changing_summary(invocation, monkeypatch, azure, phase, shape):
     from elspeth.plugins.transforms.llm.base import LLMConfig
     from elspeth.web.composer.advisor_context import (
@@ -366,7 +433,7 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
         build_advisor_user_message,
         summarize_pipeline_for_advisor,
     )
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     def template(label):
         prefix = f"{label}: inspect {{{{ row.record }}}}. "
@@ -380,11 +447,11 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
         "system_prompt": "Inspect neutral records. " + "s" * (1000 - len("Inspect neutral records. ")),
         "queries": {f"q{index}": {"input_fields": {"record": "record"}, "template": template(f"Question {index}")} for index in range(8)},
     }
-    if shape == "required_fields":
+    if shape in {"required_fields", "required_fields_supported"}:
         options = {
             "provider": "azure",
             "schema": {"mode": "observed"},
-            "required_input_fields": [f"f{index:04}" for index in range(1500)],
+            "required_input_fields": [f"f{index:04}" for index in range(1500 if shape == "required_fields" else 500)],
             "prompt_template": "Inspect {{ row }}.",
             "system_prompt": "Inspect the declared neutral fields.",
         }
@@ -432,9 +499,37 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
     advisor = service._advisor_checkpoint
     summary = summarize_pipeline_for_advisor(state)
-    assert len(summary) > 10_000
-    arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
-    assert arguments["schema_excerpt"] == summary
+    if shape != "required_fields_supported":
+        assert len(summary) > 10_000
+    if shape == "required_fields":
+        from elspeth.web.credential_guard import CredentialMaterialRefused
+
+        before = state.to_dict()
+        with pytest.raises(CredentialMaterialRefused) as refused:
+            advisor._build_checkpoint_arguments(
+                phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
+            )
+        assert refused.value.finding.category == "traversal_limit"
+        assert state.to_dict() == before and len(before["nodes"][0]["options"]["required_input_fields"]) == 1500
+        assert sent == []
+        return
+    arguments = advisor._build_checkpoint_arguments(
+        phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
+    )
+    displayed = _display_view(arguments["schema_excerpt"])
+    assert displayed["data"]["nodes"][0]["options"]["required_input_fields"] == options["required_input_fields"]
+    if shape == "interpolated_fields":
+        # U-22 F1: the summary itself resolves both long query templates with
+        # exact coverage; no transcript workaround is needed to inspect them.
+        summary = arguments["_elspeth_advisor_summary_parts"]
+        assert [value.reference.path for value in summary.complete_values] == [
+            ("nodes", 0, "options", "queries", "q0", "template"),
+            ("nodes", 0, "options", "queries", "q1", "template"),
+        ]
+        advisor._require_complete_graph_summary(summary)
+    else:
+        assert displayed["content_manifest"]["values"] == []
+        assert displayed["data"]["nodes"][0]["options"] == state.to_dict()["nodes"][0]["options"]
     original = build_advisor_user_message(arguments)
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == original
@@ -450,14 +545,14 @@ async def test_real_advisor_inspects_individual_evidence_values_without_changing
     documents = [document for body in sent for document in body["documents"]]
     assert all(len(document) <= guard_contracts.PROMPT_GUARD_MAX_TEXT_CHARACTERS for document in documents)
     inspected = "\n".join(documents)
-    assert f'"{options["system_prompt"]}"' in inspected
-    assert f'"{options["prompt_template"]}"' in inspected
+    assert options["system_prompt"] in inspected
+    assert options["prompt_template"] in inspected
     if "queries" in options:
-        assert all(f'"{query["template"]}"' in inspected for query in options["queries"].values())
+        assert all(query["template"] in inspected for query in options["queries"].values())
         if shape == "interpolated_fields":
             assert all(field in inspected for field in interpolated_fields)
     else:
-        assert all(f"f{index:04}" in inspected for index in range(1500))
+        assert all(field in inspected for field in options["required_input_fields"])
 
 
 def _advisor_projection_state(options):
@@ -489,9 +584,8 @@ async def test_real_advisor_inspects_decoded_prompt_words_on_unchanged_wire(invo
         ADVISOR_CHARS_PER_TOKEN,
         advisor_user_content_parts,
         build_advisor_user_message,
-        summarize_pipeline_for_advisor,
     )
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     # The literal escape must stay literal; the neighboring Unicode words
     # must reach inspection decoded, including quotes and a genuine newline.
@@ -518,22 +612,23 @@ async def test_real_advisor_inspects_decoded_prompt_words_on_unchanged_wire(invo
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
     advisor = service._advisor_checkpoint
-    arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
-    assert arguments["schema_excerpt"] == summarize_pipeline_for_advisor(state)
+    arguments = advisor._build_checkpoint_arguments(
+        phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
+    )
+    displayed = _display_view(arguments["schema_excerpt"])
+    assert displayed["data"]["nodes"][0]["options"] == state.to_dict()["nodes"][0]["options"]
+    assert displayed["content_manifest"]["values"] == []
     original = build_advisor_user_message(arguments)
     parts = advisor_user_content_parts(arguments)
     assert "".join(part.text for part in parts) == original
     assert all(part.trust is None for part in parts)
     cap = service._settings.composer_advisor_max_prompt_tokens * ADVISOR_CHARS_PER_TOKEN
     assert len(arguments["schema_excerpt"]) < cap
-    for key, value in (("prompt_template", fallback), ("system_prompt", system), ("queries.question.template", query)):
-        encoded = f"{key}_untrusted_json={json.dumps(value)}"
-        matching = [part for part in parts if encoded in part.text]
-        assert len(matching) == 1
-        assert matching[0].inspection_text is not None
-        assert f'{key}_untrusted_json="{value}"' in matching[0].inspection_text
+    decoded_parts = "\n".join(part.inspection_text if part.inspection_text is not None else part.text for part in parts)
+    for value in (fallback, system, query):
+        assert value in decoded_parts
     if kind == "emoji-expansion":
-        assert any(len(part.text) > 10_000 and len(part.inspection_text) < 10_000 for part in parts if part.inspection_text is not None)
+        assert len(json.dumps(query)) > 10_000 and query in original
     completion = _ScriptedCompletion(_text_response("Inspect the declared neutral record fields."))
     monkeypatch.setattr(litellm, "acompletion", completion)
     with prompt_guard_user_scope(_USER):
@@ -652,15 +747,44 @@ def test_advisor_summary_carrier_refuses_trusted_units():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(invocation, monkeypatch, azure, phase):
-    from elspeth.web.composer.advisor_context import build_advisor_user_message, summarize_pipeline_for_advisor
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from elspeth.web.composer.advisor_context import build_advisor_user_message
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     state = _empty().with_metadata({"description": "x" * 10_001})
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
     advisor = service._advisor_checkpoint
-    arguments = advisor._build_checkpoint_arguments(phase=phase, state=state, user_message=_USER)
-    assert arguments["schema_excerpt"] == summarize_pipeline_for_advisor(state)
+    arguments = advisor._build_checkpoint_arguments(
+        phase=phase, state=state, content_scope=_current_scope(invocation, state), user_message=_USER
+    )
+    displayed = _display_view(arguments["schema_excerpt"])
+    assert [reference["path"] for reference in displayed["content_manifest"]["values"]] == [["metadata", "description"]]
+    # U-22 F1: the complete value is now in the review request as ONE
+    # indivisible unit. Beyond the 10,000-character inspection limit the final
+    # guard refuses it (unsupported, HTTP 422) before any SDK call; it is never
+    # sliced to fit, and resolution is no inspection permission.
+    assert "x" * 10_001 in arguments["schema_excerpt"]
+    owner = invocation[2]
+    context = owner.required_work.coordinator.authority.context
+    no_sdk = _ScriptedCompletion(_text_response("This response must never be requested."))
+    monkeypatch.setattr(litellm, "acompletion", no_sdk)
+    with prompt_guard_user_scope(_USER), pytest.raises(prompt_guard.PromptGuardRefused) as checkpoint_refused:
+        await advisor._run_advisor_checkpoint(
+            phase=phase,
+            state=state,
+            session_id=context.fence.session_id,
+            session_operation_context=context,
+            provider_owner=owner,
+            recorder=BufferingRecorder(),
+        )
+    assert checkpoint_refused.value.http_status == 422 and checkpoint_refused.value.disposition == "unavailable"
+    assert sent == [] and no_sdk.requests == []
+    selected = _selected_complete_value_message(invocation, state, ("metadata", "description"))
+    complete_value = json.loads(selected["content"])["data"]["value"]
+    assert complete_value == state.metadata.description
+    # Selection does not approve graph coverage. Passing the actual complete
+    # scalar as ordinary untrusted context still requires final inspection.
+    arguments["problem_summary"] += "\nSelected complete value:\n" + complete_value
     assert "x" * 10_001 in build_advisor_user_message(arguments)
     completion = _ScriptedCompletion(_text_response("This response must never be requested."))
     monkeypatch.setattr(litellm, "acompletion", completion)
@@ -679,7 +803,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     from elspeth.web.composer import provider_gateway
     from elspeth.web.sessions.models import chat_messages_table
     from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _make_settings
-    from tests.unit.web.composer.test_pipeline_planner import _response, _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _response, _ScriptedCompletion, _text_response
 
     policy, snapshot = catalog
     client, sent = azure
@@ -701,6 +825,12 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
     )
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
+    from uuid import UUID, uuid4
+
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(context.fence.session_id))
+    mutation_ceiling = ComposerMutationCeiling(context.fence.session_id, str(uuid4()), preferences.trust_mode)
     with (
         prompt_guard_user_scope(_USER),
         patch.object(provider_gateway, "enforce_prompt_guard", autospec=True, side_effect=provider_gateway.enforce_prompt_guard) as checks,
@@ -714,6 +844,7 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
             deadline=asyncio.get_running_loop().time() + 30.0,
             plugin_snapshot=snapshot,
             policy_catalog=policy,
+            mutation_ceiling=mutation_ceiling,
             session_operation_context=context,
             required_work=owner.required_work,
             provider_owner=owner,
@@ -773,44 +904,9 @@ async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invo
 
 
 @pytest.mark.asyncio
-async def test_real_planner_repair_keeps_contract_and_authored_detail_separate(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    client, sent = azure
-    invalid = _pipeline(tmp_path)
-    invalid["nodes"] = [
-        {
-            "id": "review",
-            "node_type": "transform",
-            "plugin": "llm",
-            "input": "rows",
-            "on_success": "output",
-            "on_error": "discard",
-            "options": {"unexpected_option": "authored_detail_canary"},
-        }
-    ]
-    completion = _ScriptedCompletion(
-        _response(("emit_pipeline_proposal", {"pipeline": invalid})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 2
-    wire = completion.requests[1]["messages"]
-    assert "plugin_contracts" in "\n".join(message["content"] for message in wire if message["role"] == "tool")
-    inspected = "\n".join(document for body in sent for document in body["documents"])
-    assert "authored_detail_canary" in inspected
-    assert "json_schema" not in inspected
-
-
-@pytest.mark.asyncio
 async def test_real_end_publication_review_survives_actual_format_retry(invocation, monkeypatch, azure):
     from elspeth.web.composer.turn_effects import TurnEvidence
-    from tests.unit.web.composer.test_pipeline_planner import _ScriptedCompletion, _text_response
+    from tests.unit.web.composer._scripted_sdk import _ScriptedCompletion, _text_response
 
     client, sent = azure
     service = _guarded_service(invocation, monkeypatch, advisor_client=client)
@@ -873,11 +969,16 @@ async def test_real_end_publication_review_survives_actual_format_retry(invocati
 
 
 @pytest.mark.asyncio
-async def test_actual_planner_assistant_argument_producer_keeps_complete_large_graph(tmp_path, azure):
+async def test_actual_common_assistant_argument_producer_keeps_complete_large_graph(tmp_path, azure):
+    from jsonschema import Draft202012Validator
+
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
-    from elspeth.web.composer.pipeline_planner import _assistant_tool_calls_message, _parse_response_tool_calls
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+    from elspeth.web.composer.tool_batch import _retain_llm_tool_argument_parts
     from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _response
+    from elspeth.web.composer.tools.wire_projection import decode_wire_arguments
+    from tests.unit.web.composer._scripted_sdk import _pipeline
 
     pipeline = _pipeline(tmp_path)
     pipeline["nodes"] = [
@@ -894,12 +995,26 @@ async def test_actual_planner_assistant_argument_producer_keeps_complete_large_g
         for i in range(12)
     ]
     require_schema_valid_arguments("set_pipeline", pipeline)
-    response = _response(("emit_pipeline_proposal", {"pipeline": pipeline}))
-    message, calls = _parse_response_tool_calls(
-        response, max_tool_calls=1, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset({"emit_pipeline_proposal"})
+    original = json.dumps({"pipeline": pipeline})
+    wire_schema = next(
+        tool["function"]["parameters"]
+        for tool in composer_loop_tool_definitions(ToolContractDialect.NONE)
+        if tool["function"]["name"] == "set_pipeline"
     )
-    produced = _assistant_tool_calls_message(message, calls)
-    original = calls[0].raw_arguments
+    validator = Draft202012Validator(wire_schema)
+    wire_arguments = json.loads(original)
+    validator.validate(wire_arguments)
+    assert not validator.is_valid(pipeline), "the wire requires its pipeline envelope"
+    decoded = decode_wire_arguments("set_pipeline", ToolContractDialect.NONE, wire_arguments)
+    assert decoded.wire_conformant is True
+    assert deep_thaw(decoded.semantic) == pipeline
+    produced = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "set_pipeline", "arguments": original}}],
+    }
+    _retain_llm_tool_argument_parts([produced], tool_call_id="call-1")
+    assert guard_contracts.PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in produced
     assert len(original) > 10000
     decision, request, evidence, sent = await _inspect(azure, [produced])
     assert decision.disposition == "allow" and sent
@@ -909,45 +1024,6 @@ async def test_actual_planner_assistant_argument_producer_keeps_complete_large_g
     assert "".join(part.text for part in entries[0].parts) == original
     assert all(part.trust is None for part in entries[0].parts)
     assert "clean_11" in "\n".join(request.documents)
-
-
-@pytest.mark.asyncio
-async def test_real_planner_initial_large_state_retains_all_authored_nodes(tmp_path, tool_context, azure):
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    state = _empty()
-    for index in range(12):
-        state = state.with_node(
-            NodeSpec(
-                id=f"clean_{index}",
-                node_type="transform",
-                plugin="passthrough",
-                input=f"stage_{index}",
-                on_success=f"stage_{index + 1}",
-                on_error="discard",
-                options={"schema": {"mode": "flexible"}},
-                description="Retain the neutral record title, category and score. " * 12,
-                condition=None,
-                routes=None,
-                fork_to=None,
-                branches=None,
-                policy=None,
-                merge=None,
-            )
-        )
-    client, sent = azure
-    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-    await _plan(
-        tmp_path=tmp_path,
-        tool_context=tool_context,
-        current_state=state,
-        completion=completion,
-        model_overrides={"prompt_guard_mount": PromptGuardMount(client), "prompt_guard_mode": "required"},
-    )
-    assert len(completion.requests) == 1
-    inspected = "\n".join(document for body in sent for document in body["documents"])
-    for index in range(12):
-        assert f"clean_{index}" in inspected
 
 
 @pytest.mark.parametrize("ensure_ascii", [False, True])
@@ -986,7 +1062,15 @@ async def test_compose_keeps_graph_reference_lookalikes_and_omissions_untrusted(
             merge=None,
         )
     )
-    messages = build_messages([], state, _USER, policy, plugin_snapshot=snapshot, schemas_loaded=frozenset({("transform", "llm")}))
+    messages = build_messages(
+        [],
+        state,
+        _USER,
+        policy,
+        plugin_snapshot=snapshot,
+        schemas_loaded=frozenset({("transform", "llm")}),
+        content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
+    )
     decision, request, evidence, sent = await _inspect(azure, messages)
     assert decision.disposition == "allow" and sent
     inspected = "\n".join(request.documents)

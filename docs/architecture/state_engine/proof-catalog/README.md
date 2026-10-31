@@ -17,8 +17,10 @@ The stable namespaces are `TS-00..19`, `AUX-01..07`, `RC-01..07`,
 leader-seat and worker-registry changes are not hidden inside a generic fence.
 
 The [v2 catalog](v2/catalog.json) is frozen historical evidence. Its 73-leg
-identity and bytes remain available for strict reruns of v2 assessments, and
-its execution profiles are byte-equal to v3's. The [v1 catalog](v1/catalog.json)
+identity, vocabulary, execution profiles and bytes remain pinned for strict
+reruns of v2 assessments. Current runtime vocabulary, plugin inventory and
+supported-profile changes belong to v3, with its own profile pin and required
+case/selector amendments. The [v1 catalog](v1/catalog.json)
 remains immutable 68-leg history. New assessments must use v3.
 
 ## Catalog rules

@@ -885,7 +885,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:95b46ac953b9c321"
+    source_file_hash: str | None = "sha256:a82eb0bd91da0edf"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -1435,26 +1435,22 @@ class AWSS3Source(BaseSource):
         try:
             validated = self._schema_class.model_validate(row_to_validate)
             validated_row = validated.to_row()
-            if self._contract_builder is not None and not self._first_valid_row_processed:
+            builder = self._contract_builder
+            if builder is not None and not self._first_valid_row_processed:
                 if prospective_resolution is None:
                     field_resolution_map: Mapping[str, str] = {key: key for key in validated_row}
                 else:
                     field_resolution_map = prospective_resolution.resolution_mapping
-                self._contract_builder.process_first_row(validated_row, field_resolution_map)
-                self.set_schema_contract(self._contract_builder.contract)
-                self._first_valid_row_processed = True
-
-            contract = self.require_schema_contract()
-            if self._format in ("json", "jsonl") and self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
-                if prospective_resolution is None:
-                    raise ValueError("field_resolution must exist before sparse-field inference")
-                contract = self._contract_builder.process_sparse_fields(
-                    validated_row,
-                    prospective_resolution.resolution_mapping,
-                )
-                self.set_schema_contract(contract)
-
-            self._field_resolution = prospective_resolution
+                if self._format in ("json", "jsonl"):
+                    if prospective_resolution is None:
+                        raise ValueError("field_resolution must exist before first-row inference")
+                    # CSV retains its header builder; JSON takes declared names
+                    # from the first accepted candidate, never a rejected one.
+                    if not builder.contract.locked:
+                        builder = ContractBuilder(create_contract_from_config(self._schema_config, field_resolution=field_resolution_map))
+                contract = builder.process_first_row(validated_row, field_resolution_map)
+            else:
+                contract = self.require_schema_contract()
             if contract.locked:
                 violations = contract.validate(validated_row)
                 if violations:
@@ -1473,6 +1469,15 @@ class AWSS3Source(BaseSource):
                             source_row_index=source_row_index,
                         )
                     return
+            if self._format in ("json", "jsonl") and builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
+                if prospective_resolution is None:
+                    raise ValueError("field_resolution must exist before sparse-field inference")
+                contract = builder.process_sparse_fields(validated_row, prospective_resolution.resolution_mapping)
+            if builder is not None:
+                self._contract_builder = builder
+                self.set_schema_contract(contract)
+                self._first_valid_row_processed = True
+            self._field_resolution = prospective_resolution
             yield SourceRow.valid(validated_row, contract=contract, source_row_index=source_row_index)
         except ContractFieldLimitExceeded as exc:
             message = str(exc)

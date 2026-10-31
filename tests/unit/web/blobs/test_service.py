@@ -71,6 +71,7 @@ from elspeth.web.sessions.protocol import CompositionValidationError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -997,6 +998,7 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -1057,6 +1059,7 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -1124,6 +1127,7 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -1430,6 +1434,7 @@ class TestDeleteBlob:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -4640,6 +4645,7 @@ class TestFinalizeRunOutputBlobs:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -4783,6 +4789,7 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -5610,6 +5617,7 @@ class TestFinalizeRunOutputBlobsErrorCleanup:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,
@@ -5826,6 +5834,7 @@ class TestLinkBlobToRunDirectionGuard:
         with db_engine.begin() as conn:
             conn.execute(
                 composition_states_table.insert().values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id_str,
                     version=1,

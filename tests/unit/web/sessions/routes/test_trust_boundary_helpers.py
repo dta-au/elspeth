@@ -18,6 +18,7 @@ from elspeth.web.sessions.protocol import CompositionStateRecord
 from elspeth.web.sessions.routes._helpers import (
     _extract_runtime_model_snapshot,
 )
+from tests.helpers.composition_state import default_pipeline_metadata
 
 
 def _state_with_options(options: object) -> CompositionStateRecord:
@@ -28,7 +29,7 @@ def _state_with_options(options: object) -> CompositionStateRecord:
         nodes=[{"id": "n1", "node_type": "transform", "plugin": "llm", "options": options}],
         edges=None,
         outputs=None,
-        metadata_=None,
+        metadata_=default_pipeline_metadata(),
         is_valid=True,
         validation_errors=None,
         created_at=datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC),

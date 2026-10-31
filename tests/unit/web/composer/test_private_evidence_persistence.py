@@ -31,6 +31,7 @@ from elspeth.web.composer.authority_hashing import composer_authority_canonical_
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence, build_private_tool_evidence
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.turn_audit import persist_turn_audit
 from elspeth.web.sessions._persist_payload import AuditMessageDraft, RedactedToolRow
 from elspeth.web.sessions.models import chat_messages_table
@@ -178,12 +179,14 @@ def private_writer(tmp_path):
 
 
 def _normal_kwargs(session, context, evidence):
+    rows = (RedactedToolRow("private-call", "{}", None),)
     return {
         "session_id": str(session.id),
         "assistant_content": "",
         "raw_content": None,
         "redacted_assistant_tool_calls": ({"id": "private-call", "function": {"name": "create_blob"}},),
-        "redacted_tool_rows": (RedactedToolRow("private-call", "{}", None),),
+        "redacted_tool_rows": rows,
+        "revoked_tool_rows": rows,
         "private_tool_evidence": (evidence,),
         "parent_composition_state_id": None,
         "expected_current_state_id": None,
@@ -470,6 +473,9 @@ async def test_numeric_domain_argument_error_keeps_checkpoint_and_explicit_unava
     )
     await persist_turn_audit(
         sessions_service=service,
+        mutation_ceiling=None,
+        authority_revocation=None,
+        base_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
         redaction_telemetry=NoopRedactionTelemetry(),
         tool_outcomes=(_ToolOutcome(call, None, "ToolArgumentError", ToolArgumentErrorCategory.SCHEMA_BOUND, "invalid number", 0, 0),),
         decoded_args_by_call_id={"numeric-call": {"limit": 2**60}},
@@ -494,46 +500,6 @@ async def test_numeric_domain_argument_error_keeps_checkpoint_and_explicit_unava
     assert evidence.status == "arg_error"
     assert evidence.arguments.disposition == "unavailable"
     assert evidence.wire_arguments.disposition == "unavailable"
-
-
-@pytest.mark.asyncio
-async def test_received_and_accepted_one_shot_candidates_settle_in_actual_planner_cohort(
-    tmp_path, tool_context, composer_service_with_real_sessions, result_session_id
-):
-    from elspeth.web.composer.audit import BufferingRecorder
-    from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
-
-    recorder = BufferingRecorder()
-    completion = _ScriptedCompletion(
-        _response(("list_sources", {}), ("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
-    )
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
-    composer = composer_service_with_real_sessions
-    service = composer._sessions_service
-    async with acquire_compose_context(service, UUID(result_session_id)) as context:
-        await composer._planning_application._persist_pipeline_planner_audit(
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            llm_calls=recorder.llm_calls,
-            planner_attempts=recorder.planner_attempts,
-            invocations=recorder.invocations,
-            withheld_replies=recorder.withheld_replies,
-            private_candidates=recorder.private_candidates,
-            session_operation_context=context,
-        )
-    rows = _private_rows(await service.get_messages(UUID(result_session_id), limit=None))
-    evidence = [ComposerDiagnosticEvidence.from_envelope(row.tool_calls[0], expected_session_id=result_session_id) for row in rows]
-    received = [item for item in evidence if item.status == "received_response"]
-    assert len(received) == 3
-    requests = [item for item in evidence if item.status == "provider_request"]
-    assert len(requests) == len(recorder.llm_calls) == 2
-    for request, call in zip(requests, recorder.llm_calls, strict=True):
-        assert request.arguments.content == call.private_request.canonical
-    evidence = [item for item in evidence if item.status not in {"received_response", "provider_request"}]
-    assert [item.status for item in evidence] == ["received_not_dispatched", "accepted"]
-    assert all(item.authority_arguments is not None for item in evidence)
-    assert all(item.wire_arguments.disposition == "retained" for item in evidence)
 
 
 def _private_rows(messages):

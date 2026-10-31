@@ -1,0 +1,49 @@
+"""Actual pre-title publication/current claim and contention on serial PG."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_preparation as test_actual_pretitle_bootstrap_is_complete_atomic_and_replays_without_preparation,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_cancel_joins_actual_publication_and_replay_does_not_repeat_it as test_pretitle_cancel_joins_actual_publication_and_replay_does_not_repeat_it,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_cancel_joins_original_skill_preparation_without_publishing as test_pretitle_cancel_joins_original_skill_preparation_without_publishing,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_keeps_original_required_history_failure_without_publication as test_pretitle_keeps_original_required_history_failure_without_publication,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_keeps_original_skill_archive_failure_and_closes_its_producer as test_pretitle_keeps_original_skill_archive_failure_and_closes_its_producer,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_multiple_actual_reclaims_preserve_complete_original_cut as test_pretitle_multiple_actual_reclaims_preserve_complete_original_cut,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_original_failure as test_pretitle_publication_rolls_back_chunk_event_root_and_preserves_original_failure,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_rechecks_real_source_across_preparation_awaits as test_pretitle_rechecks_real_source_across_preparation_awaits,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_refuses_duplicate_recovery_event_without_another_actual_claim as test_pretitle_refuses_duplicate_recovery_event_without_another_actual_claim,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_rejects_reserved_or_forged_current_root_before_any_preparation as test_pretitle_rejects_reserved_or_forged_current_root_before_any_preparation,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_pretitle_two_actual_preparations_have_one_publication_cas as test_pretitle_two_actual_preparations_have_one_publication_cas,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_published_bootstrap_fresh_claim_uses_original_history_and_refuses_old_owner as test_published_bootstrap_fresh_claim_uses_original_history_and_refuses_old_owner,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_published_pretitle_read_refuses_unowned_later_cuts as test_published_pretitle_read_refuses_unowned_later_cuts,
+)
+from tests.unit.web.sessions.test_continuation_initialization import (
+    test_reclaimed_pretitle_checks_actual_event_creator_and_complete_predecessors as test_reclaimed_pretitle_checks_actual_event_creator_and_complete_predecessors,
+)
+
+pytestmark = pytest.mark.testcontainer

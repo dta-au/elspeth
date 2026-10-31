@@ -159,6 +159,23 @@ def test_catch_order_accepts_admission_refusal_before_supertype(tmp_path: Path, 
     assert _catch_order_findings(tmp_path, source) == []
 
 
+@pytest.mark.parametrize("supertype", ["ComposerServiceError", "Exception", "BaseException"])
+def test_catch_order_reports_shadowed_mutation_authority_revocation(tmp_path: Path, supertype: str) -> None:
+    source = f"def f():\n    try:\n        pass\n    except {supertype}:\n        pass\n    except ComposerMutationAuthorityRevoked:\n        pass\n"
+
+    findings = _catch_order_findings(tmp_path, source)
+
+    assert [finding.rule_id for finding in findings] == ["CCO1"]
+    assert "ComposerMutationAuthorityRevoked" in findings[0].message
+
+
+@pytest.mark.parametrize("supertype", ["ComposerServiceError", "Exception", "BaseException"])
+def test_catch_order_accepts_mutation_authority_revocation_before_supertype(tmp_path: Path, supertype: str) -> None:
+    source = f"def f():\n    try:\n        pass\n    except ComposerMutationAuthorityRevoked:\n        pass\n    except {supertype}:\n        pass\n"
+
+    assert _catch_order_findings(tmp_path, source) == []
+
+
 @pytest.mark.parametrize("supertype", ["ComposerAdmissionRefused", "ComposerServiceError", "Exception", "BaseException"])
 def test_catch_order_reports_shadowed_credential_material_refusal(tmp_path: Path, supertype: str) -> None:
     source = (

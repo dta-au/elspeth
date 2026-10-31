@@ -22,6 +22,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.hashing import is_lower_sha256_hex
 from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_MAX_TEXT_CHARACTERS,
+    GuardedProviderMessage,
     PromptGuardClient,
     PromptGuardContentPart,
     PromptGuardDecision,
@@ -79,6 +80,61 @@ def prompt_guard_user_scope(user_prompt: str) -> Iterator[None]:
         yield
     finally:
         _USER_PROMPT.reset(token)
+
+
+def resolve_prompt_guard_user_prompt(user_prompt: str | None) -> str | None:
+    """Resolve genuine input while preserving absent versus explicit empty text."""
+    return _USER_PROMPT.get() if user_prompt is None else user_prompt
+
+
+def _latest_genuine_user_index(messages: Sequence[GuardedProviderMessage], genuine_user: str | None) -> int | None:
+    user = genuine_user if genuine_user is not None else ""
+    genuine_index: int | None = None
+    for index, message in enumerate(messages):
+        if message["role"] == "user" and "content" in message and message["content"] == user and genuine_user is not None:
+            genuine_index = index
+    return genuine_index
+
+
+def _inspection_text(part: PromptGuardContentPart) -> str:
+    return part.text if part.inspection_text is None else part.inspection_text
+
+
+def validate_prompt_guard_credentials(
+    *,
+    messages: Sequence[GuardedProviderMessage],
+    genuine_user: str | None,
+    trusted_message_indexes: frozenset[int],
+    content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...],
+    tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...],
+    thinking_parts: tuple[PromptGuardThinkingParts | None, ...],
+) -> None:
+    """Preserve the guard's credential refusals before an aggregate size refusal.
+
+    The caller has validated exact producer coverage. This reads the same
+    genuine input and decoded untrusted units as the actual guard without
+    constructing a guard request, inspection documents, or an audit event.
+    """
+    user = genuine_user if genuine_user is not None else ""
+    require_no_credential_material(user, surface="composer_prompt_guard_request")
+    genuine_index = _latest_genuine_user_index(messages, genuine_user)
+    for index, _message in enumerate(messages):
+        if index in trusted_message_indexes:
+            continue
+        parts = content_parts[index]
+        if parts is not None and index != genuine_index:
+            for part in parts:
+                if part.trust is None:
+                    require_no_credential_material(_inspection_text(part), surface="composer_prompt_guard_request")
+        entries = tool_argument_parts[index]
+        if entries:
+            for entry in entries:
+                for part in entry.parts:
+                    require_no_credential_material(_inspection_text(part), surface="composer_prompt_guard_request")
+        thinking = thinking_parts[index]
+        if thinking is not None:
+            for part in thinking.parts:
+                require_no_credential_material(_inspection_text(part), surface="composer_prompt_guard_request")
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +269,7 @@ def _request(
     """
     if type(enforce_azure_character_limits) is not bool:
         raise AuditIntegrityError("Prompt guard size policy requires an exact enforcement decision")
-    genuine_user = _USER_PROMPT.get() if user_prompt is None else user_prompt
+    genuine_user = resolve_prompt_guard_user_prompt(user_prompt)
     supported = genuine_user is not None
     user = genuine_user if genuine_user is not None else ""
     require_no_credential_material(user, surface="composer_prompt_guard_request")
@@ -268,10 +324,7 @@ def _request(
     documents: list[str] = []
     # Exclude only the exact latest genuine user message from documents. Its
     # text is already checked as user input; earlier equal history is evidence.
-    genuine_index: int | None = None
-    for index, message in enumerate(messages):
-        if message["role"] == "user" and "content" in message and message["content"] == user and genuine_user is not None:
-            genuine_index = index
+    genuine_index = _latest_genuine_user_index(messages, genuine_user)
     for index, message in enumerate(messages):
         if index in trusted_message_indexes:
             continue
@@ -297,18 +350,18 @@ def _request(
             for part_index, part in enumerate(parts):
                 if part.trust is not None:
                     continue
-                text = part.text if part.inspection_text is None else part.inspection_text
+                text = _inspection_text(part)
                 require_no_credential_material(text, surface="composer_prompt_guard_request")
                 documents.append(f"Message {index}, content part {part_index}:\n{text}")
         if argument_entries:
             for entry in argument_entries:
                 for part_index, part in enumerate(entry.parts):
-                    text = part.text if part.inspection_text is None else part.inspection_text
+                    text = _inspection_text(part)
                     require_no_credential_material(text, surface="composer_prompt_guard_request")
                     documents.append(f"Message {index}, tool call {entry.tool_call_index}, argument part {part_index}:\n{text}")
         if thinking_entry is not None:
             for part_index, part in enumerate(thinking_entry.parts):
-                text = part.text if part.inspection_text is None else part.inspection_text
+                text = _inspection_text(part)
                 require_no_credential_material(text, surface="composer_prompt_guard_request")
                 documents.append(f"Message {index}, provider thinking part {part_index}:\n{text}")
         if parts is not None or index == genuine_index:

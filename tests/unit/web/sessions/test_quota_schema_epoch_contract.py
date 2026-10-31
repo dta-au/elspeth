@@ -186,7 +186,7 @@ def _assert_live_wal_preserved(path: Path, before: Snapshot, after: Snapshot) ->
 def test_current_epoch_refuses_predecessor_contracts_without_any_store_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, epoch: int, shape: Shape, identity_only: bool, entry: str
 ) -> None:
-    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 78
+    assert SESSION_SCHEMA_EPOCH == schema._COORDINATION_HARD_CUT_EPOCH == 79
     path = tmp_path / "predecessor.db"
     _source_store(path, epoch=epoch, shape=shape, identity_only=identity_only, monkeypatch=monkeypatch)
     before = _snapshot(path)

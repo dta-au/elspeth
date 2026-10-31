@@ -1,0 +1,16 @@
+"""The same actual ingress/private-custody/current-producer cases on PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_prompt_producer_domains import (
+    test_private_custody_is_checked_before_current_recompose_projection as test_private_custody_is_checked_before_current_recompose_projection,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producer_domains import (
+    test_recompose_uses_original_ingress_receipt_and_complete_mixed_prefix as test_recompose_uses_original_ingress_receipt_and_complete_mixed_prefix,
+)
+from tests.unit.web.sessions.test_continuation_prompt_producer_domains import (
+    test_tool_argument_producer_roundtrips_full_wire_without_customer_trust as test_tool_argument_producer_roundtrips_full_wire_without_customer_trust,
+)
+
+pytestmark = pytest.mark.testcontainer

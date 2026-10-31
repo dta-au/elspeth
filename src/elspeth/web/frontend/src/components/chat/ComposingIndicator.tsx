@@ -8,6 +8,7 @@ import type {
   CompositionState,
   ToolCall,
 } from "@/types/api";
+import type { ComposerOperationStatusV2 } from "@/types/composerOperations";
 import {
   COMPLETION_OUTCOME_LABELS,
   type CompletionOutcome,
@@ -45,26 +46,86 @@ interface ComposingIndicatorProps {
   onRetryInterruptedRequest?: () => void;
   retryDisabledReason?: string | null;
   lastRejection?: ToolCall["rejection"];
+  /** Latest Composer-Operation-Version 2 state (Continuation); null for v1. */
+  operationStatus?: ComposerOperationStatusV2 | null;
+  /** Two live-update connects failed; the request may still be running. */
+  liveUpdatesInterrupted?: boolean;
+  /** Stop was pressed and the server has not confirmed it yet. */
+  stopPending?: boolean;
 }
 
-interface RequestFocus {
-  headline: string;
-  focus: string;
-  nextMove: string;
+export const SUCCESSOR_NOTICE = "Still working on this request.";
+export const SUCCESSOR_NOTICE_MS = 5_000;
+export const LIVE_UPDATES_INTERRUPTED = "Live updates interrupted. Reconnecting.";
+
+interface ContinuationView { label: string; headline: string }
+
+/**
+ * Design §4.2 copy for v2 states. Executing keeps the ordinary backend
+ * progress view; Stop takes precedence over phase. Never says "saved": a
+ * checkpoint is internal, not a saved pipeline revision.
+ */
+export function continuationView(
+  status: ComposerOperationStatusV2 | null | undefined,
+  stopPending: boolean,
+): ContinuationView | null {
+  const live = status?.status === "queued" || status?.status === "running";
+  if (stopPending && !(status?.cancel_requested ?? false) && (status == null || live)) {
+    return { label: "Stopping", headline: "Stop requested. Waiting for the server to confirm." };
+  }
+  if (status == null || !live) return null;
+  if (status.cancel_requested) {
+    return { label: "Stopping", headline: "Stop confirmed. The composer is finishing its current step and will not start another." };
+  }
+  switch (status.phase) {
+    case "queued":
+      return { label: "Queued", headline: "Waiting for a composer worker to start this request." };
+    case "continuation_queued":
+      return { label: "Continuing", headline: "The composer reached a checkpoint. The next step of this request is queued." };
+    case "retry_waiting":
+      return { label: "Waiting to retry", headline: "A service the composer depends on did not respond. The composer will retry this request automatically." };
+    case "reconciling":
+      return { label: "Recovering", headline: "The server running this request stopped. Another server is resuming it." };
+    default:
+      return null;
+  }
+}
+
+/** Shows the successor notice once per operation and segment, never on first attach or reload. */
+function useSuccessorNotice(status: ComposerOperationStatusV2 | null | undefined, cleared: boolean): boolean {
+  // baseline: the last segment already started when first seen (never announced);
+  // announced: the last successor already announced as running.
+  const seen = useRef<{ operation: string; baseline: number; announced: number } | null>(null);
+  const [shownFor, setShownFor] = useState<string | null>(null);
+  const segment = status?.segment ?? null;
+  const operation = status?.operation_id ?? null;
+  useEffect(() => {
+    if (operation === null || segment === null) return;
+    const previous = seen.current;
+    if (previous === null || previous.operation !== operation) {
+      // A segment already running at attach is history; one first seen queued
+      // (or interrupted) has not started, so its start is still announced.
+      const baseline = segment.state === "running" ? segment.sequence : segment.sequence - 1;
+      seen.current = { operation, baseline, announced: baseline };
+      return;
+    }
+    if (segment.state === "running" && segment.sequence > previous.announced && segment.sequence > previous.baseline) {
+      seen.current = { ...previous, announced: segment.sequence };
+      setShownFor(`${operation}:${segment.sequence}`);
+    }
+  }, [operation, segment]);
+  useEffect(() => {
+    if (shownFor === null) return;
+    const timer = setTimeout(() => setShownFor(null), SUCCESSOR_NOTICE_MS);
+    return () => clearTimeout(timer);
+  }, [shownFor]);
+  return shownFor !== null && !cleared;
 }
 
 interface WorkingView {
   headline: string;
   evidence: string[];
   likelyNext: string;
-  /**
-   * Provenance of the view (elspeth-b189b5b3b8 part c): "backend" views carry
-   * evidence the server actually reported for this compose request;
-   * "estimated" views are keyword-guessed from the user's message text and
-   * must not read as if ELSPETH reported them. Rendering italicises estimated
-   * views and appends a visible "(estimated)" marker to the headline.
-   */
-  source: "backend" | "estimated";
 }
 
 function isTerminalPhase(
@@ -103,56 +164,6 @@ function describeCurrentSetup(compositionState: CompositionState | null | undefi
   return `Current setup: ${input}, ${steps}, ${outputs}.`;
 }
 
-function describeRequestFocus(latestRequest: string | null | undefined): RequestFocus {
-  const normalized = latestRequest?.toLocaleLowerCase() ?? "";
-
-  if (normalized.includes("html") && normalized.includes("json")) {
-    return {
-      headline: "Working on: convert HTML into JSON",
-      focus: "Request focus: turn HTML content into structured JSON.",
-      nextMove: "Likely next move: choose an input, extract the useful fields, then save structured JSON.",
-    };
-  }
-
-  if (/\b(database|sql|table|query)\b/.test(normalized)) {
-    return {
-      headline: "Working on: database-backed data flow",
-      focus: "Request focus: read data from a database source.",
-      nextMove: "Likely next move: identify the input query, shape the records, then send them to an output.",
-    };
-  }
-
-  if (/\b(scrape|website|web page|url|fetch)\b/.test(normalized)) {
-    return {
-      headline: "Working on: web content pipeline",
-      focus: "Request focus: fetch or parse web content.",
-      nextMove: "Likely next move: choose a web input, extract the useful content, then structure the result.",
-    };
-  }
-
-  if (/\b(output|save|export|write|artifact)\b/.test(normalized)) {
-    return {
-      headline: "Working on: saved output",
-      focus: "Request focus: produce or update saved output.",
-      nextMove: "Likely next move: check the current pipeline shape and wire the final output.",
-    };
-  }
-
-  if (/\b(file|csv|excel|upload|input)\b/.test(normalized)) {
-    return {
-      headline: "Working on: file input pipeline",
-      focus: "Request focus: use a supplied file as input.",
-      nextMove: "Likely next move: connect the file, inspect its fields, then add the needed processing steps.",
-    };
-  }
-
-  return {
-    headline: "Working through your request",
-    focus: "Request focus: update the pipeline from your latest message.",
-    nextMove: "Likely next move: compare your request with the current setup, then update the graph or explain what is missing.",
-  };
-}
-
 function backendWorkingView(
   composerProgress: ComposerProgressSnapshot | null | undefined,
 ): WorkingView | null {
@@ -169,23 +180,19 @@ function backendWorkingView(
     likelyNext:
       composerProgress.likely_next ??
       "ELSPETH will continue through the visible composer workflow.",
-    source: "backend",
   };
 }
 
-function heuristicWorkingView(
-  latestRequest: string | null | undefined,
+function waitingWorkingView(
   compositionState: CompositionState | null | undefined,
 ): WorkingView {
-  const requestFocus = describeRequestFocus(latestRequest);
   return {
-    headline: requestFocus.headline,
+    headline: "Waiting for Composer progress",
     evidence: [
-      requestFocus.focus,
+      "No live Composer progress has been reported yet.",
       describeCurrentSetup(compositionState),
     ],
-    likelyNext: requestFocus.nextMove,
-    source: "estimated",
+    likelyNext: "Live updates will appear when Composer reports progress.",
   };
 }
 
@@ -236,12 +243,16 @@ export function ComposingIndicator({
   onRetryInterruptedRequest,
   retryDisabledReason = null,
   lastRejection,
+  operationStatus = null,
+  liveUpdatesInterrupted = false,
+  stopPending = false,
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
-    heuristicWorkingView(latestRequest, compositionState);
+    waitingWorkingView(compositionState);
+  const continuation = continuationView(operationStatus, stopPending);
+  const successorNotice = useSuccessorNotice(operationStatus, stopPending || (operationStatus?.cancel_requested ?? false));
   const isTerminal = isTerminalPhase(composerProgress?.phase);
-  const isEstimated = workingView.source === "estimated";
   const progressKey = latestRequest ?? composerProgress?.request_id ?? "idle";
   const toolLogCaptionId = `${useId()}-tool-log`;
   const retryReasonId = `${useId()}-retry-reason`;
@@ -267,35 +278,36 @@ export function ComposingIndicator({
             <span className="composing-dot" />
           </div>
         )}
-        <div
-          className={`composing-working-view${isEstimated ? " composing-working-view--estimated" : ""}`}
-        >
+        <div className="composing-working-view">
           <div className="composing-status-summary" role="status">
             <div className="composing-label">
               {isTerminal ? (
                 "Last composer update"
               ) : (
                 <>
-                  {composerProgress?.phase === "calling_model"
+                  {continuation !== null
+                    ? continuation.label
+                    : composerProgress?.phase === "calling_model"
                     ? "Waiting for model response"
                     : "Working on..."}
                   <ElapsedReadout
                     key={composerProgress?.phase === "calling_model"
                       ? `${composerProgress.request_id}:${composerProgress.updated_at}`
+                      : operationStatus !== null
+                      ? `operation:${operationStatus.operation_id}`
                       : progressKey}
                     startedAt={composerProgress?.phase === "calling_model"
                       ? composerProgress.updated_at
-                      : undefined}
+                      : operationStatus?.created_at}
                   />
                 </>
               )}
             </div>
             <div className="composing-title">
-              {workingView.headline}
-              {isEstimated && (
-                <span className="composing-estimated-tag"> (estimated)</span>
-              )}
+              {continuation !== null && !isTerminal ? continuation.headline : workingView.headline}
             </div>
+            {successorNotice && !isTerminal && <div className="composing-text">{SUCCESSOR_NOTICE}</div>}
+            {liveUpdatesInterrupted && !isTerminal && <div className="composing-text">{LIVE_UPDATES_INTERRUPTED}</div>}
             {composerProgress?.phase === "cancelled" && (
               <div className="composing-text">
                 {compositionState !== null
@@ -398,7 +410,7 @@ export function ComposingIndicator({
             <div className="composing-details">
               <div className="composing-section">
                 <div className="composing-label">
-                  {isEstimated ? "Best guess from your request" : "What ELSPETH can see"}
+                  What ELSPETH can see
                 </div>
                 <ul className="composing-evidence">
                   {workingView.evidence.map((item) => (

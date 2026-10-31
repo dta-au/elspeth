@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, composition_graph_parks_table, composition_states_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 _PROVENANCE_CHECK = (
     "provenance IN ('tool_call', 'convergence_persist', 'plugin_crash_persist', 'preflight_persist', "
@@ -69,7 +70,7 @@ def _assert_recovery_catalog_contract(engine: Engine) -> None:
 
 
 def test_epoch_74_recovery_schema_matches_independent_catalog_contract(schema_engine: Engine) -> None:
-    assert SESSION_SCHEMA_EPOCH == 78
+    assert SESSION_SCHEMA_EPOCH == 79
     initialize_session_schema(schema_engine)
     _assert_recovery_catalog_contract(schema_engine)
 
@@ -87,6 +88,7 @@ def test_park_same_session_and_recovery_provenance_are_enforced(schema_engine: E
         connection.execute(sessions.insert(), [{"id": "session-a"}, {"id": "session-b"}])
         connection.execute(
             states.insert().values(
+                metadata_=stored_default_pipeline_metadata(),
                 id="state-a",
                 session_id="session-a",
                 version=1,
@@ -110,6 +112,7 @@ def test_park_same_session_and_recovery_provenance_are_enforced(schema_engine: E
     with pytest.raises(IntegrityError, match="CHECK constraint"), schema_engine.begin() as connection:
         connection.execute(
             states.insert().values(
+                metadata_=stored_default_pipeline_metadata(),
                 id="invalid-writer",
                 session_id="session-a",
                 version=2,

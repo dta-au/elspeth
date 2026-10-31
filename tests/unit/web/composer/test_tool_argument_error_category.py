@@ -200,7 +200,7 @@ class TestSchemaShapeBoundSplit:
 class TestClosedRootLookup:
     def test_every_advertised_tool_resolves_to_a_closed_root(self) -> None:
         names = [definition["name"] for definition in get_tool_definitions()]
-        assert len(names) == 43
+        assert len(names) == 44
         for name in names:
             schema = _closed_root_schema(name)
             assert schema["type"] == "object"
@@ -476,27 +476,6 @@ def test_mutation_model_rejection_is_model_validation() -> None:
     with pytest.raises(ToolArgumentError) as caught:
         _validate_mutation_arguments(_UpsertNodeArgumentsModel, {"id": 3}, "upsert_node arguments")
     assert caught.value.category is ToolArgumentErrorCategory.MODEL_VALIDATION
-
-
-# ---------------------------------------------------------------------------
-# Pipeline planner: category values are rejection codes and are not collapsed.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("category", list(ToolArgumentErrorCategory), ids=lambda category: category.value)
-def test_every_category_survives_planner_rejection_code_closure(category: ToolArgumentErrorCategory) -> None:
-    from elspeth.contracts.composer_planner_audit import _safe_token
-    from elspeth.web.composer.pipeline_planner import _closed_planner_rejection_codes
-
-    assert _closed_planner_rejection_codes((category.value,)) == (category.value,)
-    # The attempt record admits only bounded lowercase tokens.
-    assert _safe_token(category.value)
-
-
-def test_planner_rejection_closure_still_collapses_unknown_codes() -> None:
-    from elspeth.web.composer.pipeline_planner import _closed_planner_rejection_codes
-
-    assert _closed_planner_rejection_codes(("zz_not_a_known_code", "SCHEMA_VALIDATION")) == ("validation_error",)
 
 
 # ---------------------------------------------------------------------------

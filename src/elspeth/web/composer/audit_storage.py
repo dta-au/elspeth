@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, cast, final
+from typing import TYPE_CHECKING, Any, Final, cast, final
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -32,6 +32,7 @@ from elspeth.web.composer.pipeline_proposal import (
     is_owned_composition_state_authority,
     owned_composition_state_review_arguments,
 )
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource, capture_provider_audit_source
 from elspeth.web.composer.redaction import (
     MANIFEST,
     redact_arg_error_response,
@@ -47,6 +48,42 @@ from elspeth.web.composer.tool_error_payloads import (
 )
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.composer_operations import ComposerOperationError
+
+INVOCATION_AUTHORITY_REVOKED_KEY: Final = "authority_revoked"
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedOperationFailureFacts:
+    durable_operation_id: str
+    request_id: str | None
+    context: SessionOperationContext
+    source: RetainedToolFailureSource
+    publication_observation: PrivateFailureFacts | None = None
+
+    def __post_init__(self) -> None:
+        from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
+
+        if (
+            type(self.source) is not RetainedToolFailureSource
+            or type(self.context) is not SessionOperationContext
+            or type(self.durable_operation_id) is not str
+            or not self.durable_operation_id
+            or (self.request_id is not None and type(self.request_id) is not str)
+            or (self.publication_observation is not None and type(self.publication_observation) is not PrivateFailureFacts)
+        ):
+            raise AuditIntegrityError("Retained operation failure facts lost their actual closed origins")
+
+    def validate_for(self, *, durable_operation_id: str, request_id: str | None, context: SessionOperationContext) -> None:
+        if (self.durable_operation_id, self.request_id, self.context) != (durable_operation_id, request_id, context):
+            raise AuditIntegrityError("Retained failure publication crossed its current publisher")
+        if (self.source.selected.stack.logical.session_id, self.source.selected.stack.logical.operation_id) != (
+            context.fence.session_id,
+            durable_operation_id,
+        ):
+            raise AuditIntegrityError("Retained failure publication crossed its original logical source")
 
 
 @final
@@ -74,11 +111,39 @@ class ComposerOperationFailureFacts:
             raise AuditIntegrityError("Operation failure facts belong to another exact request or fence")
 
 
-def private_operation_failure_draft(capture: ComposerOperationFailureFacts, *, failure: ComposerOperationError) -> AuditMessageDraft:
+def private_operation_failure_draft(
+    capture: ComposerOperationFailureFacts | RetainedOperationFailureFacts, *, failure: ComposerOperationError
+) -> AuditMessageDraft:
     """Correlate private captured facts with the actually selected public outcome."""
-    if type(capture) is not ComposerOperationFailureFacts or type(failure) is not ComposerOperationError:
+    if type(capture) not in (ComposerOperationFailureFacts, RetainedOperationFailureFacts) or type(failure) is not ComposerOperationError:
         raise AuditIntegrityError("Operation failure projection is not nominal")
     correlation = "operation:" + capture.durable_operation_id
+    if type(capture) is RetainedOperationFailureFacts:
+        source = capture.source
+        refusal = source.failure.refusal_source
+        facts = source.invocation.private_failure
+        result = source.invocation.result_canonical if refusal is not None else None if facts is None else facts.canonical
+        if result is None:
+            raise AuditIntegrityError("Retained failure publication lacks its actual crash/refusal facts")
+        origin = {
+            "kind": "retained_successful_refusal" if refusal is not None else "retained_crash",
+            "response": source.response.reference.model_dump(mode="json"),
+            "issue": source.issue.model_dump(mode="json"),
+            "evidence": source.evidence.reference.model_dump(mode="json"),
+            "invocation_call_id": source.invocation.tool_call_id,
+            "refusal_kind": None if refusal is None else refusal.kind,
+            "provider_call_id": None if refusal is None else refusal.provider_call_id,
+            **(
+                {"publication_observation": capture.publication_observation.canonical}
+                if capture.publication_observation is not None
+                else {}
+            ),
+        }
+    elif isinstance(capture, ComposerOperationFailureFacts):
+        result = capture.facts.canonical
+        origin = None
+    else:
+        raise AuditIntegrityError("Operation failure facts have no actual closed origin")
     evidence = build_private_tool_evidence(
         session_id=capture.context.fence.session_id,
         operation_id=capture.context.fence.operation_id,
@@ -94,9 +159,10 @@ def private_operation_failure_draft(capture: ComposerOperationFailureFacts, *, f
                 "diagnostic_id": failure.diagnostic_id,
                 "failure_code": failure.failure_code,
                 "correlation_kind": "internal_operation",
+                **({"retained_origin": origin} if origin is not None else {}),
             }
         ),
-        result_canonical=capture.facts.canonical,
+        result_canonical=result,
     )
     return AuditMessageDraft(
         role="audit",
@@ -114,18 +180,12 @@ def private_failure_evidence(
     status: str,
     context: SessionOperationContext,
 ) -> ComposerDiagnosticEvidence:
-    if type(facts) is not PrivateFailureFacts:
-        raise AuditIntegrityError("private failure facts are not nominal")
-    return build_private_tool_evidence(
-        session_id=context.fence.session_id,
-        operation_id=context.fence.operation_id,
-        operation_epoch=context.fence.operation_epoch,
+    return private_failure_evidence_for_source(
+        facts,
+        identity=identity,
         tool_call_id=tool_call_id,
-        evidence_id=identity,
-        tool_name="composer_failure",
         status=status,
-        arguments_canonical=None,
-        result_canonical=facts.canonical,
+        source=capture_provider_audit_source(context),
     )
 
 
@@ -135,6 +195,46 @@ def private_diagnostic_drafts(
     context: SessionOperationContext,
     composition_state_id: str | None = None,
 ) -> tuple[AuditMessageDraft, ...]:
+    return private_diagnostic_drafts_for_source(
+        record,
+        source=capture_provider_audit_source(context),
+        composition_state_id=composition_state_id,
+    )
+
+
+def private_failure_evidence_for_source(
+    facts: PrivateFailureFacts,
+    *,
+    identity: str,
+    tool_call_id: str,
+    status: str,
+    source: ProviderAuditSource,
+) -> ComposerDiagnosticEvidence:
+    if type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("private diagnostic source is not nominal DATA")
+    if type(facts) is not PrivateFailureFacts:
+        raise AuditIntegrityError("private failure facts are not nominal")
+    return build_private_tool_evidence(
+        session_id=source.session_id,
+        operation_id=source.operation_id,
+        operation_epoch=source.operation_epoch,
+        tool_call_id=tool_call_id,
+        evidence_id=identity,
+        tool_name="composer_failure",
+        status=status,
+        arguments_canonical=None,
+        result_canonical=facts.canonical,
+    )
+
+
+def private_diagnostic_drafts_for_source(
+    record: ComposerToolInvocation | ComposerLLMCall,
+    *,
+    source: ProviderAuditSource,
+    composition_state_id: str | None = None,
+) -> tuple[AuditMessageDraft, ...]:
+    if type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("private diagnostic source is not nominal DATA")
     evidence: list[ComposerDiagnosticEvidence] = []
     if type(record) is ComposerToolInvocation:
         identity = diagnostic_evidence_identity("tool-failure", record.tool_call_id)
@@ -148,9 +248,9 @@ def private_diagnostic_drafts(
             request = record.private_request
             evidence.append(
                 ComposerDiagnosticEvidence(
-                    session_id=context.fence.session_id,
-                    operation_id=context.fence.operation_id,
-                    operation_epoch=context.fence.operation_epoch,
+                    session_id=source.session_id,
+                    operation_id=source.operation_id,
+                    operation_epoch=source.operation_epoch,
                     tool_call_id=call_id,
                     evidence_id=diagnostic_evidence_identity("provider-request", call_id),
                     tool_name="composer_provider_context",
@@ -170,9 +270,9 @@ def private_diagnostic_drafts(
         retained_arguments_remaining = 1024 * 1024
         for receipt in record.private_diagnostics:
             item = build_private_tool_evidence(
-                session_id=context.fence.session_id,
-                operation_id=context.fence.operation_id,
-                operation_epoch=context.fence.operation_epoch,
+                session_id=source.session_id,
+                operation_id=source.operation_id,
+                operation_epoch=source.operation_epoch,
                 tool_call_id=receipt.tool_call_id,
                 evidence_id=receipt.evidence_id,
                 tool_name=receipt.tool_name,
@@ -187,9 +287,9 @@ def private_diagnostic_drafts(
                     facts = json.loads(receipt.result_canonical)
                     facts["argument_disposition"] = "canonical_bounds"
                     item = build_private_tool_evidence(
-                        session_id=context.fence.session_id,
-                        operation_id=context.fence.operation_id,
-                        operation_epoch=context.fence.operation_epoch,
+                        session_id=source.session_id,
+                        operation_id=source.operation_id,
+                        operation_epoch=source.operation_epoch,
                         tool_call_id=receipt.tool_call_id,
                         evidence_id=receipt.evidence_id,
                         tool_name=receipt.tool_name,
@@ -205,7 +305,9 @@ def private_diagnostic_drafts(
         raise AuditIntegrityError("private diagnostic owner is not nominal")
     if record.private_failure is not None:
         evidence.append(
-            private_failure_evidence(record.private_failure, identity=identity, tool_call_id=call_id, status=status, context=context)
+            private_failure_evidence_for_source(
+                record.private_failure, identity=identity, tool_call_id=call_id, status=status, source=source
+            )
         )
     return tuple(
         AuditMessageDraft(
@@ -374,8 +476,15 @@ def _redacted_result_canonical(
 
 def redacted_tool_invocation_content_and_envelope(
     invocation: ComposerToolInvocation,
+    *,
+    authority_revoked: bool = False,
 ) -> tuple[str, dict[str, object]]:
     """Return the one manifest-redacted projection allowed in chat storage.
+
+    ``authority_revoked`` marks an invocation whose result P4 refused after it
+    ran. Its record stays exact (it did run and returned this result); the
+    marker says the result was not the turn's outcome, so history must never
+    replay it as one.
 
     ``ComposerToolInvocation`` retains exact in-memory arguments/results for
     convergence and audit binding. Chat storage is a separate persistence
@@ -459,6 +568,8 @@ def redacted_tool_invocation_content_and_envelope(
                 error_message=invocation.error_message,
             )
         )
+    if authority_revoked:
+        return content, {"_kind": "audit", "invocation": invocation_payload, INVOCATION_AUTHORITY_REVOKED_KEY: True}
     return content, {"_kind": "audit", "invocation": invocation_payload}
 
 
@@ -504,4 +615,8 @@ def private_tool_invocation_draft(
     )
 
 
-__all__ = ["private_tool_invocation_draft", "redacted_tool_invocation_content_and_envelope"]
+__all__ = [
+    "INVOCATION_AUTHORITY_REVOKED_KEY",
+    "private_tool_invocation_draft",
+    "redacted_tool_invocation_content_and_envelope",
+]

@@ -27,6 +27,7 @@ from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
@@ -311,9 +312,11 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
 def get_tool_definitions() -> list[dict[str, Any]]:
     """Return JSON Schema tool definitions for the LLM.
 
-    Returns 42 tools: 12 discovery + 14 mutation + 11 blob tools (5 discovery,
+    Returns 44 tools: 13 discovery + 14 mutation + 12 blob tools (6 discovery,
     6 mutation) + 3 secret tools (2 discovery, 1 mutation) + 1 advisor tool +
-    1 session-aware interpretation-review tool.
+    1 session-aware interpretation-review tool. The breakdown is measured
+    against the live registry by
+    ``tests/unit/web/composer/test_tool_definitions_documented_count.py``.
     ``request_advisor_hint`` is always part of the LLM-visible list —
     advisor is mandatory — see ``service.composer_loop_tool_definitions``.
 
@@ -721,10 +724,8 @@ def _augment_with_plugin_schemas(
 def _augment_with_validation_guidance(result: ToolResult, tool_name: str) -> ToolResult:
     """Attach inline catalogue repair guidance to a failed mutation.
 
-    The freeform twin of the planner surface's rejection enrichment
-    (``pipeline_planner._allowlisted_candidate_feedback``, which resolves the
-    same catalogue through ``explain_validation_code``). Without it the
-    freeform tool loop shipped a bare closed code and the model had to spend
+    Resolve the static catalogue through ``explain_validation_code``.
+    Without it the tool loop shipped a bare closed code and the model had to spend
     a turn on ``explain_validation_error`` to learn the fix — the exact
     round-trip ``plugin_schemas`` already eliminates for option-shape
     failures (elspeth-5ff149dc4e; live session 891b7b1e burned a turn on
@@ -821,6 +822,7 @@ def execute_tool(
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
     executing_proposal_id: str | None = None,
+    mutation_ceiling: ComposerMutationCeiling | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
@@ -975,6 +977,7 @@ def execute_tool(
         tool_arguments_hash=tool_arguments_hash,
         reviewed_source_authority=reviewed_source_authority,
         executing_proposal_id=executing_proposal_id,
+        mutation_ceiling=mutation_ceiling,
         _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 

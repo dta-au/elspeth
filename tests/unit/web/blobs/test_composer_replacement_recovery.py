@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import Engine, select, update
 
 from elspeth.contracts.blobs import BlobRecord, BlobReplacementPlan
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -76,9 +77,14 @@ async def test_replacement_recovers_acknowledgement_loss_without_restoring_commi
     original_mutate = authority.mutate
     injected = False
 
-    def lose_ack[T](context: SessionOperationContext, mutation: Callable[[SessionOperationMutationTransaction], T]) -> T:
+    def lose_ack[T](
+        context: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
+    ) -> T:
         nonlocal injected
-        result = original_mutate(context, mutation)
+        result = original_mutate(context, mutation, auto_mutation=auto_mutation)
         matches = isinstance(result, BlobReplacementPlan) and result.phase == phase
         if not injected and (matches or (phase == "retired" and result is True)):
             injected = True
@@ -143,9 +149,14 @@ async def test_successor_repairs_bytes_but_read_authority_preserves_replacement_
     class ProcessStopped(BaseException):
         pass
 
-    def stop_after_phase[T](context: SessionOperationContext, mutation: Callable[[SessionOperationMutationTransaction], T]) -> T:
+    def stop_after_phase[T](
+        context: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
+    ) -> T:
         nonlocal stopped
-        result = original_mutate(context, mutation)
+        result = original_mutate(context, mutation, auto_mutation=auto_mutation)
         if isinstance(result, BlobReplacementPlan) and result.phase == ("purge_pending" if committed else "swap_pending"):
             stopped = True
             raise ProcessStopped

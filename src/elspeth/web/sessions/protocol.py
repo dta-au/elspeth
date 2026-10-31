@@ -12,7 +12,7 @@ CompositionStateData is the input DTO for saving new state versions.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
@@ -46,6 +46,7 @@ from elspeth.contracts.composer_interpretation import (
     validate_surface_provenance,
 )
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex
@@ -70,6 +71,10 @@ from elspeth.web.sessions.pipeline_settlement_payloads import ComposerOperationB
 if TYPE_CHECKING:
     from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
+    from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy
+    from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.composer.graph_recovery import GraphRecoveryContext, GraphRecoveryIntent
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -78,8 +83,10 @@ if TYPE_CHECKING:
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.coordination.quota_authority import ProviderAttempt, TokenUsageEntry, TokenUsageSource
     from elspeth.web.execution.envelope import RunExecutionInput
+    from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
     from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
-    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft, RedactedToolRow, RejectionRecord
+    from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
     from elspeth.web.sessions.composer_operations import (
         ComposerOperationAssistantWrite,
         ComposerOperationClaim,
@@ -87,6 +94,18 @@ if TYPE_CHECKING:
         ComposerOperationRecord,
         ComposerOperationRunning,
     )
+    from elspeth.web.sessions.continuation import (
+        ComposerSegmentRecoveryReceipt,
+        ComposerSegmentStartObservation,
+        ComposerSegmentYieldReceipt,
+        ContinuationOwnerCommit,
+        StoredContinuationSnapshot,
+    )
+    from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
+    from elspeth.web.sessions.continuation_p4 import P4WriterObservation
+    from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
+    from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure
     from elspeth.web.sessions.graph_recovery import (
         CompositionGraphRead,
         CompositionStateHead,
@@ -1050,15 +1069,18 @@ class CompositionStateData:
     nodes: Sequence[Mapping[str, Any]] | None = None
     edges: Sequence[Mapping[str, Any]] | None = None
     outputs: Sequence[Mapping[str, Any]] | None = None
-    metadata_: Mapping[str, Any] | None = None
     is_valid: bool = False
     validation_errors: Sequence[CompositionValidationError] | None = None
     # Operational/audit meta describing how this state was reached. Distinct
     # from ``metadata_`` which carries user-facing PipelineMetadata. ``None``
     # is honest for revert/fork paths and for non-compose write paths.
     composer_meta: Mapping[str, Any] | None = None
+    # User-facing PipelineMetadata. Required: every stored state carries it
+    # (require_stored_state_metadata), so no producer may omit it.
+    metadata_: Mapping[str, Any] = field(kw_only=True)
 
     def __post_init__(self, source: Mapping[str, Any] | None) -> None:
+        require_stored_state_metadata(self, state_id="(unsaved)")
         serialize_composition_validation_errors(self.validation_errors)
         if source is not None:
             if self.sources is not None:
@@ -1073,8 +1095,7 @@ class CompositionStateData:
             non_none.append("edges")
         if self.outputs is not None:
             non_none.append("outputs")
-        if self.metadata_ is not None:
-            non_none.append("metadata_")
+        non_none.append("metadata_")
         if self.validation_errors is not None:
             non_none.append("validation_errors")
         if self.composer_meta is not None:
@@ -1141,7 +1162,7 @@ class CompositionStateRecord:
     nodes: Sequence[Mapping[str, Any]] | None
     edges: Sequence[Mapping[str, Any]] | None
     outputs: Sequence[Mapping[str, Any]] | None
-    metadata_: Mapping[str, Any] | None
+    metadata_: Mapping[str, Any]
     is_valid: bool
     validation_errors: Sequence[CompositionValidationError] | None
     created_at: datetime
@@ -1157,6 +1178,7 @@ class CompositionStateRecord:
     review_projection: CompositionStateReviewProjection | None = None
 
     def __post_init__(self) -> None:
+        require_stored_state_metadata(self, state_id=self.id)
         serialize_composition_validation_errors(self.validation_errors)
         non_none = []
         if self.source is not None:
@@ -1169,14 +1191,24 @@ class CompositionStateRecord:
             non_none.append("edges")
         if self.outputs is not None:
             non_none.append("outputs")
-        if self.metadata_ is not None:
-            non_none.append("metadata_")
+        non_none.append("metadata_")
         if self.validation_errors is not None:
             non_none.append("validation_errors")
         if self.composer_meta is not None:
             non_none.append("composer_meta")
         if non_none:
             freeze_fields(self, *non_none)
+
+
+def require_stored_state_metadata(state: CompositionStateData | CompositionStateRecord, *, state_id: object) -> None:
+    """Tier 1: every stored composition state carries its pipeline metadata.
+
+    The one rule for both directions: each writer refuses to store a state
+    without it, and ``state_from_record`` refuses to read one back, so the
+    store never holds a record ELSPETH cannot reconstruct.
+    """
+    if state.metadata_ is None:
+        raise ValueError(f"Composition state {state_id} has None metadata_; a stored state always carries its pipeline metadata")
 
 
 @final
@@ -2436,6 +2468,88 @@ class SessionOperationAuthority(Protocol):
     part of the public authority surface.
     """
 
+    def reconcile_unavailable_composer_segment(
+        self,
+        candidate: ContinuationRecoveryCandidate,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> Literal["recovered", "settled", "unchanged"]:
+        """Reprove unavailable ownership and atomically choose Stop or recovery."""
+        ...
+
+    def settle_lost_inactive_continuation(self, candidate: ContinuationInactiveCandidate, *, auth_provider_type: str) -> bool:
+        """Settle an archived non-running segment without acquiring its fence."""
+        ...
+
+    def recover_composer_segment(
+        self,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+    ) -> bool:
+        """Recover one unavailable continuation owner under actual SQL liveness."""
+        ...
+
+    def suspend_composer_segment(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        retry_delay_seconds: float = 0.0,
+        deadline: ComposerDrainDeadline | None = None,
+    ) -> ComposerSegmentRecoveryReceipt:
+        """Hand a live owner's segment to its next generation and release the fence."""
+        ...
+
+    def commit_checkpoint_and_successor(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        expected_head: UUID | None,
+        expected_checkpoint_id: str,
+        expected_cursor: int,
+        snapshot_json: str,
+        reason: ContinuationYieldReason,
+    ) -> ComposerSegmentYieldReceipt:
+        """Yield at a handoff-safe cut: one successor queued, fence released."""
+        ...
+
+    def verify_yield(self, receipt: ComposerSegmentYieldReceipt) -> None:
+        """Read back a committed yield, tolerating its successor's progress."""
+        ...
+
+    def verify_recovery(self, receipt: ComposerSegmentRecoveryReceipt, *, deadline: ComposerDrainDeadline | None = None) -> None:
+        """Read back an exact recovered generation, tolerating later peer progress."""
+        ...
+
+    def read_yield_outcome(self, running: ComposerOperationRunning) -> ComposerSegmentYieldReceipt | None:
+        """After an ambiguous commit: None if the yield did not commit, else its receipt."""
+        ...
+
+    def start_composer_segment(
+        self,
+        claim: ComposerOperationClaim,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+        segment_policy: ContinuationSegmentPolicy | None = None,
+        observation: ComposerSegmentStartObservation | None = None,
+        deadline: ComposerDrainDeadline | None = None,
+    ) -> SessionOperationContext:
+        """Start one current admitted continuation claim under its actual SQL fence."""
+        ...
+
+    def reconcile_composer_segment_start(
+        self, observation: ComposerSegmentStartObservation, *, deadline: ComposerDrainDeadline | None = None
+    ) -> SessionOperationContext | None:
+        """Prove this actual producer's committed context or known unstarted claim."""
+        ...
+
     def start_composer_async_operation(
         self,
         claim: ComposerOperationClaim,
@@ -2498,6 +2612,8 @@ class SessionOperationAuthority(Protocol):
         self,
         context: SessionOperationContext,
         mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
     ) -> T: ...
 
     def release(self, context: SessionOperationContext) -> None: ...
@@ -3069,6 +3185,17 @@ class SessionServiceProtocol(Protocol):
         candidate_state: CompositionState | None = None,
     ) -> GraphRecoverySettlement: ...
 
+    async def fail_continuation_tool_operation(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        required_work: RequiredWorkCoordinator,
+        failure_projection_work: RequiredWorkTicket,
+        env_ref_names: frozenset[str],
+        original: BaseException | None = None,
+        custody: ContinuationToolFailureCustody | None = None,
+    ) -> CommittedContinuationFailure: ...
+
     async def fail_composer_async_operation(
         self,
         running: ComposerOperationRunning,
@@ -3169,7 +3296,8 @@ class SessionServiceProtocol(Protocol):
         session_operation_context: SessionOperationContext,
         running: ComposerOperationRunning,
         required_work: RequiredWorkTicket | None = None,
-    ) -> MessageIngressFresh:
+        continuation: StoredContinuationSnapshot | None = None,
+    ) -> MessageIngressFresh | ContinuationIngressCheckpoint:
         """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
@@ -3568,6 +3696,34 @@ class SessionServiceProtocol(Protocol):
         """Atomically replace exact pending suffixes with closed outcomes."""
         ...
 
+    async def persist_continuation_compose_turn(
+        self,
+        *,
+        session_id: str,
+        assistant_content: str,
+        raw_content: str | None = None,
+        redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
+        redacted_tool_rows: tuple[RedactedToolRow, ...],
+        revoked_tool_rows: tuple[RedactedToolRow, ...],
+        mutation_ceiling: ComposerMutationCeiling | None = None,
+        authority_revocation: ComposerMutationRevocation | None = None,
+        private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
+        private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
+        rejection_records: tuple[RejectionRecord, ...] = (),
+        parent_composition_state_id: str | None,
+        expected_current_state_id: str | None,
+        writer_principal: ChatMessageWriterPrincipal,
+        plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
+        continuation: ContinuationOwnerCommit,
+        continuation_prepared: PreparedP4Value,
+        continuation_env_ref_names: frozenset[str] = frozenset(),
+        required_work: RequiredWorkTicket,
+        continuation_observation: P4WriterObservation | None = None,
+    ) -> RequiredSQLFinishOnce[CommittedContinuationP4]:
+        """Complete actual continuation P4 SQL outcome before deferred cancellation."""
+        ...
+
     async def persist_compose_turn_async(
         self,
         *,
@@ -3576,6 +3732,9 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...],
         redacted_tool_rows: tuple[Any, ...],
+        revoked_tool_rows: tuple[Any, ...],
+        mutation_ceiling: ComposerMutationCeiling | None = None,
+        authority_revocation: ComposerMutationRevocation | None = None,
         private_tool_evidence: tuple[ComposerDiagnosticEvidence, ...],
         private_tool_failures: tuple[ComposerDiagnosticEvidence, ...] = (),
         rejection_records: tuple[Any, ...] = (),

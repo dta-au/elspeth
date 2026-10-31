@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import threading
 import time
@@ -23,6 +24,7 @@ from sqlalchemy.pool import NullPool
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.landscape import leader_coordination_token
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.architecture import test_digest_column_shape_checks as digest_gate
 from tests.unit.core.test_schema_shape import _static_check_issues
@@ -521,14 +523,18 @@ def _seed_postgres_trigger_rows(postgres_engine: Engine, *, session_id: str, inc
             text(
                 """
                 INSERT INTO composition_states (
-                    id, session_id, version, is_valid, created_at, provenance
+                    id, session_id, version, is_valid, created_at, provenance, metadata_
                 ) VALUES (
                     :state_id, :session_id, 1, false, CURRENT_TIMESTAMP,
-                    'session_seed'
+                    'session_seed', CAST(:metadata AS JSON)
                 )
                 """
             ),
-            {"state_id": f"{session_id}-state", "session_id": session_id},
+            {
+                "state_id": f"{session_id}-state",
+                "session_id": session_id,
+                "metadata": json.dumps(stored_default_pipeline_metadata()),
+            },
         )
         conn.execute(
             text(

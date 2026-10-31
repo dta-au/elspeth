@@ -78,7 +78,7 @@ def test_authoring_surface_telemetry_emission_shape_is_pinned() -> None:
     assert len(emissions) == 1
     fields = {keyword.arg: ast.unparse(keyword.value) for keyword in emissions[0].keywords}
     assert fields == {
-        "authoring_surface": "'planner' if planner_eligible else 'compose_loop'",
+        "authoring_surface": "'compose_loop'",
         "state_is_structurally_empty": "state_is_empty",
         "session_id": "session_id",
     }

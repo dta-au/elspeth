@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Maintained subsystem reference for the unreleased 0.8.9 candidate.
+Maintained subsystem reference for the unreleased 0.8.10 candidate.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution
@@ -16,7 +16,7 @@ Landscape subsystem.
 
 [`schema.py`](../../src/elspeth/core/landscape/schema.py) owns the SQLAlchemy
 metadata, constraints, indexes, and `SQLITE_SCHEMA_EPOCH`. The current release
-requires Landscape epoch 50 and Sessions epoch 78. Startup accepts an empty
+requires Landscape epoch 50 and Sessions epoch 79. Startup accepts an empty
 store or the exact current schema; it does not migrate or relabel earlier
 evidence. Epoch 50 adds durable provider-attempt identity on run calls; epoch 49
 added the `pending_identities_purged` authentication event.

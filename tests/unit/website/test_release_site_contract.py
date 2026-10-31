@@ -6,6 +6,7 @@ import tomllib
 from datetime import date
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
@@ -54,6 +55,9 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     current_heading = f"\n## {CURRENT_VERSION} - "
     assert changelog.count(current_heading) == 1
     current_release = changelog.split(current_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+    historical_089_heading = "\n## 0.8.9 - 2026-10-21\n"
+    assert changelog.count(historical_089_heading) == 1
+    release_089 = changelog.split(historical_089_heading, maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_086 = changelog.split("\n## 0.8.6 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_085 = changelog.split("\n## 0.8.5 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_084 = changelog.split("\n## 0.8.4 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
@@ -62,25 +66,35 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     release_080 = changelog.split("\n## 0.8.0 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
     release_071 = changelog.split("\n## 0.7.1 - ", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
 
-    assert f"Session epoch advances from 77 to {SESSION_SCHEMA_EPOCH}" in current_release
-    assert f"Landscape advances from epoch 49 to {SQLITE_SCHEMA_EPOCH}" in current_release
-    assert "immutable graph snapshots" in current_release
-    assert "both distinct epoch-76" in current_release
-    assert "cannot share session stores or replicas" in current_release
-    assert "Preserve epoch-75 stores" in current_release
-    assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(current_release.split())
-    assert f"new epoch-{SESSION_SCHEMA_EPOCH} target" in current_release
-    assert "Drain and isolate old/new deployments" in current_release
-    assert "no migration,\nreset, restamping or downgrade" in current_release
+    assert f"Session epoch advances from 78 to {SESSION_SCHEMA_EPOCH}" in current_release
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_release
+    current_text = " ".join(current_release.split())
+    assert "An existing epoch-78 Sessions store is refused, not migrated" in current_text
+    assert "fresh Sessions store" in current_text
+    assert "leave the epoch-78 database in place" in current_text
+    assert "Automatic image publication from main remains held" in current_text
+    assert "Verify any release tag and container digest separately" in current_text
+    assert "this entry does not prove either has been published" in current_text
+
+    assert "Session epoch advances from 77 to 78" in release_089
+    assert "Landscape advances from epoch 49 to 50" in release_089
+    assert "immutable graph snapshots" in release_089
+    assert "both distinct epoch-76" in release_089
+    assert "cannot share session stores or replicas" in release_089
+    assert "Preserve epoch-75 stores" in release_089
+    assert "epoch-77 session stores and epoch-49 Landscape stores" in " ".join(release_089.split())
+    assert "new epoch-78 target" in release_089
+    assert "Drain and isolate old/new deployments" in release_089
+    assert "no migration,\nreset, restamping or downgrade" in release_089
     release_date = current_release.splitlines()[0].strip()
     assert date.fromisoformat(release_date).isoformat() == release_date
     assert "Composer correctness and recovery" in release_086
     assert "Reply admission does not clear graph" in release_086
     assert "Session epoch advances from 75 to 76" in release_086
     assert "explicitly new epoch-76 target" in release_086
-    assert "Automatic image publication from main remains held" in " ".join(current_release.split())
-    assert f"The {CURRENT_VERSION} tag and container publication follow successful required checks and the protected merge" in " ".join(
-        current_release.split()
+    assert "Automatic image publication from main remains held" in " ".join(release_089.split())
+    assert "The 0.8.9 tag and container publication follow successful required checks and the protected merge" in " ".join(
+        release_089.split()
     )
     assert "LLM compatibility and Composer recovery" in release_085
     assert "Omitted LLM temperature uses the provider default" in release_085
@@ -104,6 +118,22 @@ def test_changelog_preserves_historical_epochs_and_documents_current_compatibili
     assert "SESSION_SCHEMA_EPOCH` advances from 26\nto 35" in release_071
     assert "install\n0.7.1" in release_071
     assert "Blob deletion cleanup remains retryable" not in release_071
+
+
+def test_current_release_compatibility_validator_rejects_malformed_iso_date(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_changelog_preserves_historical_epochs_and_documents_current_compatibility()
+    original_text = _text
+    changelog = original_text(ROOT / "CHANGELOG.md")
+    current_heading = next(line for line in changelog.splitlines() if line.startswith(f"## {CURRENT_VERSION} - "))
+    drifted = changelog.replace(current_heading, f"## {CURRENT_VERSION} - 2026-10-XX", 1)
+    assert drifted != changelog
+
+    def text_with_bad_date(path: Path) -> str:
+        return drifted if path == ROOT / "CHANGELOG.md" else original_text(path)
+
+    monkeypatch.setattr(f"{__name__}._text", text_with_bad_date)
+    with pytest.raises(ValueError, match="Invalid isoformat string"):
+        test_changelog_preserves_historical_epochs_and_documents_current_compatibility()
 
 
 def test_every_page_has_description_favicon_and_current_navigation() -> None:
@@ -200,6 +230,8 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
     assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
     assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert f"Sessions advance from 78 to {SESSION_SCHEMA_EPOCH}" in current_text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in current_text
     assert "Qualification uses explicitly new compatible stores" in current_text
     assert f"explicitly new epoch-{SQLITE_SCHEMA_EPOCH} Landscape target" in current_text
     assert "epoch-49 Landscape stores with compatible prior application access" in current_text

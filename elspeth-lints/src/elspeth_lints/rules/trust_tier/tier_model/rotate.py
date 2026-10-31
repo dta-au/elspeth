@@ -59,7 +59,6 @@ Out of scope
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from collections import defaultdict
 from collections.abc import Collection
@@ -80,6 +79,7 @@ from elspeth_lints.core.allowlist import (
 from elspeth_lints.core.allowlist_io import AllowlistIOError, parse_allow_hits
 from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
+from elspeth_lints.core.trusted_git import SourceSnapshotError, git_metadata_operation, run_git_metadata
 
 from .rule import (
     Finding,
@@ -755,6 +755,23 @@ def check_rotation_audit_coverage(
     repo_root: Path,
     rotation_log_path: Path = DEFAULT_ROTATION_LOG_PATH,
 ) -> RotationAuditCoverageReport:
+    """Check rotations within one callback-free immutable metadata operation."""
+    with git_metadata_operation(repo_root):
+        return _check_rotation_audit_coverage(
+            allowlist_root=allowlist_root,
+            baseline_ref=baseline_ref,
+            repo_root=repo_root,
+            rotation_log_path=rotation_log_path,
+        )
+
+
+def _check_rotation_audit_coverage(
+    *,
+    allowlist_root: Path,
+    baseline_ref: str,
+    repo_root: Path,
+    rotation_log_path: Path = DEFAULT_ROTATION_LOG_PATH,
+) -> RotationAuditCoverageReport:
     """Verify fingerprint-only allowlist rotations have manifest records."""
     repo_root = repo_root.resolve()
     allowlist_root = _resolve_under_repo(path=allowlist_root, repo_root=repo_root)
@@ -1105,19 +1122,10 @@ def _git_show(*, baseline_ref: str, rel_path: str, repo_root: Path) -> str | Non
 
 
 def _run_git(args: list[str], *, repo_root: Path) -> subprocess.CompletedProcess[str]:
-    env = os.environ.copy()
-    env["LC_ALL"] = "C"
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo_root,
-            capture_output=True,
-            check=False,
-            text=True,
-            env=env,
-        )
-    except OSError as exc:
-        raise RotationAuditError(f"git command failed to start: {exc}") from exc
+        return run_git_metadata(args, repo_root=repo_root)
+    except SourceSnapshotError as exc:
+        raise RotationAuditError(f"git metadata observation failed: {exc}") from exc
 
 
 def _git_commit_exists(*, baseline_ref: str, repo_root: Path) -> bool:

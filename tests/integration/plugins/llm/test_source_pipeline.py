@@ -672,6 +672,10 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
     isolated_manager: PluginManager,
     tmp_path: Path,
 ) -> None:
+    from elspeth.contracts import TerminalPath
+    from elspeth.contracts.scheduler import TokenWorkStatus
+    from elspeth.core.landscape.schema import token_work_items_table
+
     db, payload_store, source, output_path, pipeline, graph = _build_pipeline(
         manager=isolated_manager,
         provider="openrouter",
@@ -724,25 +728,64 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
         calls_before_resume = factory.execution.get_operation_calls(source_operation.operation_id)
         assert [call.call_type for call in calls_before_resume] == [CallType.HTTP, CallType.LLM]
         assert all(call.status is CallStatus.SUCCESS for call in calls_before_resume)
-        persisted_ids_before_resume = _assert_persisted_row_and_artifact(
-            factory=factory,
-            payload_store=payload_store,
-            output_path=output_path,
-            run_id=run_id,
-            expected_row={
-                "answer": "A careful answer",
-                "answer_usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-                "answer_model": "openai/gpt-4o-mini",
-            },
-        )
+        expected_row = {
+            "answer": "A careful answer",
+            "answer_usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            "answer_model": "openai/gpt-4o-mini",
+        }
+        rows_before_resume = factory.query.get_rows(run_id)
+        assert len(rows_before_resume) == 1
+        row = rows_before_resume[0]
+        assert (row.row_index, row.source_row_index, row.ingest_sequence) == (0, 0, 0)
+        assert row.source_data_ref is not None
+        payload_bytes = payload_store.retrieve(row.source_data_ref)
+        assert sha256(payload_bytes).hexdigest() == row.source_data_ref
+        assert row.source_data_ref == row.source_data_hash == stable_hash(expected_row)
+        assert json.loads(payload_bytes) == expected_row
+        row_data = factory.query.get_row_data(row.row_id)
+        assert row_data.state is RowDataState.AVAILABLE
+        assert row_data.data is not None
+        assert dict(row_data.data) == expected_row
         checkpoint_before_resume = checkpoint_manager.get_latest_checkpoint(run_id)
         assert checkpoint_before_resume is not None
-        rows_before_resume = factory.query.get_rows(run_id)
-        tokens_before_resume = factory.query.get_tokens(rows_before_resume[0].row_id)
+        tokens_before_resume = factory.query.get_tokens(row.row_id)
+        assert len(tokens_before_resume) == 1
+        token = tokens_before_resume[0]
+        outcomes_before_resume = factory.query.get_all_token_outcomes_for_run(run_id)
+        assert len(outcomes_before_resume) == 1
+        assert outcomes_before_resume[0].token_id == token.token_id
+        assert outcomes_before_resume[0].path is TerminalPath.ABANDONED
+        assert outcomes_before_resume[0].completed is False
+        assert outcomes_before_resume[0].context_json is not None
+        assert json.loads(outcomes_before_resume[0].context_json)["incomplete_sources"] == {"primary": "interrupted"}
+        with db.connection() as conn:
+            assert conn.execute(
+                select(node_states_table.c.node_id, node_states_table.c.status).where(node_states_table.c.token_id == token.token_id)
+            ).all() == [(row.source_node_id, "completed")]
+            work_before_resume = conn.execute(
+                select(token_work_items_table).where(token_work_items_table.c.token_id == token.token_id)
+            ).all()
+        assert len(work_before_resume) == 1
+        assert work_before_resume[0].status == TokenWorkStatus.FAILED.value
+        assert work_before_resume[0].pending_sink_name is None
+        # The provider completed, but cooperative Stop admission prevented any
+        # sink dispatch. Preserve the source evidence without inventing output.
         artifacts_before_resume = factory.execution.get_artifacts(run_id)
         effects_before_resume = factory.execution.sink_effects.get_effects_for_run(run_id)
         members_before_resume = factory.execution.sink_effects.get_members_for_run(run_id)
-        output_before_resume = output_path.read_bytes()
+        assert artifacts_before_resume == []
+        assert effects_before_resume == ()
+        assert members_before_resume == ()
+        assert not output_path.exists()
+
+        def persisted_bytes() -> dict[Path, bytes]:
+            # Snapshot all persisted files, including SQLite WAL and source
+            # payloads. The SHM reader-lock file contains no persisted data.
+            return {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and not path.name.endswith("-shm")}
+
+        bytes_before_resume = persisted_bytes()
+        assert tmp_path / "audit.db" in bytes_before_resume
+        assert any(path.is_relative_to(payload_store.base_path) for path in bytes_before_resume)
 
         # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
         # source, so get_resume_point raises a refusal. Hand-build the resume
@@ -765,7 +808,8 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
             )
 
     assert route.call_count == 1
-    assert output_path.read_bytes() == output_before_resume
+    assert persisted_bytes() == bytes_before_resume
+    assert not output_path.exists()
     post_factory = RecorderFactory(db, payload_store=payload_store)
     assert post_factory.run_lifecycle.get_run(run_id) == interrupted_run
     post_lifecycle = post_factory.run_lifecycle.get_run_source_lifecycle_records(run_id)
@@ -775,21 +819,14 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
     assert post_factory.execution.get_operation_calls(source_operation.operation_id) == calls_before_resume
     assert post_factory.query.get_rows(run_id) == rows_before_resume
     assert post_factory.query.get_tokens(rows_before_resume[0].row_id) == tokens_before_resume
+    assert post_factory.query.get_all_token_outcomes_for_run(run_id) == outcomes_before_resume
     assert post_factory.execution.get_artifacts(run_id) == artifacts_before_resume
     assert post_factory.execution.sink_effects.get_effects_for_run(run_id) == effects_before_resume
     assert post_factory.execution.sink_effects.get_members_for_run(run_id) == members_before_resume
     assert checkpoint_manager.get_latest_checkpoint(run_id) == checkpoint_before_resume
-    assert (
-        _assert_persisted_row_and_artifact(
-            factory=post_factory,
-            payload_store=payload_store,
-            output_path=output_path,
-            run_id=run_id,
-            expected_row={
-                "answer": "A careful answer",
-                "answer_usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-                "answer_model": "openai/gpt-4o-mini",
-            },
+    with db.connection() as conn:
+        assert (
+            conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == token.token_id)).all()
+            == work_before_resume
         )
-        == persisted_ids_before_resume
-    )
+    assert payload_store.retrieve(row.source_data_ref) == payload_bytes

@@ -1,7 +1,7 @@
 # ADR-043: Shared Development Tooling and GitHub Issues
 
 **Date:** 2026-08-29
-**Amended:** 2026-09-25
+**Amended:** 2026-09-25, 2026-10-24
 **Status:** Accepted
 **Deciders:** ELSPETH maintainers
 **Tags:** tooling, delivery-posture, trust-tier, gates, related-adr-046
@@ -100,7 +100,50 @@ Retirement uses ordinary hygiene: archive useful state, remove the project's
 integration surfaces and local data, and report the result. Destructive
 shared-state actions still need the maintainer's authorization.
 
+## Additions
+
+### Work-at-risk check and lane rules — added 2026-10-24
+
+The maintainer adopted the decisions table of the
+[lane-process review](../../maintainer/lane-process-review-2026-10-24.md).
+Two agent trees had gone about 62 h and 66 h without a commit, and
+gitignored lane directories held 1,287 copies of `src/elspeth` that
+`git status` could not see. `scripts/work-at-risk.sh` joins the canonical
+scripts as a read-only report of uncommitted work, gitignored source copies
+and lane-directory size. AGENTS.md now requires work-in-progress commits at
+every agent stop and at least every 4 h of edits, treats source under a
+gitignored path as a defect, limits `.claude/lanes/<run>/` to notes and logs,
+and deletes a lane directory 14 days after its branch merges or is abandoned.
+
+The standing dispatch grant in `docs/maintainer/toolchain.md` was tempered at
+the same time: dispatch in proportion to risk, with a cap on evidence per
+unit.
+
 ## Retirements
+
+### Lane orchestrator skill and `/resume-lanes` — retired 2026-10-24
+
+Retired under the same review. The orchestrator's state machine was not used
+as designed: 106 of its 131 recorded lanes were still pending. The skill, its
+`.claude/skills` symlink, the `/resume-lanes` command and its ignore entries
+were removed; its local control database is ordinary tool state and is
+removed with the tool's own hygiene. The pipeline engine's orchestrator under
+`src/elspeth/engine/` is product code and is unaffected.
+
+### Red-team trigger — retired 2026-10-24
+
+The automatic seam trigger, its post-commit hook and installer, the
+reverted-guard detector and their tests were removed. The hook had been a
+no-op and the trigger had run twice. The red-team agent charter stays and is
+spawned on demand, on the chokepoints AGENTS.md names.
+
+### lane-manager full-suite verification — removed 2026-10-24
+
+lane-manager keeps its commits-ahead-of-base check and its red → green proof.
+It no longer runs the full suite per lane, which cost about 32 min a lane,
+serially, and again after every merge. The full-suite gate runs once on the
+final merged tree. Its state moved from `.lanes/` to
+`.claude/lanes/<run-id>/`.
 
 ### Local issue tracker and code index — retired 2026-09-25
 

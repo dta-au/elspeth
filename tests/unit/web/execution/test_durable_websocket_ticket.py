@@ -22,6 +22,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.auth_sessions import make_session_binding
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 
 def seed_ticket_run(engine: Engine) -> tuple[str, str, UserIdentity]:
@@ -56,7 +57,13 @@ def seed_ticket_run(engine: Engine) -> tuple[str, str, UserIdentity]:
         )
         conn.execute(
             insert(composition_states_table).values(
-                id=state_id, session_id=session_id, version=1, is_valid=True, created_at=now, provenance="session_seed"
+                metadata_=stored_default_pipeline_metadata(),
+                id=state_id,
+                session_id=session_id,
+                version=1,
+                is_valid=True,
+                created_at=now,
+                provenance="session_seed",
             )
         )
         conn.execute(insert(runs_table).values(id=run_id, session_id=session_id, state_id=state_id, status="running", started_at=now))

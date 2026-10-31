@@ -1406,6 +1406,33 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "SessionServiceImpl._insert_chat_message (allowlisted above)."
         ),
     ),
+    ReviewedWriter(
+        path="tests/integration/web/composer/test_freeform_pipeline_planner.py",
+        enclosing_symbol="test_direct_manifest_mismatch_checkpoint_defers_original_cancellation.pause",
+        table="chat_messages",
+        operation="raw_string_in_startswith",
+        purpose=(
+            "READ-ONLY statement matcher: a before_cursor_execute listener "
+            "matches `INSERT INTO chat_messages` to pause the production native "
+            "llm_call_audit insert while the deferred cancellation is observed. "
+            "The test issues no insert; the matched statement is the production "
+            "writer's own."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/testcontainer/web/test_content_publication_contention_postgres.py",
+        enclosing_symbol="test_control_without_session_serialisation_two_writers_collide_on_one_version.hold_before_insert",
+        table="composition_states",
+        operation="raw_string_in_startswith",
+        purpose=(
+            "READ-ONLY statement matcher: a before_cursor_execute listener "
+            "matches `INSERT INTO COMPOSITION_STATES` to hold both racing "
+            "production writers at a barrier between their version read and "
+            "insert (the control that proves serialisation matters). The test "
+            "issues no insert; both matched statements come from the "
+            "production content-publication repository."
+        ),
+    ),
     # ------ tests/unit/web/sessions/test_interpretation_events_table.py — Phase 5b Task 2 schema tests (4 sites) ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_interpretation_events_table.py",

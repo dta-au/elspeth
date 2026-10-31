@@ -832,13 +832,6 @@ class TestAutoWireIdempotence:
         frozen = MappingProxyType({"sources": MappingProxyType({}), "nodes": (), "edges": (), "outputs": ()})
         assert wire_required_controls(frozen, req_snapshot, req_view) is frozen
 
-        # REQUIRED posture through the service finalizer factory (the seam the
-        # regression test exercises).
-        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
-
-        finalize = _required_controls_candidate_finalizer(policy_catalog=req_view, plugin_snapshot=req_snapshot)
-        assert finalize(frozen) is frozen
-
 
 class TestAutoWireRefusals:
     def test_recommend_mode_inserts_nothing(self, tmp_path: Path) -> None:
@@ -990,21 +983,6 @@ class TestAutoWireRefusals:
         nodes = _nodes_by_id(wired)
         assert nodes["prompt_shield_auto_1"]["plugin"] == "passthrough"
         assert nodes["prompt_shield_auto_2"]["plugin"] == "aws_bedrock_prompt_shield"
-
-
-class TestServiceFinalizerFactory:
-    """The exact finalizer callable all three plan_pipeline sites now pass."""
-
-    def test_finalizer_wires_the_candidate(self, tmp_path: Path) -> None:
-        from elspeth.web.composer.planning_application import _required_controls_candidate_finalizer
-
-        view, snapshot = _guardrail_profile_view(tmp_path)
-        finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot)
-
-        wired = finalize(_bare_llm_candidate())
-
-        assert type(wired) is dict  # the planner's exact-dict finalizer contract
-        assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
 
 
 class TestDisclosureRegistry:

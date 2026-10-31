@@ -125,6 +125,11 @@ def test_each_source_has_exact_plan_mapping(authority, source):
         7,
         5,
         5,
+        11,
+        11,
+        11,
+        11,
+        14,
     )
     expected_phases = (
         2,
@@ -182,8 +187,13 @@ def test_each_source_has_exact_plan_mapping(authority, source):
         5,
         2,
         5,
+        2,
+        5,
+        4,
+        5,
+        2,
     )
-    assert len(RequiredWorkSource) == len(SOURCE_MAPPING) == 55
+    assert len(RequiredWorkSource) == len(SOURCE_MAPPING) == 60
     key = make_required_work_key(authority, source)
     assert (key.stage.value, key.subphase.value) == (expected_stages[source.value], expected_phases[source.value])
     assert key.invocation_ordinal == source.value * (source.value + 1) // 2

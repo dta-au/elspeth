@@ -22,11 +22,9 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.authority_hashing import composer_authority_hash
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import execute_tool
@@ -43,6 +41,7 @@ from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.integration.pipeline.test_colour_multi_query_contract_repair import ColourScenario, run_colour_pipeline
 from tests.integration.web.composer.test_prompt_review_card_end_to_end import _accept_as_drafted, _persist, _run_surfacer
 from tests.unit.web.composer.conftest import _fake_llm_response, _make_settings, build_test_sessions_service
@@ -247,31 +246,33 @@ async def _author(harness: _Harness, tmp_path: Path, content: str) -> Compositio
     ]
     snapshots: list[list[dict[str, Any]]] = []
 
-    async def planner(
-        messages: list[dict[str, Any]],
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> Any:
-        snapshots.append(deepcopy(messages))
-        assert responses, messages[-1]["content"]
-        return _admit_composer_llm_completion(responses.pop(0))
+    script = ComposerSDKScript(
+        primary_model=harness.settings.composer_model,
+        primary=responses,
+        advisor_model=harness.settings.composer_advisor_model,
+    )
 
-    async def advisor(**_kwargs: Any) -> ModelResponse:
+    async def advisor(**kwargs: Any) -> ModelResponse:
+        assert script.advisor.call_count <= len(responses) + 1, "Unscripted further Advisor transition"
+        schema = kwargs["response_format"]["json_schema"]["name"]
+        assert schema in {"advisor_checkpoint_response", "advisor_end_response"}
+        review = {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "CLEAN", "note": None}
+        if schema == "advisor_end_response":
+            review["publication_verdict"] = "ADMIT"
         return ModelResponse(
             model="test-advisor",
-            choices=[{"message": {"role": "assistant", "content": "CLEAN"}, "finish_reason": "stop"}],
+            choices=[{"message": {"role": "assistant", "content": json.dumps(review)}, "finish_reason": "stop"}],
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         )
 
-    with (
-        patch.object(harness.service._provider_gateway, "_call_llm", new=planner),
-        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", new=advisor),
-    ):
+    script.advisor.side_effect = advisor
+
+    async def complete(**kwargs: Any) -> object:
+        if "tools" in kwargs:
+            snapshots.append(deepcopy(kwargs["messages"]))
+        return await script(**kwargs)
+
+    with patch("litellm.acompletion", new=complete):
         result = await harness.service.compose(
             _USER_MESSAGE, [], base, session_id=str(harness.session_id), user_id="alice", user_message_id=str(harness.user_message_id)
         )

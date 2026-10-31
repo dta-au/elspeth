@@ -24,7 +24,6 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -53,7 +52,7 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from elspeth.web.sessions import composer_turn
+from elspeth.web.sessions import composer_finalization, composer_turn
 from elspeth.web.sessions.composer_app_services import composer_app_services
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import (
@@ -70,6 +69,7 @@ from elspeth.web.sessions.routes._helpers import ComposerRequestLifecycle, compo
 from elspeth.web.sessions.routes.composer import pipeline_settlement
 from elspeth.web.sessions.schemas import MessageWithStateResponse, RecomposeRequest, SendMessageRequest
 from elspeth.web.sessions.service import SessionServiceImpl
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.sessions.test_routes import (
     _EMPTY_STATE,
@@ -432,8 +432,17 @@ async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp
     from sqlalchemy import select
 
     from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer.audit import llm_call_audit_envelope
+    from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
+    from elspeth.web.composer.visible_tool_event import visible_response_gap
     from elspeth.web.sessions import composer_async_worker
-    from elspeth.web.sessions.models import chat_messages_table
+    from elspeth.web.sessions.models import (
+        chat_messages_table,
+        composition_proposals_table,
+        composition_states_table,
+        quota_provider_attempts_table,
+        token_usage_ledger_table,
+    )
     from tests.helpers.composer_operations import message_body, submit_and_settle
 
     app, service, guards, sdk, events = await _guarded_title_turn_app(
@@ -441,8 +450,25 @@ async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp
     )
     results = []
     failures = []
+    preparations = []
+    physical_calls = []
+    physical_contexts = []
     real_compose = app.state.composer_service.compose
     real_turn = composer_async_worker.run_composer_turn
+    real_prepare = service.prepare_graph_recovery
+    real_finish = service.finish_provider_attempt
+
+    async def record_actual_physical_call(*, session_operation_context, call, required_work=None):
+        result = await real_finish(session_operation_context=session_operation_context, call=call, required_work=required_work)
+        physical_calls.append(call)
+        physical_contexts.append(session_operation_context)
+        return result
+
+    async def record_actual_preparation(*args, **kwargs):
+        assert kwargs["candidate_state"] is None, "A reset handoff must not manufacture a candidate"
+        recovery = await real_prepare(*args, **kwargs)
+        preparations.append(recovery)
+        return recovery
 
     async def record_actual_failure(*args, **kwargs):
         try:
@@ -458,11 +484,21 @@ async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp
 
     monkeypatch.setattr(app.state.composer_service, "compose", record_actual_result)
     monkeypatch.setattr(composer_async_worker, "run_composer_turn", record_actual_failure)
+    monkeypatch.setattr(service, "prepare_graph_recovery", record_actual_preparation)
+    monkeypatch.setattr(service, "finish_provider_attempt", record_actual_physical_call)
     session = await service.create_session("alice", "New session", "local")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         settled = await submit_and_settle(
             client, app, path=f"/api/sessions/{session.id}/messages", body=message_body("Build the requested pipeline.")
         )
+        public = await client.get(f"/api/sessions/{session.id}/messages")
+        expanded = await client.get(
+            f"/api/sessions/{session.id}/messages",
+            params={"include_llm_audit": "true", "include_raw_content": "true", "include_tool_rows": "true"},
+        )
+        assert public.status_code == expanded.status_code == 200
+        for surface in (public.text, expanded.text):
+            assert "title-order-handoff" not in surface and DIAGNOSTIC_EVIDENCE_KIND not in surface
     rows = await service.get_messages(session.id, limit=None, include_private_evidence=True)
     with service._engine.connect() as connection:
         durable_rows = connection.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).all()
@@ -475,27 +511,70 @@ async def test_real_worker_title_gate_preserves_actual_planner_handoff_audit(tmp
         assert _user_and_assistant_roles(rows) == ["user"]
     else:
         assert settled.final.json()["status"] == "completed", failures
-        assert settled.result()["message"]["content"] == "Let's discuss the pipeline."
+        response = MessageWithStateResponse.model_validate_json(json.dumps(settled.result()), strict=True)
+        assert response.message.content == "Let's discuss the pipeline."
         assert len(results) == 1 and results[0].graph_recovery_intent is not None
         assert results[0].graph_recovery_intent.action == "reset_to_safe_checkpoint"
-        drafts = results[0].recovery_audit_drafts
-        assert drafts, "the actual planner handoff must carry its recovery audit cohort"
-        for draft in drafts:
-            if draft.tool_calls and draft.tool_calls[0]["_kind"] == "llm_call_audit":
-                # Physical settlement already checkpointed this exact complete
-                # call. Cohort replay keeps that row, including its original
-                # content, rather than duplicating it with a summary string.
-                matches = [row for row in durable_rows if deep_thaw(row.tool_calls) == deep_thaw(draft.tool_calls)]
-                assert len(matches) == 1 and matches[0].content == "Provider call result recorded."
-                continue
-            matches = [
-                row for row in durable_rows if row.content == draft.content and deep_thaw(row.tool_calls) == deep_thaw(draft.tool_calls)
-            ]
-            assert len(matches) == 1, (
-                "each actual recovery draft must become durable exactly once",
-                draft.content[:100],
-                [row.content[:100] for row in durable_rows],
-            )
+        (recovery,) = preparations
+        assert recovery.failure_reason is None and recovery.empty_fallback is True
+        assert response.recovery_notice is not None and response.recovery_notice.id == str(recovery.receipt_id)
+        assert response.state is not None and response.state.id == str(recovery.state_id)
+        (notice,) = [row for row in durable_rows if row.id == str(recovery.receipt_id)]
+        (outcome,) = [row for row in durable_rows if row.id == str(uuid.uuid5(recovery.receipt_id, "audit"))]
+        assert notice.role == "system" and notice.content == response.recovery_notice.content
+        assert json.loads(outcome.content) == {
+            "event": "graph_recovery",
+            "action": "reset_to_safe_checkpoint",
+            "target_state_id": None,
+            "state_id": str(recovery.state_id),
+            "empty_fallback": True,
+            "park_id": None,
+            "displaced_candidate_captured": False,
+            "failure_reason": None,
+            "malformed_head": False,
+        }
+        diagnostics = [
+            ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session.id))
+            for row in rows
+            for envelope in row.tool_calls or ()
+            if envelope.get("_kind") == DIAGNOSTIC_EVIDENCE_KIND
+        ]
+        (received,) = [item for item in diagnostics if item.tool_name == "handoff_to_user" and item.status == "received_response"]
+        assert received.arguments.disposition == "retained"
+        assert json.loads(received.arguments.content) == {"action": "reset_to_safe_checkpoint", "message": "Let's discuss the pipeline."}
+        private_facts = json.loads(received.result.content)
+        (primary_call,) = results[0].llm_calls
+        assert private_facts["provider_tool_call_id"] == "title-order-handoff"
+        assert private_facts["physical_call_id"] == primary_call.call_id
+        assert private_facts["disposition"] == "admitted_receipt" and private_facts["refusal_code"] is None
+        (retained_control,) = [item for item in primary_call.private_diagnostics if item.tool_name == "handoff_to_user"]
+        assert received.tool_call_id == retained_control.tool_call_id
+        with service._engine.connect() as connection:
+            states = connection.execute(select(composition_states_table)).all()
+            proposals = connection.execute(select(composition_proposals_table)).all()
+            attempts = connection.execute(select(quota_provider_attempts_table)).all()
+            ledger = connection.execute(select(token_usage_ledger_table)).all()
+        assert response.proposals == proposals == []
+        assert len(states) == 1 and states[0].provenance == "graph_recovery"
+        audits = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+        assert len(attempts) == len(ledger) == len(audits) == 2
+        assert len(physical_calls) == 2 and [call.status for call in physical_calls] == [ComposerLLMCallStatus.SUCCESS] * 2
+        assert [call.call_id for call in physical_calls] == [call["call_id"] for call in audits]
+        for call, context in zip(physical_calls, physical_contexts, strict=True):
+            public_call = llm_call_audit_envelope(call)
+            expected_envelopes = (public_call, visible_response_gap(call, context, public_call))
+            matches = [row for row in durable_rows if deep_thaw(row.tool_calls) == deep_thaw(expected_envelopes)]
+            assert len(matches) == 1 and matches[0].content == "Provider call result recorded."
+            assert call.prompt_tokens == 4 and call.completion_tokens == 3 and call.provider_cost == 0.001
+        assert {attempt.attempt_id for attempt in attempts} == {call["call_id"] for call in audits}
+        assert all(
+            attempt.settled_at is not None and attempt.ledger_entry_id in {entry.entry_id for entry in ledger} for attempt in attempts
+        )
+        primary_attempt = next(attempt for attempt in attempts if attempt.attempt_id == primary_call.call_id)
+        assert received.operation_id == primary_attempt.operation_id and received.operation_epoch == primary_attempt.operation_epoch
+        replay_rows = await service.get_messages(session.id, limit=None, include_private_evidence=False)
+        replay = json.dumps(_helpers._composer_chat_history(replay_rows))
+        assert "title-order-handoff" not in replay and '"action": "reset_to_safe_checkpoint"' not in replay
         assert len(sdk) == 2 and len(_llm_call_audit_rows(rows)) == 2
         assert events[0:3] == [("guard", "title", "allow"), ("sdk", "title"), ("guard", "primary", "allow")]
         assert _user_and_assistant_roles(rows) == ["user", "assistant"]
@@ -1047,156 +1126,19 @@ class _CancelCommittingComposer:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("call_limit", "malformed_first", "expected_end_calls", "admitted", "cost_cap", "end_cost", "handoff"),
-    [
-        pytest.param(1, False, 0, False, "5", 0.001, "valid", id="no_call_headroom"),
-        pytest.param(2, False, 1, True, "5", 0.001, "valid", id="one_end_admit"),
-        pytest.param(2, True, 1, False, "5", 0.001, "valid", id="one_end_malformed"),
-        pytest.param(3, True, 2, True, "5", 0.001, "valid", id="two_end_format_retry"),
-        pytest.param(3, False, 0, False, "0.001", 0.001, "valid", id="cost_exhausted_before_end"),
-        pytest.param(3, False, 1, False, "0.01", 0.02, "valid", id="cost_overflow_end"),
-        pytest.param(3, False, 1, False, "0.01", None, "valid", id="cost_unknown_end"),
-        pytest.param(3, True, 1, False, "0.0015", 0.001, "valid", id="cost_malformed_consumed"),
-        pytest.param(3, False, 1, True, "0.002", 0.001, "valid", id="cost_exact_cap_admit"),
-        pytest.param(3, False, 0, False, "5", 0.001, "missing", id="missing_handoff_no_fresh_allowance"),
-        pytest.param(3, False, 0, False, "5", 0.001, "expired", id="expired_original_deadline"),
-        pytest.param(3, False, 0, False, "5", 0.001, "prior_unknown", id="prior_retry_cost_not_silently_zero"),
-    ],
-)
-async def test_actual_planner_decline_review_shares_call_budget_and_saved_terminal(
-    tmp_path: Path,
-    monkeypatch,
-    call_limit: int,
-    malformed_first: bool,
-    expected_end_calls: int,
-    admitted: bool,
-    cost_cap: str,
-    end_cost: float | None,
-    handoff: str,
-) -> None:
-    import litellm
-
-    from elspeth.web.composer import planning_application
-    from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    from elspeth.web.composer.pipeline_planner import PlannerDeclined
-    from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
-    from tests.unit.web.composer._helpers import _mock_catalog
-
-    app, sessions = _make_app(tmp_path)
-    app.state.settings = app.state.settings.model_copy(
-        update={
-            "composer_prompt_guard_mode": "debug-when-unconfigured",
-            "composer_planner_max_provider_calls": call_limit,
-            "composer_planner_max_cumulative_provider_cost": Decimal(cost_cap),
-        }
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **kwargs: ComposerAvailability(available=True, model=kwargs["model"], provider="test"),
-    )
-    # A small synthetic catalog has no omitted LLM catalog facts. It makes
-    # this ordinary DECLINE arm reachable without stubbing planner or END.
-    catalog = _mock_catalog()
-    catalog.list_transforms.return_value = []
-    composer = ComposerServiceImpl.for_trained_operator(
-        catalog=catalog, settings=app.state.settings, sessions_service=sessions, session_engine=app.state.session_engine
-    )
-    app.state.composer_service = composer
-    candidate = "REQUEST_DECLINE_CANARY: I cannot satisfy this request with the available components."
-    phases = []
-    actual_plan = planning_application.plan_pipeline
-
-    async def plan_with_handoff(**kwargs):
-        try:
-            return await actual_plan(**kwargs)
-        except PlannerDeclined as declined:
-            assert declined.continuation_budget is not None
-            if handoff == "missing":
-                declined.continuation_budget = None
-            elif handoff == "expired":
-                declined.continuation_budget.deadline = asyncio.get_running_loop().time() - 1.0
-            raise
-
-    if handoff != "valid":
-        monkeypatch.setattr(planning_application, "plan_pipeline", plan_with_handoff)
-
-    async def completion(**kwargs):
-        phase = "end" if "response_format" in kwargs else "planner"
-        phases.append(phase)
-        assert len(phases) <= call_limit, "Continuation dispatched beyond its original conservative attempt limit"
-        if phase == "planner":
-            if handoff == "prior_unknown" and len(phases) == 1:
-                raise litellm.ServiceUnavailableError("Synthetic provider retry", model=kwargs["model"], llm_provider="test")
-            assert phases == ["planner"] * (2 if handoff == "prior_unknown" else 1), "No new primary turn may repair declined final prose"
-            content = "DECLINE: " + candidate
-        else:
-            assert candidate in json.dumps(kwargs["messages"])
-            assert kwargs["max_tokens"] <= app.state.settings.composer_planner_max_completion_tokens
-            content = (
-                "not JSON"
-                if malformed_first and phases.count("end") == 1
-                else json.dumps(
-                    {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
-                )
-            )
-        response = litellm.ModelResponse(
-            choices=[{"message": {"role": "assistant", "content": content, "tool_calls": None}, "index": 0, "finish_reason": "stop"}],
-            model=kwargs["model"],
-            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001 if phase == "planner" else end_cost},
-        )
-        if phase == "end" and end_cost is None:
-            # The SDK constructor normalizes null counters to zero. Model an
-            # actually absent usage field; null cost with usable counters may
-            # legitimately be priced from the bundled catalog.
-            response.usage = None
-        return response
-
-    # This one explicit SDK replacement handles every planner AND END attempt.
-    monkeypatch.setattr(litellm, "acompletion", completion)
-    session = await sessions.create_session("alice", "Existing title", "local")
-    async with _running_job(app, sessions, session.id, kind="compose_message", content="Build the requested pipeline.") as job:
-        record = await _run(app, job)
-    assert record.status == "completed"
-    response = MessageWithStateResponse.model_validate_json(record.result_json)
-    assert phases == [*(["planner"] * (2 if handoff == "prior_unknown" else 1)), *(["end"] * expected_end_calls)]
-    assert (candidate in response.message.content) is admitted
-    rows = await sessions.get_messages(session.id, limit=None)
-    calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
-    if end_cost is None:
-        assert calls[-1]["provider_cost"] is None
-        assert calls[-1]["provider_cost_source"] == "not_available"
-    public_rows = [row for row in rows if row.role == "assistant"]
-    assert any(candidate in row.content for row in public_rows) is admitted
-    private = [
-        envelope for row in rows if row.tool_calls for envelope in row.tool_calls if envelope.get("_kind") == COMPOSER_WITHHELD_REPLY_KIND
-    ]
-    assert bool(private) is (not admitted)
-    if private:
-        assert private[-1]["origin"] == "advisor_publication_withheld"
-        assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
-    passes = [
-        envelope
-        for row in rows
-        if row.tool_calls
-        for envelope in row.tool_calls
-        if envelope.get("_kind") == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
-    ]
-    assert len(passes) == int(admitted)
-    assert not (await sessions.get_state_versions(session.id))
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     "route,admit,read_all", (("primary", False, False), ("primary", True, False), ("planner", False, False), ("planner", False, True))
 )
 async def test_actual_inspection_review_controls_public_and_saved_equivalence_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str, admit: bool, read_all: bool
 ) -> None:
+    from copy import deepcopy
     from itertools import pairwise
 
     import litellm
 
+    from elspeth.core.canonical import stable_hash
     from elspeth.web.blobs.service import BlobServiceImpl
+    from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
     from elspeth.web.composer.turn_effects import TurnEvidence
     from tests.helpers.session_fences import fenced_operation_context
     from tests.unit.web.composer._helpers import _mock_catalog
@@ -1231,6 +1173,8 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     )
     calls = []
     selected_pages = []
+    selected_by_id = {}
+    requested_read_ids = []
     reviews = []
     actual_review = TurnEvidence.review_candidate
 
@@ -1240,7 +1184,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         return review
 
     async def complete(**kwargs):
-        calls.append(kwargs)
+        calls.append(deepcopy(kwargs))
         if "response_format" in kwargs:
             assert candidate in json.dumps(kwargs["messages"])
             body = json.dumps(
@@ -1255,11 +1199,23 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
             )
             tool_calls = None
         else:
-            pages = [
-                json.loads(message["content"])["data"]
+            page_messages = [
+                message
                 for message in kwargs["messages"]
                 if message["role"] == "tool" and message["tool_call_id"].startswith("inspect-page-")
             ]
+            assert len({message["tool_call_id"] for message in page_messages}) == len(page_messages)
+            pages = []
+            for message in page_messages:
+                page = json.loads(message["content"])["data"]
+                tool_id = message["tool_call_id"]
+                assert tool_id in requested_read_ids
+                if tool_id in selected_by_id:
+                    assert page == selected_by_id[tool_id], "A completed read changed in a later provider context"
+                else:
+                    selected_by_id[tool_id] = page
+                    selected_pages.append(page)
+                pages.append(page)
             if not pages:
                 assert not selected_pages, "A later context lost its selected page; do not silently reread/replay"
                 body = None
@@ -1270,7 +1226,6 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
                     )
                 ]
             else:
-                selected_pages.append(pages[-1])
                 if read_all and pages[-1]["next_offset_chars"] is not None:
                     page = pages[-1]
                     body = None
@@ -1292,6 +1247,9 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
                 else:
                     body = ("DECLINE: " if route == "planner" else "") + candidate
                     tool_calls = None
+            for tool in tool_calls or ():
+                assert tool.id not in requested_read_ids, "A completed inspection must not be replayed as a new read"
+                requested_read_ids.append(tool.id)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -1300,6 +1258,7 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
             ],
             usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
             model=kwargs["model"],
+            id=f"inspection-response-{len(calls)}",
         )
 
     monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
@@ -1324,9 +1283,10 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
     prefix = selected_pages[0]
     assert 0 < prefix["end_char"] < prefix["total_chars"] == len(content)
     assert prefix["content"] == content[: prefix["end_char"]]
+    assert prefix["content_hash"] == blob.content_hash
     for scope, review in reviews:
         inspection = review["inspection"]
-        assert scope == route
+        assert scope == "primary"
         (coverage,) = inspection["currently_available"]
         assert coverage["content_hash"] == prefix["content_hash"]
         assert coverage["ranges"] == [[0, len(content) if read_all else prefix["end_char"]]]
@@ -1335,35 +1295,66 @@ async def test_actual_inspection_review_controls_public_and_saved_equivalence_cl
         assert review["saved_effects"]["net_changed"] is False
         assert review["saved_effects"]["initial_authored_state_hash"] == review["saved_effects"]["latest_verified_authored_state_hash"]
         assert review["saved_effects"]["changed_fields"] == []
-    assert len([call for call in calls if "response_format" in call]) == (1 if admit or route == "planner" else 2)
-    inspected_page_count = len({page["start_char"] for page in selected_pages})
-    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(
-        not admit and route == "primary"
-    )
+    assert len([call for call in calls if "response_format" in call]) == (1 if admit else 2)
+    inspected_page_count = len(selected_pages)
+    assert list(selected_by_id) == requested_read_ids
+    assert len({page["start_char"] for page in selected_pages}) == inspected_page_count
+    assert len([call for call in calls if "response_format" not in call]) == inspected_page_count + 1 + int(not admit)
     if read_all:
         assert len(selected_pages) > 1
         for earlier, later in pairwise(selected_pages):
             assert later["start_char"] == earlier["end_char"]
         assert "".join(page["content"] for page in selected_pages) == content
         assert selected_pages[-1]["end_char"] == len(content)
-    if route == "primary":
-        canonical_results = [row.content for row in rows if row.role == "tool" and row.tool_call_id == "inspect-page-1"]
-    else:
-        canonical_results = [
-            envelope["invocation"]["result_canonical"]
-            for row in rows
-            for envelope in row.tool_calls or ()
-            if envelope.get("_kind") == "audit" and envelope["invocation"]["tool_name"] == "get_blob_content"
-        ]
+    read_rows = [row for row in rows if row.role == "tool" and row.tool_call_id in requested_read_ids]
+    assert [row.tool_call_id for row in read_rows] == requested_read_ids
+    canonical_results = [row.content for row in read_rows]
     assert len(canonical_results) == inspected_page_count
     assert all("name,score" not in result for result in canonical_results)
+    private_rows = await sessions.get_messages(session.id, limit=None, include_private_evidence=True)
+    private_reads = [
+        evidence
+        for row in private_rows
+        for envelope in row.tool_calls or ()
+        if envelope.get("_kind") == DIAGNOSTIC_EVIDENCE_KIND
+        for evidence in [ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session.id))]
+        if evidence.tool_name == "get_blob_content"
+    ]
+    assert [evidence.tool_call_id for evidence in private_reads] == requested_read_ids
+    for evidence in private_reads:
+        assert evidence.status == "success"
+        assert evidence.arguments.disposition == evidence.result.disposition == "retained"
+        request_arguments = json.loads(evidence.arguments.content)
+        assert request_arguments["blob_id"] == str(blob.id)
+        page = selected_by_id[evidence.tool_call_id]
+        private_result = json.loads(evidence.result.content)
+        assert private_result["data"] == page
+        assert page["content"] == content[page["start_char"] : page["end_char"]]
+        assert page["content_hash"] == selected_pages[0]["content_hash"]
+        if page["start_char"]:
+            assert request_arguments["offset_chars"] == page["start_char"]
+            assert request_arguments["expected_content_hash"] == page["content_hash"]
     retained_calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
+    assert len(retained_calls) == len(calls)
+    sdk_by_call_id = {}
+    for ordinal, request in enumerate(calls, start=1):
+        (physical,) = [call for call in retained_calls if call["provider_request_id"] == f"inspection-response-{ordinal}"]
+        assert physical["messages_hash"] == stable_hash(request["messages"])
+        sdk_by_call_id[physical["call_id"]] = request
     for _, review in reviews:
         call_id, messages_hash = review["inspection"]["current_candidate_call"]
         matching_calls = [call for call in retained_calls if call["call_id"] == call_id]
         assert len(matching_calls) == 1
         assert matching_calls[0]["messages_hash"] == messages_hash
         assert matching_calls[0]["status"] == "success"
+        assert "response_format" not in sdk_by_call_id[call_id]
+    latest_primary_id = next(
+        call["call_id"]
+        for call in retained_calls
+        if call["provider_request_id"]
+        == f"inspection-response-{max(i for i, request in enumerate(calls, start=1) if 'response_format' not in request)}"
+    )
+    assert reviews[-1][1]["inspection"]["current_candidate_call"][0] == latest_primary_id
     if not admit:
         assert "withheld" in response.message.content.lower()
         assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
@@ -1556,8 +1547,11 @@ async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publ
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_site: str
 ) -> None:
     import litellm
+    from sqlalchemy import select
 
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+    from elspeth.web.composer.diagnostic_evidence import DIAGNOSTIC_EVIDENCE_KIND, ComposerDiagnosticEvidence
+    from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
     from tests.unit.web.composer._helpers import _mock_catalog
 
     app, sessions = _make_app(tmp_path)
@@ -1583,16 +1577,23 @@ async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publ
         else ConnectionError("Synthetic END transport failure")
     )
     phases = []
+    completed_calls = []
+    actual_finish = sessions.finish_provider_attempt
+
+    async def finish(*, session_operation_context, call, required_work=None):
+        result = await actual_finish(session_operation_context=session_operation_context, call=call, required_work=required_work)
+        completed_calls.append(call)
+        return result
 
     async def completion(**kwargs):
-        phase = "end" if "response_format" in kwargs else "planner"
+        phase = "end" if "response_format" in kwargs else "primary"
         phases.append(phase)
-        assert phases in (["planner"], ["planner", "end"]), "Unknown failed-call cost must not grant a retry"
+        assert phases in (["primary"], ["primary", "end"]), "Unknown failed-call cost must not grant a retry"
         if phase == "end" and failure_site != "pass_audit":
             raise original
         content = (
             "DECLINE: " + candidate
-            if phase == "planner"
+            if phase == "primary"
             else json.dumps(
                 {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
             )
@@ -1614,6 +1615,7 @@ async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publ
 
     monkeypatch.setattr(litellm, "acompletion", completion)
     monkeypatch.setattr(sessions, "add_message", add_message)
+    monkeypatch.setattr(sessions, "finish_provider_attempt", finish)
     session = await sessions.create_session("alice", "Existing title", "local")
     async with _running_job(app, sessions, session.id, kind="compose_message", content="Build the requested pipeline.") as job:
         if failure_site == "end_transport":
@@ -1626,15 +1628,39 @@ async def test_actual_planner_decline_end_failure_preserves_audit_and_never_publ
             assert caught.value is original
             assert (await _row(job)).status == "running"
             attached = composer_turn._llm_calls_from_exception(caught.value)
-            assert len(attached) == 1
-            assert attached[0].status.value == ("cancelled" if failure_site == "end_cancel" else "success")
-    assert phases == ["planner", "end"]
+            assert len(attached) == 2
+            assert [call.call_id for call in attached] == [call.call_id for call in completed_calls]
+            assert [call.status.value for call in attached] == ["success", "cancelled" if failure_site == "end_cancel" else "success"]
+            assert job.observation.pending_exception_llm_calls == attached
+            assert job.observation.audit_cohort_durable is True
+    assert phases == ["primary", "end"]
     rows = await sessions.get_messages(session.id, limit=None)
     assert all(candidate not in row.content for row in rows if row.role == "assistant")
     assert all(envelope.get("_kind") != ADVISOR_CHECKPOINT_PASS_AUDIT_KIND for row in rows for envelope in row.tool_calls or ())
     calls = [envelope["call"] for _, envelope in _llm_call_audit_rows(rows)]
     assert len(calls) == 2
     assert len({call["call_id"] for call in calls}) == len(calls)
+    assert [call["call_id"] for call in calls] == [call.call_id for call in completed_calls]
+    assert [call["status"] for call in calls] == [call.status.value for call in completed_calls]
+    private_rows = await sessions.get_messages(session.id, limit=None, include_private_evidence=True)
+    private_requests = [
+        ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session.id))
+        for row in private_rows
+        for envelope in row.tool_calls or ()
+        if envelope.get("_kind") == DIAGNOSTIC_EVIDENCE_KIND
+    ]
+    private_requests = [item for item in private_requests if item.status == "provider_request"]
+    assert {item.tool_call_id for item in private_requests} == {call.call_id for call in completed_calls}
+    for item in private_requests:
+        assert item.arguments.disposition == "retained"
+        assert (candidate in item.arguments.content) is (item.tool_call_id == completed_calls[-1].call_id)
+    assert candidate not in json.dumps(_helpers._composer_chat_history(rows))
+    with app.state.session_engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        ledger = connection.execute(select(token_usage_ledger_table)).all()
+    assert len(attempts) == len(ledger) == 2
+    assert {item.attempt_id for item in attempts} == {call.call_id for call in completed_calls}
+    assert all(item.settled_at is not None and item.ledger_entry_id in {entry.entry_id for entry in ledger} for item in attempts)
     if failure_site == "end_transport":
         assert calls[-1]["provider_cost"] is None
     assert not (await sessions.get_state_versions(session.id))
@@ -1660,12 +1686,18 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     stale_evidence: bool,
     revoke_build: bool,
 ) -> None:
-    import litellm
+    from copy import deepcopy
+    from hashlib import sha256
 
+    import litellm
+    from sqlalchemy import select
+
+    from elspeth.core.canonical import stable_hash
     from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
     from elspeth.web.composer.advisor_decision import AdvisorGatePassed
     from elspeth.web.composer.turn_effects import TurnEvidence
     from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
+    from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
 
     app, sessions = _make_app(tmp_path)
     app.state.settings = app.state.settings.model_copy(update={"composer_prompt_guard_mode": "debug-when-unconfigured"})
@@ -1686,7 +1718,20 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     calls = []
     reviews = []
     owners = []
+    checkpoints = []
     actual_review = TurnEvidence.review_candidate
+    actual_checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
+
+    async def capture_checkpoint(**kwargs):
+        assert kwargs["phase"] == "end"
+        entry = {
+            "pass_index": kwargs["pass_index"],
+            "review": kwargs["publication_review"],
+            "request": kwargs["user_message"],
+            "sdk_ordinals": [],
+        }
+        checkpoints.append(entry)
+        return await actual_checkpoint(**kwargs)
 
     def capture_review(owner, **kwargs):
         review = actual_review(owner, **kwargs)
@@ -1695,10 +1740,12 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
         return review
 
     monkeypatch.setattr(TurnEvidence, "review_candidate", capture_review)
+    monkeypatch.setattr(composer._advisor_checkpoint, "_run_advisor_checkpoint", capture_checkpoint)
 
     async def complete(**kwargs):
-        calls.append(kwargs)
+        calls.append(deepcopy(kwargs))
         if "response_format" in kwargs:
+            checkpoints[-1]["sdk_ordinals"].append(len(calls))
             schema = kwargs["response_format"]["json_schema"]
             assert schema["name"] == "advisor_end_response"
             assert "publication_verdict" in schema["schema"]["required"]
@@ -1723,6 +1770,7 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=None), finish_reason="stop")],
             usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20, "cost": 0.001},
             model=kwargs["model"],
+            id=f"publication-response-{len(calls)}",
         )
 
     monkeypatch.setattr(litellm, "acompletion", complete)
@@ -1751,19 +1799,48 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
     ]
     assert passes
     assert all(item["publication_verdict"] == publication_verdict and len(item["publication_binding"]) == 64 for item in passes)
-    # A structurally empty persisted request uses the planner's terminal prose
-    # review. WITHHOLD ends that request instead of starting a primary repair.
-    expected_review_calls = 1
+    expected_review_calls = 2 if publication_verdict == "WITHHOLD" and not stale_evidence else 1
+    assert len(checkpoints) == len(passes) == expected_review_calls
+    for item in passes:
+        (checkpoint,) = [entry for entry in checkpoints if entry["pass_index"] == item["pass_index"]]
+        review = checkpoint["review"]
+        assert item["phase"] == "end" and item["source"] == "model"
+        assert item["publication_binding"] == review.binding
+        payload = json.loads(review.payload_json)
+        assert payload["candidate_reply"] == candidate
+        assert review.current_request_text() == checkpoint["request"] == request
+        (end_ordinal,) = checkpoint["sdk_ordinals"]
+        assert "response_format" in calls[end_ordinal - 1]
     assert len([call for call in calls if "response_format" in call]) == expected_review_calls
     primary_calls = [call for call in calls if "response_format" not in call]
     assert len(primary_calls) == expected_review_calls
-    planner_audits = [
-        envelope["call"]
-        for _, envelope in _llm_call_audit_rows(messages)
-        if envelope["call"]["model_requested"] == app.state.settings.composer_model
-    ]
-    assert len(planner_audits) == 1 and planner_audits[0]["call_id"] is not None
-    assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == planner_audits[0]["call_id"]
+    audits = [envelope["call"] for _, envelope in _llm_call_audit_rows(messages)]
+    assert len(audits) == 2 * expected_review_calls
+    assert len({call["call_id"] for call in audits}) == len(audits)
+    physical_primary_ids = []
+    for ordinal, request in enumerate(calls, start=1):
+        (physical,) = [call for call in audits if call["provider_request_id"] == f"publication-response-{ordinal}"]
+        assert physical["messages_hash"] == stable_hash(request["messages"])
+        assert physical["status"] == "success"
+        if "response_format" not in request:
+            physical_primary_ids.append(physical["call_id"])
+    assert ["end" if "response_format" in call else "primary" for call in calls] == ["primary", "end"] * expected_review_calls
+    assert json.loads(reviews[-1].payload_json)["inspection"]["current_candidate_call"][0] == physical_primary_ids[-1]
+    review_candidate_ids = [json.loads(review.payload_json)["inspection"]["current_candidate_call"][0] for review in reviews]
+    assert set(review_candidate_ids) == set(physical_primary_ids)
+    for checkpoint in checkpoints:
+        (end_ordinal,) = checkpoint["sdk_ordinals"]
+        (prior_primary,) = [physical for physical in audits if physical["provider_request_id"] == f"publication-response-{end_ordinal - 1}"]
+        assert json.loads(checkpoint["review"].payload_json)["inspection"]["current_candidate_call"] == [
+            prior_primary["call_id"],
+            prior_primary["messages_hash"],
+        ]
+    with app.state.session_engine.connect() as connection:
+        attempts = connection.execute(select(quota_provider_attempts_table)).all()
+        ledger = connection.execute(select(token_usage_ledger_table)).all()
+    assert len(attempts) == len(ledger) == len(audits)
+    assert {attempt.attempt_id for attempt in attempts} == {call["call_id"] for call in audits}
+    assert all(attempt.settled_at is not None and attempt.ledger_entry_id in {entry.entry_id for entry in ledger} for attempt in attempts)
     assert not any(
         message["role"] == "user" and message["content"].startswith("[composer-system] No tool has run this turn")
         for call in primary_calls
@@ -1778,9 +1855,21 @@ async def test_actual_end_permission_controls_public_terminal_and_saved_history(
         if entry["_kind"] == COMPOSER_WITHHELD_REPLY_KIND and entry["origin"] == "advisor_publication_withheld"
     ]
     assert bool(withheld) is not admitted
+    private_rows = await sessions.get_messages(session.id, limit=None, include_private_evidence=True)
+    withheld_records = [
+        (row, entry) for row in private_rows for entry in row.tool_calls or () if entry["_kind"] == COMPOSER_WITHHELD_REPLY_KIND
+    ]
+    superseded = [(row, entry) for row, entry in withheld_records if entry["origin"] == "repair_gate_superseded"]
+    final_withheld = [(row, entry) for row, entry in withheld_records if entry["origin"] == "advisor_publication_withheld"]
+    assert len(superseded) == expected_review_calls - 1
+    assert len(final_withheld) == int(not admitted)
+    for row, entry in [*superseded, *final_withheld]:
+        assert row.content == candidate
+        assert entry["content_hash"] == sha256(candidate.encode("utf-8")).hexdigest()
     if not admitted:
         assert "withheld" in response.message.content.lower()
         assert candidate not in record.result_json
+        assert candidate not in json.dumps(_helpers._composer_chat_history(messages))
 
 
 @pytest.mark.asyncio
@@ -2086,7 +2175,7 @@ async def test_turn_refuses_a_head_that_moved_under_its_own_lease(tmp_path: Path
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
         await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=job.lease.context,
         )
@@ -2323,7 +2412,7 @@ async def test_post_compose_runtime_preflight_arm_persists_one_audit_row_per_cal
     # composer_turn imports the helper by name, so this patches only the turn's
     # post-compose call (path 2). partial_state=None skips the handler's own
     # partial-state save; the handler goes straight to its cohort write.
-    monkeypatch.setattr(composer_turn, "_state_data_from_composer_state", _refuse_preflight)
+    monkeypatch.setattr(composer_finalization, "_state_data_from_composer_state", _refuse_preflight)
     async with _running_job(app, service, session.id, kind="compose_message", content="Save it.") as job:
         with pytest.raises(HTTPException) as refused:
             await _run(app, job)
@@ -2442,6 +2531,144 @@ async def test_expired_budget_raises_before_any_provider_call(tmp_path: Path) ->
     assert expired.value.budget_seconds_at_running == 85.0
     assert job.observation.compose_result is None
     assert (snapshot.phase, snapshot.reason) == ("failed", "convergence_wall_clock_timeout")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_title", [False, True])
+async def test_initial_mutation_preferences_precede_title_and_primary_with_original_identity(tmp_path, monkeypatch, auto_title):
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock("Ready for review.")
+    composer.composer_prompt_guard_mount = None
+    app.state.composer_service = composer
+    session = await service.create_session("alice", "New session" if auto_title else "Named pipeline", "local")
+    actual_preferences = service.get_composer_preferences
+    events, captured = [], []
+    result = composer.compose.return_value
+
+    async def preferences(session_id):
+        record = await actual_preferences(session_id)
+        events.append("preferences")
+        captured.append(record)
+        return record
+
+    async def title(**kwargs):
+        events.append("title")
+
+    async def compose(*args, **kwargs):
+        events.append("compose")
+        return result
+
+    monkeypatch.setattr(service, "get_composer_preferences", preferences)
+    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", title)
+    composer.compose.side_effect = compose
+    async with _running_job(app, service, session.id, kind="compose_message", content="Explain this pipeline.") as job:
+        record = await _run(app, job)
+    assert record.status == "completed"
+    assert events == (["preferences", "title", "compose"] if auto_title else ["preferences", "compose"])
+    (initial,) = captured
+    kwargs = composer.compose.await_args.kwargs
+    ceiling = kwargs["mutation_ceiling"]
+    assert type(ceiling) is ComposerMutationCeiling
+    assert ceiling.session_id == str(session.id)
+    assert ceiling.initial_trust_mode == initial.trust_mode
+    users = [row for row in await service.get_messages(session.id, limit=None) if row.role == "user"]
+    assert len(users) == 1
+    assert ceiling.request_id == kwargs["user_message_id"] == str(users[0].id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_title", [False, True])
+async def test_actual_sdk_title_and_primary_retain_one_original_ceiling(tmp_path, monkeypatch, auto_title):
+    import httpx
+    from sqlalchemy import select
+
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+    from elspeth.web.sessions.models import quota_provider_attempts_table, token_usage_ledger_table
+    from tests.helpers.composer_operations import message_body, submit_and_settle
+
+    app, service, _guards, sdk, _events = await _guarded_title_turn_app(
+        tmp_path, monkeypatch, title_decision="allow", primary_decision="allow", planner_handoff=True
+    )
+    composer = app.state.composer_service
+    actual_preferences, actual_compose, actual_loop = service.get_composer_preferences, composer.compose, composer._compose_loop
+    reads, supplied, loops = [], [], []
+
+    async def preferences(session_id):
+        record = await actual_preferences(session_id)
+        reads.append((len(sdk), record))
+        return record
+
+    async def compose(*args, **kwargs):
+        supplied.append((kwargs["mutation_ceiling"], kwargs["user_message_id"]))
+        return await actual_compose(*args, **kwargs)
+
+    async def loop(*args, **kwargs):
+        loops.append((kwargs["mutation_ceiling"], kwargs["turn_evidence"]))
+        return await actual_loop(*args, **kwargs)
+
+    monkeypatch.setattr(service, "get_composer_preferences", preferences)
+    monkeypatch.setattr(composer, "compose", compose)
+    monkeypatch.setattr(composer, "_compose_loop", loop)
+    session = await service.create_session("alice", "New session" if auto_title else "Named pipeline", "local")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        settled = await submit_and_settle(
+            client, app, path=f"/api/sessions/{session.id}/messages", body=message_body("Discuss the requested pipeline.")
+        )
+    assert settled.final.json()["status"] == "completed", settled.final.text
+    ((physical_before_capture, record),) = reads
+    assert physical_before_capture == 0
+    ((ceiling, human_pointer),) = supplied
+    ((loop_ceiling, evidence),) = loops
+    assert type(ceiling) is ComposerMutationCeiling
+    assert loop_ceiling is ceiling
+    assert ceiling.initial_trust_mode == record.trust_mode
+    rows = await service.get_messages(session.id, limit=None)
+    (user,) = [row for row in rows if row.role == "user"]
+    assert ceiling.request_id == evidence.request_id == human_pointer == str(user.id)
+    assert ceiling.session_id == str(session.id)
+    audits = _llm_call_audit_rows(rows)
+    assert len(sdk) == len(audits) == (2 if auto_title else 1)
+    with service._engine.connect() as conn:
+        assert len(list(conn.execute(select(quota_provider_attempts_table)))) == len(sdk)
+        assert len(list(conn.execute(select(token_usage_ledger_table)))) == len(sdk)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_title", [False, True])
+async def test_initial_preference_await_spends_original_budget_before_title_or_primary(tmp_path, monkeypatch, auto_title):
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock()
+    composer.composer_prompt_guard_mount = None
+    app.state.composer_service = composer
+    session = await service.create_session("alice", "New session" if auto_title else "Named pipeline", "local")
+    actual_preferences = service.get_composer_preferences
+    calls = []
+
+    async def title(**kwargs):
+        calls.append("title")
+
+    monkeypatch.setattr(composer_turn, "maybe_auto_title_session", title)
+    async with _running_job(app, service, session.id, kind="compose_message", content="Explain.") as job:
+        anchor = composer_turn.ComposerBudgetAnchor(
+            remaining_at_running_seconds=job.budget_anchor.remaining_at_running_seconds,
+            monotonic_at_running=time.monotonic() - 84.0,
+        )
+
+        async def preferences(session_id):
+            record = await actual_preferences(session_id)
+            remaining = anchor.remaining_seconds(monotonic_now=time.monotonic())
+            assert remaining > 0, "setup must reach preference capture within the actual admitted budget"
+            calls.append("preferences")
+            await asyncio.sleep(remaining + 0.025)
+            return record
+
+        monkeypatch.setattr(service, "get_composer_preferences", preferences)
+        with pytest.raises(ComposerTurnDeadlineExpired):
+            await _run(app, job, budget_anchor=anchor)
+    assert calls == ["preferences"]
+    composer.compose.assert_not_awaited()
 
 
 def _parked_auto_title_factory(started: asyncio.Event, cancelled: asyncio.Event) -> Any:
@@ -2696,13 +2923,13 @@ async def test_send_turn_auto_commit_settles_through_the_services_bundle_with_th
     composer.compose.side_effect = compose_with_owned_proposal
     app.state.composer_service = composer
     seen_budgets: list[float] = []
-    real_settle = composer_turn.settle_auto_commit_intent
+    real_settle = composer_finalization.settle_auto_commit_intent
 
     async def _spy_settle(**kwargs: Any) -> Any:
         seen_budgets.append(kwargs["commit_timeout_seconds"])
         return await real_settle(**kwargs)
 
-    monkeypatch.setattr(composer_turn, "settle_auto_commit_intent", _spy_settle)
+    monkeypatch.setattr(composer_finalization, "settle_auto_commit_intent", _spy_settle)
     async with _running_job(app, service, session_id, kind="compose_message", content="Build the pipeline.") as job:
         record = await _run(app, job)
 

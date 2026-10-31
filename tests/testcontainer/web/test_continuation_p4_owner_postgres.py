@@ -1,0 +1,35 @@
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_actual_p4_commits_rows_complete_receipt_and_root_together as test_actual_p4_commits_rows_complete_receipt_and_root_together,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_actual_revoked_publication_preserves_refusal_not_candidate_graph as test_actual_revoked_publication_preserves_refusal_not_candidate_graph,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_finish_once_returns_actual_committed_outcome_before_deferred_cancellation as test_finish_once_returns_actual_committed_outcome_before_deferred_cancellation,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_historical_projection_never_reconstructs_live_writer_or_exception as test_historical_projection_never_reconstructs_live_writer_or_exception,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_owed_p4_keeps_live_lease_requirement_but_drains_expired_segment as test_owed_p4_keeps_live_lease_requirement_but_drains_expired_segment,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_recovery_binds_complete_real_rows_not_only_authored_graph as test_recovery_binds_complete_real_rows_not_only_authored_graph,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_result_publication_failure_rolls_back_business_rows_and_private_head as test_result_publication_failure_rolls_back_business_rows_and_private_head,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_unavailable_p4_retains_rollback_facts_without_checkpoint_witness as test_unavailable_p4_retains_rollback_facts_without_checkpoint_witness,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_unavailable_receipt_failure_keeps_original_secondary_cause as test_unavailable_receipt_failure_keeps_original_secondary_cause,
+)
+from tests.unit.web.sessions.test_continuation_p4_owner import (
+    test_writer_refuses_substituted_selected_owner_before_any_rows as test_writer_refuses_substituted_selected_owner_before_any_rows,
+)
+
+pytestmark = pytest.mark.testcontainer

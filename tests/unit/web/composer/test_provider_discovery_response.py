@@ -11,7 +11,6 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer.planner_authoring_aids import PlannerPluginContract
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.provider_discovery_response import (
-    argument_error_response,
     closed_provider_envelope,
     projected_plugin_contract_response,
     schema_budget_failure,
@@ -85,27 +84,6 @@ def test_projected_plugin_contract_preserves_owned_encoding_bytes():
 
 
 @pytest.mark.parametrize(
-    ("code", "category"),
-    [(None, None), ("SCHEMA_VALIDATION", ToolArgumentErrorCategory.SCHEMA_SHAPE)],
-)
-def test_argument_error_projection_preserves_exact_bytes(code, category):
-    error = ToolArgumentError(argument="content", expected="a string", actual_type="int", code=code, category=category)
-    response = argument_error_response(error)
-    expected = {
-        "argument_error": {
-            "component": "content",
-            "severity": "high",
-            "error_code": code or "argument_error",
-            "error_class": "ToolArgumentError",
-            "error_category": error.category.value,
-        }
-    }
-    assert json.dumps(response.to_wire()) == json.dumps(expected)
-    with pytest.raises(FrameworkBugError, match="cannot be cached"):
-        response.readmit(None)
-
-
-@pytest.mark.parametrize(
     ("arguments", "loc", "code", "message", "category"),
     [
         (
@@ -147,8 +125,8 @@ def test_argument_error_projection_preserves_exact_bytes(code, category):
     ],
     ids=["choice", "type", "bound", "unknown-root", "unknown-mapping-key", "malformed-root"],
 )
-def test_argument_error_projection_keeps_closed_repair_facts_without_private_input(arguments, loc, code, message, category):
-    from elspeth.web.composer.pipeline_planner import _allowlisted_argument_error_entry
+def test_compose_loop_argument_error_keeps_closed_repair_facts_without_private_input(arguments, loc, code, message, category):
+    from elspeth.web.composer.tool_error_payloads import arg_error_payload
     from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema
 
     schema = {
@@ -166,26 +144,7 @@ def test_argument_error_projection_keeps_closed_repair_facts_without_private_inp
     error = caught.value
     error.__cause__ = RuntimeError("PRIVATE_CAUSE_CANARY")
 
-    response = argument_error_response(error)
-    entry = response.to_wire()["argument_error"]
-    assert entry["error_category"] == category.value
-    assert entry["validation_errors"] == [{"loc": loc, "msg": message, "type": code}]
-    assert _allowlisted_argument_error_entry(error) == entry
-    encoded = json.dumps(response.to_wire())
-    assert "PRIVATE_" not in encoded
-    entry["validation_errors"][0]["loc"].append("MUTATED_WIRE")
-    assert "MUTATED_WIRE" not in json.dumps(response.to_wire())
-
-
-def test_argument_error_projection_marks_over_budget_without_leaking_values():
-    from elspeth.web.composer.tools._dispatch import require_arguments_conform_to_schema
-
-    with pytest.raises(ToolArgumentError) as caught:
-        require_arguments_conform_to_schema(
-            "get_plugin_schema",
-            Draft202012Validator({"type": "array", "items": {"type": "integer"}}),
-            ["PRIVATE_REJECTED_VALUE"] * 9,
-        )
-    entry = argument_error_response(caught.value).to_wire()["argument_error"]
-    assert entry["validation_errors"] == [{"loc": [], "msg": "Validation produced more than 8 errors", "type": "truncated"}]
-    assert "PRIVATE_" not in json.dumps(entry)
+    assert error.category is category
+    payload = arg_error_payload(error, "get_plugin_schema")
+    assert payload["validation_errors"] == [{"loc": loc, "msg": message, "type": code}]
+    assert "PRIVATE_" not in json.dumps(payload)

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, TypeGuard, final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, TypeGuard, cast, final, get_args
 from uuid import UUID
 
 from pydantic import ValidationError as PydanticValidationError
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ToolArgumentErrorCategory
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewIdentity, AdvisorTerminalPublication
@@ -538,8 +539,144 @@ class ComposerServiceError(Exception):
     """Base exception for composer service errors."""
 
 
+class ComposerMutationAuthorityRevoked(ComposerServiceError):
+    http_status = 409
+
+    def __init__(
+        self,
+        *,
+        revocation: ComposerMutationRevocation,
+        llm_calls: tuple[ComposerLLMCall, ...],
+        failed_turn: FailedTurnMetadata | None,
+        state: CompositionState,
+        initial_version: int,
+    ) -> None:
+        if type(revocation) is not ComposerMutationRevocation:
+            raise TypeError("Mutation failure requires its actual owned revocation")
+        self.revocation = revocation
+        self.llm_calls = llm_calls
+        self.failed_turn = failed_turn
+        self.partial_state = state if state.version > initial_version else None
+        self.tool_invocations = ()
+        super().__init__(
+            "Automatic mutation authority was revoked. Review the saved session and tool evidence before sending another request."
+        )
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "error_type": "composer_mutation_authority_revoked",
+            "detail": str(self.args[0]),
+            "request_id": self.revocation.ceiling.request_id,
+            "initial_trust_mode": self.revocation.ceiling.initial_trust_mode,
+            "current_trust_mode": self.revocation.current_trust_mode,
+        }
+
+
 class ComposerAdmissionRefused(ComposerServiceError):
     """A committed admission decision refused this provider operation."""
+
+
+# Closed refusal reasons. Each reason is added together with the owner that
+# raises it, so no declared reason lacks a producer.
+ComposerContextUnsupportedReason = Literal[
+    "graph_resource_limit",
+    "graph_coverage_unavailable",
+    "manual_advisor_allowance",
+    "prepared_request_bytes",
+    "retained_history_bytes",
+    "retained_chunk_bytes",
+]
+_CONTEXT_UNSUPPORTED_DETAILS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "graph_resource_limit": "The current pipeline is too large to send to the model. Reduce its size and try again.",
+        "graph_coverage_unavailable": "The complete pipeline evidence is unavailable for model review. Review the pipeline before sending again.",
+        "manual_advisor_allowance": "The Advisor request exceeds its input allowance. Reduce the request size before sending again.",
+        "prepared_request_bytes": "This request is too large to send to the model. Shorten the conversation or the pipeline and try again.",
+        "retained_history_bytes": "This conversation is too large to retain completely. Shorten the conversation and try again.",
+        "retained_chunk_bytes": "This request is too large to retain completely. Reduce its size and try again.",
+    }
+)
+if frozenset(_CONTEXT_UNSUPPORTED_DETAILS) != frozenset(get_args(ComposerContextUnsupportedReason)):
+    raise FrameworkBugError("Composer context refusal reasons and public details disagree")
+
+
+class ComposerContextUnsupported(ComposerAdmissionRefused):
+    """Prepared provider context lies outside the supported envelope (U-22 F4).
+
+    A classified, nonretryable input refusal raised before any provider call.
+    It carries only a closed reason code: never graph content, values or
+    sizes, so its message and public payload are value-free.
+    """
+
+    http_status: ClassVar[int] = 422
+    reason: ComposerContextUnsupportedReason
+    partial_state: CompositionState | None
+    tool_invocations: tuple[ComposerToolInvocation, ...]
+    llm_calls: tuple[ComposerLLMCall, ...]
+    failed_turn: FailedTurnMetadata | None
+
+    def __init__(
+        self,
+        reason: ComposerContextUnsupportedReason,
+        *,
+        partial_state: CompositionState | None = None,
+        tool_invocations: tuple[ComposerToolInvocation, ...] = (),
+        llm_calls: tuple[ComposerLLMCall, ...] = (),
+        failed_turn: FailedTurnMetadata | None = None,
+    ) -> None:
+        reason_value = cast(object, reason)
+        if type(reason_value) is not str or reason_value not in _CONTEXT_UNSUPPORTED_DETAILS:
+            raise FrameworkBugError("Unknown composer context refusal reason")
+        if partial_state is not None and type(partial_state) is not CompositionState:
+            raise AuditIntegrityError("Context refusal evidence requires an owned composition state")
+        if type(tool_invocations) is not tuple or any(type(item) is not ComposerToolInvocation for item in tool_invocations):
+            raise AuditIntegrityError("Context refusal evidence requires owned immutable tool invocations")
+        if type(llm_calls) is not tuple or any(type(item) is not ComposerLLMCall for item in llm_calls):
+            raise AuditIntegrityError("Context refusal evidence requires owned immutable model calls")
+        if failed_turn is not None and type(failed_turn) is not FailedTurnMetadata:
+            raise AuditIntegrityError("Context refusal evidence requires owned failed-turn metadata")
+        self.reason = reason
+        # Process-local evidence for the owner that settles the turn; it never
+        # enters the message or the public payload.
+        self.partial_state = partial_state
+        self.tool_invocations = tool_invocations
+        self.llm_calls = llm_calls
+        self.failed_turn = failed_turn
+        super().__init__(f"The composer context is outside the supported envelope ({reason}).")
+
+    def with_evidence(
+        self,
+        *,
+        state: CompositionState,
+        initial_version: int,
+        tool_invocations: tuple[ComposerToolInvocation, ...] = (),
+        llm_calls: tuple[ComposerLLMCall, ...] = (),
+        failed_turn: FailedTurnMetadata | None = None,
+    ) -> ComposerContextUnsupported:
+        """Carry only undrained work; the caller supplies its persisted baseline."""
+        if type(state) is not CompositionState:
+            raise AuditIntegrityError("Context refusal evidence requires an owned composition state")
+        if type(initial_version) is not int or initial_version < 0:
+            raise AuditIntegrityError("Context refusal evidence requires an exact persisted version")
+        if type(tool_invocations) is not tuple or type(llm_calls) is not tuple:
+            raise AuditIntegrityError("Context refusal evidence requires immutable audit sequences")
+        return ComposerContextUnsupported(
+            self.reason,
+            partial_state=state if state.version > initial_version else None,
+            tool_invocations=tool_invocations,
+            llm_calls=llm_calls,
+            failed_turn=failed_turn,
+        )
+
+    def to_payload(self) -> dict[str, str]:
+        # One permanent failure_code for every reason, so a client hides Retry
+        # without learning each closed reason; the reason travels separately.
+        return {
+            "error_type": "composer_context_unsupported",
+            "failure_code": "context_unsupported",
+            "reason": self.reason,
+            "detail": _CONTEXT_UNSUPPORTED_DETAILS[self.reason],
+        }
 
 
 def _convergence_reason_for_budget(
@@ -1663,6 +1800,12 @@ class ComposerSettings(Protocol):
     def composer_max_tool_calls_per_turn(self) -> int: ...
 
     @property
+    def composer_max_prepared_request_bytes(self) -> int: ...
+
+    @property
+    def composer_attachment_inspection_max_bytes(self) -> int: ...
+
+    @property
     def composer_timeout_seconds(self) -> float: ...
 
     @property
@@ -1774,6 +1917,8 @@ class ComposerService(Protocol):
         recovery_context: GraphRecoveryContext | None = None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        *,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         """Run the LLM composition loop.
 

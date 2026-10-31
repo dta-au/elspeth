@@ -92,3 +92,51 @@ def test_codec_refuses_non_strict_and_mutated_owned_response() -> None:
         composer_operation_result_hash(
             json.dumps({"http_status": 500, "failure_code": "unknown", "body": {}, "error_type": None, "diagnostic_id": None})
         )
+
+
+def test_segment_claim_requires_both_positive_sequence_and_generation():
+    from elspeth.web.sessions.composer_operations import ComposerOperationClaim
+
+    legacy = ComposerOperationClaim(session_id=SID, operation_id=OP, claim_token="x" * 32, attempt=1)
+    assert legacy.segment_sequence is None and legacy.ownership_generation is None
+    claim = ComposerOperationClaim(
+        session_id=SID, operation_id=OP, claim_token="x" * 32, attempt=1, segment_sequence=2, ownership_generation=3
+    )
+    assert (claim.segment_sequence, claim.ownership_generation) == (2, 3)
+    for sequence, generation in ((2, None), (None, 2), (0, 1), (1, 0), (-1, 1), (True, 1), (1, True), (1, 2.0)):
+        with pytest.raises(ValueError, match="continuation claim"):
+            ComposerOperationClaim(
+                session_id=SID,
+                operation_id=OP,
+                claim_token="x" * 32,
+                attempt=1,
+                segment_sequence=sequence,
+                ownership_generation=generation,
+            )
+
+
+@pytest.mark.parametrize(
+    "kind,request_model,expected_v1,expected_v2",
+    [
+        (
+            "compose_message",
+            SendMessageRequest(operation_id=OP, content="hello"),
+            "d66457da97ff7b5fb111645661567e863339b662d19bddaac88e0b2752161d1d",
+            "79029fcd8d488212a4c8ccbfb3b7ae4c47dc11b5fd95b5bef2d054a918ed5ddd",
+        ),
+        (
+            "compose_recompose",
+            RecomposeRequest(operation_id=OP, expected_user_message_id=SID),
+            "8b968928e8bf0174b81a177126afbe5d26604d8094bfe9b922171054eda77c6b",
+            "426b877705b4f744b5eeed8f9951783d80539f5bc0dcb9eb02b3f8a364d4ffab",
+        ),
+    ],
+)
+def test_v2_request_hash_wraps_preserved_native_v1_golden(kind, request_model, expected_v1, expected_v2):
+    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+
+    assert composer_operation_request_hash(session_id=SID, kind=kind, request=request_model) == expected_v1
+    assert composer_operation_v2_request_hash(session_id=SID, kind=kind, request=request_model) == expected_v2
+    changed_id = request_model.model_copy(update={"operation_id": str(SID)})
+    assert composer_operation_v2_request_hash(session_id=SID, kind=kind, request=changed_id) == expected_v2
+    assert composer_operation_v2_request_hash(session_id=UUID(OP), kind=kind, request=request_model) != expected_v2

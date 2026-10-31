@@ -4,25 +4,26 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from uuid import UUID
 
 import litellm
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY, PromptGuardToolArgumentParts, detach_prompt_guard_messages
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-from elspeth.web.composer.pipeline_planner import _assistant_tool_calls_message, _parse_response_tool_calls
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts
 from elspeth.web.composer.prompts import build_messages
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.tool_batch import _retain_llm_tool_argument_parts
 from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-from tests.unit.web.composer.test_pipeline_planner import _pipeline, _plan, _response, _ScriptedCompletion
 from tests.unit.web.composer.test_prompt_guard_admission import _checks
 from tests.unit.web.composer.test_prompt_guard_admission import authority as _authority
 from tests.unit.web.composer.test_prompt_guard_reply_context import _gateway
@@ -84,65 +85,67 @@ def _state(shape, options):
 
 
 def _tool_messages(options):
+    """An assistant ``set_pipeline`` call carrying the compose loop's own argument parts.
+
+    ``_retain_llm_tool_argument_parts`` is the producer the compose loop runs
+    on the provider-authored assistant message once the call's arguments are
+    admitted.
+    """
     arguments = json.dumps({"pipeline": {"options": options}}, separators=(",", ":"))
-    response = _response(("emit_pipeline_proposal", {}))
-    response.choices[0].message.tool_calls[0].function.arguments = arguments
-    message, calls = _parse_response_tool_calls(
-        response, max_tool_calls=1, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset({"emit_pipeline_proposal"})
-    )
-    return [_assistant_tool_calls_message(message, calls), {"role": "user", "content": _USER}]
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "set_pipeline", "arguments": arguments}}],
+    }
+    messages = [message, {"role": "user", "content": _USER}]
+    _retain_llm_tool_argument_parts(messages, tool_call_id="call-1")
+    assert PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY in message
+    return messages
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["freeform_state", "canonical_planner", "compact_tool_arguments"])
+@pytest.mark.parametrize("surface", ["freeform_state", "compact_tool_arguments"])
 @pytest.mark.parametrize("shape", ["dataverse", "content_safety"])
 @pytest.mark.parametrize("following", ["array", "at_sign"])
-async def test_public_urls_keep_json_token_boundaries(authority, tmp_path, tool_context, monkeypatch, surface, shape, following):
+async def test_public_urls_keep_json_token_boundaries(authority, monkeypatch, surface, shape, following):
     engine, _service, owner, coordinator = authority
     options = _options(shape, following)
     state = _state(shape, options)
     gateway, inspected = _gateway(monkeypatch)
-    if surface == "canonical_planner":
-        from elspeth.core.canonical import canonical_json
-
-        completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
-        await _plan(
-            tmp_path=tmp_path,
-            tool_context=tool_context,
-            completion=completion,
-            provider_current_state=state.to_dict(),
-            model_overrides={"prompt_guard_mount": gateway.prompt_guard_mount, "prompt_guard_mode": "required"},
+    if surface == "freeform_state":
+        catalog = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        messages = build_messages(
+            [],
+            state,
+            _USER,
+            PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            content_scope=ComposerContentScope(UUID(int=1), composition_content_hash(state)),
         )
-        assert len(completion.requests) == 1
-        assert canonical_json(state.to_dict()) in completion.requests[0]["messages"][-1]["content"]
     else:
-        if surface == "freeform_state":
-            catalog = create_catalog_service()
-            snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-            messages = build_messages([], state, _USER, PolicyCatalogView.for_trained_operator(catalog, snapshot), plugin_snapshot=snapshot)
-        else:
-            messages = _tool_messages(options)
-        expected_wire, _trusted = detach_prompt_guard_messages(messages)
-        expected_wire, _tools = apply_anthropic_cache_markers(expected_wire, [], mark_history_tail=True)
-        sent = []
+        messages = _tool_messages(options)
+    expected_wire, _trusted = detach_prompt_guard_messages(messages)
+    expected_wire, _tools = apply_anthropic_cache_markers(expected_wire, [], mark_history_tail=True)
+    sent = []
 
-        async def completion(**kwargs):
-            sent.append(deepcopy(kwargs))
-            return litellm.ModelResponse(
-                model=kwargs["model"],
-                usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-                choices=[{"message": {"role": "assistant", "content": "Configuration retained for review."}}],
-            )
+    async def completion(**kwargs):
+        sent.append(deepcopy(kwargs))
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            choices=[{"message": {"role": "assistant", "content": "Configuration retained for review."}}],
+        )
 
-        monkeypatch.setattr(litellm, "acompletion", completion)
-        recorder = BufferingRecorder()
-        with prompt_guard_user_scope(_USER):
-            await gateway._call_llm_with_audit(
-                messages, [], timeout=10, recorder=recorder, provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY)
-            )
-        assert len(sent) == len(recorder.llm_calls) == 1
-        assert sent[0]["messages"] == expected_wire
-        assert [check["disposition"] for check in _checks(engine)] == ["allow"]
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    recorder = BufferingRecorder()
+    with prompt_guard_user_scope(_USER):
+        await gateway._call_llm_with_audit(
+            messages, [], timeout=10, recorder=recorder, provider_custody=owner.mint(ProviderInvocationFamily.PRIMARY)
+        )
+    assert len(sent) == len(recorder.llm_calls) == 1
+    assert sent[0]["messages"] == expected_wire
+    assert [check["disposition"] for check in _checks(engine)] == ["allow"]
     coordinator.assert_completed()
     documents = "\n".join(document for request in inspected for document in request["documents"])
     url = options["environment_url" if shape == "dataverse" else "endpoint"]
@@ -166,9 +169,7 @@ async def test_decoded_credential_tokens_remain_closed_at_physical_guard(authori
         {
             "role": "assistant",
             "content": None,
-            "tool_calls": [
-                {"id": "prior-call", "type": "function", "function": {"name": "emit_pipeline_proposal", "arguments": serialized}}
-            ],
+            "tool_calls": [{"id": "prior-call", "type": "function", "function": {"name": "set_pipeline", "arguments": serialized}}],
             PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY: (PromptGuardToolArgumentParts(0, json_argument_content_parts(serialized)),),
         },
         {"role": "user", "content": _USER},

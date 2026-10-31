@@ -6,12 +6,38 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+from tests.helpers import web_reserve_proposal_child_transfers as _supplier_sources
 from tests.helpers.web_reserve_composer_receiver import composer_dispatch_calls
 
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 PROPOSALS = "src/elspeth/web/sessions/routes/composer/proposals.py"
 SETTLEMENT = "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py"
+FINALIZATION = "src/elspeth/web/sessions/composer_finalization.py"
+RECOVERY_MESSAGES = "src/elspeth/web/composer/continuation_message_builders.py"
+RECOVERY_INSTRUCTION_ORIGINS = frozenset(
+    {
+        "elspeth.web.composer.continuation_message_builders.recovery_instruction_message",
+        "elspeth.contracts.prompt_guard.PROMPT_GUARD_TRUST_KEY",
+        "elspeth.contracts.prompt_guard.PromptGuardTrust",
+    }
+)
+RECOVERY_INSTRUCTION_FUNCTION_ORIGINS = frozenset({"elspeth.web.composer.continuation_message_builders.recovery_instruction_message"})
+RECOVERY_INSTRUCTION_CLASS_ORIGINS = frozenset({"elspeth.contracts.prompt_guard.PromptGuardTrust"})
+
+_RECOVERY_INSTRUCTION_SOURCE = """def recovery_instruction_message() -> dict[str, Any]:
+    return {
+        "role": "system",
+        PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.INSTRUCTION,
+        "content": (
+            "The saved graph could not be decoded. Its payload is unavailable and must not be inferred. "
+            "Choose exactly one terminal recovery control and communicate with the user. "
+            "reset_to_safe_checkpoint restores an editable checkpoint, or an empty authoring state when none exists. "
+            "Saving or capturing the broken graph is not required. Do not claim recovery succeeded before the "
+            "server receipt. Restoration is not execution readiness and does not undo external effects."
+        ),
+    }
+"""
 
 
 def _node(unit, path):
@@ -200,6 +226,31 @@ def _source3_local_transfers(units):
         return ["composer turn exact provider owner producer changed"], None
     if len(_lexical_bindings(turn, "provider_binding")) != 1 or len(_lexical_bindings(turn, "provider_owner")) != 1:
         return ["composer turn provider owner or binding rebound"], None
+    if (
+        not isinstance(turn.body[36], ast.Try)
+        or len(turn.body[36].body) < 16
+        or not _exact(
+            turn.body[36].body[15],
+            "provider_owner.bind_cost_budget(capture_common_provider_cost("
+            "session_id=str(session.id), request_id=str(turn_user_message_id), lifecycle_version=1, "
+            "initially_empty=state is not None and state_is_structurally_empty(state), settings=settings))",
+        )
+    ):
+        return ["composer turn original request cost capture changed"], None
+    if (
+        len(turn.body[36].body) < 18
+        or not _exact(
+            turn.body[36].body[16],
+            "initial_preferences = await service.get_composer_preferences(turn.session_id)",
+        )
+        or not _exact(
+            turn.body[36].body[17],
+            "mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)",
+        )
+        or len(_lexical_bindings(turn, "initial_preferences")) != 1
+        or len(_lexical_bindings(turn, "mutation_ceiling")) != 1
+    ):
+        return ["composer turn original request mutation capture changed"], None
     if len(_lexical_bindings(turn, "required_work")) != 2 or not _exact(
         turn.body[10],
         "if turn.budget_seconds != budget_anchor.remaining_at_running_seconds:\n"
@@ -231,9 +282,9 @@ def _source3_local_transfers(units):
     compose_calls = _calls(turn, compose_predicate)
     if len(compose_calls) != 2 or {call.func.attr for call in compose_calls} != {"compose", "compose_recovery"}:
         return ["composer turn compose call universe changed"], None
-    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 22:
+    if not isinstance(turn.body[36], ast.Try) or len(turn.body[36].body) < 25:
         return ["composer call executed path or preceding terminal changed"], None
-    dispatch = composer_dispatch_calls(turn.body[36].body[21])
+    dispatch = composer_dispatch_calls(turn.body[36].body[24])
     if dispatch is None or set(dispatch) != set(compose_calls) or _direct_prefix_has_terminal(turn, 36):
         return ["composer turn exact paired call arguments or closed branches changed"], None
     compose_call, recovery_call = dispatch
@@ -242,7 +293,7 @@ def _source3_local_transfers(units):
     for call, arm, index in ((compose_call, "orelse", 1), (recovery_call, "body", 0)):
         if _executed_path(turn, call) != (
             ("AsyncFunctionDef", "body", 36, "Try"),
-            ("Try", "body", 21, "Try"),
+            ("Try", "body", 24, "Try"),
             ("Try", "body", 2, "If"),
             ("If", arm, index, "Assign"),
             ("Assign", "value", None, "Await"),
@@ -284,6 +335,35 @@ def _source3_local_transfers(units):
         "    provider_owner.required_work.validate_context(session_operation_context)",
     ):
         return ["composer owner, service, binding or context admission changed"], None
+    loop_blocks = [
+        node
+        for node in ast.walk(compose)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(statement, ast.Return)
+            and isinstance(statement.value, ast.Await)
+            and isinstance(statement.value.value, ast.Call)
+            and _shape(statement.value.value.func) == _shape(ast.parse("self._compose_loop", mode="eval").body)
+            for statement in node.body
+        )
+    ]
+    if (
+        len(loop_blocks) != 1
+        or len(loop_blocks[0].body) != 2
+        or not _exact(
+            loop_blocks[0].body[0],
+            "if provider_owner is not None and session_id is not None and user_message_id is not None:\n"
+            "    cost_budget = provider_owner.cost_budget\n"
+            "    if cost_budget is None:\n"
+            "        cost_budget = capture_common_provider_cost(\n"
+            "            session_id=session_id, request_id=user_message_id, lifecycle_version=1,\n"
+            "            initially_empty=_state_is_structurally_empty(state), settings=self._settings)\n"
+            "        provider_owner.bind_cost_budget(cost_budget)\n"
+            "    cost_budget.validate_binding(session_id=session_id, request_id=user_message_id, lifecycle_version=1)\n"
+            "    cost_budget.require_supported_configuration()",
+        )
+    ):
+        return ["composer common entry retained cost policy admission changed"], None
 
     def proposal_predicate(n):
         return isinstance(n.func, ast.Name) and n.func.id == "settle_pipeline_proposal_under_compose_lock"
@@ -380,24 +460,54 @@ def _source3_local_transfers(units):
     }
 
 
-# These four complete executed bodies, their definition headers, and the exact
-# selected Call grammars are reviewed as one finite producer contract. The
+# The four original complete bodies and the extracted finalizer, their headers,
+# and exact selected Call grammars form one finite producer contract. The
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "d25a75d9b850b14d6eb35f77c5984bd39e9f77149249fcfe09440aaf6258c1ff",
-    SERVICE: "0513878f81043a5838f159ca8cddab63a3209b98c03eebd40356976b5745cd84",
+    TURN: "e24e67ac2fa723269ff782ddf40a194f25282279b90eb92efd5960e49a61d974",
+    SERVICE: "888d117a75a50c8c4bfda3ec1a91d624e3ba82232bdd87e957dd452dc688baac",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
+    # Root derives this from the actual selected body after the finite join is
+    # reviewed. None refuses; it is never a waiver for an unreceived body.
+    FINALIZATION: "fe3ee099677b49c914de06bb58c43fbfbcb7c5b7793a0f62964c757a7c39c1b6",
 }
-_REVIEWED_RECOVERY_METHOD_SHAPE = "3ae93045b40c4679440983c32f813a6d0ae75749e63adeaf01f2dffcdb7df89c"
+_REVIEWED_RECOVERY_METHOD_SHAPE = "cb8dea7814eb14cbe8601c402db19eb544781954c26679a6780e378b3d6d35c0"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
 _METHOD_PATHS = {
     TURN: "_run_composer_turn",
     SERVICE: "ComposerServiceImpl.compose",
     PROPOSALS: "accept_composition_proposal",
     SETTLEMENT: "settle_pipeline_proposal_under_compose_lock",
+    FINALIZATION: "settle_composer_result",
 }
+
+_FINALIZATION_NAMESPACE_SHAPE = "68064590d888ca71f9363c76fa2bbb1139dc9299cfd41376cced883bed92895b"
+_FINALIZATION_FIELDS = (
+    "service",
+    "session",
+    "recovery_context",
+    "lease",
+    "compose_base_state_id",
+    "running",
+    "observation",
+    "progress_sink",
+    "state",
+    "chat_ingress",
+    "chat_ingress_inputs",
+    "prior_completion_gates_facts",
+    "state_record",
+    "budget_anchor",
+    "services",
+    "turn",
+    "labels",
+    "provider_binding",
+    "settings",
+    "plugin_snapshot",
+    "profile_registry",
+    "required_work",
+)
 
 
 def _canonical_ast(value):
@@ -433,6 +543,8 @@ def _canonical_ast(value):
         return [_canonical_ast(item) for item in value]
     if isinstance(value, tuple):
         return [_canonical_ast(item) for item in value]
+    if value is Ellipsis:
+        return {"literal_type": "ellipsis"}
     return value
 
 
@@ -510,8 +622,150 @@ def _strip_inert_annotations(method, path):
     return visit(method)
 
 
+def _finalization_namespace_shape(tree):
+    """Keep evaluated namespace/headers; deferred bodies have separate guards."""
+
+    class Headers(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            node.body = [ast.Pass()]
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            node.body = [ast.Pass()]
+            return node
+
+        def visit_Lambda(self, node):
+            node.body = ast.Constant(value=None)
+            return node
+
+    return _method_shape(Headers().visit(_supplier_sources.copy_ast_fields(tree)))
+
+
+def _moved_finalization_contract(selected):
+    """Bind only the original turn wrapper to its complete moved supplier.
+
+    The node identities below describe the real source join, not a new SQL,
+    callback, arbitrary constructor or capability admission exception.
+    """
+    turn_unit = selected[TURN]
+    unit = selected[FINALIZATION]
+    turn = _node(turn_unit, "_run_composer_turn")
+    cls = _node(unit, "ComposerFinalizationInputs")
+    method = _node(unit, "settle_composer_result")
+    if not isinstance(turn, ast.AsyncFunctionDef) or not isinstance(cls, ast.ClassDef) or not isinstance(method, ast.AsyncFunctionDef):
+        return ["composer moved finalizer actual source declarations missing"], None
+    module = "elspeth.web.sessions.composer_finalization"
+    for name in ("ComposerFinalizationInputs", "settle_composer_result"):
+        if _supplier_sources.import_origin(turn_unit.tree, name, module, name) is None or _lexical_bindings(turn, name):
+            return ["composer moved finalizer canonical caller import changed " + name], None
+    if (
+        not _supplier_sources.owned_origin(unit.tree, "ComposerFinalizationInputs", cls)
+        or not _supplier_sources.owned_origin(unit.tree, "settle_composer_result", method)
+        or _supplier_sources.import_origin(unit.tree, "dataclass", "dataclasses", "dataclass") is None
+    ):
+        return ["composer moved finalizer owned supplier or dataclass binding changed"], None
+    fields = cls.body
+    if fields and isinstance(fields[0], ast.Expr) and isinstance(fields[0].value, ast.Constant) and type(fields[0].value.value) is str:
+        fields = fields[1:]
+    post_init = ast.parse('def __post_init__(self) -> None:\n    freeze_fields(self, "chat_ingress", "chat_ingress_inputs")').body[0]
+    if not fields or _shape(fields[-1]) != _shape(post_init):
+        return ["composer moved finalizer exact value freeze changed"], None
+    fields = fields[:-1]
+    for name in ("freeze_fields", "deep_thaw"):
+        if _supplier_sources.import_origin(unit.tree, name, "elspeth.contracts.freeze", name) is None:
+            return ["composer moved finalizer canonical value supplier changed " + name], None
+    if _supplier_sources.import_origin(unit.tree, "cast", "typing", "cast") is None:
+        return ["composer moved finalizer canonical value cast changed"], None
+    if (
+        cls.bases
+        or cls.keywords
+        or cls.type_params
+        or len(cls.decorator_list) != 1
+        or _shape(cls.decorator_list[0]) != _shape(ast.parse("dataclass(frozen=True, slots=True)", mode="eval").body)
+        or len(fields) != len(_FINALIZATION_FIELDS)
+        or any(
+            not isinstance(field, ast.AnnAssign)
+            or not isinstance(field.target, ast.Name)
+            or field.target.id != name
+            or field.value is not None
+            or field.simple != 1
+            for field, name in zip(fields, _FINALIZATION_FIELDS, strict=True)
+        )
+    ):
+        return ["composer moved finalizer constructor is not the actual plain frozen fields"], None
+    wrappers = [n for n in ast.walk(turn) if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
+    arguments = ", ".join(name + "=" + name for name in _FINALIZATION_FIELDS)
+    wrapper_source = (
+        "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse) -> ComposerOperationRecord:\n"
+        "    return await settle_composer_result(ComposerFinalizationInputs(" + arguments + "), result)"
+    )
+    if len(wrappers) != 1 or not _exact(wrappers[0], wrapper_source) or len(_lexical_bindings(turn, "settle_post_provider")) != 1:
+        return ["composer moved finalizer exact original wrapper or arguments changed"], None
+    calls = {}
+    for name in ("ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider"):
+        references = [n for n in ast.walk(turn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name]
+        sites = [n for n in ast.walk(turn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name]
+        if len(references) != 1 or len(sites) != 1 or references[0] is not sites[0].func:
+            return ["composer moved finalizer original once-only call universe changed " + name], None
+        calls[name] = sites[0]
+    owners = [
+        n for n in ast.walk(turn) if isinstance(n, ast.Assign) and any(nested is calls["settle_post_provider"] for nested in ast.walk(n))
+    ]
+    if len(owners) != 1 or not _exact(
+        owners[0],
+        "continuation = lease.create_task(_capture_freeform_child(settle_post_provider(result)), name=labels.settlement_task_name)",
+    ):
+        return ["composer moved finalizer original lease task ownership changed"], None
+    if (
+        len(method.body) < 2 + len(_FINALIZATION_FIELDS)
+        or not _exact(
+            method.body[0],
+            "from elspeth.web.sessions.composer_turn import _SETTLEMENT_TIMEOUT_DETAIL, _graph_recovery_response, _required_audit",
+        )
+        or len(_lexical_bindings(method, "inputs")) != 1
+    ):
+        return ["composer moved finalizer original supplier imports or input binding changed"], None
+    for name, statement in zip(_FINALIZATION_FIELDS, method.body[2 : 2 + len(_FINALIZATION_FIELDS)], strict=True):
+        if not _exact(statement, name + " = inputs." + name) or len(_lexical_bindings(method, name)) != 1:
+            return ["composer moved finalizer original field forwarding changed " + name], None
+    updates = ast.parse(
+        '_post_compose_updates: ComposerPostComposeUpdates = {"repair_turns_used": result.repair_turns_used, '
+        '"ingress": cast("CompositionIngressRecord", deep_thaw(chat_ingress)), '
+        '"chat_ingress_inputs": cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))}'
+    ).body[0]
+    if sum(_shape(node) == _shape(updates) for node in method.body) != 1:
+        return ["composer moved finalizer exact metadata value thaw changed"], None
+    preflight = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_handle_runtime_preflight_failure"
+    ]
+    required_values = {
+        "ingress": 'cast("CompositionIngressRecord", deep_thaw(chat_ingress))',
+        "chat_ingress_inputs": 'cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))',
+    }
+    if len(preflight) != 1 or any(
+        len(
+            [
+                item
+                for item in preflight[0].keywords
+                if item.arg == name and _shape(item.value) == _shape(ast.parse(value, mode="eval").body)
+            ]
+        )
+        != 1
+        for name, value in required_values.items()
+    ):
+        return ["composer moved finalizer exact preflight value thaw changed"], None
+    failures = []
+    if _finalization_namespace_shape(unit.tree) != _FINALIZATION_NAMESPACE_SHAPE:
+        failures.append("composer moved finalizer complete supplier namespace changed")
+    if failures:
+        return failures, None
+    return [], {name: (TURN, id(call)) for name, call in calls.items()}
+
+
 def compose_proposal_local_transfers(units):
-    """Bind the full four-method execution grammar before local receipts."""
+    """Bind original execution and the complete moved body before receipts."""
     selected = {}
     for unit in units:
         if unit.path not in _METHOD_PATHS:
@@ -524,6 +778,16 @@ def compose_proposal_local_transfers(units):
     recovery = _node(selected[SERVICE], "ComposerServiceImpl.compose_recovery")
     if recovery is None or _method_shape(recovery) != _REVIEWED_RECOVERY_METHOD_SHAPE:
         return ["composer recovery complete executed method grammar changed"], None
+    if _supplier_sources.import_origin(
+        selected[SERVICE].tree,
+        "recovery_instruction_message",
+        "elspeth.web.composer.continuation_message_builders",
+        "recovery_instruction_message",
+    ) is None or _lexical_bindings(recovery, "recovery_instruction_message"):
+        return ["composer recovery instruction supplier origin changed"], None
+    finalization_failures, finalization = _moved_finalization_contract(selected)
+    if finalization_failures:
+        return finalization_failures, None
     normalized = {}
     for path, unit in selected.items():
         if not any(
@@ -557,4 +821,64 @@ def compose_proposal_local_transfers(units):
     failures, receipt = _source3_local_transfers(tuple(normalized.values()))
     if failures:
         return failures, None
+    receipt["moved_finalization"] = finalization
     return [], receipt
+
+
+def recovery_instruction_supplier_contracts(units):
+    """Bind the extracted instruction in supplied ASTs; never read a source file.
+
+    The ordinary transfer receipt validates the consumer import and call. This
+    additional dependency receipt requires the defining source and keeps loader,
+    enum and callable-code behavior conditional on the common proof.
+    """
+    index = {}
+    for unit in units:
+        if unit.path in index:
+            return ["recovery instruction supplier: duplicate source unit"], None
+        index[unit.path] = unit
+    if SERVICE not in index or RECOVERY_MESSAGES not in index:
+        return ["recovery instruction supplier: missing current source"], None
+    source = index[RECOVERY_MESSAGES]
+    if not any(
+        isinstance(node, ast.ImportFrom) and node.module == "__future__" and any(alias.name == "annotations" for alias in node.names)
+        for node in source.tree.body
+    ):
+        return ["recovery instruction supplier: postponed annotations required"], None
+    method = _node(source, "recovery_instruction_message")
+    if method is None or not _exact(method, _RECOVERY_INSTRUCTION_SOURCE):
+        return ["recovery instruction supplier: complete producer changed"], None
+    if not _supplier_sources.owned_origin(source.tree, "recovery_instruction_message", method):
+        return ["recovery instruction supplier: producer binding changed"], None
+    origins = []
+    for binding in ("PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"):
+        origin = _supplier_sources.import_origin(source.tree, binding, "elspeth.contracts.prompt_guard", binding)
+        if origin is None:
+            return ["recovery instruction supplier: canonical dependency changed " + binding], None
+        origins.append((source.path, id(origin[1])))
+    consumer = index[SERVICE]
+    origin = _supplier_sources.import_origin(
+        consumer.tree,
+        "recovery_instruction_message",
+        "elspeth.web.composer.continuation_message_builders",
+        "recovery_instruction_message",
+    )
+    recovery = _node(consumer, "ComposerServiceImpl.compose_recovery")
+    if origin is None or recovery is None or _lexical_bindings(recovery, "recovery_instruction_message"):
+        return ["recovery instruction supplier: consumer origin changed"], None
+    calls = _calls(recovery, lambda node: isinstance(node.func, ast.Name) and node.func.id == "recovery_instruction_message")
+    if len(calls) != 1 or calls[0].args or calls[0].keywords:
+        return ["recovery instruction supplier: exact consumer call changed"], None
+    if _supplier_sources._executed_protected_loads(
+        source.tree, {"recovery_instruction_message", "PROMPT_GUARD_TRUST_KEY", "PromptGuardTrust"}
+    ):
+        return ["recovery instruction supplier: evaluated producer escape"], None
+    return [], {
+        "supplier_definitions": ((source.path, id(method)),),
+        "supplier_calls": ((consumer.path, id(calls[0])),),
+        "source_origins": (*origins, (consumer.path, id(origin[1]))),
+        "protected_origins": RECOVERY_INSTRUCTION_ORIGINS,
+        "function_origins": RECOVERY_INSTRUCTION_FUNCTION_ORIGINS,
+        "class_origins": RECOVERY_INSTRUCTION_CLASS_ORIGINS,
+        "common_unknown": ("runtime prompt-guard enum and callable-code identity", "outside or deferred supplier mutation"),
+    }

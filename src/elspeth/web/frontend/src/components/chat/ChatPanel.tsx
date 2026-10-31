@@ -283,6 +283,10 @@ export function ChatPanelContent({
   const acceptProposal = useSessionStore((s) => s.acceptProposal);
   const rejectProposal = useSessionStore((s) => s.rejectProposal);
   const composerProgress = useSessionStore((s) => s.composerProgress);
+  const composerOperationStatusV2 = useSessionStore((s) => s.composerOperationStatusV2);
+  const composerLiveUpdatesInterrupted = useSessionStore((s) => s.composerLiveUpdatesInterrupted);
+  const composerStopPendingOperationId = useSessionStore((s) => s.composerStopPendingOperationId);
+  const composerStopPending = composerStopPendingOperationId !== null;
   const clearError = useSessionStore((s) => s.clearError);
   const forkFromMessage = useSessionStore((s) => s.forkFromMessage);
   // Honest completion labels (elspeth-bf9c296ee5), derived from the run
@@ -1305,6 +1309,9 @@ export function ChatPanelContent({
             completionOutcome={freeformCompletionOutcome}
             liveToolCalls={liveToolCalls}
             lastRejection={lastComposerRejection}
+            operationStatus={composerOperationStatusV2}
+            liveUpdatesInterrupted={composerLiveUpdatesInterrupted}
+            stopPending={composerStopPending}
             onRetryInterruptedRequest={interruptedRequest === undefined
               ? undefined
               : () => { void retryMessage(interruptedRequest.id); }}
@@ -1324,6 +1331,7 @@ export function ChatPanelContent({
         onSend={handleSend}
         disabled={isComposing}
         onCancel={isComposing ? cancelComposition : undefined}
+        stopPending={isComposing && (composerStopPending || (composerOperationStatusV2?.cancel_requested ?? false))}
         inputRef={inputRef}
         onToggleBlobManager={() => setShowBlobManager((v) => !v)}
         showBlobManager={showBlobManager}

@@ -21,7 +21,6 @@ from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.application_policy import PluginPolicyContextFactory
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache
@@ -29,6 +28,7 @@ from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handof
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError, ComposerSettings
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator, RuntimePreflightFailure, RuntimePreflightKey
 from elspeth.web.execution.schemas import ValidationResult
@@ -136,7 +136,7 @@ class ComposerPreflight:
         return validate_pipeline(
             state,
             self._settings,
-            yaml_generator,
+            ComposerYamlSerializer(),
             secret_service=self._secret_service,
             secret_wiring_policy=self._secret_wiring_policy,
             user_id=user_id,

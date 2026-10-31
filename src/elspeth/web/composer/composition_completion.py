@@ -11,6 +11,7 @@ from uuid import UUID
 import structlog
 from opentelemetry import metrics
 from sqlalchemy import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -96,6 +97,7 @@ from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
     ComposerResult,
 )
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools.generation import (
@@ -133,6 +135,8 @@ from elspeth.web.interpretation_state import (
     interpretation_sites,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.required_work import RequiredWorkSource
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 slog = structlog.get_logger()
@@ -919,6 +923,101 @@ class CompositionCompletion:
             tool_calls=[withheld_reply_envelope(origin, content)],
             session_operation_context=session_operation_context,
         )
+
+    async def _retain_policy_refused_reply(
+        self,
+        content: str,
+        *,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+        provider_owner: ProviderInvocationOwner | None,
+    ) -> None:
+        """Drain private evidence for a received reply whose END admission failed."""
+        if session_id is None or not content.strip():
+            return
+        if type(provider_owner) is not ProviderInvocationOwner:
+            raise AuditIntegrityError("Policy-refused reply lacks its required-work owner")
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Policy-refused reply lacks its exact session fence")
+        binding = provider_owner.required_work
+        binding.validate_context(session_operation_context)
+        sessions = self._require_sessions_service()
+        if provider_owner.service is not sessions:
+            raise AuditIntegrityError("Policy-refused reply belongs to another session service")
+        producer, sql, projection = binding.coordinator.reserve_audit_work(
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_SQL,
+            RequiredWorkSource.REQUIRED_UNWIND_AUDIT_PROJECTION,
+            transition_ordinal=binding.transition_ordinal,
+            semantic_ordinal=binding.semantic_ordinal,
+        )
+        try:
+            sid = UUID(session_id)
+            draft = AuditMessageDraft(
+                role="audit",
+                content=content,
+                tool_calls=(withheld_reply_envelope("compose_policy_refused", content),),
+            )
+        except BaseException as original:
+            producer.complete_owned(original)
+            sql.complete_without_submission()
+            projection.complete_without_submission()
+            raise
+        producer.complete_owned()
+
+        async def persist() -> None:
+            try:
+                await sessions.add_messages_atomic(
+                    sid,
+                    (draft,),
+                    writer_principal="compose_loop",
+                    session_operation_context=session_operation_context,
+                    audit_only=True,
+                    required_work=sql,
+                )
+            except SQLAlchemyError as original:
+                if sql.complete:
+                    projection.complete_without_submission()
+                raise AuditIntegrityError("Policy-refused reply required evidence persistence failed") from original
+            except BaseException:
+                if sql.complete:
+                    projection.complete_without_submission()
+                raise
+            projection.begin_projection()
+            projection.complete_owned()
+
+        operation = persist()
+        try:
+            task = asyncio.create_task(operation)
+        except BaseException as original:
+            operation.close()
+            sql.complete_without_submission(original)
+            projection.complete_without_submission()
+            raise
+        cancellations: list[asyncio.CancelledError] = []
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as original:
+                if all(original is not prior for prior in cancellations):
+                    cancellations.append(original)
+            except BaseException:
+                break
+        try:
+            task.result()
+        except BaseException as original:
+            if task.cancelled():
+                integrity = AuditIntegrityError("Required reply evidence child lacks an actual delivered outcome")
+                integrity.__cause__ = original
+                if cancellations:
+                    raise BaseExceptionGroup(
+                        "Required reply evidence child and original cancellations", [integrity, *cancellations]
+                    ) from None
+                raise integrity from original
+            if cancellations:
+                raise BaseExceptionGroup("Required reply evidence and original cancellations", [original, *cancellations]) from None
+            raise
+        if cancellations:
+            raise BaseExceptionGroup("Required reply evidence original cancellations", cancellations)
 
     async def _qualified_advisor_repair_public_result(
         self,
@@ -2312,20 +2411,37 @@ class CompositionCompletion:
                 )
                 break
             pass_index = advisor_checkpoint_passes_used + passes_delta + 1
-            verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
-                phase="end",
-                state=state,
-                session_id=session_id,
-                recorder=recorder,
-                progress=progress,
-                user_message=user_message,
-                pass_index=pass_index,
-                advisor_review_state=review_state,
-                deadline=deadline,
-                session_operation_context=session_operation_context,
-                provider_owner=provider_owner,
-                publication_review=publication_review,
-            )
+            policy_refusal: CommonProviderCostRefused | None = None
+            try:
+                verdict = await self._advisor_checkpoint._run_advisor_checkpoint(
+                    phase="end",
+                    state=state,
+                    session_id=session_id,
+                    recorder=recorder,
+                    progress=progress,
+                    user_message=user_message,
+                    pass_index=pass_index,
+                    advisor_review_state=review_state,
+                    deadline=deadline,
+                    session_operation_context=session_operation_context,
+                    provider_owner=provider_owner,
+                    publication_review=publication_review,
+                )
+            except CommonProviderCostRefused as refusal:
+                policy_refusal = refusal
+            if policy_refusal is not None:
+                try:
+                    await self._retain_policy_refused_reply(
+                        candidate,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        provider_owner=provider_owner,
+                    )
+                except BaseException as retention_failure:
+                    raise BaseExceptionGroup(
+                        "Terminal policy refusal and required reply evidence", [policy_refusal, retention_failure]
+                    ) from None
+                raise policy_refusal
             if verdict.failure_class == "budget_exhausted":
                 break
             passes_delta += 1

@@ -738,6 +738,14 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/state.py:CompositionState.from_dict:d"
   - "src/elspeth/web/composer/state.py:CompositionState.with_metadata:patch"
   - "src/elspeth/web/composer/state.py:CompositionState.to_dict:return"
+  # Tier-1 retained batch graph decoding: ordered member pairs have been
+  # resolved to heterogeneous child objects before the selected real nominal
+  # constructor runs. _FIELDS enforces the exact kind-specific member set/order;
+  # constructor-shape checks reject Pydantic normalization before alias copyback.
+  # This is the decoder's member-to-model factory, not a new domain record or
+  # Tier-3 boundary. Keep this soft site visible in the canonical census.
+  - "src/elspeth/web/composer/continuation_batch_data.py:_construct:members"
+  - "src/elspeth/web/composer/continuation_application_graph.py:construct_application_member:members"
   - "src/elspeth/web/composer/yaml_generator.py:_source_entry:source"
   - "src/elspeth/web/composer/yaml_generator.py:_source_entry:return"
   # Reads a serialized node dict from the same CompositionState shape as
@@ -816,22 +824,17 @@ allowed_dict_patterns:
   # chat-completion message list. The service.py:_dispatch_tool_batch entry above
   # remains valid for the thin delegator that still builds and forwards the list.
   - "src/elspeth/web/composer/tool_batch.py:run_tool_batch:llm_messages (list)"
+  # Live Continuation extraction forwards the same aliased external provider
+  # message list through initialization, preparation and one-call execution.
+  # These exact parameter sites retain the existing run_tool_batch contract;
+  # internal state/result carriers receive no additional allowance.
+  - "src/elspeth/web/composer/tool_batch.py:_initialize_continuation_batch_live:llm_messages (list)"
+  - "src/elspeth/web/composer/tool_batch.py:_prepare_continuation_call_live:llm_messages (list)"
+  - "src/elspeth/web/composer/tool_batch.py:_execute_continuation_call_live:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._classify_and_budget_turn:tools (list)"
   - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._try_terminate_no_tools:llm_messages (list)"
 
-  # Shared pipeline planner provider/tool wire shapes. These are ephemeral
-  # JSON contracts fixed by the OpenAI-compatible chat/tool protocol or by
-  # the registered composer JSON Schemas; they are never durable internal
-  # domain records.
-  - "src/elspeth/web/composer/pipeline_planner.py:planner_terminal_tool_definition:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:planner_tool_definitions:return (list)"
-  - "src/elspeth/web/composer/pipeline_planner.py:_assistant_tool_calls_message:return"
-  # The provider-authored pipeline is open JSON until the canonical
-  # SetPipelineArgumentsModel validates it. This helper only rejects and
-  # reports invalid structure; it never rewrites the candidate.
-  - "src/elspeth/web/composer/pipeline_planner.py:_validate_terminal_payload:payload"
-  - "src/elspeth/web/composer/pipeline_planner.py:_AuditedDiscoveryResult.to_dict:return"
   # Public accessor returns a defensive copy of the registered dynamic JSON
   # Schema; a TypedDict would duplicate and drift from that authority.
   - "src/elspeth/web/composer/tools/schema_contract.py:canonical_set_pipeline_schema:return"
@@ -847,6 +850,12 @@ allowed_dict_patterns:
   # LLM tool-use loop. Tool JSON schemas define optional fields.
   # ═══════════════════════════════════════════════════════════════════════════
   - "src/elspeth/web/composer/tools/_common.py:ToolResult.to_dict:return"
+  # Complete retained provider-facing tool envelope: strict JSON, selected
+  # discovery-contract admission, and complete B1 nominal-result equality.
+  # Its data shape varies by registered tool. ContinuationReadOwnerResult
+  # remains the owned retained record; this return is its wire projection,
+  # not current disclosure or authorization clearance.
+  - "src/elspeth/web/sessions/continuation_owner_results.py:re_admit_read_owner_result:return"
   - "src/elspeth/web/composer/tools/_common.py:_secret_ref_placement_error:options"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:execute_tool:arguments"
@@ -881,7 +890,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/wire_projection.py:_subschemas:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:_is_container_schema:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:wire_tool_definitions:return (list)"
-  - "src/elspeth/web/composer/tools/wire_projection.py:stamp_planner_terminal:return"
   - "src/elspeth/web/composer/tools/wire_projection.py:WireTool.thawed_function:return"
   - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection._ledger_sentence:node"
   - "src/elspeth/web/composer/tools/wire_projection.py:_StrictProjection.project:node"
@@ -1000,6 +1008,93 @@ allowed_dict_patterns:
   # claim ownership of LiteLLM's open message schema.
   - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:message"
   - "src/elspeth/web/composer/provider_thinking.py:attach_provider_thinking:return"
+  # Actual mutable SDK message factories and identity-preserving wire registry.
+  # Retained recipes/current authority/state/result owners remain nominal; these
+  # sites preserve complete provider fields and owned guard metadata only.
+  - "src/elspeth/web/composer/continuation_message_builders.py:recovery_instruction_message:return"
+  - "src/elspeth/web/composer/continuation_message_builders.py:reply_instruction_message:return"
+  - "src/elspeth/web/composer/continuation_message_builders.py:build_service_initial_messages:return (list)"
+  - "src/elspeth/web/composer/continuation_message_builders.py:tool_result_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:_retained_wire:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:_argument_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._register:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._register:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._initial:return (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.initial_messages:return (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.recovery_instruction:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.reply_instruction:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.tool_arguments:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_schema_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_schema_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._schema_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.restore_shelf:return (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._rebuild_shelf:return (list)"
+  # Extracted live SDK-message assembly preserves the same mutable message
+  # objects and producer guard partitions; retained snapshots and current
+  # authority remain nominal and separately admitted by their real owners.
+  - "src/elspeth/web/composer/advisor_transcript.py:AdvisorTranscriptOwner._from_continuation_shelf:shelf (list)"
+  - "src/elspeth/web/composer/continuation_evidence_graph.py:_finish_current_evidence:messages (list)"
+  # Native/failure families preserve the same complete mutable SDK message
+  # and guard partitions; recipes, source receipts and current owners stay nominal.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:native_assistant_message:return"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:retained_family_wire:return"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:_require_native_source:wire"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:_native_message_from_wire:wire"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:_native_message_from_wire:return"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:require_native_message_refresh:message"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:rebuild_native_message:return"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:failure_schema_message:return"
+  - "src/elspeth/web/composer/continuation_message_families.py:CurrentContinuationMessageFamilies.native_message:return"
+  - "src/elspeth/web/composer/continuation_message_families.py:CurrentContinuationMessageFamilies.failure_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_native_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_native_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_failure_schema_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_failure_schema_message:return"
+  # Attachment result boundaries forward the same complete SDK message and
+  # original guard partitions. Closed recipes/results/source owners stay nominal.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:attachment_result_message:return"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:capture_attachment_result_recipe:message"
+  - "src/elspeth/web/composer/continuation_message_families.py:CurrentContinuationMessageFamilies.attachment_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_attachment_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_attachment_message:return"
+  # Ordinary assistant boundaries preserve actual SDK dictionaries and exact
+  # guard partitions; recipes, paid sources and all domain owners stay nominal.
+  - "src/elspeth/web/composer/tool_batch.py:_register_continuation_assistant_message:message"
+  - "src/elspeth/web/composer/continuation_message_families.py:CurrentContinuationMessageFamilies.tool_argument_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_call_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_call_message:return"
+  - "src/elspeth/web/composer/continuation_tool_argument_messages.py:_ordinary_message:wire"
+  - "src/elspeth/web/composer/continuation_tool_argument_messages.py:_ordinary_message:return"
+  - "src/elspeth/web/composer/continuation_tool_argument_messages.py:_require_ordinary_source:wire"
+  - "src/elspeth/web/composer/continuation_tool_argument_messages.py:rebuild_tool_argument_message:return"
+  # Ordinary tool results preserve the actual SDK dictionary, serialized body
+  # and original guard-part identities. Recipes and committed sources stay nominal.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:capture_tool_result_recipe:message"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:rebuild_tool_result_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_result_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_result_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_tool_result_provenance:message"
+  # Feedback reconstruction creates first-party SDK wire outputs; registration
+  # and publication borrow the actual live message/list aliases. Recipes,
+  # calls, outcomes, invocations and provenance remain nominal semantic owners.
+  # These exact boundaries preserve original body and ordered guard-part identities.
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:capture_tool_feedback_recipe:message"
+  - "src/elspeth/web/composer/continuation_message_family_builders.py:rebuild_tool_feedback_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_feedback_message:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers.register_tool_feedback_message:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_feedback_provenance:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:CurrentContinuationMessageProducers._remember_feedback_provenance:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.require_call:messages (list)"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_feedback:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_feedback:return"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_result:message"
+  - "src/elspeth/web/composer/continuation_prompt_producers.py:ContinuationToolMessagePublication.register_result:return"
+  # These wrappers forward existing SDK lists and return the nominal original
+  # physical-call carrier through the existing deadline/custody/settlement path.
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_outcome_with_audit:messages (list)"
+  - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm_outcome_with_audit:tools (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_outcome_before_deadline:messages (list)"
+  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._call_llm_outcome_before_deadline:tools (list)"
   # Secret tool handlers — same pattern as above, LLM-provided arguments
   - "src/elspeth/web/composer/tools/secrets.py:_handle_list_secret_refs:arguments"
   - "src/elspeth/web/composer/tools/secrets.py:_handle_validate_secret_ref:arguments"
@@ -1084,16 +1179,11 @@ allowed_dict_patterns:
   # decomposition); same Tier-3 parsed-dict semantics, no enclosing class now.
   - "src/elspeth/web/composer/tool_batch.py:_do_dispatch:_arguments"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:return (list)"
-  # Reply-only requests quote tool protocol records within the same external
-  # LiteLLM message shape; persisted history remains nominally typed.
-  - "src/elspeth/web/composer/service.py:_reply_only_messages:llm_messages (list)"
-  - "src/elspeth/web/composer/service.py:_reply_only_messages:return (list)"
   - "src/elspeth/web/composer/provider_gateway.py:composer_loop_tool_definitions:return (list)"
   # LiteLLM request kwargs for the compose loop and the pipeline planner,
   # built once so the boot probe sends exactly what production sends.
   # ``litellm.acompletion(**kwargs)`` takes an open keyword mapping.
   - "src/elspeth/web/composer/provider_gateway.py:build_composer_loop_request_kwargs:return"
-  - "src/elspeth/web/composer/pipeline_planner.py:build_planner_request_kwargs:return"
   - "src/elspeth/web/composer/boot_probe.py:ComposerProbeRequest.to_litellm_kwargs:return"
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:messages (list)"
   - "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm:tools (list)"
@@ -1114,7 +1204,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/advisor_transcript.py:_redacted_events:events (list)"
   - "src/elspeth/web/composer/advisor_transcript.py:_recover_read_bodies:events (list)"
   - "src/elspeth/web/composer/visible_tool_event.py:VisibleToolEvent.to_envelope:return"
-  - "src/elspeth/web/composer/visible_tool_event.py:visible_response_gap:return"
   # elspeth-4e79436719 §Phase 3: Anthropic cache_control marker transform
   # operates on the same provider-call payload shape as the call sites above.
   # The `tools` parameter is typed `list | None`, so the contracts check
@@ -1177,3 +1266,9 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/aws/bedrock_prompt_shield.py:AWSBedrockPromptShield.__init__:config"
   - "src/elspeth/plugins/transforms/aws/bedrock_content_safety.py:AWSBedrockContentSafety.__init__:config"
   - "src/elspeth/plugins/transforms/llm/providers/bedrock.py:BedrockLLMProvider.execute_query:response_format"
+  # Direct provider SDK message/tool wire; selected recipes and owned input
+  # descriptors are validated before this one existing gateway invocation.
+  - "src/elspeth/web/composer/continuation_primary.py:_freeze_input:messages (list)"
+  - "src/elspeth/web/composer/continuation_primary.py:_freeze_input:tools (list)"
+  - "src/elspeth/web/composer/continuation_primary.py:run_continuation_primary:messages (list)"
+  - "src/elspeth/web/composer/continuation_primary.py:run_continuation_primary:tools (list)"

@@ -20,7 +20,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcomeResponse,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError, composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
@@ -232,7 +232,8 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         assert provider_response.usage_reads == 1
         assert message.content_reads == 1
         assert message.tool_calls_reads == 1
-        assert [field.name for field in fields(_CallModelOutcome)] == ["completion"]
+        assert [field.name for field in fields(_CallModelOutcome)] == ["completion", "audit_call"]
+        assert outcome.audit_call is None
         assert not hasattr(outcome, "response")
         assert not hasattr(outcome, "assistant_message")
         assert outcome.completion.message.content == "admitted content"
@@ -242,6 +243,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         llm_messages: list[dict[str, Any]] = []
         dispatch, _advisor_calls_used = await service._dispatch_tool_batch(
             call_model=outcome,
+            mutation_ceiling=None,
             state=state,
             last_validation=None,
             last_runtime_preflight=None,
@@ -437,7 +439,7 @@ def _mutating_set_source_tool(
 async def _run_mutate_then_timeout(service: ComposerServiceImpl, session_id: str) -> tuple[ComposerConvergenceError, int]:
     """Drive a real ``_compose_loop``: one mutating turn, then a timeout.
 
-    The fake raises ``TimeoutError`` from inside ``_call_llm``, which
+    The controlled SDK raises ``TimeoutError`` inside the actual gateway, which
     ``_call_llm_with_audit`` re-raises after stamping the audit sidecar — so
     the ``except TimeoutError`` arm of ``_call_llm_before_deadline`` is the one
     that fires, not some other unwind path.
@@ -449,13 +451,11 @@ async def _run_mutate_then_timeout(service: ComposerServiceImpl, session_id: str
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return _admit_composer_llm_completion(
-                _make_llm_response(tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}])
-            )
+            return _make_llm_response(tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}])
         raise TimeoutError
 
     with (
-        patch.object(service._provider_gateway, "_call_llm", new=_first_tool_then_timeout),
+        patch("litellm.acompletion", new=_first_tool_then_timeout),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_mutating_set_source_tool),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):

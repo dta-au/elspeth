@@ -1,0 +1,14 @@
+Defensive security review of our own static-analysis gate (ELSPETH, maintainer-authorised, Anthropic CVP defensive scope). Read-only. Answer inline in under 1,000 words, citing file:line.
+
+Context: you previously reviewed this gate's P0 options; your review is at .claude/lanes/release-0.8.10/u46fix/mythos-p0-ruling.md. You recommended (b), a fail-closed budget, which is being landed, then (a), a per-SCC least fixpoint, under three soundness rules:
+1. start every node at (None, False);
+2. origin = None for any node whose producers include an SCC-mate;
+3. supplier-scalar suppression applies only to origins proven acyclically.
+The engineer has written the (a) design. Read docs/release/0.8.10-fencing-gate-diagnosis.md §8 in this worktree (commit bf7d75ba5), and the evaluator it replaces, retained_enum_state in tests/unit/architecture/test_web_landscape_mutation_fencing.py (around 11970–12212).
+
+Questions:
+1. Is the design sound, meaning it never yields fewer retention denials than the current DFS? In particular: are edges discovered by a separate, value-independent edge function a sound over-approximation of every child any rule could read? Name any rule whose reads the edge function might miss: short-circuit, isinstance early return, attribute maps, call returns.
+2. THE FLAGGED DEVIATION. The engineer says literal rule 2 can DROP a retention the DFS finds (example: kind = SomeEnum; kind = make(kind) in a loop with make's origin static; then kind.MEMBER, where the DFS retains through the enum-class attribute map), and proposes keeping origins inside SCCs as SETS that include None, so the exact origin is still None while maps into retained kinds apply per element. Is the engineer right that literal rule 2 is unsound here? Is the set-of-origins replacement sound and monotone, and does it still keep rule 3 (suppression only on acyclically proven origins) from firing on a set that contains None? Give the precise invariant that must hold.
+3. Monotonicity and termination of the worklist from (O={None}, R=False) with set-valued origins: is the lattice finite or of bounded height? What bound holds?
+4. Exactness on acyclic inputs (equal to the DFS) and caching final values per unit: any path-dependence left that makes a per-unit cache unsound?
+5. The minimum evidence before (a) lands, beyond what the note lists (probes, plants, corpus set-diff policy).

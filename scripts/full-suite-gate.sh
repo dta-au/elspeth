@@ -10,9 +10,9 @@
 #   .done marker 1137 · elspeth-lints --rules all 242 · -m testcontainer -n 0 116
 #
 # DRY-RUN BY DEFAULT: prints the preflight facts and the exact commands, runs
-# nothing. --execute runs them; --execute --detach runs them in their own
-# session (setsid nohup) and returns at once, for callers whose shell times out
-# before a 20-minute suite finishes (the Bash tool caps at 10 minutes).
+# nothing. Both execution forms supervise the foreground driver, including
+# execution preflight. --detach starts a supervisor-owning launcher in its own
+# session and returns once launched; that return is not a gate result.
 #
 # Stages (--stages, comma-separated; default: ruff,pytest):
 #   ruff          ruff check + ruff format --check over src/ tests/ scripts/ examples/
@@ -21,9 +21,11 @@
 #   contracts     scripts/check_contracts.py + generate_skill_inventory.py --check
 #   lints         elspeth-lints check --rules all --root src/elspeth, keyless
 #                 (shape-only verification). The corpus is EXPECTED to be non-zero
-#                 while the judge-signature stage is open (AGENTS.md), so this stage
-#                 records the finding count and is not fatal unless --lints-strict:
-#                 compare the count before and after your change, not to zero.
+#                 while signing is suspended (AGENTS.md), so complete, valid
+#                 finding corpora are advisory unless --lints-strict. Invalid
+#                 output or a failed scan makes the gate incomplete/nonzero.
+#                 Compare keyless finding sets before and after a change, not counts
+#                 or zero; this stage does not establish signature clearance.
 #   pytest        pytest tests/ — the default selection = CI's "Test" job. The
 #                 marker expression comes from pyproject addopts; this script never
 #                 passes -m for it.
@@ -40,8 +42,9 @@
 #     resolve inside this tree. Both `-o pythonpath=` (in-process; the ini setting
 #     beats PYTHONPATH) AND an exported PYTHONPATH (for spawned interpreters) are
 #     set, because each alone leaves a class of test importing the MAIN checkout
-#   - counts sibling pytest processes on this box from /proc (never a pgrep
-#     pattern) and caps workers at 8 unless --workers is given
+#   - with workers omitted, counts sibling pytest processes from /proc and
+#     selects 8 if any match, otherwise 12; explicit --workers (including 0)
+#     bypasses sibling observation entirely (caller-established capacity)
 #   - records HEAD + a hash of the working-tree state before the run, samples
 #     it every 5 s while each stage runs, and checks it after: a run during
 #     which the tree moved is NOT evidence and is marked frozen=NO even if the
@@ -50,10 +53,20 @@
 #     untracked NAMES, not ignored files)
 #
 # Output: one directory per run under --log-dir (default
-# $ELSPETH_GATE_LOG_DIR or /tmp/elspeth-gates/$USER), containing
+# $ELSPETH_GATE_LOG_DIR or $ROOT/.claude/lanes/full-suite-gates), containing
 #   preflight.txt · <stage>.log · <stage>-<ordinal>.exit (observed stage rc)
+#   lints.json (raw JSON stdout; lints.log retains stderr/validation errors)
 #   pytest-junit.xml · summary.txt · driver.exit · .done (last, driver terminal
 #   receipt only; read stage exit and frozen status before qualifying a run)
+#   supervisor.json · supervisor.exit (actual supervisor CLI exit, published
+#   only after it exits) · supervisor.pid · supervisor.start-stat · launcher.pid
+#   launcher.start-stat · launcher.exit (cancellation-aware outer completion)
+#   supervisor.argv.json (literal CLI/driver argv, deadline and grace)
+# The supervisor owns ordinary descendants in the driver's process group;
+# deliberate session/group escapes and external resources are outside it.
+# Its heartbeat is liveness, not test progress. An outer failure cannot qualify
+# a driver's PASS/.done. Require launcher.exit and supervisor.exit together;
+# a missing terminal receipt is incomplete evidence.
 # Nothing is ever piped through tail; read summary.txt, then the logs.
 #
 # Usage:
@@ -68,24 +81,29 @@
 #   --execute            run the stages (default: print the plan)
 #   --detach             with --execute: run under setsid nohup and return immediately
 #   --stages LIST        see above (default: ruff,pytest)
-#   --workers N          xdist workers for the pytest stage (default 12; 8 if siblings)
+#   --workers N          explicit pytest workers; no sibling observation (0 = serial)
+#                        omitted: automatic discovery selects 12, or 8 with siblings
 #   --root DIR           tree to gate (default: the git toplevel of the cwd)
 #   --log-dir DIR        parent directory for run directories
 #   --lints-strict       make a non-zero elspeth-lints exit fatal
 #   --pytest-args "..."  extra arguments appended to the pytest stage
+#   --run-timeout-seconds N  finite positive aggregate deadline (default 10800)
+#                       separate from per-item pytest timeout; cleanup grace 10 s
 #   -h, --help
 #
-# Exit codes:  0 every fatal stage passed and the tree stayed frozen
-#              1 a fatal stage failed, or the tree moved during the run
+# Exit codes:  0 fatal stages passed, tree frozen and outer cleanup complete
+#              1 a fatal stage failed, a scan was incomplete, or the tree moved
 #              2 preflight refused, or usage error
-#              (with --detach the parent exits 0 once the child is launched; the
-#               child's code is the RESULT line in summary.txt)
+#              124 aggregate deadline; 125 abandoned/incomplete group cleanup
+#              128+signal cancellation (or a signalled supervisor CLI)
+#              (with --detach the parent exits 0 once launch is accepted;
+#               terminal outer status is launcher.exit, not summary alone)
 
 set -euo pipefail
 
 EXECUTE=0; DETACH=0; STAGES="ruff,pytest"; WORKERS=""; ROOT=""; LOG_DIR=""; LINTS_STRICT=0; PYTEST_ARGS=""; RUN_DIR=""
+DRIVER_ONLY=0; LAUNCHER_ONLY=0; RUN_TIMEOUT="10800"
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
-ORIG_ARGS=("$@")
 # Absolute path to this script: --detach re-executes it AFTER `cd "$ROOT"`, and a
 # relative $0 then points at a file the target tree may not have (it did not).
 SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
@@ -99,7 +117,10 @@ while [ $# -gt 0 ]; do
         --log-dir) LOG_DIR="${2:?}"; shift ;;
         --lints-strict) LINTS_STRICT=1 ;;
         --pytest-args) PYTEST_ARGS="${2:?}"; shift ;;
+        --run-timeout-seconds) RUN_TIMEOUT="${2:?}"; shift ;;
         --run-dir) RUN_DIR="${2:?}"; shift ;;      # internal: the detached child reuses the parent's dir
+        --driver-only) DRIVER_ONLY=1 ;;            # internal recursion control, not a security boundary
+        --launcher-only) LAUNCHER_ONLY=1 ;;        # internal detached owner, never the driver
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac; shift
@@ -112,13 +133,131 @@ cd "$ROOT"
 [ -f pyproject.toml ] && [ -d src/elspeth ] || { echo "$ROOT is not an ELSPETH tree" >&2; exit 2; }
 PY="$ROOT/.venv/bin/python"
 TREE_NAME="$(basename "$ROOT")"
-LOG_DIR="${LOG_DIR:-${ELSPETH_GATE_LOG_DIR:-/tmp/elspeth-gates/${USER:-$(id -un)}}}"
+LOG_DIR="${LOG_DIR:-${ELSPETH_GATE_LOG_DIR:-$ROOT/.claude/lanes/full-suite-gates}}"
+
+# Argument validation is isolated from project imports. The supervisor starts
+# before the execution driver's provenance imports and source-state sampling.
+if [ ! -x "$PY" ]; then echo "REFUSED: no executable $PY" >&2; exit 2; fi
+if ! "$PY" -I -S -B -c 'import math, sys; n = float(sys.argv[1]); sys.exit(0 if math.isfinite(n) and n > 0 else 2)' "$RUN_TIMEOUT"; then
+    echo "--run-timeout-seconds must be finite and greater than zero" >&2
+    exit 2
+fi
 
 IFS=',' read -r -a STAGE_LIST <<<"$STAGES"
 for s in "${STAGE_LIST[@]}"; do
     case "$s" in ruff|mypy|contracts|lints|pytest|testcontainer) ;; *) echo "unknown stage: $s" >&2; exit 2 ;; esac
 done
 has_stage() { local s; for s in "${STAGE_LIST[@]}"; do [ "$s" = "$1" ] && return 0; done; return 1; }
+
+if [ "$EXECUTE" = 1 ] && [ "$DRIVER_ONLY" = 0 ]; then
+    if [ -n "${ELSPETH_JUDGE_METADATA_HMAC_KEY:-}" ]; then
+        echo "REFUSED: ELSPETH_JUDGE_METADATA_HMAC_KEY is set ([O1])" >&2
+        exit 2
+    fi
+    if [ "$LAUNCHER_ONLY" = 0 ]; then
+        [ -z "$RUN_DIR" ] || { echo "--run-dir is internal" >&2; exit 2; }
+        RUN_DIR="$LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ)-$TREE_NAME-$$"
+        mkdir -p "$RUN_DIR"
+        RUN_DIR="$(cd "$RUN_DIR" && pwd -P)"
+    else
+        [ -n "$RUN_DIR" ] && [ "$DETACH" = 0 ] || { echo "invalid launcher re-entry" >&2; exit 2; }
+    fi
+    DRIVER_ARGS=(--execute --root "$ROOT" --run-dir "$RUN_DIR"
+        --stages "$STAGES" --log-dir "$LOG_DIR" --run-timeout-seconds "$RUN_TIMEOUT")
+    [ -z "$WORKERS" ] || DRIVER_ARGS+=(--workers "$WORKERS")
+    [ "$LINTS_STRICT" = 0 ] || DRIVER_ARGS+=(--lints-strict)
+    [ -z "$PYTEST_ARGS" ] || DRIVER_ARGS+=(--pytest-args "$PYTEST_ARGS")
+    if [ "$DETACH" = 1 ]; then
+        setsid nohup "$SELF" --launcher-only "${DRIVER_ARGS[@]}" >"$RUN_DIR/driver.log" 2>&1 </dev/null &
+        echo "detached launcher requested: $!; actual owner: $RUN_DIR/launcher.pid"
+        echo "run_dir=$RUN_DIR"
+        echo "wait for launcher.exit, then inspect supervisor.exit, supervisor.json, summary.txt and driver.exit"
+        echo "cancel ONLY verified supervisor.pid (identity in supervisor.start-stat) with TERM"
+        echo "driver .done is driver-only; absent terminal receipts after owner exit mean INCOMPLETE"
+        exit 0
+    fi
+    echo "run_dir=$RUN_DIR"
+    echo "aggregate deadline=$RUN_TIMEOUT seconds; cleanup grace=10 seconds"
+    echo "cancel ONLY verified $RUN_DIR/supervisor.pid (supervisor.start-stat) with TERM"
+    echo "terminal receipt: $RUN_DIR/launcher.exit; also inspect supervisor.exit; driver .done is driver-only"
+    # This glue owns only CLI identity, signal forwarding, wait and publication.
+    # All deadlines, process-group signalling and reaping remain in the existing
+    # supervisor. A separate session prevents terminal signals reaching it twice.
+    exec "$PY" -I -S -B -c '
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+run_dir = Path(sys.argv[1])
+deadline, supervisor_script, python = sys.argv[2:5]
+command = [python, supervisor_script, "--nodeid", "full-suite-gate:" + run_dir.name,
+           "--timeout-seconds", deadline, "--grace-seconds", "10",
+           "--report", str(run_dir / "supervisor.json"), "--", *sys.argv[5:]]
+child = None
+pending = None
+forwarded = False
+publishing = False
+
+def forward():
+    global forwarded
+    if not forwarded and pending is not None and child is not None and child.poll() is None:
+        forwarded = True
+        child.send_signal(pending)
+
+def cancel(signum, _frame):
+    global pending
+    if pending is None:
+        pending = signum
+    if publishing:
+        # Actual helper status remains honest; accepted outer cancellation
+        # cannot leave a qualifying launcher-success receipt behind.
+        (run_dir / "launcher.exit").unlink(missing_ok=True)
+        raise SystemExit(128 + pending)
+    forward()
+
+signal.signal(signal.SIGTERM, cancel)
+signal.signal(signal.SIGINT, cancel)
+try:
+    (run_dir / "launcher.pid").write_text(str(os.getpid()) + "\n")
+    launcher_stat = Path("/proc/self/stat").read_text()
+    (run_dir / "launcher.start-stat").write_text(launcher_stat)
+    environment = os.environ.copy()
+    environment["_ELSPETH_GATE_LAUNCHER_IDENTITY"] = json.dumps(
+        {"pid": os.getpid(), "start": launcher_stat.rpartition(")")[2].split()[19]})
+    (run_dir / "supervisor.argv.json").write_text(json.dumps(command) + "\n")
+    child = subprocess.Popen(command, start_new_session=True, env=environment)
+    (run_dir / "supervisor.pid").write_text(str(child.pid) + "\n")
+    (run_dir / "pid").write_text(str(child.pid) + "\n")
+    try:
+        (run_dir / "supervisor.start-stat").write_text(Path(f"/proc/{child.pid}/stat").read_text())
+    except FileNotFoundError:
+        pass
+    forward()
+    result = child.wait()
+    status = result if result >= 0 else 128 - result
+    # CLI finalization has finished; its JSON alone is not this terminal signal.
+    publishing = True
+    launcher_status = status if pending is None else 128 + pending
+    for name, value in (("supervisor.exit", status), ("launcher.exit", launcher_status)):
+        temporary = run_dir / ("." + name + ".pending")
+        with temporary.open("x") as stream:
+            stream.write(str(value) + "\n")
+        os.replace(temporary, run_dir / name)
+except BaseException:
+    if child is not None and child.poll() is None:
+        child.send_signal(signal.SIGTERM)
+        child.wait()
+    raise
+raise SystemExit(launcher_status)
+' "$RUN_DIR" "$RUN_TIMEOUT" "$(dirname "$SELF")/ci_proof_progress.py" "$PY" "$SELF" --driver-only "${DRIVER_ARGS[@]}"
+fi
+
+[ "$DRIVER_ONLY" = 0 ] || { [ "$EXECUTE" = 1 ] && [ "$DETACH" = 0 ] && [ -n "$RUN_DIR" ]; } || {
+    echo "invalid driver re-entry" >&2; exit 2;
+}
 
 # --- preflight ---------------------------------------------------------------
 REFUSE=0
@@ -130,6 +269,7 @@ pre "tree        : $ROOT"
 pre "HEAD        : $(git rev-parse HEAD)  ($(git branch --show-current || true))"
 pre "stages      : $STAGES"
 pre "log dir     : $LOG_DIR"
+pre "run timeout : $RUN_TIMEOUT seconds; supervisor cleanup grace 10 seconds"
 
 if [ -n "${ELSPETH_JUDGE_METADATA_HMAC_KEY:-}" ]; then
     pre "REFUSED     : ELSPETH_JUDGE_METADATA_HMAC_KEY is set in this shell ([O1]); results here are not the keyless corpus"
@@ -140,41 +280,101 @@ if [ ! -x "$PY" ]; then
     REFUSE=1
 else
     export PYTHONPATH="$ROOT/src:$ROOT/elspeth-lints/src"
-    PROV="$("$PY" -c 'import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1 || true)"
-    E_FILE="$(sed -n 1p <<<"$PROV")"; L_FILE="$(sed -n 2p <<<"$PROV")"
-    if [[ "$E_FILE" == "$ROOT/src/"* && "$L_FILE" == "$ROOT/elspeth-lints/src/"* ]]; then
-        pre "provenance  : elspeth -> $E_FILE"
-        pre "              elspeth_lints -> $L_FILE"
+    if PROV="$("$PY" -B -c 'import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)' 2>&1)"; then
+        E_FILE="$(sed -n 1p <<<"$PROV")"; L_FILE="$(sed -n 2p <<<"$PROV")"
+        if [[ "$E_FILE" == "$ROOT/src/"* && "$L_FILE" == "$ROOT/elspeth-lints/src/"* ]]; then
+            pre "provenance  : elspeth -> $E_FILE"
+            pre "              elspeth_lints -> $L_FILE"
+        else
+            pre "REFUSED     : imports resolve outside this tree: $(tr '\n' ' ' <<<"$PROV")"
+            REFUSE=1
+        fi
     else
-        pre "REFUSED     : imports resolve outside this tree: $(tr '\n' ' ' <<<"$PROV")"
+        PROV_STATUS=$?
+        pre "REFUSED     : provenance interpreter exited $PROV_STATUS: $(tr '\n' ' ' <<<"$PROV")"
         REFUSE=1
     fi
 fi
 
-# Sibling suites: python INTERPRETERS on the box running pytest (argv[0] is a
-# python or pytest binary and the argv mentions pytest), with cwd read from /proc.
-# Wrapper shells and sandboxes whose argv merely quotes a pytest command are not
-# counted. Our own run has not started, so every hit is a sibling. A process that
-# exits mid-scan is skipped silently (cat's stderr is dropped, not the shell's).
-SIBLINGS=""
-for d in /proc/[0-9]*; do
-    pid="${d#/proc/}"; [ "$pid" = "$$" ] && continue
-    cmd="$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
-    [ -n "$cmd" ] || continue
-    argv0="$(basename -- "${cmd%% *}")"   # -- : a login shell's argv[0] is "-bash"
-    case "$argv0" in python*|pytest) ;; *) continue ;; esac
-    case "$cmd" in *pytest*) SIBLINGS+="  pid $pid cwd $(readlink "$d/cwd" 2>/dev/null || echo '?') :: ${cmd:0:90}"$'\n' ;; esac
-done
-N_SIB=0; [ -n "$SIBLINGS" ] && N_SIB="$(grep -c . <<<"$SIBLINGS")"
-if [ -z "$WORKERS" ]; then
+# Explicit capacity bypasses the WHOLE inventory branch, including wrapper
+# exclusions and fixture-input validation. Zero is an explicit serial choice.
+SIBLINGS_OBSERVED=0
+if [ -n "$WORKERS" ]; then
+    pre "capacity    : explicit workers=$WORKERS; caller-established capacity"
+    pre "siblings    : unobserved (explicit workers; no sibling discovery)"
+else
+    SIBLING_ROOT=/proc
+    SIBLING_SOURCE="host /proc"
+    if [ "${_ELSPETH_GATE_TEST_SIBLING_ROOT+x}" = x ]; then
+        # Internal fixture seam for sibling inventory ONLY. It never redirects
+        # self/parent identities, supervisor ownership, signals or cleanup.
+        SIBLING_ROOT="$_ELSPETH_GATE_TEST_SIBLING_ROOT"
+        case "$SIBLING_ROOT" in
+            "$ROOT/.pytest_cache/"*) ;;
+            *) pre "REFUSED     : invalid sibling fixture root; expected private project cache data"; exit 2 ;;
+        esac
+        if [ -z "$SIBLING_ROOT" ] || [ -L "$SIBLING_ROOT" ] || [ ! -d "$SIBLING_ROOT" ]; then
+            pre "REFUSED     : invalid sibling fixture root"
+            exit 2
+        fi
+        if ! SIBLING_REAL="$(cd "$SIBLING_ROOT" && pwd -P)" || [ "$SIBLING_REAL" != "$SIBLING_ROOT" ]; then
+            pre "REFUSED     : sibling fixture root must be a canonical directory"
+            exit 2
+        fi
+        SIBLING_SOURCE="fixture $SIBLING_ROOT"
+    fi
+    # Sibling suites: python/pytest interpreters whose argv mentions pytest.
+    # Shells merely quoting pytest are not counted. Exact owned wrappers are
+    # excluded; missing cmdline data retains the disappearing-process skip.
+    OWNED_WRAPPERS="$("$PY" -I -S -B -c '
+import json, os, sys
+def process(pid):
+    with open(f"/proc/{pid}/stat") as stream:
+        fields = stream.read().rpartition(")")[2].split()
+    return int(fields[1]), fields[19]
+try:
+    identity = json.loads(os.environ.get("_ELSPETH_GATE_LAUNCHER_IDENTITY", "null"))
+    if identity is not None:
+        supervisor, _ = process(int(sys.argv[1]))
+        launcher, _ = process(supervisor)
+        if launcher == identity["pid"] and process(launcher)[1] == identity["start"]:
+            print(launcher, supervisor)
+except (OSError, ValueError, KeyError, TypeError):
+    pass
+' "$$")"
+    SIBLINGS=""
+    for d in "$SIBLING_ROOT"/[0-9]*; do
+        pid="${d##*/}"; [ "$pid" = "$$" ] && continue
+        if [ "$SIBLING_SOURCE" != "host /proc" ]; then
+            [ -e "$d" ] || [ -L "$d" ] || continue
+            if [ -L "$d" ] || [ ! -d "$d" ] || [ -L "$d/cmdline" ] ||
+               { [ -e "$d/cmdline" ] && [ ! -f "$d/cmdline" ]; }; then
+                pre "REFUSED     : sibling fixture entries must be ordinary private data"
+                exit 2
+            fi
+        fi
+        case " $OWNED_WRAPPERS " in *" $pid "*) continue ;; esac
+        cmd="$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ' || true)"
+        [ -n "$cmd" ] || continue
+        argv0="$(basename -- "${cmd%% *}")"   # -- : a login shell's argv[0] is "-bash"
+        case "$argv0" in python*|pytest) ;; *) continue ;; esac
+        case "$cmd" in *pytest*) SIBLINGS+="  pid $pid cwd $(readlink "$d/cwd" 2>/dev/null || echo '?') :: ${cmd:0:90}"$'\n' ;; esac
+    done
+    N_SIB=0; [ -n "$SIBLINGS" ] && N_SIB="$(grep -c . <<<"$SIBLINGS")"
     if [ "$N_SIB" -gt 0 ]; then WORKERS=8; else WORKERS=12; fi
+    SIBLINGS_OBSERVED=1
+    pre "capacity    : automatic workers=$WORKERS"
+    pre "siblings    : $N_SIB pytest process(es) observed from $SIBLING_SOURCE -> workers=$WORKERS"
+    [ -n "$SIBLINGS" ] && pre "$SIBLINGS"
 fi
-pre "siblings    : $N_SIB pytest process(es) already on this box -> workers=$WORKERS"
-[ -n "$SIBLINGS" ] && pre "$SIBLINGS"
 
 if has_stage testcontainer; then
     if docker info >/dev/null 2>&1; then pre "docker      : reachable"; else pre "REFUSED     : testcontainer stage requested but docker is not reachable"; REFUSE=1; fi
-    [ "$N_SIB" -gt 0 ] && pre "WARNING     : a testcontainer run beside another suite records contention as failures; serialise on the box first"
+    if [ "$SIBLINGS_OBSERVED" = 0 ]; then
+        pre "WARNING     : siblings unobserved; caller must establish serial/exclusive testcontainer capacity"
+    elif [ "$N_SIB" -gt 0 ]; then
+        pre "WARNING     : a testcontainer run beside another suite records contention as failures; serialise on the box first"
+    fi
 fi
 
 tree_state() {
@@ -230,7 +430,7 @@ declare -A CMD_OF=()
 CMD_OF[ruff]="$ROOT/.venv/bin/ruff check ${RUFF_PATHS[*]} && $ROOT/.venv/bin/ruff format --check ${RUFF_PATHS[*]}"
 CMD_OF[mypy]="$ROOT/.venv/bin/mypy src/ elspeth-lints/src/"
 CMD_OF[contracts]="$PY scripts/check_contracts.py && $PY scripts/cicd/generate_skill_inventory.py --check"
-CMD_OF[lints]="ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing $PY -m elspeth_lints.core.cli check --rules all --root src/elspeth"
+CMD_OF[lints]="ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing $PY -m elspeth_lints.core.cli check --rules all --root src/elspeth --format json"
 CMD_OF[pytest]="$PY -m pytest tests/ -n $WORKERS -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/pytest-junit.xml $PYTEST_ARGS"
 CMD_OF[testcontainer]="$PY -m pytest tests/ -m testcontainer -n 0 -o 'pythonpath=$ROOT/src $ROOT/elspeth-lints/src' -v --junitxml=<run-dir>/testcontainer-junit.xml"
 
@@ -249,29 +449,15 @@ fi
 if [ -z "$RUN_DIR" ]; then
     RUN_DIR="$LOG_DIR/$(date -u +%Y%m%dT%H%M%SZ)-$TREE_NAME-$$"
     mkdir -p "$RUN_DIR"
-    printf '%s' "$PRE" >"$RUN_DIR/preflight.txt"
 fi
+printf '%s' "$PRE" >"$RUN_DIR/preflight.txt"
 SUMMARY="$RUN_DIR/summary.txt"
-
-# --- detach: re-exec ourselves in a fresh session and return ------------------
-if [ "$DETACH" = 1 ]; then
-    CHILD_ARGS=()
-    for a in "${ORIG_ARGS[@]}"; do [ "$a" = "--detach" ] || CHILD_ARGS+=("$a"); done
-    # A harness teardown kills the caller's process group; setsid puts the run in
-    # its own so it survives. nohup + redirected stdio so nothing holds the tty.
-    setsid nohup "$SELF" "${CHILD_ARGS[@]}" --run-dir "$RUN_DIR" --workers "$WORKERS" \
-        >"$RUN_DIR/driver.log" 2>&1 </dev/null &
-    echo $! >"$RUN_DIR/pid"
-    say "detached    : pid $(cat "$RUN_DIR/pid")  run dir $RUN_DIR"
-    say "wait with   : until [ -f $RUN_DIR/.done ]; do sleep 30; done; cat $RUN_DIR/summary.txt"
-    say "kill ONLY   : the pid in $RUN_DIR/pid, after checking /proc/<pid>/cwd is $ROOT"
-    exit 0
-fi
 
 # --- execute -----------------------------------------------------------------
 note() { printf '%s\n' "$*" | tee -a "$SUMMARY"; }
 RESULT=0
 MONITOR_FAILED=0
+LINTS_INCOMPLETE=0
 STAGE_SEQ=0
 CURRENT_STAGE="none"
 CURRENT_PHASE="setup"
@@ -351,6 +537,27 @@ trap 'record_driver_exit "$?"' EXIT
 note "run_dir=$RUN_DIR"
 note "tree=$ROOT head=$(git rev-parse HEAD) before=$BEFORE"
 
+validate_lint_result() {
+    # Reuse the pure validator beside this runner, without invoking a scan,
+    # exporting source, or changing the measured tree's import roots.
+    "$PY" -B - "$(dirname "$SELF")" "$ROOT" "$RUN_DIR/lints.json" "$1" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from trust_tier_ratchet import RatchetError, validate_scan_result
+
+try:
+    findings = validate_scan_result(
+        Path(sys.argv[3]).read_text(), returncode=int(sys.argv[4]), tree_root=Path(sys.argv[2])
+    )
+except (OSError, UnicodeError, RatchetError) as exc:
+    print(f"lint measurement incomplete: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+print(len(findings))
+PY
+}
+
 run_stage() { # run_stage <name> <fatal 0|1> <command string>
     local name="$1" fatal="$2" cmd="$3" log="$RUN_DIR/$1.log" t0 t1 rc watch_rc monitor attempt
     local watch_ready watch_stop watch_done stage_exit_file
@@ -401,14 +608,26 @@ run_stage() { # run_stage <name> <fatal 0|1> <command string>
         return 1
     fi
     CURRENT_PHASE="stage"
-    if bash -c "$cmd" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    if [ "$name" = lints ]; then
+        if bash -c "$cmd" >"$RUN_DIR/lints.json" 2>"$log"; then rc=0; else rc=$?; fi
+    else
+        if bash -c "$cmd" >"$log" 2>&1; then rc=0; else rc=$?; fi
+    fi
     OBSERVED_STAGE_RC="$rc"
     # Preserve the actual child result before fallible watcher/log cleanup.
     printf '%s\n' "$rc" >"$stage_exit_file"
     t1="$(date +%s)"
-    local extra=""
+    local extra="" lint_count
     case "$name" in
-        lints)  extra=" findings=$(grep -cE '^[^ ].*:[0-9]+:' "$log" || true)" ;;
+        lints)
+            CURRENT_PHASE="lint_validation"
+            if lint_count="$(validate_lint_result "$rc" 2>>"$log")"; then
+                extra=" lint_status=complete findings=$lint_count"
+            else
+                LINTS_INCOMPLETE=1
+                RESULT=1
+                extra=" lint_status=INCOMPLETE"
+            fi ;;
         pytest|testcontainer) extra=" $(grep -E '^(=+ .*(passed|failed|error).* =+)$' "$log" | tail -n 1 | tr -d '=' | sed 's/^ *//; s/ *$//' || true)" ;;
     esac
     note "stage=$name exit=$rc seconds=$((t1 - t0)) fatal=$fatal$extra"
@@ -461,7 +680,7 @@ elif [ "$MONITOR_FAILED" = 1 ]; then
 else
     note "after=$AFTER frozen=yes"
 fi
-if [ "$MONITOR_FAILED" = 1 ]; then
+if [ "$MONITOR_FAILED" = 1 ] || [ "$LINTS_INCOMPLETE" = 1 ]; then
     note "RESULT=INCOMPLETE"
 else
     note "RESULT=$([ "$RESULT" = 0 ] && echo PASS || echo FAIL)"

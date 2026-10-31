@@ -96,6 +96,16 @@ class PurgeManager:
 
     Identifies expired payloads from completed runs and deletes them
     from the PayloadStore while preserving audit hashes in Landscape.
+
+    Offline-only precondition: the caller must stop every writer using this
+    payload store and prevent new starts or automatic restarts from reference
+    selection through deletion and grade updates. A restored database must use
+    an isolated payload copy.
+    This class does not acquire maintenance exclusion; a preview selected while
+    writers are active is not deletion authority after they stop.
+    All references to the payload namespace must belong to this Landscape;
+    purging a store shared by independent Landscape databases is unsupported
+    even when every writer is stopped.
     """
 
     def __init__(self, db: "LandscapeDB", payload_store: PayloadStore) -> None:

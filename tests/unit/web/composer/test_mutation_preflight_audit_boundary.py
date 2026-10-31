@@ -9,12 +9,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -137,10 +138,13 @@ async def test_applied_mutation_is_audited_before_preflight(
     )
     deadline = asyncio.get_running_loop().time() + 60
     messages = []
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(result_session_id))
+    mutation_ceiling = ComposerMutationCeiling(result_session_id, str(uuid4()), preferences.trust_mode)
 
     async def dispatch():
         return await service._dispatch_tool_batch(
             call_model=_CallModelOutcome(completion=completion),
+            mutation_ceiling=mutation_ceiling,
             state=state,
             last_validation=None,
             last_runtime_preflight=None,

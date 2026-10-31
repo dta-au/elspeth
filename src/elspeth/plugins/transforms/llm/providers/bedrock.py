@@ -26,6 +26,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
     build_llm_call_request,
+    classify_unusable_content,
 )
 from elspeth.plugins.llm.config_validation import (
     BEDROCK_ACCESS_KEY_ID_MAX_LENGTH,
@@ -44,10 +45,8 @@ from elspeth.plugins.llm.config_validation import (
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import (
-    FinishReason,
     LLMAuditParent,
     LLMQueryResult,
-    UnrecognizedFinishReason,
     finish_reason_from_raw_response,
 )
 
@@ -305,11 +304,9 @@ class BedrockLLMProvider:
 
         finish_reason = finish_reason_from_raw_response(response.raw_response)
 
-        if not response.content or not response.content.strip():
-            if finish_reason == FinishReason.TOOL_CALLS:
-                raise LLMClientError("Bedrock returned tool_calls response (not supported by ELSPETH)", retryable=False)
-            safe_finish_reason = "unrecognized" if isinstance(finish_reason, UnrecognizedFinishReason) else finish_reason
-            raise ContentPolicyError(f"Bedrock LLM returned empty content (finish_reason={safe_finish_reason})")
+        if not response.content.strip():
+            failure = classify_unusable_content(content=response.content, raw_response=response.raw_response)
+            raise _redacted_bedrock_error(failure.error)
 
         return LLMQueryResult(
             content=response.content,
@@ -350,16 +347,19 @@ class BedrockLLMProvider:
             limiter=self._limiter,
             llm_call_governance=self._llm_call_governance,
             call_mode_session=self._call_mode_session,
+            require_nonempty_content=True,
         )
         redacted_error: LLMClientError | None = None
         try:
             try:
-                client.chat_completion(
+                response = client.chat_completion(
                     model=model,
                     messages=smoke_messages,
                     temperature=temperature,
                     max_tokens=32,
                 )
+                if not response.content.strip():
+                    raise classify_unusable_content(content=response.content, raw_response=response.raw_response).error
             except LLMClientError as error:
                 redacted_error = _redacted_bedrock_error(error)
         finally:
@@ -389,6 +389,7 @@ class BedrockLLMProvider:
                     limiter=self._limiter,
                     llm_call_governance=self._llm_call_governance,
                     call_mode_session=self._call_mode_session,
+                    require_nonempty_content=True,
                     **audit_parent.client_kwargs(),
                 )
             return self._llm_clients[cache_key]

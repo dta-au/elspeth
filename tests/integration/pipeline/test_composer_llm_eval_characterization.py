@@ -12,10 +12,11 @@ import contextlib
 import json
 import sqlite3
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import litellm
@@ -30,7 +31,6 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secrets import SecretInventoryItem
 from elspeth.core.secrets import SecretResolutionError, resolve_secret_refs
@@ -41,10 +41,9 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import yaml_generator as composer_yaml_generator
-from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.audit import _LLM_CALL_PUBLIC_AUDIT_FIELDS
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError
-from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     REDACTED_UNKNOWN_RESPONSE_FIELD,
     REDACTED_UNKNOWN_RESPONSE_KEY,
@@ -61,6 +60,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools import ToolResult, execute_tool
+from elspeth.web.composer.visible_tool_event import validate_visible_response_gap
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.execution.validation import validate_pipeline_for_trained_operator
@@ -69,13 +69,15 @@ from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import quota_provider_attempts_table
+from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.factories import make_context
 from tests.fixtures.identities import grant_test_pipeline_user
+from tests.helpers.composer_common_sdk import assert_actual_audits
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.helpers.session_fences import acquire_compose_context, seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 
@@ -130,28 +132,20 @@ class FakeChoice:
 @dataclass
 class FakeLLMResponse:
     choices: list[FakeChoice]
+    usage: Mapping[str, int] = field(default_factory=lambda: {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5})
+    model: str = EVAL_MODEL
 
 
-class _ReplayLLM:
-    """Callable fake LLM for CL-PP compose-loop characterization cases."""
+class _ReplayLLM(ComposerSDKScript):
+    """Finite original raw SDK replies for compose-loop characterization."""
 
-    def __init__(self, responses: tuple[_AdmittedLLMCompletion, ...]) -> None:
-        self._responses = list(responses)
+    def __init__(self, responses: tuple[FakeLLMResponse, ...]) -> None:
+        super().__init__(primary_model=EVAL_MODEL, primary=(*responses, _make_llm_response(content="Done.")))
+        self.requests: list[dict[str, Any]] = []
 
-    async def __call__(
-        self,
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-    ) -> _AdmittedLLMCompletion:
-        if not self._responses:
-            return _make_llm_response(content="Done.")
-        return self._responses.pop(0)
+    async def __call__(self, **kwargs: Any) -> object:
+        self.requests.append(deepcopy(kwargs))
+        return await super().__call__(**kwargs)
 
 
 class _NoUserSecretStore:
@@ -200,7 +194,7 @@ def _trained_operator_catalog() -> PolicyCatalogView:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _AdmittedLLMCompletion:
+) -> FakeLLMResponse:
     fake_tool_calls: list[FakeToolCall] | None = None
     if tool_calls is not None:
         fake_tool_calls = [
@@ -213,8 +207,7 @@ def _make_llm_response(
             )
             for tool_call in tool_calls
         ]
-    response = FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
-    return _admit_composer_llm_completion(response)
+    return FakeLLMResponse(choices=[FakeChoice(message=FakeMessage(content=content, tool_calls=fake_tool_calls))])
 
 
 def _empty_state() -> CompositionState:
@@ -303,7 +296,7 @@ async def _run_one_turn_for_characterization(
     session_operation_context: Any = None,
 ) -> Any:
     driver = cast(Any, service)
-    kwargs: dict[str, Any] = {"llm": llm, "session_id": session_id, "initial_state": initial_state}
+    kwargs: dict[str, Any] = {"sdk": llm, "session_id": session_id, "initial_state": initial_state, "user_id": EVAL_USER_ID}
     if session_operation_context is not None:
         # Tests that arm a commit failure acquire their COMPOSE lease first so
         # the failure lands on the compose-loop commit under test, not on the
@@ -362,7 +355,7 @@ async def _run_owned_replay_for_characterization(
     primary_calls = 0
     advisor_calls = 0
 
-    async def complete(**kwargs: Any) -> litellm.ModelResponse:
+    async def complete(**kwargs: Any) -> object:
         nonlocal primary_calls, advisor_calls
         if kwargs["model"] == service._settings.composer_advisor_model:
             advisor_calls += 1
@@ -373,16 +366,7 @@ async def _run_owned_replay_for_characterization(
         assert kwargs["model"] == service._model
         primary_calls += 1
         assert primary_calls <= 2, "No extra primary completion is supplied"
-        response = await llm(kwargs["messages"], kwargs["tools"])
-        calls = [
-            {"id": call.id, "type": "function", "function": {"name": call.function.name, "arguments": call.function.arguments}}
-            for call in response.tool_batch.calls
-        ]
-        return litellm.ModelResponse(
-            model=kwargs["model"],
-            usage={"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-            choices=[{"message": {"role": "assistant", "content": response.message.content, "tool_calls": calls or None}}],
-        )
+        return await llm(**kwargs)
 
     with patch("litellm.acompletion", side_effect=complete):
         result = await service.compose(
@@ -430,12 +414,135 @@ def _chat_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list
         return list(
             conn.execute(
                 text(
-                    "SELECT id, role, content, tool_calls, tool_call_id, parent_assistant_id, composition_state_id "
+                    "SELECT id, session_id, writer_principal, role, content, tool_calls, tool_call_id, parent_assistant_id, composition_state_id "
                     "FROM chat_messages WHERE session_id = :session_id ORDER BY sequence_no"
                 ),
                 {"session_id": session_id},
             ).fetchall()
         )
+
+
+def _atomic_turn_rows(sessions_service: SessionServiceImpl, llm: _ReplayLLM, *, session_id: str) -> list[Any]:
+    """Validate independent primary audits before checking atomic tool rows."""
+    assert len(llm.requests) == 1, "The single-turn failure trace must enter exactly one actual physical primary call"
+    calls = assert_actual_audits(sessions_service._engine, llm.requests, ["success"] * len(llm.requests), session_id=session_id)
+    call_ids = {call["call_id"] for call in calls}
+    with sessions_service._engine.connect() as conn:
+        attempts = conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == session_id)).all()
+        ledger = conn.execute(text("SELECT * FROM token_usage_ledger WHERE session_id = :session_id"), {"session_id": session_id}).all()
+    assert len(attempts) == len(ledger) == len(llm.requests)
+    assert all(attempt.settled_at is not None for attempt in attempts)
+    assert {attempt.ledger_entry_id for attempt in attempts} == {entry.entry_id for entry in ledger}
+    assert all(attempt.identity_id == EVAL_USER_ID and attempt.source == "composer" and attempt.run_id is None for attempt in attempts)
+    assert all(entry.identity_id == EVAL_USER_ID and entry.source == "composer" and entry.model == EVAL_MODEL for entry in ledger)
+    scopes = {(attempt.operation_id, attempt.operation_epoch) for attempt in attempts}
+    assert len(scopes) == 1
+    attempts_by_id = {attempt.attempt_id: attempt for attempt in attempts}
+    rows = _chat_rows(sessions_service, session_id=session_id)
+    primary_ids = set()
+    guards = []
+    for row in rows:
+        envelopes = json.loads(row.tool_calls) if row.tool_calls else []
+        if not envelopes:
+            continue
+        kind = envelopes[0].get("_kind")
+        if kind == "prompt_guard_audit":
+            assert len(envelopes) == 1 and row.role == "audit"
+            guard = envelopes[0]["check"]
+            assert guard["role"] == "composer" and guard["disposition"] == "debug_bypass"
+            assert (guard["operation_id"], guard["operation_epoch"]) in scopes
+            assert json.loads(row.content) == envelopes[0]
+            guards.append(guard["audit_id"])
+            primary_ids.add(row.id)
+        elif kind == "llm_call_audit" and envelopes[0]["call"]["call_id"] in call_ids:
+            assert row.session_id == session_id and row.role == "audit" and row.writer_principal == "compose_loop"
+            assert row.composition_state_id is row.tool_call_id is row.parent_assistant_id is None
+            assert row.content == "Provider call result recorded."
+            assert len(envelopes) == 2 and set(envelopes[0]) == {"_kind", "call"}
+            call = envelopes[0]["call"]
+            assert set(call) == set(_LLM_CALL_PUBLIC_AUDIT_FIELDS)
+            validate_visible_response_gap(envelopes[1], envelopes[0])
+            attempt = attempts_by_id[call["call_id"]]
+            assert envelopes[1]["session_id"] == session_id
+            assert envelopes[1]["operation_id"] == attempt.operation_id
+            assert envelopes[1]["operation_epoch"] == attempt.operation_epoch
+            primary_ids.add(row.id)
+        elif kind == "composer_diagnostic_evidence":
+            evidence = envelopes[0]["evidence"]
+            if evidence["status"] == "provider_request" and evidence["tool_call_id"] in call_ids:
+                assert row.session_id == session_id and row.role == "audit" and row.writer_principal == "compose_loop"
+                assert row.composition_state_id is row.tool_call_id is row.parent_assistant_id is None
+                assert row.content == "Private credential-filtered diagnostic facts"
+                primary_ids.add(row.id)
+    assert len(guards) == len(set(guards)) == len(llm.requests)
+    assert len(primary_ids) == 3 * len(llm.requests)
+    return [row for row in rows if row.id not in primary_ids]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("extra-envelope", AssertionError),
+        ("missing-gap", AssertionError),
+        ("malformed-gap", AuditIntegrityError),
+        ("wrong-gap-operation", AssertionError),
+        ("wrong-content", AssertionError),
+    ],
+)
+async def test_atomic_turn_projection_refuses_corrupted_actual_primary_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str, expected_error: type[Exception]
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    session_id = "00000000-0000-4000-8000-000000000099"
+    service, sessions_service = _composer_for_characterization(data_dir=tmp_path / "data", session_id=session_id)
+    service._max_tool_calls_per_turn = 16
+    llm = _ReplayLLM(
+        (_make_llm_response(tool_calls=[{"id": f"call_{idx}", "name": "get_pipeline_state", "arguments": {}} for idx in range(17)]),)
+    )
+    # The private driver runs the complete loop. Use its real pre-dispatch
+    # refusal to stop after one settled primary call, before any END request.
+    with pytest.raises(ComposerConvergenceError) as refusal:
+        await _run_one_turn_for_characterization(service, llm=llm, session_id=session_id)
+    assert refusal.value.reason == "tool_call_cap_exceeded"
+    assert refusal.value.evidence == {"observed": 17, "cap": 16}
+    assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
+    call_row = next(
+        row
+        for row in _chat_rows(sessions_service, session_id=session_id)
+        if row.tool_calls and json.loads(row.tool_calls)[0].get("_kind") == "llm_call_audit"
+    )
+    original_envelopes = json.loads(call_row.tool_calls)
+    envelopes = deepcopy(original_envelopes)
+    content = call_row.content
+    if mutation == "extra-envelope":
+        envelopes.append(deepcopy(envelopes[1]))
+    elif mutation == "missing-gap":
+        envelopes = envelopes[:1]
+    elif mutation == "malformed-gap":
+        envelopes[1]["public_call_hash"] += "corrupted"
+    elif mutation == "wrong-gap-operation":
+        envelopes[1]["operation_epoch"] += 1
+    else:
+        assert mutation == "wrong-content"
+        content += " corrupted"
+    # Corrupt an otherwise valid actual SDK audit, never synthesize one to
+    # satisfy the physical path. The residual projection must reject it.
+    try:
+        with sessions_service._engine.begin() as conn:
+            conn.execute(
+                chat_messages_table.update().where(chat_messages_table.c.id == call_row.id).values(tool_calls=envelopes, content=content)
+            )
+        with pytest.raises(expected_error):
+            _atomic_turn_rows(sessions_service, llm, session_id=session_id)
+    finally:
+        with sessions_service._engine.begin() as conn:
+            conn.execute(
+                chat_messages_table.update()
+                .where(chat_messages_table.c.id == call_row.id)
+                .values(tool_calls=original_envelopes, content=call_row.content)
+            )
+    assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
 
 
 def _composition_state_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list[Any]:
@@ -452,8 +559,9 @@ def _composition_state_rows(sessions_service: SessionServiceImpl, *, session_id:
 
 
 @contextlib.contextmanager
-def _force_commit_failure(engine: Engine) -> Iterator[None]:
+def _force_commit_failure(engine: Engine, service: ComposerServiceImpl) -> Iterator[None]:
     original_do_commit = engine.dialect.do_commit
+    original_persist = service._persist_turn_audit
     fired = False
 
     def _fail_once(dbapi_conn: object) -> None:
@@ -463,11 +571,18 @@ def _force_commit_failure(engine: Engine) -> Iterator[None]:
             raise sqlite3.OperationalError("simulated COMMIT failure (CL-PP characterization)")
         original_do_commit(dbapi_conn)
 
-    engine.dialect.do_commit = _fail_once
-    try:
+    async def _persist_with_failed_commit(**kwargs: Any) -> Any:
+        engine.dialect.do_commit = _fail_once
+        try:
+            return await original_persist(**kwargs)
+        finally:
+            engine.dialect.do_commit = original_do_commit
+
+    # Input inspection now performs a fenced liveness transaction. Fail the
+    # actual P4 commit, rather than whichever transaction happens first.
+    with patch.object(service, "_persist_turn_audit", new=_persist_with_failed_commit):
         yield
-    finally:
-        engine.dialect.do_commit = original_do_commit
+    assert fired, "the actual turn persistence commit was not reached"
 
 
 def _write_scenario_csv(path: Path) -> None:
@@ -652,7 +767,7 @@ async def test_cl_pp_10a_commit_failure_without_plugin_crash_raises_audit_integr
 
     async with acquire_compose_context(sessions_service, session_id) as compose_context:
         with (
-            _force_commit_failure(sessions_service._engine),
+            _force_commit_failure(sessions_service._engine, service),
             pytest.raises(AuditIntegrityError) as exc_info,
         ):
             await _run_one_turn_for_characterization(
@@ -664,7 +779,7 @@ async def test_cl_pp_10a_commit_failure_without_plugin_crash_raises_audit_integr
 
     assert isinstance(exc_info.value.__cause__, OperationalError)
     assert observed_value(telemetry.tool_row_tier1_violation_total) == 1
-    assert _chat_rows(sessions_service, session_id=session_id) == []
+    assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
 
 
 @pytest.mark.asyncio
@@ -722,7 +837,7 @@ async def test_cl_pp_10b_commit_failure_during_plugin_crash_preserves_plugin_err
 
     async with acquire_compose_context(sessions_service, session_id) as compose_context:
         with (
-            _force_commit_failure(sessions_service._engine),
+            _force_commit_failure(sessions_service._engine, service),
             capture_logs() as cap_logs,
             pytest.raises(ComposerPluginCrashError) as exc_info,
         ):
@@ -738,7 +853,7 @@ async def test_cl_pp_10b_commit_failure_during_plugin_crash_preserves_plugin_err
     assert exc_info.value.failed_turn.assistant_message_id is None
     assert observed_value(telemetry.tool_row_persist_failed_during_unwind_total) == 1
     assert any(log["event"] == "audit_insert_failed_during_tool_failure_unwind" for log in cap_logs)
-    assert _chat_rows(sessions_service, session_id=session_id) == []
+    assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
 
 
 @pytest.mark.asyncio
@@ -815,7 +930,7 @@ async def test_cl_pp_10c_cancellation_during_shielded_sync_dispatch_commits_rows
     if worker_errors:
         raise AssertionError("CL-PP-10c shielded worker failed after caller cancellation") from worker_errors[0]
 
-    rows = _chat_rows(sessions_service, session_id=session_id)
+    rows = _atomic_turn_rows(sessions_service, llm, session_id=session_id)
     assert len(rows) == 3
     assert [row.role for row in rows] == ["assistant", "tool", "audit"]
     assert rows[0].tool_calls is not None
@@ -872,7 +987,7 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
     compose_task = asyncio.create_task(_run_one_turn_for_characterization(service, llm=llm, session_id=session_id))
 
     await asyncio.wait_for(commit_returned.wait(), timeout=2.0)
-    rows_after_commit = _chat_rows(sessions_service, session_id=session_id)
+    rows_after_commit = _atomic_turn_rows(sessions_service, llm, session_id=session_id)
     assert [row.role for row in rows_after_commit] == ["assistant", "tool", "audit"]
 
     compose_task.cancel()
@@ -880,7 +995,7 @@ async def test_cl_pp_10d_cancellation_after_commit_before_response_yield_keeps_s
     with pytest.raises(asyncio.CancelledError):
         await compose_task
 
-    rows = _chat_rows(sessions_service, session_id=session_id)
+    rows = _atomic_turn_rows(sessions_service, llm, session_id=session_id)
     assert rows == rows_after_commit
     assert [row.role for row in rows] == ["assistant", "tool", "audit"]
     assert rows[0].tool_calls is not None
@@ -939,7 +1054,7 @@ async def test_cl_pp_12_tool_call_cap_exceeded_writes_no_rows_and_counts(
     assert exc_info.value.evidence == {"observed": 17, "cap": 16}
     assert execute_calls == 0
     assert observed_value(telemetry.tool_call_cap_exceeded_total) == 1
-    assert _chat_rows(sessions_service, session_id=session_id) == []
+    assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
 
 
 @pytest.mark.asyncio
@@ -1298,35 +1413,38 @@ def test_scenario_3_get_pipeline_state_preserves_redacted_patched_blob_path_that
 
 async def _failed_progress_for_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ComposerProgressEvent:
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
-    settings = _web_settings(tmp_path / "data", composer_timeout_seconds=0.05)
+    # The real guard, admission and audit preparation now precede SDK entry.
+    # Leave them headroom, then expire while the observed physical call waits.
+    settings = _web_settings(tmp_path / "data", composer_timeout_seconds=1.0)
     sessions_service = _session_service_for_characterization(
         data_dir=tmp_path / "data",
         session_id=SCENARIO_1A_SESSION_ID,
     )
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings, sessions_service=sessions_service)
     events: list[ComposerProgressEvent] = []
+    sdk_requests: list[dict[str, Any]] = []
 
     async def record_progress(event: ComposerProgressEvent) -> None:
         events.append(event)
 
-    async def slow_llm(*args: Any, **kwargs: Any) -> _AdmittedLLMCompletion:
-        del args, kwargs
-        await asyncio.sleep(1.0)
+    async def slow_llm(**kwargs: Any) -> FakeLLMResponse:
+        assert kwargs["model"] == settings.composer_model and kwargs["tools"]
+        sdk_requests.append(kwargs)
+        await asyncio.sleep(2.0)
         return _make_llm_response(content="too late")
 
-    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-        mock_llm.side_effect = slow_llm
-        with pytest.raises(ComposerConvergenceError) as exc_info:
-            await service.compose(
-                "Scenario 1A monolithic request",
-                [],
-                _empty_state(),
-                session_id=SCENARIO_1A_SESSION_ID,
-                user_id=EVAL_USER_ID,
-                progress=record_progress,
-            )
+    with patch("litellm.acompletion", new=slow_llm), pytest.raises(ComposerConvergenceError) as exc_info:
+        await service.compose(
+            "Scenario 1A monolithic request",
+            [],
+            _empty_state(),
+            session_id=SCENARIO_1A_SESSION_ID,
+            user_id=EVAL_USER_ID,
+            progress=record_progress,
+        )
 
     assert exc_info.value.budget_exhausted == "timeout"
+    assert len(sdk_requests) == 1
     return next(event for event in reversed(events) if event.phase == "failed")
 
 
@@ -1367,17 +1485,16 @@ async def _failed_progress_for_composition_budget(tmp_path: Path, monkeypatch: p
         ]
     )
 
-    with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
-        mock_llm.side_effect = [mutation, bonus_mutation]
-        with pytest.raises(ComposerConvergenceError) as exc_info:
-            await service.compose(
-                "Keep editing forever",
-                [],
-                _empty_state(),
-                session_id=SCENARIO_1A_SESSION_ID,
-                user_id=EVAL_USER_ID,
-                progress=record_progress,
-            )
+    script = ComposerSDKScript(primary_model=settings.composer_model, primary=(mutation, bonus_mutation))
+    with patch("litellm.acompletion", new=script), pytest.raises(ComposerConvergenceError) as exc_info:
+        await service.compose(
+            "Keep editing forever",
+            [],
+            _empty_state(),
+            session_id=SCENARIO_1A_SESSION_ID,
+            user_id=EVAL_USER_ID,
+            progress=record_progress,
+        )
 
     assert exc_info.value.budget_exhausted == "composition"
     return next(event for event in reversed(events) if event.phase == "failed")

@@ -91,12 +91,14 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner, composer_quota_scope
 from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl, _ComposeLoopDiagnostics
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.turn_effects import TurnEvidence
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -414,6 +416,17 @@ async def _run_gateway_loop_turn(
         )
         plugin_snapshot, policy_catalog = service._policy_context.build(None)
         diagnostics = _ComposeLoopDiagnostics()
+        # Mirror the direct driver: a session-bound loop carries its original ceiling and turn evidence.
+        preferences = await sessions.get_composer_preferences(UUID(session_id))
+        mutation_ceiling = ComposerMutationCeiling(session_id, str(uuid4()), preferences.trust_mode)
+        turn_evidence = TurnEvidence(
+            session_id=session_id,
+            session_operation_context=lease.context,
+            request_id=mutation_ceiling.request_id,
+            request=message,
+            initial_state_id=None,
+            initial_state=state,
+        )
         with composer_quota_scope(sessions, lease.context), prompt_guard_user_scope(message):
             result = await service._compose_loop(
                 message,
@@ -424,10 +437,12 @@ async def _run_gateway_loop_turn(
                 deadline=asyncio.get_running_loop().time() + service._timeout_seconds,
                 plugin_snapshot=plugin_snapshot,
                 policy_catalog=policy_catalog,
+                mutation_ceiling=mutation_ceiling,
                 session_operation_context=lease.context,
                 diagnostics=diagnostics,
                 required_work=binding,
                 provider_owner=owner,
+                turn_evidence=turn_evidence,
             )
         outcome = ComposeLoopTestResult(
             assistant_message=result.message,
@@ -869,8 +884,8 @@ async def test_sessionless_gateway_boot_probe_is_unqualified_without_dispatch(
         composer_seed=seed,
         composer_prompt_guard_mode=mode,
     )
-    assert [request.surface for request in requests] == ["loop_tools", "planner_tools"]
-    assert requests[0].tool_count == 45
+    assert [request.surface for request in requests] == ["loop_tools"]
+    assert requests[0].tool_count == 46
 
     for request in requests:
         assert request.model == model
@@ -1060,12 +1075,12 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 
 
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
-    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (35 true, 10 false)."""
+    """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (36 true, 10 false)."""
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
     from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
-    assert len(tools) == (35 if flag else 10)
+    assert len(tools) == (36 if flag else 10)
     return tools
 
 
@@ -1128,7 +1143,7 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})
     assert resolution.transport is StrictTransport.NONE
     tools = composer_loop_tool_definitions(dialect_for(resolution.transport))
-    assert len(tools) == 45
+    assert len(tools) == 46
     assert [tool for tool in tools if "strict" in tool["function"]] == []
 
     response = await litellm.acompletion(

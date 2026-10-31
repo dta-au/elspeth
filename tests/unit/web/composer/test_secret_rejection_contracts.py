@@ -14,11 +14,6 @@ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.discovery_response import admit_discovery_result, serialize_admitted_discovery_result
 from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
-from elspeth.web.composer.pipeline_planner import (
-    _allowlisted_candidate_feedback,
-    _ParsedToolCall,
-    _serialize_provider_discovery_result,
-)
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.composer.tools import _dispatch, secrets
@@ -194,8 +189,6 @@ def _assert_discovery_failure(tool: str, arguments: dict[str, Any], result: Tool
     admitted = admit_discovery_result(tool, result)
     assert admitted.response is None
     ordinary = json.loads(serialize_admitted_discovery_result(admitted))
-    call = _ParsedToolCall(call_id="metadata-call", name=tool, raw_arguments=json.dumps(arguments), arguments=arguments)
-    assert json.loads(_serialize_provider_discovery_result(call=call, result=admitted)) == ordinary
     assert ordinary["success"] is False
     assert "data" not in ordinary
     assert "validation_guidance" not in ordinary
@@ -481,8 +474,7 @@ def test_availability_discovery_remains_successful_metadata(available: bool, lis
     if listed:
         expected.update(scope="user", source_kind="stored", reason=None if available else "value_decryption_failed")
     assert admitted.response.to_wire() == expected
-    call = _ParsedToolCall(call_id="availability", name="validate_secret_ref", raw_arguments=json.dumps(args), arguments=args)
-    assert json.loads(_serialize_provider_discovery_result(call=call, result=admitted))["data"] == expected
+    assert json.loads(serialize_admitted_discovery_result(admitted))["data"] == expected
     assert inventory.calls == [("list", "operator-one"), ("has", "operator-one", "ROUTE_REF")]
 
 
@@ -601,7 +593,7 @@ def test_secret_codes_have_exact_static_guidance(code: str, context: ToolContext
     assert (result.data["explanation"], result.data["suggested_fix"]) == pair
 
 
-def test_restricted_feedback_keeps_static_repair_and_omits_raw_diagnostic(context: ToolContext) -> None:
+def test_restricted_refusal_carries_static_repair_guidance(context: ToolContext) -> None:
     state = _state()
     args = _wire_arguments("node", "clean", "PRIVATE_OPTION_CANARY")
     args["name"] = "PRIVATE_REF_CANARY"
@@ -619,16 +611,13 @@ def test_restricted_feedback_keeps_static_repair_and_omits_raw_diagnostic(contex
     assert "PRIVATE_REF_CANARY" in rejection.message
     assert "PRIVATE_OPTION_CANARY" in rejection.message
     assert rejection.error_code == "unauthorized_secret_ref"
-    feedback = _allowlisted_candidate_feedback(result)
-    rendered = json.dumps(feedback)
-    assert "PRIVATE_REF_CANARY" not in rendered
-    assert "PRIVATE_OPTION_CANARY" not in rendered
-    assert "detail" not in feedback["validation"]["errors"][0]
     assert rejection.plugin_identity is None
     assert result.plugin_schemas is None
     pair = explain_validation_code("unauthorized_secret_ref")
     assert pair is not None
-    assert pair[0] in rendered and pair[1] in rendered
+    assert result.validation_guidance is not None
+    guidance = result.validation_guidance["codes"]["unauthorized_secret_ref"]
+    assert (guidance["explanation"], guidance["suggested_fix"]) == pair
 
 
 def test_changed_owned_snapshot_recomputes_surviving_findings(context: ToolContext) -> None:
@@ -643,3 +632,72 @@ def test_changed_owned_snapshot_recomputes_surviving_findings(context: ToolConte
     assert expected != context.catalog.validate_composition_state(state).validation
     assert any(entry.error_code == "plugin_not_enabled" for entry in expected.errors)
     _assert_refusal(second, state, expected, "unauthorized_secret_ref", "node:clean")
+
+
+def _two_source_state() -> CompositionState:
+    root = _state().sources["source"]
+    return replace(_state(), sources={"left": root, "right": root})
+
+
+@pytest.mark.parametrize(
+    "target_id,code,subject",
+    [
+        pytest.param(None, "secret_target_required", None, id="omitted-with-plural-roots"),
+        pytest.param("source:left", "source_not_found", "source:source:left", id="source-prefixed"),
+        pytest.param("   ", "source_not_found", "source:   ", id="whitespace-only"),
+        pytest.param(" left ", "source_not_found", "source: left ", id="padded"),
+    ],
+)
+@pytest.mark.parametrize("dispatch", [False, True], ids=["direct", "public"])
+def test_source_selector_is_an_exact_raw_name_never_an_alias(
+    target_id: str | None, code: str, subject: str | None, dispatch: bool, context: ToolContext
+) -> None:
+    """TC-003: the selector guidance's three refusals hold in the handler.
+
+    With plural roots an omitted selector refuses rather than picking one;
+    a ``source:``-prefixed, whitespace-only or padded selector is not
+    normalised to a real root and refuses with the saved graph intact.
+    """
+    state = _two_source_state()
+    policy = _policy("source", "json")
+    active = replace(context, secret_wiring_policy=policy)
+    args = _wire_arguments("source", target_id)
+    before = state.to_dict()
+    if dispatch:
+        result = execute_tool(
+            "wire_secret_ref",
+            args,
+            state,
+            active.catalog,
+            plugin_snapshot=active.plugin_snapshot,
+            secret_service=active.secret_service,
+            secret_wiring_policy=policy,
+            user_id=active.user_id,
+            validate_arguments=True,
+        )
+        standing = active.catalog.validate_composition_state(state).validation
+    else:
+        result = secrets._execute_wire_secret_ref(args, state, active)
+        standing = state.validate()
+    assert state.to_dict() == before
+    _assert_refusal(result, state, standing, code, subject)
+
+
+def test_raw_named_source_selector_wires_exactly_that_root(context: ToolContext) -> None:
+    """Positive control for the refusals above: the raw name selects one root."""
+    state = _two_source_state()
+    result = secrets._execute_wire_secret_ref(
+        _wire_arguments("source", "left"), state, replace(context, secret_wiring_policy=_policy("source", "json"))
+    )
+    assert result.success is True
+    assert result.affected_nodes == ("source:left",)
+    assert deep_thaw(result.updated_state.sources["left"].options)["api_key"] == {"secret_ref": "ROUTE_REF"}
+    assert "api_key" not in deep_thaw(result.updated_state.sources["right"].options)
+
+
+def test_target_id_description_states_the_source_selector_contract() -> None:
+    description = secrets._WIRE_SECRET_REF_DECLARATION.json_schema["properties"]["target_id"]["description"]
+    assert "Raw source name" in description
+    assert "required for node/output targets and for source targets when multiple sources are configured" in description
+    assert "For a sole source, an unspecified selector defaults to that source" in description
+    assert "Do not prefix a source name with 'source:'." in description

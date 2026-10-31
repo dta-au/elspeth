@@ -280,6 +280,7 @@ def run_resume_processing_loop(
             pending_tokens=pending_tokens,
         )
 
+    interrupted_by_shutdown = interrupted_by_shutdown or (shutdown_event is not None and shutdown_event.is_set())
     if not interrupted_by_shutdown and row_union_executor is not None:
         handle_row_union_timeouts(
             row_union_executor=row_union_executor,
@@ -288,6 +289,7 @@ def run_resume_processing_loop(
             counters=counters,
         )
 
+    interrupted_by_shutdown = interrupted_by_shutdown or (shutdown_event is not None and shutdown_event.is_set())
     if not interrupted_by_shutdown and processor.has_scheduled_work():
         # Freshly ingested snapshot rows already contributed their terminal
         # results to pending_tokens. The durable PENDING_SINK rehydration sees
@@ -300,6 +302,10 @@ def run_resume_processing_loop(
         counters.rows_processed += len({result.token.row_id for result in newly_recovered})
         accumulate_row_outcomes(newly_recovered, counters, pending_tokens)
 
+    # Shutdown can change while a recovered claim is running. The drain has
+    # preserved unstarted work; carry that decision to the sink/checkpoint
+    # path before EOF can resolve its buffered groups or finalize the run.
+    interrupted_by_shutdown = interrupted_by_shutdown or (shutdown_event is not None and shutdown_event.is_set())
     if not interrupted_by_shutdown and flush_end_of_input:
         # CRITICAL: Flush remaining barriers only at true end-of-source.
         # ADR-030 §D steps 2-3 (slice 3): journal-quiescence gate, then the
@@ -315,6 +321,8 @@ def run_resume_processing_loop(
             coalesce_node_map=coalesce_node_map,
         )
 
+        if shutdown_event is not None and shutdown_event.is_set():
+            return True
         if processor.has_unresolved_scheduler_work():
             active_work = "; ".join(processor.summarize_unresolved_scheduler_work()) or "<unknown>"
             raise OrchestrationInvariantError(
@@ -1016,14 +1024,17 @@ class ResumeCoordinator:
             # would finalize the run and delete checkpoints WITHOUT
             # constructing the recovery processor. The no-work arm therefore
             # requires restored barrier work, the complete scheduler journal,
-            # and any leader-pending zero-member collector groups to be
-            # quiescent. Those groups have no child journal rows to inspect.
+            # unadopted group losses, and leader-pending zero-member collector
+            # groups to be quiescent. A loss-only group has no arrival hold or
+            # runnable member, but still owes its plugin-free verdict/accounting.
             # Only consult the journal when restored barriers are absent: once
             # they are present the processing path is already mandatory, so an
             # additional database query cannot change the branch decision.
             has_active_scheduler_work = not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
+            has_pending_group_losses = False
             pending_empty_collector_groups: tuple[tuple[str, str], ...] = ()
             if not state.has_restored_barrier_work and not has_active_scheduler_work:
+                has_pending_group_losses = bool(factory.scheduler.list_unadopted_group_losses(run_id=run_id))
                 require_all_opener_node_ids = tuple(
                     str(node_id)
                     for node_id, binding in graph.get_group_bindings().by_opener_node().items()
@@ -1033,11 +1044,12 @@ class ResumeCoordinator:
                     run_id=run_id,
                     opener_node_ids=require_all_opener_node_ids,
                 )
-            if has_active_scheduler_work or pending_empty_collector_groups or snapshot_rows:
+            if has_active_scheduler_work or has_pending_group_losses or pending_empty_collector_groups or snapshot_rows:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
             if (
                 not state.has_restored_barrier_work
                 and not has_active_scheduler_work
+                and not has_pending_group_losses
                 and not pending_empty_collector_groups
                 and not snapshot_rows
             ):
@@ -1269,25 +1281,6 @@ class ResumeCoordinator:
                 coordination_token=coordination_token,
             )
 
-            preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
-            try:
-                # The processor is built and the barrier journal restored (which
-                # mints the work of committed coalesce/aggregation residuals):
-                # every token must now be decided or covered before anything is
-                # re-driven or written to a sink.
-                refuse_unaccounted_resume(factory, coordination_token)
-                run_transform_runtime_preflights(
-                    factory,
-                    run_id,
-                    config,
-                    run_ctx.ctx,
-                    retry_manager=preflight_retry_manager,
-                    shutdown_event=shutdown_event,
-                )
-            except BaseException as pending_exc:
-                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
-                raise
-
             loop_ctx = LoopContext(
                 counters=ExecutionCounters(),
                 pending_tokens={name: [] for name in config.sinks},
@@ -1298,6 +1291,34 @@ class ResumeCoordinator:
                 coalesce_executor=run_ctx.coalesce_executor,
                 coalesce_node_map=run_ctx.coalesce_node_map,
             )
+            preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
+            try:
+                # The processor is built and the barrier journal restored (which
+                # mints the work of committed coalesce/aggregation residuals):
+                # every token must now be decided or covered before anything is
+                # re-driven or written to a sink.
+                refuse_unaccounted_resume(factory, coordination_token)
+                try:
+                    run_transform_runtime_preflights(
+                        factory,
+                        run_id,
+                        config,
+                        run_ctx.ctx,
+                        retry_manager=preflight_retry_manager,
+                        shutdown_event=shutdown_event,
+                        check_coordination_latch=check_coordination_latch,
+                    )
+                except GracefulShutdownError:
+                    # Restore may have remapped batches and rebuilt barrier
+                    # scalars. Retain that state without dispatching work or
+                    # entering the sink path merely to reach its checkpoint.
+                    if check_coordination_latch is not None:
+                        check_coordination_latch()
+                    self._checkpoints.checkpoint_interrupted_progress(loop_ctx, coordination_token=coordination_token)
+                    raise
+            except BaseException as pending_exc:
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
+                raise
 
             cleanup_pending_exc: BaseException | None = None
             try:

@@ -1,0 +1,25 @@
+"""Current runtime owner witnesses on the actual serial PostgreSQL store."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_current_runtime_restores_complete_history_and_one_shared_graph_then_captures as test_current_runtime_restores_complete_history_and_one_shared_graph_then_captures,
+)
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_real_committed_provider_cut_recovers_into_fresh_current_runtime as test_real_committed_provider_cut_recovers_into_fresh_current_runtime,
+)
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_runtime_context_rechecks_current_preference_without_renewing_original_ceiling as test_runtime_context_rechecks_current_preference_without_renewing_original_ceiling,
+)
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_runtime_current_prepared_batch_is_the_same_complete_evidence_graph as test_runtime_current_prepared_batch_is_the_same_complete_evidence_graph,
+)
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_runtime_refuses_source_drift_and_counter_reset_after_actual_positive as test_runtime_refuses_source_drift_and_counter_reset_after_actual_positive,
+)
+from tests.unit.web.sessions.test_continuation_runtime import (
+    test_runtime_retains_original_worker_failure_and_joins_started_cancellation as test_runtime_retains_original_worker_failure_and_joins_started_cancellation,
+)
+
+pytestmark = pytest.mark.testcontainer

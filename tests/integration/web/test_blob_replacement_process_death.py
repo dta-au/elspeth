@@ -16,6 +16,7 @@ import structlog
 from sqlalchemy import func, select
 
 from elspeth.contracts.blobs import BlobReplacementPlan
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
@@ -36,8 +37,13 @@ def _die_during_replacement(database_url: str, storage_root: str, blob_id: UUID,
     original_replace = os.replace
     old = authority.mutate(context, lambda transaction: transaction.blobs.read_blob(blob_id=blob_id))
 
-    def mutate_then_die[T](operation: SessionOperationContext, mutation: Callable[[SessionOperationMutationTransaction], T]) -> T:
-        result = original_mutate(operation, mutation)
+    def mutate_then_die[T](
+        operation: SessionOperationContext,
+        mutation: Callable[[SessionOperationMutationTransaction], T],
+        *,
+        auto_mutation: ComposerMutationCeiling | None = None,
+    ) -> T:
+        result = original_mutate(operation, mutation, auto_mutation=auto_mutation)
         if isinstance(result, BlobReplacementPlan) and result.phase == phase:
             os._exit(42)
         return result

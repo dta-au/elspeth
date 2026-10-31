@@ -9,6 +9,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer._compose_loop_carriers import _AdmittedAssistantMessage
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.turn_audit import persist_turn_audit
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
@@ -21,6 +22,10 @@ from elspeth.web.required_work import (
 )
 from elspeth.web.sessions.models import chat_messages_table
 from tests.unit.web.sessions.test_token_usage_adapters import _quota_service
+
+
+def _checkpoint_base() -> CompositionState:
+    return CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
 
 @pytest.mark.asyncio
@@ -48,6 +53,9 @@ async def test_actual_checkpoint_preserves_legacy_and_required_ownership(tmp_pat
             private_authorings=(),
             private_invocations=(),
             assistant_message=_AdmittedAssistantMessage("Exact checkpoint prose"),
+            mutation_ceiling=None,
+            authority_revocation=None,
+            base_state=_checkpoint_base(),
             raw_assistant_content=None,
             assistant_tool_calls=(),
             crash_pending=False,
@@ -91,6 +99,9 @@ async def test_null_binding_never_bypasses_exact_checkpoint_context(tmp_path):
             private_authorings=(),
             private_invocations=(),
             assistant_message=_AdmittedAssistantMessage("Forbidden checkpoint"),
+            mutation_ceiling=None,
+            authority_revocation=None,
+            base_state=_checkpoint_base(),
             raw_assistant_content=None,
             assistant_tool_calls=(),
             crash_pending=False,
@@ -202,6 +213,9 @@ async def test_actual_pending_checkpoint_keeps_projection_and_release_unresolved
                 private_authorings=(),
                 private_invocations=(),
                 assistant_message=_AdmittedAssistantMessage("Joined checkpoint"),
+                mutation_ceiling=None,
+                authority_revocation=None,
+                base_state=_checkpoint_base(),
                 raw_assistant_content=None,
                 assistant_tool_calls=(),
                 crash_pending=False,
@@ -267,6 +281,9 @@ async def test_foreign_checkpoint_binding_refuses_before_registration_or_sql(tmp
                 private_authorings=(),
                 private_invocations=(),
                 assistant_message=_AdmittedAssistantMessage("Foreign checkpoint"),
+                mutation_ceiling=None,
+                authority_revocation=None,
+                base_state=_checkpoint_base(),
                 raw_assistant_content=None,
                 assistant_tool_calls=(),
                 crash_pending=False,
@@ -320,6 +337,9 @@ async def test_required_checkpoint_sql_error_retains_original_and_failed_turn(tm
                 private_authorings=(),
                 private_invocations=(),
                 assistant_message=_AdmittedAssistantMessage("Rolled back checkpoint"),
+                mutation_ceiling=None,
+                authority_revocation=None,
+                base_state=_checkpoint_base(),
                 raw_assistant_content=None,
                 assistant_tool_calls=(),
                 crash_pending=False,
@@ -407,6 +427,9 @@ async def test_checkpoint_no_return_retains_projection_until_actual_generation_c
             private_authorings=(),
             private_invocations=(),
             assistant_message=_AdmittedAssistantMessage("Never invoked"),
+            mutation_ceiling=None,
+            authority_revocation=None,
+            base_state=_checkpoint_base(),
             raw_assistant_content=None,
             assistant_tool_calls=(),
             crash_pending=False,

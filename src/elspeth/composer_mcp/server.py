@@ -11,6 +11,7 @@ web.catalog, composer_mcp.session).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import time
@@ -47,7 +48,6 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -67,7 +67,13 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
-from elspeth.web.credential_guard import require_no_credential_material_for_tool, require_no_credential_material_in_state
+from elspeth.web.composer.yaml_serializer import ComposerYamlSerializer
+from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
+    require_no_credential_material,
+    require_no_credential_material_for_tool,
+    require_no_credential_material_in_state,
+)
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -191,6 +197,46 @@ _SESSION_TOOL_DEFS: list[dict[str, Any]] = [
 ]
 
 _SESSION_TOOL_NAMES: frozenset[str] = frozenset(d["name"] for d in _SESSION_TOOL_DEFS)
+_REGISTERED_TOOL_NAMES: frozenset[str] = _COMPOSER_TOOL_NAMES | _SESSION_TOOL_NAMES
+_UNREGISTERED_TOOL_NAME_PREFIX = "<unregistered>:sha256:"
+
+
+def _audited_tool_name(name: str) -> str:
+    """Retain registered names and digest caller text for every other name."""
+    if name in _REGISTERED_TOOL_NAMES:
+        return name
+    return _UNREGISTERED_TOOL_NAME_PREFIX + hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+# The SDK emits these records before invoking our handler. Keep the records,
+# replacing only their tool-name argument with the same safe audit identity.
+_SDK_SERVER_LOGGER_NAME = "mcp.server.lowlevel.server"
+_SDK_TOOL_NAME_LOG_TEMPLATES: frozenset[str] = frozenset(
+    {
+        "Tool '%s' not listed, no validation will be performed",
+        "Tool cache miss for %s, refreshing cache",
+    }
+)
+
+
+class _SdkToolNameLogFilter(logging.Filter):
+    """Keep unregistered caller names out of the SDK's tool-name records."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (
+            record.msg in _SDK_TOOL_NAME_LOG_TEMPLATES
+            and type(record.args) is tuple
+            and len(record.args) == 1
+            and type(record.args[0]) is str
+        ):
+            record.args = (_audited_tool_name(record.args[0]),)
+        return True
+
+
+def _install_sdk_tool_name_log_filter() -> None:
+    sdk_logger = logging.getLogger(_SDK_SERVER_LOGGER_NAME)
+    if not any(type(existing) is _SdkToolNameLogFilter for existing in sdk_logger.filters):
+        sdk_logger.addFilter(_SdkToolNameLogFilter())
 
 
 # The closed-root schema each session tool advertises is also the one that
@@ -422,7 +468,7 @@ def _dispatch_tool(
 
     return {
         "success": False,
-        "error": f"Unknown tool: {tool_name}",
+        "error": "Unknown tool: the requested name is not a registered tool on this server.",
         "state": state.to_dict(),
     }
 
@@ -580,6 +626,10 @@ def _dispatch_session_tool(
                 "error": f"Session not found: {session_id}",
                 "state": state.to_dict(),
             }
+        # TC-018: the saved file is input this dispatch did not admit. Refuse
+        # recognized credential material before the loaded state is adopted,
+        # returned or audited; the caller's checkout, state and baseline stay.
+        require_no_credential_material_in_state(checkout.state, surface="composer_mcp_loaded_state")
         active_checkout_ref[0] = checkout
         return {
             "success": True,
@@ -589,6 +639,13 @@ def _dispatch_session_tool(
 
     if tool_name == "list_sessions":
         sessions = manager.list_sessions()
+        # TC-018: listed names are read from saved files. Admit every entry
+        # before the listing reaches the response or audit, and refuse the
+        # whole listing fail-closed on any recognized value. Entries are
+        # admitted one at a time: one scan of the whole list would hit the
+        # detector's width and node bounds and refuse a large benign listing.
+        for listed_session in sessions:
+            require_no_credential_material(listed_session, surface="composer_mcp_session_listing")
         return {
             "success": True,
             "data": {"sessions": sessions},
@@ -684,6 +741,7 @@ def create_server(
     Returns:
         Configured MCP Server ready for stdio transport.
     """
+    _install_sdk_tool_name_log_filter()
     server = Server("elspeth-composer")
     session_manager = SessionManager(scratch_dir)
     coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
@@ -748,27 +806,15 @@ def create_server(
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         version_before = state_ref[0].version
-        # Pre-compute canonical args + hash so the audit record is
-        # complete on every exit path. canonical_json may itself raise
-        # ValueError on non-finite floats (Tier-3 boundary policy);
-        # that's a structural input violation that pre-dates the tool
-        # dispatch and is recorded as ARG_ERROR.
-        try:
-            arguments_canonical = canonical_json(arguments)
-            arguments_hash = stable_hash(arguments)
-            canonicalization_failed: BaseException | None = None
-        except (ValueError, TypeError) as canon_exc:
-            # Shared sentinel discipline (see web.composer.audit
-            # build_canonicalization_sentinel docstring): captures
-            # type-name + ``str(exc)`` only for the base rfc8785
-            # CanonicalizationError (its messages are type/rule strings;
-            # the domain subclasses echo the value) + sorted top-level
-            # argument keys.
-            # Audit-trail forensic fingerprint without leak risk.
-            sentinel = build_canonicalization_sentinel(canon_exc, arguments)
-            arguments_canonical = canonical_json(sentinel)
-            arguments_hash = stable_hash(sentinel)
-            canonicalization_failed = canon_exc
+        # Only owned, value-free data is canonicalized outside the envelope.
+        # Keep captured input private until credential admission succeeds.
+        # Earlier faults retain unavailable evidence or the safe refusal
+        # payload; later tool faults retain the complete admitted input pair.
+        unavailable_arguments = {"_arguments_unavailable": "evidence_not_completed"}
+        unavailable_evidence = canonical_json(unavailable_arguments), stable_hash(unavailable_arguments)
+        arguments_canonical, arguments_hash = unavailable_evidence
+        canonicalization_failed: BaseException | None = None
+        argument_evidence_defect: Exception | None = None
 
         result_dict: dict[str, Any] | None = None
         status: ComposerToolStatus = ComposerToolStatus.SUCCESS
@@ -815,6 +861,57 @@ def create_server(
             error_message = type(exc).__name__
 
         try:
+            # TC-020: admit the caller's arguments before dispatch or recording.
+            # On refusal, replace the captured canonical arguments and
+            # their hash with a value-free stand-in before the finally block
+            # records them, so the refused value reaches neither the active
+            # sidecar nor the pre-resolution buffer. The refusal payload is
+            # candidate-free by construction (fixed detail, category, surface,
+            # detector version): no argument key or value is retained.
+            # _dispatch_tool repeats this guard for its direct callers.
+            try:
+                try:
+                    try:
+                        captured_canonical = canonical_json(arguments)
+                    except (ValueError, TypeError) as canon_exc:
+                        # Caller keys are data too: even a key can contain a
+                        # credential or a lone surrogate. Keep the shared safe
+                        # exception metadata, with no caller-derived payload keys.
+                        sentinel = build_canonicalization_sentinel(canon_exc, None)
+                        captured_canonical = canonical_json(sentinel)
+                        captured_hash = stable_hash(sentinel)
+                        canonicalization_failed = canon_exc
+                    else:
+                        captured_hash = stable_hash(arguments)
+                except Exception as evidence_exc:
+                    # Admission still decides whether this input must be
+                    # withheld before an owned evidence defect can propagate.
+                    argument_evidence_defect = evidence_exc
+                require_no_credential_material_for_tool(
+                    name, arguments, surface="composer_mcp_tool_arguments", credential_state=state_ref[0]
+                )
+            except CredentialMaterialRefused as refusal:
+                arguments_canonical, arguments_hash = unavailable_evidence
+                try:
+                    withheld_arguments = {"_arguments_withheld": refusal.to_payload()}
+                    arguments_canonical, arguments_hash = canonical_json(withheld_arguments), stable_hash(withheld_arguments)
+                except Exception as refusal_evidence_exc:
+                    _capture_plugin_crash(refusal_evidence_exc)
+                    raise
+                _capture_plugin_crash(refusal)
+                raise
+            except Exception as exc:
+                _capture_plugin_crash(exc)
+                raise
+
+            if argument_evidence_defect is not None:
+                _capture_plugin_crash(argument_evidence_defect)
+                raise argument_evidence_defect
+
+            # Both capture and credential admission completed. Publish this
+            # pair together so later faults retain the exact admitted evidence.
+            arguments_canonical, arguments_hash = captured_canonical, captured_hash
+
             if canonicalization_failed is not None:
                 # Pre-dispatch ARG_ERROR: malformed LLM arguments.
                 return _argument_error_result(canonicalization_failed, ToolArgumentErrorCategory.CANONICALIZATION)
@@ -901,15 +998,16 @@ def create_server(
                     if name != "generate_yaml":
                         state_ref[0] = new_state
                     # Capture baseline when session is created or loaded.
-                    # load_session can return success=False on SessionNotFoundError;
-                    # in that case, leave session_id_ref unchanged so the scratch
-                    # session scope ("unsaved") is used.
-                    if name in ("new_session", "load_session"):
+                    # load_session can return success=False on SessionNotFoundError
+                    # with the unchanged working state; in that case leave the
+                    # diff baseline and session_id_ref unchanged (TC-019), so the
+                    # next diff still measures against the intended baseline and
+                    # the current session scope is kept.
+                    if name in ("new_session", "load_session") and result_dict["success"]:
                         baseline_ref[0] = new_state
-                        if result_dict["success"]:
-                            resolved_sid: str = result_dict["data"]["session_id"]
-                            session_id_ref[0] = resolved_sid
-                            audit_recorder.resolve_session(resolved_sid)
+                        resolved_sid: str = result_dict["data"]["session_id"]
+                        session_id_ref[0] = resolved_sid
+                        audit_recorder.resolve_session(resolved_sid)
                     # Keep the deleted session id active until the finally
                     # block records this destructive success. Then clear it
                     # so subsequent calls use the unsaved scope unless a
@@ -984,7 +1082,7 @@ def create_server(
 
             invocation = ComposerToolInvocation(
                 tool_call_id=tool_call_id,
-                tool_name=name,
+                tool_name=_audited_tool_name(name),
                 arguments_canonical=arguments_canonical,
                 arguments_hash=arguments_hash,
                 result_canonical=result_canonical,
@@ -1054,7 +1152,7 @@ def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Pa
             validate_pipeline,
             state,
             settings,
-            yaml_generator,
+            ComposerYamlSerializer(),
             plugin_snapshot=plugin_snapshot,
             profile_registry=None,
             catalog=catalog,

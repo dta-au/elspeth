@@ -1,10 +1,105 @@
 import producerFixtures from "@/test/composerRecoveryProducerFixtures.json";
+import executorFixtures from "../../../../../../tests/fixtures/web/composer/composer_executor_failure_producer.json";
 import { describe, expect, it } from "vitest";
-import { ComposerSseDecoder, decodeComposerOperationAck, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
+import { ComposerOperationDecodeError, ComposerSseDecoder, decodeComposerOperationAck, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 const sid = "11111111-1111-4111-8111-111111111111";
 const id = "22222222-2222-4222-8222-222222222222";
 const heartbeat = { schema_version: "composer-operation-stream.v1", session_id: sid, operation_id: id, sequence: 0, event: "heartbeat" };
 const encode = new TextEncoder();
+
+describe.each([
+  ["generation", executorFixtures.generation],
+  ["admission", executorFixtures.admission],
+] as const)("actual backend executor failure %s", (_family, producer) => {
+  const sessionId = producer.history.session_id;
+  const operationId = producer.terminal.operation_id;
+
+  it("preserves the actual failed terminal, safe body and correlation", () => {
+    const decoded = decodeComposerOperationSnapshot(producer.terminal, sessionId, operationId);
+    expect(decoded).toEqual(producer.terminal);
+    expect(decoded.error).toEqual(producer.terminal.error);
+    expect(decoded.error?.http_status).toBe(503);
+    expect(decoded.error?.failure_code).toBe("http_error");
+    expect(decoded.error?.error_type).toBe("executor_unavailable");
+    expect(decoded.error?.diagnostic_id).toBeNull();
+    expect(decoded.error?.body.request_id).toBe(producer.history.items[0].request_id);
+    expect(decoded.result).toBeNull();
+  });
+
+  it("preserves the actual executor category through closed operation history", () => {
+    const decoded = decodeComposerOperationFailurePage(producer.history, sessionId, operationId);
+    expect(decoded).toEqual(producer.history);
+    expect(decodeComposerOperationFailurePage(producer.history, sessionId)).toEqual(producer.history);
+    expect(decoded.items[0].error_type).toBe("executor_unavailable");
+    expect(decoded.items[0].failure_code).toBe(producer.terminal.error.failure_code);
+    expect(decoded.items[0].request_id).toBe(producer.terminal.error.body.request_id);
+    expect(decoded.items[0].saved_revisions).toEqual(producer.history.items[0].saved_revisions);
+  });
+
+  it("preserves the intentionally open terminal category independently of closed history", () => {
+    const variant = {
+      ...producer.terminal,
+      error: { ...producer.terminal.error, error_type: "unrecognized_terminal_category" },
+    };
+    expect(decodeComposerOperationSnapshot(variant, sessionId, operationId).error?.error_type).toBe("unrecognized_terminal_category");
+    expect(decodeComposerOperationSnapshot(producer.terminal, sessionId, operationId)).toEqual(producer.terminal);
+  });
+
+  it("rejects terminal schema and operation-scope corruption after its actual positive", () => {
+    expect(decodeComposerOperationSnapshot(producer.terminal, sessionId, operationId)).toEqual(producer.terminal);
+    expect(sessionId).not.toBe(operationId);
+    const mutations = [
+      { ...producer.terminal, operation_id: sessionId },
+      { ...producer.terminal, error: { ...producer.terminal.error, private_exception: "PRIVATE sentinel" } },
+      { ...producer.terminal, error: { ...producer.terminal.error, error_type: 503 } },
+      { ...producer.terminal, error: { ...producer.terminal.error, http_status: 200 } },
+      { ...producer.terminal, error: { ...producer.terminal.error, failure_code: "unreviewed_failure_code" } },
+    ];
+    for (const changed of mutations) {
+      expect(() => decodeComposerOperationSnapshot(changed, sessionId, operationId)).toThrow(ComposerOperationDecodeError);
+      expect(decodeComposerOperationSnapshot(producer.terminal, sessionId, operationId)).toEqual(producer.terminal);
+    }
+  });
+
+  it("keeps every current closed history category including U29 and rejects unknown vocabulary", () => {
+    // These are controlled one-field vocabulary neighbors of the captured page,
+    // not additional producer captures or a rewritten accepted fixture.
+    for (const category of [
+      "request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost",
+      "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable",
+      "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed",
+      "composer_mutation_authority_revoked", null,
+    ]) {
+      const control = { ...producer.history, items: [{ ...producer.history.items[0], error_type: category }] };
+      expect(decodeComposerOperationFailurePage(control, sessionId, operationId)).toEqual(control);
+      const changed = { ...control, items: [{ ...control.items[0], error_type: "unreviewed_history_category" }] };
+      expect(() => decodeComposerOperationFailurePage(changed, sessionId, operationId)).toThrow("Unknown public failure category");
+      expect(decodeComposerOperationFailurePage(control, sessionId, operationId)).toEqual(control);
+    }
+  });
+
+  it("rejects private, scope and saved-fact corruption from a reached current-history positive", () => {
+    const control = {
+      ...producer.history,
+      items: [{ ...producer.history.items[0], error_type: "database_unavailable" }],
+    };
+    expect(decodeComposerOperationFailurePage(control, sessionId, operationId)).toEqual(control);
+    const mutations = [
+      { ...control, body: { detail: "PRIVATE sentinel" } },
+      { ...control, session_id: operationId },
+      { ...control, items: [{ ...control.items[0], body: { detail: "PRIVATE sentinel" } }] },
+      { ...control, items: [{ ...control.items[0], session_id: operationId }] },
+      { ...control, items: [{ ...control.items[0], operation_id: sessionId }] },
+      { ...control, items: [{ ...control.items[0], saved_revisions: { ...control.items[0].saved_revisions, count: false } }] },
+      { ...control, items: [control.items[0], control.items[0]] },
+    ];
+    for (const changed of mutations) {
+      expect(() => decodeComposerOperationFailurePage(changed, sessionId, operationId)).toThrow(ComposerOperationDecodeError);
+      expect(decodeComposerOperationFailurePage(control, sessionId, operationId)).toEqual(control);
+    }
+    expect(() => decodeComposerOperationFailurePage(control, sessionId, sessionId)).toThrow("Failure page operation mismatch");
+  });
+});
 
 describe("retained failure page admission", () => {
   const outcome = { session_id: sid, operation_id: id, kind: "compose_message", user_message_id: null, settled_at: "2026-10-14T08:00:00Z", failure_code: "operation_failed", error_type: "operation_failed", diagnostic_id: id, request_id: "request-reference", saved_revisions: { attribution: "fenced", count: 2, latest_state_id: id, latest_version: 7 } };
@@ -138,4 +233,39 @@ describe("live backend producer serialization parity", () => {
     expect(decodeComposerOperationSnapshot(complete, sid, id).result?.proposals).toHaveLength(2);
     for (const field of ["created_at", "updated_at"]) for (const value of ["not a timestamp", "1", 22, null]) expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, proposals: [{ ...producerFixtures.proposal, [field]: value }] } }, sid, id)).toThrow();
   });
+});
+
+
+it("retains actual saved facts for mutation authority refusal without inventing proposals", () => {
+  const outcome = {
+    session_id: sid, operation_id: id, kind: "compose_message", user_message_id: null,
+    settled_at: "2026-10-22T08:00:00Z", failure_code: "http_error",
+    error_type: "composer_mutation_authority_revoked", diagnostic_id: null,
+    request_id: "request", saved_revisions: { attribution: "fenced", count: 1, latest_state_id: id, latest_version: 2 },
+  };
+  const page = { session_id: sid, items: [outcome], next_cursor: null };
+  expect(decodeComposerOperationFailurePage(page, sid).items[0]).toEqual(outcome);
+  for (const changes of [{ proposal_id: id }, { error_type: "invented_auto_proposal" }]) {
+    expect(() => decodeComposerOperationFailurePage({ ...page, items: [{ ...outcome, ...changes }] }, sid)).toThrow();
+  }
+  const frame = { ...heartbeat, event: "progress", payload: {
+    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    phase: "failed", headline: "Automatic mutation authority was revoked.", evidence: [],
+    likely_next: "Review the saved session before retrying.", reason: "mutation_authority_revoked",
+    updated_at: "2026-10-22T08:00:00Z",
+  } };
+  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
+  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "invented_auto_proposal" } }, sid, id)).toThrow();
+});
+
+it("decodes the context-unsupported progress reason (U-22 F4)", () => {
+  const frame = { ...heartbeat, event: "progress", payload: {
+    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    phase: "failed", headline: "This request is too large to send to the model.",
+    evidence: ["The current pipeline is too large to send to the model. Reduce its size and try again."],
+    likely_next: "Reduce the pipeline or conversation size, then send the request again.", reason: "context_unsupported",
+    updated_at: "2026-10-25T08:00:00Z",
+  } };
+  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
+  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "context_unsupported_invented" } }, sid, id)).toThrow();
 });

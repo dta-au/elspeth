@@ -92,6 +92,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -2869,7 +2870,7 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
         per_iter_state_record = await _save_composition_state_with_compose_authority(
             service,
             session_id,
-            CompositionStateData(
+            composition_state_data(
                 nodes=_state_with(
                     _llm_node(
                         term=f"term_{i}",

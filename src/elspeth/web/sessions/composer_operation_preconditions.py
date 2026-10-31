@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import get_args
 from uuid import UUID
 
@@ -10,7 +11,12 @@ from sqlalchemy import Connection, select
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationPreconditionRefused, ComposerOperationRecord
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationError,
+    ComposerOperationKind,
+    ComposerOperationPreconditionRefused,
+    ComposerOperationRecord,
+)
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_proposals_table,
@@ -26,7 +32,17 @@ from elspeth.web.sessions.proposal_decoder import (
 from elspeth.web.sessions.schemas import RecomposeRequest
 
 
-def _refuse(job: ComposerOperationRecord, *, status: int, detail: str, error_type: str | None = None, flat: bool = False) -> None:
+@dataclass(frozen=True, slots=True)
+class ComposerOperationPreconditions:
+    session_id: UUID
+    actor_user_id: str
+    request_id: str | None
+    base_state_id: UUID | None
+    kind: ComposerOperationKind
+    request_json: str | None
+
+
+def _refuse(job: ComposerOperationPreconditions, *, status: int, detail: str, error_type: str | None = None, flat: bool = False) -> None:
     body: dict[str, JsonValue] = {"detail": detail}
     if error_type is not None:
         body["error_type"] = error_type
@@ -48,6 +64,18 @@ def check_composer_operation_preconditions_on_connection(
 
     if type(job) is not ComposerOperationRecord:
         raise TypeError("job must be ComposerOperationRecord")
+    return check_composer_request_preconditions_on_connection(
+        conn,
+        ComposerOperationPreconditions(job.session_id, job.actor_user_id, job.request_id, job.base_state_id, job.kind, job.request_json),
+        auth_provider_type=auth_provider_type,
+    )
+
+
+def check_composer_request_preconditions_on_connection(
+    conn: Connection, job: ComposerOperationPreconditions, *, auth_provider_type: str
+) -> UUID | None:
+    if type(job) is not ComposerOperationPreconditions:
+        raise TypeError("job must be ComposerOperationPreconditions")
     if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
         raise ValueError("auth_provider_type must name a browser authentication provider")
     sid = str(job.session_id)

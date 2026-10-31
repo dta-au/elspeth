@@ -28,7 +28,9 @@ class ComposerOperationApp:
     composer: DelayedComposerFake
 
 
-async def build_composer_operation_app(tmp_path: Path, *, timeout_seconds: float = 300.0) -> ComposerOperationApp:
+async def build_composer_operation_app(
+    tmp_path: Path, *, timeout_seconds: float = 300.0, continuation_enabled: bool = False
+) -> ComposerOperationApp:
     settings = WebSettings(
         data_dir=tmp_path,
         landscape_url=f"sqlite:///{tmp_path}/runs/audit.db",
@@ -40,6 +42,7 @@ async def build_composer_operation_app(tmp_path: Path, *, timeout_seconds: float
         composer_rate_limit_per_minute=100,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough",),
+        composer_continuation_enabled=continuation_enabled,
     )
     app = create_app(settings=settings)
     provider = app.state.auth_provider

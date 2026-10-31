@@ -17,6 +17,7 @@ from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.required_work import RequiredWorkSource, required_failure_leaves
 from elspeth.web.sessions import composer_async_worker as worker_module
+from elspeth.web.sessions import composer_finalization
 from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerTurnDeadlineExpired, composer_operation_request_hash
 from elspeth.web.sessions.schemas import SendMessageRequest
@@ -154,7 +155,6 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(
     from elspeth.contracts.errors import ComposerOwnedSettlementFailure
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
     from elspeth.web.coordination import composer_operation_authority
-    from elspeth.web.sessions import composer_turn
     from elspeth.web.sessions.composer_operations import ComposerTurnDeadlineExpired
     from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
     from tests.unit.web.sessions.test_freeform_route_custody import _ActualCustodyGate
@@ -225,7 +225,7 @@ async def test_worker_retains_late_original_cause_after_durable_call_cohort(
         return actual_capture(root)
 
     monkeypatch.setattr(composer, "compose", compose)
-    monkeypatch.setattr(composer_turn, "_message_with_state_response", fail_projection)
+    monkeypatch.setattr(composer_finalization, "_message_with_state_response", fail_projection)
     monkeypatch.setattr(worker_module, "capture_failure_facts", capture)
     drive = None
     try:

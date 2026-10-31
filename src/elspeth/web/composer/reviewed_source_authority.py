@@ -6,11 +6,14 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
+from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, select
 
+from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.plugins.sources.blob_rows import _MAX_BLOBS, BlobRowsEntry
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ReviewedSourceAuthority
@@ -76,6 +79,20 @@ def _canonical_blob_id(value: object, *, field_name: str) -> str:
     return value
 
 
+def _reviewed_plural_entries(value: object, *, stable_id: str) -> tuple[BlobRowsEntry, ...]:
+    """Validate the original entry types and list rules without replacing custody."""
+    field_name = f"reviewed_sources[{stable_id!r}].options.blobs"
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= _MAX_BLOBS:
+        raise AuditIntegrityError(f"reviewed plural blob custody {field_name} must be a list of 1-{_MAX_BLOBS} entries")
+    try:
+        entries = tuple(BlobRowsEntry.model_validate(deep_thaw(entry), strict=True) for entry in value)
+    except PydanticValidationError as exc:
+        raise AuditIntegrityError(f"reviewed plural blob custody {field_name} contains a malformed entry") from exc
+    if len({entry.blob_id for entry in entries}) != len(entries) or len({entry.payload_ref for entry in entries}) != len(entries):
+        raise AuditIntegrityError(f"reviewed plural blob custody {field_name} repeats an attachment")
+    return entries
+
+
 @trust_boundary(
     tier=3,
     source="web-authored reviewed-source facts carried on the proposal (untrusted persisted session state)",
@@ -123,6 +140,7 @@ def resolve_reviewed_source_authority(
     raw_storage_paths: dict[str, tuple[str, ...]] = {}
     reviewed_hash_prefixes: dict[str, str] = {}
     authoring_hashes: dict[str, str] = {}
+    plural_entries: dict[str, tuple[BlobRowsEntry, ...]] = {}
     for stable_id, raw_source in sources.items():
         if type(stable_id) is not str or not stable_id or not isinstance(raw_source, Mapping):
             raise AuditIntegrityError("reviewed source authority contains a malformed source record")
@@ -155,6 +173,13 @@ def resolve_reviewed_source_authority(
             elif type(option_value) is str:
                 recorded_paths = raw_storage_paths[stable_id] if stable_id in raw_storage_paths else ()
                 raw_storage_paths[stable_id] = (*recorded_paths, option_value)
+        plugin = raw_source["plugin"] if "plugin" in raw_source else None
+        if plugin == "blob_rows":
+            if "blobs" not in options:
+                raise AuditIntegrityError("reviewed plural blob custody is missing its original entries")
+            if referenced_ids:
+                raise AuditIntegrityError("reviewed plural blob custody also claims scalar blob identity")
+            plural_entries[stable_id] = _reviewed_plural_entries(options["blobs"], stable_id=stable_id)
         if len(referenced_ids) > 1:
             raise AuditIntegrityError("reviewed source blob custody fields disagree")
         if referenced_ids:
@@ -187,6 +212,45 @@ def resolve_reviewed_source_authority(
                 raise AuditIntegrityError("reviewed blob authority references a ready blob without a content hash")
             verified_storage_by_blob_id[blob_id] = row.storage_path
             verified_hash_by_blob_id[blob_id] = row.content_hash
+        for entries in plural_entries.values():
+            records = {
+                row.id: row
+                for row in conn.execute(
+                    select(
+                        blobs_table.c.id,
+                        blobs_table.c.session_id,
+                        blobs_table.c.status,
+                        blobs_table.c.content_hash,
+                        blobs_table.c.filename,
+                        blobs_table.c.mime_type,
+                        blobs_table.c.size_bytes,
+                        blobs_table.c.creation_modality,
+                    ).where(blobs_table.c.id.in_([entry.blob_id for entry in entries]))
+                )
+            }
+            for entry in entries:
+                record = records[entry.blob_id] if entry.blob_id in records else None
+                if record is None:
+                    raise AuditIntegrityError("reviewed plural blob authority references a missing blob")
+                if record.session_id != session_id:
+                    raise AuditIntegrityError("reviewed plural blob authority references a blob owned by another session")
+                if record.status != "ready":
+                    raise AuditIntegrityError("reviewed plural blob authority references a blob that is not ready")
+                try:
+                    modality = CreationModality(record.creation_modality)
+                except ValueError as exc:
+                    raise AuditIntegrityError("reviewed plural blob authority references a malformed creation modality") from exc
+                if is_llm_authored_creation_modality(modality):
+                    raise AuditIntegrityError("reviewed plural blob authority references LLM-authored content")
+                if (record.content_hash, record.filename, record.mime_type, record.size_bytes) != (
+                    entry.payload_ref,
+                    entry.filename,
+                    entry.mime_type,
+                    entry.size_bytes,
+                ):
+                    raise AuditIntegrityError(
+                        "reviewed plural blob entry no longer matches the session record; the attachment changed after review and requires re-review"
+                    )
 
     # Content identity binding: authority is granted for the BYTES that were
     # reviewed, not for a blob id/path.  update_blob mutates bytes and hash

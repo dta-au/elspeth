@@ -156,6 +156,6 @@ class TestTier1MetadataCrash:
     """Tier 1: None metadata_ is database corruption — crash immediately."""
 
     def test_none_metadata_raises_valueerror(self) -> None:
-        record = _make_record(metadata_=None)
+        # The record refuses at construction, which is how every stored row is decoded.
         with pytest.raises(ValueError, match="None metadata_"):
-            state_from_record(record)
+            _make_record(metadata_=None)

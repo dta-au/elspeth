@@ -11,8 +11,11 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from psycopg import sql
+from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 from tests.helpers.postgres_target import postgres_test_target, provisioned_postgres_url
+from tests.testcontainer.web.test_external_deployment_postgres import _DatabasePair, _identifier
 from xdist import is_xdist_worker
 
 from elspeth.web import aws_rds_trust
@@ -214,3 +217,30 @@ def aws_rds_trust_subprocess_env(
         "ELSPETH_TEST_RDS_TRUST_UID": str(file_stat.st_uid),
         "ELSPETH_TEST_RDS_TRUST_MODE": str(stat.S_IMODE(file_stat.st_mode)),
     }
+
+
+# Shared by the cross-process Composer and the stream replica tests.
+@pytest.fixture
+def composer_http_databases(external_deployment_postgres_url: str) -> Iterator[_DatabasePair]:
+    """Separate task-owned databases; owner bootstrap and DDL-denied runtime role."""
+    databases = _DatabasePair(
+        postgres_url=external_deployment_postgres_url,
+        session_database=_identifier("composer_http_session"),
+        landscape_database=_identifier("composer_http_landscape"),
+        runtime_role=_identifier("composer_http_runtime"),
+        runtime_password=uuid.uuid4().hex,
+    )
+    assert databases.session_database != databases.landscape_database
+    admin = create_engine(external_deployment_postgres_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as connection:
+            for name in (databases.session_database, databases.landscape_database):
+                connection.exec_driver_sql(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)).as_string())
+        yield databases
+    finally:
+        with admin.connect() as connection:
+            for name in (databases.session_database, databases.landscape_database):
+                connection.exec_driver_sql(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)).as_string())
+            if databases.role_created:
+                connection.exec_driver_sql(sql.SQL("DROP ROLE {}").format(sql.Identifier(databases.runtime_role)).as_string())
+        admin.dispose()

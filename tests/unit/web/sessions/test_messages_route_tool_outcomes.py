@@ -28,6 +28,7 @@ from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import _tool_call_outcomes_by_call_id
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.helpers.session_fences import make_compose_context
 from tests.unit.web.conftest import _make_session
 
@@ -53,6 +54,7 @@ def _seed_compose_turn_with_outcomes(test_client: TestClient) -> dict[str, Any]:
         _make_session(conn, session_id=session_id, user_id="alice")
         conn.execute(
             insert(composition_states_table).values(
+                metadata_=stored_default_pipeline_metadata(),
                 id=state_id,
                 session_id=session_id,
                 version=2,

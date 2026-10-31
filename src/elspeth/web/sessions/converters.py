@@ -15,7 +15,9 @@ from __future__ import annotations
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import LoweredPipelineDocument, generate_pipeline_dict
-from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row as chat_message_record_from_row
+from elspeth.web.sessions.protocol import CompositionStateRecord, require_stored_state_metadata
+from elspeth.web.sessions.state_decoder import state_record_from_row as state_record_from_row
 
 
 def state_from_record(record: CompositionStateRecord) -> CompositionState:
@@ -28,9 +30,7 @@ def state_from_record(record: CompositionStateRecord) -> CompositionState:
     database corruption or a migration gap — crash immediately.
 
     """
-    if record.metadata_ is None:
-        msg = f"CompositionStateRecord {record.id} has None metadata_ — database corruption or migration gap"
-        raise ValueError(msg)
+    require_stored_state_metadata(record, state_id=record.id)
 
     sources = deep_thaw(record.sources) if record.sources is not None else None
     if sources is None and record.source is not None:

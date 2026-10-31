@@ -132,15 +132,16 @@ def test_live_catalog_includes_zero_knob_tools_and_absence() -> None:
 def test_advisor_interception_requires_owned_receiver_and_complete_arguments(monkeypatch: pytest.MonkeyPatch, replacement: str) -> None:
     from scripts.cicd import composer_wire_census as census
 
-    from elspeth.web.composer.tool_batch import run_tool_batch
-
+    owner = census._advisor_interception_owner()
     getsource = census.inspect.getsource
-    source = getsource(run_tool_batch)
+    source = getsource(owner)
     original_call = "ctx.advisor_checkpoint._validate_advisor_arguments(arguments)"
+    if original_call not in source:
+        original_call = "AdvisorCheckpointOwner._validate_advisor_arguments(ctx.advisor_checkpoint, arguments)"
     assert source.count(original_call) == 1
 
     def mutated_source(function: object) -> str:
-        if function is run_tool_batch:
+        if function is owner:
             return source.replace(original_call, replacement)
         return getsource(function)
 

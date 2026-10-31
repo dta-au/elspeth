@@ -21,11 +21,15 @@ from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget, CommonProviderCostRefused, CommonProviderCostRequest
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.quota_authority import ProviderAttempt
 from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkRole, RequiredWorkSource, RequiredWorkTicket
 
 if TYPE_CHECKING:
+    from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+    from elspeth.web.sessions.continuation import StoredContinuationSnapshot
+    from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, TitleAuditSettlementRequest
     from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 
@@ -66,6 +70,7 @@ class ProviderInvocationOwner:
         self._service = service
         self._required_work = required_work
         self._counters = dict.fromkeys(ProviderInvocationFamily, 0)
+        self._cost_budget: CommonProviderCostBudget | None = None
 
     @property
     def service(self) -> SessionServiceProtocol:
@@ -74,6 +79,21 @@ class ProviderInvocationOwner:
     @property
     def required_work(self) -> RequiredWorkBinding:
         return self._required_work
+
+    @property
+    def cost_budget(self) -> CommonProviderCostBudget | None:
+        return self._cost_budget
+
+    def bind_cost_budget(self, budget: CommonProviderCostBudget) -> None:
+        if type(budget) is not CommonProviderCostBudget:
+            raise AuditIntegrityError("provider owner requires nominal request policy")
+        if self._cost_budget is not None:
+            if self._cost_budget is not budget:
+                raise AuditIntegrityError("provider owner cannot replace request policy")
+            return
+        if self._counters[ProviderInvocationFamily.PRIMARY] or self._counters[ProviderInvocationFamily.ADVISOR]:
+            raise AuditIntegrityError("provider policy cannot start after covered invocation")
+        self._cost_budget = budget
 
     def mint(self, family: ProviderInvocationFamily) -> ProviderCallCustody:
         if type(family) is not ProviderInvocationFamily:
@@ -88,7 +108,12 @@ class ProviderInvocationOwner:
             semantic,
             RequiredWorkRole.TITLE if family is ProviderInvocationFamily.TITLE else RequiredWorkRole.TURN,
         )
-        return ProviderCallCustody(service=self.service, context=binding.coordinator.authority.context, required_work=binding)
+        return ProviderCallCustody(
+            service=self.service,
+            context=binding.coordinator.authority.context,
+            required_work=binding,
+            cost_budget=self.cost_budget if family in (ProviderInvocationFamily.PRIMARY, ProviderInvocationFamily.ADVISOR) else None,
+        )
 
 
 class ProviderCallCustody:
@@ -99,6 +124,8 @@ class ProviderCallCustody:
         "_admitted_ns",
         "_admitting",
         "_context",
+        "_cost_budget",
+        "_cost_response_accountable",
         "_required_work",
         "_sdk_entered",
         "_service",
@@ -106,14 +133,28 @@ class ProviderCallCustody:
         "_undispatched_recurrence",
         "attempt",
         "call",
+        "continuation_title",
+        "continuation_title_result",
+        "continuation_title_selected",
     )
 
-    def __init__(self, *, service: SessionServiceProtocol, context: SessionOperationContext, required_work: RequiredWorkBinding) -> None:
+    def __init__(
+        self,
+        *,
+        service: SessionServiceProtocol,
+        context: SessionOperationContext,
+        required_work: RequiredWorkBinding,
+        cost_budget: CommonProviderCostBudget | None = None,
+    ) -> None:
         if type(required_work) is not RequiredWorkBinding:
             raise AuditIntegrityError("Provider custody requires a nominal explicit binding")
         required_work.validate_context(context)
         if context.operation_kind is not SessionOperationKind.COMPOSE:
             raise AuditIntegrityError("Provider custody requires exact COMPOSE authority")
+        if cost_budget is not None and type(cost_budget) is not CommonProviderCostBudget:
+            raise AuditIntegrityError("provider custody received foreign cost policy")
+        self._cost_budget = cost_budget
+        self._cost_response_accountable = False
         self._service = service
         self._context = context
         self._required_work = required_work
@@ -124,6 +165,61 @@ class ProviderCallCustody:
         self._admitted_ns = 0
         self._undispatched_recurrence = 0
         self._settlements = 0
+        self.continuation_title: PreparedTitleProvider | None = None
+        self.continuation_title_selected: StoredContinuationSnapshot | None = None
+        self.continuation_title_result: TitleAuditSettlementRequest | None = None
+
+    def bind_continuation_title(self, prepared: PreparedTitleProvider) -> None:
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+        from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider
+
+        if (
+            type(prepared) is not PreparedTitleProvider
+            or self.continuation_title is not None
+            or self.attempt is not None
+            or self.required_work.role is not RequiredWorkRole.TITLE
+            or self.required_work.semantic_ordinal != 6
+            or self._cost_budget is not None
+            or type(prepared.clock) is not ContinuationActionClock
+            or prepared.work.coordinator is not self.required_work.coordinator
+            or prepared.work.transition_ordinal != self.required_work.transition_ordinal
+            or prepared.running.session_operation_context is not self.context
+            or prepared.composer._require_sessions_service() is not self.service
+        ):
+            raise AuditIntegrityError("Durable TITLE requires its actual first family-3 invocation and original context")
+        self.continuation_title = prepared
+        self.continuation_title_selected = prepared.selected
+
+    async def retain_continuation_title(self, completion: _AdmittedLLMCompletion) -> None:
+        from elspeth.web.composer.continuation_title_provider import retain_current_title_success
+
+        if self.continuation_title is None or self.call is None or not self._sdk_entered:
+            raise AuditIntegrityError("TITLE retention requires its actual physical success and original audit")
+        _, cancellations = await self._join(retain_current_title_success(self, completion))
+        self.raise_deferred_cancellations(cancellations)
+
+    def prepare_cost_request(self, kwargs: CommonProviderCostRequest) -> None:
+        if self._cost_budget is not None:
+            self._cost_budget.prepare_request(kwargs)
+
+    def cost_completion_limit(self) -> int | None:
+        if self._cost_budget is None:
+            return None
+        policy = self._cost_budget.snapshot().policy
+        return policy.max_completion_tokens if policy is not None else None
+
+    def require_cost_dispatch(self) -> None:
+        if self._cost_budget is not None:
+            self._cost_budget.require_dispatch()
+
+    def require_cost_output(self) -> None:
+        if self._cost_budget is not None:
+            self._cost_budget.require_output()
+
+    def mark_cost_response_accountable(self, *, admitted_metadata: bool) -> None:
+        if type(admitted_metadata) is not bool or self.attempt is None or not self._sdk_entered:
+            raise AuditIntegrityError("response accountability requires actual dispatched custody")
+        self._cost_response_accountable = admitted_metadata
 
     @property
     def service(self) -> SessionServiceProtocol:
@@ -225,19 +321,37 @@ class ProviderCallCustody:
         self._admitting = True
         try:
             await self.settle()
+            self.require_cost_dispatch()
+            self._cost_response_accountable = False
             title = self.required_work.role is RequiredWorkRole.TITLE
             sql, projection = self.required_work.reserve_pair(
                 RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL if title else RequiredWorkSource.PROVIDER_ADMISSION_SQL,
                 RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION if title else RequiredWorkSource.PROVIDER_ADMISSION_PROJECTION,
             )
             try:
-                attempt, cancellations = await self._join(
-                    self.service.begin_provider_attempt(
-                        session_operation_context=self.context,
-                        source="auto_title" if title else "composer",
-                        required_work=sql,
+                if self.continuation_title is None:
+                    attempt, cancellations = await self._join(
+                        self.service.begin_provider_attempt(
+                            session_operation_context=self.context,
+                            source="auto_title" if title else "composer",
+                            required_work=sql,
+                        )
                     )
-                )
+                else:
+                    from elspeth.web.sessions.continuation_title_provider import TitleProviderAdmission
+                    from elspeth.web.sessions.service import SessionServiceImpl
+
+                    if type(self.service) is not SessionServiceImpl:
+                        raise AuditIntegrityError("TITLE admission requires its actual sessions owner")
+                    admitted, cancellations = await self._join(
+                        self.service.begin_continuation_title_attempt(
+                            prepared=self.continuation_title, requested_model=model, required_work=sql
+                        )
+                    )
+                    if type(admitted) is not TitleProviderAdmission:
+                        raise AuditIntegrityError("TITLE admission lost its exact physical/source result")
+                    attempt = admitted.attempt
+                    self.continuation_title_selected = admitted.selected
             except BaseException:
                 if sql.complete:
                     projection.complete_without_submission()
@@ -263,7 +377,12 @@ class ProviderCallCustody:
     def mark_sdk_entered(self) -> None:
         if self.attempt is None or self._sdk_entered or self.call is not None:
             raise AuditIntegrityError("Physical provider dispatch lacks exact admitted custody")
+        if self._cost_budget is not None:
+            self._cost_budget.dispatched()
         self._sdk_entered = True
+
+    def has_undispatched_attempt(self) -> bool:
+        return self.attempt is not None and not self._sdk_entered
 
     def needs_terminal_audit(self) -> bool:
         return self.attempt is not None and self._sdk_entered and self.call is None
@@ -292,6 +411,16 @@ class ProviderCallCustody:
             return
         if not self._sdk_entered or self.call is None:
             raise AuditIntegrityError("Required provider attempt lacks complete terminal audit")
+        current_title: TitleAuditSettlementRequest | None = None
+        if self.continuation_title_result is not None:
+            from elspeth.web.composer.continuation_title_provider import refresh_current_title_settlement
+            from elspeth.web.sessions.service import SessionServiceImpl
+
+            if type(self.service) is not SessionServiceImpl:
+                raise AuditIntegrityError("TITLE settlement requires its actual sessions writer")
+            # Current reads may refuse or be cancelled. Do not allocate the
+            # accounting receipt until it can be handed to the real finisher.
+            current_title = await refresh_current_title_settlement(self)
         binding = self.required_work
         projection: RequiredWorkTicket | None = None
         if binding.role is RequiredWorkRole.TITLE:
@@ -307,13 +436,27 @@ class ProviderCallCustody:
                 RequiredWorkSource.PROVIDER_SETTLEMENT_SQL, RequiredWorkSource.PROVIDER_SETTLEMENT_PROJECTION
             )
         try:
-            _, cancellations = await self._join(
-                self.service.finish_provider_attempt(
-                    session_operation_context=self.context,
-                    call=self.call,
-                    required_work=sql,
+            if self.continuation_title_result is None:
+                _, cancellations = await self._join(
+                    self.service.finish_provider_attempt(
+                        session_operation_context=self.context,
+                        call=self.call,
+                        required_work=sql,
+                    )
                 )
-            )
+            else:
+                from elspeth.web.sessions.service import SessionServiceImpl
+
+                if type(self.service) is not SessionServiceImpl or current_title is None:
+                    raise AuditIntegrityError("TITLE settlement lost its actual current source result")
+                _, cancellations = await self._join(
+                    self.service.finish_provider_attempt(
+                        session_operation_context=self.context,
+                        call=current_title.audit_call,
+                        required_work=sql,
+                        continuation_title=current_title,
+                    )
+                )
         except BaseException:
             if projection is not None and sql.complete:
                 projection.complete_without_submission()
@@ -321,6 +464,8 @@ class ProviderCallCustody:
         if projection is not None:
             projection.begin_projection()
             projection.complete_owned()
+        if self._cost_budget is not None:
+            self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
         self.attempt = None
         self.call = None
         self._sdk_entered = False
@@ -355,6 +500,16 @@ async def provider_call_scope(custody: ProviderCallCustody) -> AsyncIterator[Pro
         except BaseException as settlement:
             if body is not None and settlement is not body:
                 raise BaseExceptionGroup("Provider body and required settlement outcomes", [body, settlement]) from None
+            raise
+        try:
+            custody.require_cost_output()
+        except CommonProviderCostRefused as refusal:
+            from elspeth.web.composer.provider_gateway import _MalformedLLMResponseError
+
+            if isinstance(body, _MalformedLLMResponseError):
+                raise refusal from body
+            if body is not None:
+                raise BaseExceptionGroup("Provider body and monetary continuation refusal", [body, refusal]) from None
             raise
 
 
@@ -525,18 +680,6 @@ async def admit_provider_attempt(*, model: str) -> None:
         raise
     except Exception as failure:
         raise ComposerOwnedSettlementFailure() from failure
-
-
-def provider_attempt_needs_terminal_audit() -> bool:
-    """Whether a completion failure belongs to an admitted, unaudited attempt.
-
-    Retry admission first settles the preceding call. If that fails, the
-    span still holds its terminal evidence and must not be rebound to the
-    retry's exception. Unscoped callers retain their own audit lifecycle.
-    Check before building a call record, which binds it into the span.
-    """
-    span = _CONTEXTVAR_GET(_SPAN)
-    return span is None or (span.attempt is not None and span.call is None)
 
 
 def bind_provider_attempt(call: ComposerLLMCall) -> ComposerLLMCall:

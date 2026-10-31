@@ -30,6 +30,8 @@ const READ_ONLY_TOOL_CALL_DESCRIPTIONS: Record<string, string> = {
     "Looks up usage guidance and worked examples for a specific plugin.",
   get_pipeline_state:
     "Reads the current pipeline state being composed in this session.",
+  get_complete_pipeline_value:
+    "Reads the complete value of a long pipeline field for inspection.",
   get_audit_info:
     "Looks up audit metadata for the current session (run IDs, lineage anchors).",
   get_expression_grammar:

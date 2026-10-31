@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import errno
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from pydantic import JsonValue, TypeAdapter, ValidationError
@@ -15,11 +18,15 @@ from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlemen
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.prompt_guard import PromptGuardRefused
+from elspeth.web.composer.protocol import ComposerContextUnsupported, ComposerMutationAuthorityRevoked
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerRequiredRecoveryFailure
 from elspeth.web.sessions.protocol import StaleComposeStateError
+
+if TYPE_CHECKING:
+    from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
 
 _JSON: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 _RETRYABLE_STORAGE_ERRNOS = frozenset((errno.EIO, errno.ENOSPC, errno.EROFS))
@@ -130,6 +137,42 @@ def _leaves(exc: BaseException) -> tuple[BaseException, ...]:
     return (exc,)
 
 
+def project_retained_tool_failure(
+    source: RetainedToolFailureSource, *, request_id: str | None, diagnostic_id: str
+) -> ComposerOperationError:
+    """Project proved DATA without reviving a native exception or its text."""
+    if source.audit_unavailable:
+        return _http_error(
+            500,
+            {
+                "error_type": "audit_integrity_error",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                "request_id": request_id,
+            },
+            "audit_integrity_error",
+        )
+    refusal = source.failure.refusal_source
+    if refusal is not None:
+        payload = refusal.outcome.response
+        if not isinstance(payload, Mapping) or type(payload) not in (dict, MappingProxyType):
+            raise AuditIntegrityError("Retained refusal projection lost its actual original result")
+        if refusal.kind == "context_unsupported":
+            value = _JSON.validate_python({key: payload[key] for key in ("error_type", "failure_code", "reason", "detail")}, strict=True)
+            if type(value) is not dict:
+                raise AuditIntegrityError("Retained context refusal is not its actual public mapping")
+            return _http_error(422, {"detail": {**value, "request_id": request_id}}, "composer_context_unsupported")
+        if refusal.kind == "prompt_guard_refused":
+            value = _JSON.validate_python({key: payload[key] for key in ("error_type", "detail", "audit_id")}, strict=True)
+            if type(value) is not dict:
+                raise AuditIntegrityError("Retained guard refusal is not its actual public mapping")
+            return _http_error(
+                503 if value["error_type"] == "prompt_guard_unavailable" else 422,
+                {**value, "request_id": request_id},
+                str(value["error_type"]),
+            )
+    return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
+
+
 def _integrity_category(exc: BaseException) -> int:
     if isinstance(exc, AuditIntegrityError):
         return 0
@@ -169,7 +212,7 @@ def project_composer_operation_error(
                     "transcript_url": None,
                 }
             return _http_error(500, body, "audit_integrity_error")
-        if isinstance(leaf, (OperationalError, AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+        if isinstance(leaf, OperationalError):
             return _http_error(
                 503,
                 {
@@ -178,6 +221,16 @@ def project_composer_operation_error(
                     "request_id": request_id,
                 },
                 "database_unavailable",
+            )
+        if isinstance(leaf, (AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+            return _http_error(
+                503,
+                {
+                    "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+                    "error_type": "executor_unavailable",
+                    "request_id": request_id,
+                },
+                "executor_unavailable",
             )
         if isinstance(leaf, OSError) and leaf.errno in _RETRYABLE_STORAGE_ERRNOS:
             return _http_error(
@@ -194,6 +247,12 @@ def project_composer_operation_error(
     if len(leaves) != 1:
         return _generic_failure(request_id=request_id, diagnostic_id=diagnostic_id)
     leaf = leaves[0]
+    if isinstance(leaf, ComposerMutationAuthorityRevoked):
+        mutation_payload: dict[str, JsonValue] = {**leaf.to_payload()}
+        return _http_error(409, {"detail": mutation_payload}, "composer_mutation_authority_revoked")
+    if isinstance(leaf, ComposerContextUnsupported):
+        context_payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
+        return _http_error(leaf.http_status, {"detail": context_payload}, "composer_context_unsupported")
     if isinstance(leaf, PromptGuardRefused):
         payload: dict[str, JsonValue] = {**leaf.to_payload(), "request_id": request_id}
         return _http_error(leaf.http_status, payload, str(payload["error_type"]))

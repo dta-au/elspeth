@@ -1,20 +1,10 @@
-"""Cohort settlement close-out coverage for elspeth-90231248dc.
+"""Common audit-cohort settlement and exactly-once draining.
 
-The fix chose the ATOMICITY branch of the ticket's contract: a buffered audit
-cohort (tool breadcrumbs, LLM-call sidecars, planner evidence) settles in one
-``add_messages_atomic`` transaction — fully durable or cleanly absent — and a
-tool turn the compose loop already persisted inline is never drained again by
-a route handler. These tests pin the three mechanisms the 2026-08-09 sweep
-found unpinned:
+A tool turn already persisted inline must not drain again through a route
+handler. Buffered public/private audit rows settle in one transaction.
 
-* exactly-once across a mid-request provider timeout — the loop-side carrier
-  still carries the already-persisted invocations, so the handler's
-  ``failed_turn`` suppression is the load-bearing guard;
-* per-write-index fault injection on the planner cohort, on the success AND
-  the decline path, with the injection proven to have fired;
-* cancellation timing — a cohort cancelled mid-flight is drained through the
-  shield and lands whole (or, with a mid-cohort failure, not at all), while the
-  caller's ``CancelledError`` still propagates.
+A cancelled cohort drains through the shield and lands whole; a mid-cohort
+failure leaves no partial rows while the original cancellation propagates.
 """
 
 from __future__ import annotations
@@ -27,36 +17,31 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID, uuid4
+from unittest.mock import MagicMock
+from uuid import UUID
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.diagnostic_evidence import (
     DIAGNOSTIC_EVIDENCE_KIND,
     ComposerDiagnosticEvidence,
     diagnostic_evidence_identity,
 )
-from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
-from elspeth.web.sessions.models import chat_messages_table, composition_proposals_table
+from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.routes import _handle_convergence_error
 from tests.helpers.session_fences import acquire_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
@@ -130,19 +115,6 @@ def _chat_rows(sessions_service: Any, session_id: str) -> list[Mapping[str, Any]
         )
 
 
-async def _seed_user_message(sessions_service: Any, session_id: str) -> UUID:
-    """The proposal row's ``user_message_id`` is a real FK — seed the originating user row."""
-    record = await sessions_service.add_message(UUID(session_id), "user", "build me a pipeline", writer_principal="route_user_message")
-    return UUID(str(record.id))
-
-
-def _proposal_count(sessions_service: Any, session_id: str) -> int:
-    with sessions_service._engine.connect() as conn:
-        return len(
-            conn.execute(select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == session_id)).fetchall()
-        )
-
-
 def _envelope_kind(row: Mapping[str, Any]) -> str | None:
     tool_calls = row["tool_calls"]
     if not tool_calls or not isinstance(tool_calls[0], Mapping):
@@ -172,35 +144,6 @@ def _invocation_occurrences(rows: list[Mapping[str, Any]]) -> dict[str, int]:
 
 def _llm_audit_rows(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
     return [row for row in rows if _envelope_kind(row) == "llm_call_audit"]
-
-
-@dataclass
-class _InsertInjector:
-    """Fault-inject ``_insert_chat_message`` at one zero-based cohort index.
-
-    ``fail_at=None`` is the control arm. ``fired`` records whether the injected
-    failure was actually raised — every rejecting assertion checks it so a
-    wrong-reason pass (the failure never fired) cannot masquerade as coverage.
-    """
-
-    sessions_service: Any
-    fail_at: int | None
-    calls: int = 0
-    fired: bool = False
-    _original: Any = field(default=None, repr=False)
-
-    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self._original = self.sessions_service._insert_chat_message
-
-        def _flaky_insert(conn: Any, **kwargs: Any) -> str:
-            index = self.calls
-            self.calls += 1
-            if self.fail_at is not None and index == self.fail_at:
-                self.fired = True
-                raise OperationalError("injected chat-message insert failure", {}, Exception("db unavailable"))
-            return self._original(conn, **kwargs)
-
-        monkeypatch.setattr(self.sessions_service, "_insert_chat_message", _flaky_insert)
 
 
 # ---------------------------------------------------------------------------
@@ -384,180 +327,6 @@ async def test_handler_drains_carried_invocations_only_when_no_turn_was_persiste
 
 
 # ---------------------------------------------------------------------------
-# 2. per-write-index fault injection on the planner cohort
-# ---------------------------------------------------------------------------
-
-_PLANNER_COHORT = tuple(_discovery_invocation(f"call_planner_{index}") for index in range(3))
-
-
-def _green_preflight() -> ValidationResult:
-    return ValidationResult(
-        is_valid=True,
-        checks=[],
-        errors=[],
-        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
-    )
-
-
-def _plan() -> PipelinePlanResult:
-    proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
-        base=AbsentBase(),
-        repair_count=0,
-        skill_hash=stable_hash("planner-skill"),
-    )
-    return PipelinePlanResult(
-        proposal=proposal,
-        tool_call_id="call_pipeline",
-        custody_result="not_required",
-        model_identifier="planner-model",
-        model_version="planner-model-v1",
-        provider="test",
-        candidate_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _FakePreferences:
-    trust_mode: str
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
-async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_index(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    result_session_id: str,
-    monkeypatch: pytest.MonkeyPatch,
-    fail_at: int | None,
-) -> None:
-    """``_stage_pipeline_plan``: a failure at any cohort row leaves zero rows AND no proposal."""
-    service = composer_service_with_real_sessions
-    sessions_service = service._sessions_service  # type: ignore[attr-defined]
-    user_message_id = await _seed_user_message(sessions_service, result_session_id)
-    injector = _InsertInjector(sessions_service, fail_at)
-    injector.install(monkeypatch)
-    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
-
-    async def _stage() -> Any:
-        async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._planning_application._stage_pipeline_plan(
-                session_operation_context=compose_context,
-                plan=_plan(),
-                state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-                session_id=UUID(result_session_id),
-                current_state_id=None,
-                user_message_id=user_message_id,
-                user_id="phase3-test-user",
-                preferences=_FakePreferences(trust_mode="explicit_approve"),
-                recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
-                planner_llm_calls=(),
-                planner_private_candidates=(),
-                planner_attempts=(),
-                planner_invocations=_PLANNER_COHORT,
-                planner_withheld_replies=(),
-                plugin_snapshot=None,
-            )
-
-    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
-        if fail_at is None:
-            result = await _stage()
-            assert result.message
-            rows = _chat_rows(sessions_service, result_session_id)
-            assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-            assert _proposal_count(sessions_service, result_session_id) == 1
-            assert injector.calls == 2 * len(_PLANNER_COHORT)
-            return
-
-        with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
-            await _stage()
-
-    assert injector.fired, "the injected failure never fired — this arm would pass for the wrong reason"
-    assert injector.calls == fail_at + 1, "the cohort must stop at the failing row, not keep inserting"
-    assert _chat_rows(sessions_service, result_session_id) == [], f"a partial planner cohort survived a failure at index {fail_at}"
-    assert _proposal_count(sessions_service, result_session_id) == 0, "no proposal may exist without its evidence cohort"
-
-
-async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, recorder: BufferingRecorder) -> Any:
-    driver = cast(Any, service)
-    sessions_service = cast(Any, service._sessions_service)
-    plugin_snapshot, policy_catalog = driver._policy_context.build(None)
-    # P4-D6 family A2b: the planner-evidence cohort is a fenced session write,
-    # so the staging turn runs under a real acquired COMPOSE operation exactly
-    # as the compose route does.
-    async with sessions_service._call_context(UUID(session_id), SessionOperationKind.COMPOSE) as compose_context:
-        return await driver._planning_application._plan_and_stage_empty_pipeline(
-            message="build me a pipeline",
-            messages=[],
-            state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-            session_id=session_id,
-            current_state_id=None,
-            user_id="phase3-test-user",
-            progress=None,
-            user_message_id=str(uuid4()),
-            recorder=recorder,
-            plugin_snapshot=plugin_snapshot,
-            policy_catalog=policy_catalog,
-            session_operation_context=compose_context,
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [None, 0, 1, 2, 3, 4, 5], ids=["control", "index0", "index1", "index2", "index3", "index4", "index5"])
-async def test_planner_decline_path_cohort_is_all_or_nothing_at_every_write_index(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    result_session_id: str,
-    monkeypatch: pytest.MonkeyPatch,
-    fail_at: int | None,
-) -> None:
-    """The ``PlannerDeclined`` arm mirrors the success path: zero rows on any failure, and the
-    failure surfaces as Tier-1 audit corruption rather than being swallowed into a decline reply."""
-    service = composer_service_with_real_sessions
-    sessions_service = service._sessions_service  # type: ignore[attr-defined]
-    injector = _InsertInjector(sessions_service, fail_at)
-    injector.install(monkeypatch)
-    recorder = BufferingRecorder()
-
-    async def _declining_planner(**kwargs: Any) -> Any:
-        planner_recorder = kwargs["recorder"]
-        for invocation in _PLANNER_COHORT:
-            planner_recorder.record(invocation)
-        raise PlannerDeclined("declined", decline_text="I cannot build that from the available components.")
-
-    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", _declining_planner)
-
-    if fail_at is None:
-        result = await _plan_and_stage_empty(service, result_session_id, recorder)
-        assert "completion review could not run within the existing request limits" in result.message
-        assert "I cannot build that from the available components." not in result.message
-        rows = _chat_rows(sessions_service, result_session_id)
-        assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}
-        stored = await sessions_service.get_messages(UUID(result_session_id), limit=None)
-        withheld = [row for row in stored if _envelope_kind({"tool_calls": row.tool_calls}) == "composer_withheld_reply"]
-        assert len(withheld) == 1
-        assert withheld[0].role == "audit"
-        assert withheld[0].content == "I cannot build that from the available components."
-        assert withheld[0].tool_calls[0]["origin"] == "advisor_publication_withheld"
-        publications = [row for row in stored if _envelope_kind({"tool_calls": row.tool_calls}) == "advisor_terminal_publication_audit"]
-        assert len(publications) == 1 and publications[0].role == "audit"
-        assert publications[0].tool_calls[0]["publication"] == {
-            "branch": "terminal_block",
-            "reason": "budget_exhausted",
-            "preflight_shape": "absent",
-            "findings_backend_authored": False,
-        }
-        assert injector.calls == 2 * len(_PLANNER_COHORT) + len(withheld) + len(publications)
-        return
-
-    with pytest.raises(AuditIntegrityError, match="pipeline planner audit persistence failed before proposal creation"):
-        await _plan_and_stage_empty(service, result_session_id, recorder)
-
-    assert injector.fired, "the injected failure never fired — this arm would pass for the wrong reason"
-    assert injector.calls == fail_at + 1
-    assert _chat_rows(sessions_service, result_session_id) == [], f"a partial decline-path cohort survived a failure at index {fail_at}"
-    assert _proposal_count(sessions_service, result_session_id) == 0
-
-
-# ---------------------------------------------------------------------------
 # 3. cancellation timing on the settling cohort
 # ---------------------------------------------------------------------------
 
@@ -656,54 +425,3 @@ async def test_cancel_then_mid_cohort_failure_lands_nothing_and_keeps_the_cancel
     assert gate.fired, "the mid-cohort failure never fired"
     assert isinstance(exc_info.value.__cause__, OperationalError), "the DB failure must stay diagnosable as the cancellation's __cause__"
     assert _chat_rows(sessions_service, result_session_id) == [], "a cancelled-and-failed cohort left a durable prefix"
-
-
-@pytest.mark.asyncio
-async def test_planner_cohort_cancelled_mid_settlement_lands_whole_and_creates_no_proposal(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    result_session_id: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end on the planner success path: evidence lands whole, cancel wins, no proposal follows."""
-    service = composer_service_with_real_sessions
-    sessions_service = service._sessions_service  # type: ignore[attr-defined]
-    user_message_id = await _seed_user_message(sessions_service, result_session_id)
-    gate = _GatedInsert(sessions_service)
-    gate.install(monkeypatch)
-    preflight = AsyncMock(spec=service._preflight.cached_runtime_preflight, return_value=_green_preflight())  # type: ignore[attr-defined]
-
-    async def _stage() -> Any:
-        async with acquire_compose_context(sessions_service, result_session_id) as compose_context:
-            return await service._planning_application._stage_pipeline_plan(
-                session_operation_context=compose_context,
-                plan=_plan(),
-                state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-                session_id=UUID(result_session_id),
-                current_state_id=None,
-                user_message_id=user_message_id,
-                user_id="phase3-test-user",
-                preferences=_FakePreferences(trust_mode="explicit_approve"),
-                recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
-                planner_llm_calls=(),
-                planner_private_candidates=(),
-                planner_attempts=(),
-                planner_invocations=_PLANNER_COHORT,
-                planner_withheld_replies=(),
-                plugin_snapshot=None,
-            )
-
-    with patch.object(service._preflight, "cached_runtime_preflight", preflight):
-        task = asyncio.create_task(_stage())
-        await asyncio.wait_for(gate.entered.wait(), timeout=2.0)
-        task.cancel()
-        await asyncio.sleep(0)
-        assert not task.done(), "cancellation escaped while the planner cohort transaction was still open"
-        gate.release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=5.0)
-
-    rows = _chat_rows(sessions_service, result_session_id)
-    assert _invocation_occurrences(rows) == {inv.tool_call_id: 1 for inv in _PLANNER_COHORT}, "the evidence cohort must land whole"
-    assert _proposal_count(sessions_service, result_session_id) == 0, (
-        "evidence-without-proposal is the safe direction; a proposal must not follow a cancelled request"
-    )

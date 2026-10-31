@@ -35,6 +35,14 @@ def test_scope_index_selects_the_innermost_nested_scope(tmp_path: Path) -> None:
     assert index.symbol("nested.py", 4) == "outer"
 
 
+@pytest.mark.parametrize("value", ["", "synthetic-key-never-provider-material"])
+def test_keyfree_helper_refuses_before_subprocess_environment_copy(value: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", value)
+
+    with pytest.raises(RuntimeError, match="key-free"):
+        rejudge._lints_env(tmp_path)
+
+
 def test_scope_index_falls_back_to_lineno_when_ast_end_lineno_is_none(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

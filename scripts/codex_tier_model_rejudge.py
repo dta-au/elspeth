@@ -20,18 +20,18 @@ can auto-repair it (it refuses while NO_MATCHING entries exist). Three steps:
 
 CUSTODY BOUNDARY -- this script signs NOTHING. It produces PROPOSED rationales
 only, using the agent's OpenRouter/Codex access. The authoritative judge+sign is
-the OPERATOR step, run in the cert shell with the HMAC key:
+the OPERATOR step, through the separately installed protected runtime:
 
     # 1) drop the stale NO_MATCHING entries the worklist enumerated
     python scripts/codex_tier_model_rejudge.py emit-deletes --out <DIR>   # prints the keys
     #    (delete those keys from config/cicd/enforce_tier_model/*.yaml)
     # 2) auto-repair drift + sign the manifest entries (re-runs the real judge per entry)
     ELSPETH_JUDGE_METADATA_HMAC_KEY=... \
-      sign-judge-signatures --root src/elspeth \
+      /usr/local/libexec/elspeth-operator sign-judge-signatures --root src/elspeth \
         --allowlist-dir config/cicd/enforce_tier_model \
         --owner john --manifest <DIR>/manifest.yaml --dry-run     # then drop --dry-run
-    # 3) regenerate the fingerprint baseline (needs the green signed gate + the key)
-    python scripts/cicd/regen_fingerprint_baseline.py
+    # Baseline regeneration remains disabled until a protected, key-free
+    # maintenance path is qualified. Never run this script in the signer shell.
 
 `sign-judge-signatures` re-judges every manifest entry itself and signs only the
 ones the judge ACCEPTS; this script's verdict is a pre-screen to make that run
@@ -76,10 +76,16 @@ _ScopeSpan = tuple[int, int, list[str]]
 # worklist construction
 # --------------------------------------------------------------------------- #
 def _lints_env(repo_root: Path) -> dict[str, str]:
+    _require_key_free()
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{repo_root / 'elspeth-lints' / 'src'}:{env.get('PYTHONPATH', '')}"
     env.update(SHAPE_ONLY_ENV)
     return env
+
+
+def _require_key_free() -> None:
+    if "ELSPETH_JUDGE_METADATA_HMAC_KEY" in os.environ:
+        raise RuntimeError("this proposal helper is key-free; use the protected operator runtime for signing")
 
 
 def _run_diagnose(repo_root: Path, root: Path, allowlist: Path) -> _JsonObject:
@@ -417,6 +423,7 @@ def build_manifest(out_dir: Path) -> dict[str, int]:
 # cli
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    _require_key_free()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("step", choices=["build-worklist", "rejudge", "build-manifest", "emit-deletes"])
     p.add_argument("--out", default="notes/060-rejudge", help="output dir for worklist/reports/manifest")

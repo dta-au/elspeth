@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.execution_custody import ExecutionTestCustody
 from tests.helpers.process_diagnostics import ProcessDiagnostics, trace_child_process
 from tests.testcontainer.web.test_cross_process_run_control_postgres import _envelope
@@ -45,7 +46,6 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, run_events_table, runs_table
-from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -100,7 +100,7 @@ def _die_after_engine_result(session_url, landscape_url, data_dir, terminal, con
         )
         state = await sessions.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose,
         )

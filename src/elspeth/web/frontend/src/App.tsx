@@ -7,6 +7,7 @@ import {
   useRef,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { setComposerAdmissionVersion } from "@/config/composerProtocol";
 import "./styles/index.css";
 import * as api from "./api/client";
 import {
@@ -384,6 +385,9 @@ function App() {
       useSessionStore
         .getState()
         .setComposerAdvisorModel(status.composer_advisor_model);
+      // The Composer-Operation-Version every new submission requests; missing
+      // (older server) means 1.
+      setComposerAdmissionVersion(status.composer_operation_admission_version);
       // Deploy beacon: debounce across consecutive polls so a mid-deploy
       // status flap never flashes the banner; latch once stable.
       staleBuildStreakRef.current = nextStaleBuildStreak(

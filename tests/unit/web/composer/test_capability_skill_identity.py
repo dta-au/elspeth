@@ -2,52 +2,24 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any
 
 import pytest
 
-from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.canonical import stable_hash
 from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
 from elspeth.web.composer.capability_skill import (
     CANONICAL_CAPABILITY_FIELDS,
     CAPABILITY_CORE_NODE_GUIDANCE,
-    PlannerCapabilityManifest,
-    build_planner_capability_manifest,
     canonical_capability_fields,
     documented_capability_fields,
     load_pipeline_capability_core,
     validate_capability_field_contract,
 )
-from elspeth.web.composer.pipeline_planner import PLANNER_DISCOVERY_TOOL_NAMES, planner_tool_definitions
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.skills import load_skill
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
-
-
-def _messages(rendered_skill: str, *, sensitive_user_text: str = "build it") -> list[dict[str, Any]]:
-    return [
-        {"role": "system", "content": rendered_skill},
-        {"role": "user", "content": sensitive_user_text},
-    ]
-
-
-def _manifest(
-    rendered_skill: str,
-    *,
-    sensitive_user_text: str = "build it",
-) -> PlannerCapabilityManifest:
-    return build_planner_capability_manifest(
-        messages=_messages(rendered_skill, sensitive_user_text=sensitive_user_text),
-        tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
-        canonical_schema=canonical_set_pipeline_schema(),
-    )
 
 
 def test_freeform_planner_prepends_capability_core_once() -> None:
@@ -58,27 +30,13 @@ def test_freeform_planner_prepends_capability_core_once() -> None:
 
 
 def test_capability_core_names_no_planner_exclusive_terminal_tool() -> None:
-    # The core is shared by the freeform tool loop and proposal planner.
-    # The latter's terminal contract is delivered per request, while both
-    # author the canonical `set_pipeline` document shape.
+    # Both the capability core and the rendered live prompt advertise the
+    # complete set_pipeline document and exclude the retired terminal.
     core = load_pipeline_capability_core()
 
     assert "emit_pipeline_proposal" not in core
     assert "emit_pipeline_proposal" not in build_system_prompt(None)
     assert "`set_pipeline`" in core
-
-
-def test_planner_request_instruction_carries_the_terminal_contract() -> None:
-    # Split-the-core counterpart: with the shared bytes surface-neutral, the
-    # planner's terminal-alone and bounded-repair contract must ride the per-request
-    # instruction channel every plan_pipeline call sends.
-    from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
-
-    assert "emit_pipeline_proposal" in PLANNER_TERMINAL_INSTRUCTION
-    assert "alone in its turn" in PLANNER_TERMINAL_INSTRUCTION
-    assert "After a rejection, repair and resubmit the complete proposal" in PLANNER_TERMINAL_INSTRUCTION
-    assert "handoff_to_user or restore_parked_graph alone" in PLANNER_TERMINAL_INSTRUCTION
-    assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
 
 
 def test_capability_core_explains_digest_budget_omissions() -> None:
@@ -221,18 +179,11 @@ def test_capability_field_extraction_rejects_missing_required_schema_node() -> N
         canonical_capability_fields(schema)
 
 
-def test_manifest_rejects_schema_and_terminal_updated_without_documented_field() -> None:
+def test_capability_contract_rejects_an_undocumented_schema_field() -> None:
     schema = canonical_set_pipeline_schema()
     schema["properties"]["future_topology"] = {"type": "object"}
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    tools[-1]["function"]["parameters"]["properties"]["pipeline"] = schema
-
     with pytest.raises(AuditIntegrityError, match="documented capability fields drifted"):
-        build_planner_capability_manifest(
-            messages=_messages(build_system_prompt(None)),
-            tools=tools,
-            canonical_schema=schema,
-        )
+        validate_capability_field_contract(schema, load_pipeline_capability_core())
 
 
 @pytest.mark.parametrize("mutation", ("missing_start", "missing_family", "malformed_fields"))
@@ -250,136 +201,3 @@ def test_documented_field_inventory_fails_closed_on_drift(mutation: str) -> None
             validate_capability_field_contract(canonical_set_pipeline_schema(), changed)
         else:
             documented_capability_fields(changed)
-
-
-def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    manifest = _manifest(build_system_prompt(None))
-
-    assert [tool["function"]["name"] for tool in tools] == [
-        *PLANNER_DISCOVERY_TOOL_NAMES,
-        "handoff_to_user",
-        "restore_parked_graph",
-        "emit_pipeline_proposal",
-    ]
-    assert manifest.effective_tool_hash == stable_hash(tools)
-    assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
-
-
-def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    retained = {"get_plugin_assistance", "get_plugin_schema", "list_models", "handoff_to_user", "restore_parked_graph"}
-    subset = [tool for tool in tools if tool["function"]["name"] in retained or tool is tools[-1]]
-
-    manifest = build_planner_capability_manifest(
-        messages=_messages(build_system_prompt(None)),
-        tools=subset,
-        canonical_schema=canonical_set_pipeline_schema(),
-    )
-
-    assert [tool["function"]["name"] for tool in subset] == [
-        "get_plugin_assistance",
-        "get_plugin_schema",
-        "list_models",
-        "handoff_to_user",
-        "restore_parked_graph",
-        "emit_pipeline_proposal",
-    ]
-    assert manifest.effective_tool_hash == stable_hash(subset)
-
-
-@pytest.mark.parametrize("mutation", ("reordered", "unknown"))
-def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> None:
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    retained = {"get_plugin_assistance", "get_plugin_schema", "handoff_to_user", "restore_parked_graph", "emit_pipeline_proposal"}
-    subset = [tool for tool in tools if tool["function"]["name"] in retained]
-    build_planner_capability_manifest(
-        messages=_messages(build_system_prompt(None)), tools=subset, canonical_schema=canonical_set_pipeline_schema()
-    )
-    if mutation == "reordered":
-        subset[0], subset[1] = subset[1], subset[0]
-    else:
-        subset[0]["function"]["name"] = "unknown_discovery"
-
-    with pytest.raises(AuditIntegrityError, match="identities or order"):
-        build_planner_capability_manifest(
-            messages=_messages(build_system_prompt(None)),
-            tools=subset,
-            canonical_schema=canonical_set_pipeline_schema(),
-        )
-
-
-def test_freeform_planner_builds_capability_manifest_core() -> None:
-    manifest = _manifest(build_system_prompt(None))
-
-    assert manifest.capability_core_hash == hashlib.sha256(load_pipeline_capability_core().encode("utf-8")).hexdigest()
-    assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
-    assert manifest.effective_tool_hash == stable_hash(planner_tool_definitions(dialect=ToolContractDialect.NONE))
-
-
-@pytest.mark.parametrize("mutation", ("missing_core", "duplicate_core", "reordered_tools", "mutated_schema"))
-def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> None:
-    core = load_pipeline_capability_core()
-    messages = _messages(build_system_prompt(None))
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    if mutation == "missing_core":
-        messages[0]["content"] = "interaction only"
-    elif mutation == "duplicate_core":
-        messages[0]["content"] = f"{core}{core}"
-    elif mutation == "reordered_tools":
-        tools[0], tools[1] = tools[1], tools[0]
-    else:
-        tools[-1]["function"]["parameters"]["properties"]["pipeline"]["properties"].pop("edges")
-
-    with pytest.raises(AuditIntegrityError):
-        build_planner_capability_manifest(
-            messages=messages,
-            tools=tools,
-            canonical_schema=canonical_set_pipeline_schema(),
-        )
-
-
-def test_manifest_rejects_message_missing_required_role() -> None:
-    messages = _messages(build_system_prompt(None))
-    del messages[0]["role"]
-
-    with pytest.raises(KeyError, match="role"):
-        build_planner_capability_manifest(
-            messages=messages,
-            tools=planner_tool_definitions(dialect=ToolContractDialect.NONE),
-            canonical_schema=canonical_set_pipeline_schema(),
-        )
-
-
-def test_manifest_rejects_terminal_missing_required_parameters() -> None:
-    tools = planner_tool_definitions(dialect=ToolContractDialect.NONE)
-    del tools[-1]["function"]["parameters"]
-
-    with pytest.raises(KeyError, match="parameters"):
-        build_planner_capability_manifest(
-            messages=_messages(build_system_prompt(None)),
-            tools=tools,
-            canonical_schema=canonical_set_pipeline_schema(),
-        )
-
-
-def test_manifest_is_hash_only_and_never_copies_private_prompt_values(tmp_path: Path) -> None:
-    private_value = "sk-private-provider-value-never-public"
-    deployment = tmp_path / "skills"
-    deployment.mkdir()
-    (deployment / "pipeline_composer.md").write_text(f"Private deployment instruction: {private_value}\n")
-
-    manifest = _manifest(
-        build_system_prompt(str(tmp_path)),
-        sensitive_user_text=private_value,
-    )
-    rendered = repr(asdict(manifest))
-
-    assert private_value not in rendered
-    assert set(asdict(manifest)) == {
-        "planner_implementation_id",
-        "capability_core_hash",
-        "canonical_schema_hash",
-        "effective_tool_hash",
-        "rendered_prompt_hash",
-    }

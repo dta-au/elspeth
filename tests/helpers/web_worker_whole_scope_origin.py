@@ -15,9 +15,49 @@ import types
 APP = "src/elspeth/web/app.py"
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
 TURN = "src/elspeth/web/sessions/composer_turn.py"
+POLICY_SETTINGS = "src/elspeth/web/composer/continuation_policy_settings.py"
+POLICY_MODELS = "src/elspeth/web/composer/continuation_policy.py"
+POLICY_SUPPLIER_GRAMMARS = {
+    POLICY_SETTINGS: "10ed3196f604e8fa4d3a6dcb164a5a80176a1ef92bf474f4008f5d20a921cead",
+    POLICY_MODELS: "ecc7e9efaf913b36c840a72ffeb3ea8bac25a92c9b62f4efbd4bb0ca10a48666",
+}
+POLICY_SUPPLIER_DEFINITIONS = {
+    POLICY_SETTINGS: (
+        "_guard_seconds",
+        "_provider_action",
+        "_local_action",
+        "continuation_policy_from_settings",
+        "_require_first_segment_fits_its_chain",
+    ),
+    POLICY_MODELS: (
+        "ContinuationActionPolicy",
+        "ContinuationSegmentPolicy",
+        "ContinuationActionBounds",
+        "ContinuationAdmissionPolicy",
+        "decode_continuation_policy",
+    ),
+}
+POLICY_SUPPLIER_ORIGINS = frozenset(
+    path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + name
+    for path, names in POLICY_SUPPLIER_DEFINITIONS.items()
+    for name in names
+) | frozenset(
+    "elspeth.web.composer.continuation_policy_settings." + name
+    for name in ("GUARD_STAGE_MARGIN_SECONDS", "_DEFAULT_GUARD_TIMEOUT_SECONDS", "_FIRST_SEGMENT_SESSION_SQL_ACTIONS")
+)
+POLICY_SUPPLIER_CLASS_ORIGINS = frozenset(
+    "elspeth.web.composer.continuation_policy." + name
+    for name in ("ContinuationActionPolicy", "ContinuationSegmentPolicy", "ContinuationActionBounds", "ContinuationAdmissionPolicy")
+)
+POLICY_SUPPLIER_FUNCTION_ORIGINS = frozenset(
+    path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + name
+    for path, names in POLICY_SUPPLIER_DEFINITIONS.items()
+    for name in names
+    if path != POLICY_MODELS or name == "decode_continuation_policy"
+)
 GRAMMARS = {
-    "_create_app": "16627e75bdca4a3c8a2d2938ca1c29eac4812d3261c7aeb28cff1272c5ce8a3b",
-    "ComposerAsyncWorker._run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
+    "_create_app": "b57b0d1b932f77844d3474e125399ee60523f125474e255c16c04558a4e2facd",
+    "ComposerAsyncWorker._run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
@@ -68,9 +108,48 @@ def canonical(value):
     return value
 
 
+_YAML_ADAPTER_PREFLIGHT_CALL = "validate_pipeline(\n            state,\n            settings,\n            ComposerYamlSerializer(),\n            secret_service=app.state.scoped_secret_resolver,\n            secret_wiring_policy=runtime_secret_wiring_policy(settings.secret_wiring_allowlist),\n            user_id=user_id,\n            session_id=session_id,\n            blob_get_metadata=_blob_get_metadata,\n            blob_get_content=blob_get_content,\n            plugin_snapshot=plugin_snapshot,\n            profile_registry=app.state.operator_profile_registry,\n            catalog=app.state.catalog_service,\n        )"
+
+
+def adapter_grammar_projection(node):
+    """Project only the reviewed adapter operand onto the previous grammar.
+
+    All receipts and compiler metadata still use the original input tree. This
+    disposable comparison copy preserves every other node. The complete
+    nominal-adapter receipt separately owns the class, import and lexical uses.
+    """
+    if not isinstance(node, ast.FunctionDef) or node.name != "_create_app":
+        return node
+    constructors = [child for child in ast.walk(node) if isinstance(child, ast.Call) and chain(child.func) == ("ComposerYamlSerializer",)]
+    if not constructors:
+        # Historical source remains a valid worker-only grammar; the combined
+        # adapter receipt independently requires the actual new production tuple.
+        return node
+    clone = copy.deepcopy(node)
+    functions = [child for child in clone.body if isinstance(child, ast.FunctionDef) and child.name == "_session_runtime_preflight"]
+    if len(functions) != 1:
+        raise ValueError("nominal YAML preflight owner is not unique")
+    expected = ast.dump(ast.parse(_YAML_ADAPTER_PREFLIGHT_CALL, mode="eval").body, include_attributes=False)
+    returns = [
+        child
+        for child in functions[0].body
+        if isinstance(child, ast.Return)
+        and isinstance(child.value, ast.Call)
+        and ast.dump(child.value, include_attributes=False) == expected
+    ]
+    if len(constructors) != 1 or len(returns) != 1:
+        raise ValueError("nominal YAML preflight argument delta is not exact")
+    call = returns[0].value
+    if len(call.args) != 3 or not isinstance(call.args[2], ast.Call) or call.args[2].args or call.args[2].keywords:
+        raise ValueError("nominal YAML constructor acquired an argument")
+    call.args[2] = ast.copy_location(ast.Name(id="yaml_generator_module", ctx=ast.Load()), call.args[2])
+    return clone
+
+
 def grammar(node):
     clone = copy.copy(node)
     clone.body = list(node.body)
+    clone = adapter_grammar_projection(clone)
     if (
         clone.body
         and isinstance(clone.body[0], ast.Expr)
@@ -260,7 +339,7 @@ def worker_whole_scope_origin_local_contracts(units):
     selected = {}
     scopes = {}
     names = {
-        "_create_app": ("FastAPI", "ComposerAsyncWorker", "weakref"),
+        "_create_app": ("FastAPI", "ComposerAsyncWorker", "weakref", "continuation_policy_from_settings"),
         "ComposerAsyncWorker._run_started_under_lease": ("run_composer_turn",),
         "run_composer_turn": ("_run_composer_turn",),
     }
@@ -351,6 +430,27 @@ def worker_whole_scope_origin_local_contracts(units):
             )
     if failures:
         return failures, receipt
+    receipt["drain_owner_origins"] = []
+    for path in (APP, WORKER):
+        origin = import_origin(index[path].tree, "ComposerDrainSignal", "elspeth.web.sessions.composer_drain", "ComposerDrainSignal")
+        if origin is None:
+            failures.append("worker whole scope: actual nominal drain owner import changed " + path)
+        else:
+            statement, alias = origin
+            receipt["drain_owner_origins"].append(
+                {
+                    "source_origin": "elspeth.web.sessions.composer_drain.ComposerDrainSignal",
+                    "import_statement": (path, id(statement)),
+                    "import_alias": (path, id(alias)),
+                    "qualification": "ACTUAL_SOURCE_IMPORT_RUNTIME_OWNER_UNKNOWN",
+                }
+            )
+    if failures:
+        return failures, receipt
+    policy_failures, policy_receipt = _continuation_policy_consumer(index[APP])
+    if policy_failures:
+        return policy_failures, receipt
+    receipt["continuation_policy_consumer"] = policy_receipt
     nodes = list(body_nodes(app))
     app_stores = list(binding_nodes(nodes, "app"))
     declarations = [n for n in nodes if isinstance(n, (ast.Global, ast.Nonlocal)) and "app" in n.names]
@@ -436,3 +536,137 @@ def worker_whole_scope_origin_local_contracts(units):
             failures.append("worker whole scope: unreviewed direct first-class app use")
         receipt["app_direct_call_uses"].append(record)
     return failures, receipt
+
+
+def _continuation_policy_consumer(unit):
+    """The one actual authority construction receives the original settings."""
+    factory, _ = find(unit.tree, "_create_app")
+    origin = import_origin(
+        unit.tree,
+        "continuation_policy_from_settings",
+        "elspeth.web.composer.continuation_policy_settings",
+        "continuation_policy_from_settings",
+    )
+    authority_origin = import_origin(
+        unit.tree,
+        "ComposerAsyncOperationAuthority",
+        "elspeth.web.coordination.composer_operation_authority",
+        "ComposerAsyncOperationAuthority",
+    )
+    if (
+        not isinstance(factory, ast.FunctionDef)
+        or not factory.args.args
+        or factory.args.args[0].arg != "settings"
+        or origin is None
+        or authority_origin is None
+    ):
+        return ["worker policy supplier: canonical consumer import changed"], None
+    code, _reason = code_for(unit.tree, [factory])
+    if code is None or any(
+        name in code.co_varnames + code.co_cellvars + code.co_freevars
+        for name in ("continuation_policy_from_settings", "ComposerAsyncOperationAuthority")
+    ):
+        return ["worker policy supplier: consumer supplier localized/captured"], None
+    nodes = list(body_nodes(factory))
+    if list(binding_nodes(nodes, "settings")) or any(
+        isinstance(node, (ast.Global, ast.Nonlocal)) and "settings" in node.names for node in nodes
+    ):
+        return ["worker policy supplier: original settings binding changed"], None
+    constructors = [
+        node
+        for node in factory.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and chain(node.targets[0]) == ("composer_async_authority",)
+        and isinstance(node.value, ast.Call)
+        and chain(node.value.func) == ("ComposerAsyncOperationAuthority",)
+    ]
+    uses = [node for node in nodes if isinstance(node, ast.Name) and node.id == "continuation_policy_from_settings"]
+    if len(constructors) != 1:
+        return ["worker policy supplier: exact authority construction changed"], None
+    authority_store = constructors[0].targets[0]
+    if list(binding_nodes(nodes, "composer_async_authority")) != [authority_store]:
+        return ["worker policy supplier: retained authority binding changed"], None
+    call = constructors[0].value
+    keywords = [keyword for keyword in call.keywords if keyword.arg == "continuation_policy"]
+    if (
+        len(keywords) != 1
+        or not isinstance(keywords[0].value, ast.Call)
+        or chain(keywords[0].value.func) != ("continuation_policy_from_settings",)
+        or len(keywords[0].value.args) != 1
+        or chain(keywords[0].value.args[0]) != ("settings",)
+        or keywords[0].value.keywords
+        or uses != [keywords[0].value.func]
+    ):
+        return ["worker policy supplier: exact settings-to-authority transfer changed"], None
+    installed = [
+        node
+        for node in factory.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and chain(node.targets[0]) == ("app", "state", "composer_async_operation_authority")
+        and chain(node.value) == ("composer_async_authority",)
+    ]
+    workers = [
+        node.value
+        for node in factory.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and chain(node.targets[0]) == ("app", "state", "composer_async_worker")
+        and isinstance(node.value, ast.Call)
+        and chain(node.value.func) == ("ComposerAsyncWorker",)
+    ]
+    if len(installed) != 1 or len(workers) != 1:
+        return ["worker policy supplier: current authority installation changed"], None
+    worker_authorities = [keyword.value for keyword in workers[0].keywords if keyword.arg == "authority"]
+    authority_uses = [
+        node for node in nodes if isinstance(node, ast.Name) and node.id == "composer_async_authority" and isinstance(node.ctx, ast.Load)
+    ]
+    if (
+        len(worker_authorities) != 1
+        or chain(worker_authorities[0]) != ("composer_async_authority",)
+        or authority_uses != [installed[0].value, worker_authorities[0]]
+    ):
+        return ["worker policy supplier: current worker authority transfer changed"], None
+    return [], {
+        "authority_constructor": (unit.path, id(call)),
+        "policy_call": (unit.path, id(keywords[0].value)),
+        "settings_argument": (unit.path, id(keywords[0].value.args[0])),
+        "authority_installation": (unit.path, id(installed[0])),
+        "worker_authority_argument": (unit.path, id(worker_authorities[0])),
+        "source_origins": ((unit.path, id(origin[1])), (unit.path, id(authority_origin[1]))),
+    }
+
+
+def continuation_policy_supplier_contracts(units):
+    """Bind the complete value-policy suppliers in caller-owned current ASTs."""
+    index = {}
+    for unit in units:
+        if unit.path in index:
+            return ["worker policy supplier: duplicate source unit"], None
+        index[unit.path] = unit
+    if any(path not in index for path in (APP, POLICY_SETTINGS, POLICY_MODELS)):
+        return ["worker policy supplier: missing current source"], None
+    failures, consumer = _continuation_policy_consumer(index[APP])
+    if failures:
+        return failures, None
+    definitions = []
+    for path, expected in POLICY_SUPPLIER_GRAMMARS.items():
+        unit = index[path]
+        if not isinstance(unit.tree, ast.Module) or grammar(unit.tree) != expected:
+            return ["worker policy supplier: complete current supplier changed " + path], None
+        for name in POLICY_SUPPLIER_DEFINITIONS[path]:
+            definition, _ = find(unit.tree, name)
+            if definition is None or not owned_origin(unit.tree, name, definition):
+                return ["worker policy supplier: owned producer binding changed " + path + ":" + name], None
+            definitions.append((path, id(definition)))
+    return [], {
+        "supplier_definitions": tuple(definitions),
+        "supplier_calls": (consumer["policy_call"],),
+        "source_origins": consumer["source_origins"],
+        "protected_origins": POLICY_SUPPLIER_ORIGINS,
+        "function_origins": POLICY_SUPPLIER_FUNCTION_ORIGINS,
+        "class_origins": POLICY_SUPPLIER_CLASS_ORIGINS,
+        "consumer": consumer,
+        "common_unknown": ("normal Pydantic/settings constructor and loader behavior", "outside or deferred supplier mutation"),
+    }

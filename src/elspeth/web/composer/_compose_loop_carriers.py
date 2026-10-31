@@ -36,23 +36,77 @@ Layer: L3 (application). Imports from L0 (``contracts/freeze``,
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
-from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMProviderCostSource
+from elspeth.contracts.composer_mutation import ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationCancelledDuringTurn,
+    ComposerOperationFenceLost,
+    ComposerTurnDeadlineExpired,
+)
+
+if TYPE_CHECKING:
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+    from elspeth.contracts.composer_progress import ComposerProgressSink
+    from elspeth.contracts.session_operation import SessionOperationContext
+    from elspeth.web.catalog.policy_view import PolicyCatalogView
+    from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord
+    from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+    from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
+    from elspeth.web.composer.continuation_caches import ContinuationCachesSnapshot
+    from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload, RuntimePreflightCache
+    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+    from elspeth.web.composer.service import _ComposeLoopDiagnostics
+    from elspeth.web.composer.turn_effects import TurnEvidence
+    from elspeth.web.execution.completion_gates import CompletionGateFacts
+    from elspeth.web.execution.schemas import ValidationResult
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.required_work import RequiredWorkBinding
+
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
+
+# Concrete first-party failures retain their native operation classification.
+# Plain TimeoutError and implementation RuntimeError/ValueError are distinct.
+_ServiceFailure = (
+    SQLAlchemyError
+    | AsyncWorkerAdmissionTimeoutError
+    | RequiredGenerationUnavailable
+    | SessionOperationFenceLost
+    | ComposerOperationFenceLost
+    | ComposerOperationCancelledDuringTurn
+    | ComposerTurnDeadlineExpired
+)
+
+
+class _ServiceHandlerFailure(Exception):
+    """Private proof of the actual session-handler throw, never portable DATA."""
+
+    def __init__(self, original: _ServiceFailure, *, audit: DispatchAudit, tool_call_id: str) -> None:
+        if not isinstance(original, _ServiceFailure):
+            raise TypeError("service handler marker requires its closed native failure family")
+        super().__init__("Registered session handler raised a service failure")
+        self.original = original
+        self.audit = audit
+        self.tool_call_id = tool_call_id
 
 
 class _ToolBatchCancellationRequested(Exception):
@@ -246,13 +300,16 @@ class _ToolOutcome:
 class _CallModelOutcome:
     """Result of one LLM call in the compose loop (Phase P1).
 
-    The sole field is the frozen completion admitted before the provider
-    object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
-    its already-admitted tool batch and provider metadata, and P5's B-4D-3
+    The completion is frozen before the provider object leaves the Tier-3
+    boundary. Explicit primary custody also carries the original physical
+    audit object created and recorded by the gateway, after settlement.
+    P2 reads its owned message, P3 consumes its already-admitted tool batch
+    and provider metadata, and P5's B-4D-3
     last-chance path consumes the same carrier directly.
     """
 
     completion: _AdmittedLLMCompletion
+    audit_call: ComposerLLMCall | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +410,9 @@ class _DispatchOutcome:
 
     # State identity at the start of this dispatch turn.
     pre_state_id: str | None
+    authority_revocation: ComposerMutationRevocation | None = None
+    # Native only. A failed continuation cut must refuse this original.
+    service_failure: _ServiceFailure | None = None
 
     def __post_init__(self) -> None:
         # decoded_args_by_call_id is dict[str, dict[str, Any]] at
@@ -397,6 +457,7 @@ class _PersistOutcome:
     # The commit metadata remains authoritative if pure effect verification
     # fails afterward. The driver records it before propagating this failure.
     effect_verification_failure: AuditIntegrityError | None
+    authority_revocation: ComposerMutationRevocation | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "redacted_assistant_tool_calls", "redacted_tool_rows")
@@ -457,3 +518,58 @@ class _ClassifyOutcome:
     # mirroring the P2 ``_TerminateOutcome.repair_turns_delta`` field.
     repair_turns_delta: int = 0  # 0 or 1
     publication_binding: str | None = None
+
+
+@dataclass(slots=True)
+class _ComposeIterationState:
+    state: CompositionState
+    initial_version: int
+    llm_messages: list[dict[str, Any]]
+    tools: list[dict[str, Any]]
+    recorder: BufferingRecorder
+    composition_turns_used: int
+    discovery_turns_used: int
+    mutation_success_seen: bool
+    discovery_cache: dict[str, CachedDiscoveryPayload]
+    last_validation: ValidationSummary | None
+    runtime_preflight_cache: RuntimePreflightCache
+    last_runtime_preflight: ValidationResult | None
+    anti_anchor: AntiAnchorTracker
+    advisor_calls_used: int
+    repair_turns_used: int
+    advisor_checkpoint_passes_used: int
+    advisor_review_state: _AdvisorReviewState
+    persisted_assistant_message_id: str | None
+    persisted_assistant_content: str | None
+    persisted_tool_call_turn: bool
+    failed_turn: FailedTurnMetadata | None
+    current_state_id: str | None
+    advisor_repair_context_introduced: bool
+    pending_advisor_elision_indices: list[int]
+    turn_evidence: TurnEvidence
+    continuation_cache_history: ContinuationCachesSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ComposeIterationBindings:
+    message: str
+    session_id: str | None
+    user_id: str | None
+    user_message_id: str | None
+    deadline: float
+    progress: ComposerProgressSink | None
+    plugin_snapshot: PluginAvailabilitySnapshot
+    policy_catalog: PolicyCatalogView
+    mutation_ceiling: ComposerMutationCeiling | None
+    session_operation_context: SessionOperationContext | None
+    completion_gates: CompletionGateFacts | None
+    diagnostics: _ComposeLoopDiagnostics | None
+    required_work: RequiredWorkBinding | None
+    provider_owner: ProviderInvocationOwner | None
+    ingress: CompositionIngressRecord | None
+    chat_ingress_inputs: Sequence[ChatIngressInput] | None
+    actor: str
+    session_scope: str
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "chat_ingress_inputs")

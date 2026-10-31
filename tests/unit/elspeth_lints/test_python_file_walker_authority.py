@@ -15,6 +15,7 @@ Nine walkers once solved worktree-blindness with four different idioms
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -42,6 +43,7 @@ LEAK_FILES: tuple[Path, ...] = (
     Path(".claude/worktrees/wt/src/elspeth/LEAK.py"),
     Path(".worktrees/y/src/elspeth/dotwt.py"),
     Path(".venv/lib/v.py"),
+    Path(".hypothesis/constants/ignored.py"),
     Path("node_modules/x/n.py"),
 )
 
@@ -79,6 +81,21 @@ WALKERS: dict[str, Callable[[Path], Iterable[Path]]] = {
 
 @pytest.fixture
 def synthetic_tree(tmp_path: Path) -> Path:
+    # A project-local basetemp may itself be ignored by the parent checkout.
+    # Own the fixture's Git context so tree_gate tests these files rather than
+    # inheriting that unrelated ignore decision. Keep dependency exclusions in
+    # the walkers: an empty local excludes file must not hide any LEAK_FILE.
+    subprocess.run(["git", "init", "--quiet", "--template="], cwd=tmp_path, check=True, capture_output=True, text=True)
+    excludes = tmp_path / ".git" / "info" / "exclude"
+    excludes.parent.mkdir(parents=True, exist_ok=True)
+    excludes.write_text("", encoding="utf-8")
+    subprocess.run(
+        ["git", "config", "--local", "core.excludesFile", str(excludes)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     for relative in (REAL_FILE, *LEAK_FILES):
         target = tmp_path / relative
         target.parent.mkdir(parents=True)
@@ -119,7 +136,19 @@ _PINNED_FILES: tuple[Path, ...] = ()
 # ``tests/conftest.py`` fingerprints EVERY directory entry (lstat of each
 # name, sorted) to detect stray writes into ``.elspeth/`` — pruning anything
 # from it would defeat its purpose.
-_NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset({REPO_ROOT / "tests" / "conftest.py"})
+# Artifact authentication must inventory every file, including dependency and
+# hidden directories. Snapshot permission/cleanup walks likewise visit every
+# directory. Applying source-discovery exclusions to these would hide injected
+# artifacts or leave worker evidence permissions/cleanup incomplete.
+_NOT_PYTHON_FILE_WALKS: frozenset[Path] = frozenset(
+    {
+        REPO_ROOT / "tests" / "conftest.py",
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/operator_runtime.py",
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/judge_supervisor.py",
+        # Maintenance snapshot cleanup chmods all directories, not Python files.
+        REPO_ROOT / "elspeth-lints/src/elspeth_lints/core/baseline_supervisor.py",
+    }
+)
 
 
 def test_no_private_python_file_walk_outside_the_authority() -> None:

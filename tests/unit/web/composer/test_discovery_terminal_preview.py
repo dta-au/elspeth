@@ -198,7 +198,7 @@ async def test_preview_keeps_authoring_available_until_the_real_deadline(monkeyp
         return await _clean_advisor_checkpoint(*args, **kwargs)
 
     monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", advisor)
-    before_deadline = service._call_llm_before_deadline
+    before_deadline = service._call_llm_outcome_before_deadline
 
     async def expire_final_reply(*args: Any, **kwargs: Any) -> Any:
         if len(advertised_tools) == 1:
@@ -206,7 +206,7 @@ async def test_preview_keeps_authoring_available_until_the_real_deadline(monkeyp
         return await before_deadline(*args, **kwargs)
 
     if final_kind == "expired":
-        monkeypatch.setattr(service, "_call_llm_before_deadline", expire_final_reply)
+        monkeypatch.setattr(service, "_call_llm_outcome_before_deadline", expire_final_reply)
 
     user_message = "Preview the current pipeline and explain the result."
     if final_kind == "tools":

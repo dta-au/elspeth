@@ -44,12 +44,13 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     token_usage_ledger_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, RunDiagnosticsAuditAuthority, RunDiagnosticsAuditDraft
+from elspeth.web.sessions.protocol import RunDiagnosticsAuditAuthority, RunDiagnosticsAuditDraft
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.auto_title import RecordingTitleService, call_auto_title
+from tests.helpers.composition_state import composition_state_data
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.coordination.test_durable_run_admission import _admission
@@ -395,7 +396,7 @@ async def test_composer_charges_completion_day_across_midnight_not_settlement_da
 @pytest.mark.asyncio
 async def test_diagnostics_ledger_failure_rolls_back_audit_and_accounting(harness, engine, monkeypatch) -> None:
     session = await harness.create_session("alice", "Pipeline", "local")
-    state = await harness.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    state = await harness.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
     run = await harness.create_run(session.id, state.id)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
     with engine.connect() as conn:
@@ -424,7 +425,7 @@ async def test_diagnostics_ledger_failure_rolls_back_audit_and_accounting(harnes
 @pytest.mark.asyncio
 async def test_run_diagnostics_cohort_charges_its_llm_rows(harness: FencedSessionServiceHarness, engine: Engine) -> None:
     session = await harness.create_session("alice", "Pipeline", "local")
-    state = await harness.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    state = await harness.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
     run = await harness.create_run(session.id, state.id)
     authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
     await harness.add_run_diagnostics_audit_messages_atomic(

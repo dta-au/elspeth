@@ -359,7 +359,7 @@ def receiver_transfer_prefix(statements):
     The deferred settlement body is a separate captured-function effect premise.
     """
     nodes = [n for n in statements if not isinstance(n, ast.Pass)]
-    if len(nodes) != 16:
+    if len(nodes) != 19:
         return False
     imp, deferred = nodes[:2]
     history = nodes[2:11]
@@ -391,7 +391,23 @@ def receiver_transfer_prefix(statements):
         expected_history, include_attributes=False
     ):
         return False
-    error, settled, budget, state, guard = nodes[11:]
+    capture = ast.parse(
+        "provider_owner.bind_cost_budget(capture_common_provider_cost(\n"
+        "    session_id=str(session.id), request_id=str(turn_user_message_id), lifecycle_version=1,\n"
+        "    initially_empty=state is not None and state_is_structurally_empty(state), settings=settings))"
+    ).body[0]
+    if ast.dump(nodes[11], include_attributes=False) != ast.dump(capture, include_attributes=False):
+        return False
+    mutation_capture = ast.parse(
+        "initial_preferences = await service.get_composer_preferences(turn.session_id)\n"
+        "mutation_ceiling = ComposerMutationCeiling("
+        "str(turn.session_id), str(turn_user_message_id), initial_preferences.trust_mode)\n"
+    )
+    if ast.dump(ast.Module(body=nodes[12:14], type_ignores=[]), include_attributes=False) != ast.dump(
+        mutation_capture, include_attributes=False
+    ):
+        return False
+    error, settled, budget, state, guard = nodes[14:]
     if not (
         isinstance(imp, ast.ImportFrom)
         and imp.module == "openai"
@@ -612,6 +628,7 @@ def composer_title_prelude(invoke):
         "                seed=settings.composer_seed, session_operation_context=lease.context,\n"
         "                prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,\n"
         "                prompt_guard_mode=settings.composer_prompt_guard_mode,\n"
+        "                max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,\n"
         "                api_base=settings.composer_endpoint_base_url,\n"
         "                api_key=(settings.composer_endpoint_api_key.get_secret_value()\n"
         "                    if settings.composer_endpoint_api_key is not None else None),\n"
@@ -645,10 +662,12 @@ def composer_title_prelude(invoke):
         "_BadRequestLLMError",
         "ComposerPluginCrashError",
         "ComposerRuntimePreflightError",
-        "PipelinePlannerError",
+        "(PipelinePlannerError, CommonProviderCostRefused)",
         "ChargeableAdmissionRefused",
         "PromptGuardRefused",
+        "ComposerContextUnsupported",
         "ComposerAdmissionRefused",
+        "ComposerMutationAuthorityRevoked",
         "ComposerServiceError",
     ]:
         return None
@@ -676,6 +695,51 @@ def composer_title_prelude(invoke):
     )
     if ast.dump(invoke.handlers[9], include_attributes=False) != ast.dump(expected_refusal, include_attributes=False):
         return None
+    expected_context_refusal = (
+        ast.parse(
+            "try:\n"
+            "    pass\n"
+            "except ComposerContextUnsupported as exc:\n"
+            "    llm_calls = exc.llm_calls\n"
+            "    observation.pending_exception_llm_calls = llm_calls\n"
+            "    observation.pending_exception_tool_invocations = exc.tool_invocations\n"
+            "    if llm_calls or exc.tool_invocations:\n"
+            "        await _required_audit(observation, _persist_turn_audit_cohort(\n"
+            "            service, session.id, exc.tool_invocations, llm_calls,\n"
+            "            tool_composition_state_id=compose_base_state_id,\n"
+            "            llm_composition_state_id=compose_base_state_id, plugin_crash_pending=True,\n"
+            "            session_operation_context=lease.context, required_audit=True,\n"
+            "            required_work=observation.required_work))\n"
+            "        observation.audit_cohort_durable = True\n"
+            "    await _publish_progress(progress_sink, event=ComposerProgressEvent(\n"
+            "        phase='failed', headline=\"The model cannot review this request's complete context.\",\n"
+            "        evidence=(exc.to_payload()['detail'],),\n"
+            "        likely_next='Review the pipeline and request size before sending again.',\n"
+            "        reason='context_unsupported'))\n"
+            "    raise HTTPException(status_code=exc.http_status, detail=exc.to_payload()) from exc\n"
+        )
+        .body[0]
+        .handlers[0]
+    )
+    if ast.dump(invoke.handlers[10], include_attributes=False) != ast.dump(expected_context_refusal, include_attributes=False):
+        return None
+    expected_revocation = (
+        ast.parse(
+            "try:\n"
+            "    pass\n"
+            "except ComposerMutationAuthorityRevoked as exc:\n"
+            "    observation.pending_exception_llm_calls = _llm_calls_from_exception(exc)\n"
+            "    await _publish_progress(progress_sink, event=ComposerProgressEvent(\n"
+            "        phase='failed', headline='Automatic mutation authority was revoked.',\n"
+            "        evidence=(str(exc),), likely_next='Review the saved session before retrying.',\n"
+            "        reason='mutation_authority_revoked'))\n"
+            "    raise HTTPException(status_code=409, detail=exc.to_payload()) from exc\n"
+        )
+        .body[0]
+        .handlers[0]
+    )
+    if ast.dump(invoke.handlers[12], include_attributes=False) != ast.dump(expected_revocation, include_attributes=False):
+        return None
     return invoke.body[0]
 
 
@@ -695,6 +759,26 @@ def composer_dispatch_calls(invoke):
         != "if state is None:\n    raise AuditIntegrityError('Ordinary Composer admission lacks its graph')"
     ):
         return None
+    expected_calls = {
+        "compose": ast.parse(
+            "composer.compose(message_text, chat_messages, state, session_id=str(turn.session_id), "
+            "current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None, "
+            "user_id=turn.actor_user_id, progress='<unproved advisory effect>', session_operation_context=lease.context, "
+            "user_message_id=str(turn_user_message_id), mutation_ceiling=mutation_ceiling, "
+            "completion_gates=prior_completion_gates_facts, budget_seconds=compose_budget_seconds, "
+            "required_work=provider_binding, provider_owner=provider_owner, recovery_context=recovery_context, "
+            "retained_operation_context=retained_operation_context, "
+            "advisor_history=AdvisorTranscriptHistory.from_records(session_id=str(turn.session_id), "
+            "actor_user_id=turn.actor_user_id, current_request_id=str(turn_user_message_id), request=message_text, records=records))",
+            mode="eval",
+        ).body,
+        "compose_recovery": ast.parse(
+            "composer.compose_recovery(message=message_text, recovery_context=recovery_context, "
+            "session_operation_context=lease.context, budget_seconds=compose_budget_seconds, "
+            "required_work=provider_binding, provider_owner=provider_owner)",
+            mode="eval",
+        ).body,
+    }
     calls = []
     for statement, method in ((branch.orelse[1], "compose"), (branch.body[0], "compose_recovery")):
         if (
@@ -715,7 +799,27 @@ def composer_dispatch_calls(invoke):
             values = [item.value for item in call.keywords if item.arg == keyword]
             if len(values) != 1 or ast.unparse(values[0]) != expected:
                 return None
+        ceilings = [item.value for item in call.keywords if item.arg == "mutation_ceiling"]
+        if method == "compose":
+            if len(ceilings) != 1 or ast.unparse(ceilings[0]) != "mutation_ceiling":
+                return None
+        elif ceilings:
+            return None
         if any(item.arg is None for item in call.keywords):
+            return None
+        # Preserve the existing unproved advisory-progress boundary; every
+        # other actual argument, default escape, order and keyword is closed.
+        candidate = ast.Call(
+            func=call.func,
+            args=call.args,
+            keywords=[
+                ast.keyword(arg=item.arg, value=ast.Constant(value="<unproved advisory effect>"))
+                if method == "compose" and item.arg == "progress"
+                else item
+                for item in call.keywords
+            ],
+        )
+        if ast.dump(candidate, include_attributes=False) != ast.dump(expected_calls[method], include_attributes=False):
             return None
         calls.append(call)
     return tuple(calls)
@@ -759,6 +863,9 @@ def composer_receiver_local_contracts(units):
         (DTO, "dataclass", "dataclasses", "dataclass"),
         (DTO, "final", "typing", "final"),
         (DTO, "ComposerService", "elspeth.web.composer.protocol", "ComposerService"),
+        (TURN, "capture_common_provider_cost", "elspeth.web.composer.provider_cost", "capture_common_provider_cost"),
+        (TURN, "CommonProviderCostRefused", "elspeth.web.composer.provider_cost", "CommonProviderCostRefused"),
+        (TURN, "state_is_structurally_empty", "elspeth.web.composer.no_tool_policy", "state_is_structurally_empty"),
     ):
         require(imported(trees[path], binding, module, member), path + ": canonical import producer " + binding)
     app = find(trees[APP], "_create_app")
@@ -1046,11 +1153,11 @@ def composer_receiver_local_contracts(units):
                 bi = next(i for i, n in enumerate(owner.body) if n is bindings[0])
                 ci = next(i for i, n in enumerate(owner.body) if n is invoke)
                 oi = next(i for i, n in enumerate(turn.body) if n is owner)
-                active_path = bi == 15 and ci == 21 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
-                # The exact import/deferred/history operations precede capture;
-                # only the five scalar/deadline statements follow it. Preserve
-                # all sixteen operation checks; the separately closed title
-                # prelude is the only admitted suspended interval afterwards.
+                active_path = bi == 18 and ci == 24 and not early_abrupt(owner.body[:ci]) and not early_abrupt(turn.body[:oi])
+                # The exact import/deferred/history/cost operations precede the
+                # initial preference read and original request ceiling. Only the
+                # five scalar/deadline statements follow receiver capture. The
+                # closed title prelude is the only suspended interval afterwards.
                 prefix = owner.body[4:bi] + owner.body[bi + 1 : ci]
                 active_path = active_path and receiver_transfer_prefix(prefix)
                 deferred = [n for n in prefix if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
@@ -1191,6 +1298,18 @@ def composer_receiver_local_contracts(units):
             "actual remaining_seconds receiver origin, field/descriptor effects and return producer",
         ),
         ("time.monotonic", "actual budget supplier call with no argument; callback/module stability"),
+        (
+            "elspeth.web.composer.provider_cost.capture_common_provider_cost",
+            "exact original session/message/lifecycle/applicability capture; supplier and returned budget effects remain unknown",
+        ),
+        (
+            "elspeth.web.composer.provider_quota.ProviderInvocationOwner.bind_cost_budget",
+            "actual retained provider owner and nominal budget identity; receiver/member/callback effects remain unknown",
+        ),
+        (
+            "elspeth.web.composer.no_tool_policy.state_is_structurally_empty",
+            "actual original state eligibility predicate; source origin and outside effects remain unknown",
+        ),
         ("openai.OpenAIError", "actual definition import before dispatch; module/loader effects"),
         (
             "PROVIDER_TEST_SEAMS",

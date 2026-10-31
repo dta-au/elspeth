@@ -290,7 +290,7 @@ class DataverseSource(BaseSource):
     _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a993a9a403c9b3b8"
+    source_file_hash: str | None = "sha256:b34fbb2338e3e362"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -1041,11 +1041,29 @@ class DataverseSource(BaseSource):
                     # inferred fields. Pydantic extra="allow" accepts any type
                     # for extras — the contract enforces inferred types here.
                     contract = self._contract_builder.contract if self._contract_builder is not None else self.require_schema_contract()
+                    if contract.locked:
+                        violations = contract.validate(validated_row)
+                        if violations:
+                            error_msg = "; ".join(str(v) for v in violations)
+                            ctx.record_validation_error(
+                                row=validated_row,
+                                error=error_msg,
+                                schema_mode=self._schema_config.mode,
+                                destination=self._on_validation_failure,
+                            )
+                            self._quarantine_count += 1
+                            if self._on_validation_failure != "discard":
+                                yield SourceRow.quarantined(
+                                    row=validated_row,
+                                    error=error_msg,
+                                    destination=self._on_validation_failure,
+                                    source_row_index=current_source_row_index,
+                                )
+                            continue
+
+                    # Reject type drift before granting this row schema or
+                    # naming authority, including across page boundaries.
                     if self._contract_builder is not None and contract.mode in ("OBSERVED", "FLEXIBLE"):
-                        # Dataverse rows can be sparse across pages/FetchXML
-                        # result sets. If a later row emits a new attribute,
-                        # its SourceRow contract must carry the audit/header
-                        # metadata before validation and yield.
                         try:
                             contract = self._contract_builder.process_sparse_fields(
                                 validated_row,
@@ -1068,28 +1086,7 @@ class DataverseSource(BaseSource):
                                 )
                             continue
                         self.set_schema_contract(contract)
-
                     self._field_resolution = prospective_resolution
-                    if contract.locked:
-                        violations = contract.validate(validated_row)
-                        if violations:
-                            error_msg = "; ".join(str(v) for v in violations)
-                            ctx.record_validation_error(
-                                row=validated_row,
-                                error=error_msg,
-                                schema_mode=self._schema_config.mode,
-                                destination=self._on_validation_failure,
-                            )
-                            self._quarantine_count += 1
-                            if self._on_validation_failure != "discard":
-                                yield SourceRow.quarantined(
-                                    row=validated_row,
-                                    error=error_msg,
-                                    destination=self._on_validation_failure,
-                                    source_row_index=current_source_row_index,
-                                )
-                            continue
-
                     self._rows_yielded += 1
                     yield SourceRow.valid(validated_row, contract=contract, source_row_index=current_source_row_index)
 

@@ -14,7 +14,7 @@ the web app and its Jobs.
 > `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
 > acceptance is claimed. This is an executable operator procedure; steps marked
 > **LIVE** require measurements during execution. A future acceptance receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.9.json` is no longer a tracker
+> `docs/operator/evidence/azure-container-apps/0.8.10.json` is no longer a tracker
 > closure or documentation-promotion condition.
 
 > **Temporary deployment policy:** only fresh/new stores are supported until
@@ -90,7 +90,7 @@ A successful install has:
   `/api/health` and `/api/ready`;
 - both databases (`elspeth_sessions`, `elspeth_landscape`) on one Flexible
   Server behind a private endpoint, one schema-owner role and one runtime role,
-  session epoch 78 and Landscape epoch 50 initialized;
+  session epoch 79 and Landscape epoch 50 initialized;
 - one NFS 4.1 Azure Files share mounted at `/mnt/elspeth` on the app and every
   Job with `data`, `data/blobs` and `payloads` owned `1654:1654`. SMB Azure
   Files is not supported for this target; **Azure Files carries no database**

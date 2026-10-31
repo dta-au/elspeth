@@ -20,6 +20,7 @@ from elspeth.web.coordination.review_authority import RepositoryReviewAuthority,
 from elspeth.web.sessions.models import composition_states_table, identities_table, identity_relationships_table, identity_roles_table
 from elspeth.web.sessions.routes.workflow.mailbox import create_mailbox_router, decision_is_unseen
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.unit.web.conftest import _make_session
 
 _BINDING = ApprovalBinding(
@@ -84,6 +85,7 @@ def _request(client: TestClient, *, addressed_to: str) -> tuple[str, str, str]:
         _make_session(conn, session_id=session_id, user_id="alice", created_at=now, updated_at=now)
         conn.execute(
             insert(composition_states_table).values(
+                metadata_=stored_default_pipeline_metadata(),
                 id=state_id,
                 session_id=session_id,
                 version=1,

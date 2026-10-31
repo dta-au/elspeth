@@ -9,11 +9,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from uuid import UUID
 
 from openai import OpenAIError
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
+from elspeth.contracts.composer_content import ComposerContentScope
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
@@ -22,10 +24,11 @@ from elspeth.contracts.prompt_guard import (
     PROMPT_GUARD_CONTENT_PARTS_KEY,
     PROMPT_GUARD_TRUST_KEY,
     PromptGuardTrust,
-    detach_prompt_guard_evidence,
 )
 from elspeth.contracts.provider_rejection import SafeRequestRejection
+from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer import provider_gateway
@@ -38,6 +41,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorFirstPartyFailure,
     _AdvisorProviderFailure,
     _AdvisorReviewState,
+    _ServiceFailure,
 )
 from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentContextUnavailable, AdvisorAbandonmentReview
 from elspeth.web.composer.advisor_audit import (
@@ -50,6 +54,7 @@ from elspeth.web.composer.advisor_audit import (
 from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointPhase, AdvisorCheckpointVerdictSource
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorSignoffGateFact
+from elspeth.web.composer.advisor_invocation_outcome import _AdvisorInvocationCapture
 from elspeth.web.composer.advisor_output import (
     AdvisorEndResponse,
     parse_advisor_abandonment_response,
@@ -60,6 +65,7 @@ from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner, AdvisorVisibleTranscript
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.content_scope import composition_scope_for_operation
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     attach_llm_calls,
@@ -86,10 +92,19 @@ from elspeth.web.composer.no_tool_policy import (
     state_is_structurally_empty,
 )
 from elspeth.web.composer.pipeline_planner import PlannerContinuationBudget, PlannerContinuationUnavailable
+from elspeth.web.composer.prepared_provider_input import prepare_provider_input
 from elspeth.web.composer.progress import advisor_checkpoint_progress_event, emit_progress
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, build_prompt_guard_mount
-from elspeth.web.composer.protocol import ComposerResult, ComposerSettings, ToolArgumentError
+from elspeth.web.composer.prompts import build_composition_content_view
+from elspeth.web.composer.protocol import (
+    ComposerAdmissionRefused,
+    ComposerContextUnsupported,
+    ComposerResult,
+    ComposerSettings,
+    ToolArgumentError,
+)
 from elspeth.web.composer.provider_context import capture_provider_context
+from elspeth.web.composer.provider_cost import CommonProviderCostRefused
 from elspeth.web.composer.provider_errors import ProviderRequestFailure, classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
@@ -116,6 +131,7 @@ from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation
     from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 _ADVISOR_RECENT_ERRORS_MAX_ITEMS: Final[int] = 5
@@ -242,6 +258,7 @@ class AdvisorCheckpointOwner:
         sessions_service: SessionServiceProtocol | None,
         chargeable_admission: ComposerChargeableAdmission,
         prompt_guard_mount: PromptGuardMount | None = None,
+        secret_service: WebSecretResolver | None = None,
     ) -> None:
         self._settings = settings
         self._composer_skill_text = composer_skill_text
@@ -249,6 +266,7 @@ class AdvisorCheckpointOwner:
         self._advisor_endpoint_api_key = advisor_endpoint_api_key
         self._sessions_service = sessions_service
         self._chargeable_admission = chargeable_admission
+        self._secret_service = secret_service
         self._prompt_guard_mount = (
             prompt_guard_mount if prompt_guard_mount is not None else build_prompt_guard_mount(settings.composer_advisor_prompt_guard)
         )
@@ -257,6 +275,13 @@ class AdvisorCheckpointOwner:
         if self._sessions_service is None:
             raise RuntimeError("sessions_service not wired")
         return self._sessions_service
+
+    async def _current_env_ref_names(self, session_id: str) -> frozenset[str]:
+        """List names for the already-fenced session owner, never secret values."""
+        if self._secret_service is None:
+            return frozenset()
+        session = await self._require_sessions_service().get_session(UUID(session_id))
+        return frozenset(item.name for item in self._secret_service.list_refs(session.user_id))
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.
@@ -319,6 +344,10 @@ class AdvisorCheckpointOwner:
         abandonment_context: AdvisorAbandonmentReview | None = None,
         advisor_transcript: AdvisorVisibleTranscript | None = None,
         current_state: CompositionState | None = None,
+        session_id: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        on_provider_dispatch: Callable[[], None] | None = None,
+        failure_observation: ContinuationDispatchFailureObservation | None = None,
     ) -> _AdvisorCallOutcome:
         """Classify an advisor call without suppressing controlled-code faults.
 
@@ -350,11 +379,22 @@ class AdvisorCheckpointOwner:
             if current_state is not None:
                 if type(current_state) is not CompositionState:
                     raise TypeError("Advisor hint graph must be the owned current state")
+                if session_id is None or session_operation_context is None:
+                    raise AuditIntegrityError("Advisor graph requires current session authority")
+                content_scope = composition_scope_for_operation(
+                    current_state,
+                    session_id=session_id,
+                    session_operation_context=session_operation_context,
+                    session_operation_authority=self._require_sessions_service().session_operation_authority,
+                )
                 summary = _advisor_context.fit_advisor_checkpoint_summary(
                     current_state,
                     internal_request,
                     self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN,
+                    content_scope=content_scope,
+                    env_ref_names=await self._current_env_ref_names(session_id),
                 )
+                self._require_complete_graph_summary(summary)
                 internal_request["schema_excerpt"] = "".join(part.text for part in summary.values)
                 internal_request["_elspeth_advisor_summary_parts"] = summary
             guidance, metadata = await self._call_advisor_with_audit(
@@ -363,7 +403,13 @@ class AdvisorCheckpointOwner:
                 timeout=timeout,
                 provider_owner=provider_owner,
                 structured_output=is_abandonment,
+                on_provider_dispatch=on_provider_dispatch,
+                failure_observation=failure_observation,
             )
+        except AsyncWorkerAdmissionTimeoutError as exc:
+            if failure_observation is not None:
+                failure_observation.observe_execution_failure(exc)
+            return _AdvisorFirstPartyFailure(original_exc=exc)
         except TimeoutError:
             raise
         except AdvisorAbandonmentContextUnavailable as exc:
@@ -379,6 +425,8 @@ class AdvisorCheckpointOwner:
                 )
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except Exception as exc:
+            if isinstance(exc, _ServiceFailure) and failure_observation is not None:
+                failure_observation.observe_execution_failure(exc)
             return _AdvisorFirstPartyFailure(original_exc=exc)
         if is_abandonment:
             decision = parse_advisor_abandonment_response(guidance)
@@ -414,6 +462,8 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_custody: ProviderCallCustody | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        _outcome: _AdvisorInvocationCapture | None = None,
+        failure_observation: ContinuationDispatchFailureObservation | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Phone the configured advisor (frontier) model for a hint.
 
@@ -448,6 +498,9 @@ class AdvisorCheckpointOwner:
         max_completion = self._settings.composer_advisor_max_completion_tokens
         if continuation_budget is not None:
             max_completion = min(max_completion, continuation_budget.policy.max_completion_tokens)
+        cost_limit = provider_custody.cost_completion_limit() if provider_custody is not None else None
+        if cost_limit is not None:
+            max_completion = min(max_completion, cost_limit)
 
         trigger = cast(str, arguments["trigger"])
         trigger_instructions = "\n\n" + _advisor_context.advisor_system_instructions_for_trigger(trigger)
@@ -471,7 +524,7 @@ class AdvisorCheckpointOwner:
         user_msg = _advisor_context.build_advisor_user_message(arguments)
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         if checkpoint_phase is None and "advisor_transcript" not in arguments and len(user_msg) > char_cap:
-            raise InvariantError("Advisor input exceeded its admitted complete-message budget")
+            raise ComposerContextUnsupported("manual_advisor_allowance")
         # Checkpoint builders retain the complete required graph and fit only
         # optional additions. The public hint's allowance is not a graph cap.
 
@@ -501,6 +554,7 @@ class AdvisorCheckpointOwner:
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
+        failure_to_capture: Exception | None = None
         kwargs: dict[str, Any] = build_advisor_request_options(
             model=advisor_model,
             temperature=self._settings.composer_temperature,
@@ -513,13 +567,39 @@ class AdvisorCheckpointOwner:
             checkpoint_phase=checkpoint_phase,
             abandonment_review=abandonment_review,
         )
-        guard_evidence = detach_prompt_guard_evidence(messages)
+        advisor_content = tuple(
+            PreparedAdvisorContent(index, message["content"]) for index, message in enumerate(messages) if message["role"] == "user"
+        )
+        try:
+            prepared_input = prepare_provider_input(
+                messages=messages,
+                tools=kwargs["tools"] if "tools" in kwargs else None,
+                tools_present="tools" in kwargs,
+                model=advisor_model,
+                role="advisor",
+                mount=self._prompt_guard_mount,
+                mode=self._settings.composer_prompt_guard_mode,
+                user_prompt=None,
+                max_bytes=self._settings.composer_max_prepared_request_bytes,
+                advisor_content=advisor_content,
+            )
+        except (ComposerAdmissionRefused, AuditIntegrityError, TypeError, ValueError, RecursionError) as refused:
+            attach_llm_calls(refused, recorder)
+            raise
+        guard_evidence = prepared_input.evidence
         messages = guard_evidence.messages
         trusted_indexes = guard_evidence.trusted_message_indexes
         kwargs["messages"] = messages
-        private_request = capture_provider_context(messages=messages, tools=None)
+        if prepared_input.tools_present:
+            kwargs["tools"] = prepared_input.tools
+        private_request = capture_provider_context(messages=messages, tools=prepared_input.tools)
         if abandonment_review and private_request.disposition != "retained":
             raise AdvisorAbandonmentContextUnavailable("Abandonment evidence exceeds an existing safe-input boundary")
+        # Reserve only a successfully prepared attempt. A graph/allowance
+        # refusal above has no physical request and spends no continuation
+        # allowance. The physical dispatch callback retains deadline/cost checks.
+        if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
+            raise PlannerContinuationUnavailable("Advisor continuation has no existing preparation headroom")
         try:
             response = await asyncio.wait_for(
                 provider_gateway._litellm_acompletion(
@@ -528,13 +608,12 @@ class AdvisorCheckpointOwner:
                     prompt_guard_mount=self._prompt_guard_mount,
                     prompt_guard_mode=self._settings.composer_prompt_guard_mode,
                     prompt_guard_role="advisor",
+                    prompt_guard_user_prompt=prepared_input.genuine_user,
                     prompt_guard_trusted_message_indexes=trusted_indexes,
                     prompt_guard_content_parts=guard_evidence.content_parts,
-                    prepared_advisor_content=tuple(
-                        PreparedAdvisorContent(index, message["content"])
-                        for index, message in enumerate(messages)
-                        if message["role"] == "user"
-                    ),
+                    prepared_advisor_content=advisor_content,
+                    prepared_input=prepared_input,
+                    max_prepared_request_bytes=self._settings.composer_max_prepared_request_bytes,
                     **kwargs,
                 ),
                 timeout=effective_timeout,
@@ -582,6 +661,9 @@ class AdvisorCheckpointOwner:
                 provider_metadata=response_metadata,
                 surface="composer_advisor_response",
             )
+            if _outcome is not None:
+                _outcome.message = message
+                _outcome.provider_metadata = response_metadata
             guidance = raw_content
             status = ComposerLLMCallStatus.SUCCESS
             usage = token_usage_from_response(response)
@@ -592,8 +674,11 @@ class AdvisorCheckpointOwner:
                 "cached_prompt_tokens": usage.cached_prompt_tokens,
                 "latency_ms": (time.monotonic_ns() - started_ns) // 1_000_000,
             }
+            if _outcome is not None:
+                _outcome.guidance = guidance
+                _outcome.metadata = metadata
             return guidance, metadata
-        except PromptGuardRefused:
+        except (PromptGuardRefused, ComposerContextUnsupported):
             raise
         except TimeoutError:
             status = ComposerLLMCallStatus.TIMEOUT
@@ -606,6 +691,7 @@ class AdvisorCheckpointOwner:
             error_message = type(exc).__name__
             raise
         except OpenAIError as exc:
+            failure_to_capture = exc
             failure = classify_provider_failure(exc)
             status = failure.audit_status if failure is not None else ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -640,14 +726,20 @@ class AdvisorCheckpointOwner:
             error_message = type(exc).__name__
             raise
         finally:
+            if failure_observation is not None:
+                origin = sys.exc_info()[1]
+                if origin is not None:
+                    failure_observation.observe_primary(origin)
             with required_provider_audit_scope(provider_custody):
                 if status is not None and (recorder is not None or provider_custody is not None):
                     if provider_custody is None or provider_custody.needs_terminal_audit():
+                        if _outcome is not None and provider_custody is not None:
+                            _outcome.attempt = provider_custody.attempt
                         call = build_llm_call_record(
                             model_requested=advisor_model,
                             pricing_model=self._settings.composer_advisor_pricing_model,
                             messages=messages,
-                            tools=None,
+                            tools=prepared_input.tools,
                             status=status,
                             started_at=started_at,
                             started_ns=started_ns,
@@ -655,20 +747,29 @@ class AdvisorCheckpointOwner:
                             seed=self._settings.composer_seed,
                             response=response,
                             response_metadata=response_metadata,
+                            max_completion_tokens_requested=max_completion,
                             error_class=error_class,
                             error_message=error_message,
                             credential_surface="composer_advisor_response",
                             provider_custody=provider_custody,
+                            failure=failure_to_capture,
                             private_request=private_request,
                         )
+                        if _outcome is not None:
+                            _outcome.audit_call = call
                         if provider_custody is not None:
+                            provider_custody.mark_cost_response_accountable(admitted_metadata=response_metadata is not None)
                             provider_custody.retain_audit(call)
                         if recorder is not None:
                             recorder.record_llm_call(call, provider_custody=provider_custody)
+                            if _outcome is not None:
+                                _outcome.recorder_completed = True
                         if continuation_budget is not None:
                             continuation_budget.consume_call(
                                 call, retained=recorder is not None and any(retained is call for retained in recorder.llm_calls)
                             )
+                            if _outcome is not None:
+                                _outcome.continuation_budget_completed = True
                     current_exc = sys.exc_info()[1]
                     if current_exc is not None:
                         attach_llm_calls(current_exc, recorder)
@@ -708,8 +809,16 @@ class AdvisorCheckpointOwner:
         on_provider_dispatch: Callable[[], None] | None = None,
         provider_owner: ProviderInvocationOwner | None = None,
         continuation_budget: PlannerContinuationBudget | None = None,
+        _outcome: _AdvisorInvocationCapture | None = None,
+        failure_observation: ContinuationDispatchFailureObservation | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        if _outcome is not None:
+            if type(_outcome) is not _AdvisorInvocationCapture or _outcome.claimed or provider_owner is None:
+                raise AuditIntegrityError("Advisor observation requires one fresh explicitly owned invocation")
+            _outcome.claimed = True
         if provider_owner is None:
+            if failure_observation is not None:
+                raise AuditIntegrityError("V2 Advisor failure observation lacks its actual provider owner")
             return await self._call_advisor_with_audit_legacy(
                 arguments,
                 recorder=recorder,
@@ -719,6 +828,39 @@ class AdvisorCheckpointOwner:
                 continuation_budget=continuation_budget,
             )
         provider_custody = self._new_advisor_custody(provider_owner)
+        if failure_observation is not None:
+            if recorder is not failure_observation.owner.recorder or failure_observation.provider_custody is not None:
+                raise AuditIntegrityError("Advisor failure observation changed its actual invocation owners")
+            failure_observation.provider_custody = provider_custody
+            try:
+                async with provider_call_scope(provider_custody):
+                    try:
+                        return await self._call_advisor_with_audit_body(
+                            arguments,
+                            recorder=recorder,
+                            timeout=timeout,
+                            structured_output=structured_output,
+                            on_provider_dispatch=on_provider_dispatch,
+                            provider_custody=provider_custody,
+                            continuation_budget=continuation_budget,
+                            _outcome=_outcome,
+                            failure_observation=failure_observation,
+                        )
+                    except BaseException as original:
+                        # Includes preparation before the body's audit finally.
+                        failure_observation.observe_primary(original)
+                        raise
+            except BaseException as error:
+                if failure_observation.owner.original is None:
+                    # A scope-exit-only cost refusal is its actual origin.
+                    failure_observation.observe_primary(error)
+                    raise
+                if failure_observation.owner.original is error:
+                    raise
+                combined = failure_observation.owner.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
         async with provider_call_scope(provider_custody):
             return await self._call_advisor_with_audit_body(
                 arguments,
@@ -728,6 +870,7 @@ class AdvisorCheckpointOwner:
                 on_provider_dispatch=on_provider_dispatch,
                 provider_custody=provider_custody,
                 continuation_budget=continuation_budget,
+                _outcome=_outcome,
             )
 
     def _build_checkpoint_arguments(
@@ -735,6 +878,8 @@ class AdvisorCheckpointOwner:
         *,
         phase: AdvisorCheckpointPhase,
         state: CompositionState,
+        content_scope: ComposerContentScope,
+        env_ref_names: frozenset[str] = frozenset(),
         user_message: str | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         publication_review: AdvisorPublicationReview | None = None,
@@ -756,6 +901,10 @@ class AdvisorCheckpointOwner:
         request, so its separate fallback is omitted rather than duplicated.
         Required request text is not part of the optional graph-prose allowance.
         """
+        # Establish scope, credential and graph admission before descriptive
+        # template analysis can raise an ordinary unsupported-context signal.
+        # The complete review producer below revalidates these same sources.
+        build_composition_content_view(state, content_scope=content_scope, env_ref_names=env_ref_names)
         pipeline_summary = _advisor_context.summarize_pipeline_for_advisor(state)
         if publication_review is None and advisor_transcript is None and user_message is not None:
             advisor_transcript = AdvisorTranscriptOwner(request=user_message).snapshot()
@@ -776,7 +925,9 @@ class AdvisorCheckpointOwner:
             }
             if advisor_transcript is not None:
                 early_arguments["advisor_transcript"] = advisor_transcript
-            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, early_arguments, char_cap)
+            summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+                state, early_arguments, char_cap, content_scope=content_scope, env_ref_names=env_ref_names
+            )
             early_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
             early_arguments["_elspeth_advisor_summary_parts"] = summary_parts
             return early_arguments
@@ -851,10 +1002,24 @@ class AdvisorCheckpointOwner:
             end_arguments["advisor_transcript"] = advisor_transcript
         elif user_message is not None and user_message.strip():
             end_arguments["user_message"] = user_message
-        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, end_arguments, char_cap)
+        summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+            state, end_arguments, char_cap, content_scope=content_scope, env_ref_names=env_ref_names
+        )
         end_arguments["schema_excerpt"] = "".join(part.text for part in summary_parts.values)
         end_arguments["_elspeth_advisor_summary_parts"] = summary_parts
         return end_arguments
+
+    @staticmethod
+    def _require_complete_graph_summary(summary: _advisor_context.AdvisorSummaryParts) -> None:
+        if type(summary) is not _advisor_context.AdvisorSummaryParts or summary.content_manifest is None:
+            raise AuditIntegrityError("Advisor graph review lost its current content manifest")
+        # Corrupt nominal carriers remain integrity faults. Only a genuinely
+        # absent selected value in an otherwise valid summary is unsupported.
+        summary.__post_init__()
+        # Coverage, not presence, decides: every referenced value must be resolved
+        # into the review request. A nonempty manifest no longer suppresses review.
+        if tuple(value.reference for value in summary.complete_values) != summary.content_manifest.values:
+            raise ComposerContextUnsupported("graph_coverage_unavailable")
 
     def _advisor_blocked_result(
         self,
@@ -1322,28 +1487,31 @@ class AdvisorCheckpointOwner:
             )
             return verdict
 
-        def graph_coverage_withheld() -> AdvisorCheckpointVerdict:
-            # Size refusal is not a completed model review or an ADMIT binding.
-            return AdvisorCheckpointVerdict(
-                ok=False,
-                blocking=False,
-                findings_text="Complete required graph evidence could not be represented safely.",
-                failure_class="unavailable",
-                retryable=False,
-            )
-
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
         try:
+            if session_id is None or session_operation_context is None:
+                raise AuditIntegrityError("Advisor graph requires current session authority")
+            content_scope = composition_scope_for_operation(
+                state,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+                session_operation_authority=self._require_sessions_service().session_operation_authority,
+            )
             arguments = self._build_checkpoint_arguments(
                 phase=phase,
                 state=state,
+                content_scope=content_scope,
+                env_ref_names=await self._current_env_ref_names(session_id),
                 user_message=user_message,
                 advisor_review_state=advisor_review_state,
                 publication_review=publication_review,
                 advisor_transcript=advisor_transcript,
             )
-        except _advisor_context.AdvisorGraphCoverageUnavailable:
-            return graph_coverage_withheld()
+            self._require_complete_graph_summary(arguments["_elspeth_advisor_summary_parts"])
+        except ComposerContextUnsupported as exc:
+            raise exc.with_evidence(
+                state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
+            ) from exc
         char_cap = self._settings.composer_advisor_max_prompt_tokens * _advisor_context.ADVISOR_CHARS_PER_TOKEN
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
         provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
@@ -1363,21 +1531,35 @@ class AdvisorCheckpointOwner:
             provider_attempts += 1
             format_reprompt_sent = format_reprompt_sent or format_reprompt_pending
 
-        for _ in range(attempts):
-            if format_reprompt_pending:
-                # The format instruction can change rendered budget overhead.
-                # Refit the same complete saved graph, never a fitted prefix.
+        for attempt_index in range(attempts):
+            if attempt_index:
+                # Transport and format retries both resolve current complete
+                # evidence and permitted reference names afresh. A prior
+                # preparation supplies no authority for a later physical call.
                 try:
-                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(state, call_arguments, char_cap)
-                except _advisor_context.AdvisorGraphCoverageUnavailable:
-                    return graph_coverage_withheld()
+                    content_scope = composition_scope_for_operation(
+                        state,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        session_operation_authority=self._require_sessions_service().session_operation_authority,
+                    )
+                    summary_parts = _advisor_context.fit_advisor_checkpoint_summary(
+                        state,
+                        call_arguments,
+                        char_cap,
+                        content_scope=content_scope,
+                        env_ref_names=await self._current_env_ref_names(session_id),
+                    )
+                    self._require_complete_graph_summary(summary_parts)
+                except ComposerContextUnsupported as exc:
+                    raise exc.with_evidence(
+                        state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
+                    ) from exc
                 call_arguments = {
                     **call_arguments,
                     "schema_excerpt": "".join(part.text for part in summary_parts.values),
                     "_elspeth_advisor_summary_parts": summary_parts,
                 }
-            if continuation_budget is not None and not continuation_budget.reserve_attempt(now=_compose_deadline_time()):
-                return continuation_withheld()
             remaining: float | None = None
             if deadline is not None:
                 remaining = deadline - _compose_deadline_time()
@@ -1392,6 +1574,11 @@ class AdvisorCheckpointOwner:
                     if last_exc is None and not last_response_unparseable:
                         raise _AdvisorCheckpointComposeDeadlineExpired
                     break
+            if phase == "end" and provider_owner is not None and provider_owner.cost_budget is not None:
+                try:
+                    provider_owner.cost_budget.require_end_headroom()
+                except CommonProviderCostRefused:
+                    return continuation_withheld()
             attempt_call_offset = len(recorder.llm_calls) if recorder is not None else 0
             try:
                 if remaining is None:
@@ -1413,7 +1600,7 @@ class AdvisorCheckpointOwner:
                         provider_owner=provider_owner,
                         continuation_budget=continuation_budget,
                     )
-            except PromptGuardRefused as exc:
+            except (PromptGuardRefused, ComposerContextUnsupported) as exc:
                 raise exc.with_evidence(
                     state=state, initial_version=state.version, llm_calls=recorder.llm_calls if recorder is not None else ()
                 ) from exc

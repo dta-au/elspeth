@@ -24,6 +24,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -211,7 +212,7 @@ def _seed_run_and_blob(conn, *, session_id: UUID, run_id: UUID, blob_id: UUID) -
             nodes=None,
             edges=None,
             outputs=None,
-            metadata_=None,
+            metadata_=stored_default_pipeline_metadata(),
             is_valid=True,
             validation_errors=None,
             composer_meta=None,

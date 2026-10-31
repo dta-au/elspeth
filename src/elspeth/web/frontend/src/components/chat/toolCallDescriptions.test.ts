@@ -31,6 +31,7 @@ describe("read-only / mutating membership", () => {
     "get_plugin_schema",
     "get_plugin_assistance",
     "get_pipeline_state",
+    "get_complete_pipeline_value",
     "get_audit_info",
     "get_expression_grammar",
     "diff_pipeline",

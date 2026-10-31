@@ -17,6 +17,7 @@ from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer._compose_loop_carriers import _ServiceFailure, _ServiceHandlerFailure
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit, finish_arg_error, finish_success
 from elspeth.web.composer.discovery_cache import serialize_tool_result as _serialize_tool_result
@@ -37,6 +38,8 @@ from elspeth.web.composer.tools.declarations import EffectDomain
 from elspeth.web.execution.schemas import ValidationResult
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+    from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation
     from elspeth.web.sessions.protocol import SessionServiceProtocol
     from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
@@ -140,6 +143,8 @@ class SessionToolOwner:
         anti_anchor: AntiAnchorTracker,
         policy_catalog: PolicyCatalogView,
         review_preflight: ValidationResult | None = None,
+        failure_observation: ContinuationDispatchFailureObservation | None = None,
+        publication: ContinuationToolMessagePublication | None = None,
     ) -> _SessionAwareDispatchOutcome:
         """Dispatch a session-aware async composer tool.
 
@@ -179,6 +184,14 @@ class SessionToolOwner:
         Adding a new session-aware tool extends that dict; this dispatch
         method itself does not need to change shape.
         """
+        if failure_observation is not None:
+            failure_observation.require(recorder, audit)
+        if publication is not None:
+            from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+
+            if type(publication) is not ContinuationToolMessagePublication:
+                raise AuditIntegrityError("session publication requires its nominal issued owner")
+            publication.require_call(recorder=recorder, audit=audit, tool_name=tool_name, tool_call_id=tool_call_id, messages=llm_messages)
         if session_id is None:
             # Compose-loop invariant. ``composer_loop_tool_definitions`` filters
             # nothing: every compose turn advertises the session-aware
@@ -224,14 +237,15 @@ class SessionToolOwner:
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
             tool_feedback_json = json.dumps(arg_error_payload)
-            llm_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_feedback_json,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                }
-            )
+            message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": tool_feedback_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+            }
+            if publication is not None:
+                publication.register_feedback(serialized=tool_feedback_json, message=message)
+            llm_messages.append(message)
             return _SessionAwareDispatchOutcome(
                 result=None,
                 is_discovery=False,
@@ -272,8 +286,21 @@ class SessionToolOwner:
                     },
                 )
             else:
-                result = await handler(**kwargs)
+                try:
+                    result = await handler(**kwargs)
+                except ToolArgumentError:
+                    raise
+                except BaseException as error:
+                    if failure_observation is not None:
+                        failure_observation.observe_execution_failure(error)
+                    if isinstance(error, _ServiceFailure):
+                        # The batch consumes this private marker. Result/audit
+                        # failures below did not originate in this handler call.
+                        raise _ServiceHandlerFailure(error, audit=audit, tool_call_id=tool_call_id) from error
+                    raise
         except ToolArgumentError as exc:
+            if failure_observation is not None:
+                failure_observation.observe_feedback(exc)
             # Two sub-paths: rate-cap (write F-6 row + emit F-15 telemetry
             # BEFORE raising the LLM-facing ARG_ERROR) vs. generic
             # ARG_ERROR (no extra side effects, standard echo).
@@ -332,19 +359,22 @@ class SessionToolOwner:
             )
             anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
             tool_feedback_json = json.dumps(arg_error_payload)
-            llm_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": tool_feedback_json,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                }
-            )
+            message = {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": tool_feedback_json,
+                PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
+            }
+            if publication is not None:
+                publication.register_feedback(serialized=tool_feedback_json, message=message)
+            llm_messages.append(message)
             # Session-aware tools currently all carry composition-state
             # mutation intent (interpretation review stages a future
             # /resolve patch). Count toward composition turns regardless
             # of the SUCCESS/ARG_ERROR outcome, matching the sync
             # ARG_ERROR handling for mutation tools.
+            if failure_observation is not None:
+                failure_observation.owner.consume_nonprimary()
             return _SessionAwareDispatchOutcome(
                 result=None,
                 is_discovery=False,
@@ -354,6 +384,8 @@ class SessionToolOwner:
                 post_version=state.version,
             )
 
+        if failure_observation is not None:
+            failure_observation.observe_returned(result)
         result = normalize_tool_result_validation(result, policy_catalog)
 
         # SUCCESS path. The handler returned a clean ToolResult; record
@@ -361,13 +393,12 @@ class SessionToolOwner:
         # ``result_payload`` matches the sync path's ToolResult.to_dict()
         # so the audit table's ``result_canonical`` column is shape-
         # consistent across dispatch paths.
-        recorder.record(
-            finish_success(
-                audit,
-                result_payload=result.to_dict(),
-                version_after=result.updated_state.version,
+        if failure_observation is None:
+            recorder.record(finish_success(audit, result_payload=result.to_dict(), version_after=result.updated_state.version))
+        else:
+            recorder.record_with_failure_observation(
+                finish_success(audit, result_payload=result.to_dict(), version_after=result.updated_state.version), failure_observation
             )
-        )
         # Don't claim mutation success when the handler intentionally
         # returns state.version unchanged (interpretation_review_pending
         # stages a future /resolve patch; the version advances at
@@ -377,14 +408,15 @@ class SessionToolOwner:
         if result.updated_state.version > state.version:
             anti_anchor.record_success()
         tool_feedback_json = _serialize_tool_result(result)
-        llm_messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": tool_feedback_json,
-                PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(result, tool_feedback_json),
-            }
-        )
+        message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": tool_feedback_json,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(result, tool_feedback_json),
+        }
+        if publication is not None:
+            publication.register_result(result=result, serialized=tool_feedback_json, message=message)
+        llm_messages.append(message)
         return _SessionAwareDispatchOutcome(
             result=result,
             is_discovery=False,

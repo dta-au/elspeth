@@ -62,13 +62,14 @@ ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
-### Canonical scripts: worktree cleanup, branch safety, full-suite gate
+### Canonical scripts: worktree cleanup, branch safety, full-suite gate, work at risk
 
-Three scripts under `scripts/` are the canonical way to do the tasks agents
+Four scripts under `scripts/` are the canonical way to do the tasks agents
 otherwise improvise by hand (the header of each one cites the transcript
-measurement and the incident behind every rule it enforces). All three are
-**dry-run by default** and print the exact commands they would run; nothing
-changes without `--execute`. Prefer them over retyping the underlying git and
+measurement and the incident behind every rule it enforces). The three that
+can act are **dry-run by default** and print the exact commands they would
+run; nothing changes without `--execute`. `work-at-risk.sh` only reads.
+Prefer them over retyping the underlying git and
 pytest incantations, and fix the script when a rule is wrong rather than
 working around it.
 
@@ -95,13 +96,27 @@ working around it.
   base range, rerere, the HMAC key in the environment, and that
   `elspeth.__file__` resolves inside this tree. Exit 1 on any FAIL. `--fetch`
   is its only write.
-- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--root DIR] [--log-dir DIR]`
+- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--workers N] [--root DIR] [--log-dir DIR] [--run-timeout-seconds N]`
   runs the pre-merge gate as CI runs it: one log per stage, every exit code
   written to `summary.txt`, the tree state hashed before and after
   (`frozen=NO` means the run is not evidence), provenance proved with both
-  `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
-  suites are on the box. From an agent shell use `--execute --detach` and poll
-  the printed `.done` path. The suite is never piped through `tail`.
+  `-o pythonpath` and an exported `PYTHONPATH`. Omitted workers trigger automatic
+  host sibling discovery (12 workers, or 8 with matching siblings). Explicit
+  `--workers N`, including 0 for serial, bypasses discovery entirely and records
+  siblings as unobserved; establish capacity before choosing N. Public execution
+  supervises the foreground driver, including preflight. From an agent shell use
+  `--execute --detach --workers N` with the assigned capacity and poll
+  the printed `launcher.exit` path. Require zero launcher and actual
+  `supervisor.exit` statuses, `supervisor.json` cleanup complete, and a passing
+  driver with complete stage receipts and `summary.txt` frozen=yes before qualifying the
+  gate. `.done` is driver-only. The suite is never piped through `tail`.
+- `scripts/work-at-risk.sh [--count-all]` reports, for every registered
+  worktree, the hours since the oldest uncommitted or untracked file, the
+  hours since the last commit, the `src/elspeth` copies under gitignored paths
+  (which `git status` cannot see), and the size of `.claude/lanes/`. It WARNs
+  on uncommitted work older than 12 h, on any ignored source copy, and on
+  lanes over 10 GB, and shows DIRTY even when a tree is IN-USE. Exit 1 on any
+  WARN. Run it at session start and before any handover.
 
 ## Gotchas
 
@@ -200,8 +215,9 @@ working around it.
   to a false positive; do not bypass the hook with `--no-verify`.
 - Do not use `git stash` — use a worktree or a commit instead. This is a
   convention, not an enforced gate: nothing blocks it. (A `.git/hooks/pre-stash`
-  once claimed to, but git has no such hook, so it never ran; it was removed
-  2026-09-02 along with the claim that it worked. Blocking a stash would need a
+  once claimed to, but git has no such hook, so it never ran. The claim was
+  dropped 2026-09-02; the file itself lingered in the main checkout until
+  2026-10-24. Blocking a stash would need a
   `reference-transaction` hook rejecting `refs/stash`, which is deliberately not
   installed — that hook fires on every ref update in the repo.)
 - Never commit a `/home/<user>` or `/Users/<user>` path in a tracked file:
@@ -224,9 +240,32 @@ working around it.
   unique, lane-private log path, not a shared generic filename.
 - Do not claim "zero failures", "suite green", or "passes in isolation" until
   the process has exited and you have read its exit code.
-- `scripts/full-suite-gate.sh --execute --detach` does all of the above for
-  you (per-stage logs, recorded exit codes, a frozen-tree check); read its
-  `summary.txt`, not its terminal output.
+- `scripts/full-suite-gate.sh --execute --detach --workers N` with established
+  capacity does all of the above for
+  you (per-stage logs, recorded exits, a frozen-tree check and ordinary-group
+  supervision). Read `launcher.exit`, actual `supervisor.exit` and
+  `supervisor.json` alongside `summary.txt` and driver/stage receipts;
+  require complete cleanup and a passing frozen driver to qualify. `.done`
+  alone proves only driver receipt completion. Terminal output alone is
+  not the result.
+- Every commit that lands on a release or integration branch must keep green
+  tests green. No landed commit may turn a passing test red; that is what
+  `git bisect` treats as a regression. Fixes made one after another, even in
+  one shared test file, may land as separate commits, as long as failures
+  only decrease. Compare consecutive commits over sets of (test id, failure
+  signature) pairs, where the signature is the exception type plus the first
+  line of its message. Do not compare counts, which change as tests are added:
+  (a) each commit's failing pairs are a subset of the previous commit's, and
+      any pair that is new under an existing id is explained;
+  (b) every test id a commit introduces passes at that commit, because a
+      subset check alone cannot see a failing-first test added ahead of its
+      fix.
+  Where a signature embeds data that changes between runs (a `tmp_path`, a
+  uuid, a digest, a timestamp), normalise only that part, narrowly, and state
+  the rule. A broad normalisation disarms the check while it still appears to
+  run. Squash or reorder a commit that adds a red test before its fix or
+  carries a planted mutation. After resolving a cherry-pick conflict by hand,
+  re-check this on the receiving branch.
 
 ## Subagent Reporting
 
@@ -236,6 +275,12 @@ working around it.
 - Coordination and lane state go under `.claude/lanes/<run>/` — the
   `lane-manager` convention, already gitignored and already named in Commit
   Hygiene as never-stage.
+- `.claude/lanes/<run>/` holds notes and logs only. Never put a source tree
+  or a `.db` copy there; name the store's path instead. Delete a lane
+  directory 14 days after its branch merges or is abandoned.
+- Source under a gitignored path is a defect, not lane state. Work lives on
+  a branch in a worktree (2026-10-24: two trees went 62 h and 66 h without a
+  commit while 1,287 gitignored copies of `src/elspeth` held the work).
 - A durable deliverable (a review, an inventory, a design note, an evidence
   bundle) goes to a tracked path under `docs/`. Confirm it with
   `git check-ignore -v <path>` before writing: no output means the path is
@@ -260,6 +305,9 @@ working around it.
   output. `scripts/branch-safety-check.sh` checks the staged set for exactly
   those paths, for user-home paths, and for credential-shaped strings; run it
   before every commit, rebase or push.
+- Commit work in progress at every agent stop and at least every 4 h of
+  edits. Rewriting those commits before merge is fine; losing the work is
+  not. `scripts/work-at-risk.sh` shows what is still uncommitted.
 - Run the lint gate (ruff) locally before pushing; do not rely on CI to
   surface unused imports or formatting.
 
@@ -274,11 +322,9 @@ working around it.
 - Confirm the target version and branch before editing docs, changelogs or
   release notes. Which release a change belongs to is a decision to check,
   not an inference from the current checkout.
-- This is not a budget cap. Wide dispatch and deep analysis are standing
-  policy for the maintainer's own agents
-  ([docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
-  authorization); this section constrains what you hand back, not what you
-  spend getting there.
+- This section constrains what you hand back. How much to dispatch is set by
+  [docs/maintainer/toolchain.md](docs/maintainer/toolchain.md) § Standing
+  authorization: in proportion to risk, with a cap on evidence per unit.
 
 ## Project delivery posture
 
@@ -365,14 +411,43 @@ fix (see elspeth-63cf3803e6), never a reason to route around the provider.
 
 ## Operator signature verification (tier-model allowlist signing)
 
-CI does not run the signed trust-tier check or the historical blanket ratchet.
-Its green result covers the checks that actually run, not operator signature
-clearance. Fix tier-model defects as you find them and do not add drift; compare
-keyless finding sets before and after a change. The operator verifies and signs
-the reviewed package in a trusted context after churn has settled. Keep the
-operator-held key out of CI and agent environments.
+**Signing is suspended** pending the on-prem migration (maintainer ruling;
+[docs/release/0.8.10-custody-handover-prompt.md](docs/release/0.8.10-custody-handover-prompt.md)
+§ 2), and it is not part of CI. No sign-bundle, rekey or fingerprint-baseline
+regeneration runs. Never plan a re-sign, a "sign before land" ordering or an
+owed signature. CI does not run the signed trust-tier check or the historical
+blanket ratchet. Its green covers the checks that actually run, not signature
+clearance.
 
-The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
+Track tier-model findings with the **keyless set-diff**. Run the keyless scan
+(§ Quick reference) on the base and on the tip, and compare the finding *sets*
+(added and removed), not counts and not against zero. Fix tier-model defects as
+you find them and do not add drift. Shape-only verification cannot detect forged
+judge metadata, so a keyless result is never signature clearance.
+
+An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody
+rule). Keep it out of CI and agent environments, and never hand-edit a
+`judge_metadata_signature`. Key-bearing verbs refuse from the editable checkout:
+`sign-bundle`, `rekey`, `sign-judge-signatures`, `migrate-judge-scope`,
+`regenerate-fingerprint-baseline`, non-dry-run `justify`/`audit-verdict`, and any
+command run with the key set all exit 2 with `Operator runtime unavailable`.
+
+When signing is re-enabled, the operator fires those verbs only through the
+**protected entrypoint `/usr/local/libexec/elspeth-operator`**
+([ADR-052](docs/architecture/adr/052-key-bearing-lint-operations-run-only-in-a-protected-operator-runtime.md)).
+Building, installing and qualifying that runtime and its judge supervisor is
+post-release operator work. Until then the signer findings stay open. Key-free
+staging through the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`) still
+prepares a worklist for that operator step, which re-derives every binding from
+the live tree. Every judge call needs the installed judge supervisor and refuses
+without it; there is no local Codex/SDK fallback. That covers `stage_preview`,
+`reaudit`, `check-judge-quality` and `justify --dry-run`. The `codex-cli` judge
+transport is disabled, because its native shell could read the worker's
+provider credentials. `stage_preview` and the operator command it renders use
+`agent`. Judging runs with read-only judge tool access, and every rationale is
+secret-scrubbed. Background is in
+the `judge-signature-workflow` skill and
+[docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 
 ## Shared issue tracking
 

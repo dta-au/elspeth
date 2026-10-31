@@ -19,7 +19,7 @@ from collections.abc import Callable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
-from typing import Annotated, Any, Literal, TypeAliasType, Union, get_args, get_origin
+from typing import Annotated, Any, Final, Literal, TypeAliasType, Union, cast, get_args, get_origin
 
 from pydantic import (
     BaseModel,
@@ -53,6 +53,10 @@ from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
+
+# Public attachment selectors must fit the existing control-plane traversal.
+# The blob_rows persisted-storage contract has its own independent limit.
+MAX_SOURCE_BLOB_IDS: Final[int] = DEFAULT_CREDENTIAL_TRAVERSAL_POLICY.max_width
 
 
 @trust_boundary(
@@ -157,6 +161,7 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
                 "COMPOSE_TIMEOUT",
                 "DEADLINE_TOO_CLOSE",
                 "ADVISOR_ERROR",
+                "PROVIDER_POLICY_REFUSED",
             }
         ),
         "_kind": frozenset(
@@ -177,6 +182,18 @@ _SAFE_PUBLIC_RESPONSE_TEXT_BY_FIELD: Mapping[str, frozenset[str]] = MappingProxy
         # server-authored identifier. Only codes in the emitted-code registry
         # survive; any other value is summarized like free text.
         "error_code": REGISTERED_ERROR_CODES,
+    }
+)
+_SAFE_ADVISOR_POLICY_REFUSAL_CODES = frozenset(
+    {
+        "REPAIR_POLICY_UNSUPPORTED",
+        "COST_UNAVAILABLE",
+        "COST_CAP_EXCEEDED",
+        "PROVIDER_CALLS_EXHAUSTED",
+        "REQUEST_BYTES_EXHAUSTED",
+        "MALFORMED_RESPONSE",
+        "COMPLETION_TOKENS_EXCEEDED",
+        "RESPONSE_TRUNCATED",
     }
 )
 _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS = frozenset(
@@ -1598,7 +1615,7 @@ class SetSourceFromBlobsArgumentsModel(BaseModel):
     key outright.
     """
 
-    blob_ids: list[str] = Field(min_length=1, max_length=1000)
+    blob_ids: list[str] = Field(min_length=1, max_length=MAX_SOURCE_BLOB_IDS)
     on_success: str
     source_name: str = "source"
     on_validation_failure: str | None = None
@@ -1777,10 +1794,10 @@ class _InlineBlobModel(BaseModel):
 class _SetPipelineNamedSourceModel(BaseModel):
     """Typed fields shared by every named ``set_pipeline.sources`` root.
 
-    Named sources deliberately exclude ``blob_id`` and ``inline_blob``:
-    those custody-bearing fields are supported only by the legacy singular
-    ``source`` branch. Keeping a distinct runtime model makes that semantic
-    boundary visible to the advertised-schema compatibility guard.
+    Every root accepts a scalar attachment or ordered document attachments.
+    Named sources exclude inline creation; only the default source accepts
+    ``inline_blob``. Non-null selector ambiguity is a recoverable binding
+    refusal in the handler, separate from malformed argument shapes.
     """
 
     plugin: str
@@ -1791,6 +1808,8 @@ class _SetPipelineNamedSourceModel(BaseModel):
     # like _PipelineEdgeModel.label — structurally not a leak surface, so no
     # Sensitive marker (the §4.4.2 walker admits closed-list scalars).
     description: str | None = None
+    blob_id: str | None = None
+    blob_ids: list[str] | None = Field(default=None, min_length=1, max_length=MAX_SOURCE_BLOB_IDS)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -1827,12 +1846,11 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     the named-source model. Full replacement cannot borrow an old choice;
     empty values are rejected by semantic admission without choosing discard.
 
-    ``blob_id`` / ``inline_blob`` exclusivity
+    ``blob_id`` / ``blob_ids`` / ``inline_blob`` exclusivity
     ------------------------------------------
-    The JSON schema does NOT encode "exactly one of (blob_id, inline_blob)
-    or neither" (JSON Schema's ``oneOf`` is not used here); the handler at
-    :func:`_execute_set_pipeline` (``tools.py:4039``) rejects the
-    both-supplied case at runtime.  We deliberately do NOT replicate the
+    The JSON schema does NOT encode selector exclusivity with ``oneOf``;
+    the handler rejects multiple non-null selectors at runtime. Omitted or
+    null selectors are absent. We deliberately do NOT replicate the
     exclusivity at the Pydantic model layer — the handler's existing check
     produces a recoverable ``_failure_result`` with a repair hint that the
     LLM can act on, whereas a Pydantic-level rejection would surface as a
@@ -1840,7 +1858,6 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
     shapes (type vs semantic).
     """
 
-    blob_id: str | None = None
     inline_blob: _InlineBlobModel | None = None
 
 
@@ -3834,6 +3851,15 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 handles_no_sensitive_data_reason_struct=_GET_PIPELINE_STATE_REASON,
             )
         ),
+        "get_complete_pipeline_value": ToolRedaction(
+            policy=ToolRedactionPolicy(
+                known_argument_keys=("reference_id",),
+                redact_unknown_argument_keys=True,
+                handles_no_sensitive_data=False,
+                sensitive_response_keys=("data",),
+                known_response_keys=_tool_result_response_keys(data=True),
+            )
+        ),
         "preview_pipeline": ToolRedaction(
             policy=ToolRedactionPolicy(
                 redact_unknown_argument_keys=True,
@@ -4113,6 +4139,12 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                 # note}.  Union of all shapes, guidance included per the sensitive⊆known rule.
                 known_response_keys=(
                     "status",
+                    "code",
+                    "outbound_call_made",
+                    "error_type",
+                    "failure_code",
+                    "reason",
+                    "detail",
                     "error",
                     "error_class",
                     "budget_used",
@@ -4154,6 +4186,15 @@ def _redact_declarative_known_response_value(
     """Apply a type/value disposition after declarative key admission."""
     if field_name == "success":
         return value if type(value) is bool else _summarize_external_response_value(value)
+    if tool_name == "request_advisor_hint":
+        if field_name == "code":
+            return (
+                value
+                if isinstance(value, str) and value in _SAFE_ADVISOR_POLICY_REFUSAL_CODES
+                else _summarize_external_response_value(value)
+            )
+        if field_name == "outbound_call_made":
+            return value if type(value) is bool else _summarize_external_response_value(value)
     if field_name in _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS:
         return value if type(value) is int else _summarize_external_response_value(value)
     if field_name == "status":
@@ -4173,6 +4214,31 @@ def _redact_declarative_known_response_value(
         )
         return _project_validated_response_scalars(redacted)
     return _project_untrusted_response_structure(value, path=(field_name,))
+
+
+def _context_unsupported_response_projection(
+    tool_name: str,
+    *,
+    success: object,
+    outbound_call_made: object,
+    error_type: object,
+    failure_code: object,
+    reason: object,
+    detail: object,
+) -> dict[str, str]:
+    """Admit only the complete fixed manual-Advisor refusal vocabulary."""
+    if tool_name != "request_advisor_hint" or success is not False or outbound_call_made is not False:
+        return {}
+    from elspeth.web.composer.protocol import ComposerContextUnsupported, ComposerContextUnsupportedReason
+
+    if type(reason) is not str or reason not in get_args(ComposerContextUnsupportedReason):
+        return {}
+    expected = ComposerContextUnsupported(cast(ComposerContextUnsupportedReason, reason)).to_payload()
+    if any(type(value) is not str for value in (error_type, failure_code, detail)):
+        return {}
+    if error_type != expected["error_type"] or failure_code != expected["failure_code"] or detail != expected["detail"]:
+        return {}
+    return expected
 
 
 def redact_tool_call_response(
@@ -4257,6 +4323,18 @@ def redact_tool_call_response(
         telemetry.response_projection_limit(tool_name=tool_name, scope="row")
         return dict(_RESPONSE_PROJECTION_LIMIT)
 
+    # The dispatcher owns this exact value-free refusal for every registered
+    # session service. It is neither an arbitrary tool payload nor a crash row.
+    if (
+        set(response) == {"success", "status", "reason"}
+        and response["success"] is False
+        and type(response["status"]) is str
+        and response["status"] == "SERVICE_FAILURE"
+        and type(response["reason"]) is str
+        and response["reason"] == "service_failure"
+    ):
+        return {"success": False, "status": "SERVICE_FAILURE", "reason": "service_failure"}
+
     # --- Type-driven path ---
     if entry.argument_model is not None:
         # Spec §4.2.4: manifest_dispatch is a per-invocation, walker-wide beacon.
@@ -4322,6 +4400,15 @@ def redact_tool_call_response(
     policy = entry.policy
     assert policy is not None  # offensive: satisfies the type-checker contract
 
+    context_refusal_projection = _context_unsupported_response_projection(
+        tool_name,
+        success=response["success"] if "success" in response else None,
+        outbound_call_made=response["outbound_call_made"] if "outbound_call_made" in response else None,
+        error_type=response["error_type"] if "error_type" in response else None,
+        failure_code=response["failure_code"] if "failure_code" in response else None,
+        reason=response["reason"] if "reason" in response else None,
+        detail=response["detail"] if "detail" in response else None,
+    )
     redacted: dict[str, Any] = {}
     for key, value in response.items():
         if key in policy.sensitive_response_keys:
@@ -4342,6 +4429,10 @@ def redact_tool_call_response(
                 # Over-budget known value: degrade this key only, never the row.
                 telemetry.response_projection_limit(tool_name=tool_name, scope="key")
                 redacted[key] = _REDACTED_RESPONSE_PROJECTION_LIMIT
+            elif key in context_refusal_projection:
+                # These are the owned serializer's four fixed strings, admitted
+                # together with their reason/detail and undispatched binding.
+                redacted[key] = context_refusal_projection[key]
             else:
                 redacted[key] = _redact_declarative_known_response_value(
                     value,

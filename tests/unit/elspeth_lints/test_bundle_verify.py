@@ -151,6 +151,9 @@ def _write_pre_judge_entry(allowlist_dir: Path, yaml_name: str, *, key: str) -> 
 
 def _bundle(root: Path, allowlist_dir: Path, actions: tuple[BundleAction, ...]) -> ReviewBundle:
     repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    # Isolate the fixture before HEAD discovery can find an enclosing checkout.
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     if (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],

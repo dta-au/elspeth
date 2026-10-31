@@ -1,0 +1,202 @@
+"""Project-wide top-level symbol reachability over src/elspeth (AST, read-only).
+
+Nodes are (module, top-level name). Edges come from every Name / module-attribute
+reference inside a definition's subtree, resolved through that module's imports
+(including function-local imports). Roots are every module's non-definition
+top-level statements plus every definition in a module outside the scanned
+focus set (treated as live), minus explicitly retired roots.
+
+Usage: python reachability.py <src_root> <focus_module> [<focus_module> ...] --retire mod:name ...
+Prints the focus modules' unreachable top-level names.
+"""
+
+from __future__ import annotations
+
+import ast
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+def module_name(src: Path, path: Path) -> str:
+    rel = path.relative_to(src.parent).with_suffix("")
+    parts = list(rel.parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+class Module:
+    def __init__(self, name: str, tree: ast.Module, is_pkg: bool) -> None:
+        self.name = name
+        self.tree = tree
+        self.is_pkg = is_pkg
+        self.defs: dict[str, ast.AST] = {}
+        self.top_stmts: list[ast.stmt] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.defs[node.name] = node
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [t.id for t in targets if isinstance(t, ast.Name)]
+                if names and not any(n == "__all__" for n in names):
+                    for n in names:
+                        self.defs[n] = node
+                else:
+                    self.top_stmts.append(node)
+            else:
+                self.top_stmts.append(node)
+
+
+def resolve_from(mod: Module, node: ast.ImportFrom) -> str:
+    if node.level == 0:
+        return node.module or ""
+    base = mod.name.split(".")
+    if not mod.is_pkg:
+        base = base[:-1]
+    base = base[: len(base) - (node.level - 1)]
+    return ".".join(base + ([node.module] if node.module else []))
+
+
+def import_maps(mod: Module, subtree: ast.AST) -> tuple[dict[str, tuple[str, str]], dict[str, str]]:
+    """name -> (module, symbol) for from-imports; alias -> module for module imports."""
+    syms: dict[str, tuple[str, str]] = {}
+    mods: dict[str, str] = {}
+    for node in ast.walk(subtree):
+        if isinstance(node, ast.ImportFrom):
+            src = resolve_from(mod, node)
+            for alias in node.names:
+                syms[alias.asname or alias.name] = (src, alias.name)
+                mods.setdefault(alias.asname or alias.name, f"{src}.{alias.name}")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname:
+                    mods[alias.asname] = alias.name
+    return syms, mods
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    src = Path(args[0]).resolve()
+    rest = args[1:]
+    why: list[tuple[str, str]] = []
+    if "--why" in rest:
+        i = rest.index("--why")
+        why = [tuple(rest[i + 1].split(":", 1))]  # type: ignore[list-item]
+        rest = rest[:i] + rest[i + 2 :]
+    retire: set[tuple[str, str]] = set()
+    if "--retire" in rest:
+        i = rest.index("--retire")
+        retire = {tuple(x.split(":", 1)) for x in rest[i + 1 :]}  # type: ignore[misc]
+        rest = rest[:i]
+    modules: dict[str, Module] = {}
+    for path in sorted(src.rglob("*.py")):
+        name = module_name(src, path)
+        modules[name] = Module(name, ast.parse(path.read_text(encoding="utf-8")), path.name == "__init__.py")
+    focus = {m for m in modules for f in rest if (m == f or (f.endswith(".*") and m.startswith(f[:-2] + ".")))}
+    file_imports = {name: import_maps(m, m.tree) for name, m in modules.items()}
+
+    def refs(mod: Module, subtree: ast.AST) -> set[tuple[str, str]]:
+        syms, mods = file_imports[mod.name]
+        out: set[tuple[str, str]] = set()
+        for node in ast.walk(subtree):
+            if isinstance(node, ast.Name):
+                if node.id in mod.defs:
+                    out.add((mod.name, node.id))
+                elif node.id in syms:
+                    out.add(syms[node.id])
+            elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                target = mods.get(node.value.id)
+                if target is not None:
+                    out.add((target, node.attr))
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in mod.defs:
+                # string references such as __all__ entries or getattr names keep a symbol
+                out.add((mod.name, node.value))
+        return out
+
+    def canonical(key: tuple[str, str], depth: int = 0) -> tuple[str, str]:
+        """Follow re-exports: a name a module imports rather than defines resolves to its source."""
+        mod_name, sym = key
+        mod = modules.get(mod_name)
+        if mod is None or sym in mod.defs or depth > 10:
+            return key
+        syms, _mods = file_imports[mod_name]
+        if sym in syms:
+            return canonical(syms[sym], depth + 1)
+        return key
+
+    graph: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+    roots: set[tuple[str, str]] = set()
+    for name, mod in modules.items():
+        for stmt in mod.top_stmts:
+            if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__all__" for t in stmt.targets):
+                continue  # an export list is not a caller
+            roots |= {canonical(r) for r in refs(mod, stmt)}
+        for sym, node in mod.defs.items():
+            graph[(name, sym)] = {canonical(r) for r in refs(mod, node)}
+            if name not in focus:
+                roots.add((name, sym))
+    roots -= retire
+    retired_edges = {key: set(graph.get(key, ())) for key in retire}
+    for key in retire:
+        graph[key] = set()
+        # a retired definition in a non-focus module is not a root
+    seen: set[tuple[str, str]] = set()
+    parent: dict[tuple[str, str], tuple[str, str] | None] = {}
+    stack: list[tuple[tuple[str, str], tuple[str, str] | None]] = [(r, None) for r in roots]
+    while stack:
+        node, via = stack.pop()
+        if node in seen or node in retire:
+            continue
+        seen.add(node)
+        parent[node] = via
+        stack.extend((nxt, node) for nxt in graph.get(node, ()))
+    for target in why:
+        chain = []
+        cur: tuple[str, str] | None = target if target in seen else None
+        while cur is not None:
+            chain.append(cur)
+            cur = parent[cur]
+        print("WHY", target, "<-", " <- ".join(f"{m}:{n}" for m, n in chain[1:]) if chain else "UNREACHABLE")
+    closure: set[tuple[str, str]] = set()
+    stack = [edge for edges in retired_edges.values() for edge in edges] + list(retire)
+    while stack:
+        node = stack.pop()
+        if node in closure or node in seen:
+            continue
+        closure.add(node)
+        stack.extend(retired_edges.get(node, graph.get(node, ())))
+    full_graph = {**graph, **retired_edges}
+    referrers: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+    for src_node, edges in full_graph.items():
+        for edge in edges:
+            if edge != src_node:
+                referrers[edge].add(src_node)
+    deletable = {n for n in closure if n[0] in modules and n[1] in modules[n[0]].defs} | set(retire)
+    changed = True
+    while changed:
+        changed = False
+        for node in sorted(deletable):
+            if node in retire:
+                continue
+            if any(r not in deletable for r in referrers[node]):
+                deletable.discard(node)
+                changed = True
+    print("## deletable (every src referrer is itself deleted):")
+    for mod_name, sym in sorted(deletable - set(retire)):
+        print(f"  {mod_name}:{sym}")
+    print("## kept: in the retired closure but still referenced by surviving code:")
+    for mod_name, sym in sorted(n for n in closure if n not in deletable and n[0] in modules and n[1] in modules[n[0]].defs):
+        keepers = sorted(f"{m}:{x}" for m, x in referrers[(mod_name, sym)] if (m, x) not in deletable)
+        print(f"  {mod_name}:{sym}  <- {', '.join(keepers[:3])}")
+    for name in sorted(focus):
+        mod = modules[name]
+        dead = [sym for sym in mod.defs if (name, sym) not in seen]
+        print(f"== {name}: {len(dead)} unreachable of {len(mod.defs)}")
+        for sym in dead:
+            node = mod.defs[sym]
+            print(f"  {getattr(node, 'lineno', '?')}: {sym}")
+
+
+if __name__ == "__main__":
+    main()

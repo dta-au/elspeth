@@ -24,6 +24,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
 from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
+from tests.helpers.composition_state import composition_state_data
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web import async_workers
@@ -41,7 +42,7 @@ from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunR
 from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
-from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
+from elspeth.web.sessions.protocol import RunRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -139,7 +140,7 @@ async def _create_running_run(service: SessionServiceImpl, engine: Engine) -> tu
     try:
         state = await service.save_composition_state(
             session.id,
-            CompositionStateData(is_valid=True),
+            composition_state_data(is_valid=True),
             provenance="session_seed",
             session_operation_context=compose_context,
         )
@@ -188,7 +189,7 @@ async def test_deployment_recovery_is_isolated_from_other_test_runs(deployment, 
             context = _acquire_as(service, session.id)
             state = await service.save_composition_state(
                 session.id,
-                CompositionStateData(is_valid=True),
+                composition_state_data(is_valid=True),
                 provenance="session_seed",
                 session_operation_context=context,
             )

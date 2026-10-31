@@ -30,27 +30,30 @@ from typing import Any
 from unittest.mock import patch
 from uuid import UUID
 
+import litellm
 import pytest
 
 import elspeth.web.composer.tool_batch as tool_batch
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+from tests.helpers.advisor_review import parse_advisor_publication_review
+from tests.helpers.composer_sdk import ComposerSDKScript
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
     _PROPOSAL_SESSION_ID,
     _harness,
     _incremental_base_state,
     _inline_pipeline_args,
-    _ScriptedLLM,
-    _tool_turn,
 )
 from tests.integration.web.composer.test_freeform_required_controls import (
     _required_textract_policy,
     _textract_llm_mapper_args,
 )
-from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
+from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM, _FakeLLMResponse
 
 _MODEL_ORDER = ["zeta", "alpha"]
 _SOURCE_ORDER = ["zeta_src", "alpha_src"]
@@ -198,6 +201,100 @@ class _RecordingLLM(_FakeComposeLLM):
         )
 
 
+class _RawReplaySDK:
+    """Finite raw PRIMARY replies, including only declared interpretation repairs."""
+
+    def __init__(
+        self,
+        service: ComposerServiceImpl,
+        call_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        interpretation_repairs: int = 0,
+    ) -> None:
+        assert interpretation_repairs in (0, _MAX_REPAIR_TURNS)
+        self.responses = (
+            _fake_llm_response(tool_calls=({"id": call_id, "name": tool_name, "arguments": arguments},)),
+            _fake_llm_response(content="Done."),
+            *(_fake_llm_response(content="Done.") for _ in range(interpretation_repairs)),
+        )
+        self.message_snapshots: list[list[dict[str, Any]]] = []
+        self.sdk = ComposerSDKScript(
+            primary_model=service._provider_gateway._model,
+            primary=[],
+            advisor_model=service._settings.composer_advisor_model,
+        )
+        self.sdk.primary.side_effect = self.respond
+
+    async def respond(self, *, messages: list[dict[str, Any]], **_kwargs: Any) -> _FakeLLMResponse:
+        assert len(self.message_snapshots) < len(self.responses), "Unexpected extra primary SDK reply"
+        if len(self.message_snapshots) >= 2:
+            repair = messages[-1]
+            assert repair["role"] == "user"
+            assert repair["content"].startswith("[composer-system] The current pipeline contains pending assumption-review site(s)")
+            assert "pipeline_decision:prompt_shield_auto_1:required_control_auto_wired" in repair["content"]
+            assert "pipeline_decision:content_safety_auto_1:required_control_auto_wired" in repair["content"]
+        self.message_snapshots.append(copy.deepcopy(messages))
+        return self.responses[len(self.message_snapshots) - 1]
+
+
+def _bind_real_terminal_review(
+    monkeypatch: pytest.MonkeyPatch,
+    service: ComposerServiceImpl,
+    llm: _RawReplaySDK,
+    *,
+    request: str,
+) -> list[dict[str, Any]]:
+    """Keep the existing EARLY isolation; execute the real terminal END owner."""
+    checkpoint = service._advisor_checkpoint
+    isolated_checkpoint = checkpoint._run_advisor_checkpoint
+    reviews: list[dict[str, Any]] = []
+
+    async def checkpoint_phase(*args: Any, **kwargs: Any):
+        if kwargs["phase"] == "end":
+            return await AdvisorCheckpointOwner._run_advisor_checkpoint(checkpoint, *args, **kwargs)
+        assert kwargs["phase"] == "early"
+        return await isolated_checkpoint(*args, **kwargs)
+
+    async def terminal_completion(**kwargs: Any):
+        assert not reviews, "Only one actual terminal END response is supplied"
+        assert "tools" not in kwargs
+        assert kwargs["model"] == service._settings.composer_advisor_model
+        assert kwargs["response_format"]["json_schema"]["name"] == "advisor_end_response"
+        review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
+        assert review["current_request"] == request
+        assert review["candidate_reply"] == "Done."
+        reviews.append(review)
+        return litellm.ModelResponse(
+            model=kwargs["model"],
+            choices=[
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {
+                                "verdict": "CLEAN",
+                                "category": "other",
+                                "steps": [],
+                                "findings": "",
+                                "note": None,
+                                "publication_verdict": "ADMIT",
+                            }
+                        ),
+                    },
+                }
+            ],
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+        )
+
+    monkeypatch.setattr(checkpoint, "_run_advisor_checkpoint", checkpoint_phase)
+    llm.sdk.advisor.side_effect = terminal_completion
+    return reviews
+
+
 def _record_replay_callers(monkeypatch: pytest.MonkeyPatch) -> list[int]:
     """Record the ``tool_batch`` line each transcript rewrite is called from.
 
@@ -308,12 +405,13 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
     args = _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows")
     canary = "private-inline-auto-7f45"
     args["source"]["inline_blob"]["content"] = f"doc_key\ninbox/{canary}.pdf\n"
-    llm = _ScriptedLLM(_tool_turn("call_auto", "set_pipeline", args))
+    llm = _RawReplaySDK(harness.service, "call_auto", "set_pipeline", args, interpretation_repairs=_MAX_REPAIR_TURNS)
+    terminal_reviews = _bind_real_terminal_review(monkeypatch, harness.service, llm, request="Build and apply a Textract to LLM pipeline.")
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
-        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch("litellm.acompletion", new=llm.sdk),
     ):
         result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline.",
@@ -333,6 +431,11 @@ async def test_auto_commit_finalization_replay_keeps_coalesce_order(tmp_path: Pa
     assert authority["source"]["options"]["interpretation_requirements"][0]["draft"] == args["source"]["inline_blob"]["content"]
     assert _node_plugins(replayed) == _WIRED_PLUGINS, "the transcript must be the finalized (auto-wired) arguments"
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
+
+    assert llm.sdk.primary.await_count == len(llm.message_snapshots) == 2 + _MAX_REPAIR_TURNS
+    assert result.repair_turns_used == _MAX_REPAIR_TURNS
+    assert llm.sdk.advisor.await_count == len(terminal_reviews) == 1
+    assert result.runtime_preflight is not None and not result.runtime_preflight.readiness.completion_ready
 
 
 def _with_reversed_sources(args: dict[str, Any], tmp_path: Path) -> dict[str, Any]:
@@ -382,14 +485,17 @@ async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Pat
         _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows"),
         tmp_path,
     )
-    llm = _ScriptedLLM(_tool_turn("call_sources", "set_pipeline", args))
+    llm = _RawReplaySDK(harness.service, "call_sources", "set_pipeline", args, interpretation_repairs=_MAX_REPAIR_TURNS)
+    terminal_reviews = _bind_real_terminal_review(
+        monkeypatch, harness.service, llm, request="Build and apply a Textract to LLM pipeline over two manifests."
+    )
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
-        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch("litellm.acompletion", new=llm.sdk),
     ):
-        await harness.service.compose(
+        result = await harness.service.compose(
             "Build and apply a Textract to LLM pipeline over two manifests.",
             [],
             _incremental_base_state(tmp_path),
@@ -406,20 +512,28 @@ async def test_auto_commit_finalization_replay_keeps_sources_order(tmp_path: Pat
     assert list(replayed["sources"]) == _SOURCE_ORDER
     assert list(_node(replayed, "merge")["branches"]) == _MODEL_ORDER
 
+    assert llm.sdk.primary.await_count == len(llm.message_snapshots) == 2 + _MAX_REPAIR_TURNS
+    assert result.repair_turns_used == _MAX_REPAIR_TURNS
+    assert llm.sdk.advisor.await_count == len(terminal_reviews) == 1
+    assert result.runtime_preflight is not None and not result.runtime_preflight.readiness.completion_ready
+
 
 @pytest.mark.asyncio
 async def test_explicit_finalization_and_custody_replay_keeps_coalesce_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Explicit approval: success path, finalization rewrite, then the inline-custody rewrite."""
     harness = _harness(tmp_path)
     view, snapshot = _required_textract_policy(tmp_path)
-    llm = _ScriptedLLM(
-        _tool_turn("call_explicit", "set_pipeline", _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows"))
+    llm = _RawReplaySDK(
+        harness.service,
+        "call_explicit",
+        "set_pipeline",
+        _with_reversed_coalesce(_textract_llm_mapper_args(tmp_path), sink="output_rows"),
     )
     caller_lines = _record_replay_callers(monkeypatch)
 
     with (
         patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
-        patch.object(harness.service._provider_gateway, "_call_llm", new=llm),
+        patch("litellm.acompletion", new=llm.sdk),
     ):
         await harness.service.compose(
             "Build a Textract to LLM pipeline and prepare it for review.",
@@ -462,10 +576,10 @@ async def test_inline_custody_replay_keeps_coalesce_order(tmp_path: Path, monkey
             "branches": {"zeta": "zeta", "alpha": "alpha"},
         },
     ]
-    llm = _ScriptedLLM(_tool_turn("call_inline", "set_pipeline", args))
+    llm = _RawReplaySDK(harness.service, "call_inline", "set_pipeline", args)
     caller_lines = _record_replay_callers(monkeypatch)
 
-    with patch.object(harness.service._provider_gateway, "_call_llm", new=llm):
+    with patch("litellm.acompletion", new=llm.sdk):
         result = await harness.service.compose(
             "Prepare this pipeline for review.",
             [],

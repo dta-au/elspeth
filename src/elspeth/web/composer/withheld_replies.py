@@ -30,6 +30,7 @@ WithheldReplyOrigin = Literal[
     "advisor_repair_terminal",
     "advisor_publication_withheld",
     "compose_deadline_expired",
+    "compose_policy_refused",
     "planner_prose_unadmitted",
 ]
 

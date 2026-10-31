@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import Engine, func, insert, select, text, update
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.web.coordination.review_authority import (
     OpenReviewRequestExists,
@@ -72,7 +73,12 @@ def _seed(engine: Engine) -> None:
         )
         conn.execute(
             insert(composition_states_table).values(
-                id="state-1", session_id="session-1", version=1, provenance="session_seed", created_at=now
+                metadata_=stored_default_pipeline_metadata(),
+                id="state-1",
+                session_id="session-1",
+                version=1,
+                provenance="session_seed",
+                created_at=now,
             )
         )
 

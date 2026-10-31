@@ -33,6 +33,7 @@ from elspeth.contracts.composer_audit import (
 )
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
@@ -129,6 +130,7 @@ from tests.helpers.composer_operations import (
     settle_sync,
     submit_and_settle,
 )
+from tests.helpers.composition_state import composition_state_data
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -684,10 +686,11 @@ class _BlockingRecordingComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         del state, session_id, current_state_id, user_id, progress, user_message_id
         del session_operation_context, completion_gates, budget_seconds, required_work, provider_owner, recovery_context
-        del retained_operation_context, advisor_history
+        del retained_operation_context, advisor_history, mutation_ceiling
 
         self.calls.append(
             {
@@ -733,9 +736,10 @@ class _ProgressAwareComposer:
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ) -> ComposerResult:
         del message, chat_messages, session_id, current_state_id, user_id, user_message_id, completion_gates, budget_seconds
-        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history
+        del required_work, provider_owner, recovery_context, retained_operation_context, advisor_history, mutation_ceiling
         assert session_operation_context is not None
         assert progress is not None, "session routes must pass a composer progress sink"
         self.progress_sink_seen = True
@@ -3935,7 +3939,7 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         # Create a pending run via the service layer
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             await service.create_run(
                 session_id,
@@ -4005,7 +4009,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Completed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4036,7 +4040,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Failed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4076,7 +4080,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Fanout Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4133,7 +4137,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Mixed Batch"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await service.save_composition_state(session_id, composition_state_data(is_valid=True), provenance="session_seed")
         good_run = await service.create_run(session_id, state.id)
         await service.update_run_status(good_run.id, "running")
         await service.update_run_status(
@@ -4191,7 +4195,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Missing Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4243,7 +4247,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Open Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4294,7 +4298,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Discarded Rows"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -4364,7 +4368,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Running Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, composition_state_data(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -5975,7 +5979,9 @@ class TestMessageRoutes:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
+        from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
         from tests.helpers.advisor_review import parse_advisor_publication_review
+        from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 
         prompt_canary = "PROMPT_CANARY_9c0b3d"
         option_canary = "OPTION_CANARY_314a7e"
@@ -5994,7 +6000,7 @@ class TestMessageRoutes:
             update={
                 "composer_model": "test/planner",
                 "composer_boot_probe_enabled": False,
-                "composer_planner_repair_budget": 0,
+                "composer_planner_repair_budget": 2,
             }
         )
         monkeypatch.setattr(
@@ -6056,89 +6062,39 @@ class TestMessageRoutes:
             ],
         }
 
-        responses = iter(
-            (
-                SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content=None,
-                                tool_calls=[
-                                    SimpleNamespace(
-                                        id="redaction-candidate",
-                                        function=SimpleNamespace(
-                                            name="emit_pipeline_proposal",
-                                            arguments=json.dumps({"pipeline": rejected_pipeline}),
-                                        ),
-                                    )
-                                ],
-                            ),
-                            finish_reason="tool_calls",
-                        )
-                    ],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                    model="provider/planner-v1",
-                    id="redaction-primary",
-                ),
-                SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content="I cannot safely complete that pipeline.",
-                                tool_calls=[],
-                            ),
-                            finish_reason="stop",
-                        )
-                    ],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                    model="anthropic/claude-sonnet-4-6",
-                    id="redaction-advisor",
-                ),
-                SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content=json.dumps(
-                                    {
-                                        "verdict": "CLEAN",
-                                        "category": "other",
-                                        "steps": [],
-                                        "findings": "",
-                                        "note": None,
-                                        "publication_verdict": "ADMIT",
-                                    }
-                                ),
-                                tool_calls=[],
-                            ),
-                            finish_reason="stop",
-                        )
-                    ],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-                    model="anthropic/claude-sonnet-4-6",
-                    id="redaction-end",
-                ),
-            )
+        request = f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
+        candidate = "I cannot safely complete that pipeline."
+        composer = app.state.composer_service
+        checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
+        assert checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
+        script = CommonSDK(
+            request=request,
+            candidate=candidate,
+            steps=(
+                Step("primary", tool_name="set_pipeline", arguments={"pipeline": rejected_pipeline}),
+                Step("primary", content=candidate),
+                Step("end"),
+            ),
         )
-        provider_requests: list[dict[str, Any]] = []
-
-        async def completion(**kwargs: Any) -> Any:
-            provider_requests.append(kwargs)
-            return next(responses)
-
-        monkeypatch.setattr("litellm.acompletion", completion)
+        script.bind(composer, monkeypatch)
+        monkeypatch.setattr("litellm.acompletion", script)
+        provider_requests = script.requests
 
         sent = _settled_composer_response(
             client,
             app,
             path=f"/api/sessions/{session_id}/messages",
             body=message_body(
-                f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl.",
+                request,
                 state_id=current_head_state_id_sync(client, session_id),
             ),
         )
 
         assert sent.status_code == 200, sent.json()
+        script.assert_done()
+        assert script.phases == ["end"]
         assert len(provider_requests) == 3
+        assert_actual_audits(app.state.session_engine, provider_requests, ("success", "success", "success"), session_id=session_id)
         end_messages = provider_requests[2]["messages"]
         assert [message["role"] for message in end_messages] == ["system", "user"]
         review = parse_advisor_publication_review(end_messages[1]["content"])
@@ -6146,18 +6102,12 @@ class TestMessageRoutes:
         assert review["candidate_reply"] == "I cannot safely complete that pipeline."
         assert review["saved_effects"]["saved_revision_count"] == 0
         assert review["saved_effects"]["net_changed"] is False
-        advisor_context = json.dumps(provider_requests[1]["messages"])
-        assert all(canary in advisor_context for canary in canaries.values())
-        transcript_prefix = "Complete available same-session visible conversation evidence."
-        hatch_transcript = next(
-            message["content"]
-            for message in provider_requests[1]["messages"]
-            if message["role"] == "user" and message["content"].startswith(transcript_prefix)
-        )
+        correction_context = json.dumps(provider_requests[1]["messages"])
+        assert all(canary in correction_context for canary in canaries.values())
         feedback_events = [
-            event
-            for event in json.loads(hatch_transcript.partition("\n")[2])["events"]
-            if event["role"] == "tool" and event["tool_call_id"] == "redaction-candidate"
+            message
+            for message in provider_requests[1]["messages"]
+            if message["role"] == "tool" and message["tool_call_id"] == "common-tool-1"
         ]
         assert len(feedback_events) == 1
         assert validator_message_canary in json.dumps(feedback_events[0])
@@ -6170,8 +6120,13 @@ class TestMessageRoutes:
             ComposerDiagnosticEvidence.from_envelope(message.tool_calls[0], expected_session_id=session_id) for message in private_audit
         ]
         assert private_evidence
-        assert any(evidence.status == "received_response" for evidence in private_evidence)
-        assert any(evidence.status == "rejected" for evidence in private_evidence)
+        (authoring,) = [evidence for evidence in private_evidence if evidence.tool_name == "set_pipeline"]
+        assert authoring.tool_call_id == "common-tool-1" and authoring.status == "success"
+        assert authoring.arguments.content is not None and json.loads(authoring.arguments.content) == rejected_pipeline
+        assert authoring.wire_arguments.content is not None
+        assert json.loads(authoring.wire_arguments.content) == {"pipeline": rejected_pipeline}
+        assert authoring.result.content is not None
+        assert json.loads(authoring.result.content)["success"] is False
         private_requests = [evidence for evidence in private_evidence if evidence.status == "provider_request"]
         assert len(private_requests) == 3
         assert len({evidence.evidence_id for evidence in private_evidence}) == len(private_evidence)
@@ -6188,7 +6143,7 @@ class TestMessageRoutes:
         private_payload = json.dumps([deep_thaw(message.tool_calls) for message in private_audit])
         for canary_name in ("option", "path", "validator_message"):
             assert canaries[canary_name] in private_payload
-        persisted_audit = [message for message in persisted_messages if message.role == "audit" and message not in private_audit]
+        persisted_audit = [message for message in persisted_messages if message.role in {"audit", "tool"} and message not in private_audit]
         included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true")
         assert included.status_code == 200, included.json()
         private_message_ids = {str(message.id) for message in private_audit}
@@ -6196,54 +6151,38 @@ class TestMessageRoutes:
         raw_included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true&include_raw_content=true")
         assert raw_included.status_code == 200, raw_included.json()
         assert private_message_ids.isdisjoint(message["id"] for message in raw_included.json())
-        returned_audit = [message for message in included.json() if message["role"] == "audit"]
+        returned_audit = [message for message in included.json() if message["role"] in {"audit", "tool"}]
         audit_surfaces = {
-            "GET with raw content": json.dumps([message for message in raw_included.json() if message["role"] == "audit"]),
+            "GET with raw content": json.dumps([message for message in raw_included.json() if message["role"] in {"audit", "tool"}]),
             "persisted": json.dumps(
                 [{"content": message.content, "tool_calls": deep_thaw(message.tool_calls)} for message in persisted_audit],
                 sort_keys=True,
             ),
             "GET": json.dumps(returned_audit, sort_keys=True),
         }
-        # Physical calls checkpoint before the planner returns its semantic cohort.
-        envelopes = [message.tool_calls[0] for message in persisted_audit if message.tool_calls]
+        # Common physical calls and END remain durable, with actual tool rows
+        # covered above. No retired planner cohort or hatch receipt is invented.
+        envelopes = [message.tool_calls[0] for message in persisted_audit if message.role == "audit" and message.tool_calls]
         physical = [envelope for envelope in envelopes if envelope["_kind"] == "llm_call_audit"]
         attempts = [envelope for envelope in envelopes if envelope["_kind"] == "planner_attempt_audit"]
         passes = [envelope for envelope in envelopes if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND]
-        assert len(envelopes) == 9
         assert [envelope["_kind"] for envelope in envelopes] == [
             "prompt_guard_audit",
             "llm_call_audit",
             "prompt_guard_audit",
             "llm_call_audit",
-            "planner_attempt_audit",
-            "planner_attempt_audit",
             "prompt_guard_audit",
             "llm_call_audit",
             ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
         ]
-        _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "advisor", "advisor"])
+        _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "composer", "advisor"])
         assert guard_requests
         assert all(
             request["userPrompt"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
             for request in guard_requests
         )
-        assert len(physical) == 3 and len(attempts) == 2 and len(passes) == 1
-        planner_cohort = [
-            envelope
-            for envelope in envelopes
-            if envelope["_kind"] == "planner_attempt_audit"
-            or (envelope["_kind"] == "llm_call_audit" and envelope["call"]["planner_call_ordinal"] is not None)
-        ]
-        assert [envelope["_kind"] for envelope in planner_cohort] == [
-            "llm_call_audit",
-            "llm_call_audit",
-            "planner_attempt_audit",
-            "planner_attempt_audit",
-        ]
-        assert [envelope["call"]["planner_call_ordinal"] for envelope in physical[:2]] == [1, 2]
-        assert physical[2]["call"]["planner_call_ordinal"] is None
-        assert [envelope["attempt"]["planner_call_ordinal"] for envelope in attempts] == [1, 2]
+        assert len(physical) == 3 and attempts == [] and len(passes) == 1
+        assert all(envelope["call"]["planner_call_ordinal"] is None for envelope in physical)
         assert passes[0]["pass"]["phase"] == "end"
         assert passes[0]["pass"]["publication_verdict"] == "ADMIT"
         assert passes[0]["pass"]["provider_attempts"] == 1
@@ -8180,7 +8119,7 @@ class TestRunAlreadyActiveError:
         app, service = _make_app(tmp_path)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, composition_state_data(is_valid=True), provenance="session_seed")
         # Create a run to block the session
         async with _execute_session_operation_context(service, session.id) as context:
             await service.create_run(
@@ -8383,7 +8322,7 @@ class TestPaginationRoutes:
 
         session = await service.create_session("alice", "Pipeline", "local")
         for _ in range(5):
-            await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+            await _save_test_composition_state(service, session.id, composition_state_data(is_valid=False), provenance="session_seed")
 
         resp = client.get(
             f"/api/sessions/{session.id}/state/versions?limit=2",
@@ -11071,7 +11010,7 @@ def test_composer_chat_history_skips_audit_tool_messages() -> None:
 
 
 def test_composer_chat_history_marks_edited_fork_user_but_not_fork_system_row() -> None:
-    from elspeth.web.composer.planning_application import _freeform_planner_conversation_context
+    from elspeth.web.composer.request_history import authoritative_conversation_context as _freeform_planner_conversation_context
     from elspeth.web.sessions.routes import _composer_chat_history
 
     session_id = uuid.uuid4()

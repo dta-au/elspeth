@@ -24,6 +24,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.protocol import OperationReceiptFailureCode
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -126,6 +127,7 @@ class TestCompositionStateUniqueConstraint:
             # First state version
             conn.execute(
                 insert(composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id_1,
                     session_id=session_id,
                     version=1,
@@ -140,6 +142,7 @@ class TestCompositionStateUniqueConstraint:
             with pytest.raises(IntegrityError):
                 conn.execute(
                     insert(composition_states_table).values(
+                        metadata_=stored_default_pipeline_metadata(),
                         id=state_id_2,
                         session_id=session_id,
                         version=1,
@@ -351,6 +354,7 @@ class TestCheckConstraints:
             )
             conn.execute(
                 insert(composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id,
                     version=1,
@@ -391,6 +395,7 @@ class TestCheckConstraints:
             )
             conn.execute(
                 insert(composition_states_table).values(
+                    metadata_=stored_default_pipeline_metadata(),
                     id=state_id,
                     session_id=session_id,
                     version=1,

@@ -1,5 +1,6 @@
 """Actual route projections retain structured errors and fork custody checks."""
 
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -7,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+from elspeth.web.composer.state import PipelineMetadata, ValidationEntry, ValidationSummary
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.sessions.protocol import CompositionStateRecord, CompositionValidationError
 from elspeth.web.sessions.routes._helpers import (
@@ -28,7 +29,7 @@ def _record(errors: tuple[CompositionValidationError, ...] | None) -> Compositio
         nodes=(),
         edges=(),
         outputs=(),
-        metadata_={},
+        metadata_=asdict(PipelineMetadata()),
         is_valid=False,
         validation_errors=errors,
         created_at=datetime.now(UTC),

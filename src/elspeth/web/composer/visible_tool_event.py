@@ -11,7 +11,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Final, final
+from typing import Any, Final, Literal, TypedDict, final
 
 from pydantic import JsonValue
 
@@ -23,12 +23,26 @@ from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.pipeline_custody import inline_custody_audit_projection
+from elspeth.web.composer.provider_audit_source import ProviderAuditSource, capture_provider_audit_source
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.validation import _redact_sensitive_content
 
 VISIBLE_TOOL_EVENT_KIND: Final = "composer_visible_tool_event"
 VISIBLE_TOOL_EVENT_SCHEMA: Final = "composer.visible-tool-event.v1"
 VISIBLE_RESPONSE_GAP_KIND: Final = "composer_visible_response_gap"
+SELECTED_RESULT_AUTHORITY_REVOKED: Final = "selected_result_authority_revoked"
+
+
+class VisibleResponseGapWire(TypedDict):
+    _kind: Literal["composer_visible_response_gap"]
+    schema: Literal["composer.visible-response-gap.v1"]
+    session_id: str
+    operation_id: str
+    operation_epoch: int
+    provider_call_id: str | None
+    status: str
+    public_call_hash: str
+    reason: str
 
 
 def _hash(text: str) -> str:
@@ -113,7 +127,7 @@ class VisibleToolEvent:
                 continue
             if type(value) is not str:
                 raise AuditIntegrityError("Visible tool evidence requires exact serialized strings")
-            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+            if tool_name == "set_pipeline":
                 value, gap = _inline_custody_safe_text(value)
                 if gap is not None:
                     content[name] = None
@@ -121,7 +135,7 @@ class VisibleToolEvent:
                     continue
                 assert value is not None
             redacted = _redact_sensitive_content(value)
-            if tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+            if tool_name == "set_pipeline":
                 projected_redacted, gap = _inline_custody_safe_text(redacted)
                 if gap is not None:
                     content[name] = None
@@ -212,6 +226,22 @@ class VisibleToolEvent:
             raise AuditIntegrityError("Visible tool event parent can be assigned only by its new P4 row")
         return replace(self, parent_assistant_id=assistant_id)
 
+    def with_authority_revocation(self, display_result: str) -> VisibleToolEvent:
+        """Record that P4 refused the selected result after the model saw it.
+
+        The refusal becomes the event's outcome; the superseded candidate is
+        not retained as replayable visible evidence.
+        """
+        if self.parent_assistant_id is not None:
+            raise AuditIntegrityError("Only an unpersisted visible event may select its display")
+        if type(display_result) is not str:
+            raise TypeError("Visible display must be serialized text")
+        content = json.loads(self.payload_json)
+        content["selected_result"] = None
+        content["availability_gaps"] = [*content["availability_gaps"], SELECTED_RESULT_AUTHORITY_REVOKED]
+        payload = json.dumps(content, ensure_ascii=False)
+        return replace(self, display_result_hash=_hash(display_result), payload_json=payload, payload_hash=_hash(payload))
+
     def to_envelope(self) -> dict[str, Any]:
         return {"_kind": VISIBLE_TOOL_EVENT_KIND, "schema": VISIBLE_TOOL_EVENT_SCHEMA, **asdict(self)}
 
@@ -268,7 +298,7 @@ class VisibleToolEvent:
                 gap.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise AuditIntegrityError("Visible tool event stored payload contains text that is not valid UTF-8") from exc
-        if result.tool_name in {"set_pipeline", "emit_pipeline_proposal"}:
+        if result.tool_name == "set_pipeline":
             for name in ("received_arguments", "effective_arguments", "selected_result"):
                 original = payload[name]
                 if original is not None:
@@ -285,7 +315,7 @@ def visible_response_gap(
     call: ComposerLLMCall,
     context: SessionOperationContext,
     public_call: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> VisibleResponseGapWire:
     """Persist record-scoped missing bytes without claiming operation coverage."""
     if (
         type(call) is not ComposerLLMCall
@@ -293,12 +323,23 @@ def visible_response_gap(
         or context.operation_kind is not SessionOperationKind.COMPOSE
     ):
         raise AuditIntegrityError("Visible response coverage requires actual COMPOSE call custody")
+    return visible_response_gap_for_source(call, capture_provider_audit_source(context), public_call)
+
+
+def visible_response_gap_for_source(
+    call: ComposerLLMCall,
+    source: ProviderAuditSource,
+    public_call: Mapping[str, Any],
+) -> VisibleResponseGapWire:
+    """Project original source labels as DATA, without writer authority."""
+    if type(call) is not ComposerLLMCall or type(source) is not ProviderAuditSource:
+        raise AuditIntegrityError("Visible response source projection requires nominal DATA")
     return {
         "_kind": VISIBLE_RESPONSE_GAP_KIND,
         "schema": "composer.visible-response-gap.v1",
-        "session_id": context.fence.session_id,
-        "operation_id": context.fence.operation_id,
-        "operation_epoch": context.fence.operation_epoch,
+        "session_id": source.session_id,
+        "operation_id": source.operation_id,
+        "operation_epoch": source.operation_epoch,
         "provider_call_id": call.call_id,
         "status": call.status.value,
         "public_call_hash": _hash(json.dumps(deep_thaw(public_call), ensure_ascii=False, sort_keys=True)),

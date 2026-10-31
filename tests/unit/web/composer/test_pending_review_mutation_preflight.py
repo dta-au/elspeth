@@ -7,10 +7,11 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
@@ -144,8 +145,11 @@ async def test_mutation_feedback_checks_real_graph_while_reviews_pending(
         _fake_llm_response(tool_calls=({"id": "request", "name": tool_name, "arguments": arguments},))
     )
     messages = []
+    preferences = await service._require_sessions_service().get_composer_preferences(UUID(session_id))
+    mutation_ceiling = ComposerMutationCeiling(session_id, str(uuid4()), preferences.trust_mode)
     dispatch, _ = await service._dispatch_tool_batch(
         call_model=_CallModelOutcome(completion=completion),
+        mutation_ceiling=mutation_ceiling,
         state=state,
         last_validation=None,
         last_runtime_preflight=None,

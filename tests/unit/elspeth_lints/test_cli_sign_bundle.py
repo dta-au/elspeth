@@ -59,6 +59,8 @@ from elspeth_lints.core.review_bundle import (
 from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _HMAC_KEY = "x" * 32
 _RECORDED_AT = "2024-01-01T00:00:00+00:00"
 _MODEL = "claude-opus-4-7"
@@ -251,6 +253,9 @@ def _bundle(
     bundle_id: str = "sign-bundle-under-test",
 ) -> ReviewBundle:
     repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    # Isolate the fixture before HEAD discovery can find an enclosing checkout.
+    if not (repo / ".git").exists():
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
     if (
         subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
@@ -2210,6 +2215,281 @@ def test_sign_bundle_resume_without_the_flag_stops_on_a_journalled_block(tmp_pat
     assert _canonical_key(alpha) in capsys.readouterr().out
 
 
+def _exact_stale_fixture(tmp_path: Path, *, same_file: bool = False, existing_lock: bool = False) -> tuple[Path, Path, Path, str]:
+    subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    assert Path(subprocess.check_output(["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"], text=True).strip()) == tmp_path
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path, name="enforce_exact_stale")
+    actions = []
+    keys = []
+    for name in ("widget", "sibling"):
+        rel = f"plugins/{name}.py"
+        _write_source(root, rel, name)
+        key = _write_signed_v2_entry(allowlist_dir, f"{name}.yaml", finding=_live_finding(root, rel))
+        _write_source(root, rel, name, active=False)
+        keys.append(key)
+        actions.append(BundleAction(lane="resign", kind="stale_delete", key=key, source_file=f"{name}.yaml"))
+    if same_file:
+        sibling = allowlist_dir / "sibling.yaml"
+        sibling_text = sibling.read_text(encoding="utf-8").removeprefix("allow_hits:\n")
+        sibling_text = sibling_text.replace(f"- key: {keys[1]}\n", f"- key: {keys[1]}\n  # retained sibling comment\n")
+        target = allowlist_dir / "widget.yaml"
+        target.write_text(target.read_text(encoding="utf-8") + sibling_text, encoding="utf-8")
+        sibling.unlink()
+        actions[1] = BundleAction(lane="resign", kind="stale_delete", key=keys[1], source_file="widget.yaml")
+    if existing_lock:
+        (allowlist_dir / ".widget.yaml.lock").write_bytes(b"preserve existing lock bytes\n")
+    _write_source(root, "alpha/mod.py", "alpha")
+    # Keep original bundle indices: the selected orphan is index 1, not 0.
+    actions.insert(0, _new_judgment_action(_live_finding(root, "alpha/mod.py"), "alpha/mod.py"))
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, tuple(actions)))
+    return root, allowlist_dir, bundle_path, keys[0]
+
+
+@pytest.mark.parametrize("same_file", [False, True])
+@pytest.mark.parametrize("existing_lock", [False, True])
+def test_sign_bundle_stale_key_publishes_only_exact_orphan(tmp_path: Path, same_file: bool, existing_lock: bool) -> None:
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path, same_file=same_file, existing_lock=existing_lock)
+    before = _tree_bytes(allowlist_dir)
+    before_modes = {path.relative_to(allowlist_dir).as_posix(): path.stat().st_mode for path in allowlist_dir.rglob("*")}
+
+    with _patch_judge(_accept_all) as judge_calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key)))
+
+    assert rc == 0
+    assert judge_calls == []
+    expected = dict(before)
+    if same_file:
+        sibling_bytes = before["widget.yaml"].split(b"- key: ", 2)[2]
+        expected["widget.yaml"] = b"allow_hits:\n- key: " + sibling_bytes
+    else:
+        expected["widget.yaml"] = b"allow_hits: []\n"
+    assert _tree_bytes(allowlist_dir) == expected
+    after_modes = {path.relative_to(allowlist_dir).as_posix(): path.stat().st_mode for path in allowlist_dir.rglob("*")}
+    assert {name: mode for name, mode in after_modes.items() if name != "widget.yaml"} == {
+        name: mode for name, mode in before_modes.items() if name != "widget.yaml"
+    }
+    assert (allowlist_dir / "widget.yaml").stat().st_mode & 0o7777 == 0o600
+    journals = list((allowlist_dir.parent / ".sign-bundle-transactions").rglob("transaction.json"))
+    assert len(journals) == 1
+    manifest = json.loads(journals[0].read_text())
+    assert manifest["schema_version"] == 2
+    assert manifest["exact_stale"]["index"] == 1
+    assert manifest["exact_stale"]["key"] == key
+    assert manifest["completed_actions"] == [1]
+
+
+@pytest.mark.parametrize("selection", ["missing", "live"])
+def test_sign_bundle_stale_key_refuses_non_orphan_selection(tmp_path: Path, selection: str) -> None:
+    root, allowlist_dir, bundle_path, _key = _exact_stale_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    live_key = json.loads(bundle_path.read_text())["actions"][0]["key"]
+    key = "unknown-exact-key" if selection == "missing" else live_key
+    with _patch_judge(_accept_all) as calls:
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 2
+    assert calls == []
+    assert _tree_bytes(allowlist_dir) == before
+    assert not list((allowlist_dir.parent / ".sign-bundle-transactions").rglob("transaction.json"))
+
+
+def test_sign_bundle_stale_key_still_requires_complete_census(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    payload = json.loads(bundle_path.read_text())
+    del payload["actions"][0]
+    bundle_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = _tree_bytes(allowlist_dir)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 2
+    assert "target census missing justify action" in capsys.readouterr().err
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize("crash_point", ["after_delete", "before_publish"])
+def test_sign_bundle_stale_key_resume_inherits_exact_scope(tmp_path: Path, capsys: pytest.CaptureFixture[str], crash_point: str) -> None:
+    from elspeth_lints.core import cli
+
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    original = cli._execute_stale_delete_action
+
+    def delete_then_interrupt(*args: Any, **kwargs: Any) -> int:
+        original(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    target = (
+        "elspeth_lints.core.cli._execute_stale_delete_action"
+        if crash_point == "after_delete"
+        else ("elspeth_lints.core.sign_bundle_transaction._publish_transaction")
+    )
+    effect = delete_then_interrupt if crash_point == "after_delete" else KeyboardInterrupt
+    with patch(target, side_effect=effect):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 130
+    stderr = capsys.readouterr().err
+    transaction = _recovery_path(stderr)
+    assert "--stale-key" in stderr
+    assert _tree_bytes(allowlist_dir) == before
+    with _patch_judge(_accept_all) as calls:
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction)))) == 0
+    assert calls == []
+    expected = dict(before)
+    expected["widget.yaml"] = b"allow_hits: []\n"
+    assert _tree_bytes(allowlist_dir) == expected
+
+
+@pytest.mark.parametrize("mutation", ["comment", "extra_file", "lock_bytes"])
+def test_sign_bundle_stale_key_refuses_extra_candidate_bytes(tmp_path: Path, mutation: str) -> None:
+    from elspeth_lints.core import cli
+
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path, same_file=True, existing_lock=True)
+    before = _tree_bytes(allowlist_dir)
+    original = cli._execute_stale_delete_action
+
+    def delete_and_mutate(action: Any, *, source_file: str, args: argparse.Namespace) -> int:
+        code = original(action, source_file=source_file, args=args)
+        name = {"comment": "widget.yaml", "extra_file": "unrelated.bin", "lock_bytes": ".widget.yaml.lock"}[mutation]
+        with (args.allowlist_dir / name).open("ab") as handle:
+            handle.write(b"\n# unrelated bytes\n")
+        return code
+
+    with patch("elspeth_lints.core.cli._execute_stale_delete_action", side_effect=delete_and_mutate):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize("mutation", ["key", "index", "owner", "running", "completed_bool", "blocked", "downgrade", "expected"])
+def test_sign_bundle_stale_key_refuses_authenticated_invalid_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], mutation: str
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    with patch("elspeth_lints.core.cli._execute_stale_delete_action", side_effect=KeyboardInterrupt):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    if mutation == "key":
+        manifest["exact_stale"]["key"] = "unknown-key"
+    elif mutation == "index":
+        manifest["exact_stale"]["index"] = 2
+    elif mutation == "owner":
+        manifest["exact_stale"]["source_file"] = "sibling.yaml"
+    elif mutation == "running":
+        manifest["running_action"] = 0
+    elif mutation == "completed_bool":
+        manifest["completed_actions"] = [True]
+    elif mutation == "blocked":
+        manifest["blocked_actions"] = [1]
+    elif mutation == "downgrade":
+        manifest["schema_version"] = 1
+    else:
+        manifest["exact_stale"]["expected_snapshot"]["widget.yaml"] = "0" * 64
+    sign_bundle_transaction.save_manifest(transaction, manifest)
+    with _patch_judge(_accept_all) as calls:
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction)))) == 2
+    assert calls == []
+    assert _tree_bytes(allowlist_dir) == before
+
+
+def test_sign_bundle_stale_key_dry_run_still_requires_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    # Missing paths prove that refusal precedes bundle/tree reads.
+    assert (
+        main(_argv(tmp_path / "absent.json", tmp_path / "source", tmp_path / "allowlist", extra=("--dry-run", "--stale-key", "key"))) == 2
+    )
+
+
+def test_sign_bundle_stale_key_dry_run_writes_nothing(tmp_path: Path) -> None:
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    before = _tree_bytes(tmp_path)
+    with _patch_judge(_accept_all) as calls:
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run", "--stale-key", key))) == 0
+    assert calls == []
+    assert _tree_bytes(tmp_path) == before
+
+
+def test_sign_bundle_stale_key_and_lanes_are_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(_argv(tmp_path / "absent.json", tmp_path, tmp_path / "allowlist", extra=("--stale-key", "key", "--lanes", "resign")))
+    assert exc.value.code == 2
+
+
+def test_sign_bundle_stale_key_refuses_crlf_without_publishing(tmp_path: Path) -> None:
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    target = allowlist_dir / "widget.yaml"
+    target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+    # Bind the complete bundle to the actual CRLF input; refusal must come
+    # from the exact byte contract rather than stale source binding.
+    payload = json.loads(bundle_path.read_text())
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
+    payload.update(source_rev=binding.source_rev, source_dirty=binding.source_dirty, source_snapshot_sha256=binding.source_snapshot_sha256)
+    bundle_path.write_text(json.dumps(payload), encoding="utf-8")
+    before = _tree_bytes(allowlist_dir)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize("scope", ["different_key", "lanes"])
+def test_sign_bundle_stale_key_resume_refuses_explicit_scope_change(tmp_path: Path, capsys: pytest.CaptureFixture[str], scope: str) -> None:
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    with patch("elspeth_lints.core.cli._execute_stale_delete_action", side_effect=KeyboardInterrupt):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    extra = ("--stale-key", "different-key") if scope == "different_key" else ("--lanes", "resign")
+    before = _tree_bytes(allowlist_dir)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction), *extra))) == 2
+    assert _tree_bytes(allowlist_dir) == before
+
+
+@pytest.mark.parametrize("source_drift", ["none", "mismatch", "unavailable"])
+@pytest.mark.parametrize("active_drift", ["none", "comment", "mode", "empty_directory"])
+def test_sign_bundle_stale_key_recovers_after_exchange(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], active_drift: str, source_drift: str
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root, allowlist_dir, bundle_path, key = _exact_stale_fixture(tmp_path)
+    before = _tree_bytes(allowlist_dir)
+    before_modes = {path.relative_to(allowlist_dir).as_posix(): path.stat().st_mode for path in [allowlist_dir, *allowlist_dir.rglob("*")]}
+    original = sign_bundle_transaction.publish_candidate
+
+    def publish_then_interrupt(tx_path: Path, manifest: dict[str, Any]) -> None:
+        original(tx_path, manifest)
+        raise KeyboardInterrupt
+
+    with patch.object(sign_bundle_transaction, "publish_candidate", side_effect=publish_then_interrupt):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--stale-key", key))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    if active_drift == "comment":
+        with (allowlist_dir / "sibling.yaml").open("ab") as handle:
+            handle.write(b"\n# later active writer must be preserved\n")
+    elif active_drift == "mode":
+        (allowlist_dir / "sibling.yaml").chmod(0o640)
+    elif active_drift == "empty_directory":
+        (allowlist_dir / "later-empty-directory").mkdir()
+    published = _tree_bytes(allowlist_dir)
+    published_modes = {
+        path.relative_to(allowlist_dir).as_posix(): path.stat().st_mode for path in [allowlist_dir, *allowlist_dir.rglob("*")]
+    }
+    journal_before = (transaction / sign_bundle_transaction.MANIFEST_NAME).read_bytes()
+    if source_drift == "mismatch":
+        with (root / "alpha/mod.py").open("a", encoding="utf-8") as handle:
+            handle.write("\n# source changed after publication\n")
+    elif source_drift == "unavailable":
+        shutil.rmtree(root)
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+    assert rc == (0 if active_drift == "none" and source_drift == "none" else 2)
+    assert calls == []
+    rolled_back = active_drift == "none" and source_drift != "none"
+    expected_modes = before_modes if rolled_back else published_modes
+    assert {
+        path.relative_to(allowlist_dir).as_posix(): path.stat().st_mode for path in [allowlist_dir, *allowlist_dir.rglob("*")]
+    } == expected_modes
+    assert _tree_bytes(allowlist_dir) == (before if rolled_back else published)
+    if active_drift != "none":
+        assert (transaction / sign_bundle_transaction.MANIFEST_NAME).read_bytes() == journal_before
+
+
 def test_sign_bundle_lanes_resign_only_never_judges_and_publishes_deterministic_work(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2989,7 +3269,7 @@ def test_sign_bundle_source_observation_oserror_is_normal_verify_failure_without
     before = _tree_bytes(allowlist_dir)
 
     with (
-        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        patch("elspeth_lints.core.trusted_git.subprocess.Popen", side_effect=OSError("git unavailable")),
         patch("elspeth_lints.core.sign_bundle_transaction.create_transaction") as create_transaction,
     ):
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
@@ -3381,7 +3661,50 @@ def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
 
     assert rc == 0
     assert not any("regen_fingerprint_baseline.py" in str(call) for call in calls)
-    assert "canonical-allowlist-only" in capsys.readouterr().out
+    assert "baseline regeneration deferred" in capsys.readouterr().out
+
+
+def test_sign_bundle_canonical_success_does_not_launch_repository_regeneration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Canonical publication must not start repository code with signing authority."""
+    root = tmp_path / "src" / "elspeth"
+    root.mkdir(parents=True)
+    allowlist_dir = _build_allowlist_dir(tmp_path / "config" / "cicd", name="enforce_tier_model")
+    regen_script = tmp_path / "scripts" / "cicd" / "regen_fingerprint_baseline.py"
+    regen_script.parent.mkdir(parents=True)
+    regen_script.write_text("raise AssertionError('repository maintenance must not execute')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "elspeth_lints.core.cli.__file__",
+        str(tmp_path / "elspeth-lints" / "src" / "elspeth_lints" / "core" / "cli.py"),
+    )
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+    )
+    bundle_path = _write_bundle_file(tmp_path, bundle)
+    forbidden_launches: list[tuple[object, bool]] = []
+    real_run = subprocess.run
+
+    def observe_run(*args: Any, **kwargs: Any) -> Any:
+        if args and str(regen_script) in args[0]:
+            child_env = kwargs.get("env", os.environ)
+            forbidden_launches.append((args[0], "ELSPETH_JUDGE_METADATA_HMAC_KEY" in child_env))
+            return subprocess.CompletedProcess(args[0], 0)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", observe_run)
+
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 0
+    assert orphan_key not in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert forbidden_launches == []
+    assert "baseline regeneration deferred" in capsys.readouterr().out
 
 
 def test_sign_bundle_resume_rejects_candidate_and_manifest_co_tamper(

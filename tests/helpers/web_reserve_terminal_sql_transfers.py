@@ -18,11 +18,14 @@ TERMINAL = "_run_composer_terminal_sql"
 COMPLETE = "complete_composer_async_operation"
 FAIL = "fail_composer_async_operation"
 GRAMMARS = {
-    TERMINAL: "a10083507d0d46ac9dae642785ff99692edad99350d2917862c2f9ff045c4300",
-    COMPLETE: "4947b18fec56b611b18c552727355de19b281da98f24f27f207e109f27cddd0a",
-    FAIL: "722ac4ab6f9aee7a02e7750b20ca7fe9ef5e2113799beb1891fbeac045dc2644",
+    TERMINAL: "b9434496ecd1693abf1c49209a7c1f9b0aaf3a79ca96191bc01465399e9dfe9c",
+    COMPLETE: "c3a5979ae7d9e64d630b8b1b1d0032f93e28f165f8787ea4ccc4251f07252c67",
+    FAIL: "d9a28db1e77ac3fe1a9c9c8f945ce2b5a6555da0188654df739f141136bf3c13",
 }
-NAMESPACE_GRAMMAR = "58e64107f0a28ec8e1f832994517b743e68dd9f2562ec387287dbf9e57614621"
+# Current finite declaration includes the continuation P4/title methods and
+# nullable audit parameters. Every evaluated header/default stays in the hash;
+# the three invoked SQL bodies and their caller transfers are separate below.
+NAMESPACE_GRAMMAR = "70f64aefecae8ac4379e4dd7cffb8b8111037aaa92cccd4289307ebfee383003"
 MASK = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
 SUPPLIERS = (
     ("RequiredWorkCoordinator", "elspeth.web.required_work", REQUIRED),
@@ -55,6 +58,63 @@ def namespace_grammar(class_node):
             return node
 
     return grammar(Headers().visit(copy_ast_fields(class_node)))
+
+
+def _p4_declaration_header_failures(cls):
+    """Bind the reviewed P4 declaration delta, never grant its method bodies."""
+    expected = {
+        "_readback_continuation_p4_transaction": (
+            "def _readback_continuation_p4_transaction(self, observation: P4WriterObservation, *, "
+            "original: BaseException, env_ref_names: frozenset[str]) -> AuditOutcome | None:\n pass"
+        ),
+        "_retain_unavailable_continuation_p4": (
+            "def _retain_unavailable_continuation_p4(self, continuation: ContinuationOwnerCommit, *, "
+            "prepared: PreparedP4Value | None, outcome: AuditOutcome, env_ref_names: frozenset[str], "
+            "observation: P4WriterObservation | None) -> AuditOutcome:\n pass"
+        ),
+        "fail_continuation_tool_operation": (
+            "async def fail_continuation_tool_operation(self, running: ComposerOperationRunning, *, "
+            "required_work: RequiredWorkCoordinator, failure_projection_work: RequiredWorkTicket, "
+            "env_ref_names: frozenset[str], original: BaseException | None = None, "
+            "custody: ContinuationToolFailureCustody | None = None) -> CommittedContinuationFailure:\n pass"
+        ),
+    }
+    failures = []
+    for name, source in expected.items():
+        methods = [node for node in cls.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
+        if len(methods) != 1:
+            failures.append("terminal SQL transfer: reviewed P4 declaration missing " + name)
+            continue
+        header = copy_ast_fields(methods[0])
+        header.body = [ast.Pass()]
+        if ast.dump(header, include_attributes=False) != ast.dump(ast.parse(source).body[0], include_attributes=False):
+            failures.append("terminal SQL transfer: reviewed P4 declaration header changed " + name)
+    observation = ast.parse("P4WriterObservation | None", mode="eval").body
+    for name in ("persist_compose_turn", "persist_continuation_compose_turn"):
+        methods = [node for node in cls.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
+        if len(methods) != 1:
+            failures.append("terminal SQL transfer: reviewed P4 declaration missing " + name)
+            continue
+        method = methods[0]
+        fields = [
+            (argument, default)
+            for argument, default in zip(method.args.kwonlyargs, method.args.kw_defaults, strict=True)
+            if argument.arg == "continuation_observation"
+        ]
+        if (
+            len(fields) != 1
+            or fields[0][0].annotation is None
+            or ast.dump(fields[0][0].annotation, include_attributes=False) != ast.dump(observation, include_attributes=False)
+            or not isinstance(fields[0][1], ast.Constant)
+            or fields[0][1].value is not None
+        ):
+            failures.append("terminal SQL transfer: reviewed P4 observation input changed " + name)
+        returned = "AuditOutcome" if name == "persist_compose_turn" else "RequiredSQLFinishOnce[CommittedContinuationP4]"
+        if method.returns is None or ast.dump(method.returns, include_attributes=False) != ast.dump(
+            ast.parse(returned, mode="eval").body, include_attributes=False
+        ):
+            failures.append("terminal SQL transfer: reviewed P4 return annotation changed " + name)
+    return failures
 
 
 def chain(node):
@@ -344,6 +404,7 @@ def terminal_sql_local_contracts(units):
     cls, _ = find(tree, CLASS)
     if not isinstance(cls, ast.ClassDef) or not owned_origin(tree, CLASS, cls):
         return ["terminal SQL transfer: current service class source origin changed"], receipt
+    failures.extend(_p4_declaration_header_failures(cls))
     for path in sorted(required_paths):
         if not _postponed_annotations(index[path].tree):
             failures.append("terminal SQL transfer: unsupported selected source annotation mode " + path)

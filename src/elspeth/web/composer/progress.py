@@ -497,13 +497,13 @@ async def emit_progress(
 
 
 def model_call_progress_event(message: str) -> ComposerProgressEvent:
-    headline = "I'm asking the model to choose the next safe pipeline update."
-    normalized = message.lower()
-    if "html" in normalized and "json" in normalized:
-        headline = "I'm asking the model to choose an HTML input and JSON output."
+    """Describe provider dispatch without inferring the requested action.
+
+    Keep ``message`` for existing callers; progress copy is independent of it.
+    """
     return ComposerProgressEvent(
         phase="calling_model",
-        headline=headline,
+        headline="I'm asking the model to respond using the prepared pipeline context.",
         evidence=("The composer is using the prepared prompt and visible pipeline state.",),
         likely_next="The model may answer directly or request safe pipeline tools.",
     )

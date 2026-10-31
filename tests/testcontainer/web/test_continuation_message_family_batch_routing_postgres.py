@@ -1,0 +1,13 @@
+"""Same selected historical batch routing oracles on real PostgreSQL."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_message_family_batch_routing import (
+    test_actual_selected_tool_batch_payload_preserves_complete_historical_roots as test_actual_selected_tool_batch_payload_preserves_complete_historical_roots,
+)
+from tests.unit.web.sessions.test_continuation_message_family_batch_routing import (
+    test_selected_batch_routing_refuses_changed_real_binding_after_positive as test_selected_batch_routing_refuses_changed_real_binding_after_positive,
+)
+
+pytestmark = pytest.mark.testcontainer

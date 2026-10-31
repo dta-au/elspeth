@@ -26,7 +26,6 @@ import pytest
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -382,17 +381,16 @@ def _dispatch(tool_name: str, arguments: dict[str, Any], state: CompositionState
     "node_factory, error_code",
     [(_batch_plugin_as_transform, "batch_transform_misplaced"), (_aggregation_with_required_fields, "batch_required_fields_invalid")],
 )
-def test_batch_candidate_feedback_preserves_specific_private_repair_classification(node_factory, error_code: str) -> None:
+def test_batch_candidate_refusal_preserves_specific_repair_classification(node_factory, error_code: str) -> None:
     state = _linear_state()
     context = _context()
-    candidate = build_set_pipeline_candidate(_set_pipeline_arguments(node_factory()), state, context)
-    feedback = _allowlisted_candidate_feedback(candidate.result)
+    result = _dispatch("set_pipeline", _set_pipeline_arguments(node_factory()), state, context)
 
-    assert candidate.acceptable is False
-    assert candidate.result.updated_state is state
-    leading = feedback["validation"]["errors"][0]
-    assert leading["error_code"] == error_code
-    assert "detail" not in leading
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.validation.errors[0].error_code == error_code
+    assert result.validation_guidance is not None
+    leading = result.validation_guidance["codes"][error_code]
     guidance = explain_validation_code(error_code)
     assert guidance is not None
     assert (leading["explanation"], leading["suggested_fix"]) == guidance
@@ -402,7 +400,7 @@ def test_batch_candidate_feedback_preserves_specific_private_repair_classificati
     else:
         assert "Read the message" not in leading["suggested_fix"]
         assert "node_type='aggregation'" in leading["suggested_fix"]
-    assert candidate.result.validation.errors[0].message not in str(feedback)
+    assert result.to_dict()["validation"]["errors"][0]["error_code"] == error_code
 
     corrected = _aggregation_with_required_fields()
     corrected["options"].pop("required_input_fields")
@@ -574,12 +572,12 @@ def test_splice_validation_rejection_forwards_the_candidate_errors_through_dispa
     assert contract_entries[0].rejected_component == "node:inserted"
     assert "ghost_field" in contract_entries[0].message
 
-    # The one-shot planner's feedback keeps only rejection entries; the
-    # forwarded code must survive that gate, attributed to the inserted node.
-    feedback = _allowlisted_candidate_feedback(result)
-    projected = [(entry["component"], entry["error_code"]) for entry in feedback["validation"]["errors"]]
-    assert projected[0] == ("rejected_mutation", "splice_validation_failed")
-    assert ("node:inserted", "schema_contract_violation") in projected
+    # The live tool envelope preserves the rejected component attribution.
+    projected = result.to_dict()["validation"]["errors"]
+    assert (projected[0]["component"], projected[0]["error_code"]) == ("rejected_mutation", "splice_validation_failed")
+    (contract_wire,) = [entry for entry in projected if entry["error_code"] == "schema_contract_violation"]
+    assert contract_wire["component"] == "rejected_mutation"
+    assert contract_wire["rejected_component"] == "node:inserted"
 
 
 def test_splice_validation_rejection_does_not_forward_errors_the_pre_state_already_had() -> None:

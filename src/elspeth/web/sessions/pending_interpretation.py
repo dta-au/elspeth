@@ -610,22 +610,6 @@ def _source_data_contract_demand_from_state_record(
     return source_name, demand
 
 
-# Prefixes (case-insensitive) that, when they appear immediately before the
-# placeholder, indicate the LLM placed the placeholder inside a structural
-# directive rather than in the prompt body. Substituting the user's
-# accepted_value into a structural-directive position would produce a
-# broken prompt at runtime — fail closed.
-#
-# CLOSED LIST — extending this set is a governance action for the
-# prompt-template patch helper. Any new prefix must be paired with a
-# direct-helper unit test and a writer-path audit.
-_STRUCTURAL_DIRECTIVE_PREFIXES: tuple[str, ...] = (
-    "system:",
-    "role:",
-    "instructions:",
-)
-
-
 @trust_boundary(
     tier=3,
     source=(
@@ -765,14 +749,6 @@ def _patch_structured_interpretation_prompt(
             )
         stored_requirement = requirements_by_id[requirement_id]
         if requirement_id == matching_requirement_id:
-            prefix_lower = "".join(rendered).rstrip().lower()
-            for directive in _STRUCTURAL_DIRECTIVE_PREFIXES:
-                if prefix_lower.endswith(directive):
-                    raise InterpretationPlaceholderConsumedError(
-                        f"_patch_llm_transform_prompt: interpretation requirement {requirement_id!r} in node "
-                        f"{affected_node_id!r} is immediately preceded by structural directive {directive!r}; "
-                        f"substituting into a directive position would produce a broken prompt"
-                    )
             matched_ref_count += 1
             rendered.append(accepted_value)
             continue
@@ -871,9 +847,11 @@ def _patch_llm_transform_prompt(
     * the affected node has no ``options`` mapping;
     * ``options.prompt_template`` is missing or not a string;
     * the prompt template does not contain the expected placeholder;
-    * the placeholder appears more than once in the template;
-    * the prefix immediately before the placeholder matches (case-insensitive)
-      any of :data:`_STRUCTURAL_DIRECTIVE_PREFIXES`.
+    * the placeholder appears more than once in the template.
+
+    Prompt labels remain text in the user prompt template. Provider message
+    roles come from the separate runtime configuration, while the caller
+    validates the accepted value and binds it to the reviewed prompt.
 
     The helper is pure (no DB IO). It is called from
     :meth:`SessionServiceImpl.resolve_interpretation_event` BEFORE the
@@ -968,22 +946,6 @@ def _patch_llm_transform_prompt(
                 f"the placeholder must appear exactly once"
             )
         placeholder_match = placeholder_matches[0]
-
-        # Structural-directive guard: the substring ending at the placeholder
-        # is the "prefix immediately before". We strip trailing whitespace
-        # (so "System: {{...}}" is caught even though there's a space before
-        # the placeholder) and compare case-insensitively against the closed
-        # prefix list.
-        prefix = template[: placeholder_match.start()].rstrip()
-        prefix_lower = prefix.lower()
-        for directive in _STRUCTURAL_DIRECTIVE_PREFIXES:
-            if prefix_lower.endswith(directive):
-                raise InterpretationPlaceholderConsumedError(
-                    f"_patch_llm_transform_prompt: placeholder {placeholder!r} in node "
-                    f"{affected_node_id!r} is immediately preceded by structural "
-                    f"directive {directive!r}; substituting into a directive position "
-                    f"would produce a broken prompt"
-                )
 
         # Patch is a single span replacement; we already verified exactly one
         # matching placeholder so this is unambiguous. The resolved string is written

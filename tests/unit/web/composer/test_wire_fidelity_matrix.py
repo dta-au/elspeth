@@ -3,7 +3,7 @@
 Every test here is a **characterization**: it pins what LiteLLM 1.102's
 adapters put on the wire today, so each row is green on arrival. The rows
 answer one question per route family: does the ``function.strict`` stamp
-that ELSPETH builds (``openai_strict`` dialect: ``true`` on the 35
+that ELSPETH builds (``openai_strict`` dialect: ``true`` on the 36
 strict-capable tools, an explicit ``false`` on the 10 option tools) reach
 the transmitted body unchanged, and does the ``none`` list (no ``strict``
 key) stay today's bytes?
@@ -30,7 +30,7 @@ Every request is built the way production builds it: the route is resolved
 by :func:`resolve_composer_tool_contract` under the row's **named**
 ``composer_strict_tools`` setting, the tool list is the one for the
 resolved dialect, and the kwargs come from
-``build_composer_loop_request_kwargs`` or ``build_planner_request_kwargs``.
+``build_composer_loop_request_kwargs``.
 A loopback base is a custom endpoint, which resolves to ``none`` under
 ``preferred`` (rows 5 and 8), and hosted OpenAI and Azure are ``none`` under
 ``preferred`` too (ruling 7). So each row that measures adapter forwarding
@@ -67,8 +67,6 @@ import pytest
 import respx
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer.capability_skill import PLANNER_TERMINAL_TOOL_NAME
-from elspeth.web.composer.pipeline_planner import build_planner_request_kwargs, planner_tool_definitions
 from elspeth.web.composer.provider_gateway import build_composer_loop_request_kwargs, composer_loop_tool_definitions
 from elspeth.web.composer.strict_transport import (
     StrictTransport,
@@ -377,8 +375,8 @@ def _count(flags: Mapping[str, object], value: object) -> int:
 
 
 def _assert_openai_strict_stamps(flags: Mapping[str, object], *, synthetic: int = 0) -> None:
-    """The ``openai_strict`` loop list: 35 ``true``, 10 ``false``, and the unstamped synthetic tools."""
-    assert _count(flags, True) == 35
+    """The ``openai_strict`` loop list: 36 ``true``, 10 ``false``, and the unstamped synthetic tools."""
+    assert _count(flags, True) == 36
     assert _count(flags, False) == 10
     assert sum(1 for flag in flags.values() if flag == _ABSENT) == synthetic
 
@@ -427,36 +425,7 @@ def test_openrouter_preferred_control_sends_no_strict_key(loopback: _Loopback) -
     recorded = _send_loopback(loopback, request.kwargs)
 
     assert recorded.body["tools"] == request.sent_tools
-    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=45)
-
-
-def test_openrouter_planner_list_forwards_its_stamps(loopback: _Loopback) -> None:
-    """Characterization: the planner's request (``build_planner_request_kwargs``) forwards 22 ``true`` and the terminal ``false``."""
-    settings = _route_settings(_OPENROUTER_MODEL, f"{loopback.base}/api/v1", "forward_to_endpoint")
-    contract = resolve_composer_tool_contract(settings, env=os.environ)
-    assert contract.planner.resolution.transport is StrictTransport.FORWARDING
-    tools = planner_tool_definitions(dialect=contract.planner.dialect)
-    sent = copy.deepcopy(tools)
-    kwargs = build_planner_request_kwargs(
-        model=settings.composer_model,
-        messages=list(_MESSAGES),
-        tools=tools,
-        max_completion_tokens=16,
-        temperature=None,
-        seed=None,
-        reasoning_effort="low",
-        api_base=settings.composer_endpoint_base_url,
-        api_key=_FAKE_KEY,
-    )
-
-    recorded = _send_loopback(loopback, kwargs)
-
-    assert recorded.body["tools"] == sent
-    flags = _strict_flags(_chat_functions(recorded.body))
-    assert flags == _sent_flags(sent)
-    assert flags.pop(PLANNER_TERMINAL_TOOL_NAME) is False
-    assert len(flags) == 22
-    assert set(flags.values()) == {True}
+    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=46)
 
 
 def test_openai_prefix_with_an_openrouter_host_resolves_forwarding() -> None:
@@ -479,7 +448,7 @@ def test_openai_prefix_with_an_openrouter_host_resolves_forwarding() -> None:
 
 @pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
 def test_openai_compatible_custom_base_forwards_the_stamps(loopback: _Loopback, model: str) -> None:
-    """Characterization, row 8 under ``forward_to_endpoint``: 35 ``true`` and 10 ``false`` reach the wire."""
+    """Characterization, row 8 under ``forward_to_endpoint``: 36 ``true`` and 10 ``false`` reach the wire."""
     request = _loop_request(_route_settings(model, f"{loopback.base}/v1", "forward_to_endpoint"))
     assert request.transport is StrictTransport.FORWARDING
 
@@ -499,7 +468,7 @@ def test_openai_compatible_custom_base_preferred_control_sends_no_strict_key(loo
 
     recorded = _send_loopback(loopback, request.kwargs)
 
-    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=45)
+    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=46)
 
 
 @pytest.mark.parametrize("model", ["openai/gpt-4.1", "gpt-5.5"])
@@ -508,7 +477,7 @@ def test_openai_compatible_chat_drops_an_ecma_only_pattern(loopback: _Loopback, 
 
     The same synthetic tool reaches the wire verbatim on OpenRouter
     (``test_openrouter_forwards_the_stamped_list_verbatim``). The
-    transformation is LiteLLM's regex sanitiser; the 35 strict tools carry
+    transformation is LiteLLM's regex sanitiser; the 36 strict tools carry
     no ``pattern`` (the ``pattern_census`` measurement), so it does not
     touch them.
     """
@@ -562,7 +531,7 @@ def test_hosted_openai_chat_preferred_control_sends_no_strict_key() -> None:
 
     body = _send_hosted(request.kwargs, _HOSTED_CHAT_URL)
 
-    _assert_no_strict_key(_strict_flags(_chat_functions(body)), tool_count=45)
+    _assert_no_strict_key(_strict_flags(_chat_functions(body)), tool_count=46)
 
 
 def test_hosted_responses_bridge_forwards_the_stamps() -> None:
@@ -590,12 +559,12 @@ def test_hosted_responses_bridge_writes_strict_null_for_an_unstamped_list(settin
     """
     request = _loop_request(_route_settings("gpt-5.5", None, setting))
     assert request.transport is StrictTransport.NONE
-    _assert_no_strict_key(_sent_flags(request.sent_tools), tool_count=45)
+    _assert_no_strict_key(_sent_flags(request.sent_tools), tool_count=46)
 
     body = _send_hosted(request.kwargs, _HOSTED_RESPONSES_URL)
 
     flags = _strict_flags(_responses_tools(body))
-    assert len(flags) == 45
+    assert len(flags) == 46
     assert set(flags.values()) == {None}
 
 
@@ -638,7 +607,7 @@ def test_azure_chat_preferred_control_sends_no_strict_key(loopback: _Loopback, m
 
     recorded = _send_loopback(loopback, request.kwargs)
 
-    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=45)
+    _assert_no_strict_key(_strict_flags(_chat_functions(recorded.body)), tool_count=46)
 
 
 def test_azure_chat_flattens_a_root_one_of(loopback: _Loopback, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -692,12 +661,12 @@ def test_azure_responses_bridge_preferred_control_writes_strict_null(loopback: _
     monkeypatch.delenv("AZURE_API_VERSION", raising=False)
     request = _loop_request(_azure_settings("azure/gpt-5.5", loopback.base, "preferred"))
     assert request.transport is StrictTransport.NONE
-    _assert_no_strict_key(_sent_flags(request.sent_tools), tool_count=45)
+    _assert_no_strict_key(_sent_flags(request.sent_tools), tool_count=46)
 
     recorded = _send_loopback(loopback, request.kwargs)
 
     flags = _strict_flags(_responses_tools(recorded.body))
-    assert len(flags) == 45
+    assert len(flags) == 46
     assert set(flags.values()) == {None}
 
 
@@ -722,7 +691,7 @@ def test_native_anthropic_drops_a_forced_strict_stamp(loopback: _Loopback) -> No
     recorded = _send_loopback(loopback, request.kwargs)
 
     assert recorded.path == "/v1/messages"
-    _assert_no_strict_key(_strict_flags(_anthropic_tools(recorded.body)), tool_count=45)
+    _assert_no_strict_key(_strict_flags(_anthropic_tools(recorded.body)), tool_count=46)
 
 
 def test_native_anthropic_resolved_list_control(loopback: _Loopback) -> None:
@@ -740,7 +709,7 @@ def test_native_anthropic_resolved_list_control(loopback: _Loopback) -> None:
 
     flags = _strict_flags(_anthropic_tools(recorded.body))
     assert flags == _sent_flags(request.sent_tools)
-    _assert_no_strict_key(flags, tool_count=45)
+    _assert_no_strict_key(flags, tool_count=46)
 
 
 # ---------------------------------------------------------------------------
@@ -781,5 +750,5 @@ def test_bedrock_converse_enum_null(
 
     assert recorded.path == f"/model/{_BEDROCK_MODEL.removeprefix('bedrock/')}/converse"
     specs = _converse_tool_specs(recorded.body)
-    _assert_no_strict_key(_strict_flags(specs), tool_count=46)
+    _assert_no_strict_key(_strict_flags(specs), tool_count=47)
     assert specs["zz_enum"]["inputSchema"]["json"]["properties"]["e"] == {"enum": expected_on_wire}

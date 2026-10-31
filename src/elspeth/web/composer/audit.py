@@ -75,6 +75,8 @@ from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.composer.withheld_replies import WithheldReply, WithheldReplyOrigin
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, RecorderSnapshot
+    from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation
     from elspeth.web.composer.provider_quota import ProviderCallCustody
 
 
@@ -295,12 +297,85 @@ class BufferingRecorder(
         self._private_authorings: dict[str, PrivateToolAuthoring] = {}
         self._lock = threading.Lock()
 
+    def snapshot_for_continuation(self, *, drained: RecorderDrainCursors) -> RecorderSnapshot:
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot, RetainedVisibleLink
+
+        with self._lock:
+            invocations = tuple(self._invocations)
+            links = []
+            for invocation, event in self._visible_tool_events:
+                indexes = tuple(index for index, item in enumerate(invocations) if item is invocation)
+                if len(indexes) != 1:
+                    raise AuditIntegrityError("visible event does not own exactly one buffered invocation")
+                links.append(RetainedVisibleLink(indexes[0], event))
+            snapshot = RecorderSnapshot(
+                invocations=invocations,
+                llm_calls=tuple(self._llm_calls),
+                planner_attempts=tuple(self._planner_attempts),
+                withheld_replies=tuple(self._withheld_replies),
+                visible_tool_events=tuple(links),
+                private_candidates=tuple(self._private_candidates),
+                private_authorings=tuple(self._private_authorings.values()),
+                drained=drained,
+            )
+        snapshot.validate_links_and_cursors()
+        return snapshot
+
+    @classmethod
+    def for_continuation(cls, snapshot: RecorderSnapshot) -> tuple[BufferingRecorder, RecorderDrainCursors]:
+        from elspeth.web.composer.continuation_audit_buffer import RecorderSnapshot
+
+        if type(snapshot) is not RecorderSnapshot:
+            raise TypeError("audit buffer restoration requires its owned snapshot")
+        snapshot.validate_links_and_cursors()
+        owner = cls()
+        owner._invocations = list(snapshot.invocations)
+        owner._llm_calls = list(snapshot.llm_calls)
+        owner._planner_attempts = list(snapshot.planner_attempts)
+        owner._withheld_replies = list(snapshot.withheld_replies)
+        owner._visible_tool_events = [(owner._invocations[link.invocation_index], link.event) for link in snapshot.visible_tool_events]
+        owner._private_candidates = list(snapshot.private_candidates)
+        owner._private_authorings = {item.tool_call_id: item for item in snapshot.private_authorings}
+        return owner, snapshot.drained
+
+    def restore_received_llm_call(self, call: ComposerLLMCall) -> None:
+        from elspeth.web.composer.continuation_provider_outcomes import encode_physical_audit_call
+
+        if type(call) is not ComposerLLMCall or call.call_id is None:
+            raise AuditIntegrityError("historical received audit has no actual complete physical identity")
+        canonical = encode_physical_audit_call(call)
+        with self._lock:
+            existing = tuple(item for item in self._llm_calls if item.call_id == call.call_id)
+            if existing:
+                if len(existing) != 1 or encode_physical_audit_call(existing[0]) != canonical:
+                    raise AuditIntegrityError("one physical identity contains different complete historical audits")
+                return
+            self._llm_calls.append(call)
+
     def record(self, invocation: ComposerToolInvocation) -> None:
         with self._lock:
-            authoring = self._private_authorings.get(invocation.tool_call_id)
-            if authoring is not None:
-                invocation = replace(invocation, private_authoring=authoring)
-            self._invocations.append(invocation)
+            self._append_invocation_locked(invocation)
+
+    def _append_invocation_locked(
+        self, invocation: ComposerToolInvocation, *, observation: ContinuationDispatchFailureObservation | None = None
+    ) -> ComposerToolInvocation:
+        authoring = self._private_authorings.get(invocation.tool_call_id)
+        if authoring is not None:
+            invocation = replace(invocation, private_authoring=authoring)
+        if observation is not None:
+            observation.stored = invocation
+        self._invocations.append(invocation)
+        return invocation
+
+    def record_with_failure_observation(
+        self, invocation: ComposerToolInvocation, observation: ContinuationDispatchFailureObservation
+    ) -> None:
+        observation.require(self, observation.audit)
+        observation.observe_constructed_invocation(invocation)
+        with self._lock:
+            stored = self._append_invocation_locked(invocation, observation=observation)
+            observation.stored = stored
+            observation.appended = True
 
     def record_private_tool_authoring(self, authoring: PrivateToolAuthoring) -> None:
         """Bind receipt stages before any invocation can escape through unwind."""
@@ -793,6 +868,8 @@ def begin_dispatch_or_arg_error(
 def rebind_dispatch_arguments(
     audit: DispatchAudit,
     arguments: Mapping[str, Any],
+    *,
+    failure_observation: ContinuationDispatchFailureObservation | None = None,
 ) -> DispatchAudit:
     """Bind an open dispatch envelope to final custody-safe arguments.
 
@@ -800,13 +877,27 @@ def rebind_dispatch_arguments(
     before validation.  Only the authority-bearing argument canonicalization
     changes, before custody I/O or any durable proposal write occurs.
     """
-    return replace(
+    if failure_observation is not None:
+        from elspeth.web.composer.continuation_tool_failure import ContinuationDispatchFailureObservation
+
+        if type(failure_observation) is not ContinuationDispatchFailureObservation:
+            raise AuditIntegrityError("dispatch rebind requires its nominal prebound observation")
+        failure_observation.require(failure_observation.owner.recorder, audit)
+        failure_observation.require_rebind_open(audit)
+    rebound = replace(
         audit,
         arguments_canonical=canonical_json(arguments),
         arguments_hash=stable_hash(arguments),
         authority_arguments_canonical=(composer_authority_canonical_json(arguments) if audit.tool_name == "set_pipeline" else None),
         authority_arguments_hash=composer_authority_hash(arguments) if audit.tool_name == "set_pipeline" else None,
     )
+    if failure_observation is not None:
+        # Only this canonical owner constructs and installs the new audit.
+        # The observer has no API that accepts an arbitrary replacement.
+        failure_observation.rebinds.append(audit)
+        failure_observation.audit = rebound
+        failure_observation.owner.call.audit = rebound
+    return rebound
 
 
 def finish_success(
@@ -1067,6 +1158,7 @@ async def dispatch_with_audit(
     do_dispatch: Callable[[], Awaitable[Any]],
     version_after_provider: Callable[[Any], int],
     arg_error_payload_factory: Callable[[ToolArgumentError], Mapping[str, Any]],
+    failure_observation: ContinuationDispatchFailureObservation | None = None,
 ) -> DispatchOutcome:
     """Run a tool dispatch under the audit envelope.
 
@@ -1169,6 +1261,10 @@ async def dispatch_with_audit(
     # taken; ``status is None`` after finally entry means an unanticipated
     # ``BaseException`` propagated past the typed handlers and the
     # finally block must reconstruct the exception via ``sys.exc_info``.
+    if failure_observation is not None:
+        if type(recorder) is not BufferingRecorder:
+            raise AuditIntegrityError("V2 dispatch observation requires its actual buffering recorder")
+        failure_observation.require(recorder, audit)
     status: ComposerToolStatus | None = None
     success_result: Any = None
     success_version_after: int | None = None
@@ -1185,6 +1281,8 @@ async def dispatch_with_audit(
             # safe-by-construction message: see the ToolArgumentError
             # docstring in protocol.py. Capture here; record in finally.
             status = ComposerToolStatus.ARG_ERROR
+            if failure_observation is not None:
+                failure_observation.observe_feedback(exc)
             arg_error_exc = exc
             arg_error_payload = arg_error_payload_factory(exc)
             raise
@@ -1198,6 +1296,8 @@ async def dispatch_with_audit(
             # class of failure.
             status = ComposerToolStatus.PLUGIN_CRASH
             crash_exc = narrow_exc
+            if failure_observation is not None:
+                failure_observation.observe_execution_failure(narrow_exc)
             raise
         except Exception as plugin_exc:
             # General PLUGIN_CRASH path — caller wraps with
@@ -1205,6 +1305,8 @@ async def dispatch_with_audit(
             # recorder buffer through to the route handler.
             status = ComposerToolStatus.PLUGIN_CRASH
             crash_exc = plugin_exc
+            if failure_observation is not None:
+                failure_observation.observe_execution_failure(plugin_exc)
             raise
 
         # SUCCESS path. The final recorder.record(...) lives in
@@ -1214,68 +1316,135 @@ async def dispatch_with_audit(
         # ``finally`` clause records PLUGIN_CRASH and re-raises (see the
         # try/except around finish_success below), so a canonicalization
         # failure cannot skip the audit record.
+        if failure_observation is not None:
+            failure_observation.observe_returned(result)
         success_result = result
         success_version_after = version_after_provider(result)
         status = ComposerToolStatus.SUCCESS
         return DispatchOutcome(result=result, version_after=success_version_after)
     finally:
-        # Single record point — fires on every exit, including
-        # BaseException subclasses (CancelledError, SystemExit,
-        # KeyboardInterrupt, GeneratorExit) that the typed except
-        # handlers above do not catch. ``status`` is ``None`` exactly
-        # when such an exception is propagating; we reconstruct it via
-        # sys.exc_info() and record CANCELLED for coordinator cancellation
-        # or PLUGIN_CRASH for other BaseException subclasses before it leaves.
-        if status is None:
-            current_exc = sys.exc_info()[1]
-            # Offensive guard: status==None with no propagating
-            # exception is structurally impossible — every successful
-            # path assigns SUCCESS before the return statement
-            # evaluates the finally block. If we reach this branch
-            # without an exception, an audit row would be dropped
-            # silently — fail loudly instead.
-            if current_exc is None:
-                raise RuntimeError(
-                    "dispatch_with_audit: finally entered with status=None and no propagating exception — audit invariant violated"
-                )
-            if isinstance(current_exc, asyncio.CancelledError):
-                recorder.record(finish_cancelled(audit, exc=current_exc))
-            else:
-                recorder.record(finish_plugin_crash(audit, exc=current_exc))
-        elif status is ComposerToolStatus.SUCCESS:
-            # success_version_after was assigned alongside status.
-            # Offensive guard: the dataclass requires ``int`` here, so
-            # a None would crash on construction; mypy prefers the
-            # explicit narrow.
-            if success_version_after is None:
-                raise RuntimeError("dispatch_with_audit: SUCCESS status with no version_after captured")
+        if failure_observation is not None:
+            current = sys.exc_info()[1]
+            if current is not None and not (status is ComposerToolStatus.ARG_ERROR and current is arg_error_exc):
+                failure_observation.observe_primary(current)
             try:
-                invocation = finish_success(
-                    audit,
-                    result_payload=_result_to_audit_payload(success_result),
-                    version_after=success_version_after,
-                )
-            except Exception as exc:
-                recorder.record(finish_plugin_crash(audit, exc=exc))
-                raise
-            recorder.record(invocation)
-        elif status is ComposerToolStatus.ARG_ERROR:
-            if arg_error_exc is None:
-                raise RuntimeError("dispatch_with_audit: ARG_ERROR status with no captured exception")
-            safe_message = arg_error_exc.args[0] if arg_error_exc.args else "tool argument error"
-            recorder.record(
-                finish_arg_error(
-                    audit,
-                    error_class=type(arg_error_exc).__name__,
-                    error_category=arg_error_exc.category,
-                    error_message=str(safe_message),
-                    error_payload=arg_error_payload,
-                )
+                if status is ComposerToolStatus.SUCCESS:
+                    if success_version_after is None:
+                        raise AuditIntegrityError("observed success lost its actual state version")
+                    try:
+                        recorded = finish_success(
+                            audit, result_payload=_result_to_audit_payload(success_result), version_after=success_version_after
+                        )
+                    except BaseException as error:
+                        failure_observation.observe_primary(error)
+                        recorded = finish_plugin_crash(audit, exc=error)
+                        failure_observation.owner.recorder.record_with_failure_observation(recorded, failure_observation)
+                        raise
+                elif status is ComposerToolStatus.ARG_ERROR:
+                    if arg_error_exc is None:
+                        raise AuditIntegrityError("observed argument failure lost its original")
+                    recorded = finish_arg_error(
+                        audit,
+                        error_class=type(arg_error_exc).__name__,
+                        error_category=arg_error_exc.category,
+                        error_message=str(arg_error_exc.args[0] if arg_error_exc.args else "tool argument error"),
+                        error_payload=arg_error_payload,
+                    )
+                elif isinstance(current, asyncio.CancelledError):
+                    recorded = finish_cancelled(audit, exc=current)
+                else:
+                    origin = crash_exc if crash_exc is not None else current
+                    if origin is None:
+                        raise AuditIntegrityError("observed dispatch lacks its actual originating failure")
+                    recorded = finish_plugin_crash(audit, exc=origin)
+                failure_observation.owner.recorder.record_with_failure_observation(recorded, failure_observation)
+            except BaseException as error:
+                combined = failure_observation.owner.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
+        else:
+            _record_dispatch_exit(
+                recorder=recorder,
+                audit=audit,
+                status=status,
+                success_result=success_result,
+                success_version_after=success_version_after,
+                arg_error_exc=arg_error_exc,
+                arg_error_payload=arg_error_payload,
+                crash_exc=crash_exc,
+                current_exc=sys.exc_info()[1],
             )
-        else:  # ComposerToolStatus.PLUGIN_CRASH (typed handlers)
-            if crash_exc is None:
-                raise RuntimeError("dispatch_with_audit: PLUGIN_CRASH status with no captured exception")
-            recorder.record(finish_plugin_crash(audit, exc=crash_exc))
+
+
+def _record_dispatch_exit(
+    *,
+    recorder: ComposerToolRecorder,
+    audit: DispatchAudit,
+    status: ComposerToolStatus | None,
+    success_result: Any,
+    success_version_after: int | None,
+    arg_error_exc: ToolArgumentError | None,
+    arg_error_payload: Mapping[str, Any] | None,
+    crash_exc: BaseException | None,
+    current_exc: BaseException | None,
+) -> None:
+    # Single record point — fires on every exit, including
+    # BaseException subclasses (CancelledError, SystemExit,
+    # KeyboardInterrupt, GeneratorExit) that the typed except
+    # handlers above do not catch. ``status`` is ``None`` exactly
+    # when such an exception is propagating; we reconstruct it via
+    # sys.exc_info() and record CANCELLED for coordinator cancellation
+    # or PLUGIN_CRASH for other BaseException subclasses before it leaves.
+    if status is None:
+        # Offensive guard: status==None with no propagating
+        # exception is structurally impossible — every successful
+        # path assigns SUCCESS before the return statement
+        # evaluates the finally block. If we reach this branch
+        # without an exception, an audit row would be dropped
+        # silently — fail loudly instead.
+        if current_exc is None:
+            raise RuntimeError(
+                "dispatch_with_audit: finally entered with status=None and no propagating exception — audit invariant violated"
+            )
+        if isinstance(current_exc, asyncio.CancelledError):
+            recorder.record(finish_cancelled(audit, exc=current_exc))
+        else:
+            recorder.record(finish_plugin_crash(audit, exc=current_exc))
+    elif status is ComposerToolStatus.SUCCESS:
+        # success_version_after was assigned alongside status.
+        # Offensive guard: the dataclass requires ``int`` here, so
+        # a None would crash on construction; mypy prefers the
+        # explicit narrow.
+        if success_version_after is None:
+            raise RuntimeError("dispatch_with_audit: SUCCESS status with no version_after captured")
+        try:
+            invocation = finish_success(
+                audit,
+                result_payload=_result_to_audit_payload(success_result),
+                version_after=success_version_after,
+            )
+        except Exception as exc:
+            recorder.record(finish_plugin_crash(audit, exc=exc))
+            raise
+        recorder.record(invocation)
+    elif status is ComposerToolStatus.ARG_ERROR:
+        if arg_error_exc is None:
+            raise RuntimeError("dispatch_with_audit: ARG_ERROR status with no captured exception")
+        safe_message = arg_error_exc.args[0] if arg_error_exc.args else "tool argument error"
+        recorder.record(
+            finish_arg_error(
+                audit,
+                error_class=type(arg_error_exc).__name__,
+                error_category=arg_error_exc.category,
+                error_message=str(safe_message),
+                error_payload=arg_error_payload,
+            )
+        )
+    else:  # ComposerToolStatus.PLUGIN_CRASH (typed handlers)
+        if crash_exc is None:
+            raise RuntimeError("dispatch_with_audit: PLUGIN_CRASH status with no captured exception")
+        recorder.record(finish_plugin_crash(audit, exc=crash_exc))
 
 
 def _result_to_audit_payload(result: Any) -> Mapping[str, Any]:

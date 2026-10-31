@@ -178,10 +178,9 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
             content = primary_replies.pop(0)
             primary_ordinal = sum(call.model == model for call in dispatches)
             sent_names = {tool["function"]["name"] for tool in kwargs["tools"]}
-            if transition in {"initial", "recompose"}:
-                assert "emit_pipeline_proposal" in sent_names and "set_pipeline" not in sent_names
-            else:
-                assert "set_pipeline" in sent_names
+            # H2 retired the empty-state planner route: every transition, initial
+            # and recompose included, runs the ordinary compose loop and its palette.
+            assert "set_pipeline" in sent_names and "emit_pipeline_proposal" not in sent_names
             if transition == "source_missing":
                 rootless_prompts.append(deepcopy(kwargs["messages"]))
                 if primary_ordinal == 2:
@@ -300,8 +299,9 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
             session_id = created.json()["id"]
             baseline = None
             if transition in {"followup", "source_missing", "authoring"}:
-                # Ordinary-loop scenarios start from a real previous draft.
-                # Initial and recompose retain the empty PLANNER -> END path.
+                # These scenarios start from a real previous draft. Initial and
+                # recompose start from an empty session, which since H2 also runs
+                # the ordinary compose loop (PRIMARY -> END), not a planner route.
                 baseline = await _seed_output_only_draft(app, service, UUID(session_id))
             operation_ids: list[str] = []
             rounds = 2 if transition == "followup" else 1

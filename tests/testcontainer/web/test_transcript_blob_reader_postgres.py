@@ -1,0 +1,28 @@
+"""Actual service/blob/current-read tests on PostgreSQL; serial native custody."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_actual_current_restore_rebuilds_required_reader_without_serializing_capability as test_actual_current_restore_rebuilds_required_reader_without_serializing_capability,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_reader_constructor_refuses_a_foreign_session_after_real_positive as test_reader_constructor_refuses_a_foreign_session_after_real_positive,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_reader_keeps_original_primitive_exception_identity as test_reader_keeps_original_primitive_exception_identity,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_real_reader_preserves_bytes_missing_result_integrity_and_current_fence as test_real_reader_preserves_bytes_missing_result_integrity_and_current_fence,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_required_reader_bit_cannot_default_when_omitted as test_required_reader_bit_cannot_default_when_omitted,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_required_reader_cannot_be_dropped_by_internal_graph_constructor as test_required_reader_cannot_be_dropped_by_internal_graph_constructor,
+)
+from tests.unit.web.composer.test_transcript_blob_reader import (
+    test_selected_reader_service_must_share_actual_engine_before_sql_submission as test_selected_reader_service_must_share_actual_engine_before_sql_submission,
+)
+
+pytestmark = pytest.mark.testcontainer

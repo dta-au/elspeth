@@ -6,11 +6,15 @@ import hashlib
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+import pytest
+
 from elspeth_lints.core.allowlist import JudgeVerdict, compute_judge_metadata_signature
 from elspeth_lints.core.protocols import Finding
 from elspeth_lints.rules.trust_boundary.scope import rule as scope_rule
 from elspeth_lints.rules.trust_boundary.tests import rule as tests_rule
 from elspeth_lints.rules.trust_boundary.tier import rule as tier_rule
+
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
 
 _TEST_HMAC_KEY = "test-judge-metadata-hmac-key-2026-05-24"
 _RECORDED_AT = datetime(2026, 5, 24, 12, 0, tzinfo=UTC)

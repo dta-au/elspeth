@@ -7,7 +7,11 @@ import inspect
 import json
 import types
 
+from tests.helpers import web_reserve_worker_caller as worker_caller
+from tests.helpers import web_worker_whole_scope_origin as source_origins
+
 WORKER = "src/elspeth/web/sessions/composer_async_worker.py"
+LIFECYCLE = "src/elspeth/web/coordination/lifecycle.py"
 METHODS = (
     "_run_started",
     "_run_started_under_lease",
@@ -94,13 +98,254 @@ def code_for(tree, owners):
 
 GRAMMARS = {
     "_run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "_run_started_under_lease": "daf38d630a65beb59e65af3a81a44ee074492814371c532a285113ad897c2b68",
+    "_run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
     "_reconcile_failed_adoption": "275bf719b88e638c990f9da7217588ed581cdfdee326dba3813d547dd4f41ce4",
     "_reserve_failed_terminal_projection": "2eac0f1a376009eea11cac52de3d2d70f6fad279400b87162b3a162dcdcbbe66",
     "_settle_failure": "ebdb7c1fe90737788a107dda02489381741194830a0f995aaae600d3faa491fb",
     "_recover_failed_adoption": "cc360dcce49988785bb88b1b30241f9d099e19654599b0f784b1856f33fb469e",
 }
 IMPORT_GRAMMAR = "3b442f921115a868c5b933f82f0681432b524512986f3ff1478cf65b97c2bc64"
+CONTINUATION_OWNER_GRAMMARS = {
+    "ComposerAsyncWorker._job_v2": "a41545c808e9030345269056df65d47c85d5811b06bb665e4a6b92bc26a6021d",
+    "ContinuationLeaseAdoption": "6c853b51d24a4cc2d73d8adc70fa44567b25eb671141e558a2cf08b0f5c7c87f",
+}
+
+_CONTINUATION_START_PREFIX = """
+running = ComposerOperationRunning(claim=claim, session_operation_context=context)
+if observation.policy is None or observation.hard_expires_at is None or self._drain_signal is None:
+    raise AuditIntegrityError("V2 start lost its actual retained timing/process signal owners")
+sql_deadline = ContinuationSQLDeadlineOwner(
+    running,
+    policy=observation.policy,
+    drain_signal=self._drain_signal,
+    drain_seconds=self._drain_seconds,
+    hard_expires_at=observation.hard_expires_at,
+)
+coordinator = RequiredWorkCoordinator(
+    RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, claim.operation_id, claim.attempt),
+    sql_deadline_owner=sql_deadline,
+)
+self._required_coordinators[key] = coordinator
+adoption = ContinuationLeaseAdoption(
+    services.session_service.session_operation_authority,
+    context,
+    lease_seconds=services.session_service.session_operation_lease_seconds,
+    required_work=coordinator,
+)
+self._continuation_adoptions[key] = adoption
+adoption.cancellations.extend(cancellations)
+"""
+
+_CONTINUATION_ADOPTION_JOIN = """
+async def join(self) -> SessionOperationLease:
+    if self.lease is None:
+        interval = _validate_lifecycle_timing(lease_seconds=self.lease_seconds, renew_interval_seconds=None)
+        self.lease = SessionOperationLease.__new__(SessionOperationLease)
+        SessionOperationLease.__init__(
+            self.lease, self.authority, self.context, lease_seconds=self.lease_seconds,
+            renew_interval_seconds=interval, required_work=self.required_work,
+        )
+    if self.task is None:
+        ticket = self.required_work.reserve(RequiredWorkSource.LEASE_ADOPTION)
+        self.task = asyncio.create_task(
+            run_required_sql_finish_once(ticket, self.authority.compare_and_swap, self.context),
+            name="continuation-adoption-compare-and-swap",
+        )
+    self.outcome = await _join_shielded_task_after_cancellation(self.task, cancellation_observations=self.cancellations)
+    for cancellation in self.outcome.deferred_cancellations:
+        _retain_cancellation(self.cancellations, cancellation)
+    failures = [self.outcome.error] if type(self.outcome) is RequiredSQLRaised else []
+    if type(self.outcome) not in (RequiredSQLReturned, RequiredSQLRaised):
+        raise contract_errors.AuditIntegrityError("Continuation adoption lost its actual physical CAS result")
+    _raise_lifecycle_originals(self.cancellations, failures)
+    return self.lease
+"""
+
+_CONTINUATION_ADOPTION_CONSTRUCTOR = """
+def __init__(
+    self, authority: SessionOperationAuthority, context: SessionOperationContext, *,
+    lease_seconds: int, required_work: RequiredWorkCoordinator,
+) -> None:
+    if type(context) is not SessionOperationContext or context.operation_kind is not SessionOperationKind.COMPOSE:
+        raise contract_errors.AuditIntegrityError("Continuation adoption requires the exact started COMPOSE context")
+    if type(required_work) is not RequiredWorkCoordinator or required_work.authority.context != context:
+        raise contract_errors.AuditIntegrityError("Continuation adoption lost its exact required-work owner")
+    self.authority = authority
+    self.context = context
+    self.lease_seconds = lease_seconds
+    self.required_work = required_work
+    self.lease: SessionOperationLease | None = None
+    self.task: asyncio.Task[RequiredSQLFinishOnce[None]] | None = None
+    self.outcome: RequiredSQLFinishOnce[None] | None = None
+    self.cancellations: list[asyncio.CancelledError] = []
+"""
+
+
+def continuation_start_owner_contract(units):
+    """The actual V2 start/adoption edge, never a generic constructor grant."""
+    units = tuple(units)
+    index = {unit.path: unit for unit in units}
+    if len(index) != len(units) or WORKER not in index or LIFECYCLE not in index:
+        return ["worker continuation start: lifecycle source owner missing"], None
+    worker, lifecycle = index[WORKER], index[LIFECYCLE]
+    worker_class, _ = find(worker.tree, "ComposerAsyncWorker")
+    method, owners = find(worker.tree, "ComposerAsyncWorker._job_v2")
+    adoption, _ = find(lifecycle.tree, "ContinuationLeaseAdoption")
+    if (
+        not isinstance(method, ast.AsyncFunctionDef)
+        or not isinstance(adoption, ast.ClassDef)
+        or grammar(method) != CONTINUATION_OWNER_GRAMMARS["ComposerAsyncWorker._job_v2"]
+        or grammar(adoption) != CONTINUATION_OWNER_GRAMMARS["ContinuationLeaseAdoption"]
+    ):
+        return ["worker continuation start: complete original start/adoption source changed"], None
+    expected_header = ast.parse("async def _job_v2(self, claim: ComposerOperationClaim) -> None:\n    pass").body[0]
+    if (
+        method.decorator_list
+        or method.type_params
+        or ast.dump(method.args) != ast.dump(expected_header.args)
+        or ast.dump(method.returns) != ast.dump(expected_header.returns)
+    ):
+        return ["worker continuation start: exact original method header changed"], None
+    code, reason = code_for(worker.tree, owners)
+    mask = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR | inspect.CO_ITERABLE_COROUTINE
+    suppliers = {
+        "ComposerOperationRunning",
+        "ContinuationSQLDeadlineOwner",
+        "RequiredWorkCoordinator",
+        "RequiredWorkAuthority",
+        "RequiredAuthorityKind",
+        "ContinuationLeaseAdoption",
+    }
+    if (
+        code is None
+        or code.co_flags & mask != inspect.CO_COROUTINE
+        or suppliers & set(code.co_varnames + code.co_cellvars + code.co_freevars)
+        or any(isinstance(node, (ast.Global, ast.Nonlocal)) and suppliers & set(node.names) for node in ast.walk(method))
+    ):
+        return ["worker continuation start: actual coroutine/supplier scope changed"], None
+    if (
+        not source_origins.owned_origin(worker.tree, "ComposerAsyncWorker", worker_class)
+        or not source_origins.owned_origin(lifecycle.tree, "ContinuationLeaseAdoption", adoption)
+        or not isinstance(worker_class, ast.ClassDef)
+        or worker_class.bases
+        or worker_class.keywords
+        or worker_class.decorator_list
+        or worker_class.type_params
+        or any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name
+            in {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
+            for node in worker_class.body
+        )
+        or adoption.bases
+        or adoption.keywords
+        or adoption.decorator_list
+        or adoption.type_params
+        or [node.name for node in adoption.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))] != ["__init__", "join"]
+    ):
+        return ["worker continuation start: actual plain owner binding/header changed"], None
+    for cls in (worker_class, adoption):
+        if any(
+            not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and type(node.value.value) is str)
+            for node in cls.body
+        ):
+            return ["worker continuation start: actual owner evaluated namespace changed"], None
+    namespace_failures = worker_caller.worker_namespace_contract(worker_class)
+    if namespace_failures:
+        return namespace_failures, None
+    imports = []
+    for unit, binding, module in (
+        (worker, "ComposerOperationRunning", "elspeth.web.sessions.composer_operations"),
+        (worker, "ContinuationSQLDeadlineOwner", "elspeth.web.sessions.continuation_sql_deadline"),
+        (worker, "RequiredWorkCoordinator", "elspeth.web.required_work"),
+        (worker, "RequiredWorkAuthority", "elspeth.web.required_work"),
+        (worker, "RequiredAuthorityKind", "elspeth.web.required_work"),
+        (worker, "ContinuationLeaseAdoption", "elspeth.web.coordination.lifecycle"),
+        (lifecycle, "RequiredWorkSource", "elspeth.web.required_work"),
+        (lifecycle, "run_required_sql_finish_once", "elspeth.web.async_workers"),
+        (lifecycle, "SessionOperationContext", "elspeth.web.coordination.contracts"),
+        (lifecycle, "SessionOperationKind", "elspeth.web.coordination.contracts"),
+        (lifecycle, "RequiredWorkCoordinator", "elspeth.web.required_work"),
+        (lifecycle, "RequiredSQLReturned", "elspeth.web.required_sql_outcomes"),
+        (lifecycle, "RequiredSQLRaised", "elspeth.web.required_sql_outcomes"),
+    ):
+        origin = source_origins.import_origin(unit.tree, binding, module, binding)
+        if origin is None:
+            return ["worker continuation start: actual source import changed " + binding], None
+        imports.extend((unit.path, id(node)) for node in origin)
+    expected = ast.parse(_CONTINUATION_START_PREFIX).body
+    blocks = [
+        value
+        for node in ast.walk(method)
+        for _field, value in ast.iter_fields(node)
+        if isinstance(value, list) and len(value) >= len(expected) and all(isinstance(statement, ast.stmt) for statement in value)
+    ]
+    matches = [
+        block[start : start + len(expected)]
+        for block in blocks
+        for start in range(len(block) - len(expected) + 1)
+        if [ast.dump(node) for node in block[start : start + len(expected)]] == [ast.dump(node) for node in expected]
+    ]
+    if len(matches) != 1:
+        return ["worker continuation start: exact timing/authority/adoption transfer changed"], None
+    prefix = matches[0]
+    running, deadline, coordinator, retained, constructed, adopted = (prefix[i] for i in (0, 2, 3, 4, 5, 6))
+    joins = [node for node in ast.walk(method) if isinstance(node, ast.Call) and chain(node.func) == ("adoption", "join")]
+    if len(joins) != 1 or joins[0].args or joins[0].keywords:
+        return ["worker continuation start: same retained adoption join changed"], None
+    join, _ = find(lifecycle.tree, "ContinuationLeaseAdoption.join")
+    constructor, _ = find(lifecycle.tree, "ContinuationLeaseAdoption.__init__")
+    if (
+        not isinstance(constructor, ast.FunctionDef)
+        or ast.dump(constructor) != ast.dump(ast.parse(_CONTINUATION_ADOPTION_CONSTRUCTOR).body[0])
+        or not isinstance(join, ast.AsyncFunctionDef)
+        or ast.dump(join) != ast.dump(ast.parse(_CONTINUATION_ADOPTION_JOIN).body[0])
+    ):
+        return ["worker continuation start: exact original adoption CAS/lease/outcome changed"], None
+    reserves = [node for node in ast.walk(join) if isinstance(node, ast.Call) and chain(node.func) == ("self", "required_work", "reserve")]
+    if (
+        len(reserves) != 1
+        or [chain(node) for node in reserves[0].args] != [("RequiredWorkSource", "LEASE_ADOPTION")]
+        or reserves[0].keywords
+    ):
+        return ["worker continuation start: exact adoption reserve changed"], None
+    owner_call = coordinator.value
+    deadline_argument = next(keyword.value for keyword in owner_call.keywords if keyword.arg == "sql_deadline_owner")
+    allocation = next(
+        node for node in ast.walk(join) if isinstance(node, ast.Call) and chain(node.func) == ("SessionOperationLease", "__new__")
+    )
+    initialization = next(
+        node for node in ast.walk(join) if isinstance(node, ast.Call) and chain(node.func) == ("SessionOperationLease", "__init__")
+    )
+    return [], {
+        "definition": (WORKER, id(method)),
+        "compiler_kind_bits": code.co_flags & mask,
+        "compiler_reason": reason,
+        "adoption_definition": (LIFECYCLE, id(adoption)),
+        "join_definition": (LIFECYCLE, id(join)),
+        "adoption_constructor_definition": (LIFECYCLE, id(constructor)),
+        "lease_allocation": (LIFECYCLE, id(allocation)),
+        "lease_initialization": (LIFECYCLE, id(initialization)),
+        "running": (WORKER, id(running.value)),
+        "deadline": (WORKER, id(deadline.value)),
+        "coordinator": (WORKER, id(owner_call)),
+        "authority": (WORKER, id(owner_call.args[0])),
+        "retained_coordinator": (WORKER, id(retained)),
+        "adoption": (WORKER, id(constructed.value)),
+        "retained_adoption": (WORKER, id(adopted)),
+        "join_call": (WORKER, id(joins[0])),
+        "supplier_arguments": frozenset(
+            {
+                (WORKER, id(owner_call), id(owner_call.args[0])),
+                (WORKER, id(owner_call), id(deadline_argument)),
+            }
+        ),
+        "continuation_reserve_calls": frozenset({(LIFECYCLE, id(reserves[0]))}),
+        "adoption_reserve_receiver": (LIFECYCLE, id(reserves[0].func.value)),
+        "import_nodes": tuple(imports),
+        "qualification": "SOURCE_LOCAL_ORIGINAL_OWNER_TRANSFER_COMMON_EFFECTS_REQUIRED",
+    }
 
 
 def worker_six_local_contracts(units):
@@ -261,6 +506,11 @@ def worker_six_local_contracts(units):
             )
     receipt["reserve_calls"] = frozenset(row["call"] for row in rows)
     receipt["per_call"] = rows
+    continuation_failures, continuation = continuation_start_owner_contract(units)
+    if continuation_failures:
+        return continuation_failures, receipt
+    receipt["continuation_start_owner"] = continuation
+    receipt["continuation_reserve_calls"] = continuation["continuation_reserve_calls"]
     expected = [
         ("_run_started", "_run_started_under_lease", 1),
         ("_recover_failed_adoption", "_reconcile_failed_adoption", 1),
@@ -288,8 +538,8 @@ def worker_six_local_contracts(units):
 
 
 SUPPLIER_IMPORT_GRAMMARS = {
-    "elspeth.web.coordination.lifecycle": "3f71a5261ad1f880340240640fa10a6c784bba1726112c93621c177612d69909",
-    "elspeth.contracts.session_operation": "64ee5d516987d7b041060d4e50942522660437bafdb01f40054ad67431417306",
+    "elspeth.web.coordination.lifecycle": "386c21fb55b3289545251677448dd29fbe2a9b23220398ac49f774d445bc85eb",
+    "elspeth.contracts.session_operation": "499e013091e47e73666eff45d82788d171510b6e5e4d596143c9f8d8790443bf",
     "elspeth.web.required_sql_outcomes": "6ab23511eebf3383ddcdcfbcc511b8dae4b1c358df3e02781732ffb460b741c7",
     "elspeth.web.sessions.composer_operations": "747dacdbbb06c576e01bb44de86d6df77b5eb26b914cf0ea296f68fed5b81758",
 }

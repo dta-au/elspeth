@@ -5,30 +5,31 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
+import litellm
 import pytest
 import structlog
-from litellm.exceptions import APIError as LiteLLMAPIError
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION, PipelinePlannerError
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerResult
+from elspeth.web.composer.provider_cost import CommonProviderCostBudget
+from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blobs_table,
@@ -36,13 +37,16 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     proposal_events_table,
+    quota_provider_attempts_table,
+    token_usage_ledger_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import ComposerSessionPreferencesTransition, ComposerTrustMode, CompositionStateData
+from elspeth.web.sessions.routes._helpers import _composer_chat_history
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
-from tests.helpers.advisor_review import parse_advisor_publication_review
+from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits, assert_initial_wire
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -123,7 +127,7 @@ def _terminal_response(data_dir: Path, session_id: str) -> _Response:
                         _ToolCall(
                             id="freeform-terminal",
                             function=_Function(
-                                name="emit_pipeline_proposal",
+                                name="set_pipeline",
                                 arguments=json.dumps({"pipeline": _pipeline(data_dir, session_id)}),
                             ),
                         )
@@ -171,7 +175,7 @@ def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: st
                         _ToolCall(
                             id=f"freeform-routing-{condition}",
                             function=_Function(
-                                name="emit_pipeline_proposal",
+                                name="set_pipeline",
                                 arguments=json.dumps({"pipeline": pipeline}),
                             ),
                         )
@@ -183,41 +187,20 @@ def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: st
     )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
-@pytest.mark.parametrize("persisted_base", [False, True], ids=["absent-base", "present-base"])
-async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust_modes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    trust_mode: str,
-    persisted_base: bool,
-) -> None:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    await sessions.update_composer_preferences(
-        session.id,
-        trust_mode=trust_mode,  # type: ignore[arg-type]
-        density_default="high",
-        actor="test",
-    )
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        "Build a CSV to JSONL pipeline.",
-        writer_principal="route_user_message",
-    )
-    current_state = None
+def _source_files(tmp_path: Path, sid) -> None:
+    source = tmp_path / "blobs" / str(sid) / "input.csv"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("name\nAda\n", encoding="utf-8")
+    (tmp_path / "outputs" / str(sid)).mkdir(parents=True, exist_ok=True)
+
+
+async def _common_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, trust_mode, persisted_base: bool = False):
+    request = "Build a CSV to JSONL pipeline."
+    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
+    await sessions.update_composer_preferences(session.id, trust_mode=trust_mode, density_default="high", actor="test")
+    base = None
     if persisted_base:
-        current_state = await sessions.save_composition_state(
+        base = await sessions.save_composition_state(
             session.id,
             CompositionStateData(
                 sources={},
@@ -229,154 +212,180 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
             ),
             provenance="session_seed",
         )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
-    requests: list[dict[str, Any]] = []
-
-    async def completion(**kwargs: Any) -> _Response:
-        requests.append(kwargs)
-        return _terminal_response(tmp_path, str(session.id))
-
-    monkeypatch.setattr("litellm.acompletion", completion)
-
+        with engine.connect() as conn:
+            seed_before = dict(
+                conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(base.id))).mappings().one()
+            )
+    _source_files(tmp_path, session.id)
+    authored = _pipeline(tmp_path, str(session.id))
+    auto = trust_mode == "auto_commit"
+    candidate = "The draft was saved." if auto else "The proposed pipeline is waiting for approval."
+    steps = [Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored})]
+    if auto:
+        steps.append(Step("early"))
+    steps.extend((Step("primary", content=candidate), Step("end")))
+    script = CommonSDK(request=request, candidate=candidate, steps=tuple(steps), saved=int(auto))
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
     result = await composer.compose(
-        "Build a CSV to JSONL pipeline.",
+        request,
         [],
         _empty_state(),
         session_id=str(session.id),
-        current_state_id=str(current_state.id) if current_state is not None else None,
+        current_state_id=None if base is None else str(base.id),
         user_id="planner-user",
-        user_message_id=str(user_message.id),
+        user_message_id=str(user.id),
     )
-
-    proposals = await sessions.list_composition_proposals(session.id, status="pending")
-    assert len(proposals) == 1
-    proposal = proposals[0]
-    assert proposal.tool_name == "set_pipeline"
-    assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
-    assert proposal.pipeline_metadata is not None
-    assert proposal.pipeline_metadata.base["kind"] == ("present" if persisted_base else "absent")
-    assert proposal.base_state_id == (current_state.id if current_state is not None else None)
-    if current_state is not None:
-        assert proposal.pipeline_metadata.base == {
-            "kind": "present",
-            "state_id": str(current_state.id),
-            "composition_content_hash": composition_content_hash(_empty_state()),
-        }
-    assert result.state == _empty_state()
-    if trust_mode == "auto_commit":
-        assert result.pipeline_commit_intent is not None
-        assert result.pipeline_commit_intent.proposal_id == proposal.id
-        assert result.pipeline_commit_intent.draft_hash == proposal.pipeline_metadata.draft_hash  # type: ignore[union-attr]
-    else:
-        assert result.pipeline_commit_intent is None
-
-    with engine.connect() as conn:
-        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    planner_audit_kinds = [
-        calls[0].get("_kind")
-        for role, calls in audit_rows
-        if role == "audit" and calls and calls[0].get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
-    ]
-    assert planner_audit_kinds == ["llm_call_audit", "planner_attempt_audit"]
-    assert len(requests) == 1
-    assert requests[0]["max_tokens"] == settings.composer_planner_max_completion_tokens
+    script.assert_done()
+    assert sdk.await_count == len(steps)
+    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+    assert script.requests[0]["max_tokens"] == composer._settings.composer_planner_max_completion_tokens
+    assert all(request["max_tokens"] <= composer._settings.composer_planner_max_completion_tokens for request in script.requests)
+    calls = assert_actual_audits(engine, script.requests, ("success",) * len(steps), session_id=str(session.id))
+    if base is not None:
+        with engine.connect() as conn:
+            seed_after = dict(
+                conn.execute(select(composition_states_table).where(composition_states_table.c.id == str(base.id))).mappings().one()
+            )
+        assert seed_after == seed_before
+    return engine, sessions, session, user, composer, base, result, script, calls
 
 
 @pytest.mark.asyncio
-async def test_planner_llm_call_audit_persists_the_served_endpoint(
+@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
+@pytest.mark.parametrize("persisted_base", [False, True], ids=["absent-base", "present-base"])
+async def test_empty_build_obeys_common_trust_mode_and_exact_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_mode: str,
+    persisted_base: bool,
+) -> None:
+    from elspeth.web.composer.authority_hashing import composer_authority_hash
+
+    engine, sessions, session, user, composer, base, result, script, calls = await _common_build(
+        tmp_path, monkeypatch, trust_mode=trust_mode, persisted_base=persisted_base
+    )
+    proposals = await sessions.list_composition_proposals(session.id)
+    assert result.pipeline_commit_intent is None
+    with engine.connect() as conn:
+        states = (
+            conn.execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.session_id == str(session.id))
+                .order_by(composition_states_table.c.version)
+            )
+            .mappings()
+            .all()
+        )
+    if trust_mode == "explicit_approve":
+        (proposal,) = proposals
+        assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
+        assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
+        assert proposal.user_message_id == user.id and proposal.tool_call_id == "common-tool-1"
+        assert proposal.base_state_id == (None if base is None else base.id)
+        metadata = proposal.pipeline_metadata
+        assert metadata is not None
+        assert metadata.base == (
+            {"kind": "absent"}
+            if base is None
+            else {"kind": "present", "state_id": str(base.id), "composition_content_hash": composition_content_hash(_empty_state())}
+        )
+        assert metadata.repair_count == 0
+        assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
+        assert proposal.composer_model_identifier == script.requests[0]["model"] == composer._settings.composer_model
+        assert proposal.composer_model_version == calls[0]["model_returned"] == "provider/common-v1"
+        assert proposal.composer_provider == composer._availability.provider == "test"
+        assert proposal.tool_arguments_hash == composer_authority_hash(_pipeline(tmp_path, str(session.id)))
+        authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
+        assert authority.row == proposal
+        assert deep_thaw(authority.proposal.pipeline) == _pipeline(tmp_path, str(session.id))
+        assert authority.proposal.draft_hash == metadata.draft_hash
+        assert result.state == _empty_state()
+        assert len(states) == int(base is not None)
+        assert all(state["provenance"] == "session_seed" for state in states)
+        assert script.phases == ["end"]
+    else:
+        from elspeth.web.sessions.converters import state_from_record, state_record_from_row
+        from tests.helpers.advisor_review import parse_advisor_publication_review
+
+        assert proposals == [] and result.state.sources["source"].plugin == "csv"
+        assert result.state.outputs[0].plugin == "json"
+        assert len(states) == int(base is not None) + 1
+        saved = [state for state in states if base is None or state["id"] != str(base.id)]
+        (saved_state,) = saved
+        end_review = parse_advisor_publication_review(script.requests[-1]["messages"][1]["content"])
+        saved_effects = end_review["saved_effects"]
+        assert saved_effects["verification"] == "verified"
+        assert saved_effects["saved_revision_count"] == 1
+        assert saved_effects["latest_committed_state_id"] == saved_state["id"]
+        assert saved_effects["latest_verified_state_id"] == saved_state["id"]
+        with engine.connect() as conn:
+            (tool_row,) = (
+                conn.execute(
+                    select(chat_messages_table).where(
+                        chat_messages_table.c.session_id == str(session.id),
+                        chat_messages_table.c.role == "tool",
+                        chat_messages_table.c.tool_call_id == "common-tool-1",
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            (attempt,) = (
+                conn.execute(
+                    select(quota_provider_attempts_table).where(
+                        quota_provider_attempts_table.c.session_id == str(session.id),
+                        quota_provider_attempts_table.c.attempt_id == calls[0]["call_id"],
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        assert result.persisted_tool_call_turn is True
+        assert result.persisted_assistant_message_id is not None
+        assert tool_row["writer_principal"] == "compose_loop"
+        assert tool_row["parent_assistant_id"] == result.persisted_assistant_message_id
+        assert tool_row["composition_state_id"] == saved_state["id"]
+        assert saved_state["provenance"] == "tool_call"
+        assert saved_state["derived_from_state_id"] == (None if base is None else str(base.id))
+        assert saved_state["creator_operation_id"] == attempt["operation_id"]
+        with engine.connect() as conn:
+            saved_row = conn.execute(
+                select(composition_states_table).where(
+                    composition_states_table.c.session_id == str(session.id),
+                    composition_states_table.c.id == saved_state["id"],
+                )
+            ).one()
+        saved_record = state_record_from_row(saved_row)
+        assert str(saved_record.id) == saved_state["id"] and saved_record.session_id == session.id
+        saved_graph = state_from_record(saved_record)
+        assert saved_graph.version == saved_record.version == saved_state["version"]
+        assert saved_record.version == (1 if base is None else base.version + 1)
+        assert saved_graph.sources["source"].plugin == "csv"
+        assert saved_graph.outputs[0].plugin == "json"
+        assert saved_graph.sources["source"].options["path"] == str(tmp_path / "blobs" / str(session.id) / "input.csv")
+        assert saved_graph.outputs[0].options["path"] == str(tmp_path / "outputs" / str(session.id) / "result.jsonl")
+        stored = saved_graph.to_dict()
+        returned = result.state.to_dict()
+        assert stored["sources"] == returned["sources"]
+        assert stored["nodes"] == returned["nodes"] and stored["edges"] == returned["edges"]
+        assert stored["outputs"] == returned["outputs"] and stored["metadata"] == returned["metadata"]
+        assert script.phases == ["early", "end"]
+
+
+@pytest.mark.asyncio
+async def test_common_llm_call_audit_persists_the_served_endpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pipeline planner records its call through ``build_llm_call_record(response=...)``.
-
-    That branch reads the provider object directly rather than an admitted
-    metadata carrier, so ``provider_served`` must be proven on the persisted
-    ``llm_call_audit`` row of a real planner turn, not only on the compose loop.
-    """
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    """The common provider boundary persists its served endpoint on each actual SQL call row."""
+    _engine, _sessions, _session, _user, _composer, _base, _result, script, calls = await _common_build(
+        tmp_path, monkeypatch, trust_mode="explicit_approve"
     )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        "Build a CSV to JSONL pipeline.",
-        writer_principal="route_user_message",
-    )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
-
-    async def completion(**_kwargs: Any) -> _Response:
-        response = _terminal_response(tmp_path, str(session.id))
-        response.provider = "DeepInfra"
-        return response
-
-    monkeypatch.setattr("litellm.acompletion", completion)
-
-    await composer.compose(
-        "Build a CSV to JSONL pipeline.",
-        [],
-        _empty_state(),
-        session_id=str(session.id),
-        user_id="planner-user",
-        user_message_id=str(user_message.id),
-    )
-
-    with engine.connect() as conn:
-        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    planner_calls = [
-        calls[0]["call"]
-        for role, calls in audit_rows
-        if role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" and calls[0]["call"]["planner_call_ordinal"] is not None
-    ]
-    assert len(planner_calls) == 1
-    assert planner_calls[0]["provider_served"] == "DeepInfra"
+    assert len(calls) == len(script.requests) == 3
+    assert all(call["provider_served"] == "DeepInfra" for call in calls)
+    assert {call["provider_request_id"] for call in calls} == {"common-sdk-1", "common-sdk-2", "common-sdk-3"}
 
 
 @pytest.mark.asyncio
@@ -385,94 +394,91 @@ async def test_planner_llm_call_audit_persists_the_served_endpoint(
     [("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")],
     ids=["downgrade-mid-plan", "upgrade-mid-plan"],
 )
-async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
+async def test_trust_mode_change_during_provider_requires_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    initial_trust_mode: str,
-    flipped_trust_mode: str,
+    initial_trust_mode: ComposerTrustMode,
+    flipped_trust_mode: ComposerTrustMode,
 ) -> None:
-    """A preference flip while the planner is in a provider call requires review.
+    """A preference flip during the common primary provider call requires review.
 
     Regression for elspeth-01d4c6e683: trust authority was snapshotted before
     the provider call, so a user switching auto_commit -> explicit_approve
-    mid-plan still had the in-flight plan committed automatically. Auto-commit
-    now requires the pre-plan snapshot AND the preference at staging time to
+    mid-call still had the in-flight plan committed automatically. Auto-commit
+    requires the request ceiling AND the preference at staging time to
     both be auto_commit; any mismatch lands the proposal on the review path.
     """
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
+    request = "Build a CSV to JSONL pipeline."
+    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
+    _source_files(tmp_path, session.id)
     await sessions.update_composer_preferences(
         session.id,
-        trust_mode=initial_trust_mode,  # type: ignore[arg-type]
+        trust_mode=initial_trust_mode,
         density_default="high",
         actor="test",
     )
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        "Build a CSV to JSONL pipeline.",
-        writer_principal="route_user_message",
-    )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
+    flips: list[ComposerSessionPreferencesTransition] = []
 
-    async def completion(**kwargs: Any) -> _Response:
-        # The preference flip lands while the provider call is in flight —
-        # after the planner snapshotted preferences, before staging.
-        await sessions.update_composer_preferences(
-            session.id,
-            trust_mode=flipped_trust_mode,  # type: ignore[arg-type]
-            density_default="high",
-            actor="test",
+    async def flip() -> None:
+        flips.append(
+            await sessions.update_composer_preferences(
+                session.id,
+                trust_mode=flipped_trust_mode,
+                density_default="high",
+                actor="test",
+            )
         )
-        return _terminal_response(tmp_path, str(session.id))
 
-    monkeypatch.setattr("litellm.acompletion", completion)
-
+    authored = _pipeline(tmp_path, str(session.id))
+    candidate = "The proposed pipeline is waiting for your review."
+    script = CommonSDK(
+        request=request,
+        candidate=candidate,
+        steps=(
+            Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored}, before_return=flip),
+            Step("primary", content=candidate),
+            Step("end"),
+        ),
+    )
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
     result = await composer.compose(
-        "Build a CSV to JSONL pipeline.",
+        request,
         [],
         _empty_state(),
         session_id=str(session.id),
         current_state_id=None,
         user_id="planner-user",
-        user_message_id=str(user_message.id),
+        user_message_id=str(user.id),
     )
-
-    # Either direction of mismatch must land on the review path: the
-    # proposal is staged as pending and no commit intent is granted.
-    proposals = await sessions.list_composition_proposals(session.id, status="pending")
-    assert len(proposals) == 1
-    assert result.pipeline_commit_intent is None
+    script.assert_done()
+    assert sdk.await_count == 3 and script.phases == ["end"]
+    (transition,) = flips
+    assert transition.prior.trust_mode == initial_trust_mode
+    assert transition.current.trust_mode == flipped_trust_mode
+    assert (await sessions.get_composer_preferences(session.id)).trust_mode == flipped_trust_mode
+    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+    assert result.message.startswith(candidate)
     assert "for your review" in result.message
+    assert result.pipeline_commit_intent is None and result.state == _empty_state()
+    (proposal,) = await sessions.list_composition_proposals(session.id)
+    assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
+    assert deep_thaw(proposal.arguments_json) == authored
+    assert proposal.user_message_id == user.id and proposal.tool_call_id == "common-tool-1"
+    assert proposal.base_state_id is None and proposal.committed_state_id is None
+    metadata = proposal.pipeline_metadata
+    assert metadata is not None
+    assert metadata.base == {"kind": "absent"} and metadata.repair_count == 0
+    assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
+    authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
+    assert authority.row == proposal
+    assert deep_thaw(authority.proposal.pipeline) == authored
+    assert authority.proposal.draft_hash == metadata.draft_hash
+    with engine.connect() as conn:
+        assert conn.execute(select(composition_states_table)).all() == []
+        assert conn.execute(select(blobs_table)).all() == []
+    assert_actual_audits(engine, script.requests, ("success",) * 3, session_id=str(session.id))
 
 
 @pytest.mark.asyncio
@@ -481,360 +487,230 @@ async def test_referential_empty_build_projects_authoritative_prior_user_request
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A referential build turn must not erase the request it refers to."""
-    message = "Build the requested pipeline."
-    _engine, sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-    original_request = (
+    from elspeth.web.composer.request_history import authoritative_conversation_context
+
+    request = "Build the requested pipeline."
+    original = (
         "Read transactions.csv, route rows where amount > 500 to high_value, route every other row to standard, and write both as JSONL."
     )
     refinement = "Keep an audit trace field in both outputs."
-    requests: list[dict[str, Any]] = []
-    responses = [
-        _routing_terminal_response(tmp_path, str(session.id), condition="row['amount'] > 500"),
+    engine, sessions, session, first_user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=original)
+    prior = [
+        first_user,
+        await sessions.add_message(session.id, "assistant", "I can prepare that pipeline.", writer_principal="compose_loop"),
+        await sessions.add_message(session.id, "user", refinement, writer_principal="route_user_message"),
+        await sessions.add_message(session.id, "assistant", "Understood.", writer_principal="compose_loop"),
     ]
-
-    async def completion(**kwargs: Any) -> _Response:
-        requests.append(kwargs)
-        return responses.pop(0)
-
-    monkeypatch.setattr("litellm.acompletion", completion)
-
-    await composer.compose(
-        message,
-        [
-            {"role": "user", "content": original_request, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
-            {"role": "assistant", "content": "I can prepare that pipeline."},
-            {"role": "user", "content": refinement, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
-            {"role": "assistant", "content": "Understood."},
-        ],
+    current = await sessions.add_message(session.id, "user", request, writer_principal="route_user_message")
+    records = [*prior, current]
+    assert len({record.id for record in records}) == 5
+    sequence_numbers = [record.sequence_no for record in records]
+    assert all(number is not None for number in sequence_numbers)
+    assert sequence_numbers == sorted(sequence_numbers)
+    assert len(set(sequence_numbers)) == 5
+    history = _composer_chat_history(prior)
+    context = authoritative_conversation_context(request, history)
+    assert context is not None
+    assert [(item.history_index, item.content) for item in context.prior_user_requests] == [(0, original), (2, refinement)]
+    assert [(item.history_index, item.content) for item in context.prior_assistant_messages] == [
+        (1, "I can prepare that pipeline."),
+        (3, "Understood."),
+    ]
+    assert history[0]["_elspeth_user_message_id"] == str(prior[0].id)
+    assert history[2]["_elspeth_user_message_id"] == str(prior[2].id)
+    _source_files(tmp_path, session.id)
+    await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
+    authored = _pipeline(tmp_path, str(session.id))
+    (tmp_path / "blobs" / str(session.id) / "input.csv").write_text("name,amount,audit_trace\nAda,600,fixture\n", encoding="utf-8")
+    authored["nodes"] = [
+        {
+            "id": "route_amount",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": "row['amount'] > 500",
+            "routes": {"true": "high_value", "false": "standard"},
+        }
+    ]
+    authored["outputs"] = [
+        {
+            **deepcopy(authored["outputs"][0]),
+            "sink_name": name,
+            "options": {
+                **deepcopy(authored["outputs"][0]["options"]),
+                "path": str(tmp_path / "outputs" / str(session.id) / f"{name}.jsonl"),
+            },
+        }
+        for name in ("high_value", "standard")
+    ]
+    candidate = "The requested routing proposal is waiting for approval."
+    script = CommonSDK(
+        request=request,
+        candidate=candidate,
+        steps=(
+            Step("primary", tool_name="set_pipeline", arguments={"pipeline": authored}),
+            Step("primary", content=candidate),
+            Step("end"),
+        ),
+    )
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    result = await composer.compose(
+        request,
+        history,
         _empty_state(),
         session_id=str(session.id),
         user_id="planner-user",
-        user_message_id=str(user_message.id),
+        user_message_id=str(current.id),
     )
-
-    assert len(requests) == 1
-    provider_requests: list[tuple[str, dict[str, Any]]] = []
-    for provider_message in requests[0]["messages"]:
-        if provider_message["role"] != "user":
-            continue
-        try:
-            payload = json.loads(provider_message["content"])
-        except json.JSONDecodeError:
-            continue
-        if type(payload) is dict and "instruction" in payload and payload["instruction"] == PLANNER_TERMINAL_INSTRUCTION:
-            provider_requests.append((provider_message["content"], payload))
-    assert len(provider_requests) == 1
-    _provider_user_message, provider_payload = provider_requests[0]
-    assert provider_payload["intent"] == message
-    assert provider_payload["conversation_context"] == {
-        "prior_user_requests": [
-            {"history_index": 0, "content": original_request},
-            {"history_index": 2, "content": refinement},
-        ],
-        "additional_prior_user_requests_omitted": 0,
-        "prior_assistant_messages": [
-            {"history_index": 1, "content": "I can prepare that pipeline."},
-            {"history_index": 3, "content": "Understood."},
-        ],
-    }
-    authoritative_requests = json.dumps(provider_payload["conversation_context"]["prior_user_requests"])
+    script.assert_done()
+    assert sdk.await_count == 3 and script.phases == ["end"]
+    for physical_primary in script.requests[:2]:
+        primary = physical_primary["messages"]
+        positions = [
+            next(i for i, row in enumerate(primary) if row["role"] == role and row["content"] == text)
+            for role, text in [
+                ("user", original),
+                ("assistant", "I can prepare that pipeline."),
+                ("user", refinement),
+                ("assistant", "Understood."),
+            ]
+        ]
+        assert positions == sorted(positions)
+        assert len(positions) == len(set(positions)) == 4
+        (current_position,) = [i for i, row in enumerate(primary) if row["role"] == "user" and row["content"] == request]
+        assert current_position > positions[-1]
+    assert context.additional_prior_user_requests_omitted == 0
+    assert [item.content for item in context.prior_user_requests] == [original, refinement]
+    authoritative_requests = json.dumps([item.content for item in context.prior_user_requests])
     assert "I can prepare that pipeline." not in authoritative_requests
     assert "Understood." not in authoritative_requests
-    proposals = await sessions.list_composition_proposals(session.id, status="pending")
-    assert len(proposals) == 1
-    assert deep_thaw(proposals[0].arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
+    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+    assert result.state == _empty_state() and result.pipeline_commit_intent is None
+    (proposal,) = await sessions.list_composition_proposals(session.id)
+    assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
+    assert deep_thaw(proposal.arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
+    assert deep_thaw(proposal.arguments_json) == authored
+    assert proposal.user_message_id == current.id and proposal.tool_call_id == "common-tool-1"
+    assert proposal.base_state_id is None and proposal.committed_state_id is None
+    metadata = proposal.pipeline_metadata
+    assert metadata is not None
+    assert metadata.base == {"kind": "absent"} and metadata.repair_count == 0
+    assert metadata.skill_hash == proposal.composer_skill_hash == composer._composer_skill_hash
+    authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
+    assert authority.row == proposal
+    assert deep_thaw(authority.proposal.pipeline) == authored
+    assert authority.proposal.draft_hash == metadata.draft_hash
+    with engine.connect() as conn:
+        assert conn.execute(select(composition_states_table)).all() == []
+        assert conn.execute(select(blobs_table)).all() == []
+    assert_actual_audits(engine, script.requests, ("success",) * 3, session_id=str(session.id))
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("trust_mode", "expected_status", "expected_reason"),
-    [
-        ("auto_commit", "rejected", "request_cancelled"),
-        ("explicit_approve", "pending", None),
-    ],
-)
-async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycle_without_dispatch_or_state(
+@pytest.mark.parametrize("trust_mode", ["auto_commit", "explicit_approve"])
+def test_cancellation_preserves_actual_common_or_pending_proposal_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trust_mode: str,
-    expected_status: str,
-    expected_reason: str | None,
 ) -> None:
-    """Cancelled auto mode terminalises; explicit review stays crash-resumable."""
-    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    await sessions.update_composer_preferences(
-        session.id,
-        trust_mode=trust_mode,  # type: ignore[arg-type]
-        density_default="high",
-        actor="test",
-    )
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        "Build a CSV to JSONL pipeline.",
-        writer_principal="route_user_message",
-    )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
+    if trust_mode == "auto_commit":
+        from tests.integration.web.composer.test_common_mutation_authority_cancellation import run_public_cancel_case
 
-    async def completion(**_kwargs: Any) -> _Response:
-        return _terminal_response(tmp_path, str(session.id))
+        run_public_cancel_case(tmp_path, monkeypatch, seam="started_p4", fail_sql=False, count=3)
+        return
 
-    monkeypatch.setattr("litellm.acompletion", completion)
-
-    loop = asyncio.get_running_loop()
-    worker_started = asyncio.Event()
-    release_worker = threading.Event()
-    worker_finished = asyncio.Event()
-    from elspeth.web.sessions import service as sessions_module
-
-    original_finish_once = sessions_module.run_required_sql_finish_once
-    creation_tickets: list[RequiredWorkTicket] = []
-
-    async def pause_create_worker(ticket: RequiredWorkTicket, func: Callable[[], Any]) -> Any:
-        if ticket.key.source is not RequiredWorkSource.PROPOSAL_CREATION_SQL:
-            return await original_finish_once(ticket, func)
-        assert ticket.key.session_id == str(session.id)
-        creation_tickets.append(ticket)
-
-        def paused_create() -> Any:
-            loop.call_soon_threadsafe(worker_started.set)
-            if not release_worker.wait(timeout=5.0):
-                raise TimeoutError("test did not release proposal creation worker")
-            try:
-                return func()
-            finally:
-                loop.call_soon_threadsafe(worker_finished.set)
-
-        return await original_finish_once(ticket, paused_create)
-
-    monkeypatch.setattr(sessions_module, "run_required_sql_finish_once", pause_create_worker)
-    compose_task = asyncio.create_task(
-        composer.compose(
-            "Build a CSV to JSONL pipeline.",
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
+    async def explicit_case() -> None:
+        request = "Build a CSV to JSONL pipeline."
+        engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
+        _source_files(tmp_path, session.id)
+        await sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
+        script = CommonSDK(
+            request=request,
+            candidate="",
+            steps=(
+                Step(
+                    "primary",
+                    tool_name="set_pipeline",
+                    arguments={"pipeline": _pipeline(tmp_path, str(session.id))},
+                ),
+            ),
         )
-    )
-    await asyncio.wait_for(worker_started.wait(), timeout=5.0)
-    compose_task.cancel()
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    cancellation_escaped_before_worker = compose_task.done()
-    release_worker.set()
-    await asyncio.wait_for(worker_finished.wait(), timeout=5.0)
+        script.bind(composer, monkeypatch)
+        sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+        monkeypatch.setattr(litellm, "acompletion", sdk)
+        entered, release = threading.Event(), threading.Event()
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(compose_task, timeout=5.0)
+        def park(_conn, _cursor, statement, _parameters, _context, _many):
+            if statement.startswith("INSERT INTO composition_proposals"):
+                entered.set()
+                assert release.wait(10)
 
-    assert len(creation_tickets) == 1
-    assert creation_tickets[0].complete
-    proposals = await sessions.list_composition_proposals(session.id)
-    assert not cancellation_escaped_before_worker, "request cancellation escaped while proposal creation was still in flight"
-    assert len(proposals) == 1
-    assert proposals[0].status == expected_status
-    assert proposals[0].committed_state_id is None
-    authority = await sessions.get_authoritative_pipeline_proposal(
-        session_id=session.id,
-        proposal_id=proposals[0].id,
-    )
-    assert authority.row.status == expected_status
-
-    with engine.connect() as conn:
-        terminal_payloads = (
-            conn.execute(select(proposal_events_table.c.payload).where(proposal_events_table.c.event_type == "proposal.rejected"))
-            .scalars()
-            .all()
+        event.listen(engine, "before_cursor_execute", park)
+        task = asyncio.create_task(
+            composer.compose(
+                request,
+                [],
+                _empty_state(),
+                session_id=str(session.id),
+                current_state_id=None,
+                user_id="planner-user",
+                user_message_id=str(user.id),
+            )
         )
-        assert conn.execute(select(composition_states_table)).all() == []
-        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    if expected_reason is None:
-        assert terminal_payloads == []
-    else:
-        assert len(terminal_payloads) == 1
-        assert terminal_payloads[0]["reason_code"] == expected_reason
-        assert terminal_payloads[0]["dispatch"] is None
-    assert any(role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" for role, calls in audit_rows)
-    assert not any(calls and calls[0].get("_kind") == "audit" for _role, calls in audit_rows)
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            task.cancel("cancel during actual explicit proposal SQL")
+            await asyncio.sleep(0)
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await asyncio.wait_for(task, 10)
+            assert type(caught.value) is asyncio.CancelledError
+            assert caught.value.args == ("cancel during actual explicit proposal SQL",)
+            script.assert_done()
+            assert sdk.await_count == 1 and script.phases == []
+            assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+            assert_actual_audits(engine, script.requests, ("success",), session_id=str(session.id))
 
-    # A subsequent real write proves proposal creation and cancellation cleanup
-    # released the process/session transaction locks.
-    await asyncio.wait_for(
-        sessions.add_message(session.id, "system", "lock probe", writer_principal="route_system_message"),
-        timeout=2.0,
-    )
+            (proposal,) = await sessions.list_composition_proposals(session.id)
+            assert proposal.status == "pending" and proposal.tool_name == "set_pipeline"
+            assert proposal.committed_state_id is None and proposal.base_state_id is None
+            assert proposal.user_message_id == user.id
+            assert proposal.tool_call_id == "common-tool-1"
+            assert deep_thaw(proposal.arguments_json) == _pipeline(tmp_path, str(session.id))
+            assert proposal.pipeline_metadata is not None
+            assert proposal.pipeline_metadata.base == {"kind": "absent"}
+            authority = await sessions.get_authoritative_pipeline_proposal(session_id=session.id, proposal_id=proposal.id)
+            assert authority.row.status == "pending"
+            assert authority.row.audit_event_id == authority.creation_event_id
+
+            with engine.connect() as conn:
+                assert conn.execute(select(composition_states_table)).all() == []
+                assert conn.execute(select(blobs_table)).all() == []
+                assert (
+                    conn.execute(select(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.rejected")).all() == []
+                )
+                audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
+            assert not any(calls and calls[0].get("_kind") == "audit" for _role, calls in audit_rows)
+            await asyncio.wait_for(
+                sessions.add_message(session.id, "system", "lock probe", writer_principal="route_system_message"),
+                2,
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            event.remove(engine, "before_cursor_execute", park)
+
+    asyncio.run(explicit_case())
 
 
-@pytest.mark.asyncio
-async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_cancel(
+def test_auto_commit_cancellation_preserves_p4_failure_and_repeated_originals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Required SQL retains both request cancellations and the exact cleanup failure."""
-    from elspeth.web.sessions import service as sessions_module
+    from tests.integration.web.composer.test_common_mutation_authority_cancellation import run_public_cancel_case
 
-    message = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-    await sessions.update_composer_preferences(
-        session.id,
-        trust_mode="auto_commit",
-        density_default="high",
-        actor="test",
-    )
-
-    async def completion(**_kwargs: Any) -> _Response:
-        return _terminal_response(tmp_path, str(session.id))
-
-    monkeypatch.setattr("litellm.acompletion", completion)
-
-    loop = asyncio.get_running_loop()
-    proposal_created = asyncio.Event()
-    release_create_result = threading.Event()
-    creation_worker_finished = asyncio.Event()
-    rejection_started = asyncio.Event()
-    release_rejection = threading.Event()
-    rejection_worker_finished = asyncio.Event()
-    rejection_kwargs: dict[str, Any] = {}
-    original_finish_once = sessions_module.run_required_sql_finish_once
-    original_reject = sessions.reject_pipeline_composition_proposal_finish_once
-    creation_cancellations: list[asyncio.CancelledError] = []
-    rejection_cancellations: list[asyncio.CancelledError] = []
-    observed_tickets: list[RequiredWorkTicket] = []
-    rejection_failure = AuditIntegrityError("rejection audit write failed")
-
-    async def observe_rejection(**kwargs: Any) -> Any:
-        expected = kwargs["expected"]
-        rejection_kwargs.update(reason=expected.reason, dispatch=expected.dispatch, actor=expected.actor)
-        return await original_reject(**kwargs)
-
-    async def hold_required_sql(ticket: RequiredWorkTicket, func: Callable[[], Any]) -> Any:
-        if ticket.key.source is RequiredWorkSource.PROPOSAL_CREATION_SQL:
-            assert ticket.key.session_id == str(session.id)
-            observed_tickets.append(ticket)
-
-            def held_create() -> Any:
-                try:
-                    row = func()
-                    loop.call_soon_threadsafe(proposal_created.set)
-                    if not release_create_result.wait(timeout=5.0):
-                        raise TimeoutError("test did not release committed proposal creation worker")
-                    return row
-                finally:
-                    loop.call_soon_threadsafe(creation_worker_finished.set)
-
-            outcome = await original_finish_once(ticket, held_create)
-            creation_cancellations.extend(outcome.deferred_cancellations)
-            return outcome
-        if ticket.key.source is RequiredWorkSource.PROPOSAL_REJECTION_SQL:
-            assert ticket.key.session_id == str(session.id)
-            observed_tickets.append(ticket)
-
-            def failing_rejection() -> Any:
-                try:
-                    loop.call_soon_threadsafe(rejection_started.set)
-                    if not release_rejection.wait(timeout=5.0):
-                        raise TimeoutError("test did not release proposal rejection worker")
-                    raise rejection_failure
-                finally:
-                    loop.call_soon_threadsafe(rejection_worker_finished.set)
-
-            outcome = await original_finish_once(ticket, failing_rejection)
-            rejection_cancellations.extend(outcome.deferred_cancellations)
-            return outcome
-        return await original_finish_once(ticket, func)
-
-    monkeypatch.setattr(sessions_module, "run_required_sql_finish_once", hold_required_sql)
-    monkeypatch.setattr(sessions, "reject_pipeline_composition_proposal_finish_once", observe_rejection)
-
-    compose_task = asyncio.create_task(
-        composer.compose(
-            message,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
-        )
-    )
-    await asyncio.wait_for(proposal_created.wait(), timeout=5.0)
-    compose_task.cancel("initial request cancellation")
-    await asyncio.sleep(0)
-    release_create_result.set()
-    await asyncio.wait_for(rejection_started.wait(), timeout=5.0)
-    compose_task.cancel("later shutdown cancellation")
-    await asyncio.sleep(0)
-    release_rejection.set()
-
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        await asyncio.wait_for(compose_task, timeout=5.0)
-
-    def original_leaves(root: BaseException) -> tuple[BaseException, ...]:
-        if isinstance(root, BaseExceptionGroup):
-            return tuple(leaf for child in root.exceptions for leaf in original_leaves(child))
-        return (root,)
-
-    assert type(exc_info.value) is BaseExceptionGroup
-    assert len(creation_cancellations) == len(rejection_cancellations) == 1
-    leaves = original_leaves(exc_info.value)
-    assert len(leaves) == 3
-    assert leaves[0] is creation_cancellations[0]
-    assert leaves[1] is rejection_failure
-    assert leaves[2] is rejection_cancellations[0]
-    assert type(leaves[0]) is type(leaves[2]) is asyncio.CancelledError
-    assert leaves[0].args == ("initial request cancellation",)
-    assert leaves[2].args == ("later shutdown cancellation",)
-    assert str(rejection_failure) == "rejection audit write failed"
-    assert len(observed_tickets) == 2
-    assert all(ticket.complete for ticket in observed_tickets)
-    assert creation_worker_finished.is_set()
-    assert rejection_worker_finished.is_set()
-    assert rejection_kwargs["reason"] == "request_cancelled"
-    assert rejection_kwargs["dispatch"] is None
-    assert rejection_kwargs["actor"] == "system:auto_reject_request_cancelled"
-    proposals = await sessions.list_composition_proposals(session.id)
-    assert len(proposals) == 1
-    assert proposals[0].status == "pending", "failed terminal cleanup must not fabricate a rejected row"
-    with engine.connect() as conn:
-        assert conn.execute(select(composition_states_table)).all() == []
-        audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    assert any(role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" for role, calls in audit_rows)
-    assert not any(calls and calls[0].get("_kind") == "audit" for _role, calls in audit_rows)
+    run_public_cancel_case(tmp_path, monkeypatch, seam="started_p4", fail_sql=True, count=3)
 
 
 @pytest.mark.asyncio
@@ -861,85 +737,30 @@ async def test_auto_commit_cancellation_survives_rejection_failure_and_repeated_
     ],
     ids=["empty-informational", "nonempty-incremental"],
 )
-async def test_structural_entry_selects_planner_or_ordinary_compose_loop(
+async def test_empty_and_existing_graph_use_same_actual_common_provider_loop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     message: str,
     state: CompositionState,
 ) -> None:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        message,
-        writer_principal="route_user_message",
-    )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
-    expected = ComposerResult(message="ordinary loop", state=state)
-    ordinary_loop = AsyncMock(spec=composer._compose_loop, return_value=expected)
-    monkeypatch.setattr(composer, "_compose_loop", ordinary_loop)
-    planner_path = not state.sources
-    provider_requests: list[dict[str, Any]] = []
-    reply = "I can help you plan a pipeline and explain the available plugins."
+    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=message)
+    candidate = "I can explain the current draft without changing it."
+    script = CommonSDK(request=message, candidate=candidate, steps=(Step("primary", content=candidate), Step("end")))
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    common = AsyncMock(spec=composer._compose_loop, wraps=composer._compose_loop)
+    monkeypatch.setattr(composer, "_compose_loop", common)
 
-    async def completion(**kwargs: Any) -> _Response:
-        provider_requests.append(kwargs)
-        if "response_format" in kwargs:
-            assert len(provider_requests) == 2, "Exactly one END follows the planner's informational answer"
-            assert kwargs["model"] == settings.composer_advisor_model
-            assert kwargs.get("tools") is None
-            review = parse_advisor_publication_review(kwargs["messages"][1]["content"])
-            assert review["current_request"] == message
-            assert review["candidate_reply"] == reply
-            assert review["saved_effects"]["saved_revision_count"] == 0
-            assert review["saved_effects"]["net_changed"] is False
-            content = json.dumps(
-                {"verdict": "CLEAN", "category": "other", "steps": [], "findings": "", "note": None, "publication_verdict": "ADMIT"}
-            )
-        else:
-            assert len(provider_requests) == 1, "Only one informational planner response is supplied"
-            assert kwargs["model"] == settings.composer_model
-            names = [tool["function"]["name"] for tool in kwargs["tools"]]
-            assert "emit_pipeline_proposal" in names
-            assert "set_pipeline" not in names
-            content = reply
-        return _Response(
-            choices=[_Choice(message=_Message(content=content, tool_calls=[]))],
-            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
-            model=kwargs["model"],
-        )
+    budget_bindings = []
+    actual_bind = ProviderInvocationOwner.bind_cost_budget
 
-    monkeypatch.setattr("litellm.acompletion", completion)
+    def observe_binding(owner: ProviderInvocationOwner, budget: CommonProviderCostBudget) -> None:
+        actual_bind(owner, budget)
+        budget_bindings.append((owner, budget, budget.snapshot()))
+
+    monkeypatch.setattr(ProviderInvocationOwner, "bind_cost_budget", observe_binding)
+    before = state.to_dict()
 
     result = await composer.compose(
         message,
@@ -947,115 +768,159 @@ async def test_structural_entry_selects_planner_or_ordinary_compose_loop(
         state,
         session_id=str(session.id),
         user_id="planner-user",
-        user_message_id=str(user_message.id),
+        user_message_id=str(user.id),
     )
-
-    if planner_path:
-        ordinary_loop.assert_not_awaited()
-        assert len(provider_requests) == 2
-        assert result.message.startswith(reply)
-        assert result.state == state
-        with engine.connect() as conn:
-            assert conn.execute(select(composition_states_table)).all() == []
-    else:
-        assert result is expected
-        ordinary_loop.assert_awaited_once()
-        assert provider_requests == []
+    common.assert_awaited_once()
+    script.assert_done()
+    assert sdk.await_count == 2
+    assert result.message.startswith(candidate)
+    assert result.state == state and state.to_dict() == before
     assert await sessions.list_composition_proposals(session.id) == []
+    assert_initial_wire(script.requests[0], text=message, state=state, session_id=str(session.id))
+    _assert_no_pipeline_side_effects(engine)
+    calls = assert_actual_audits(engine, script.requests, ("success", "success"), session_id=str(session.id))
+
+    ((owner, budget, initial),) = budget_bindings
+    assert type(owner) is ProviderInvocationOwner and type(budget) is CommonProviderCostBudget
+    assert owner.service is sessions and owner.cost_budget is budget
+    assert common.await_args is not None
+    loop_call = common.await_args
+    assert loop_call.args[0] == message and loop_call.args[2] is state
+    assert loop_call.args[3] == str(session.id) and loop_call.args[5] == "planner-user" and loop_call.args[8] == str(user.id)
+    assert loop_call.kwargs["provider_owner"] is owner and loop_call.kwargs["required_work"] is owner.required_work
+    context = loop_call.kwargs["session_operation_context"]
+    assert context is owner.required_work.coordinator.authority.context
+    assert context.operation_kind is SessionOperationKind.COMPOSE and context.fence.session_id == str(session.id)
+    snapshot = budget.snapshot()
+    assert snapshot.session_id == initial.session_id == str(session.id)
+    assert snapshot.request_id == initial.request_id == str(user.id)
+    assert snapshot.lifecycle_version == initial.lifecycle_version == 1
+    assert initial.physical_calls == 0 and initial.charges == ()
+    assert snapshot.policy is initial.policy
+    if not state.sources:
+        assert snapshot.applicability == initial.applicability == "legacy_empty_v1"
+        assert snapshot.policy is not None
+        settings = composer._settings
+        assert snapshot.policy.max_provider_calls == settings.composer_planner_max_provider_calls
+        assert snapshot.policy.max_request_bytes == settings.composer_planner_max_request_bytes
+        assert snapshot.policy.max_completion_tokens == settings.composer_planner_max_completion_tokens
+        assert snapshot.policy.max_cumulative_provider_cost == settings.composer_planner_max_cumulative_provider_cost
+        assert snapshot.policy.repair_budget == settings.composer_planner_repair_budget
+        assert all(request["max_tokens"] <= snapshot.policy.max_completion_tokens for request in script.requests)
+    else:
+        assert snapshot.applicability == initial.applicability == "not_applicable"
+        assert snapshot.policy is None
+    assert snapshot.physical_calls == len(snapshot.charges) == 2
+    assert [charge.call_id for charge in snapshot.charges] == [call["call_id"] for call in calls]
+    assert all(charge.cost == Decimal("0.01") and charge.cost_source == "response_usage.cost" for charge in snapshot.charges)
+    assert all(charge.response_accountable for charge in snapshot.charges)
+    assert snapshot.known_cost == snapshot.validated_cost == Decimal("0.02")
+    assert snapshot.cost_known is True and snapshot.refusal_code is None
+
+    with engine.connect() as conn:
+        attempts = (
+            conn.execute(select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == str(session.id)))
+            .mappings()
+            .all()
+        )
+        ledger = (
+            conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.session_id == str(session.id))).mappings().all()
+        )
+    assert len(attempts) == len(ledger) == 2
+    assert {attempt["attempt_id"] for attempt in attempts} == {call["call_id"] for call in calls}
+    assert len({attempt["ledger_entry_id"] for attempt in attempts}) == 2
+    assert {attempt["ledger_entry_id"] for attempt in attempts} == {entry["entry_id"] for entry in ledger}
+    for attempt in attempts:
+        assert attempt["settled_at"] is not None
+        assert attempt["identity_id"] == "planner-user" and attempt["source"] == "composer"
+        assert attempt["operation_id"] == context.fence.operation_id
+        assert attempt["operation_epoch"] == context.fence.operation_epoch
+        assert attempt["lease_token"] == context.fence.lease_token
+        (entry,) = [entry for entry in ledger if entry["entry_id"] == attempt["ledger_entry_id"]]
+        (call,) = [call for call in calls if call["call_id"] == attempt["attempt_id"]]
+        assert entry["identity_id"] == "planner-user" and entry["source"] == "composer"
+        assert entry["model"] == call["model_returned"]
+        assert entry["prompt_tokens"] == call["prompt_tokens"] == 10
+        assert entry["completion_tokens"] == call["completion_tokens"] == 5
 
 
 @pytest.mark.asyncio
-async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
+async def test_common_required_provider_audit_failure_publishes_no_proposal_or_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    engine = create_session_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+    from elspeth.web.sessions.service import ComposerRequiredAuditPersistenceError
+
+    request = "Build a CSV to JSONL pipeline."
+    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
+    preference_transition = await sessions.update_composer_preferences(
+        session.id, trust_mode="explicit_approve", density_default="high", actor="test"
     )
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="planner-user")
-        grant_test_pipeline_user(conn, identity_id="planner-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("planner-user", "Planner", "local")
-    user_message = await sessions.add_message(
-        session.id,
-        "user",
-        "Build a CSV to JSONL pipeline.",
-        writer_principal="route_user_message",
+    assert preference_transition.current.trust_mode == "explicit_approve"
+    assert preference_transition.current.density_default == "high"
+    with engine.connect() as conn:
+        events_before = [dict(row) for row in conn.execute(select(proposal_events_table).order_by(proposal_events_table.c.id)).mappings()]
+    (preference_event,) = events_before
+    assert preference_event["event_type"] == "trust_mode.changed"
+    assert preference_event["session_id"] == str(session.id)
+    assert preference_event["proposal_id"] is None
+    assert preference_event["actor"] == "test"
+    assert preference_event["payload"] == {
+        "trust_mode": preference_transition.current.trust_mode,
+        "prior_trust_mode": preference_transition.prior.trust_mode,
+        "density_default": preference_transition.current.density_default,
+    }
+    script = CommonSDK(
+        request=request,
+        candidate="",
+        steps=(Step("primary", tool_name="set_pipeline", arguments={"pipeline": _pipeline(tmp_path, str(session.id))}),),
     )
-    settings = WebSettings(
-        data_dir=tmp_path,
-        composer_model="test/planner",
-        composer_boot_probe_enabled=False,
-        composer_prompt_guard_mode="debug-when-unconfigured",
-        composer_max_composition_turns=3,
-        composer_max_discovery_turns=2,
-        composer_timeout_seconds=20.0,
-        composer_rate_limit_per_minute=10,
-        shareable_link_signing_key=b"\x00" * 32,
-    )
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
-    )
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    original = sessions._insert_chat_message
+    sql_failure = SQLAlchemyError("actual required native provider audit failure")
+    fired: list[SQLAlchemyError] = []
 
-    provider_calls: list[dict[str, Any]] = []
+    def fail(conn: Any, **kwargs: Any) -> Any:
+        envelopes = kwargs["tool_calls"]
+        if kwargs["role"] == "audit" and envelopes and envelopes[0].get("_kind") == "llm_call_audit":
+            fired.append(sql_failure)
+            raise sql_failure
+        return original(conn, **kwargs)
 
-    async def completion(**kwargs: Any) -> _Response:
-        provider_calls.append(kwargs)
-        return _terminal_response(tmp_path, str(session.id))
-
-    monkeypatch.setattr("litellm.acompletion", completion)
-    # Fail the planner cohort in its real SQL worker, after guard admission
-    # and the physical provider checkpoint have completed independently.
-    original_insert = sessions._insert_chat_message
-    audit_failure = SQLAlchemyError("audit write failed")
-    failed_inserts: list[SQLAlchemyError] = []
-
-    def fail_planner_attempt_insert(*args: Any, **kwargs: Any) -> Any:
-        tool_calls = kwargs["tool_calls"]
-        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
-            failed_inserts.append(audit_failure)
-            raise audit_failure
-        return original_insert(*args, **kwargs)
-
-    monkeypatch.setattr(sessions, "_insert_chat_message", fail_planner_attempt_insert)
-
-    with pytest.raises(AuditIntegrityError, match="audit persistence failed before proposal creation") as caught:
+    monkeypatch.setattr(sessions, "_insert_chat_message", fail)
+    with pytest.raises(ComposerRequiredAuditPersistenceError) as caught:
         await composer.compose(
-            "Build a CSV to JSONL pipeline.",
+            request,
             [],
             _empty_state(),
             session_id=str(session.id),
             user_id="planner-user",
-            user_message_id=str(user_message.id),
+            user_message_id=str(user.id),
         )
 
-    assert failed_inserts == [audit_failure]
-    assert caught.value.__cause__ is audit_failure
-    assert len(provider_calls) == 1
+    assert caught.value.__cause__ is sql_failure
+    assert fired == [sql_failure]
+    assert sdk.await_count == 1 and script.phases == []
+    script.assert_done()
+    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+    assert await sessions.list_composition_proposals(session.id) == []
     persisted = await sessions.get_messages(session.id, limit=None)
     durable_call_kinds = [
         envelope["_kind"]
         for row in persisted
         for envelope in (row.tool_calls or ())
-        if envelope["_kind"] in {"prompt_guard_audit", "llm_call_audit", "planner_attempt_audit"}
+        if envelope.get("_kind") in {"prompt_guard_audit", "llm_call_audit", "planner_attempt_audit"}
     ]
-    assert durable_call_kinds == ["prompt_guard_audit", "llm_call_audit"]
-    assert await sessions.list_composition_proposals(session.id) == []
+    assert durable_call_kinds == ["prompt_guard_audit"]
     with engine.connect() as conn:
+        events_after = [dict(row) for row in conn.execute(select(proposal_events_table).order_by(proposal_events_table.c.id)).mappings()]
+        assert events_after == events_before
+        assert conn.execute(select(blobs_table)).all() == []
         assert conn.execute(select(composition_proposals_table)).all() == []
-        assert conn.execute(select(proposal_events_table)).all() == []
         assert conn.execute(select(composition_states_table)).all() == []
+        assert conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "tool")).all() == []
 
 
 async def _recipe_composer_context(
@@ -1146,204 +1011,6 @@ async def test_freeform_matching_provider_cancellation_persists_once_without_sel
     _assert_no_pipeline_side_effects(engine)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("provider_outcome", "expected_status"),
-    (
-        ("success", ComposerLLMCallStatus.SUCCESS),
-        ("error", ComposerLLMCallStatus.API_ERROR),
-        ("cancel", ComposerLLMCallStatus.CANCELLED),
-    ),
-)
-async def test_freeform_planner_manifest_mismatch_is_durable_before_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    provider_outcome: str,
-    expected_status: ComposerLLMCallStatus,
-) -> None:
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    message = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-    requests: list[dict[str, Any]] = []
-    manifests: list[Any] = []
-    owned_messages: list[list[dict[str, Any]]] = []
-    integrity_failures: list[AuditIntegrityError] = []
-    real_builder = planner_module.build_planner_capability_manifest  # type: ignore[attr-defined]
-    real_matcher = planner_module._assert_planner_call_matches_manifest
-    provider_failure: BaseException | None = None
-    if provider_outcome == "error":
-        provider_failure = LiteLLMAPIError(
-            status_code=503,
-            message="provider unavailable",
-            llm_provider="test-provider",
-            model="test/planner",
-        )
-    elif provider_outcome == "cancel":
-        provider_failure = asyncio.CancelledError()
-
-    def capture_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        manifests.append(manifest)
-        owned_messages.append(kwargs["messages"])
-        return manifest
-
-    def observe_mismatch(call: Any, manifest: Any, recorder: Any) -> None:
-        try:
-            real_matcher(call, manifest, recorder)
-        except AuditIntegrityError as failure:
-            integrity_failures.append(failure)
-            raise
-
-    async def mutating_completion(**kwargs: Any) -> _Response:
-        assert len(owned_messages) == 1
-        assert kwargs["messages"] is not owned_messages[0]
-        original_content = owned_messages[0][0]["content"]
-        kwargs["messages"][0]["content"] += "\nprovider-side mutation"
-        assert owned_messages[0][0]["content"] == original_content
-        # Guarded SDK kwargs are detached. Corrupt the actual planner-owned
-        # context after its real manifest was built to exercise the integrity gate.
-        owned_messages[0][0]["content"] += "\nowned planner input mutation"
-        requests.append(kwargs)
-        if provider_failure is not None:
-            raise provider_failure
-        return _terminal_response(tmp_path, str(session.id))
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    monkeypatch.setattr(planner_module, "_assert_planner_call_matches_manifest", observe_mismatch)
-    monkeypatch.setattr("litellm.acompletion", mutating_completion)
-
-    expected_error_type = {
-        "success": AuditIntegrityError,
-        "error": ExceptionGroup,
-        "cancel": BaseExceptionGroup,
-    }[provider_outcome]
-    with pytest.raises(expected_error_type) as caught:
-        await composer.compose(
-            message,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
-        )
-
-    assert type(caught.value) is expected_error_type
-    assert len(integrity_failures) == 1
-    assert type(integrity_failures[0]) is AuditIntegrityError
-    assert str(integrity_failures[0]) == "planner call inputs changed after capability manifest construction"
-    if provider_failure is None:
-        assert caught.value is integrity_failures[0]
-    else:
-        assert isinstance(caught.value, BaseExceptionGroup)
-        assert caught.value.message == "Provider original body and audit construction outcomes"
-        assert len(caught.value.exceptions) == 2
-        assert caught.value.exceptions[0] is provider_failure
-        assert caught.value.exceptions[1] is integrity_failures[0]
-
-    persisted = await sessions.get_messages(session.id, limit=None)
-    audit_calls = [
-        envelope["call"] for row in persisted for envelope in (row.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
-    ]
-    assert len(requests) == len(manifests) == len(audit_calls) == 1
-    assert audit_calls[0]["status"] == expected_status.value
-    assert audit_calls[0]["messages_hash"] != manifests[0].rendered_prompt_hash
-    assert audit_calls[0]["tools_spec_hash"] == manifests[0].effective_tool_hash
-    assert await sessions.list_composition_proposals(session.id) == []
-    _assert_no_pipeline_side_effects(engine)
-
-
-@pytest.mark.asyncio
-async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellation_exactly_once(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A request cancel racing mismatch-audit persistence wins after the row commits."""
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    message = "Build a CSV to JSONL pipeline."
-    engine, sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-
-    owned_messages: list[list[dict[str, Any]]] = []
-    real_builder = planner_module.build_planner_capability_manifest
-
-    def capture_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        owned_messages.append(kwargs["messages"])
-        return manifest
-
-    async def mutating_completion(**kwargs: Any) -> _Response:
-        assert len(owned_messages) == 1
-        assert kwargs["messages"] is not owned_messages[0]
-        original_content = owned_messages[0][0]["content"]
-        kwargs["messages"][0]["content"] += "\nprovider-side mutation"
-        assert owned_messages[0][0]["content"] == original_content
-        owned_messages[0][0]["content"] += "\nowned planner input mutation"
-        return _terminal_response(tmp_path, str(session.id))
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
-    monkeypatch.setattr("litellm.acompletion", mutating_completion)
-
-    loop = asyncio.get_running_loop()
-    audit_worker_started = asyncio.Event()
-    release_audit_worker = threading.Event()
-    audit_worker_finished = asyncio.Event()
-    original_insert = sessions._insert_chat_message  # type: ignore[attr-defined]
-
-    def pause_mismatch_audit_insert(*args: Any, **kwargs: Any) -> Any:
-        row_id = original_insert(*args, **kwargs)
-        tool_calls = kwargs["tool_calls"]
-        # Physical evidence already checkpointed; race the manifest-mismatch cohort.
-        if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
-            loop.call_soon_threadsafe(audit_worker_started.set)
-            if not release_audit_worker.wait(timeout=5.0):
-                raise TimeoutError("test did not release mismatch audit worker")
-            loop.call_soon_threadsafe(audit_worker_finished.set)
-        return row_id
-
-    monkeypatch.setattr(sessions, "_insert_chat_message", pause_mismatch_audit_insert)
-    compose_task = asyncio.create_task(
-        composer.compose(
-            message,
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="planner-user",
-            user_message_id=str(user_message.id),
-        )
-    )
-    await asyncio.wait_for(audit_worker_started.wait(), timeout=5.0)
-    compose_task.cancel("request cancelled during mismatch audit persistence")
-    await asyncio.sleep(0)
-    cancellation_escaped_before_worker = compose_task.done()
-    release_audit_worker.set()
-    await asyncio.wait_for(audit_worker_finished.wait(), timeout=5.0)
-
-    with pytest.raises(asyncio.CancelledError) as caught:
-        await asyncio.wait_for(compose_task, timeout=5.0)
-
-    assert not cancellation_escaped_before_worker
-    assert caught.value.args == ("request cancelled during mismatch audit persistence",)
-    assert type(caught.value.__cause__) is AuditIntegrityError
-    assert "planner call inputs changed" in str(caught.value.__cause__)
-    persisted = await sessions.get_messages(session.id, limit=None)
-    audit_calls = [
-        envelope["call"] for row in persisted for envelope in (row.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
-    ]
-    assert len(audit_calls) == 1
-    assert audit_calls[0]["status"] == ComposerLLMCallStatus.SUCCESS.value
-    assert await sessions.list_composition_proposals(session.id) == []
-    _assert_no_pipeline_side_effects(engine)
-
-
 def _assert_no_pipeline_side_effects(engine: Any) -> None:
     with engine.connect() as conn:
         assert conn.execute(select(blobs_table)).all() == []
@@ -1353,36 +1020,38 @@ def _assert_no_pipeline_side_effects(engine: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_freeform_compose_routes_to_the_planner_without_pipeline_side_effects(
+async def test_freeform_common_provider_timeout_has_no_pipeline_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Freeform compose reaches the provider planner, and a planner failure
-    leaves zero pipeline side effects.
-    """
-    message = "Build the requested pipeline."
-    engine, _sessions, session, user_message, composer = await _recipe_composer_context(
-        tmp_path,
-        monkeypatch,
-        message=message,
-    )
-    from elspeth.web.composer import planning_application
+    """A first physical common provider timeout leaves zero pipeline side effects."""
+    from elspeth.web.composer.protocol import ComposerConvergenceError
 
-    fallback = AsyncMock(
-        spec=planning_application.plan_pipeline,
-        side_effect=PipelinePlannerError("fallback stopped", code="TEST_STOP"),
-    )
-    monkeypatch.setattr(planning_application, "plan_pipeline", fallback)
+    request = "Build the requested pipeline."
+    engine, sessions, session, user, composer = await _recipe_composer_context(tmp_path, monkeypatch, message=request)
+    original = TimeoutError("bounded physical timeout")
+    script = CommonSDK(request=request, candidate="", steps=(Step("primary", failure=original),))
+    script.bind(composer, monkeypatch)
+    sdk = AsyncMock(spec=litellm.acompletion, side_effect=script.__call__)
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    common = AsyncMock(spec=composer._compose_loop, wraps=composer._compose_loop)
+    monkeypatch.setattr(composer, "_compose_loop", common)
 
-    with pytest.raises(PipelinePlannerError, match="fallback stopped"):
+    with pytest.raises(ComposerConvergenceError) as caught:
         await composer.compose(
-            message,
+            request,
             [],
             _empty_state(),
             session_id=str(session.id),
             user_id="planner-user",
-            user_message_id=str(user_message.id),
+            user_message_id=str(user.id),
         )
 
-    fallback.assert_awaited_once()
+    assert caught.value.budget_exhausted == "timeout" and caught.value.max_turns == 0
+    common.assert_awaited_once()
+    script.assert_done()
+    assert sdk.await_count == 1 and script.phases == []
+    assert_initial_wire(script.requests[0], text=request, state=_empty_state(), session_id=str(session.id))
+    assert_actual_audits(engine, script.requests, ("timeout",), session_id=str(session.id))
+    assert await sessions.list_composition_proposals(session.id) == []
     _assert_no_pipeline_side_effects(engine)

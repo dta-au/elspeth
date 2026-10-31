@@ -1,0 +1,22 @@
+"""Original paid-input/native history witnesses on the real serial PG owner."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_continuation_runtime_provider_history import (
+    test_actual_provider_publication_to_latest_capture_preserves_registered_native_source as test_actual_provider_publication_to_latest_capture_preserves_registered_native_source,
+)
+from tests.unit.web.sessions.test_continuation_runtime_provider_history import (
+    test_actual_publication_with_another_admitted_recorder_refuses_stale_runtime_capture as test_actual_publication_with_another_admitted_recorder_refuses_stale_runtime_capture,
+)
+from tests.unit.web.sessions.test_continuation_runtime_provider_history import (
+    test_publication_keeps_current_selected_wire_check_after_original_paid_input_split as test_publication_keeps_current_selected_wire_check_after_original_paid_input_split,
+)
+from tests.unit.web.sessions.test_continuation_runtime_provider_history import (
+    test_two_actual_native_providers_replay_exact_old_source_then_refuse_its_corruption as test_two_actual_native_providers_replay_exact_old_source_then_refuse_its_corruption,
+)
+from tests.unit.web.sessions.test_continuation_runtime_provider_history import (
+    test_two_original_native_sources_survive_actual_fresh_claim_without_new_sdk as test_two_original_native_sources_survive_actual_fresh_claim_without_new_sdk,
+)
+
+pytestmark = pytest.mark.testcontainer

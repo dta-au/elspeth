@@ -1,0 +1,28 @@
+"""Original title outcome carrier on the same real serial PostgreSQL owners."""
+
+import pytest
+from tests.testcontainer.web.test_composer_operations_postgres import operation_postgres_target as operation_postgres_target
+from tests.testcontainer.web.test_composer_operations_postgres import operation_store as operation_store
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_actual_title_cancellation_retains_original_exception_and_already_settled_physical_audit as test_actual_title_cancellation_retains_original_exception_and_already_settled_physical_audit,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_actual_title_role_refusal_returns_original_undispatched_disposition as test_actual_title_role_refusal_returns_original_undispatched_disposition,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_empty_title_request_is_explicitly_undispatched_without_guard_quota_or_title_write as test_empty_title_request_is_explicitly_undispatched_without_guard_quota_or_title_write,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_foreign_title_custody_retains_original_guard_failure_without_snapshot_attribute_access as test_foreign_title_custody_retains_original_guard_failure_without_snapshot_attribute_access,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_title_observation_retains_actual_sdk_audit_attempt_and_current_writer_once as test_title_observation_retains_actual_sdk_audit_attempt_and_current_writer_once,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_title_original_audit_construction_failure_retains_actual_unfinished_attempt_without_synthetic_audit as test_title_original_audit_construction_failure_retains_actual_unfinished_attempt_without_synthetic_audit,
+)
+from tests.unit.web.sessions.test_auto_title_outcome import (
+    test_title_post_write_failure_is_original_raised_outcome_not_a_fabricated_success_receipt as test_title_post_write_failure_is_original_raised_outcome_not_a_fabricated_success_receipt,
+)
+
+pytestmark = pytest.mark.testcontainer

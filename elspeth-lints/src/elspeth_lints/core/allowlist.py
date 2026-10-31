@@ -858,6 +858,7 @@ def compute_judge_metadata_signature(
 
 def _judge_metadata_hmac_key() -> bytes:
     """Load the deployment-held key used to sign judge metadata."""
+    _require_operator_key_runtime()
     raw = os.environ.get(_JUDGE_METADATA_SIGNATURE_ENV_VAR)
     if raw is None or raw == "":
         raise JudgeMetadataKeyUnavailableError(
@@ -886,6 +887,7 @@ def _hmac_key_bytes_from_env(var_name: str) -> bytes:
     unset/empty or the key is too short — the fail-closed gate ``rekey`` runs before
     any tree read.
     """
+    _require_operator_key_runtime()
     raw = os.environ.get(var_name)
     if raw is None or raw == "":
         raise ValueError(f"{var_name} is required (HMAC key environment variable) but is unset or empty.")
@@ -896,6 +898,16 @@ def _hmac_key_bytes_from_env(var_name: str) -> bytes:
             "shorter HMAC keys are not acceptable for audit metadata binding."
         )
     return key
+
+
+def _require_operator_key_runtime() -> None:
+    """Key-consuming library callers share the protected CLI admission rule."""
+    from elspeth_lints.core import operator_runtime
+
+    try:
+        operator_runtime.require_operator_runtime()
+    except operator_runtime.OperatorRuntimeUnavailableError as exc:
+        raise JudgeMetadataKeyUnavailableError(str(exc)) from exc
 
 
 def _judge_metadata_signature_verify_mode() -> str:

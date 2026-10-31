@@ -1,0 +1,26 @@
+"""Does the FILE-scoped exemption admit a planted enumeration? Both directions.
+
+Paths are resolved, because the real test gets its paths from rglob (absolute)
+and a relative path compares unequal to the canonical one no matter what.
+"""
+import ast, importlib.util
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("t_thaw", "tests/unit/contracts/test_prompt_guard_provenance_thaw.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+canonical = Path("src/elspeth/contracts/prompt_guard.py").resolve()
+elsewhere = Path("src/elspeth/contracts/other.py").resolve()
+assert canonical == mod._CANONICAL_DEFINITION, f"{canonical} != {mod._CANONICAL_DEFINITION}"
+source = canonical.read_text(encoding="utf-8")
+plant = "\n\nPLANTED_KEYS = frozenset({PROMPT_GUARD_TRUST_KEY, PROMPT_GUARD_CONTENT_PARTS_KEY})\n"
+
+for label, path, text in (
+    ("clean   @ canonical", canonical, source),
+    ("planted @ canonical", canonical, source + plant),
+    ("planted @ elsewhere", elsewhere, source + plant),
+):
+    lines = mod._duplicate_enumerations(ast.parse(text))
+    reported = bool(lines) and path != mod._CANONICAL_DEFINITION
+    print(f"{label}: detector={lines} reported_as_offender={reported}")

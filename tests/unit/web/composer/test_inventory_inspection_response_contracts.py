@@ -16,7 +16,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.plugin_capabilities import CapabilityDeclaration
+from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSummary
@@ -228,14 +228,19 @@ def test_owned_cache_containers_cannot_be_repaired_from_mutable_shapes() -> None
     default_corruption: dict[str, Any] = {"default": {"nested": []}}
     bad_default = replace(inventory.available[0].config_fields[0], **default_corruption)
     capability_corruption: dict[str, Any] = {"capability": "llm"}
-    bad_capability = CapabilityDeclaration(**capability_corruption)
+    valid_capability = CapabilityDeclaration(PluginCapability.LLM)
+    valid_inventory = replace(inventory, available=(replace(inventory.available[0], policy_capabilities=(valid_capability,)),))
+    assert PLUGIN_INVENTORY_RESPONSE_CONTRACT.admit(valid_inventory).to_wire()["available"][0]["policy_capabilities"] == [
+        {"capability": "llm", "control_role": None, "blocks_positive_detection": False}
+    ]
+    with pytest.raises(TypeError, match="requires a PluginCapability"):
+        CapabilityDeclaration(**capability_corruption)
     corruptions = (
         replace(inventory, **root_corruption),
         replace(inventory, **root_item_corruption),
         replace(inventory, available=(replace(inventory.available[0], **nested_corruption),)),
         replace(inventory, available=(replace(inventory.available[0], **nested_item_corruption),)),
         replace(inventory, available=(replace(inventory.available[0], config_fields=(bad_default,)),)),
-        replace(inventory, available=(replace(inventory.available[0], policy_capabilities=(bad_capability,)),)),
     )
     for corrupted in corruptions:
         with pytest.raises(FrameworkBugError):

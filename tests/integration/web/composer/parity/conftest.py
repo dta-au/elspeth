@@ -1,6 +1,6 @@
-"""Real-path freeform Composer graph and planner-policy fixtures.
+"""Real-path common Composer graph and plugin-policy fixtures.
 
-The scripted provider supplies fixture responses, while the production planner,
+The scripted provider supplies fixture responses, while the production loop,
 proposal lifecycle, candidate validation, and committed-state reader remain real.
 """
 
@@ -45,6 +45,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.composer_fakes import StaticPluginSnapshotFactory
 from tests.fixtures.identities import wire_test_pipeline_user_authority
+from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 from tests.helpers.composer_operations import install_composer_async_worker
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -102,7 +103,7 @@ class _ScriptedCompletion:
 
 
 def emit_proposal_response(pipeline: Mapping[str, Any], *, tool_call_id: str = "parity-terminal") -> _Response:
-    """A terminal response calling ``emit_pipeline_proposal`` with ``pipeline``."""
+    """A provider-authored full set_pipeline replacement in its wire envelope."""
     return _Response(
         choices=[
             _Choice(
@@ -112,7 +113,7 @@ def emit_proposal_response(pipeline: Mapping[str, Any], *, tool_call_id: str = "
                         _ToolCall(
                             id=tool_call_id,
                             function=_Function(
-                                name="emit_pipeline_proposal",
+                                name="set_pipeline",
                                 arguments=json.dumps({"pipeline": pipeline}),
                             ),
                         )
@@ -203,12 +204,22 @@ class ParityEnv:
     def _client(self) -> AsyncClient:
         return AsyncClient(transport=ASGITransport(app=self.app), base_url="http://parity")
 
-    def _script(self, fixture: Mapping[str, Any], session_id: str) -> Mapping[str, Any]:
-        """Patch the completion global to emit this fixture's pipeline; return it."""
+    def _script(self, fixture: Mapping[str, Any], session_id: str) -> CommonSDK:
+        """Script explicit proposal, provider reply and actual END review."""
         pipeline = rewrite_source_paths(fixture["canonical_arguments"], self.data_dir, session_id)
-        completion = _ScriptedCompletion(emit_proposal_response(pipeline))
+        reply = "The proposed pipeline is waiting for approval."
+        completion = CommonSDK(
+            request=fixture["intent"],
+            candidate=reply,
+            steps=(
+                Step("primary", tool_name="set_pipeline", arguments={"pipeline": pipeline}),
+                Step("primary", content=reply),
+                Step("end"),
+            ),
+        )
+        completion.bind(self.composer, self.monkeypatch)
         self.monkeypatch.setattr("litellm.acompletion", completion)
-        return pipeline
+        return completion
 
     def reference_state(self, fixture: Mapping[str, Any]) -> CompositionState:
         """Ground-truth committed graph: fixture args through set_pipeline directly.
@@ -253,14 +264,12 @@ class ParityEnv:
     async def drive_freeform(self, fixture: Mapping[str, Any]) -> CompositionState:
         """Freeform: real ``compose()`` empty-build path → proposal → accept.
 
-        The reworded imperative intent trips ``_user_request_expects_pipeline_mutation``
-        and the recipe bypass guarantees a non-match, so ``compose`` enters
-        ``_plan_and_stage_empty_pipeline`` → ``plan_pipeline`` (real planner) and
-        stages one pending proposal, which is then accepted over the real HTTP
-        route.
+        The provider stages a complete set_pipeline proposal through the common
+        tool loop, then supplies prose reviewed by the real END advisor. The
+        pending proposal is accepted through the real HTTP route.
         """
         session = await self.sessions.create_session("alice", "Alice", "local")
-        self._script(fixture, str(session.id))
+        script = self._script(fixture, str(session.id))
         await self.sessions.update_composer_preferences(
             session.id,
             trust_mode="explicit_approve",
@@ -281,12 +290,12 @@ class ParityEnv:
             user_id="alice",
             user_message_id=str(user_message.id),
         )
+        script.assert_done()
+        assert script.phases == ["end"]
+        assert_actual_audits(self.app.state.session_engine, script.requests, ("success", "success", "success"), session_id=str(session.id))
         proposals = await self.sessions.list_composition_proposals(session.id, status="pending")
         if len(proposals) != 1:
-            raise AssertionError(
-                f"freeform did not stage exactly one proposal for {fixture['class']} "
-                f"(got {len(proposals)}) — it may have fallen through to the compose loop"
-            )
+            raise AssertionError(f"freeform did not stage exactly one proposal for {fixture['class']} (got {len(proposals)})")
         proposal = proposals[0]
         metadata = proposal.pipeline_metadata
         if metadata is None:
@@ -404,7 +413,6 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.settings = settings
     app.state.composer_service = composer
     app.state.interpretation_surfacing = composer._interpretation_surfacing
-    app.state.planning_application = composer._planning_application
     app.state.schema_disclosure = composer._schema_disclosure
     app.state.rate_limiter = ComposerRateLimiter(limit=1000)
     app.state.catalog_service = catalog

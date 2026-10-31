@@ -17,7 +17,6 @@ from sqlalchemy import func, select
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
@@ -53,11 +52,6 @@ def _assert_inline_source_refusal(result: ToolResult, state: CompositionState, c
     guidance = result.to_dict()["validation_guidance"]["codes"][code]
     assert explanation_fragment in guidance["explanation"]
     assert guidance["suggested_fix"]
-    projected = _allowlisted_candidate_feedback(result)["validation"]["errors"][0]
-    assert projected["error_code"] == code
-    assert projected["explanation"] == guidance["explanation"]
-    assert projected["suggested_fix"] == guidance["suggested_fix"]
-    assert "detail" not in projected
 
 
 class TestSetPipelineSchemaShape:

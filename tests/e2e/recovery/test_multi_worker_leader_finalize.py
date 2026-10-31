@@ -35,6 +35,7 @@ Contracts pinned (each FAILS under the pre-fix code):
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -44,12 +45,14 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
+from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, WorkerMembershipToken
-from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError
+from elspeth.contracts.errors import GracefulShutdownError, OrchestrationInvariantError, RunWorkerEvictedError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.core.config import QueueSettings, SourceSettings, TransformSettings
+from elspeth.core.checkpoint import CheckpointManager
+from elspeth.core.config import CheckpointSettings, QueueSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
@@ -65,6 +68,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.checkpointing import CheckpointCoordinator
 from elspeth.engine.processor import RowProcessor
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -588,6 +592,82 @@ def test_late_follower_pending_sink_is_drained_exactly_once(tmp_path: Path) -> N
     assert values.count(999) == 1, f"follower's row must be written exactly once, got values={values}"
     # The leader's own row is also present (no row lost).
     assert 10 in values
+
+
+def test_shutdown_during_follower_pending_sink_drain_checkpoints_before_stopping(tmp_path: Path) -> None:
+    """Shutdown observed while the leader drains follower PENDING_SINK work is
+    a graceful interruption of that flush: the drained row is written once,
+    interrupted progress is checkpointed, and only then does the run stop.
+
+    Pins the live shutdown flag the leader passes to the follower-drain sink
+    flush. With a constant ``False`` the flush writes and returns; the drain
+    loop then finds no remaining follower work and exits before its own
+    shutdown check, so the run finalizes and never raises GracefulShutdownError
+    or writes the interrupted-progress checkpoint.
+
+    Checkpointing is enabled so the interrupted-progress call has a real
+    manager; the test reads the persisted sequence immediately before and
+    after that call, so other checkpoints written around it (run start, post
+    sink) cannot satisfy the assertion.
+    """
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    checkpoints = CheckpointManager(db)
+    orch = Orchestrator(
+        db,
+        checkpoint_manager=checkpoints,
+        checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="aggregation_only")),
+    )
+    follower_token: dict[str, str] = {}
+    shutdown_event = threading.Event()
+
+    def _seed(run_id: str) -> None:
+        follower_token["run_id"] = run_id
+        follower_token["id"] = _seed_follower_pending_sink_row(
+            db, payload_store, run_id, ingest_sequence=0, source_node_id=_source_node_id(db, run_id), value=999
+        )
+
+    config, graph, sink, _source = _build([{"id": 1, "value": 10}], _seed)
+    original_drain = RowProcessor.drain_scheduled_work
+    original_checkpoint = CheckpointCoordinator.checkpoint_interrupted_progress
+    events: list[str] = []
+    persisted: list[tuple[int, int]] = []
+
+    def latest_sequence() -> int:
+        latest = checkpoints.get_latest_checkpoint(follower_token["run_id"])
+        assert latest is not None, "a checkpointing-enabled run writes a run-start checkpoint"
+        return latest.sequence_number
+
+    def drain_then_request_shutdown(self: RowProcessor, *args: Any, **kwargs: Any) -> Any:
+        results = original_drain(self, *args, **kwargs)
+        if any(result.token.token_id == follower_token["id"] for result in results):
+            events.append("follower_drained")
+            shutdown_event.set()
+        return results
+
+    def record_checkpoint(self: CheckpointCoordinator, *args: Any, **kwargs: Any) -> None:
+        # The follower row is already written when the checkpoint is taken.
+        assert [r.get("value") for r in sink.results].count(999) == 1
+        before = latest_sequence()
+        original_checkpoint(self, *args, **kwargs)
+        persisted.append((before, latest_sequence()))
+        events.append("interrupted_checkpoint")
+
+    with (
+        patch.object(RowProcessor, "drain_scheduled_work", drain_then_request_shutdown),
+        patch.object(CheckpointCoordinator, "checkpoint_interrupted_progress", record_checkpoint),
+        pytest.raises(GracefulShutdownError) as error,
+    ):
+        orch.run(config, graph=graph, payload_store=payload_store, shutdown_event=shutdown_event)
+
+    assert error.value.run_id == follower_token["run_id"]
+    assert events == ["follower_drained", "interrupted_checkpoint"]
+    # The interrupted-progress call itself persisted exactly one new
+    # checkpoint: it was written, not merely invoked.
+    ((before, after),) = persisted
+    assert after == before + 1
+    values = [r.get("value") for r in sink.results]
+    assert values.count(999) == 1, f"follower's row must be written exactly once, got values={values}"
 
 
 @pytest.mark.timeout(60)

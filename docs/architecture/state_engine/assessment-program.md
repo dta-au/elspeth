@@ -379,10 +379,11 @@ this path only when an assessment has a v1 manifest and recorded hashes:
    reproduction preconditions the package declares (for example, a quiet-host
    load bar for contention-sensitive process probes).
 
-The current v3 catalog intentionally fails live-inventory validation against an
-older checkout, and the frozen v1/v2 catalogs may fail live-inventory validation
-against current source. Validate historical identity in the package-bearing checkout;
-execute historical behavior in the detached baseline worktree.
+The maintained v3 catalog checks the checkout's current plugin inventory and
+runtime vocabulary. Frozen v1/v2 catalogs retain their historical contracts and
+do not consult current live inventory; v2 also retains its historical vocabulary
+and execution-profile pin. Validate historical identity in the package-bearing
+checkout; execute historical behavior in the detached baseline worktree.
 
 ### Legacy best-effort reconstruction
 

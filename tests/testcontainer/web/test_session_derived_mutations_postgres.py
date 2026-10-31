@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import Engine, delete, event, func, insert, select, update
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -93,7 +94,7 @@ def _seed_run_and_blob(
                 nodes=None,
                 edges=None,
                 outputs=None,
-                metadata_=None,
+                metadata_=stored_default_pipeline_metadata(),
                 is_valid=True,
                 validation_errors=None,
                 composer_meta=None,

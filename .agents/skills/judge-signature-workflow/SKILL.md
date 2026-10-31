@@ -41,6 +41,15 @@ The signature is a **symmetric HMAC** — any holder of
 
 ## Judging transport policy (updated 2026-07-27)
 
+> **2026-10-24: `--judge-transport codex-cli` is disabled.** Inside the judge
+> worker, Codex's native shell could read the provider home (`HOME`/`CODEX_HOME`
+> hold provider credentials), and Codex CLI cannot be shown to disable that
+> shell completely. `call_judge` and the worker both refuse it ("the codex-cli
+> judge transport is disabled") until provider authentication is brokered
+> outside model and tool authority. Use `--judge-transport agent`: its readonly
+> tools are realpath-confined to the evidence snapshot, and blinded mode has no
+> tools. The Codex text below is historical until then.
+
 All judging — including the final signature verdict in the operator step — runs
 on the **Codex CLI harness with read-only tool access**:
 `--judge-transport codex-cli --judge-tools readonly`. The Codex child
@@ -71,8 +80,14 @@ judge misjudged boundary code it could not see and forced bulk operator
 overrides. [O1] is unchanged (tool access is read-only context, not key access),
 and readonly-mode rationales are secret-scrubbed before persistence.
 `--judge-tools readonly` accepts `codex-cli` and the legacy `agent` (Claude
-Agent SDK) transport; OpenRouter has no tool loop. Use `codex-cli` for the
-normal signing workflow. Do not recommend blinded OpenRouter runs except as a
+Agent SDK) transport; OpenRouter has no tool loop. The SDK transport refuses
+before import when the signing-key environment variable is present, even if
+empty. Key-free SDK judging remains available; this guard does not establish
+process isolation or erase keys previously loaded in memory. Key-bearing SDK
+signing requires a protected worker and SDK artifact qualification, which are
+still pending. Real signing remains disabled pending on-prem migration and
+operator-boundary qualification. While `codex-cli` is disabled (see the note
+above), use `agent` for the signing workflow. Do not recommend blinded OpenRouter runs except as a
 deliberate fallback.
 
 ## Agent side — stage a bundle (key-free MCP: `mcp__elspeth-judge__*`)
@@ -118,8 +133,12 @@ bundles must be re-staged.
    question 7): an unverifiable one is BLOCK-PENDING, a contradicted one is
    BLOCKED. The mirror error is worse than a block: a suppression justified
    by "X already checks this" where X is not reached deletes the only gate.
-4. **`stage_preview`** (needs installed + authenticated Codex CLI and the
-   `[mcp]` extra) — run the read-only Codex judge over each `new_judgment`
+4. **`stage_preview`** (needs the installed, admitted judge supervisor;
+   ADR-052. It judges through the `agent` transport, never the disabled
+   `codex-cli`. Until the supervisor is installed it refuses with "protected
+   judge supervisor admission is unavailable or invalid", with no local
+   Codex/SDK fallback; skip this step and leave the action for the
+   operator.) — run the read-only agent judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);
    surfaces BLOCKED reasons so you can fix the code or rationale *before* the
    operator spends a real judge call. The previewed request carries the same
@@ -131,12 +150,15 @@ bundles must be re-staged.
    summarise the bundle (source identity, per-lane counts, preview outcomes,
    and which justify actions still lack a rationale) and emit the
    **paste-ready operator `sign-bundle` command** plus `sign_bundle_plan`,
-   which prices it. Arg: `bundle_id`.
+   which prices it. Args: `bundle_id`, optional exact `stale_key`. With that
+   selector the primary command retires only one verified orphan, and the plan
+   reports one action, zero judge calls, original index, owning YAML and the
+   unselected action count. Full-bundle verification still precedes selection.
 6. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
    entries and flag broken ones into a rekey bundle, recording env-var **names**
    only, never key bytes. Args: `old_key_env`, `new_key_env`.
 
-Every one of those tools emits `sign_bundle_command` (the whole-bundle form) and
+By default those tools emit `sign_bundle_command` (the whole-bundle form) and
 `sign_bundle_plan`, both derived from the bundle's own contents.
 `sign_bundle_plan.per_lane` lists each staged lane cheapest-first with its action
 count, its **judge-call** count, and a `--lanes`-scoped command that fires only
@@ -163,7 +185,7 @@ the tree and abort before the first write on any mismatch.
 ```
 elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
   --judge-transport codex-cli --judge-tools readonly --dry-run \
-  [--lanes resign|new_judgment[,...]] [--continue-on-block] [--judge-concurrency N]
+  [--lanes resign|new_judgment[,...] | --stale-key KEY] [--continue-on-block] [--judge-concurrency N]
 elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NEW_VAR>
 ```
 
@@ -187,6 +209,23 @@ elspeth-lints rekey --in <bundle.json> --old-key-env <OLD_VAR> --new-key-env <NE
   blocked entries fail-closed and exiting 3 so a partial run never reads as
   clean. Paste the forms from `sign_bundle_plan` rather than hand-writing
   either flag — those carry each scope's judge-call price.
+- For one orphan, use public `stage_status(bundle_id=..., stale_key=KEY)` and
+  hand the operator its exact `--stale-key` dry-run command. Never substitute
+  `--lanes resign`: that lane can contain unrelated judge calls. Do not filter
+  the bundle, narrow the roots, retarget a shared MCP instance or invoke private
+  handlers. The complete unchanged v2 bundle/census must verify first. The
+  operator key remains required even for mechanical dry-run; agents stay key-free.
+  Exact mode preserves all surviving bytes and paths, permits only canonical
+  last-row `allow_hits: []` normalization, refuses CRLF target YAML before
+  publication and skips broader baseline/counter refreshes. Its authenticated
+  mode/path guard retains surviving modes and directory membership; the selected
+  YAML uses the canonical atomic writer's `0600` mode. Exact recovery refuses
+  unrelated active drift without overwriting it; legacy recovery is unchanged.
+  Its authenticated
+  schema-2 journal retains original bytes, expected snapshot, original action
+  index, key and owner; older CLIs refuse it. Resume inherits omitted scope and
+  refuses a changed key or lane selection. Existing schema-1 lane/all-action
+  journals remain supported; review-bundle schema v2 does not change.
 - Non-dry-run `sign-bundle` works in a private same-filesystem transaction.
   Accepted decisions are HMAC-authenticated and journalled there; the active
   allowlist remains byte-identical on BLOCK, failure, or interruption. Only a

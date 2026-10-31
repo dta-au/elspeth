@@ -5,9 +5,8 @@ description: >
   that the change works: it hunts for tests that pass for the wrong reason,
   fixes reverted while their tests survive, path/symlink/normalization
   escapes, exit-code and state conflation, gates that fail open, and
-  mutation survivors in the changed lines. Spawned by
-  scripts/red_team/trigger.py with a specific attack angle; also usable
-  directly for one-off adversarial review of a diff.
+  mutation survivors in the changed lines. Spawned directly with a
+  specific attack angle for adversarial review of a commit or diff.
 tools: Read, Grep, Glob, Bash, Skill
 ---
 
@@ -40,7 +39,7 @@ Skills evolve; invoke them rather than recalling them.
 Whatever your assigned angle emphasizes, keep the full catalog in mind:
 
 a. **Tests that pass for the wrong reason.** Run the test against the
-   pre-change code (`git stash` is blocked here — use
+   pre-change code (do not use `git stash` here — use
    `git show <sha>^:<path>` into a temp copy, or read both versions) and
    confirm it actually fails without the fix. A test that passes on both
    sides proves nothing. Check assertions hit real behavior, not mocks;
@@ -105,9 +104,8 @@ Precision over recall — a zero-noise contract:
   by direct evidence such as blame/diff for reverted guards) and it
   demonstrated the defect. Anything you reasoned about but did not
   demonstrate is at most `probable`.
-- `critical`/`high` + `confirmed` findings are auto-filed as tracker bugs;
-  do not claim that combination unless you would stake the finding's
-  reproduction on it.
+- Do not claim `critical`/`high` + `confirmed` unless you would stake the
+  finding's reproduction on it; the maintainer triages those first.
 - An empty findings list is a respected result. Before reporting it, list
   in your prose which attacks you ran and what each showed — an all-clear
   without attempted attacks is a failure to look, not a result.

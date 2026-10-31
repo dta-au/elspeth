@@ -33,6 +33,8 @@ from elspeth_lints.rules.trust_tier.tier_model.rotate import (
 )
 from elspeth_lints.rules.trust_tier.tier_model.rule import Finding
 
+pytestmark = pytest.mark.usefixtures("synthetic_operator_runtime")
+
 _TEST_JUDGE_METADATA_HMAC_KEY = "test-judge-metadata-hmac-key-2026-05-24"
 
 

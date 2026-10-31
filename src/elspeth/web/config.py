@@ -48,7 +48,9 @@ from elspeth.web.auth.urls import (
 )
 from elspeth.web.compartments import COMPARTMENT_ID_PATTERN, is_compartment_id
 from elspeth.web.composer.reasoning import ReasoningEffort
+from elspeth.web.composer.request_limits import DEFAULT_MAX_PREPARED_REQUEST_BYTES
 from elspeth.web.composer.strict_transport import StrictToolsSetting
+from elspeth.web.continuation_settings import ContinuationActionBoundsSettings
 from elspeth.web.plugin_policy.profiles import (
     AWSS3SourceProfileSettings,
     AWSTextractProfileSettings,
@@ -368,11 +370,29 @@ class WebSettings(BaseModel):
     composer_max_composition_turns: int = Field(..., ge=1)
     composer_max_discovery_turns: int = Field(..., ge=1)
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
+    composer_max_prepared_request_bytes: int = Field(
+        default=DEFAULT_MAX_PREPARED_REQUEST_BYTES,
+        strict=True,
+        ge=1,
+        description="Maximum canonical UTF-8 bytes of final prepared messages and tools for each physical model attempt.",
+    )
+    composer_attachment_inspection_max_bytes: int = Field(
+        default=262_144,
+        strict=True,
+        ge=1,
+        le=262_144,
+        description=(
+            "Maximum complete-original bytes inspected by each current V2 attachment read, before paging. "
+            "Operators may tighten the existing inspection ceiling; independent response and credential limits still apply. "
+            "This setting does not configure V1 or direct-tool attachment reads."
+        ),
+    )
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Canonical full-pipeline planner budgets. These are independent of the
-    # ordinary incremental compose loop because the planner accounts for exact
-    # request bytes, physical provider attempts, requested completion tokens,
-    # and post-call provider cost.
+    # Direct planner policy and legacy eligible Web v1 compatibility bounds.
+    # Common v1 preserves physical calls, exact request bytes, completion and
+    # post-call cost; v2 has no legacy planner policy. The repair value is
+    # facade compatibility only: default 2 does not control common repair;
+    # a nondefault value refuses eligible v1 admission before provider work.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
     composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
@@ -402,7 +422,32 @@ class WebSettings(BaseModel):
     composer_async_claim_lease_seconds: int = Field(default=30, ge=5, le=600)
     composer_async_scan_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     composer_async_poll_after_ms: int = Field(default=1000, ge=100, le=60_000)
-    composer_async_drain_seconds: float = Field(default=10.0, gt=0, le=120)
+    composer_async_drain_seconds: float = Field(default=10.0, gt=0, le=120, allow_inf_nan=False)
+    web_http_drain_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Prepared HTTP shutdown bound; the U-37 signal/server integration must wire it to the HTTP drain.",
+    )
+    composer_shutdown_grace_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+        description=(
+            "Actual infrastructure termination grace declared by the operator. This setting does not change the platform grace. "
+            "When Continuation is enabled, the larger HTTP/worker drain must leave one second for membership stop and five seconds of margin."
+        ),
+    )
+    # Composer Continuation (V2). Admission is default-off; a missing
+    # Composer-Operation-Version still means V1 whatever this says. The values
+    # bind only at admission and are retained per operation (design §4).
+    composer_continuation_enabled: bool = False
+    # Upper bounds keep every derived deadline representable as a timedelta.
+    composer_continuation_segment_nominal_seconds: float = Field(default=420.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_watermark_seconds: float = Field(default=120.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_quantum_seconds: float = Field(default=180.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_settlement_reserve_seconds: float = Field(default=25.0, gt=0, le=86_400, allow_inf_nan=False)
+    composer_continuation_action_bounds: ContinuationActionBoundsSettings = Field(default_factory=ContinuationActionBoundsSettings)
 
     @property
     def composer_sync_timeout_seconds(self) -> float:
@@ -1283,6 +1328,29 @@ class WebSettings(BaseModel):
         object.__setattr__(self, "sso_userinfo_endpoint", validated.userinfo_endpoint)
 
     @model_validator(mode="after")
+    def _validate_continuation_segment_policy(self) -> WebSettings:
+        """Refuse at startup what ``ContinuationSegmentPolicy`` would refuse at admission."""
+        if self.composer_continuation_watermark_seconds >= self.composer_continuation_segment_nominal_seconds:
+            raise ValueError("composer_continuation_watermark_seconds must be smaller than composer_continuation_segment_nominal_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_continuation_shutdown_grace(self) -> WebSettings:
+        """Check the prepared V2 budget without changing legacy V1 drain settings.
+
+        The full U-37 integration must coordinate HTTP, worker disposition and
+        membership shutdown before this declaration can bound a real process.
+        Unconditional process-grace enforcement remains that integration's
+        obligation; this compatibility gate does not qualify V1 shutdown.
+        """
+        if (
+            self.composer_continuation_enabled
+            and max(self.web_http_drain_seconds, self.composer_async_drain_seconds) + 1.0 + 5.0 > self.composer_shutdown_grace_seconds
+        ):
+            raise ValueError("composer_shutdown_grace_seconds must cover max(web_http_drain_seconds, composer_async_drain_seconds) + 1 + 5")
+        return self
+
+    @model_validator(mode="after")
     def _validate_composer_timeout_transport_headroom(self) -> WebSettings:
         """Keep a positive transport-safe budget for synchronous consumers.
 
@@ -1541,7 +1609,14 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
-    {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles", "execution_rate_limit"}
+    {
+        "plugin_preferences",
+        "plugin_control_modes",
+        "llm_profiles",
+        "bedrock_guardrail_default_profiles",
+        "execution_rate_limit",
+        "composer_continuation_action_bounds",
+    }
 )
 _OPTIONAL_JSON_OBJECT_FIELDS: frozenset[str] = frozenset({"composer_prompt_guard", "composer_advisor_prompt_guard"})
 
@@ -1594,12 +1669,17 @@ def configured_auth_settings(settings: WebSettings) -> Mapping[str, bool]:
     }
 
 
-def _annotation_scalar_types(annotation: Any) -> set[type]:
-    """Flatten an annotation (including ``X | None`` unions) to its scalar types."""
+def _annotation_scalar_types(annotation: Any) -> tuple[type, ...]:
+    """Flatten an annotation while retaining each type by identity, without hashing it."""
     origin = typing.get_origin(annotation)
-    if origin in (typing.Union, types.UnionType):
-        return {member for arg in typing.get_args(annotation) for member in _annotation_scalar_types(arg)}
-    return {annotation} if isinstance(annotation, type) else set()
+    if origin is typing.Union or origin is types.UnionType:
+        members: list[type] = []
+        for arg in typing.get_args(annotation):
+            for member in _annotation_scalar_types(arg):
+                if not any(member is known for known in members):
+                    members.append(member)
+        return tuple(members)
+    return (annotation,) if isinstance(annotation, type) else ()
 
 
 def _coerce_env_scalar(value: str, annotation: Any) -> object:
@@ -1613,12 +1693,12 @@ def _coerce_env_scalar(value: str, annotation: Any) -> object:
     them against the original input.
     """
     scalar_types = _annotation_scalar_types(annotation)
-    if bool in scalar_types:
+    if any(scalar is bool for scalar in scalar_types):
         return value
     try:
-        if int in scalar_types and float not in scalar_types:
+        if any(scalar is int for scalar in scalar_types) and not any(scalar is float for scalar in scalar_types):
             return int(value)
-        if float in scalar_types:
+        if any(scalar is float for scalar in scalar_types):
             return float(value)
     except ValueError:
         return value

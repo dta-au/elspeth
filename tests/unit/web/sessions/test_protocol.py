@@ -23,7 +23,6 @@ from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     AuditAccessLogAuthority,
     ChatMessageRecord,
-    CompositionStateData,
     CompositionStateRecord,
     OperationReceiptFence,
     RunAlreadyActiveError,
@@ -37,6 +36,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionRunStatus,
 )
+from tests.helpers.composition_state import composition_state_data, default_pipeline_metadata
 
 
 @pytest.mark.parametrize(
@@ -396,7 +396,7 @@ class TestCompositionStateData:
     def test_mutable_inputs_are_frozen(self) -> None:
         source = {"type": "csv", "path": "/data/test.csv"}
         nodes = [{"id": "n1", "type": "source"}]
-        data = CompositionStateData(
+        data = composition_state_data(
             source=source,
             nodes=nodes,
             is_valid=True,
@@ -412,12 +412,12 @@ class TestCompositionStateData:
             data.nodes.append({"id": "n2"})  # type: ignore[union-attr]
 
     def test_none_fields_not_frozen(self) -> None:
-        data = CompositionStateData(is_valid=False)
+        data = composition_state_data(is_valid=False)
         assert data.sources is None
         assert data.nodes is None
 
     def test_frozen_immutability(self) -> None:
-        data = CompositionStateData(is_valid=True)
+        data = composition_state_data(is_valid=True)
         with pytest.raises(AttributeError):
             data.is_valid = False  # type: ignore[misc]
 
@@ -432,7 +432,7 @@ class TestCompositionStateRecord:
             nodes=[{"id": "n1"}],
             edges=None,
             outputs=None,
-            metadata_=None,
+            metadata_=default_pipeline_metadata(),
             is_valid=True,
             validation_errors=None,
             created_at=datetime.now(UTC),

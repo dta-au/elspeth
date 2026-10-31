@@ -1,0 +1,41 @@
+"""Every dict literal in src/elspeth that is keyed by a guard key, by AST.
+
+Not a grep: a text pattern anchored on `{` only finds literals whose FIRST key
+is a guard key, which is how a three-file sample came out of a ten-file set.
+"""
+import ast, sys
+from pathlib import Path
+
+ROOT = Path("src/elspeth")
+
+
+def guard_keys(node: ast.Dict) -> list[str]:
+    return [
+        k.id
+        for k in node.keys
+        if k is not None and type(k) is ast.Name and k.id.startswith("PROMPT_GUARD_") and k.id.endswith("_KEY")
+    ]
+
+
+per_file: dict[str, int] = {}
+worst = 0
+multi: list[str] = []
+for path in sorted(ROOT.rglob("*.py")):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if type(node) is ast.Dict:
+            names = guard_keys(node)
+            if names:
+                per_file[str(path)] = per_file.get(str(path), 0) + 1
+                worst = max(worst, len(names))
+                if len(names) >= 2:
+                    multi.append(f"{path}:{node.lineno} -> {names}")
+
+for name, count in sorted(per_file.items(), key=lambda kv: (-kv[1], kv[0])):
+    print(f"{count:3d}  {name}")
+print(f"\n{sum(per_file.values())} literals across {len(per_file)} files; MAX guard keys in any ONE literal = {worst}")
+print(f"literals with >= 2 guard keys: {len(multi)} {multi}")
+
+planted = ast.parse("d = {PROMPT_GUARD_TRUST_KEY: a, PROMPT_GUARD_THINKING_PARTS_KEY: b}")
+hits = [n.lineno for n in ast.walk(planted) if type(n) is ast.Dict and len(guard_keys(n)) >= 2]
+print(f"CONTROL planted 2-key dict -> {hits}  (must be [1])")

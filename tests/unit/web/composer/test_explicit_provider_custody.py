@@ -57,16 +57,16 @@ def _required_guard_settings(tmp_path, monkeypatch):
     return settings, requests
 
 
-def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt):
+def _assert_required_guard_admitted(engine, context, requests, *, role, user_prompt, expected_count=1):
     checks = _checks(engine)
-    assert len(checks) == 1
-    check = checks[0]
-    assert check["operation_id"] == context.fence.operation_id
-    assert check["operation_epoch"] == context.fence.operation_epoch
-    assert check["role"] == role
-    assert check["adapter"] == "azure_prompt_shields"
-    assert check["mode"] == "required"
-    assert (check["disposition"], check["reason"]) == ("allow", "clean")
+    assert len(checks) == expected_count
+    for check in checks:
+        assert check["operation_id"] == context.fence.operation_id
+        assert check["operation_epoch"] == context.fence.operation_epoch
+        assert check["role"] == role
+        assert check["adapter"] == "azure_prompt_shields"
+        assert check["mode"] == "required"
+        assert (check["disposition"], check["reason"]) == ("allow", "clean")
     assert requests
     assert all(json.loads(request.content)["userPrompt"] == user_prompt for request in requests)
 
@@ -370,92 +370,6 @@ async def test_actual_advisor_producer_retains_complete_audit_without_recorder(t
         RequiredWorkSource.DISPATCH_AUDIT_SQL,
         RequiredWorkSource.DISPATCH_AUDIT_PROJECTION,
     }
-    authority.release(context)
-    engine.dispose()
-
-
-@pytest.mark.asyncio
-async def test_actual_planner_producer_uses_physical_sdk_and_settles_failed_call(tmp_path, monkeypatch):
-    from dataclasses import replace
-
-    import litellm
-
-    from elspeth.web.catalog.policy_view import PolicyCatalogView
-    from elspeth.web.composer.audit import BufferingRecorder
-    from elspeth.web.composer.capability_skill import load_pipeline_capability_core
-    from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage, plan_pipeline
-    from elspeth.web.composer.pipeline_proposal import AbsentBase
-    from elspeth.web.dependencies import create_catalog_service
-    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from tests.unit.web.composer.test_pipeline_planner import (
-        _budget,
-        _custody,
-        _empty_state,
-        _lifecycle,
-        _model,
-        _ScriptedCompletion,
-    )
-
-    settings, guard_requests = _required_guard_settings(tmp_path, monkeypatch)
-    user_prompt = "Build the requested pipeline."
-    engine, authority, service = _quota_service(tmp_path)
-    session = authority.create_session_with_initial_fence(
-        user_id="alice", title="Planner", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
-    )
-    context = authority.acquire(
-        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
-    )
-    coordinator = RequiredWorkCoordinator(
-        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
-    )
-    owner = ProviderInvocationOwner(service=service, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
-    catalog = create_catalog_service()
-    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    recorder = BufferingRecorder()
-    sdk_error = ValueError("local physical planner failure")
-    physical_calls = []
-
-    async def completion(**kwargs):
-        _assert_required_guard_admitted(engine, context, guard_requests, role="composer", user_prompt=user_prompt)
-        physical_calls.append(kwargs)
-        raise sdk_error
-
-    monkeypatch.setattr(litellm, "acompletion", completion)
-    with prompt_guard_user_scope(user_prompt), pytest.raises(ValueError) as caught:
-        await plan_pipeline(
-            intent=user_prompt,
-            current_state=_empty_state(),
-            provider_current_state=_empty_state().to_dict(),
-            schemas_loaded=frozenset(),
-            mark_schema_loaded=None,
-            policy_catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
-            plugin_snapshot=snapshot,
-            originating_message=PlannerOriginatingMessage(
-                session_id=str(session.id), message_id=str(uuid4()), content="Build the requested pipeline.", user_id="alice"
-            ),
-            base=AbsentBase(),
-            model_config=_model(
-                _ScriptedCompletion([]),
-                prompt_guard_mount=build_prompt_guard_mount(settings.composer_prompt_guard),
-                prompt_guard_mode=settings.composer_prompt_guard_mode,
-            ),
-            rendered_skill=load_pipeline_capability_core() + "\nOrdinary bounded planner instructions.",
-            repair_budget=0,
-            budget_policy=_budget(),
-            custody_config=replace(
-                _custody(tmp_path), session_engine=engine, session_operation_context=context, session_operation_authority=authority
-            ),
-            lifecycle=_lifecycle(),
-            recorder=recorder,
-            candidate_finalizer=lambda candidate: candidate,
-            provider_service=service,
-            provider_owner=owner,
-        )
-    assert caught.value is sdk_error
-    assert len(physical_calls) == 1
-    assert len(recorder.llm_calls) == 1
-    assert len(_ledger(engine)) == 1
-    coordinator.assert_completed()
     authority.release(context)
     engine.dispose()
 

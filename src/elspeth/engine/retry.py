@@ -43,6 +43,10 @@ from elspeth.contracts.errors import MaxRetriesExceeded
 T = TypeVar("T")
 
 
+class RetryShutdownRequestedError(InterruptedError):
+    """RetryManager stopped at an explicit cooperative shutdown boundary."""
+
+
 class RetryManager:
     """Manages retry logic for transform execution.
 
@@ -103,14 +107,14 @@ class RetryManager:
 
         def raise_if_shutdown_requested(when: str) -> None:
             if shutdown_event is not None and shutdown_event.is_set():
-                raise InterruptedError(f"shutdown requested {when}")
+                raise RetryShutdownRequestedError(f"shutdown requested {when}")
 
         def interruptible_sleep(seconds: float) -> None:
             if shutdown_event is None:
                 time.sleep(seconds)
                 return
             if shutdown_event.wait(timeout=seconds):
-                raise InterruptedError("shutdown requested during retry wait")
+                raise RetryShutdownRequestedError("shutdown requested during retry wait")
 
         # Use tenacity's before_sleep hook to invoke on_retry callback.
         # This ensures callback fires ONLY when a retry is actually scheduled,

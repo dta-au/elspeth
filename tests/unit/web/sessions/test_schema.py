@@ -38,6 +38,7 @@ from elspeth.web.sessions.schema import (
     probe_current_schema,
 )
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stored_default_pipeline_metadata
 
 
 @pytest.mark.parametrize(
@@ -97,6 +98,7 @@ def _seed_session_state(conn) -> tuple[str, str]:
     )
     conn.execute(
         insert(composition_states_table).values(
+            metadata_=stored_default_pipeline_metadata(),
             id=state_id,
             session_id=session_id,
             version=1,
@@ -373,7 +375,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 76 requires committed terminal graph-review facts on effective reads.
     # Epoch 77 retains that authority, makes container storage optional and
     # enforces its singleton across actors; neither epoch-76 predecessor suffices.
-    assert SESSION_SCHEMA_EPOCH == 78
+    # Epoch 79 retains versioned continuation children and exact snapshot bytes.
+    assert SESSION_SCHEMA_EPOCH == 79
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
