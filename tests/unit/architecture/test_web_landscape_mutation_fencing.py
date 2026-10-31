@@ -20699,6 +20699,15 @@ _reserve_CLOSURE_ALLOWLIST = {
 }
 
 
+# The same exact-count review for rows of the reserve proof dispatch layer
+# (_reserve_ReserveProof.dispatch_failures); only rows that carry
+# "<path>:<line>:<symbol>" can match.
+_reserve_PROOF_ALLOWLIST = {
+    (entry["category"], entry["path"], entry["symbol"]): entry["count"]
+    for entry in _reserve_json.loads((_reserve_BASE / "reviewed-proof-allowlist.json").read_text())["entries"]
+}
+
+
 def _reserve_apply_closure_allowlist(failures, unit_paths, allowlist=None):
     """Drop exactly-reviewed closure rows; keep every other row; report stale entries."""
     allowlist = _reserve_CLOSURE_ALLOWLIST if allowlist is None else allowlist
@@ -21576,7 +21585,9 @@ class _reserve_ReserveProof:
         self.failures.extend(self.boundary.failures)
         if self.failures:
             return
-        self.failures.extend(self.dispatch_failures())
+        self.failures.extend(
+            _reserve_apply_closure_allowlist(self.dispatch_failures(), frozenset(u.path for u in self.units), _reserve_PROOF_ALLOWLIST)
+        )
 
     def dispatch_failures(self):
         failures = []
@@ -22841,7 +22852,7 @@ class _reserve_ReserveProof:
                             else:
                                 fields.add(None)
                         if (None in forms or None in fields) and (unit.path, id(n)) in self.boundary.reflection_sites:
-                            failures.append("unproved reflection operator/selector " + unit.path + ":" + str(n.lineno) + " " + _symbol(n))
+                            failures.append("unproved reflection operator/selector " + unit.path + ":" + str(n.lineno) + ":" + _symbol(n))
                         namespace_access = namespace_access or bool(fields - {None} & {"__globals__", "__builtins__"})
                         if fields - {None} & namespace_helper_names and (not closed_reader):
                             failures.append("reflected private namespace accessor outside closed owner " + unit.path)
@@ -22974,7 +22985,9 @@ class _reserve_ReserveProof:
                         or enum_member
                         or reviewed_class_call
                     ):
-                        failures.append("selected owned supplier class/descriptor escape " + unit.path)
+                        failures.append(
+                            "selected owned supplier class/descriptor escape " + unit.path + ":" + str(n.lineno) + ":" + _symbol(n)
+                        )
                 if (
                     isinstance(n, (ast.Name, ast.Attribute))
                     and isinstance(n.ctx, ast.Load)
@@ -23243,7 +23256,7 @@ class _reserve_ReserveProof:
                         if not _looks_like_landscape_receiver(n.value, n.attr, resolver=r, use=n) and not (
                             _non_landscape_scalar_attribute_read(n, r, scalar_proof)
                         ):
-                            failures.append("reserve callable escape " + unit.path)
+                            failures.append("reserve callable escape " + unit.path + ":" + str(n.lineno) + ":" + _symbol(n))
                     elif r.qualified_name(n.value, use=n) == _reserve_COORD:
                         failures.append("unbound coordinator dispatch " + unit.path)
                 if isinstance(n, ast.Attribute) and n.attr in _reserve_PROTECTED and isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -40781,6 +40794,17 @@ def test_reviewed_authority_field_stores_refuse_a_changed_store(path: str, befor
     assert original.source.count(before) == 1
     changed = tuple(_parse_source(path, original.source.replace(before, after)) if unit.path == path else unit for unit in units)
     assert _reserve_reviewed_authority_field_stores(changed) == (["owned authority field initializer is not unique " + path], frozenset())
+
+
+def test_proof_allowlist_entries_are_reviewed_and_well_formed() -> None:
+    entries = _reserve_json.loads((_reserve_BASE / "reviewed-proof-allowlist.json").read_text())["entries"]
+    paths = {unit.path for unit in _production_units()}
+    keys = [(entry["category"], entry["path"], entry["symbol"]) for entry in entries]
+    assert len(keys) == len(set(keys)) == len(_reserve_PROOF_ALLOWLIST)
+    for entry in entries:
+        assert set(entry) == {"category", "path", "symbol", "count", "reason"}
+        assert entry["path"] in paths and type(entry["count"]) is int and entry["count"] >= 1
+        assert isinstance(entry["symbol"], str) and entry["reason"].strip()
 
 
 def test_closure_allowlist_drops_only_exact_reviewed_counts() -> None:

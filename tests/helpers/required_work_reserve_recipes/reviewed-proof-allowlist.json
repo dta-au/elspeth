@@ -1,0 +1,48 @@
+{
+ "schema": 1,
+ "description": "Reviewed allowlist for the reserve proof dispatch layer (_reserve_ReserveProof.dispatch_failures). Same exact-count semantics as reviewed-closure-allowlist.json: rows are matched by (category, path, symbol) with an exact row count; a changed count surfaces every row of that key, and a dropped count is reported stale.",
+ "entries": [
+  {
+   "category": "unproved reflection operator/selector",
+   "path": "src/elspeth/contracts/composer_llm_audit.py",
+   "symbol": "ComposerLLMCall.to_dict",
+   "count": 1,
+   "reason": "Read-only getattr(self, field.name) over dataclasses.fields(self) of the frozen record; the selector is the declared field set, which the finite-selector analysis does not model."
+  },
+  {
+   "category": "unproved reflection operator/selector",
+   "path": "src/elspeth/contracts/freeze.py",
+   "symbol": "freeze_fields",
+   "count": 1,
+   "reason": "Generic __post_init__ helper: read-only getattr(instance, name) after every name is checked against dataclasses.fields(instance); the caller-supplied selector is beyond the finite-selector analysis."
+  },
+  {
+   "category": "unproved reflection operator/selector",
+   "path": "src/elspeth/engine/__init__.py",
+   "symbol": "__getattr__",
+   "count": 1,
+   "reason": "PEP 562 lazy re-export guarded by name in _ORCHESTRATOR_EXPORTS (a closed literal set); only the orchestrator package's types branch has a reviewed receipt."
+  },
+  {
+   "category": "unproved reflection operator/selector",
+   "path": "src/elspeth/engine/orchestrator/__init__.py",
+   "symbol": "__getattr__",
+   "count": 1,
+   "reason": "RowPlugin branch of the lazy re-export whose whole body _reserve_orchestrator_type_export_reflection already pins; that receipt returns only the types-branch getattr, and the plugin_types branch is guarded by name in _PLUGIN_TYPE_EXPORTS ({'RowPlugin'})."
+  },
+  {
+   "category": "selected owned supplier class/descriptor escape",
+   "path": "src/elspeth/web/composer/_compose_loop_carriers.py",
+   "symbol": "<module>",
+   "count": 1,
+   "reason": "ComposerOperationFenceLost is a member of the module-level `|` union _ServiceFailure, used only by isinstance and annotations; a types.UnionType is immutable and the analysis models tuple type checks, not unions."
+  },
+  {
+   "category": "reserve callable escape",
+   "path": "src/elspeth/web/sessions/continuation_sql_deadline.py",
+   "symbol": "ContinuationSQLDeadlineOwner.begin_action",
+   "count": 1,
+   "reason": "self.policy.segment.reserve is the float ContinuationSegmentPolicy.reserve, not the coordinator method; the scalar-read proof refuses receivers in a method that also writes self attributes (_subject_rebound)."
+  }
+ ]
+}
