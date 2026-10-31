@@ -15,6 +15,11 @@ from unittest.mock import AsyncMock
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 
 
+async def _sdk_request(**kwargs: Any) -> object:
+    """Call shape of the SDK completion the oracles stand in for: keywords only."""
+    raise AssertionError("specification only; never awaited")
+
+
 class ComposerSDKScript:
     """Route only the actual SDK request shape, retaining separate call oracles.
 
@@ -35,8 +40,8 @@ class ComposerSDKScript:
     ) -> None:
         self.primary_model = primary_model
         self.advisor_model = advisor_model
-        self.primary = AsyncMock(side_effect=tuple(primary))
-        self.advisor = AsyncMock(side_effect=tuple(advisor))
+        self.primary = AsyncMock(spec=_sdk_request, side_effect=tuple(primary))
+        self.advisor = AsyncMock(spec=_sdk_request, side_effect=tuple(advisor))
 
     async def __call__(self, **kwargs: Any) -> object:
         if "tools" in kwargs:
