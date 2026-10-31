@@ -14291,6 +14291,18 @@ def _reserve_selected_origin_effect_failures(
             """
             qualified = origin[1]
             parent = parents.get(id(node))
+            if (
+                qualified in _reserve_TYPING_SUBSCRIPT_FORMS
+                and isinstance(parent, ast.Subscript)
+                and parent.value is node
+                and isinstance(parent.ctx, ast.Load)
+            ):
+                # A typing special form consumed only by its own subscription
+                # (an evaluated TypedDict field or type alias) is a callee role
+                # like the Call case below: the subscription returns a new typing
+                # object and the supplier itself is not transferred. Writes to the
+                # form's slots remain separate mutation findings.
+                return True
             if qualified == approval_class:
                 return _reserve_approval_binding_class_use(node, unit, parents, scoped_expression)
             if _reserve_plugin_lookup_exception_role(node, origin, parents, plugin_lookup_exception):
@@ -20437,6 +20449,19 @@ def _reserve_continuation_batch_state_receipt(units):
     }
 
 
+# Standard-library supplier origins whose runtime object cannot be mutated, so a
+# first-class use cannot change what any other holder sees. Reviewed 2026-11-01
+# on Python 3.12 and 3.13: datetime.datetime carries Py_TPFLAGS_IMMUTABLETYPE and
+# refuses both type.__setattr__ and object.__setattr__.
+# test_immutable_stdlib_supplier_origins_are_actually_immutable re-verifies this
+# at runtime. typing.Required/NotRequired are NOT listed (their slots, including
+# _getitem, are writable through object.__setattr__), nor is typing.Annotated.
+_reserve_IMMUTABLE_STDLIB_SUPPLIER_ORIGINS = frozenset({"datetime.datetime"})
+# Typing special forms admitted only in load-context subscription (see
+# supplier_structural_role). They are mutable, so they are not immutable origins.
+_reserve_TYPING_SUBSCRIPT_FORMS = frozenset({"typing.Required", "typing.NotRequired", "typing.Annotated"})
+
+
 def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
     recovery_supplier_failures, recovery_supplier = _reserve_compose_proposal_transfers.recovery_instruction_supplier_contracts(units)
@@ -21200,7 +21225,9 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         | yaml_adapter["supplier_bindings"]
         | data_transfers["supplier_bindings"]
         | frozenset().union(*(receipt["supplier_bindings"] for receipt in continuation_receipts)),
-        immutable_supplier_origins=batch["data_immutable_supplier_origins"] | callbacks["immutable_supplier_origins"],
+        immutable_supplier_origins=batch["data_immutable_supplier_origins"]
+        | callbacks["immutable_supplier_origins"]
+        | _reserve_IMMUTABLE_STDLIB_SUPPLIER_ORIGINS,
         validated_nonretaining_calls=callbacks["calls"],
         additional_supplier_roots=batch["data_supplier_origins"] | callbacks["origins"],
         validated_supplier_uses=callbacks["uses"]
@@ -40398,3 +40425,34 @@ def _reserve_yaml_serializer_use_failures(receipt, protected_uses):
     if actual != receipt["uses"]:
         return ["nominal YAML serializer constructor references or same-AST join changed"]
     return []
+
+
+def _reserve_runtime_supplier_is_immutable(value: object) -> bool:
+    """True only for a type CPython marks immutable that refuses both setattr paths."""
+    if not isinstance(value, type) or not value.__flags__ & (1 << 8):  # Py_TPFLAGS_IMMUTABLETYPE
+        return False
+    for setter in (type.__setattr__, object.__setattr__):
+        try:
+            setter(value, "_reserve_immutability_probe", None)
+        except TypeError:
+            continue
+        return False
+    return True
+
+
+def test_immutable_stdlib_supplier_origins_are_actually_immutable() -> None:
+    import importlib
+    import typing
+
+    for origin in sorted(_reserve_IMMUTABLE_STDLIB_SUPPLIER_ORIGINS):
+        module, _, name = origin.rpartition(".")
+        assert _reserve_runtime_supplier_is_immutable(importlib.import_module(module).__dict__[name]), origin
+    # Controls: special forms with writable slots and a mutable class are refused.
+    assert not _reserve_runtime_supplier_is_immutable(typing.Required)
+    assert not _reserve_runtime_supplier_is_immutable(typing.NotRequired)
+    assert not _reserve_runtime_supplier_is_immutable(typing.Annotated)
+
+    class _Mutable:
+        pass
+
+    assert not _reserve_runtime_supplier_is_immutable(_Mutable)
