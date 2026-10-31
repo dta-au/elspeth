@@ -19,8 +19,12 @@ from elspeth.web.composer.continuation import LogicalRequestBinding
 from elspeth.web.composer.continuation_application_graph import (
     ApplicationGraph,
     ApplicationGraphCut,
+    ApplicationRecorderSource,
+    admit_application_recorder_source,
+    capture_application_recorder_source,
     decode_application_graph,
     encode_application_graph,
+    require_application_recorder_source,
 )
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, RecorderSnapshot, encode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData
@@ -259,12 +263,12 @@ def require_evidence_application_links(
     snapshot: TurnEvidenceFields,
     *,
     env_ref_names: frozenset[str],
-    recorder_chunk: PrivateChunk,
+    recorder_source: ApplicationRecorderSource,
     sources: P4ApplicationSources | None = None,
 ) -> ApplicationGraph | None:
     if type(snapshot) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
         raise TypeError("evidence application admission requires its actual snapshot source")
-    return _admit_application_source(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+    return _admit_application_source(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
 
 
 def append_primary_call_to_evidence(
@@ -296,7 +300,8 @@ def append_primary_call_to_evidence(
     ):
         raise AuditIntegrityError("primary evidence extension changed its exact original recorder prefix")
     graph = admitted.graph
-    audit = encode_recorder_snapshot(recorder)
+    recorder_source = capture_application_recorder_source(recorder, env_ref_names=env_ref_names)
+    audit = recorder_source.chunk
     updated = snapshot.model_copy(update={"recorder": audit.reference})
     if graph is not None:
         # The SQL snapshot and live recorder were independently decoded. Reuse
@@ -307,7 +312,7 @@ def append_primary_call_to_evidence(
         if encode_recorder_snapshot(extended) != audit:
             raise AuditIntegrityError("primary evidence extension differs from its complete actual recorder")
         changed_graph = replace(graph, recorder=extended)
-        graph_json = encode_application_graph(changed_graph, env_ref_names=env_ref_names)
+        graph_json = encode_application_graph(changed_graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
         if snapshot.application_entry is not None:
             entry = snapshot.application_entry.model_copy(update={"graph_json": graph_json})
             updated = updated.model_copy(update={"application_entry": entry})
@@ -352,7 +357,9 @@ def build_portable_p4_application(
     )
     after_data = RestoredBatchData(complete, graph.selected.accumulator, graph.selected.calls)
     after_graph = ApplicationGraph(after_data, effects, recorder, (*graph.cuts, cut))
-    graph_json = encode_application_graph(after_graph, env_ref_names=env_ref_names)
+    recorder_source = capture_application_recorder_source(recorder, env_ref_names=env_ref_names)
+    audit = recorder_source.chunk
+    graph_json = encode_application_graph(after_graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
     prepared_json = result.receipt.prepared_p4_json
     if prepared_json is None:
         raise AuditIntegrityError("portable application lost its complete original P4 input")
@@ -390,7 +397,6 @@ def build_portable_p4_application(
                 authored_state_hash=historical.authored_state_hash,
             ),
         )
-    audit = encode_recorder_snapshot(recorder)
     after_snapshot = snapshot.model_copy(
         update={
             "effects": retained_effects(effects),
@@ -414,7 +420,7 @@ def build_portable_p4_application(
         after_data,
         recorder,
         encode_turn_evidence(after, env_ref_names=env_ref_names),
-        encode_private_chunk(codec="composer.applied-p4-batch.v1", canonical=graph_json, env_ref_names=env_ref_names),
+        encode_private_chunk(codec="composer.applied-p4-batch.v2", canonical=graph_json, env_ref_names=env_ref_names),
         after.recorder_chunk,
         encode_private_chunk(
             codec="composer.state.v1", canonical=canonical_json(after_data.batch.state.to_dict()), env_ref_names=env_ref_names
@@ -431,6 +437,7 @@ def require_portable_p4_application(
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
     source_chunks: tuple[PrivateChunk, ...],
+    recorder_source: ApplicationRecorderSource,
 ) -> None:
     if type(entry) is not PortableP4ApplicationEntry:
         raise TypeError("portable application requires its closed journal owner")
@@ -441,6 +448,7 @@ def require_portable_p4_application(
         producer=producer,
         env_ref_names=env_ref_names,
         sources=P4ApplicationSources(entry, source_chunks),
+        recorder_source=recorder_source,
     )
 
 
@@ -465,13 +473,16 @@ def _require_p4_application_source(
     producer: P4EffectProducerData,
     env_ref_names: frozenset[str],
     sources: P4ApplicationSources | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> None:
     if type(source) is PortableP4ApplicationEntry:
         entry = PortableP4ApplicationEntry.model_validate_json(canonical_json(source.model_dump(mode="json")))
         _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
         if type(sources) is not P4ApplicationSources:
             raise AuditIntegrityError("journal admission lost its original dependency owners")
-        graph = admit_journal_values(entry, env_ref_names=env_ref_names, sources=sources)
+        if recorder_source is None:
+            raise AuditIntegrityError("standalone journal lost its explicit recorder source")
+        graph = admit_journal_values(entry, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
     elif type(source) is AdmittedTurnEvidence:
         admitted = require_admitted_turn_evidence(source, env_ref_names=env_ref_names)
         _checked_result(result_chunk, result, producer, env_ref_names=env_ref_names)
@@ -559,12 +570,16 @@ def journal_effect_locators(
 
 
 def admit_journal_values(
-    entry: PortableP4ApplicationEntry, *, env_ref_names: frozenset[str], sources: P4ApplicationSources
+    entry: PortableP4ApplicationEntry,
+    *,
+    env_ref_names: frozenset[str],
+    sources: P4ApplicationSources,
+    recorder_source: ApplicationRecorderSource,
 ) -> ApplicationGraph:
     """Admit one source journal and return its graph; callers still owe SQL joins."""
     if type(entry) is not PortableP4ApplicationEntry:
         raise TypeError("journal admission requires its actual application entry source")
-    graph = _admit_application_source(entry, env_ref_names=env_ref_names, sources=sources)
+    graph = _admit_application_source(entry, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
     if graph is None:
         raise AuditIntegrityError("portable journal lost its admitted application graph")
     return graph
@@ -575,7 +590,7 @@ def _admit_application_source(
     *,
     env_ref_names: frozenset[str],
     sources: P4ApplicationSources | None = None,
-    recorder_chunk: PrivateChunk | None = None,
+    recorder_source: ApplicationRecorderSource,
 ) -> ApplicationGraph | None:
     """Own the source decode and both admission orders without accepting a graph."""
 
@@ -647,20 +662,22 @@ def _admit_application_source(
 
     if type(source) is PortableP4ApplicationEntry:
         require_canonical_entry(source)
-        graph = decode_application_graph(source.graph_json, env_ref_names=env_ref_names)
+        graph = decode_application_graph(source.graph_json, env_ref_names=env_ref_names, recorder_source=recorder_source)
         require_journal_graph(source, graph)
         return graph
     if not isinstance(source, TurnEvidenceFields) or type(source) not in (TurnEvidenceFields, TurnEvidenceSnapshot):
         raise TypeError("application admission requires its actual evidence or journal source")
     snapshot = source
-    if type(recorder_chunk) is not PrivateChunk or recorder_chunk.reference != snapshot.recorder:
+    require_application_recorder_source(recorder_source, env_ref_names)
+    recorder_chunk = recorder_source.chunk
+    if recorder_chunk.reference != snapshot.recorder:
         raise AuditIntegrityError("evidence graph lost its original recorder source")
     if snapshot.application_entry is not None and snapshot.joint_graph_json is not None:
         raise AuditIntegrityError("evidence duplicated its journal graph outside its one owner")
     graph_json = snapshot.application_entry.graph_json if snapshot.application_entry is not None else snapshot.joint_graph_json
     if graph_json is None:
         return None
-    graph = decode_application_graph(graph_json, env_ref_names=env_ref_names)
+    graph = decode_application_graph(graph_json, env_ref_names=env_ref_names, recorder_source=recorder_source)
     if (
         retained_effects(graph.effects) != snapshot.effects
         or encode_recorder_snapshot(graph.recorder) != recorder_chunk
@@ -705,6 +722,7 @@ def capture_joint_evidence_graph(
     drained: RecorderDrainCursors,
     data: RestoredBatchData | RestoredPreparedBatchData | None,
     env_ref_names: frozenset[str],
+    recorder_source: ApplicationRecorderSource,
     recorder_snapshot: RecorderSnapshot | None = None,
 ) -> tuple[str | None, PortableP4ApplicationEntry | None]:
     if type(owner) is not TurnEvidence or type(recorder) is not BufferingRecorder or type(drained) is not RecorderDrainCursors:
@@ -737,10 +755,15 @@ def capture_joint_evidence_graph(
     if type(snapshot) is not RecorderSnapshot or snapshot.drained != drained:
         raise AuditIntegrityError("joint capture lost its actual original recorder cut")
     graph = ApplicationGraph(data, owner.effects, snapshot, cuts, audit, dialect)
-    graph_json = encode_application_graph(graph, env_ref_names=env_ref_names)
+    graph_json = encode_application_graph(graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
     if entry is not None:
         entry = entry.model_copy(update={"graph_json": graph_json})
-        admit_journal_values(entry, env_ref_names=env_ref_names, sources=P4ApplicationSources(entry, owner._portable_p4_sources))
+        admit_journal_values(
+            entry,
+            env_ref_names=env_ref_names,
+            sources=P4ApplicationSources(entry, owner._portable_p4_sources),
+            recorder_source=recorder_source,
+        )
         for key, live in owner._historical_p4_applications.items():
             indexes = [index for index, item in enumerate(entry.applications) if item.effect_key == key]
             if len(indexes) != 1:
@@ -806,7 +829,8 @@ def retain_portable_application_on_live_evidence(
         application.data.calls,
     )
     graph = ApplicationGraph(after, application.effects_after, application.recorder_after, (*cuts, cut))
-    if encode_application_graph(graph, env_ref_names=env_ref_names) != bundle.entry.graph_json:
+    recorder_source = admit_application_recorder_source(bundle.evidence_after.recorder_chunk, env_ref_names=env_ref_names)
+    if encode_application_graph(graph, env_ref_names=env_ref_names, recorder_source=recorder_source) != bundle.entry.graph_json:
         raise AuditIntegrityError("warm and retained projections differ in values or actual alias partition")
     owner._portable_p4_graph = graph
     owner._portable_p4_entry = bundle.entry
@@ -820,7 +844,7 @@ def require_selected_applied_batch_chunk(chunk: PrivateChunk, *, evidence: Admit
     Callers use RestoredTurnEvidence.batch after this check. Decoding a second
     equal batch would lose its actual aliases to evidence and recorder roots.
     """
-    if type(chunk) is not PrivateChunk or chunk.reference.codec != "composer.applied-p4-batch.v1":
+    if type(chunk) is not PrivateChunk or chunk.reference.codec != "composer.applied-p4-batch.v2":
         raise AuditIntegrityError("selected applied batch has another actual codec")
     verify_private_chunk(chunk.reference, chunk.canonical)
     admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)

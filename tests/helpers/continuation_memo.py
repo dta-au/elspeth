@@ -18,9 +18,11 @@ from contextlib import _GeneratorContextManager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from inspect import CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR, CO_VARARGS
 from threading import Lock, get_ident
-from types import BuiltinFunctionType, CellType, CodeType, FrameType, FunctionType, MethodType
+from types import BuiltinFunctionType, CellType, CodeType, FrameType, FunctionType, MethodType, TracebackType
 from typing import Final, Literal
+from weakref import ReferenceType, ref
 
 import pytest
 from sqlalchemy import event as sql_events
@@ -30,6 +32,7 @@ from sqlalchemy.dialects.sqlite.base import SQLiteCompiler, SQLiteExecutionConte
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.engine.default import DefaultDialect, DefaultExecutionContext
+from sqlalchemy.engine.events import ConnectionEvents
 from sqlalchemy.sql import base as sql_base
 from sqlalchemy.sql import crud as sql_crud
 from sqlalchemy.sql import dml as sql_dml
@@ -240,6 +243,13 @@ _STRUCTURE_CURSOR_EXECUTE = DefaultDialect.do_execute
 _STRUCTURE_CURSOR_NO_PARAMS = DefaultDialect.do_execute_no_params
 _STRUCTURE_CURSOR_MANY = DefaultDialect.do_executemany
 _STRUCTURE_SINGLE_CONTEXT = Connection._exec_single_context
+_STRUCTURE_ROW_ADAPTER_CODE_REF = ref(
+    next(
+        code
+        for code in ConnectionEvents.__dict__["_listen"].__func__.__code__.co_consts
+        if type(code) is CodeType and code.co_name == "wrap_before_cursor_execute"
+    )
+)
 _STRUCTURE_ADAPTER = next(code for code in _STRUCTURE_PREPARE.__code__.co_consts if type(code) is CodeType and code.co_name == "invoke")
 _STRUCTURE_ADAPTER_RUN = next(code for code in _STRUCTURE_ADAPTER.co_consts if type(code) is CodeType and code.co_name == "run")
 _STRUCTURE_ROLES = (
@@ -268,6 +278,9 @@ _LIFETIME_YIELD = sys.monitoring.events.PY_YIELD
 _LIFETIME_RETURN = sys.monitoring.events.PY_RETURN
 _LIFETIME_UNWIND = sys.monitoring.events.PY_UNWIND
 _LIFETIME_FRAME = sys._getframe
+_STRUCTURE_EXCEPTION_TRACEBACK = BaseException.__dict__["__traceback__"]
+_STRUCTURE_EXCEPTION_TYPE = type
+_STRUCTURE_EXCEPTION_TYPE_NAME = type.__dict__["__name__"]
 _LIFETIME_GET_PROFILE = sys.getprofile
 _LIFETIME_GET_TOOL = sys.monitoring.get_tool
 _LIFETIME_USE_TOOL = sys.monitoring.use_tool_id
@@ -717,6 +730,20 @@ _STRUCTURE_CACHE_SLOT_GUARDS = tuple(
     for descriptor in (owner.__dict__.get(name),)
     for function in (descriptor.__func__ if type(descriptor) in (classmethod, staticmethod) else descriptor,)
 )
+# Code presence records the immutable kind of these original held objects,
+# never the validity of their current code or defining slot. Keep the original
+# tuple/symbol identities so an exchanged fact cannot forge that kind marker.
+_STRUCTURE_GUARD_KIND_ORIGINS = (
+    type,
+    FunctionType,
+    _STRUCTURE_STORE_SLOT_GUARDS,
+    _STRUCTURE_STORE_VISITOR_GUARDS,
+    _STRUCTURE_VISITOR_GUARDS,
+    _STRUCTURE_CACHE_SLOT_GUARDS,
+)
+# Independent original tuple binding, not validity. Its immutable expected kind
+# operands may be borrowed; the actual symbols and tuple binding stay live.
+_STRUCTURE_STORE_SLOT_KIND_ORIGINS = _STRUCTURE_GUARD_KIND_ORIGINS
 
 
 @dataclass(frozen=True, slots=True)
@@ -809,6 +836,82 @@ class _StructureInvocation:
     store_source_shape: tuple | None = None
     store_thread: int | None = None
     store_submission: int | None = None
+    row_origin: "_StructureRowOrigin | None" = None
+    row_dispatch: int | None = None
+    row_dispatch_closed: bool = False
+    row_generation: int = 0
+    row_callbacks_started: int = 0
+    row_callbacks_closed: int = 0
+    row_callback: "_StructureRowCallback | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StructureRowOrigin:
+    context: int
+    container: int
+    row: int
+    cursor: int
+    constructor: int
+    code: int
+    globals: int
+
+
+class _StructureRowCodeIdentity(ReferenceType[CodeType]):
+    """Weak code identity: CodeType's structural equality is never admission."""
+
+    __slots__ = ("identity",)
+
+    def __new__(cls, code: CodeType, callback=None):
+        anchor = super().__new__(cls, code, callback)
+        anchor.identity = id(code)
+        return anchor
+
+    def __hash__(self) -> int:
+        return self.identity
+
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        if type(other) is not _StructureRowCodeIdentity:
+            return False
+        code = self()
+        return code is not None and code is other()
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+
+@dataclass(frozen=True, slots=True)
+class _StructureRowCodeFacts:
+    anchor: _StructureRowCodeIdentity
+    positional_names: tuple[str, ...]
+    vararg_name: str | None
+    unsupported: bool
+    return_sites: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _StructureRowCallback:
+    generation: int
+    request: int
+    event: int
+    origin: _StructureRowOrigin
+    dispatch: int
+    call_offset: int
+    frame: int
+    function: int
+    receiver: int | None
+    code: int
+    globals: int
+    thread: int
+    hook: int
+    carrier: tuple[int | None, int | None, bool | None]
+    submission: int | None
+    expected: int | None
+    witness: int | None
+    return_sites: frozenset[int]
+    returned: bool = False
+    outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +951,7 @@ class _StructureThread:
     counter: int = 0
     error_count: int = 0
     errors: list[str] = field(default_factory=list)
+    internal_errors: list[tuple[str, str, int]] = field(default_factory=list)
     events: list[StructureEvent] = field(default_factory=list)
     edges: list[StructureEdge] = field(default_factory=list)
     lifetimes: list[StructureLifetime] = field(default_factory=list)
@@ -865,6 +969,9 @@ class _StructureThread:
     return_generation: int = 0
     pending_returns: dict[int, _StructurePendingReturn] = field(default_factory=dict)
     native_entry: _StructureNativeEntry | None = None
+    row_generation: int = 0
+    row_callbacks: dict[int, _StructureRowCallback] = field(default_factory=dict)
+    row_returns: dict[int, _StructureRowCallback] = field(default_factory=dict)
 
 
 def _structure_refuse(trace, code: str) -> None:
@@ -879,6 +986,41 @@ def _structure_refuse(trace, code: str) -> None:
     thread.error_count += 1
     if len(thread.errors) < 8:
         thread.errors.append(code)
+
+
+def _structure_internal_error(trace, error: Exception) -> None:
+    """Borrow only this catch's live traceback entry; retain primitive facts."""
+    try:
+        thread = trace._structure_threads.get(get_ident())
+        if thread is None or len(thread.internal_errors) >= 8:
+            return
+        error_name = _STRUCTURE_EXCEPTION_TYPE_NAME.__get__(_STRUCTURE_EXCEPTION_TYPE(error))
+        if _STRUCTURE_EXCEPTION_TYPE(error_name) is not _STRUCTURE_EXCEPTION_TYPE(""):
+            error_name = "unavailable"
+            trace._structure_observer_incomplete = True
+        caller = _LIFETIME_FRAME(1)
+        traceback = _STRUCTURE_EXCEPTION_TRACEBACK.__get__(error)
+        if (
+            _STRUCTURE_EXCEPTION_TYPE(traceback) is not TracebackType
+            or traceback.tb_frame is not caller
+            or caller.f_globals is not globals()
+            or caller.f_code is not RetentionMemoTrace._structure_profile.__code__
+        ):
+            thread.internal_errors.append((error_name, "unbound", 0))
+        else:
+            code_name, line = caller.f_code.co_name, traceback.tb_lineno
+            if _STRUCTURE_EXCEPTION_TYPE(code_name) is not _STRUCTURE_EXCEPTION_TYPE("") or _STRUCTURE_EXCEPTION_TYPE(
+                line
+            ) is not _STRUCTURE_EXCEPTION_TYPE(0):
+                trace._structure_observer_incomplete = True
+                thread.internal_errors.append((error_name, "unbound", 0))
+            else:
+                thread.internal_errors.append((error_name, code_name, line))
+    except BaseException:
+        # Diagnostic acquisition cannot replace an original application result
+        # or a native ordinary/process-control primary. The original refusal is
+        # already recorded, and unavailable provenance never qualifies.
+        trace._structure_observer_incomplete = True
 
 
 def _structure_number(thread: _StructureThread) -> int:
@@ -906,46 +1048,49 @@ def _structure_sql_sources_current() -> bool:
     # Identity guards never invoke a mutable identifier's equality/protocol.
     if not _structure_store_cache_sources_current():
         return False
-    if (
-        any(
+    for table, name, schema, named, fullname in _STRUCTURE_TABLE_FACTS:
+        if (
             type(table) is not Table
             or table.name is not name
             or table.schema is not schema
             or table.named_with_column is not named
             or table.fullname is not fullname
-            for table, name, schema, named, fullname in _STRUCTURE_TABLE_FACTS
-        )
-        or any(
+        ):
+            return False
+    for column, table, name, key, datatype, literal in _STRUCTURE_COLUMN_FACTS:
+        if (
             type(column) is not Column
             or column.table is not table
             or column.name is not name
             or column.key is not key
             or column.type is not datatype
             or column.is_literal is not literal
-            for column, table, name, key, datatype, literal in _STRUCTURE_COLUMN_FACTS
-        )
-        or any(identifier.quote is not quote for identifier, quote in _STRUCTURE_IDENTIFIER_FACTS)
-    ):
-        return False
-    if any(compiler.__mro__ is not mro for compiler, mro in _STRUCTURE_COMPILER_MROS):
-        return False
-    if (
-        any(
-            len(sites) != count
-            for sites, (_name, _function, _code, _globals, count) in zip(_STRUCTURE_STORE_CALLS, _STRUCTURE_STORE_FUNCTIONS, strict=True)
-        )
-        or any(
-            stored_continuation.__dict__.get(name) is not function or function.__code__ is not code or function.__globals__ is not namespace
-            for name, function, code, namespace, _count in _STRUCTURE_STORE_FUNCTIONS
-        )
-        or any(
+        ):
+            return False
+    for identifier, quote in _STRUCTURE_IDENTIFIER_FACTS:
+        if identifier.quote is not quote:
+            return False
+    for compiler, mro in _STRUCTURE_COMPILER_MROS:
+        if compiler.__mro__ is not mro:
+            return False
+    for sites, (_name, _function, _code, _globals, count) in zip(_STRUCTURE_STORE_CALLS, _STRUCTURE_STORE_FUNCTIONS, strict=True):
+        if len(sites) != count:
+            return False
+    for name, function, code, namespace, _count in _STRUCTURE_STORE_FUNCTIONS:
+        if stored_continuation.__dict__.get(name) is not function or function.__code__ is not code or function.__globals__ is not namespace:
+            return False
+    for name, function, code, class_name, constructor in _STRUCTURE_STORE_CONSTRUCTORS:
+        if (
             stored_continuation.__dict__.get(name) is not function
             or function.__code__ is not code
             or function.__globals__.get(class_name) is not constructor
-            for name, function, code, class_name, constructor in _STRUCTURE_STORE_CONSTRUCTORS
-        )
-        or any(module.__dict__.get(name) is not expected for module, name, expected in _STRUCTURE_STORE_MODULE_CLASSES)
-        or sql_operators.add is not _STRUCTURE_STORE_ADD
+        ):
+            return False
+    for module, name, expected in _STRUCTURE_STORE_MODULE_CLASSES:
+        if module.__dict__.get(name) is not expected:
+            return False
+    if (
+        sql_operators.add is not _STRUCTURE_STORE_ADD
         or sql_operators.comma_op is not _STRUCTURE_STORE_COMMA
         or stored_continuation.func is not _STRUCTURE_STORE_FUNC
         or type(_STRUCTURE_STORE_FUNC.__dict__.get("opts")) is not dict
@@ -960,16 +1105,19 @@ def _structure_sql_sources_current() -> bool:
         or sql_base.CompileState.plugins is not _STRUCTURE_STORE_COMPILE_PLUGINS
         or _STRUCTURE_STORE_COMPILE_PLUGINS.get(("default", "insert")) is not sql_dml.InsertDMLState
         or _STRUCTURE_STORE_COMPILE_PLUGINS.get(("default", "update")) is not sql_dml.UpdateDMLState
-        or any(
-            sql_crud.__dict__.get(name) is not function or type(function) is not FunctionType or function.__code__ is not code
-            for name, function, code in _STRUCTURE_STORE_CRUD_FUNCTIONS
-        )
-        or any(cls.__mro__ is not mro for cls, mro in _STRUCTURE_STORE_MROS)
-        or any(
-            table.columns is not columns or table.implicit_returning is not returning
-            for table, columns, returning in _STRUCTURE_STORE_TABLE_FACTS
-        )
-        or any(
+    ):
+        return False
+    for name, function, code in _STRUCTURE_STORE_CRUD_FUNCTIONS:
+        if sql_crud.__dict__.get(name) is not function or type(function) is not FunctionType or function.__code__ is not code:
+            return False
+    for cls, mro in _STRUCTURE_STORE_MROS:
+        if cls.__mro__ is not mro:
+            return False
+    for table, columns, returning in _STRUCTURE_STORE_TABLE_FACTS:
+        if table.columns is not columns or table.implicit_returning is not returning:
+            return False
+    for column, default, onupdate, server_default, server_onupdate, primary, nullable, autoincrement in _STRUCTURE_STORE_COLUMN_FACTS:
+        if (
             column.default is not default
             or column.onupdate is not onupdate
             or column.server_default is not server_default
@@ -977,28 +1125,64 @@ def _structure_sql_sources_current() -> bool:
             or column.primary_key is not primary
             or column.nullable is not nullable
             or column.autoincrement is not autoincrement
-            for column, default, onupdate, server_default, server_onupdate, primary, nullable, autoincrement in _STRUCTURE_STORE_COLUMN_FACTS
-        )
-        or any(
+        ):
+            return False
+    guards = _STRUCTURE_STORE_SLOT_GUARDS
+    if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[2]:
+        return False
+    origins = _STRUCTURE_STORE_SLOT_KIND_ORIGINS
+    if _STRUCTURE_GUARD_KIND_ORIGINS is not origins:
+        return False
+    original_type, original_function_type = origins[0], origins[1]
+    for owner, name, present, descriptor, function, code in guards:
+        if (
             (name in owner.__dict__) is not present
             or owner.__dict__.get(name) is not descriptor
-            or (type(function) is FunctionType and function.__code__ is not code)
-            for owner, name, present, descriptor, function, code in _STRUCTURE_STORE_SLOT_GUARDS
-        )
-        or any(
+            or (
+                type is not original_type
+                or FunctionType is not original_function_type
+                or _STRUCTURE_GUARD_KIND_ORIGINS is not origins
+                or (code is not None and function.__code__ is not code)
+            )
+        ):
+            return False
+    guards = _STRUCTURE_STORE_VISITOR_GUARDS
+    if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[3]:
+        return False
+    for owner, name, present, function, code in guards:
+        if (
             (name in owner.__dict__) is not present
             or owner.__dict__.get(name) is not function
-            or (present and (type(function) is not FunctionType or function.__code__ is not code))
-            for owner, name, present, function, code in _STRUCTURE_STORE_VISITOR_GUARDS
-        )
-    ):
+            or (
+                present
+                and (
+                    type is not _STRUCTURE_GUARD_KIND_ORIGINS[0]
+                    or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1]
+                    or code is None
+                    or function.__code__ is not code
+                )
+            )
+        ):
+            return False
+    guards = _STRUCTURE_VISITOR_GUARDS
+    if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[4]:
         return False
-    return all(
-        (name in owner.__dict__) is present
-        and owner.__dict__.get(name) is function
-        and (not present or (type(function) is FunctionType and function.__code__ is code))
-        for owner, name, present, function, code in _STRUCTURE_VISITOR_GUARDS
-    )
+    for owner, name, present, function, code in guards:
+        if not (
+            (name in owner.__dict__) is present
+            and owner.__dict__.get(name) is function
+            and (
+                not present
+                or (
+                    type is _STRUCTURE_GUARD_KIND_ORIGINS[0]
+                    and FunctionType is _STRUCTURE_GUARD_KIND_ORIGINS[1]
+                    and code is not None
+                    and function.__code__ is code
+                )
+            )
+        ):
+            return False
+    return True
 
 
 def _structure_sql_signature(statement) -> tuple[int, bytes]:
@@ -1100,24 +1284,35 @@ def _structure_store_cache_sources_current() -> bool:
         or _STRUCTURE_CACHE_GETTER.__code__ is not _STRUCTURE_CACHE_GETTER_CODE
         or _STRUCTURE_CACHE_GETTER.__globals__ is not sql_base.__dict__
         or sql_base.__dict__.get("util") is not sql_util
-        or any(cls.__mro__ is not mro for cls, mro in _STRUCTURE_CACHE_MROS)
-        or any(
-            (name in owner.__dict__) is not present
-            or owner.__dict__.get(name) is not descriptor
-            or (type(function) is FunctionType and function.__code__ is not code)
-            for owner, name, present, descriptor, function, code in _STRUCTURE_CACHE_SLOT_GUARDS
-        )
     ):
         return False
+    for cls, mro in _STRUCTURE_CACHE_MROS:
+        if cls.__mro__ is not mro:
+            return False
+    guards = _STRUCTURE_CACHE_SLOT_GUARDS
+    if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[5]:
+        return False
+    for owner, name, present, descriptor, function, code in guards:
+        if (
+            (name in owner.__dict__) is not present
+            or owner.__dict__.get(name) is not descriptor
+            or (
+                type is not _STRUCTURE_GUARD_KIND_ORIGINS[0]
+                or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1]
+                or (code is not None and function.__code__ is not code)
+            )
+        ):
+            return False
     descriptor_state = object.__getattribute__(_STRUCTURE_CACHE_DESCRIPTOR, "__dict__")
-    return not (
-        type(descriptor_state) is not dict
-        or dict.__len__(descriptor_state) != len(_STRUCTURE_CACHE_DESCRIPTOR_FACTS)
-        or any(type(key) is not str for key in dict.keys(descriptor_state))
-        or any(
-            name not in descriptor_state or descriptor_state[name] is not expected for name, expected in _STRUCTURE_CACHE_DESCRIPTOR_FACTS
-        )
-    )
+    if type(descriptor_state) is not dict or dict.__len__(descriptor_state) != len(_STRUCTURE_CACHE_DESCRIPTOR_FACTS):
+        return False
+    for key in dict.keys(descriptor_state):
+        if type(key) is not str:
+            return False
+    for name, expected in _STRUCTURE_CACHE_DESCRIPTOR_FACTS:
+        if name not in descriptor_state or descriptor_state[name] is not expected:
+            return False
+    return True
 
 
 def _structure_store_empty_dialect_cache(statement: object) -> None:
@@ -2457,6 +2652,61 @@ def _direct_call_site(
     return range(call.offset, instructions[index + 1].offset), call.positions.lineno
 
 
+def _structure_row_callback_site() -> tuple[frozenset[int], int, int]:
+    """One original six-argument listener CALL and its two-local assignment."""
+    code = _STRUCTURE_SINGLE_CONTEXT.__code__
+    instructions = tuple(dis.get_instructions(code))
+    expected = (
+        ("LOAD_FAST", "fn"),
+        ("LOAD_FAST", "self"),
+        ("LOAD_FAST", "cursor"),
+        ("LOAD_FAST", "str_statement"),
+        ("LOAD_FAST", "effective_parameters"),
+        ("LOAD_FAST", "context"),
+        ("LOAD_FAST", "context"),
+        ("LOAD_ATTR", "executemany"),
+    )
+    sites = []
+    for index, call in enumerate(instructions):
+        if call.opname != "CALL" or call.arg != 6 or instructions[index + 1].opname != "UNPACK_SEQUENCE":
+            continue
+        unpack = instructions[index + 1]
+        if unpack.arg != 2:
+            continue
+        stores = instructions[index + 2 : index + 4]
+        if stores[0].opname == "STORE_FAST_STORE_FAST":
+            names = stores[0].argval
+        else:
+            names = tuple(item.argval for item in stores if item.opname == "STORE_FAST")
+        if names != ("str_statement", "effective_parameters"):
+            continue
+        for start in range(max(0, index - 12), index):
+            loads = []
+            for item in instructions[start:index]:
+                if item.opname == "PUSH_NULL":
+                    continue
+                if item.opname == "LOAD_FAST_LOAD_FAST":
+                    loads.extend(("LOAD_FAST", name) for name in item.argval)
+                else:
+                    loads.append((item.opname, item.argval))
+            if tuple(loads) == expected:
+                sites.append((call.offset, unpack.offset))
+                break
+    assert len(sites) == 1, "original before-cursor listener return grammar changed"
+    call_offset, unpack_offset = sites[0]
+    # 3.13 get_instructions omits CACHE items even with show_caches=True.
+    # Both supported interpreters expose the original two-byte code units;
+    # admit only actual CACHE words between this CALL and its exact UNPACK.
+    offsets = frozenset(range(call_offset, unpack_offset, 2))
+    assert all(code.co_code[offset] == dis.opmap["CACHE"] for offset in offsets if offset != call_offset), (
+        "original before-cursor CALL has a non-cache successor before UNPACK"
+    )
+    return offsets, call_offset, unpack_offset
+
+
+_STRUCTURE_ROW_CALL_OFFSETS, _STRUCTURE_ROW_CALL_OFFSET, _STRUCTURE_ROW_UNPACK_OFFSET = _structure_row_callback_site()
+
+
 _METADATA_CALL_OFFSETS, _METADATA_CALL_LINE = _direct_call_site(_METADATA_VALIDATOR, "find_credential_material", arguments=2)
 _CONTEXT_TEXT_SITE = _direct_call_site(_CONTEXT_TEXT, "find_credential_material", arguments=2)
 _CONTEXT_CONTENT_SITE = _direct_call_site(_CONTEXT_CONTENT, "_text", loads_expected=2, arguments=1)
@@ -2939,6 +3189,10 @@ class RetentionMemoTrace:
         self._structure_engines: tuple[Engine, ...] = ()
         self._structure_listeners: list[tuple[Engine, str, Callable[..., None]]] = []
         self._structure_threads: dict[int, _StructureThread] = {self._owner_thread: _StructureThread(self._owner_thread)}
+        self._structure_row_codes: dict[_StructureRowCodeIdentity, _StructureRowCodeFacts] = {}
+        adapter = _STRUCTURE_ROW_ADAPTER_CODE_REF()
+        if adapter is not None:
+            self._structure_row_code_facts(adapter)
         self._structure_memo_clocks: dict[int, _StructureInvocation] = {}
         self._structure_submissions: dict[int, tuple[int, str, int | None, int | None, int]] = {}
         self._structure_connections: dict[int, tuple[int, int]] = {}
@@ -2950,6 +3204,10 @@ class RetentionMemoTrace:
         self._observation_incomplete = False
         self._terminal_incomplete = False
         self._installed = False
+        self._report_name = "retention-memo-observation-" + str(id(self))
+        self._report_item: pytest.Item | None = None
+        self._report_manager: pytest.PytestPluginManager | None = None
+        self._report_registered = False
         self.require_native_bytes = require_native_bytes
         self.byte_errors: list[str] = []
         self.byte_error_diagnostics: list[NativeByteErrorDiagnostic] = []
@@ -3165,14 +3423,27 @@ class RetentionMemoTrace:
             self._byte_monitor = _ByteMonitor(self._byte_call)
         try:
             request.addfinalizer(self._finalize)
+            self._report_item = request.node
+            self._report_manager = request.config.pluginmanager
+            self._report_manager.register(self, self._report_name)
+            if self._report_manager.get_plugin(self._report_name) is not self:
+                raise RuntimeError("memo observation report cleanup was not registered")
+            self._report_registered = True
             monkeypatch.setattr(continuation_clock, "retention_stage_memo_scope", scope)
             monkeypatch.setattr(async_workers, "_submit_shared", submit)
             sys.setprofile(self._main_hook)
             self._installed = True
         except BaseException as error:
-            if self._byte_monitor is not None:
-                self._byte_monitor.close(error)
+            self.close(primary=error)
             raise
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_makereport(self, item, call):
+        # Fixture finalizers run after the call report is rendered. Close only
+        # this window's failed call first; its unfinished finalizer stays strict.
+        if item is self._report_item and call.when == "call" and call.excinfo is not None:
+            self.close(primary=call.excinfo.value)
+        return (yield)
 
     def _make_hook(self, previous, *, expected_id: int | None = None):
         state = _ProfileHookState()
@@ -3274,8 +3545,13 @@ class RetentionMemoTrace:
             or hook.__closure__ is None
         ):
             return False
-        cells = dict(zip(_LIFETIME_PROFILE_CODE.co_freevars, hook.__closure__, strict=True))
-        state = cells["state"].cell_contents
+        closure = hook.__closure__
+        if len(closure) != len(_LIFETIME_PROFILE_FREEVARS):
+            return False
+        previous_cell = closure[_LIFETIME_PROFILE_CELL_INDEXES[0]]
+        trace_cell = closure[_LIFETIME_PROFILE_CELL_INDEXES[1]]
+        state_cell = closure[_LIFETIME_PROFILE_CELL_INDEXES[2]]
+        state = state_cell.cell_contents
         if type(state) is not _ProfileHookState:
             return False
         origin = state.origin
@@ -3283,12 +3559,12 @@ class RetentionMemoTrace:
             type(origin) is _ProfileHookOrigin
             and origin.hook is hook
             and origin.previous is None
-            and origin.previous_cell is cells["previous"]
-            and cells["previous"].cell_contents is None
-            and origin.trace_cell is cells["self"]
-            and cells["self"].cell_contents is self
-            and origin.state_cell is cells["state"]
-            and cells["state"].cell_contents is state
+            and origin.previous_cell is previous_cell
+            and previous_cell.cell_contents is None
+            and origin.trace_cell is trace_cell
+            and trace_cell.cell_contents is self
+            and origin.state_cell is state_cell
+            and state_cell.cell_contents is state
         )
 
     def _structure_sources_current(self) -> bool:
@@ -3297,9 +3573,11 @@ class RetentionMemoTrace:
         monitor = self._structure_lifetime_monitor
         if monitor is not None and not monitor.installing and not monitor.current():
             return False
+        for function, code in _STRUCTURE_FUNCTION_CODES:
+            if not (type(function) is FunctionType and function.__code__ is code):
+                return False
         if (
-            not all(type(function) is FunctionType and function.__code__ is code for function, code in _STRUCTURE_FUNCTION_CODES)
-            or continuation_clock.__dict__.get("ContinuationActionClock") is not _STRUCTURE_CLOCK_CLASS
+            continuation_clock.__dict__.get("ContinuationActionClock") is not _STRUCTURE_CLOCK_CLASS
             or _STRUCTURE_CLOCK_CLASS.__dict__.get("run") is not _STRUCTURE_CLOCK
             or Engine.__dict__.get("begin") is not _STRUCTURE_SQLA_ENGINE_BEGIN
         ):
@@ -3328,25 +3606,36 @@ class RetentionMemoTrace:
                     return False
             elif method.__func__ is not _STRUCTURE_SQLA_ENGINE_BEGIN:
                 return False
-        return (
-            all(type(function) is FunctionType and function.__code__ is code for function, code in _STRUCTURE_FUNCTION_CODES)
-            and continuation_clock.ContinuationActionClock.run is _STRUCTURE_CLOCK
+        for function, code in _STRUCTURE_FUNCTION_CODES:
+            if not (type(function) is FunctionType and function.__code__ is code):
+                return False
+        if not (
+            continuation_clock.ContinuationActionClock.run is _STRUCTURE_CLOCK
             and continuation_clock.ContinuationActionClock is _STRUCTURE_CLOCK_CLASS
             and Engine.begin is _STRUCTURE_SQLA_ENGINE_BEGIN
             and SQLiteCompiler.construct_params is _STRUCTURE_CONSTRUCT_PARAMS
             and PGCompiler_psycopg.construct_params is _STRUCTURE_CONSTRUCT_PARAMS
             and Connection._exec_single_context is _STRUCTURE_SINGLE_CONTEXT
-            and all(
+        ):
+            return False
+        for dialect in (SQLiteDialect_pysqlite, PGDialect_psycopg):
+            if not (
                 dialect.do_execute is _STRUCTURE_CURSOR_EXECUTE
                 and dialect.do_execute_no_params is _STRUCTURE_CURSOR_NO_PARAMS
                 and dialect.do_executemany is _STRUCTURE_CURSOR_MANY
-                for dialect in (SQLiteDialect_pysqlite, PGDialect_psycopg)
-            )
-            and composition_initialization.initialize_continuation_composition is _STRUCTURE_ROOT
+            ):
+                return False
+        if not (
+            composition_initialization.initialize_continuation_composition is _STRUCTURE_ROOT
             and continuation_first_runtime.restore_first_continuation_runtime is _STRUCTURE_HANDOFF_ROOT
             and session_locking.locked_session_transaction is _STRUCTURE_WINDOW_FACTORY
-            and all(session_locking.__dict__.get(name) is function for name, function in _STRUCTURE_LOCK_BINDINGS)
-            and _GeneratorContextManager.__enter__.__code__ is _STRUCTURE_CONTEXT_ENTER_CODE
+        ):
+            return False
+        for name, function in _STRUCTURE_LOCK_BINDINGS:
+            if session_locking.__dict__.get(name) is not function:
+                return False
+        if not (
+            _GeneratorContextManager.__enter__.__code__ is _STRUCTURE_CONTEXT_ENTER_CODE
             and _STRUCTURE_WINDOW_FACTORY.__wrapped__ is _STRUCTURE_WINDOW
             and database_clock.database_now is _STRUCTURE_DB_CLOCK
             and stored_continuation.database_now is _STRUCTURE_DB_CLOCK
@@ -3365,12 +3654,15 @@ class RetentionMemoTrace:
             and composition_initialization.locked_session_transaction is _STRUCTURE_WINDOW_FACTORY
             and session_engine.create_session_engine is _STRUCTURE_ENGINE_FACTORY
             and session_engine._SESSION_WRITE_INTENT_OPTION is _STRUCTURE_WRITE_OPTION
-            and all(
+        ):
+            return False
+        for context in (SQLiteExecutionContext, PGExecutionContext_psycopg):
+            if not (
                 context._init_compiled.__func__ is _STRUCTURE_EXECUTION_INIT
                 and context._init_statement.__func__ is _STRUCTURE_STATEMENT_INIT
-                for context in (SQLiteExecutionContext, PGExecutionContext_psycopg)
-            )
-        )
+            ):
+                return False
+        return True
 
     def _structure_profile(self, frame: FrameType, event: str, arg: object, expected_id: int | None) -> None:
         if self._structure_closed or self._structure_closing:
@@ -3460,6 +3752,7 @@ class RetentionMemoTrace:
                         thread.worker_enter = entered.ordinal
                         thread.edges.append(StructureEdge(thread.submission, entered.ordinal, "submit_to_worker"))
                 return
+            self._structure_row_profile(frame, event, arg, thread)
             binding = _STRUCTURE_CODES.get(id(frame.f_code))
             role = binding[1] if binding is not None and binding[0] is frame.f_code else None
             if role is None or event not in ("call", "return"):
@@ -3540,6 +3833,22 @@ class RetentionMemoTrace:
                         _structure_refuse(self, "unsupported_or_unbound_SQL_shape")
                     except Exception:
                         _structure_refuse(self, "unsupported_or_unbound_SQL_shape")
+                    if request.store_role is not None:
+                        processed = frame.f_locals.get("core_positional_parameters" if arg.compiled.positional else "core_dict_parameters")
+                        if (
+                            role != "context_compiled"
+                            or arg is not frame.f_locals.get("self")
+                            or type(processed) is not list
+                            or len(processed) != 1
+                            or arg.parameters is not processed
+                            or type(processed[0]) not in (tuple, list, dict)
+                            or arg.executemany is not False
+                        ):
+                            _structure_refuse(self, "publication_processed_row_origin_unbound")
+                        else:
+                            request.row_origin = _StructureRowOrigin(
+                                id(arg), id(processed), id(processed[0]), id(arg.cursor), id(frame), id(code), id(frame.f_globals)
+                            )
                     return
                 # The original dialect receives the final statement and rows
                 # after ALL retval listeners. Pair to the context born above,
@@ -3588,6 +3897,9 @@ class RetentionMemoTrace:
                 shape = replace(shape, bind_arities=_structure_parameter_arities(rows, role == "cursor_many"))
                 thread.events[request.index] = replace(thread.events[request.index], sql=shape)
                 if request.store_role is not None:
+                    self._structure_row_consume(thread, request, frame.f_back)
+                    if not self._structure_row_live(request, frame.f_back) or rows is not frame.f_back.f_locals.get("effective_parameters"):
+                        _structure_refuse(self, "publication_final_row_origin_changed")
                     try:
                         _structure_dml_shape(self, request, context, final_parameters=rows)
                     except _StructureShapeRefusal as refusal:
@@ -3793,9 +4105,13 @@ class RetentionMemoTrace:
                                 _structure_refuse(self, "driver_sql_without_fixed_original_source")
             owner.event, owner.index = attempt.ordinal, len(thread.events) - 1
             thread.frames[key] = owner
-        except Exception:
+        except Exception as error:
             # No application/observer lock and no native error payload retained.
             _structure_refuse(self, "structure_profile_internal_error")
+            try:
+                _structure_internal_error(self, error)
+            except BaseException:
+                self._structure_observer_incomplete = True
 
     def _structure_carrier(self) -> tuple[int | None, int | None, bool | None]:
         memo = _CATALOG_STAGE_CONTEXT.get()
@@ -3810,6 +4126,314 @@ class RetentionMemoTrace:
             _structure_refuse(self, "lifetime_carrier_closed_unowned")
             return id(memo), stage, None
         return id(memo), stage, closed
+
+    def _structure_row_code_facts(self, code: CodeType) -> _StructureRowCodeFacts | None:
+        probe = _StructureRowCodeIdentity(code)
+        existing = self._structure_row_codes.get(probe)
+        if existing is not None:
+            if existing.anchor() is not code:
+                _structure_refuse(self, "publication_row_code_facts_anchor_changed")
+                return None
+            return existing
+        owner_ref = ref(self)
+
+        def evict(anchor):
+            owner = owner_ref()
+            if owner is not None and anchor() is None:
+                # The dead key equals only itself. A recycled address or an
+                # equal-looking CodeType cannot remove another live key.
+                owner._structure_row_codes.pop(anchor, None)
+
+        anchor = _StructureRowCodeIdentity(code, evict)
+        facts = _StructureRowCodeFacts(
+            anchor,
+            code.co_varnames[: code.co_argcount],
+            code.co_varnames[code.co_argcount + code.co_kwonlyargcount] if code.co_flags & CO_VARARGS else None,
+            bool(code.co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)),
+            frozenset(item.offset for item in dis.get_instructions(code) if item.opname in ("RETURN_VALUE", "RETURN_CONST")),
+        )
+        self._structure_row_codes[anchor] = facts
+        return facts
+
+    @staticmethod
+    def _structure_row_request(thread: _StructureThread, frame: FrameType | None) -> tuple[int, _StructureInvocation] | None:
+        for _ in range(64):
+            if frame is None:
+                break
+            owner = thread.frames.get(id(frame))
+            if owner is not None and owner.role in ("sql", "driver"):
+                return id(frame), owner
+            frame = frame.f_back
+        return None
+
+    @staticmethod
+    def _structure_row_live(owner: _StructureInvocation, caller: FrameType) -> bool:
+        origin = owner.row_origin
+        values = caller.f_locals
+        context, parameters, row = values.get("context"), values.get("parameters"), values.get("effective_parameters")
+        return (
+            origin is not None
+            and origin.code == id(_STRUCTURE_EXECUTION_INIT.__code__)
+            and origin.globals == id(_STRUCTURE_EXECUTION_INIT.__globals__)
+            and id(caller) == owner.row_dispatch
+            and caller.f_code is _STRUCTURE_SINGLE_CONTEXT.__code__
+            and caller.f_globals is _STRUCTURE_SINGLE_CONTEXT.__globals__
+            and type(context) in (SQLiteExecutionContext, PGExecutionContext_psycopg)
+            and id(context) == origin.context == owner.execution_context
+            and id(context.root_connection) == owner.connection
+            and values.get("self") is context.root_connection
+            and values.get("cursor") is context.cursor
+            and id(context.cursor) == origin.cursor
+            and context.executemany is False
+            and type(parameters) is list
+            and id(parameters) == origin.container
+            and context.parameters is parameters
+            and len(parameters) == 1
+            and row is parameters[0]
+            and id(row) == origin.row
+        )
+
+    def _structure_row_source(
+        self, thread: _StructureThread, owner: _StructureInvocation, edge: _StructureRowCallback, frame: FrameType
+    ) -> bool:
+        caller = frame.f_back
+        if caller is None:
+            return False
+        callback = caller.f_locals.get("fn")
+        receiver = callback.__self__ if type(callback) is MethodType else None
+        function = callback.__func__ if type(callback) is MethodType else callback
+        return (
+            type(function) is FunctionType
+            and id(callback) == edge.function
+            and (None if receiver is None else id(receiver)) == edge.receiver
+            and frame.f_code is function.__code__
+            and frame.f_globals is function.__globals__
+            and id(frame) == edge.frame
+            and id(frame.f_code) == edge.code
+            and id(frame.f_globals) == edge.globals
+            and caller.f_code is _STRUCTURE_SINGLE_CONTEXT.__code__
+            and caller.f_globals is _STRUCTURE_SINGLE_CONTEXT.__globals__
+            and caller.f_lasti in _STRUCTURE_ROW_CALL_OFFSETS
+            and edge.call_offset == _STRUCTURE_ROW_CALL_OFFSET
+            and id(caller) == edge.dispatch == owner.row_dispatch
+            and thread.frames.get(edge.request) is owner
+            and owner.event == edge.event
+            and owner.row_callback is edge
+            and owner.row_origin is edge.origin
+            and owner.row_generation == edge.generation
+            and thread.identity == get_ident() == edge.thread
+            and edge.hook == id(sys.getprofile())
+            and self._structure_exchange_supported()
+            and self._structure_carrier() == edge.carrier
+            and (thread.submission, thread.expected, thread.witness) == (edge.submission, edge.expected, edge.witness)
+        )
+
+    @staticmethod
+    def _structure_row_arguments(frame: FrameType, caller: FrameType, callback: object, facts: _StructureRowCodeFacts) -> bool:
+        bound = type(callback) is MethodType
+        function = callback.__func__ if bound else callback
+        if type(function) is not FunctionType or facts.anchor() is not frame.f_code or facts.unsupported:
+            return False
+        current = caller.f_locals
+        arguments = (
+            current.get("self"),
+            current.get("cursor"),
+            current.get("str_statement"),
+            current.get("effective_parameters"),
+            current.get("context"),
+            current["context"].executemany,
+        )
+        if bound:
+            arguments = (callback.__self__, *arguments)
+        values = frame.f_locals
+        positional = len(facts.positional_names)
+        if any(values.get(name) is not value for name, value in zip(facts.positional_names, arguments, strict=False)):
+            return False
+        if len(arguments) <= positional:
+            return True
+        if facts.vararg_name is None:
+            return False
+        extra = values.get(facts.vararg_name)
+        return (
+            type(extra) is tuple
+            and len(extra) == len(arguments) - positional
+            and all(actual is expected for actual, expected in zip(extra, arguments[positional:], strict=True))
+        )
+
+    def _structure_row_consume(self, thread: _StructureThread, owner: _StructureInvocation, caller: FrameType) -> None:
+        edge = owner.row_callback
+        if edge is None:
+            if owner.row_callbacks_started == 0:
+                _structure_refuse(self, "publication_row_callback_missing")
+            return
+        if (
+            not edge.returned
+            or edge.outcome != "returned"
+            or edge.generation != owner.row_generation
+            or edge.origin is not owner.row_origin
+            or thread.row_returns.get(edge.generation) is not edge
+            or thread.frames.get(edge.request) is not owner
+            or edge.event != owner.event
+            or edge.thread != get_ident()
+            or edge.hook != id(sys.getprofile())
+            or edge.dispatch != id(caller)
+            or not self._structure_row_live(owner, caller)
+            or edge.carrier != self._structure_carrier()
+            or (thread.submission, thread.expected, thread.witness) != (edge.submission, edge.expected, edge.witness)
+        ):
+            _structure_refuse(self, "publication_row_callback_not_consumed")
+        thread.row_callbacks.pop(edge.frame, None)
+        owner.row_callbacks_closed += 1
+        owner.row_callback = None
+
+    def _structure_row_profile(self, frame: FrameType, event: str, arg: object, thread: _StructureThread) -> None:
+        if event not in ("call", "c_call", "return"):
+            return
+        # Audit only active listener frames, borrowing their natural live caller
+        # aliases. Numeric pending receipts never keep a retired row/frame alive.
+        if thread.row_callbacks and event in ("call", "c_call"):
+            ancestor = frame
+            remaining = len(thread.row_callbacks)
+            for _ in range(64):
+                if ancestor is None:
+                    break
+                edge = thread.row_callbacks.get(id(ancestor))
+                if edge is not None and id(ancestor.f_code) == edge.code and id(ancestor.f_globals) == edge.globals:
+                    owner = thread.frames.get(edge.request)
+                    if owner is None or not self._structure_row_source(thread, owner, edge, ancestor):
+                        _structure_refuse(self, "publication_row_callback_source_changed")
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+                ancestor = ancestor.f_back
+        if frame.f_code is _STRUCTURE_SINGLE_CONTEXT.__code__:
+            found = self._structure_row_request(thread, frame.f_back)
+            if found is None or found[1].store_role is None:
+                return
+            _key, owner = found
+            if event == "call":
+                context = frame.f_locals.get("context")
+                origin = owner.row_origin
+                if (
+                    owner.row_dispatch is not None
+                    or origin is None
+                    or frame.f_globals is not _STRUCTURE_SINGLE_CONTEXT.__globals__
+                    or type(context) not in (SQLiteExecutionContext, PGExecutionContext_psycopg)
+                    or id(context) != origin.context
+                    or id(context.root_connection) != owner.connection
+                    or frame.f_locals.get("self") is not context.root_connection
+                    or id(context.parameters) != origin.container
+                    or type(context.parameters) is not list
+                    or len(context.parameters) != 1
+                    or id(context.parameters[0]) != origin.row
+                    or id(context.cursor) != origin.cursor
+                ):
+                    _structure_refuse(self, "publication_row_dispatch_origin_changed")
+                owner.row_dispatch = id(frame)
+            elif event == "c_call" and frame.f_lasti in _STRUCTURE_ROW_CALL_OFFSETS:
+                _structure_refuse(self, "publication_row_callback_callable_unsupported")
+            elif event == "return":
+                edge = owner.row_callback
+                if edge is not None and edge.returned and edge.outcome == "unwound":
+                    if (
+                        edge.generation != owner.row_generation
+                        or edge.origin is not owner.row_origin
+                        or thread.row_returns.get(edge.generation) is not edge
+                        or thread.frames.get(edge.request) is not owner
+                        or edge.event != owner.event
+                        or edge.thread != get_ident()
+                        or edge.hook != id(sys.getprofile())
+                        or edge.carrier != self._structure_carrier()
+                        or (thread.submission, thread.expected, thread.witness) != (edge.submission, edge.expected, edge.witness)
+                        or not self._structure_row_live(owner, frame)
+                    ):
+                        _structure_refuse(self, "publication_row_callback_unwind_changed")
+                    thread.row_callbacks.pop(edge.frame, None)
+                    owner.row_callbacks_closed += 1
+                    owner.row_callback = None
+                elif edge is not None:
+                    self._structure_row_consume(thread, owner, frame)
+                if id(frame) != owner.row_dispatch or owner.row_dispatch_closed:
+                    _structure_refuse(self, "publication_row_dispatch_terminal_changed")
+                owner.row_dispatch_closed = True
+            return
+        caller = frame.f_back
+        if caller is None or caller.f_code is not _STRUCTURE_SINGLE_CONTEXT.__code__:
+            return
+        if caller.f_lasti not in _STRUCTURE_ROW_CALL_OFFSETS and caller.f_lasti != _STRUCTURE_ROW_UNPACK_OFFSET:
+            return
+        found = self._structure_row_request(thread, caller.f_back)
+        if found is None or found[1].store_role is None:
+            return
+        key, owner = found
+        if caller.f_lasti == _STRUCTURE_ROW_UNPACK_OFFSET:
+            _structure_refuse(self, "publication_row_callback_callable_unsupported")
+            return
+        if event == "call":
+            if owner.row_callback is not None:
+                self._structure_row_consume(thread, owner, caller)
+            callback = caller.f_locals.get("fn")
+            function = callback.__func__ if type(callback) is MethodType else callback
+            if (
+                type(function) is not FunctionType
+                or frame.f_code is not function.__code__
+                or frame.f_globals is not function.__globals__
+                or not self._structure_row_live(owner, caller)
+            ):
+                _structure_refuse(self, "publication_row_callback_entry_changed")
+                return
+            facts = self._structure_row_code_facts(frame.f_code)
+            if facts is None:
+                return
+            if not self._structure_row_arguments(frame, caller, callback, facts):
+                _structure_refuse(self, "publication_row_callback_entry_changed")
+                return
+            thread.row_generation += 1
+            owner.row_generation = thread.row_generation
+            owner.row_callbacks_started += 1
+            edge = _StructureRowCallback(
+                thread.row_generation,
+                key,
+                owner.event,
+                owner.row_origin,
+                id(caller),
+                _STRUCTURE_ROW_CALL_OFFSET,
+                id(frame),
+                id(callback),
+                id(callback.__self__) if type(callback) is MethodType else None,
+                id(frame.f_code),
+                id(frame.f_globals),
+                get_ident(),
+                id(sys.getprofile()),
+                self._structure_carrier(),
+                thread.submission,
+                thread.expected,
+                thread.witness,
+                facts.return_sites,
+            )
+            owner.row_callback = edge
+            thread.row_callbacks[id(frame)] = edge
+        elif event == "return":
+            edge = owner.row_callback
+            if edge is None or edge.returned:
+                _structure_refuse(self, "publication_row_callback_return_unpaired")
+                return
+            if not self._structure_row_source(thread, owner, edge, frame):
+                _structure_refuse(self, "publication_row_callback_return_source_changed")
+            edge = replace(edge, returned=True, outcome="returned" if frame.f_lasti in edge.return_sites else "unwound")
+            owner.row_callback = edge
+            if edge.generation in thread.row_returns:
+                _structure_refuse(self, "publication_row_callback_receipt_reused")
+            else:
+                thread.row_returns[edge.generation] = edge
+            thread.row_callbacks.pop(edge.frame, None)
+            if edge.outcome == "returned" and (
+                type(arg) is not tuple
+                or len(arg) != 2
+                or not self._structure_row_live(owner, caller)
+                or arg[1] is not caller.f_locals.get("effective_parameters")
+            ):
+                _structure_refuse(self, "publication_row_callback_return_changed")
 
     def _structure_pending_return(self, frame: FrameType, thread: _StructureThread, owner: _StructureInvocation) -> None:
         key = id(frame)
@@ -4029,6 +4653,15 @@ class RetentionMemoTrace:
                     thread.last[("handoff_root", current.parent)] = joined.ordinal
             return
         if role in ("sql", "driver"):
+            if current.store_role is not None and (
+                current.row_origin is None
+                or current.row_dispatch is None
+                or not current.row_dispatch_closed
+                or current.row_callback is not None
+                or current.row_callbacks_started == 0
+                or current.row_callbacks_closed != current.row_callbacks_started
+            ):
+                _structure_refuse(self, "publication_row_observation_incomplete")
             if (
                 not current.listener_seen
                 or current.driver_attempts != 1
@@ -4184,7 +4817,11 @@ class RetentionMemoTrace:
         self._structure_closing = True
         interrupt = None
         if any(
-            thread.frames or thread.pending_returns or thread.native_entry is not None or thread.submission is not None
+            thread.frames
+            or thread.pending_returns
+            or thread.row_callbacks
+            or thread.native_entry is not None
+            or thread.submission is not None
             for thread in self._structure_threads.values()
         ):
             _structure_refuse(self, "closed_with_active_original_owner")
@@ -4227,6 +4864,7 @@ class RetentionMemoTrace:
                 owner.sql_signature = None
                 owner.execution_context = None
                 owner.pending_shape = None
+                owner.row_origin = None
         if interrupt is not None and primary is None:
             raise interrupt
 
@@ -4275,6 +4913,15 @@ class RetentionMemoTrace:
             self.structure_snapshot(),
             self._structure_error_count + sum(thread.error_count for thread in self._structure_threads.values()),
             self._structure_observer_incomplete,
+            tuple(
+                (
+                    thread.identity,
+                    thread.row_generation,
+                    tuple((generation, id(receipt), receipt) for generation, receipt in thread.row_returns.items()),
+                    tuple((frame, id(receipt), receipt) for frame, receipt in thread.row_callbacks.items()),
+                )
+                for thread in self._structure_threads.values()
+            ),
         )
 
     def _assert_structure_observation(self, requested: bool) -> None:
@@ -6291,9 +6938,30 @@ class RetentionMemoTrace:
             assert total.input_characters <= limit.max_input_characters, "uncached validation scalar-input budget exceeded"
         self._verified_uncached_totals = totals
 
-    def close(self) -> None:
-        if self._closed and not (
-            (self.require_catalog_schema or self._structure_required) and self._installed and get_ident() == self._owner_thread
+    def _close_report_registration(self) -> None:
+        manager = self._report_manager
+        if manager is None or get_ident() != self._owner_thread:
+            return
+        current = manager.get_plugin(self._report_name)
+        if current is self:
+            if manager.unregister(self) is not self or manager.get_plugin(self._report_name) is not None:
+                self._observation_incomplete = True
+                self.errors.append("report cleanup registration was not released")
+                return
+        elif self._report_registered or current is not None:
+            self._observation_incomplete = True
+            self.errors.append("report cleanup registration changed during observation")
+        self._report_registered = False
+        self._report_manager = None
+        self._report_item = None
+
+    def close(self, *, primary: BaseException | None = None) -> None:
+        primary = sys.exception() if primary is None else primary
+        if (
+            self._closed
+            and not (self._installed and get_ident() == self._owner_thread)
+            and self._report_manager is None
+            and (self._byte_monitor is None or self._byte_monitor.closed)
         ):
             return
         # No observer/application lock: close can run inside an observed
@@ -6311,24 +6979,45 @@ class RetentionMemoTrace:
             )
         ):
             self._catalog_schema_error("catalog schema observation closed before its stage or worker exited")
-        structure_interrupt = None
+        interrupt = None
         if self._structure_required:
             try:
-                self._structure_close(sys.exception())
+                self._structure_close(primary)
             except BaseException as error:
-                structure_interrupt = error
+                interrupt = error
+                self._structure_observer_incomplete = True
         self._closed = True
         if self._installed and get_ident() == self._owner_thread:
-            if not self._main_state.prior_failed:
-                if sys.getprofile() is self._main_hook:
-                    sys.setprofile(self._previous)
-                else:
-                    self.errors.append("loop profiler changed during observation")
-            self._installed = False
+            try:
+                if not self._main_state.prior_failed:
+                    if sys.getprofile() is self._main_hook:
+                        sys.setprofile(self._previous)
+                    else:
+                        self.errors.append("loop profiler changed during observation")
+                self._installed = False
+            except BaseException as error:
+                self._observation_incomplete = True
+                self.errors.append("loop profile cleanup interrupted")
+                if interrupt is None:
+                    interrupt = error
         if self._byte_monitor is not None:
-            self._byte_monitor.close(sys.exception())
-        if structure_interrupt is not None:
-            raise structure_interrupt
+            try:
+                self._byte_monitor.close(primary)
+            except BaseException as error:
+                self._observation_incomplete = True
+                self.errors.append("byte monitor cleanup interrupted")
+                if interrupt is None:
+                    interrupt = error
+        try:
+            self._close_report_registration()
+        except BaseException as error:
+            self._observation_incomplete = True
+            self.errors.append("report cleanup registration interrupted")
+            if interrupt is None:
+                interrupt = error
+        self._structure_row_codes.clear()
+        if interrupt is not None and primary is None:
+            raise interrupt
 
     def _finalize(self) -> None:
         self.close()
@@ -6591,3 +7280,5 @@ _LIFETIME_PROFILE_FACTORY_CODE = _LIFETIME_PROFILE_FACTORY.__code__
 _LIFETIME_PROFILE_CODE = next(
     code for code in _LIFETIME_PROFILE_FACTORY_CODE.co_consts if type(code) is CodeType and code.co_name == "hook"
 )
+_LIFETIME_PROFILE_FREEVARS = _LIFETIME_PROFILE_CODE.co_freevars
+_LIFETIME_PROFILE_CELL_INDEXES = tuple(_LIFETIME_PROFILE_FREEVARS.index(name) for name in ("previous", "self", "state"))

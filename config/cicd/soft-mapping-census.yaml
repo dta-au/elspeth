@@ -771,8 +771,8 @@ files:
     Mapping[str, Any]: 12
     dict[str, Any]: 1
   src/elspeth/web/composer/advisor_invocation_outcome.py:
-    Mapping[str, Any]: 1
-    dict[str, Any]: 3
+    Mapping[str, Any]: 3
+    dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 2
   src/elspeth/web/composer/advisor_policy.py:
@@ -814,10 +814,12 @@ files:
   src/elspeth/web/composer/continuation_evidence_graph.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
+    dict[str, object]: 2
   src/elspeth/web/composer/continuation_message_builders.py:
     dict[str, Any]: 4
   src/elspeth/web/composer/continuation_message_families.py:
-    dict[str, Any]: 9
+    dict[str, Any]: 11
+    dict[str, object]: 4
   src/elspeth/web/composer/continuation_message_family_builders.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 14
@@ -829,12 +831,13 @@ files:
     Mapping[str, Any]: 2
     dict[str, Any]: 4
   src/elspeth/web/composer/continuation_prompt_producers.py:
-    Mapping[str, Any]: 9
+    Mapping[str, Any]: 11
     dict[str, Any]: 38
+    dict[str, object]: 4
   src/elspeth/web/composer/continuation_provider_input.py:
     Mapping[str, Any]: 2
   src/elspeth/web/composer/continuation_retention.py:
-    Mapping[str, object]: 3
+    Mapping[str, object]: 7
   src/elspeth/web/composer/continuation_tool_argument_messages.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 4
@@ -1076,8 +1079,8 @@ files:
   src/elspeth/web/secrets/user_store.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/_auto_title.py:
-    Mapping[str, Any]: 1
-    dict[str, Any]: 2
+    Mapping[str, Any]: 2
+    dict[str, Any]: 1
   src/elspeth/web/sessions/_persist_payload.py:
     Mapping[str, Any]: 1
   src/elspeth/web/sessions/archive_quarantine.py:
@@ -1085,6 +1088,8 @@ files:
     dict[str, object]: 2
   src/elspeth/web/sessions/audit_checkpoint.py:
     Mapping[str, Any]: 2
+  src/elspeth/web/sessions/composer_finalization.py:
+    Mapping[str, object]: 2
   src/elspeth/web/sessions/continuation_owner_results.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
@@ -1131,10 +1136,10 @@ files:
     Mapping[str, Any]: 16
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 799
-  Mapping[str, object]: 321
+  Mapping[str, Any]: 804
+  Mapping[str, object]: 327
   MutableMapping[str, Any]: 8
   boundary: 60
-  dict[str, Any]: 1187
-  dict[str, object]: 398
-  soft: 2713
+  dict[str, Any]: 1186
+  dict[str, object]: 408
+  soft: 2733

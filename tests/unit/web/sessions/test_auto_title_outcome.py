@@ -11,6 +11,8 @@ from sqlalchemy import select
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardTrust
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.prompt_guard import build_prompt_guard_mount, prompt_guard_user_scope
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
@@ -32,6 +34,29 @@ from tests.unit.web.sessions.test_token_usage_adapters import _ledger
 
 operation_store = operations.operation_store
 USER = "Label this customer document workflow"
+
+
+def test_prepared_title_request_snapshots_values_with_one_shared_audit_message_projection():
+    original = _auto_title.prepare_auto_title_request(
+        user_message=USER, model="test/model", temperature=0.25, seed=7, api_base="https://model.example.test/v1"
+    )
+    assert original.kwargs["messages"] is original.audit_messages
+    borrowed = deep_thaw(original.kwargs)
+    expected = deep_thaw(original.kwargs)
+    prepared = _auto_title.PreparedAutoTitleRequest(borrowed, original.user_prompt)
+    assert deep_thaw(prepared.kwargs) == expected
+    assert prepared.kwargs["messages"] is prepared.audit_messages
+    assert prepared.audit_messages[0][PROMPT_GUARD_TRUST_KEY] is PromptGuardTrust.INSTRUCTION
+    borrowed["model"] = "changed-after-preparation"
+    borrowed["messages"][0]["content"] = "changed instruction"
+    borrowed["messages"].append({"role": "user", "content": "late borrowed message"})
+    assert deep_thaw(prepared.kwargs) == expected
+    assert prepared.user_prompt == USER
+    assert prepared.kwargs["timeout"] == 5.0 and prepared.kwargs["num_retries"] == prepared.kwargs["max_retries"] == 0
+    with pytest.raises(TypeError):
+        prepared.kwargs["model"] = "cannot-rewrite-snapshot"
+    with pytest.raises(TypeError):
+        prepared.audit_messages[0]["content"] = "cannot-rewrite-message"
 
 
 def title_case(store, tmp_path, monkeypatch, *, grant_role=True):

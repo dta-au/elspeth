@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer._compose_loop_carriers import (
     _AdmittedAssistantMessage,
     _AdmittedLLMProviderMetadata,
@@ -28,17 +29,26 @@ class AdvisorInvocationObservation:
     message: _AdmittedAssistantMessage | None
     provider_metadata: _AdmittedLLMProviderMetadata | None
     guidance: str | None
-    metadata: dict[str, Any] | None
+    metadata: Mapping[str, Any] | None
     attempt: ProviderAttempt | None
     audit_call: ComposerLLMCall | None
     recorder_completed: bool
     continuation_budget_completed: bool
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "metadata")
+
 
 @dataclass(frozen=True, slots=True)
 class AdvisorInvocationReturned:
     observation: AdvisorInvocationObservation
-    result: tuple[str, dict[str, Any]]
+
+    @property
+    def result(self) -> tuple[str, Mapping[str, Any]]:
+        guidance, metadata = self.observation.guidance, self.observation.metadata
+        if guidance is None or metadata is None:
+            raise AuditIntegrityError("Returned Advisor observation lacks its original successful values")
+        return guidance, metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,4 +118,6 @@ async def observe_advisor_invocation(
         )
     except BaseException as error:
         return AdvisorInvocationRaised(capture.snapshot(), error)
-    return AdvisorInvocationReturned(capture.snapshot(), result)
+    if capture.guidance is None or capture.metadata is None or result[0] is not capture.guidance or result[1] is not capture.metadata:
+        raise AuditIntegrityError("Advisor observation lost its original successful result")
+    return AdvisorInvocationReturned(capture.snapshot())

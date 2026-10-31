@@ -11,6 +11,7 @@ from litellm import ModelResponse
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer import advisor_checkpoint
@@ -314,6 +315,69 @@ async def test_advisor_observer_refuses_foreign_owner_before_any_effect(operatio
         with pytest.raises(AuditIntegrityError, match="actual explicit provider owner"):
             await observe_advisor_invocation(advisor, ARGUMENTS, recorder=None, provider_owner=object())
         assert not requests and not custodies and not audits and not _ledger(operation_store[0])
+        coordinator.assert_completed()
+    finally:
+        operation_store[1].release(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorder_failure", (False, True))
+async def test_advisor_metadata_snapshot_detaches_values_and_preserves_original_live_owners(
+    operation_store, tmp_path, monkeypatch, recorder_failure
+):
+    advisor, provider, context, coordinator, requests, custodies, audits, projections = advisor_case(operation_store, tmp_path, monkeypatch)
+    recorder = BufferingRecorder()
+    original_error = AuditIntegrityError("original Advisor recorder failure after accounting")
+    original_metadata = []
+    actual_call = advisor._call_advisor_with_audit
+
+    async def observe_actual_call(*args, **kwargs):
+        try:
+            return await actual_call(*args, **kwargs)
+        finally:
+            original_metadata.append(kwargs["_outcome"].metadata)
+
+    monkeypatch.setattr(advisor, "_call_advisor_with_audit", observe_actual_call)
+    if recorder_failure:
+        actual_record = recorder.record_llm_call
+
+        def fail_after_original_record(*args, **kwargs):
+            actual_record(*args, **kwargs)
+            raise original_error
+
+        monkeypatch.setattr(recorder, "record_llm_call", fail_after_original_record)
+    physical = []
+
+    async def completion(**kwargs):
+        _assert_required_guard_admitted(operation_store[0], context, requests, role="advisor", user_prompt=USER)
+        physical.append(custodies[0].attempt)
+        return reply()
+
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    try:
+        with prompt_guard_user_scope(USER):
+            result = await observe_advisor_invocation(advisor, ARGUMENTS, recorder=recorder, provider_owner=provider)
+        observed = result.observation
+        (borrowed,) = original_metadata
+        assert type(borrowed) is dict and observed.metadata is not borrowed
+        assert deep_thaw(observed.metadata) == borrowed
+        expected = dict(borrowed)
+        assert observed.message is projections[0][0] and observed.provider_metadata is projections[0][2]
+        assert observed.attempt is physical[0] and observed.audit_call is audits[0]
+        assert recorder.llm_calls[0] is audits[0]
+        if recorder_failure:
+            assert type(result) is AdvisorInvocationRaised and result.error is original_error
+        else:
+            assert type(result) is AdvisorInvocationReturned
+            assert result.result[0] is observed.guidance and result.result[1] is observed.metadata
+        borrowed["model"] = "changed-after-observation"
+        borrowed["prompt_tokens"] = -1
+        assert deep_thaw(observed.metadata) == expected
+        with pytest.raises(TypeError):
+            observed.metadata["model"] = "cannot-rewrite-snapshot"
+        if not recorder_failure:
+            assert result.result[1] is observed.metadata and deep_thaw(result.result[1]) == expected
+        assert len(physical) == len(audits) == len(_ledger(operation_store[0])) == 1
         coordinator.assert_completed()
     finally:
         operation_store[1].release(context)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import cast, overload
+from typing import Self, cast, overload
 
 import rfc8785
 
@@ -43,10 +43,38 @@ from elspeth.web.composer.provider_thinking import scan_native_thinking_blocks
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 
 
-@dataclass(frozen=True, slots=True)
 class _ExtendedMessages(Sequence[GuardedProviderMessage]):
-    source: Sequence[GuardedProviderMessage] = field(repr=False)
-    tail: GuardedProviderMessage = field(repr=False)
+    """Read-only bindings over live history and its exact appended message."""
+
+    __slots__ = ("_initialized", "source", "tail")
+
+    source: Sequence[GuardedProviderMessage]
+    tail: GuardedProviderMessage
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[GuardedProviderMessage], tail: GuardedProviderMessage) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[GuardedProviderMessage], tail: GuardedProviderMessage) -> None:
+        if self._initialized:
+            raise AttributeError("_ExtendedMessages cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "tail", tail)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_ExtendedMessages has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_ExtendedMessages has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.tail) == (actual.source, actual.tail)
 
     def __len__(self) -> int:
         return len(self.source) + 1
@@ -68,10 +96,38 @@ class _ExtendedMessages(Sequence[GuardedProviderMessage]):
         return self.source[position]
 
 
-@dataclass(frozen=True, slots=True)
 class _MessageSlice(Sequence[GuardedProviderMessage]):
-    source: Sequence[GuardedProviderMessage] = field(repr=False)
+    """Read-only bindings over a live source and its original selected positions."""
+
+    __slots__ = ("_initialized", "positions", "source")
+
+    source: Sequence[GuardedProviderMessage]
     positions: range
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[GuardedProviderMessage], positions: range) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[GuardedProviderMessage], positions: range) -> None:
+        if self._initialized:
+            raise AttributeError("_MessageSlice cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "positions", positions)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_MessageSlice has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_MessageSlice has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.positions) == (actual.source, actual.positions)
 
     def __len__(self) -> int:
         return len(self.positions)
@@ -161,9 +217,36 @@ class _QuotedFields(ReadonlyJsonObject):
         raise KeyError(key)
 
 
-@dataclass(frozen=True, slots=True)
 class _ReplyRoles(Sequence[GuardedProviderMessage]):
-    source: Sequence[GuardedProviderMessage] = field(repr=False)
+    """Read-only source binding for cache planning over current message roles."""
+
+    __slots__ = ("_initialized", "source")
+
+    source: Sequence[GuardedProviderMessage]
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[GuardedProviderMessage]) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[GuardedProviderMessage]) -> None:
+        if self._initialized:
+            raise AttributeError("_ReplyRoles cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_ReplyRoles has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_ReplyRoles has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source,) == (actual.source,)
 
     def __len__(self) -> int:
         return len(self.source)
@@ -183,12 +266,42 @@ class _ReplyRoles(Sequence[GuardedProviderMessage]):
         return {"role": _role(message), "content": ""} if _quoted(message) else message
 
 
-@dataclass(frozen=True, slots=True)
 class _SizedMessages(ReadonlyJsonArray):
-    source: Sequence[GuardedProviderMessage] = field(repr=False)
-    prefix: str = field(repr=False)
-    suffix: str = field(repr=False)
+    """Read-only bindings for exact framing of the original live messages."""
+
+    __slots__ = ("_initialized", "cache", "prefix", "source", "suffix")
+
+    source: Sequence[GuardedProviderMessage]
+    prefix: str
+    suffix: str
     cache: AnthropicCacheMarkerPlan
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[GuardedProviderMessage], prefix: str, suffix: str, cache: AnthropicCacheMarkerPlan) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[GuardedProviderMessage], prefix: str, suffix: str, cache: AnthropicCacheMarkerPlan) -> None:
+        if self._initialized:
+            raise AttributeError("_SizedMessages cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "prefix", prefix)
+        object.__setattr__(self, "suffix", suffix)
+        object.__setattr__(self, "cache", cache)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_SizedMessages has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_SizedMessages has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.prefix, self.suffix, self.cache) == (actual.source, actual.prefix, actual.suffix, actual.cache)
 
     def __len__(self) -> int:
         return len(self.source)

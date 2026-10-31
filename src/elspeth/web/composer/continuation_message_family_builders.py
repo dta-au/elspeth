@@ -46,7 +46,7 @@ from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, adm
 from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts, json_content_parts
 from elspeth.web.composer.provider_thinking import attach_provider_thinking, native_thinking_blocks
 from elspeth.web.composer.tools._common import ToolResult, build_plugin_schemas_for_failure
-from elspeth.web.composer.tools._registry import response_contract_for, should_augment_with_plugin_schemas
+from elspeth.web.composer.tools._registry import should_augment_with_plugin_schemas
 
 
 def require_feedback_invocation(
@@ -250,13 +250,14 @@ def capture_tool_result_recipe(
 def rebuild_tool_result_message(*, call: _AdmittedToolCall, result: ToolResult) -> dict[str, Any]:
     """Use the existing result producer on a separately admitted SQL result."""
     from elspeth.web.composer.continuation_message_builders import tool_result_message
+    from elspeth.web.composer.continuation_tool_batch import _response_contract
 
     if type(call) is not _AdmittedToolCall or type(result) is not ToolResult:
         raise AuditIntegrityError("tool result restore lost its actual completed call/result DATA")
     if result.plugin_schemas is not None:
         raise AuditIntegrityError("schema-augmented tool result requires its existing current-policy producer family")
     produced: ToolResult | AdmittedDiscoveryResult = result
-    if response_contract_for(call.function.name) is not None:
+    if _response_contract(call.function.name) is not None:
         produced = admit_discovery_result(call.function.name, result)
         serialized = serialize_admitted_discovery_result(produced)
     else:

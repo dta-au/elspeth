@@ -51,6 +51,8 @@ from elspeth.web.composer._compose_loop_carriers import (
     _CallModelOutcome,
     _DispatchOutcome,
     _PersistOutcome,
+    _ServiceFailure,
+    _ServiceHandlerFailure,
     _ToolBatchCancellationRequested,
     _ToolOutcome,
 )
@@ -1000,6 +1002,7 @@ class ContinuationBatchState:
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
     advisor_failure: Exception | None = None
+    service_failure: _ServiceFailure | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = None
     decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -1192,6 +1195,7 @@ async def _initialize_continuation_batch_live(
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
     advisor_failure: Exception | None = None
+    service_failure: _ServiceFailure | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
@@ -1211,6 +1215,7 @@ async def _initialize_continuation_batch_live(
     batch.plugin_crash = plugin_crash
     batch.plugin_crash_cause = plugin_crash_cause
     batch.advisor_failure = advisor_failure
+    batch.service_failure = service_failure
     batch.advisor_compose_timeout = advisor_compose_timeout
     batch.pre_state_id = pre_state_id
     batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -1275,6 +1280,7 @@ async def _prepare_continuation_call_live(
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
     advisor_compose_timeout = batch.advisor_compose_timeout
     pre_state_id = batch.pre_state_id
     decoded_args_by_call_id = batch.decoded_args_by_call_id
@@ -1754,6 +1760,7 @@ async def _prepare_continuation_call_live(
         batch.plugin_crash = plugin_crash
         batch.plugin_crash_cause = plugin_crash_cause
         batch.advisor_failure = advisor_failure
+        batch.service_failure = service_failure
         batch.advisor_compose_timeout = advisor_compose_timeout
         batch.pre_state_id = pre_state_id
         batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -1830,6 +1837,7 @@ async def _execute_continuation_call_live(
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
     advisor_compose_timeout = batch.advisor_compose_timeout
     pre_state_id = batch.pre_state_id
     decoded_args_by_call_id = batch.decoded_args_by_call_id
@@ -1888,6 +1896,44 @@ async def _execute_continuation_call_live(
             error_message=error_message,
             post_version=post_version,
         )
+
+    def _complete_service_failure(original: _ServiceFailure) -> None:
+        nonlocal service_failure, all_cache_hits
+        from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+        if failure_custody is not None:
+            failure_custody.observe_primary(original)
+            if (
+                observation is None
+                or not observation.execution_failed
+                or observation.returned
+                or failure_custody.errors
+                or failure_custody.original is not original
+            ):
+                raise failure_custody.failure(original)
+        payload = {"success": False, "status": "SERVICE_FAILURE", "reason": "service_failure"}
+        try:
+            invocation = finish_success(audit, result_payload=payload, version_after=state.version)
+            if observation is None:
+                recorder.record(invocation)
+            else:
+                recorder.record_with_failure_observation(invocation, observation)
+            _append_tool_outcome(response=payload, error_class=None, error_category=None, error_message=None, post_version=state.version)
+            if failure_custody is not None:
+                failure_custody.promote_completed_service_failure(original)
+        except BaseException as secondary:
+            if failure_custody is not None:
+                combined = failure_custody.failure(secondary)
+                if combined is secondary:
+                    raise
+                raise combined from combined.__cause__
+            combined = combine_failure_objects(original, secondary)
+            if combined is secondary:
+                raise
+            raise combined from combined.__cause__
+        service_failure = original
+        batch.service_failure = original
+        all_cache_hits = False
 
     try:
         for tool_call in (call.tool_call,):
@@ -2978,6 +3024,9 @@ async def _execute_continuation_call_live(
                         failure_custody.observe_primary(first_party_exc)
                         if failure_custody.errors or isinstance(first_party_exc, BaseExceptionGroup):
                             raise failure_custody.failure(first_party_exc)
+                    if isinstance(first_party_exc, _ServiceFailure):
+                        _complete_service_failure(first_party_exc)
+                        break
                     if isinstance(first_party_exc, ComposerContextUnsupported):
                         context_payload = {
                             "success": False,
@@ -3190,6 +3239,7 @@ async def _execute_continuation_call_live(
                         llm_calls=recorder.llm_calls,
                         failed_turn=preflight_exc.failed_turn,
                     ) from preflight_exc.original_exc
+                handler_failure: _ServiceHandlerFailure | None = None
                 try:
                     session_aware_outcome = await _await_started_tool_stage(
                         ctx.session_tools._dispatch_session_aware_tool(
@@ -3214,6 +3264,8 @@ async def _execute_continuation_call_live(
                         recorder=recorder,
                         failure_observation=observation,
                     )
+                except _ServiceHandlerFailure as marker:
+                    handler_failure = marker
                 except (AssertionError, MemoryError, RecursionError, SystemError):
                     # Same narrow-class discipline as the sync execute_tool
                     # handler below: interpreter/Tier-1 invariant states must
@@ -3223,6 +3275,11 @@ async def _execute_continuation_call_live(
                     # Tier-1 audit invariant — same passthrough as the sync path.
                     raise
                 except Exception as tool_exc:
+                    if isinstance(tool_exc, _ServiceFailure):
+                        # Only the inner handler's owned marker can close a
+                        # service refusal. Result/audit/post-handler failures
+                        # retain their real owner without inventing completion.
+                        raise
                     # elspeth-9c01c943a5: the session-aware dispatch converts
                     # ToolArgumentError internally, so any exception reaching
                     # here is a plugin/service bug. Without this capture it
@@ -3259,6 +3316,20 @@ async def _execute_continuation_call_live(
                     plugin_crash_cause = tool_exc
                     if failure_custody is not None:
                         failure_custody.promote_completed_failure(kind="plugin_crash", original=tool_exc, wrapper=plugin_crash)
+                    break
+                if handler_failure is not None:
+                    if (
+                        type(handler_failure) is not _ServiceHandlerFailure
+                        or handler_failure.audit is not audit
+                        or handler_failure.tool_call_id != tool_call.id
+                    ):
+                        raise AuditIntegrityError(
+                            "service handler failure changed its actual issued audit/call"
+                        ) from handler_failure.original
+                    # Leave the marker's exception suite before audit closure.
+                    # A real secondary must keep its own context, never acquire
+                    # this private routing marker as an implicit exception link.
+                    _complete_service_failure(handler_failure.original)
                     break
                 all_cache_hits = False
                 _append_tool_outcome(
@@ -3918,6 +3989,7 @@ async def _execute_continuation_call_live(
             batch.plugin_crash = plugin_crash
             batch.plugin_crash_cause = plugin_crash_cause
             batch.advisor_failure = advisor_failure
+        batch.service_failure = service_failure
         batch.advisor_compose_timeout = advisor_compose_timeout
         batch.pre_state_id = pre_state_id
         batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -3957,12 +4029,17 @@ def _finish_continuation_batch_live(
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
     if failure_custody is not None and failure_custody.completed:
         if failure_custody.batch is not batch:
             raise AuditIntegrityError("batch finish changed its original native failure custody")
         plugin_crash = failure_custody.wrapper
         plugin_crash_cause = failure_custody.original if plugin_crash is not None else None
         advisor_origin = failure_custody.original
+        if batch.service_failure is not None:
+            if advisor_origin is not batch.service_failure:
+                raise AuditIntegrityError("service finish replaced its actual native original")
+            service_failure = batch.service_failure
         if batch.retained_failure is not None and batch.retained_failure.kind == "advisor_failure":
             if not isinstance(advisor_origin, Exception):
                 raise AuditIntegrityError("Advisor finish lost its actual handled exception")
@@ -3991,6 +4068,7 @@ def _finish_continuation_batch_live(
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
         advisor_failure=advisor_failure,
+        service_failure=service_failure,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,

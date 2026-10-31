@@ -26,6 +26,7 @@ from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf, encode_message_shelf
 from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerMutationAuthorityRevoked
+from elspeth.web.sessions.composer_operation_versions import COMPOSER_OPERATION_VERSION_HEADER
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     blob_replacement_cleanups_table,
@@ -40,7 +41,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import CompositionStateData
 from tests.helpers.advisor_review import parse_advisor_publication_review
-from tests.helpers.composer_operations import message_body, running_operation_sync, settle_sync
+from tests.helpers.composer_operations import message_body, running_operation_sync, settle_sync, submit_and_settle
 from tests.integration.web.composer.test_freeform_pipeline_planner import _pipeline
 from tests.integration.web.composer.test_freeform_planner_failure_translation import (
     _build_app,
@@ -331,6 +332,7 @@ def run_authority_case(
     cap_errors=None,
     create_ack_loss=False,
     rootless_mixed=False,
+    explicit_v1=False,
     observed=None,
 ):
     entered, release = threading.Event(), threading.Event()
@@ -610,8 +612,15 @@ def run_authority_case(
 
     monkeypatch.setattr(composer, "_persist_turn_audit", observe_module_p4)
 
+    async def settle_explicit_v1(http):
+        http.headers[COMPOSER_OPERATION_VERSION_HEADER] = "1"
+        return await submit_and_settle(http, client.app, path=path, body=body)
+
     with ThreadPoolExecutor(max_workers=2) as executor:
-        pending = executor.submit(settle_sync, client, client.app, path=path, body=body)
+        if explicit_v1:
+            pending = executor.submit(client.run_in_one_loop, settle_explicit_v1)
+        else:
+            pending = executor.submit(settle_sync, client, client.app, path=path, body=body)
         try:
             assert entered.wait(15), "Actual selected owner was never reached"
             if barrier == "p4_locked":
@@ -642,6 +651,11 @@ def run_authority_case(
             .mappings()
             .one()
         )
+        if explicit_v1:
+            assert settled.accepted.request.headers[COMPOSER_OPERATION_VERSION_HEADER] == "1"
+            assert settled.accepted.headers[COMPOSER_OPERATION_VERSION_HEADER] == "1"
+            assert operation["operation_id"] == body["operation_id"]
+            assert operation["lifecycle_version"] == 1
         blobs = conn.execute(select(blobs_table).where(blobs_table.c.session_id == sid)).mappings().all()
         rejections = conn.execute(
             select(composition_rejection_events_table).where(composition_rejection_events_table.c.session_id == sid)
@@ -789,7 +803,7 @@ def _assert_revoked_graph_replays_as_refusal(event):
 def test_late_downgrade_refuses_graph_but_keeps_actual_p4_cohort(tmp_path, monkeypatch):
     observed = {}
     settled, states, proposals, chat, phases, primary, physical = run_authority_case(
-        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", observed=observed
+        tmp_path, monkeypatch, initial="auto_commit", final="explicit_approve", barrier="p4", explicit_v1=True, observed=observed
     )
     assert states == [] and proposals == []
     status, body = settled.error()

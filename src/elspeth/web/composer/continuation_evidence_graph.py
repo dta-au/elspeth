@@ -7,8 +7,8 @@ history/application-ledger cuts are refused until their actual producer is retai
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import FrozenInstanceError
+from typing import TYPE_CHECKING, Any, Self
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import AuditIntegrityError
@@ -21,7 +21,8 @@ from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptOwner
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.continuation import LogicalRequestBinding
-from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot, encode_recorder_snapshot
+from elspeth.web.composer.continuation_application_graph import capture_application_recorder_source
+from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors, decode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData
 from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
@@ -44,16 +45,157 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 
 
-@dataclass(frozen=True, slots=True)
 class RestoredTurnEvidence:
+    """Original live evidence owners with closed bindings, never a frozen DATA snapshot."""
+
+    __slots__ = (
+        "_sealed",
+        "applications",
+        "batch",
+        "drained",
+        "evidence",
+        "messages",
+        "recorder",
+        "selected_audit",
+        "selected_dialect",
+    )
+
     evidence: TurnEvidence
     messages: list[dict[str, Any]]
     recorder: BufferingRecorder
     drained: RecorderDrainCursors
-    batch: RestoredBatchData | None = None
-    applications: PortableP4ApplicationEntry | None = None
-    selected_audit: PortableDispatchAudit | None = None
-    selected_dialect: ToolContractDialect | None = None
+    batch: RestoredBatchData | None
+    applications: PortableP4ApplicationEntry | None
+    selected_audit: PortableDispatchAudit | None
+    selected_dialect: ToolContractDialect | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        evidence: TurnEvidence,
+        messages: list[dict[str, object]],
+        recorder: BufferingRecorder,
+        drained: RecorderDrainCursors,
+        batch: RestoredBatchData | None = None,
+        applications: PortableP4ApplicationEntry | None = None,
+        selected_audit: PortableDispatchAudit | None = None,
+        selected_dialect: ToolContractDialect | None = None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        evidence: TurnEvidence,
+        messages: list[dict[str, object]],
+        recorder: BufferingRecorder,
+        drained: RecorderDrainCursors,
+        batch: RestoredBatchData | None = None,
+        applications: PortableP4ApplicationEntry | None = None,
+        selected_audit: PortableDispatchAudit | None = None,
+        selected_dialect: ToolContractDialect | None = None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("RestoredTurnEvidence cannot be reinitialized")
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "recorder", recorder)
+        object.__setattr__(self, "drained", drained)
+        object.__setattr__(self, "batch", batch)
+        object.__setattr__(self, "applications", applications)
+        object.__setattr__(self, "selected_audit", selected_audit)
+        object.__setattr__(self, "selected_dialect", selected_dialect)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("RestoredTurnEvidence bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("RestoredTurnEvidence bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not RestoredTurnEvidence or type(other) is not RestoredTurnEvidence:
+            return NotImplemented
+        return (
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        ) == (
+            other.evidence,
+            other.messages,
+            other.recorder,
+            other.drained,
+            other.batch,
+            other.applications,
+            other.selected_audit,
+            other.selected_dialect,
+        )
+
+    def with_batch(self, batch: RestoredBatchData) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_drained(self, drained: RecorderDrainCursors) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            drained,
+            self.batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_batch_and_drained(self, batch: RestoredBatchData, drained: RecorderDrainCursors) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            drained,
+            batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_selected_dispatch(self, audit: PortableDispatchAudit, dialect: ToolContractDialect) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            audit,
+            dialect,
+        )
+
+    def without_selected_dispatch(self) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            None,
+            None,
+        )
 
 
 def capture_turn_evidence(
@@ -90,7 +232,8 @@ def capture_turn_evidence(
     from elspeth.web.composer.continuation_evidence_application_data import capture_joint_evidence_graph, journal_effect_locators
 
     recorder_snapshot = recorder.snapshot_for_continuation(drained=drained)
-    recorder_chunk = encode_recorder_snapshot(recorder_snapshot)
+    recorder_source = capture_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)
+    recorder_chunk = recorder_source.chunk
     if expected_recorder is not None and recorder_chunk != expected_recorder:
         raise AuditIntegrityError("evidence capture changed its expected original recorder")
     joint_graph_json, application_entry = capture_joint_evidence_graph(
@@ -100,6 +243,7 @@ def capture_turn_evidence(
         data=data,
         env_ref_names=env_ref_names,
         recorder_snapshot=recorder_snapshot,
+        recorder_source=recorder_source,
     )
     sources = P4ApplicationSources(application_entry, owner._portable_p4_sources)
     if application_entry is None and (owner.effects.batches or owner.effects.committed_revision_ids):

@@ -117,8 +117,10 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_env_inventory import ContinuationEnvSelection, CurrentContinuationEnvInventory
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.composer.continuation_owed_evidence import OwedP4EvidenceData
+    from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.sessions.continuation import ContinuationOwnerCommit, PreparedSegmentSettlement
@@ -126,7 +128,11 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_attachment_result import AttachmentEffectPreparation, AttachmentResultCheckpoint
     from elspeth.web.sessions.continuation_composition_initialization import CurrentCompositionInitializationSource
     from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
-    from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
+    from elspeth.web.sessions.continuation_p4_application_store import (
+        StoredP4Application,
+        StoredTerminalP4Application,
+        StoredTerminalP4Preparation,
+    )
     from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
@@ -858,7 +864,28 @@ class ComposerAsyncOperationAuthority:
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
             from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
             from elspeth.web.composer.continuation_selection import SelectedContinuationState
+            from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
             from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
+            from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+            terminal_source = read_terminal_p4_source_on_connection(
+                conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
+            )
+            if type(terminal_source) is StoredTerminalP4Preparation:
+                raise ComposerTerminalSQLCompletionUnknown("terminal P4 preparation cannot become a claimed completion")
+            if terminal_source is not None:
+                if type(outcome) is not ComposerOperationError:
+                    raise AuditIntegrityError("terminal service completion cannot publish operation success")
+                parent = _read(conn, running.claim.session_id, running.claim.operation_id)
+                if parent is None:
+                    raise AuditIntegrityError("terminal P4 disposition lost its actual logical request")
+                if parent.cancel_requested_at is not None:
+                    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
+
+                    outcome = request_cancelled_error(request_id=parent.request_id)
+                return settle_composer_operation_on_connection(conn, running, outcome=outcome)
 
             stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
             selected = SelectedContinuationState(
@@ -1108,7 +1135,7 @@ class ComposerAsyncOperationAuthority:
 
     def read_continuation_tool_failure(
         self, running: ComposerOperationRunning, *, env_ref_names: frozenset[str]
-    ) -> RetainedToolFailureSource | None:
+    ) -> RetainedToolFailureSource | StoredTerminalP4Preparation | StoredTerminalP4Application | None:
         from elspeth.web.sessions.continuation_tool_failure import read_tool_failure_source_on_connection
 
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
@@ -1282,6 +1309,19 @@ class ComposerAsyncOperationAuthority:
                 effect_key=effect_key,
                 input_sha256=input_sha256,
             )
+
+    def prepare_terminal_continuation_p4(
+        self,
+        running: ComposerOperationRunning,
+        *,
+        completion: TerminalServiceCompletion,
+        prepared: PreparedP4Value,
+        env_ref_names: frozenset[str],
+    ) -> ContinuationOwnerCommit:
+        from elspeth.web.sessions.continuation_p4 import prepare_terminal_p4_on_connection
+
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            return prepare_terminal_p4_on_connection(conn, running, completion=completion, prepared=prepared, env_ref_names=env_ref_names)
 
     def prepare_continuation_p4(
         self,

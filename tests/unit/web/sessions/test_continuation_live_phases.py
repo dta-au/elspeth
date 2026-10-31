@@ -1,7 +1,7 @@
 """Actual V2 paid response → tool → owed Stop prefix source controls."""
 
 from contextlib import asynccontextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 from typing import Any
 
@@ -437,6 +437,97 @@ async def test_actual_v2_tool_phase_preserves_live_paid_objects_and_commits_the_
         assert owner.runtime.graph.batch.calls is primary.outcome.completion.tool_batch.calls
         assert message is registered[0] and message["content"] is serialized
         assert stored_rows(operation_store[0]) == before and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+async def test_actual_result_source_and_graph_successors_preserve_original_live_owners(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer import continuation_message_families as families
+    from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence
+    from elspeth.web.composer.continuation_message_families import CurrentContinuationMessageFamilies, _ToolResultFamilySource
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        original = owner.runtime.graph
+        live_messages = original.messages
+        assert original.batch is not None
+        await _advance(owner)
+        runtime = owner.runtime
+        assert runtime.graph.messages is live_messages and runtime.live.llm_messages is live_messages
+        message = next(item for item in live_messages if item.get("tool_call_id") == "first_read")
+        wire, recipe = runtime.materialization.capture_message(message)
+        captured = []
+        actual_source = families._require_tool_result_source_on_connection
+
+        def source(*args, **kwargs):
+            value = actual_source(*args, **kwargs)
+            if value.recipe == recipe:
+                captured.append(value)
+            return value
+
+        monkeypatch.setattr(families, "_require_tool_result_source_on_connection", source)
+        restored = await restore_continuation_runtime(
+            service=owner.service,
+            authority=owner.authority,
+            selected=runtime.source.selected,
+            inventory=runtime.materialization.inventory,
+            required_work=owner.work,
+            provider_owner=owner.provider_owner,
+        )
+        assert captured and restored.graph.batch is not None
+        assert any(families.family_message_wire(item) == wire for item in restored.live.llm_messages)
+        record = captured[0]
+        assert type(record) is _ToolResultFamilySource
+        copied = _ToolResultFamilySource(record.recipe, record.call, record.result, dict(record.message))
+        assert copied == record and copied.message is not record.message
+        assert all(item == record for item in captured)
+        record_message = record.message
+        with pytest.raises(FrozenInstanceError):
+            record.message = {}
+        with pytest.raises(FrozenInstanceError):
+            del record.result
+        with pytest.raises(FrozenInstanceError):
+            record._sealed = False
+        with pytest.raises(FrozenInstanceError):
+            record.extra = object()
+        with pytest.raises(FrozenInstanceError, match="reinitialized"):
+            _ToolResultFamilySource.__init__(record, record.recipe, record.call, record.result, {})
+        with pytest.raises(AttributeError):
+            _ = record.__dict__
+        assert record.message is record_message and record.call is copied.call and record.result is copied.result
+
+        replacement_batch, replacement_drained = restored.graph.batch, restored.graph.drained
+        assert replacement_batch is not original.batch and replacement_drained is not original.drained
+        changed_batch = original.with_batch(replacement_batch)
+        changed_drain = original.with_drained(replacement_drained)
+        changed_both = original.with_batch_and_drained(replacement_batch, replacement_drained)
+        for following in (changed_batch, changed_drain, changed_both):
+            assert type(following) is RestoredTurnEvidence and following is not original
+            assert following.evidence is original.evidence and following.messages is live_messages
+            assert following.recorder is original.recorder and following.applications is original.applications
+            assert following.selected_audit is original.selected_audit and following.selected_dialect is original.selected_dialect
+        assert changed_batch.batch is replacement_batch and changed_batch.drained is original.drained
+        assert changed_drain.batch is original.batch and changed_drain.drained is replacement_drained
+        assert changed_both.batch is replacement_batch and changed_both.drained is replacement_drained
+        assert original.batch is runtime.graph.batch and original.messages is live_messages
+
+        current = CurrentContinuationMessageFamilies(
+            owner.service, owner.authority, runtime.source.selected, runtime.materialization.inventory
+        )
+        assert current.restore_messages(((recipe, wire),))
+        before = stored_rows(operation_store[0])
+        forged = []
+
+        def changed_source(*args, **kwargs):
+            value = actual_source(*args, **kwargs)
+            if value.recipe == recipe:
+                object.__setattr__(value, "message", {**value.message, "tool_call_id": "changed_original_result_call"})
+                forged.append(value)
+            return value
+
+        monkeypatch.setattr(families, "_require_tool_result_source_on_connection", changed_source)
+        with pytest.raises(AuditIntegrityError, match="complete original selected wire"):
+            current.restore_messages(((recipe, wire),))
+        assert forged and len(sdk) == 1 and stored_rows(operation_store[0]) == before
+        assert runtime.graph.messages is live_messages and runtime.materialization.capture_message(message) == (wire, recipe)
 
 
 @pytest.mark.asyncio

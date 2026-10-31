@@ -35,6 +35,7 @@ from elspeth.web.composer._schema_response_grammar import JSONSchemaSnapshot, Kn
 from elspeth.web.composer.audit import DispatchAudit
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
 from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, bounded_json_loads
+from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import (
     PortableDispatchAudit,
@@ -49,6 +50,7 @@ from elspeth.web.composer.continuation_tool_batch import (
     RetainedBatchFailure,
     _decode_validation,
     _read_json_value,
+    _response_contract,
     _state_from_tool_json,
     _validation_json,
     encode_tool_result_value,
@@ -83,7 +85,7 @@ from elspeth.web.execution.schemas import (
 )
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_application_graph import ApplicationGraph
+    from elspeth.web.composer.continuation_application_graph import ApplicationGraph, ApplicationRecorderSource
 
 _MAX_NODES = 100_000
 _MAX_DEPTH = 128
@@ -163,6 +165,8 @@ def _joint(
     ):
         raise TypeError("batch retention requires the actual coupled owners")
     batch, acc, calls = data.batch, data.accumulator, data.calls
+    if batch.service_failure is not None:
+        _fail("batch cut contains a live service failure")
     # This live-only owner has no retained wire representation. Every capture
     # path (quiescent, prepared and completed) shares this check before encoding:
     # cold reconstruction may restore only the settled spent integer, never
@@ -283,7 +287,7 @@ def _joint(
             # ToolResult.to_dict() may still contain PluginSchemaInfo/models.
             envelope = (
                 admit_discovery_result(outcome.call.function.name, response).to_dict()
-                if response_contract_for(outcome.call.function.name) is not None
+                if _response_contract(outcome.call.function.name) is not None
                 else response.to_dict()
             )
             require_retained_result_credentials(
@@ -937,6 +941,7 @@ def _encode(
     *,
     memory_completion: bool = False,
     application: ApplicationGraph | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> str:
     if application is not None:
         from elspeth.web.composer.continuation_application_graph import application_result_tools
@@ -948,7 +953,15 @@ def _encode(
             prepared = (application.selected_audit, application.selected_dialect)
     else:
         result_tools = _joint(data, env_ref_names, prepared, memory_completion=memory_completion)
-    return _encode_values(data, env_ref_names, result_tools, prepared, memory_completion=memory_completion, application=application)
+    return _encode_values(
+        data,
+        env_ref_names,
+        result_tools,
+        prepared,
+        memory_completion=memory_completion,
+        application=application,
+        recorder_source=recorder_source,
+    )
 
 
 def _encode_values(
@@ -959,6 +972,7 @@ def _encode_values(
     *,
     memory_completion: bool = False,
     application: ApplicationGraph | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> str:
     """Directional wire emission inside an already checked constructor call.
 
@@ -967,6 +981,16 @@ def _encode_values(
     """
     if application is not None and application.selected_audit is not None and application.selected_dialect is not None:
         prepared = application.selected_audit, application.selected_dialect
+    recorder_slots = None
+    if application is not None:
+        from elspeth.web.composer.continuation_application_graph import application_recorder_slots, require_application_recorder_source
+
+        if recorder_source is None:
+            _fail("application graph lost its explicit original recorder source")
+        require_application_recorder_source(recorder_source, env_ref_names)
+        recorder_slots = application_recorder_slots(application, recorder_source)
+    elif recorder_source is not None:
+        _fail("standalone batch cannot acquire an application recorder source")
     identities: dict[int, int] = {}
     active: set[int] = set()
     nodes: list[Any] = []
@@ -994,7 +1018,7 @@ def _encode_values(
         if application is not None:
             from elspeth.web.composer.continuation_application_graph import application_members
 
-            extra_members = application_members(value)
+            extra_members = application_members(value, recorder_slots=recorder_slots)
         elif type(value) is ComposerToolInvocation:
             # Only the new closed refusal edge reaches an invocation in a
             # standalone batch. Reuse its exact codec/private-authoring links;
@@ -1077,14 +1101,17 @@ def _encode_values(
     payload: dict[str, Any] = {"schema_version": "composer.coupled-batch-data.v1", "roots": roots, "nodes": nodes}
     if application is not None:
         roots.extend((visit(application.effects), visit(application.recorder), visit(application.cuts)))
-        payload["schema_version"] = "composer.evidence-batch-graph.v1"
+        payload["schema_version"] = "composer.evidence-batch-graph.v2"
+        if recorder_source is None:
+            _fail("application graph lost its explicit original recorder source")
+        payload["recorder_source"] = recorder_source.chunk.reference.model_dump(mode="json")
     if prepared is not None:
         payload["schema_version"] = "composer.prepared-batch-data.v1"
         payload["dialect"] = prepared[1].value
         if memory_completion:
             payload["schema_version"] = "composer.memory-completion-batch-data.v1"
         elif application is not None:
-            payload["schema_version"] = "composer.prepared-evidence-batch-graph.v1"
+            payload["schema_version"] = "composer.prepared-evidence-batch-graph.v2"
     encoded = canonical_json(payload)
     if len(encoded.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
         _fail("coupled batch data exceeds its complete byte bound")
@@ -1098,8 +1125,16 @@ def _decode_graph(
     prepared: bool = False,
     memory_completion: bool = False,
     application: bool = False,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph:
-    return _decode_graph_values(encoded, env_ref_names, prepared=prepared, memory_completion=memory_completion, application=application)[0]
+    return _decode_graph_values(
+        encoded,
+        env_ref_names,
+        prepared=prepared,
+        memory_completion=memory_completion,
+        application=application,
+        recorder_source=recorder_source,
+    )[0]
 
 
 def _decode_graph_values(
@@ -1109,6 +1144,7 @@ def _decode_graph_values(
     prepared: bool = False,
     memory_completion: bool = False,
     application: bool = False,
+    recorder_source: ApplicationRecorderSource | None = None,
 ) -> tuple[RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph, dict[int, str]]:
     if type(encoded) is not str or len(encoded.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES:
         _fail("coupled batch data exceeds its complete byte bound")
@@ -1116,7 +1152,7 @@ def _decode_graph_values(
     if application:
         if prepared or memory_completion:
             _fail("application decoder mixed another phase format")
-        prepared = type(payload) is dict and payload.get("schema_version") == "composer.prepared-evidence-batch-graph.v1"
+        prepared = type(payload) is dict and payload.get("schema_version") == "composer.prepared-evidence-batch-graph.v2"
     expected_keys = {"schema_version", "roots", "nodes", "dialect"} if prepared else {"schema_version", "roots", "nodes"}
     expected_codec = "composer.prepared-batch-data.v1" if prepared else "composer.coupled-batch-data.v1"
     if memory_completion:
@@ -1124,9 +1160,24 @@ def _decode_graph_values(
             _fail("memory completion format requires its audit/dialect fields")
         expected_codec = "composer.memory-completion-batch-data.v1"
     if application:
-        expected_codec = "composer.prepared-evidence-batch-graph.v1" if prepared else "composer.evidence-batch-graph.v1"
+        expected_codec = "composer.prepared-evidence-batch-graph.v2" if prepared else "composer.evidence-batch-graph.v2"
+        expected_keys.add("recorder_source")
     if type(payload) is not dict or set(payload) != expected_keys or payload["schema_version"] != expected_codec:
         _fail("batch graph lost its closed format")
+    if application:
+        from elspeth.web.composer.continuation_application_graph import require_application_recorder_source
+
+        if recorder_source is None:
+            _fail("application graph lost its explicit original recorder source")
+        require_application_recorder_source(recorder_source, env_ref_names)
+        try:
+            source_reference = PrivateChunkRef.model_validate(payload["recorder_source"], strict=True, extra="forbid")
+        except (ModelValidationError, ValueError, TypeError) as error:
+            raise AuditIntegrityError("application graph lost its exact original recorder reference") from error
+        if source_reference != recorder_source.chunk.reference:
+            _fail("application graph changed its actual original recorder source")
+    elif recorder_source is not None:
+        _fail("standalone batch cannot acquire an application recorder source")
     dialect = None
     if prepared:
         if type(payload["dialect"]) is not str:
@@ -1142,6 +1193,7 @@ def _decode_graph_values(
         _fail("batch graph lost its finite nodes or exact coupled roots")
     restored: dict[int, Any] = {}
     active: set[int] = set()
+    claimed_llm_slots: dict[int, int] = {}
 
     def visit(reference: Any, depth: int = 0) -> Any:
         if depth > _MAX_DEPTH or type(reference) is not dict:
@@ -1164,7 +1216,31 @@ def _decode_graph_values(
             _fail("batch graph lost its closed node")
         kind, value = node["kind"], node["value"]
         result: Any
-        if kind == "portable_dispatch_audit":
+        if kind == "application_llm":
+            if not application or recorder_source is None:
+                _fail("application LLM occurs outside its actual source graph")
+            if (
+                type(value) is not list
+                or len(value) != 1
+                or type(value[0]) is not list
+                or len(value[0]) != 2
+                or value[0][0] != "recorder_slot"
+                or type(value[0][1]) is not dict
+                or set(value[0][1]) != {"scalar"}
+            ):
+                _fail("application LLM lost its exact source-slot member")
+            slot = value[0][1]["scalar"]
+            if type(slot) is not int or not 0 <= slot < len(recorder_source.snapshot.llm_calls):
+                _fail("application LLM has an invalid original recorder slot")
+            # Claim before serializing a large source cell or allocating its DTO.
+            # A repeated node reference has already returned from `restored`.
+            if slot in claimed_llm_slots:
+                _fail("distinct application LLM nodes claim the same recorder slot")
+            claimed_llm_slots[slot] = index
+            from elspeth.web.composer.continuation_application_graph import construct_application_llm
+
+            result = construct_application_llm(recorder_source, slot)
+        elif kind == "portable_dispatch_audit":
             if not prepared or type(value) is not str:
                 _fail("portable audit occurs outside a prepared data cut")
             result = decode_dispatch_audit(value, env_ref_names=env_ref_names)
@@ -1235,7 +1311,11 @@ def _decode_graph_values(
         data = RestoredBatchData(batch, accumulator, calls)
         application_value = None
         if application:
-            from elspeth.web.composer.continuation_application_graph import ApplicationGraph, application_result_tools
+            from elspeth.web.composer.continuation_application_graph import (
+                ApplicationGraph,
+                application_recorder_slots,
+                application_result_tools,
+            )
 
             effects, recorder, cuts = (visit(root) for root in roots[3:])
             if prepared:
@@ -1245,6 +1325,11 @@ def _decode_graph_values(
             else:
                 application_value = ApplicationGraph(data, effects, recorder, cuts)
             result_tools = application_result_tools(application_value, env_ref_names)
+            if recorder_source is None:
+                _fail("application graph lost its original recorder source")
+            actual_slots = application_recorder_slots(application_value, recorder_source)
+            if any(actual_slots.get(id(restored[index])) != slot for slot, index in claimed_llm_slots.items()):
+                _fail("application LLM changed its canonical first recorder identity slot")
         elif prepared:
             if len(audit_values) != 1 or dialect is None:
                 _fail("prepared batch lost its one exact audit/dialect owner")

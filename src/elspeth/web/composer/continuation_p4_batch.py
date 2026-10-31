@@ -39,6 +39,8 @@ _VALUE = TypeAdapter(_P4PendingValue)
 
 def _joined(data: RestoredBatchData, *, env_ref_names: frozenset[str]) -> None:
     batch = data.batch
+    if batch.service_failure is not None:
+        raise AuditIntegrityError("P4 pending cut contains a live service failure")
     from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
 
     require_retained_failure_links(data)
@@ -71,6 +73,7 @@ def _joined(data: RestoredBatchData, *, env_ref_names: frozenset[str]) -> None:
     crash_pending = (
         batch.plugin_crash is not None
         or batch.advisor_failure is not None
+        or batch.service_failure is not None
         or (retained is not None and retained.kind in ("plugin_crash", "advisor_failure"))
     )
     if prepared.crash_pending is not crash_pending:

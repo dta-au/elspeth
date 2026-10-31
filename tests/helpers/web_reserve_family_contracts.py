@@ -931,6 +931,9 @@ def _lease_contracts():
                 annotate(s("_renewal_error"), union(n("BaseException"), c(None)), c(None)),
                 annotate(s("_renewal_attempt"), union(n("_RenewalAttemptObservation"), c(None)), c(None)),
                 annotate(s("_owned_tasks"), index(n("set"), index(a(n("asyncio"), "Task"), n("Any"))), call("set")),
+                annotate(
+                    s("_continuation_stages"), index(n("list"), index(n("ContinuationStage"), n("Any"))), ast.List(elts=[], ctx=ast.Load())
+                ),
                 annotate(s("_close_task"), union(index(a(n("asyncio"), "Task"), c(None)), c(None)), c(None)),
                 annotate(s("_finish_mode"), union(index(n("Literal"), seq(c("close"), c("consume"))), c(None)), c(None)),
                 assign(s("_disposition"), a(n("SessionOperationLeaseDisposition"), "ACTIVE")),
@@ -1679,6 +1682,8 @@ def _owned_method_definition_failures(unit, cls, method, slots):
         ("ProviderCallCustody", "_join"): "R",
         ("ProviderCallCustody", "join_title_update"): "R",
         ("SessionOperationLease", "create_task"): "T",
+        ("SessionOperationLease", "create_continuation_stage"): "T",
+        ("SessionOperationLease", "join_continuation_stage"): "T",
         ("SessionOperationLease", "_consume_continuation_handoff"): "T",
         ("SessionOperationLease", "consume_continuation_handoff"): "T",
     }.get((cls.name, method.name))
@@ -1691,26 +1696,32 @@ def _owned_method_definition_failures(unit, cls, method, slots):
         and method.type_params[0].bound is None
         and getattr(method.type_params[0], "default_value", None) is None
     )
-    handoff_header = {
+    retained_header = {
+        ("SessionOperationLease", "create_continuation_stage"): (
+            "def create_continuation_stage[T](self, coroutine: Coroutine[Any, Any, T], *, name: str) -> ContinuationStage[T]:\n    pass\n"
+        ),
+        ("SessionOperationLease", "join_continuation_stage"): (
+            "async def join_continuation_stage[T](self, stage: ContinuationStage[T]) -> T:\n    pass\n"
+        ),
         ("SessionOperationLease", "_consume_continuation_handoff"): (
             "async def _consume_continuation_handoff[T](self, action: Callable[[], T], outcome: list[T]) -> None:\n    pass\n"
         ),
         ("SessionOperationLease", "consume_continuation_handoff"): (
-            "async def consume_continuation_handoff[T](self, action: Callable[[], T]) -> T:\n    pass\n"
+            "async def consume_continuation_handoff[T](self, action: Callable[[], T], *, deadline: ComposerDrainDeadline | None = None) -> T:\n    pass\n"
         ),
     }.get((cls.name, method.name))
-    supported_handoff_header = True
-    if handoff_header is not None:
-        expected = ast.parse(handoff_header).body[0]
-        supported_handoff_header = (
-            type(method) is ast.AsyncFunctionDef
+    supported_retained_header = True
+    if retained_header is not None:
+        expected = ast.parse(retained_header).body[0]
+        supported_retained_header = (
+            type(method) is type(expected)
             and not method.decorator_list
             and _same(method.args, expected.args)
             and _same(method.returns, expected.returns)
         )
     if (
         not supported_parameters
-        or not supported_handoff_header
+        or not supported_retained_header
         or method.type_comment is not None
         or not _postponed_annotations(unit)
         or method.name in set(slots) | {"__slots__"} | descriptor_names | default_names
@@ -1986,6 +1997,7 @@ def family_local_contracts(units):
                     "_close_task",
                     "_closed",
                     "_context",
+                    "_continuation_stages",
                     "_disposition",
                     "_execution_obligation",
                     "_finish_mode",

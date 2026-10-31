@@ -17,6 +17,7 @@ from elspeth.contracts.prompt_guard import PROMPT_GUARD_CONTENT_PARTS_KEY
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer._compose_loop_carriers import _ServiceFailure, _ServiceHandlerFailure
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit, finish_arg_error, finish_success
 from elspeth.web.composer.discovery_cache import serialize_tool_result as _serialize_tool_result
@@ -292,6 +293,10 @@ class SessionToolOwner:
                 except BaseException as error:
                     if failure_observation is not None:
                         failure_observation.observe_execution_failure(error)
+                    if isinstance(error, _ServiceFailure):
+                        # The batch consumes this private marker. Result/audit
+                        # failures below did not originate in this handler call.
+                        raise _ServiceHandlerFailure(error, audit=audit, tool_call_id=tool_call_id) from error
                     raise
         except ToolArgumentError as exc:
             if failure_observation is not None:

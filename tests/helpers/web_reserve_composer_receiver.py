@@ -628,6 +628,7 @@ def composer_title_prelude(invoke):
         "                seed=settings.composer_seed, session_operation_context=lease.context,\n"
         "                prompt_guard_mount=services.composer_service.composer_prompt_guard_mount,\n"
         "                prompt_guard_mode=settings.composer_prompt_guard_mode,\n"
+        "                max_prepared_request_bytes=settings.composer_max_prepared_request_bytes,\n"
         "                api_base=settings.composer_endpoint_base_url,\n"
         "                api_key=(settings.composer_endpoint_api_key.get_secret_value()\n"
         "                    if settings.composer_endpoint_api_key is not None else None),\n"
@@ -758,6 +759,26 @@ def composer_dispatch_calls(invoke):
         != "if state is None:\n    raise AuditIntegrityError('Ordinary Composer admission lacks its graph')"
     ):
         return None
+    expected_calls = {
+        "compose": ast.parse(
+            "composer.compose(message_text, chat_messages, state, session_id=str(turn.session_id), "
+            "current_state_id=str(compose_base_state_id) if compose_base_state_id is not None else None, "
+            "user_id=turn.actor_user_id, progress='<unproved advisory effect>', session_operation_context=lease.context, "
+            "user_message_id=str(turn_user_message_id), mutation_ceiling=mutation_ceiling, "
+            "completion_gates=prior_completion_gates_facts, budget_seconds=compose_budget_seconds, "
+            "required_work=provider_binding, provider_owner=provider_owner, recovery_context=recovery_context, "
+            "retained_operation_context=retained_operation_context, "
+            "advisor_history=AdvisorTranscriptHistory.from_records(session_id=str(turn.session_id), "
+            "actor_user_id=turn.actor_user_id, current_request_id=str(turn_user_message_id), request=message_text, records=records))",
+            mode="eval",
+        ).body,
+        "compose_recovery": ast.parse(
+            "composer.compose_recovery(message=message_text, recovery_context=recovery_context, "
+            "session_operation_context=lease.context, budget_seconds=compose_budget_seconds, "
+            "required_work=provider_binding, provider_owner=provider_owner)",
+            mode="eval",
+        ).body,
+    }
     calls = []
     for statement, method in ((branch.orelse[1], "compose"), (branch.body[0], "compose_recovery")):
         if (
@@ -785,6 +806,20 @@ def composer_dispatch_calls(invoke):
         elif ceilings:
             return None
         if any(item.arg is None for item in call.keywords):
+            return None
+        # Preserve the existing unproved advisory-progress boundary; every
+        # other actual argument, default escape, order and keyword is closed.
+        candidate = ast.Call(
+            func=call.func,
+            args=call.args,
+            keywords=[
+                ast.keyword(arg=item.arg, value=ast.Constant(value="<unproved advisory effect>"))
+                if method == "compose" and item.arg == "progress"
+                else item
+                for item in call.keywords
+            ],
+        )
+        if ast.dump(candidate, include_attributes=False) != ast.dump(expected_calls[method], include_attributes=False):
             return None
         calls.append(call)
     return tuple(calls)

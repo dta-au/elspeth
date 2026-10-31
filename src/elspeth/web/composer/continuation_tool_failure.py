@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Literal
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
-from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _ToolOutcome
+from elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _CallModelOutcome, _ServiceFailure, _ToolOutcome
 from elspeth.web.composer.continuation_codec import PrivateChunk
 from elspeth.web.composer.continuation_tool_batch import RetainedAdvisorRefusalSource, RetainedBatchFailure
 from elspeth.web.composer.protocol import ComposerPluginCrashError
@@ -20,8 +20,10 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
     from elspeth.web.composer.continuation_batch_data import RestoredBatchData
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
     from elspeth.web.composer.provider_quota import ProviderCallCustody
-    from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState
+    from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState, ToolBatchContext
 
 
 def combine_failure_objects(original: BaseException, *others: BaseException) -> BaseException:
@@ -143,6 +145,173 @@ class ContinuationToolFailureCustody:
         self.batch.retained_failure = descriptor
         self.batch.stop_issued_batch = True
         self.completed = True
+
+    def promote_completed_service_failure(self, original: _ServiceFailure) -> None:
+        """Close only the actual handler's audited refusal; retain no descriptor."""
+        self.observe_primary(original)
+        observation = self.observation
+        invocation = observation.stored
+        if (
+            not isinstance(original, _ServiceFailure)
+            or self.completed
+            or self.errors
+            or self.original is not original
+            or observation.owner is not self
+            or self.call.audit is not observation.audit
+            or not observation.execution_failed
+            or observation.returned
+            or invocation is None
+            or not observation.appended
+            or not self.batch.tool_outcomes
+            or self.batch.retained_failure is not None
+            or self.batch.plugin_crash is not None
+            or self.batch.advisor_failure is not None
+        ):
+            raise AuditIntegrityError("service completion lost its one actual handler origin/audit")
+        outcome = self.batch.tool_outcomes[-1]
+        if outcome.call is not self.call.tool_call:
+            raise AuditIntegrityError("service completion changed its actual issued outcome")
+        _require_service_failure_output(outcome, invocation)
+        self.invocation = invocation
+        self.batch.service_failure = original
+        self.batch.stop_issued_batch = True
+        self.completed = True
+
+
+@dataclass(slots=True)
+class TerminalServiceCompletion:
+    """One live issued completion; neither portable DATA nor a SQL permission.
+
+    Seal before a P4 owner exists. The same actual owner binds later and must
+    reprove its immutable issue/prefix/fence in authoritative terminal P4 SQL.
+    """
+
+    custody: ContinuationToolFailureCustody = field(repr=False)
+    runtime: RestoredContinuationRuntime = field(repr=False)
+    context: ToolBatchContext = field(repr=False)
+    call_model: _CallModelOutcome = field(repr=False)
+    issued_effect_key: str
+    p4: ContinuationLiveP4 | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.require_native()
+
+    def require_native(self) -> None:
+        from elspeth.web.composer.continuation import ToolBatchFrame
+        from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+        from elspeth.web.composer.tool_batch import ToolBatchContext
+
+        custody, runtime = self.custody, self.runtime
+        if (
+            type(custody) is not ContinuationToolFailureCustody
+            or type(runtime) is not RestoredContinuationRuntime
+            or type(self.context) is not ToolBatchContext
+            or type(self.call_model) is not _CallModelOutcome
+            or runtime.graph.batch is None
+        ):
+            raise AuditIntegrityError("terminal service completion requires its actual native owners")
+        data = runtime.graph.batch
+        batch, call, original = data.batch, custody.call, custody.original
+        top = runtime.source.selected.stack.frames[-1]
+        if (
+            not isinstance(original, _ServiceFailure)
+            or not custody.completed
+            or custody.errors
+            or custody.wrapper is not None
+            or custody.batch is not batch
+            or custody.calls is not data.calls
+            or self.call_model.completion.tool_batch.calls is not data.calls
+            or batch.service_failure is not original
+            or batch.retained_failure is not None
+            or batch.phase != "dispatch_ready"
+            or batch.current_call is not None
+            or call.phase != "applied"
+            or batch.next_tool_index != call.index + 1
+            or not batch.stop_issued_batch
+            or len(batch.tool_outcomes) != batch.next_tool_index
+            or batch.tool_outcomes[-1].call is not call.tool_call
+            or custody.invocation is None
+            or custody.observation.stored is not custody.invocation
+            or not custody.observation.appended
+            or not custody.observation.execution_failed
+            or custody.observation.returned
+            or self.context.recorder is not custody.recorder
+            or runtime.live.recorder is not custody.recorder
+            or runtime.bindings.required_work is not custody.work
+            or runtime.materialization.inventory.running is not custody.running
+            or self.context.session_operation_context is not custody.running.session_operation_context
+            or type(top) is not ToolBatchFrame
+            or top.phase != "effect_reconciling"
+            or top.next_tool_index != call.index
+            or top.response != custody.response.reference
+            or self.issued_effect_key != f"tool:{custody.response.reference.digest}:{call.index}"
+        ):
+            raise AuditIntegrityError("terminal service completion changed its actual issue/prefix/native origin")
+        _require_service_failure_output(batch.tool_outcomes[-1], custody.invocation)
+        if not any(invocation is custody.invocation for invocation in custody.recorder.invocations):
+            raise AuditIntegrityError("terminal service completion lost its actual recorded invocation")
+
+    def bind_p4(self, owner: ContinuationLiveP4) -> None:
+        if self.p4 is not None:
+            raise AuditIntegrityError("terminal service completion cannot replace its one actual P4 owner")
+        self._require_p4_owners(owner)
+        self.p4 = owner
+
+    def _require_p4_owners(self, owner: ContinuationLiveP4) -> None:
+        from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+
+        self.require_native()
+        if (
+            type(owner) is not ContinuationLiveP4
+            or owner.runtime is not self.runtime
+            or owner.data is not self.runtime.graph.batch
+            or owner.work is not self.custody.work
+            or owner.inventory.running is not self.custody.running
+            or owner.selected is not self.runtime.source.selected
+        ):
+            raise AuditIntegrityError("terminal service completion changed its actual P4/context owners")
+
+    def require_p4(self, owner: ContinuationLiveP4) -> None:
+        self._require_p4_owners(owner)
+        if self.p4 is not owner:
+            raise AuditIntegrityError("terminal service P4 does not own this native completion")
+
+
+def _require_service_failure_output(outcome: _ToolOutcome, invocation: ComposerToolInvocation) -> None:
+    from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, _validated_invocation_arguments
+
+    _validated_invocation_arguments(invocation)
+    payload = outcome.response
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"success", "status", "reason"}
+        or payload["success"] is not False
+        or type(payload["status"]) is not str
+        or payload["status"] != "SERVICE_FAILURE"
+        or type(payload["reason"]) is not str
+        or payload["reason"] != "service_failure"
+        or outcome.error_class is not None
+        or outcome.error_category is not None
+        or outcome.error_message is not None
+        or outcome.pre_version != outcome.post_version
+        or invocation.status is not ComposerToolStatus.SUCCESS
+        or invocation.private_failure is not None
+        or invocation.error_class is not None
+        or invocation.error_message is not None
+        or invocation.error_category is not None
+        or invocation.tool_call_id != outcome.call.id
+        or invocation.tool_name != outcome.call.function.name
+        or invocation.version_before != outcome.pre_version
+        or invocation.version_after != outcome.post_version
+        or invocation.strict_sent is not outcome.strict_sent
+        or invocation.wire_conformant is not outcome.wire_conformant
+        or invocation.private_authoring is None
+        or invocation.private_authoring.raw_arguments != outcome.call.function.arguments
+        or invocation.result_canonical != canonical_json(payload)
+        or invocation.result_hash is None
+    ):
+        raise AuditIntegrityError("service completion lost its exact controlled result/invocation")
+    _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="service refusal original result")
 
 
 @dataclass(slots=True)

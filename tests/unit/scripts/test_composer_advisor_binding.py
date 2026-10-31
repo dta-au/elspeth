@@ -51,6 +51,79 @@ def test_live_b2_chain_reaches_actual_nominal_advisor_model() -> None:
     assert row.shipped == row.model_fields
 
 
+@pytest.mark.parametrize("fault", ("property", "foreign-slot", "foreign-method", "code-only", "default"))
+def test_live_source_record_binding_refuses_runtime_slot_method_and_code_substitution(monkeypatch, fault):
+    from elspeth.web.composer import continuation_evidence_graph as graph
+    from elspeth.web.composer import continuation_prompt_producers as producers
+
+    assert continuation_advisor_execution_owner(tool_batch) is tool_batch._execute_continuation_call_live
+    owner = graph.RestoredTurnEvidence
+    if fault == "property":
+        monkeypatch.setattr(owner, "messages", property(lambda self: ()))
+    elif fault == "foreign-slot":
+        monkeypatch.setattr(owner, "messages", vars(producers.ContinuationToolMessagePublication)["messages"])
+    elif fault == "foreign-method":
+        monkeypatch.setattr(owner, "__init__", producers.ContinuationToolMessagePublication.__init__)
+    elif fault == "code-only":
+        method = owner.__init__
+        constants = tuple(value + " changed" if type(value) is str else value for value in method.__code__.co_consts)
+        assert constants != method.__code__.co_consts
+        monkeypatch.setattr(method, "__code__", method.__code__.replace(co_consts=constants))
+    else:
+        assert owner.__init__.__defaults__ == (None, None, None, None)
+        monkeypatch.setattr(owner.__init__, "__defaults__", (None, None, None, "foreign"))
+    with pytest.raises(AdvisorBindingError, match=r"source record|source-record"):
+        continuation_advisor_execution_owner(tool_batch)
+
+
+@pytest.mark.parametrize(
+    ("member", "fault"),
+    [(name, "code") for name in ("require_call", "register_feedback", "bind_completed_outcome", "register_result")]
+    + [("require_call", "descriptor"), ("register_feedback", "globals")],
+)
+def test_publication_existing_methods_keep_actual_own_code_descriptor_and_globals(monkeypatch, member, fault):
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    owner = ContinuationToolMessagePublication
+    method = vars(owner)[member]
+    if fault == "descriptor":
+        monkeypatch.setattr(owner, member, property(lambda self: None))
+    elif fault == "globals":
+        substitute = FunctionType(method.__code__, dict(method.__globals__), name=method.__name__, argdefs=method.__defaults__)
+        monkeypatch.setattr(owner, member, substitute)
+    else:
+        assert method.__code__.co_names
+        monkeypatch.setattr(method, "__code__", method.__code__.replace(co_names=("foreign", *method.__code__.co_names[1:])))
+    with pytest.raises(AdvisorBindingError, match=r"source record producers\.ContinuationToolMessagePublication"):
+        continuation_advisor_execution_owner(tool_batch)
+
+
+def test_publication_constructor_refuses_defaults_subclass_before_truth_or_iteration(monkeypatch):
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    touched = []
+
+    class MisleadingDefaults(tuple):
+        def __bool__(self):
+            touched.append("truth")
+            return False
+
+        def __iter__(self):
+            touched.append("iteration")
+            return iter(())
+
+    defaults = MisleadingDefaults(("foreign catalog",))
+    method = ContinuationToolMessagePublication.__init__
+    assert method.__defaults__ is None
+    monkeypatch.setattr(method, "__defaults__", defaults)
+    assert method.__defaults__ is defaults and not touched
+    with pytest.raises(AdvisorBindingError, match=r"source record.*exact defaults container"):
+        continuation_advisor_execution_owner(tool_batch)
+    assert not touched, "the finite checker must refuse the foreign container before invoking its hooks"
+
+
 def test_source_formatting_preserves_every_model_census_row(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = census.census_model_wire()
     getsource = inspect.getsource
@@ -590,3 +663,370 @@ def test_pre_model_schema_validator_is_the_actual_nominal_supplier(monkeypatch: 
     monkeypatch.setattr(dispatch, "Draft202012Validator", ForeignValidator)
     with pytest.raises(census.CensusError, match=r"dispatch\.Draft202012Validator no longer resolves"):
         census._advisor_admission_handler()
+
+
+@pytest.mark.parametrize(
+    ("owner", "old", "new"),
+    [
+        pytest.param(
+            "initializer",
+            "assistant_wire = native_assistant_message(completion)",
+            "assistant_wire = native_assistant_message(other_completion)",
+            id="original-completion-substituted",
+        ),
+        pytest.param(
+            "initializer",
+            "_register_continuation_assistant_message(ctx, call_model, assistant_wire)",
+            "_register_continuation_assistant_message(ctx, call_model, dict(assistant_wire))",
+            id="registered-message-detached",
+        ),
+        pytest.param(
+            "native_message",
+            '"arguments": tc.function.arguments,',
+            '"arguments": "{}",',
+            id="moved-native-arguments-replaced",
+        ),
+        pytest.param(
+            "registration",
+            "tool_call_id=tool_call_id,",
+            "tool_call_id=None,",
+            id="registration-call-identity-lost",
+        ),
+        pytest.param(
+            "publication",
+            "    def require_call(",
+            "    def __post_init__(self) -> None:\n        self.call.arguments.clear()\n\n    def require_call(",
+            id="pre-model-publication-constructor-destroys-input",
+        ),
+        pytest.param(
+            "require_context",
+            "        if (",
+            "        self.inventory.running.session_operation_context = context\n        if (",
+            id="pre-model-context-observer-mutates-owner",
+        ),
+        pytest.param(
+            "observation_require",
+            "        if recorder is not self.owner.recorder or audit is not self.audit:",
+            "        self.owner.call.arguments.clear()\n        if recorder is not self.owner.recorder or audit is not self.audit:",
+            id="pre-model-failure-observer-destroys-input",
+        ),
+        pytest.param(
+            "custody_init",
+            "self.observation = ContinuationDispatchFailureObservation(self, self.call.audit)",
+            "self.observation = foreign_observation",
+            id="custody-installs-foreign-observer",
+        ),
+        pytest.param(
+            "issued_caller",
+            "failure_custody=self.failure_custody,",
+            "failure_custody=foreign_custody,",
+            id="issued-caller-substitutes-custody",
+        ),
+        pytest.param(
+            "execute",
+            "on_provider_dispatch=reservation.dispatch,",
+            "on_provider_dispatch=lambda: None,",
+            id="reservation-dispatch-disconnected",
+        ),
+        pytest.param(
+            "execute",
+            "                        reservation.close()",
+            "                        pass",
+            id="reservation-final-close-removed",
+        ),
+        pytest.param(
+            "wire_module",
+            'if definition["name"] == "set_pipeline":',
+            'if definition["name"] == "request_advisor_hint":',
+            id="wire-factory-replaces-advisor-schema",
+        ),
+        pytest.param(
+            "produce_current",
+            "owner = CurrentContinuationMessageProducers(service, authority, selected, inventory, inputs, finish_read=finish_read)",
+            "owner = foreign_producer",
+            id="cold-producer-construction-substituted",
+        ),
+        pytest.param(
+            "first_graph",
+            "producer = CurrentContinuationMessageProducers(service, authority, selected, inventory, inputs)",
+            "producer = foreign_producer",
+            id="first-producer-construction-substituted",
+        ),
+        pytest.param(
+            "producer_init",
+            "        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead",
+            "        self.inventory = foreign_inventory\n        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead",
+            id="producer-constructor-replaces-owner",
+        ),
+        pytest.param(
+            "producer_declaration",
+            "    def __post_init__(self) -> None:",
+            "    def __getattribute__(self, name):\n        return foreign_value\n\n    def __post_init__(self) -> None:",
+            id="producer-instance-lookup-substituted",
+        ),
+        pytest.param(
+            "load_producers",
+            "actual = outcome.value",
+            "actual = foreign_production",
+            id="producer-projection-substitutes-return",
+        ),
+        pytest.param(
+            "restore_live",
+            "return RestoredContinuationRuntime(live, bindings, graph, materialization, source, graph.drained, attachments, names)",
+            "return RestoredContinuationRuntime(live, bindings, graph, foreign_producer, source, graph.drained, attachments, names)",
+            id="restored-materialization-substituted",
+        ),
+        pytest.param(
+            "first_runtime",
+            "materialization=restored.materialization,",
+            "materialization=foreign_producer,",
+            id="first-runtime-forwarding-substituted",
+        ),
+        pytest.param(
+            "cold_runtime",
+            "graph=graph,\n            materialization=production.producers,",
+            "graph=graph,\n            materialization=foreign_producer,",
+            id="cold-runtime-forwarding-substituted",
+        ),
+        pytest.param(
+            "build_context",
+            "message_producers=runtime.materialization,",
+            "message_producers=foreign_producer,",
+            id="context-receiver-forwarding-substituted",
+        ),
+        pytest.param(
+            "phase_read",
+            "following = replace(runtime, source=fresh)",
+            "following = replace(runtime, source=fresh, materialization=foreign_producer)",
+            id="warm-runtime-replaces-receiver",
+        ),
+        pytest.param(
+            "ordinary_adapter",
+            "message_producers: CurrentContinuationMessageProducers | None = None,",
+            "message_producers: CurrentContinuationMessageProducers | None = foreign_producer,",
+            id="ordinary-none-default-replaced",
+        ),
+        pytest.param(
+            "ordinary_caller",
+            "dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(",
+            "dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(\n                            message_producers=foreign_producer,",
+            id="ordinary-caller-injects-receiver",
+        ),
+    ],
+)
+def test_p4_pre_model_observers_preserve_original_input(monkeypatch: pytest.MonkeyPatch, owner: str, old: str, new: str) -> None:
+    from elspeth.web.composer import continuation_first_runtime as first
+    from elspeth.web.composer import continuation_message_family_builders as builders
+    from elspeth.web.composer import continuation_prompt_producers as producers
+    from elspeth.web.composer import continuation_runtime as runtime
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.continuation_prompt_producers import (
+        ContinuationToolMessagePublication,
+        CurrentContinuationMessageProducers,
+    )
+    from elspeth.web.composer.continuation_tool_failure import (
+        ContinuationDispatchFailureObservation,
+        ContinuationToolFailureCustody,
+    )
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.tools import wire_projection
+
+    owners = {
+        "initializer": tool_batch._initialize_continuation_batch_live,
+        "native_message": builders.native_assistant_message,
+        "registration": tool_batch._register_continuation_assistant_message,
+        "publication": ContinuationToolMessagePublication,
+        "require_context": CurrentContinuationMessageProducers.require_context,
+        "observation_require": ContinuationDispatchFailureObservation.require,
+        "custody_init": ContinuationToolFailureCustody.__post_init__,
+        "issued_caller": ContinuationLivePhases._execute_one_owned,
+        "execute": tool_batch._execute_continuation_call_live,
+        "wire_module": wire_projection,
+        "produce_current": producers._produce_current_messages,
+        "first_graph": first._restore_first_graph,
+        "producer_init": CurrentContinuationMessageProducers.__post_init__,
+        "producer_declaration": CurrentContinuationMessageProducers,
+        "load_producers": producers.load_current_message_producers,
+        "restore_live": runtime._restore_live,
+        "first_runtime": first.restore_first_continuation_runtime,
+        "cold_runtime": runtime.restore_continuation_runtime,
+        "build_context": runtime.build_runtime_tool_batch_context,
+        "phase_read": ContinuationLivePhases._current_phase_read,
+        "ordinary_adapter": ComposerServiceImpl._dispatch_tool_batch,
+        "ordinary_caller": ComposerServiceImpl._advance_live_compose_iteration,
+    }
+    # A stale unrelated prerequisite must fail here, never masquerade as a
+    # successful opposition. No template replacement is installed by this test.
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    with monkeypatch.context() as changed:
+        _mutate_source(changed, owners[owner], old, new)
+        with pytest.raises(AdvisorBindingError, match="changed its complete executable source contract"):
+            continuation_advisor_execution_owner(tool_batch)
+        row = census.census_model_wire()["request_advisor_hint"]
+        assert row.model_class is None
+        assert row.site.startswith("unresolved:")
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+
+
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    [
+        ("runtime", "load_current_message_producers"),
+        ("first", "CurrentContinuationMessageProducers"),
+        ("phases", "ContinuationToolFailureCustody"),
+        ("phases", "build_runtime_tool_batch_context"),
+        ("initial", "restore_continuation_runtime"),
+        ("wire", "canonical_set_pipeline_schema"),
+        ("phases", "ContinuationLiveP4"),
+        ("p4_application", "ContinuationLiveP4"),
+        ("p4_application", "replace"),
+        ("p4", "RestoredContinuationRuntime"),
+    ],
+)
+def test_p4_receiver_supplier_identity_is_required(monkeypatch: pytest.MonkeyPatch, owner: str, name: str) -> None:
+    from elspeth.web.composer import continuation_composition_initialization as initial
+    from elspeth.web.composer import continuation_first_runtime as first
+    from elspeth.web.composer import continuation_live_p4 as p4
+    from elspeth.web.composer import continuation_live_p4_application as p4_application
+    from elspeth.web.composer import continuation_live_phases as phases
+    from elspeth.web.composer import continuation_runtime as runtime
+    from elspeth.web.composer.tools import wire_projection as wire
+
+    owners = {
+        "runtime": runtime,
+        "first": first,
+        "phases": phases,
+        "initial": initial,
+        "wire": wire,
+        "p4": p4,
+        "p4_application": p4_application,
+    }
+
+    def foreign(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the source census must never invoke a substitute")
+
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    with monkeypatch.context() as changed:
+        changed.setattr(owners[owner], name, foreign)
+        with pytest.raises(AdvisorBindingError, match=rf"{owner}\.{name} no longer resolves"):
+            continuation_advisor_execution_owner(tool_batch)
+        assert census.census_model_wire()["request_advisor_hint"].model_class is None
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        pytest.param(
+            "self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data))",
+            "self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data), materialization=foreign_producer)",
+            id="initialize-batch-replaces-producer",
+        ),
+        pytest.param(
+            "self.runtime = owner.runtime",
+            "self.runtime = replace(owner.runtime, materialization=foreign_producer)",
+            id="persist-batch-replaces-producer",
+        ),
+    ],
+)
+def test_p4_phase_runtime_writers_preserve_producer_in_class_source(monkeypatch: pytest.MonkeyPatch, old: str, new: str) -> None:
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    getsource = inspect.getsource
+    original = getsource(ContinuationLivePhases)
+    assert original.count(old) == 1
+    changed = original.replace(old, new)
+    class_reads: list[object] = []
+
+    def source(subject: object) -> str:
+        if subject is ContinuationLivePhases:
+            class_reads.append(subject)
+            return changed
+        return getsource(subject)
+
+    with monkeypatch.context() as mutation:
+        mutation.setattr(inspect, "getsource", source)
+        failures: list[str] = []
+        try:
+            continuation_advisor_execution_owner(tool_batch)
+        except AdvisorBindingError as error:
+            failures.append(str(error))
+        # This is the actual class-source consumer. Patching an unselected
+        # method's separate source object would never exercise the erased body.
+        assert class_reads
+        assert failures == [
+            "advisor continuation provenance: phases.ContinuationLivePhases changed its complete executable source contract"
+        ]
+        row = census.census_model_wire()["request_advisor_hint"]
+        assert row.model_class is None
+        assert row.site.startswith("unresolved:")
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+
+
+@pytest.mark.parametrize(
+    ("owner", "old", "new", "contract"),
+    [
+        pytest.param(
+            "application",
+            "owner.runtime = replace(\n        runtime,",
+            "owner.runtime = replace(\n        runtime,\n        materialization=foreign_producer,",
+            "p4_application.finish_live_p4_application",
+            id="application-replaces-materialization",
+        ),
+        pytest.param(
+            "service",
+            "continuation=continuation,",
+            "continuation=foreign_owner,",
+            "service.ComposerServiceImpl._persist_turn_audit",
+            id="service-forwards-foreign-owner",
+        ),
+        pytest.param(
+            "publication",
+            "await finish_live_p4_application(continuation, effects_before=effects_before)",
+            "await finish_live_p4_application(foreign_owner, effects_before=effects_before)",
+            "turn_audit.persist_turn_audit",
+            id="publication-forwards-foreign-owner",
+        ),
+        pytest.param(
+            "p4_class",
+            "    def __post_init__(self) -> None:\n        if (",
+            "    def __post_init__(self) -> None:\n        self.runtime = foreign_runtime\n        if (",
+            "p4.ContinuationLiveP4",
+            id="p4-constructor-replaces-runtime",
+        ),
+        pytest.param(
+            "phase_class",
+            "self.p4 = owner = ContinuationLiveP4(",
+            "self.p4 = owner = ForeignP4(",
+            "phases.ContinuationLivePhases",
+            id="phase-constructs-foreign-p4",
+        ),
+    ],
+)
+def test_p4_publication_preserves_actual_runtime_owner(
+    monkeypatch: pytest.MonkeyPatch, owner: str, old: str, new: str, contract: str
+) -> None:
+    from elspeth.web.composer import continuation_live_p4_application as application
+    from elspeth.web.composer import turn_audit
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
+    from elspeth.web.composer.service import ComposerServiceImpl
+
+    owners = {
+        "application": application.finish_live_p4_application,
+        "service": ComposerServiceImpl._persist_turn_audit,
+        "publication": turn_audit.persist_turn_audit,
+        "p4_class": ContinuationLiveP4,
+        "phase_class": ContinuationLivePhases,
+    }
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()
+    with monkeypatch.context() as changed:
+        _mutate_source(changed, owners[owner], old, new)
+        with pytest.raises(AdvisorBindingError) as refusal:
+            continuation_advisor_execution_owner(tool_batch)
+        assert str(refusal.value) == f"advisor continuation provenance: {contract} changed its complete executable source contract"
+        row = census.census_model_wire()["request_advisor_hint"]
+        assert row.model_class is None
+        assert row.site.startswith("unresolved:")
+    test_live_b2_chain_reaches_actual_nominal_advisor_model()

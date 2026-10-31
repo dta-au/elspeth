@@ -79,7 +79,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.coupled-batch-data.v1",
         "composer.p4-pending-batch.v1",
         "composer.prepared-p4.v1",
-        "composer.applied-p4-batch.v1",
+        "composer.applied-p4-batch.v2",
         "composer.advisor.v1",
         "composer.end.v1",
         "composer.caches.v1",

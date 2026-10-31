@@ -11,7 +11,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Self
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -66,7 +66,6 @@ def bind_retained_json_encoding(canonical: str, *, expected_bytes: int) -> str:
     return canonical
 
 
-@dataclass(frozen=True, slots=True)
 class OrderedObjectJSON(ReadonlyJsonString):
     """The exact compact ordered-object encoding as a prospective JSON string.
 
@@ -75,7 +74,33 @@ class OrderedObjectJSON(ReadonlyJsonString):
     neither the inner object text nor its escaped outer copy is allocated.
     """
 
-    source: Mapping[str, object] = field(repr=False)
+    __slots__ = ("_initialized", "source")
+
+    source: Mapping[str, object]
+    _initialized: bool
+
+    def __new__(cls, source: Mapping[str, object]) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Mapping[str, object]) -> None:
+        if self._initialized:
+            raise AttributeError("OrderedObjectJSON cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("OrderedObjectJSON has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("OrderedObjectJSON has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source,) == (actual.source,)
 
     def chunks(self) -> Iterator[str]:
         active: set[int] = set()
@@ -189,10 +214,38 @@ class _RetainedModelView(ReadonlyJsonObject):
         return self.projection.value(self.source.__dict__[key])
 
 
-@dataclass(frozen=True, slots=True)
 class _RetainedObjectView(ReadonlyJsonObject):
-    source: Mapping[str, object] = field(repr=False)
-    projection: _ModelProjection = field(repr=False)
+    """Read-only bindings over the original live object and projection owner."""
+
+    __slots__ = ("_initialized", "projection", "source")
+
+    source: Mapping[str, object]
+    projection: _ModelProjection
+    _initialized: bool
+
+    def __new__(cls, source: Mapping[str, object], projection: _ModelProjection) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Mapping[str, object], projection: _ModelProjection) -> None:
+        if self._initialized:
+            raise AttributeError("_RetainedObjectView cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "projection", projection)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_RetainedObjectView has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_RetainedObjectView has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.projection) == (actual.source, actual.projection)
 
     def __len__(self) -> int:
         return len(self.source)
@@ -206,10 +259,38 @@ class _RetainedObjectView(ReadonlyJsonObject):
         return self.projection.value(self.source[key])
 
 
-@dataclass(frozen=True, slots=True)
 class _RetainedArrayView(ReadonlyJsonArray):
-    source: Sequence[object] = field(repr=False)
-    projection: _ModelProjection = field(repr=False)
+    """Read-only bindings over the original live sequence and projection owner."""
+
+    __slots__ = ("_initialized", "projection", "source")
+
+    source: Sequence[object]
+    projection: _ModelProjection
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[object], projection: _ModelProjection) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[object], projection: _ModelProjection) -> None:
+        if self._initialized:
+            raise AttributeError("_RetainedArrayView cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "projection", projection)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_RetainedArrayView has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_RetainedArrayView has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.projection) == (actual.source, actual.projection)
 
     def __len__(self) -> int:
         return len(self.source)

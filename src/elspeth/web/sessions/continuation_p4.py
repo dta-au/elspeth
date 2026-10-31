@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
 
 from pydantic import TypeAdapter
@@ -57,9 +57,15 @@ from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow,
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
-    from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
+    from elspeth.web.composer.continuation_terminal_p4_data import TerminalP4Document, TerminalP4Input
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+    from elspeth.web.sessions.continuation_p4_application_store import (
+        StoredP4Application,
+        StoredTerminalP4Application,
+        StoredTerminalP4Preparation,
+    )
 from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     _OWED_P4_SCOPE_KEY,
     _OWED_P4_SEAL,
@@ -123,7 +129,7 @@ class P4WriterObservation:
     readback: ReadmittedP4Result | None = None
     known_not_committed: bool = False
     committed: bool = False
-    application_candidate: StoredP4Application | None = None
+    application_candidate: StoredP4Application | StoredTerminalP4Application | None = None
     failed_candidates: tuple[AuditOutcome, ...] = ()
     prior_errors: tuple[BaseException, ...] = ()
 
@@ -194,6 +200,12 @@ def read_p4_transaction_outcome_on_connection(
     application = observation.application_candidate
     if candidate is None or application is None:
         raise AuditIntegrityError("committed P4 lacks its actual committing owner's two candidates")
+    from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application, StoredTerminalP4Application
+
+    if type(application) is StoredTerminalP4Application:
+        return _read_terminal_p4_transaction_outcome(conn, observation, application, env_ref_names=env_ref_names)
+    if type(application) is not StoredP4Application:
+        raise AuditIntegrityError("P4 readback replaced its closed application owner")
     # This is historical outcome readback of this physical invocation, not a
     # current mutation boundary. Exact immutable creator/source joins tolerate
     # legitimate subsequent head/generation progress without granting its fence.
@@ -341,6 +353,23 @@ def _selected_prepared(
     effect_key: str,
     env_ref_names: frozenset[str],
 ) -> PreparedP4Value:
+    from elspeth.web.composer.continuation_terminal_p4_data import decode_terminal_p4_input
+
+    frame = decode_continuation_snapshot(stored.payload_json).frames[-1]
+    if type(frame) is ToolBatchFrame and frame.accumulator.codec == "composer.tool-batch.v1":
+        terminal = read_terminal_p4_source_on_connection(
+            conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
+        )
+        if terminal is None:
+            raise AuditIntegrityError("issued P4 source lost its mandatory terminal input")
+        value = decode_terminal_p4_input(terminal.input_document, env_ref_names=env_ref_names)
+        if (
+            value.checkpoint_id != stored.checkpoint_id
+            or value.cursor != stored.cursor
+            or effect_key != f"batch:{value.issue.response.digest}:p4"
+        ):
+            raise AuditIntegrityError("terminal P4 selected a different prepared source")
+        return value.prepared
     return selected_prepared_p4_data_on_connection(
         conn,
         stored,
@@ -677,9 +706,25 @@ def retain_p4_result_on_connection(
     )
     encoded = _dump_owned(_RECEIPT, receipt)
     decode_p4_receipt(encoded, env_ref_names=env_ref_names)
-    chunk = encode_private_chunk(codec="composer.owner-result.v1", canonical=encoded, env_ref_names=env_ref_names)
-    key = private_chunk_key(chunk)
-    put_chunk(conn, session_id=sid, operation_id=operation_id, key=key, payload=encoded.encode("utf-8"), codec=chunk.reference.codec)
+    terminal = read_terminal_p4_source_on_connection(
+        conn, session_id=commit.running.claim.session_id, operation_id=operation_id, env_ref_names=env_ref_names
+    )
+    terminal_result = None
+    if terminal is not None:
+        terminal_result = _terminal_result_document(terminal, receipt, env_ref_names=env_ref_names)
+        key = f"terminal-p4-result:{terminal_result.reference.digest}"
+        put_chunk(
+            conn,
+            session_id=sid,
+            operation_id=operation_id,
+            key=key,
+            payload=terminal_result.canonical.encode("utf-8"),
+            codec=terminal_result.reference.codec,
+        )
+    else:
+        chunk = encode_private_chunk(codec="composer.owner-result.v1", canonical=encoded, env_ref_names=env_ref_names)
+        key = private_chunk_key(chunk)
+        put_chunk(conn, session_id=sid, operation_id=operation_id, key=key, payload=encoded.encode("utf-8"), codec=chunk.reference.codec)
     receipt_id = str(receipt.assistant_id) if receipt.assistant_id is not None else f"unavailable:{commit.effect_key}"
     changed = conn.execute(
         update(effects)
@@ -705,6 +750,8 @@ def retain_p4_result_on_connection(
     )
     if changed.rowcount != 1:
         raise ContinuationCASConflict("P4 owner result lost its actual preparing effect")
+    if terminal_result is not None:
+        return receipt
     stack = decode_continuation_snapshot(stored.payload_json)
     if any(item.effect_key == commit.effect_key for item in stack.pending_owner_results):
         raise AuditIntegrityError("P4 owner result is already pending application")
@@ -1185,3 +1232,529 @@ def prepare_p4_on_connection(
         )
         read_selected_turn_evidence_graph_on_connection(conn, running, selected=full, names=env_ref_names)
     return ContinuationOwnerCommit(running, key, input_hash, selected.checkpoint_id, selected.cursor)
+
+
+def _terminal_document_on_connection(conn: Connection, *, session_id: str, operation_id: str, key: str) -> TerminalP4Document:
+    from elspeth.web.composer.continuation_terminal_p4_data import TerminalP4Document, TerminalP4Reference
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+
+    row = conn.execute(
+        select(chunks).where(chunks.c.session_id == session_id, chunks.c.operation_id == operation_id, chunks.c.chunk_key == key)
+    ).one_or_none()
+    if row is None or row.codec not in ("composer.terminal-p4-input.v1", "composer.terminal-p4-result.v1"):
+        raise AuditIntegrityError("terminal P4 lost its closed private document")
+    payload = read_chunk(conn, session_id=session_id, operation_id=operation_id, key=key)
+    try:
+        reference = TerminalP4Reference(codec=row.codec, digest=row.sha256, byte_length=row.byte_length)
+        return TerminalP4Document(reference, payload.decode("utf-8", errors="strict"))
+    except (ValueError, UnicodeError) as error:
+        raise AuditIntegrityError("terminal P4 document lost its exact encoding") from error
+
+
+def _require_terminal_source_on_connection(conn: Connection, value: TerminalP4Input, *, env_ref_names: frozenset[str]) -> None:
+    """Rejoin the closed manifest to its actual immutable issued SQL sources."""
+    from elspeth.web.composer.continuation import ComposeFrame
+    from elspeth.web.composer.continuation_batch_data import decode_prepared_batch_data
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_data_on_connection
+    from elspeth.web.composer.continuation_phase_transitions import (
+        read_tool_issue_data_on_connection,
+        validate_tool_effects_data_on_connection,
+    )
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.coordination.composer_operation_authority import _record_from_row
+    from elspeth.web.sessions.continuation import _settlement_transition
+    from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_data_on_connection
+    from elspeth.web.sessions.continuation_selection import load_private_chunks
+    from elspeth.web.sessions.models import composer_async_operations_table as jobs
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+    from elspeth.web.sessions.models import composer_continuation_events_table as events
+    from elspeth.web.sessions.models import composer_operation_segments_table as segments
+    from elspeth.web.sessions.models import sessions_table
+    from elspeth.web.sessions.time_normalization import restore_utc
+
+    sid, oid = value.logical.session_id, value.logical.operation_id
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == oid)).one_or_none()
+    principal = conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one_or_none()
+    creator = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == oid,
+            attempts.c.sequence == value.producer.creator_sequence,
+            attempts.c.generation == value.producer.creator_generation,
+        )
+    ).one_or_none()
+    checkpoint = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == oid,
+            checkpoints.c.checkpoint_id == value.checkpoint_id,
+        )
+    ).one_or_none()
+    if (
+        parent is None
+        or principal is None
+        or creator is None
+        or checkpoint is None
+        or parent.lifecycle_version != 2
+        or parent.actor_user_id != value.actor_user_id
+        or principal.user_id != value.actor_user_id
+        or creator.claim_attempt != value.claim_attempt
+        or creator.session_operation_id != value.producer.creator_operation_id
+        or creator.session_operation_epoch != value.producer.creator_operation_epoch
+        or checkpoint.cursor != value.cursor
+        or parent.request_hash != value.logical.request_hash
+        or parent.kind != value.logical.kind
+        or parent.base_state_id != value.logical.base_state_id
+    ):
+        raise AuditIntegrityError("terminal P4 changed its actual principal/creator/issued checkpoint")
+    original = StoredContinuationSnapshot(
+        read_chunk(conn, session_id=sid, operation_id=oid, key=checkpoint.snapshot_chunk_key).decode("utf-8", errors="strict"),
+        checkpoint.cursor,
+        checkpoint.checkpoint_id,
+    )
+    root = decode_continuation_snapshot(original.payload_json)
+    current_stored = load_snapshot(conn, session_id=sid, operation_id=oid)
+    current = decode_continuation_snapshot(current_stored.payload_json)
+    frame, compose = root.frames[-1], root.frames[0]
+    if (
+        type(frame) is not ToolBatchFrame
+        or type(compose) is not ComposeFrame
+        or root.logical != value.logical
+        or current.logical != root.logical
+        or root.cursor != value.cursor
+        or frame.phase != "effect_reconciling"
+        or frame.accumulator != value.issue.prepared
+        or frame.response != value.issue.response
+        or frame.next_tool_index != value.issue.tool_index
+        or compose.evidence != value.source_evidence
+        or root.effect_frontier != value.effect_frontier
+        or prepared_p4_members(value.prepared, env_ref_names=env_ref_names).mutation_ceiling != root.mutation_ceiling.materialize()
+        or current.frames != root.frames
+    ):
+        raise AuditIntegrityError("terminal P4 changed its complete original selected source")
+    issue = read_tool_issue_data_on_connection(
+        conn, session_id=UUID(sid), operation_id=oid, effect_key=value.issued_effect_key, env_ref_names=env_ref_names
+    )
+    if issue != value.issue:
+        raise AuditIntegrityError("terminal P4 changed its actual issued call")
+    previous = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == oid,
+            checkpoints.c.checkpoint_id == issue.previous_checkpoint_id,
+        )
+    ).one()
+    before = decode_continuation_snapshot(
+        read_chunk(conn, session_id=sid, operation_id=oid, key=previous.snapshot_chunk_key).decode("utf-8", errors="strict")
+    )
+    prior = before.frames[-1]
+    if type(prior) is not ToolBatchFrame or prior.accumulator != value.prior_prefix:
+        raise AuditIntegrityError("terminal P4 changed its original prior prefix")
+    for reference in (value.prior_prefix, value.source_evidence, value.issue.prepared, value.response.reference):
+        raw = read_chunk(conn, session_id=sid, operation_id=oid, key=f"value:{reference.codec}:{reference.digest}")
+        verify_private_chunk(reference, raw.decode("utf-8", errors="strict"))
+        if reference == value.response.reference and raw != value.response.canonical.encode("utf-8"):
+            raise AuditIntegrityError("terminal P4 replaced its actual paid response bytes")
+
+    if current_stored != original:
+        # Admit only the real one-step settlement of this issued checkpoint,
+        # using its existing producer and actual terminal/attempt/event rows.
+        record = _record_from_row(parent)
+        settled_by: Literal["owner_terminal", "settle_lost", "settle_lost_inactive_session"]
+        if record.settled_by == "owner_terminal":
+            settled_by = "owner_terminal"
+        elif record.settled_by == "settle_lost":
+            settled_by = "settle_lost"
+        elif record.settled_by == "settle_lost_inactive_session":
+            settled_by = "settle_lost_inactive_session"
+        else:
+            raise AuditIntegrityError("terminal P4 advanced without its actual segment settlement owner")
+        segment = conn.execute(
+            select(segments).where(segments.c.session_id == sid, segments.c.operation_id == oid, segments.c.sequence == issue.sequence)
+        ).one_or_none()
+        if (
+            record.status != "failed"
+            or record.result_json is None
+            or record.settled_at is None
+            or record.current_segment_sequence != issue.sequence
+            or record.ownership_generation != issue.generation
+            or segment is None
+            or segment.generation != issue.generation
+            or segment.state != "settled"
+            or creator.revoked_at is None
+            or restore_utc(creator.revoked_at) != record.settled_at
+            or creator.outcome != ("settled" if record.settled_by == "owner_terminal" else "interrupted")
+        ):
+            raise AuditIntegrityError("terminal P4 advanced without its actual same-attempt settlement")
+        outcome = ComposerOperationError.model_validate_json(record.result_json, strict=True)
+        following, unknown, expected_events = _settlement_transition(
+            original, segment=segment, outcome=outcome, published_at=record.settled_at, settled_by=settled_by
+        )
+        if unknown != (value.issued_effect_key,) or current != following.model_copy(
+            update={"cursor": original.cursor + len(expected_events)}
+        ):
+            raise AuditIntegrityError("terminal P4 changed its exact issued-to-settled transition")
+        actual_events = conn.execute(
+            select(events)
+            .where(events.c.session_id == sid, events.c.operation_id == oid, events.c.sequence > original.cursor)
+            .order_by(events.c.sequence)
+        ).all()
+        if len(actual_events) != len(expected_events):
+            raise AuditIntegrityError("terminal P4 settlement lost its exact event cohort")
+        for ordinal, (actual_event, expected_event) in enumerate(zip(actual_events, expected_events, strict=True), original.cursor + 1):
+            if (
+                actual_event.sequence != ordinal
+                or actual_event.tag != expected_event.tag
+                or actual_event.payload_chunk_key != f"event:{ordinal}"
+                or read_chunk(conn, session_id=sid, operation_id=oid, key=actual_event.payload_chunk_key)
+                != expected_event.payload_json.encode("utf-8")
+            ):
+                raise AuditIntegrityError("terminal P4 settlement changed its original event attribution")
+
+    # The terminal row is the sole addition to the issued checkpoint's ledger.
+    # Its own input/result/creator proof belongs to the caller below. It cannot
+    # exempt any earlier provider, tool or application from ordinary admission.
+    terminal_key = f"batch:{issue.response.digest}:p4"
+    actual = conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.operation_id == oid)).all()
+    # Bind canonical tool keys before the ordinary validator filters by owner.
+    if any(row.effect_key.startswith("tool:") != (row.owner == "tool_dispatch") for row in actual):
+        raise AuditIntegrityError("terminal P4 changed an original tool effect's owner role")
+    if any(entry.effect_id == terminal_key for entry in root.effect_frontier) or {
+        (row.effect_key, row.disposition, row.receipt_key) for row in actual if row.effect_key != terminal_key
+    } != {(entry.effect_id, entry.disposition, entry.receipt_id) for entry in current.effect_frontier}:
+        raise AuditIntegrityError("terminal P4 changed its complete original SQL effect frontier")
+    selected = SelectedContinuationState(
+        current_stored.checkpoint_id, current, load_private_chunks(conn, session_id=sid, operation_id=oid, stack=current)
+    )
+    admitted = read_selected_turn_evidence_graph_data_on_connection(
+        conn, session_id=UUID(sid), operation_id=oid, selected=selected, names=env_ref_names
+    )
+    require_p4_application_journal_data_on_connection(
+        conn, session_id=UUID(sid), operation_id=oid, selected=selected, evidence=admitted, env_ref_names=env_ref_names
+    )
+    unresolved = validate_tool_effects_data_on_connection(
+        conn, session_id=UUID(sid), operation_id=oid, selected=selected, env_ref_names=env_ref_names
+    )
+    prepared = decode_prepared_batch_data(
+        next(chunk.canonical for chunk in selected.chunks if chunk.reference == issue.prepared), env_ref_names=env_ref_names
+    )
+    call = prepared.batch.current_call
+    if (
+        call is None
+        or call.index != frame.next_tool_index
+        or call.effect_key is not None
+        or unresolved != (value.issued_effect_key,)
+        or tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
+        != unresolved
+        or root.pending_owner_results
+        or root.pending_settlement_ids
+    ):
+        raise AuditIntegrityError("terminal P4 changed its sole actual issued tool or prior completed history")
+
+
+def read_terminal_p4_source_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, env_ref_names: frozenset[str]
+) -> StoredTerminalP4Preparation | StoredTerminalP4Application | None:
+    """Recognize terminal mode before any ordinary restore or recovery.
+
+    A prepared-only owner remains unresolved. Missing one side of the retained
+    input/effect pair is corruption, never permission to select ordinary mode.
+    """
+    from elspeth.web.composer.continuation_terminal_p4_data import (
+        decode_terminal_p4_input,
+        decode_terminal_p4_result,
+        terminal_p4_input_key,
+    )
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application, StoredTerminalP4Preparation
+    from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+
+    sid = str(session_id)
+    stored = load_snapshot(conn, session_id=sid, operation_id=operation_id)
+    root = decode_continuation_snapshot(stored.payload_json)
+    frame = root.frames[-1]
+    if type(frame) is not ToolBatchFrame:
+        return None
+    key = f"batch:{frame.response.digest}:p4"
+    marker_key = terminal_p4_input_key(key)
+    marker = conn.execute(
+        select(chunks.c.chunk_key).where(
+            chunks.c.session_id == sid, chunks.c.operation_id == operation_id, chunks.c.chunk_key == marker_key
+        )
+    ).one_or_none()
+    effect = conn.execute(
+        select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id, effects.c.effect_key == key)
+    ).one_or_none()
+    if marker is None:
+        if effect is not None and frame.accumulator.codec == "composer.tool-batch.v1":
+            raise AuditIntegrityError("terminal P4 effect lost its mandatory input marker")
+        return None
+    if effect is None or effect.owner != "session_sql" or frame.accumulator.codec != "composer.tool-batch.v1":
+        raise AuditIntegrityError("terminal P4 marker lost its actual issued effect owner")
+    document = _terminal_document_on_connection(conn, session_id=sid, operation_id=operation_id, key=marker_key)
+    value = decode_terminal_p4_input(document, env_ref_names=env_ref_names)
+    _require_terminal_source_on_connection(conn, value, env_ref_names=env_ref_names)
+    if (
+        effect.input_sha256 != value.semantic_input_sha256
+        or (effect.creator_sequence, effect.creator_generation) != (value.producer.creator_sequence, value.producer.creator_generation)
+        or key != f"batch:{value.issue.response.digest}:p4"
+    ):
+        raise AuditIntegrityError("terminal P4 changed its selected semantic input or creator")
+    if effect.disposition == "prepared":
+        if effect.result_chunk_key is not None or effect.receipt_key is not None:
+            raise AuditIntegrityError("prepared terminal P4 carries a fabricated completion")
+        return StoredTerminalP4Preparation(document)
+    if effect.disposition != "committed" or effect.result_chunk_key is None:
+        raise AuditIntegrityError("terminal P4 has no closed actual disposition")
+    result_document = _terminal_document_on_connection(conn, session_id=sid, operation_id=operation_id, key=effect.result_chunk_key)
+    result = decode_terminal_p4_result(result_document, input_document=document, env_ref_names=env_ref_names)
+    if effect.result_chunk_key != f"terminal-p4-result:{result_document.reference.digest}":
+        raise AuditIntegrityError("terminal P4 changed its exact immutable result locator")
+    receipt, outcome = decode_p4_receipt(canonical_json(result.receipt.model_dump(mode="json")), env_ref_names=env_ref_names)
+    verify_p4_immutable_receipt_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        effect_key=key,
+        input_sha256=effect.input_sha256,
+        receipt_key=effect.receipt_key,
+        creator_sequence=effect.creator_sequence,
+        creator_generation=effect.creator_generation,
+        receipt=receipt,
+        data=outcome,
+        selected=value.prepared,
+        env_ref_names=env_ref_names,
+    )
+    return StoredTerminalP4Application(document, result_document, env_ref_names)
+
+
+def prepare_terminal_p4_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    *,
+    completion: TerminalServiceCompletion,
+    prepared: PreparedP4Value,
+    env_ref_names: frozenset[str],
+) -> ContinuationOwnerCommit:
+    """Bind the actual native completion to its issued SQL source, without capture."""
+    from sqlalchemy import insert
+
+    from elspeth.web.composer.continuation import ComposeFrame
+    from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
+    from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_chunk
+    from elspeth.web.composer.continuation_evidence_application_values import P4EffectProducerData
+    from elspeth.web.composer.continuation_phase_transitions import (
+        read_tool_issue_source_on_connection,
+        require_issued_tool_runtime_on_connection,
+    )
+    from elspeth.web.composer.continuation_terminal_p4_data import TerminalP4Input, encode_terminal_p4_input, terminal_p4_input_key
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+    from elspeth.web.sessions.continuation import bound_action_json
+    from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+
+    if type(completion) is not TerminalServiceCompletion or completion.p4 is None:
+        raise AuditIntegrityError("terminal P4 preparation requires its actual bound native completion")
+    owner = completion.p4
+    completion.require_p4(owner)
+    if owner.inventory.running is not running or owner.runtime is not completion.runtime or owner.prepared is not None:
+        raise AuditIntegrityError("terminal P4 preparation changed its actual live owner")
+    selected = owner.selected
+    key = require_issued_tool_runtime_on_connection(conn, running, selected=selected, env_ref_names=env_ref_names)
+    if key != completion.issued_effect_key:
+        raise AuditIntegrityError("terminal P4 preparation substituted its issued effect")
+    issue = read_tool_issue_source_on_connection(conn, running, effect_key=key, env_ref_names=env_ref_names)
+    sid, oid = str(running.claim.session_id), running.claim.operation_id
+    previous = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid, checkpoints.c.operation_id == oid, checkpoints.c.checkpoint_id == issue.previous_checkpoint_id
+        )
+    ).one()
+    previous_root = decode_continuation_snapshot(
+        read_chunk(conn, session_id=sid, operation_id=oid, key=previous.snapshot_chunk_key).decode("utf-8", errors="strict")
+    )
+    prior, compose = previous_root.frames[-1], selected.stack.frames[0]
+    if type(prior) is not ToolBatchFrame or type(compose) is not ComposeFrame:
+        raise AuditIntegrityError("terminal P4 lost its original complete prefix/Compose sources")
+    prefix = decode_coupled_batch_chunk(
+        PrivateChunk(
+            prior.accumulator,
+            read_chunk(conn, session_id=sid, operation_id=oid, key=f"value:{prior.accumulator.codec}:{prior.accumulator.digest}").decode(
+                "utf-8", errors="strict"
+            ),
+        ),
+        env_ref_names=env_ref_names,
+    )
+    if prefix.calls != owner.data.calls or prefix.batch.tool_outcomes != owner.data.batch.tool_outcomes[:-1]:
+        raise AuditIntegrityError("terminal P4 changed its actual preceding completed results")
+    response = next(chunk for chunk in selected.chunks if chunk.reference == issue.response)
+    recorder = encode_recorder_snapshot(owner.runtime.live.recorder.snapshot_for_continuation(drained=owner.runtime.drained))
+    actor_user_id = owner.runtime.bindings.user_id
+    if type(actor_user_id) is not str or not actor_user_id:
+        raise AuditIntegrityError("terminal P4 lost its authenticated original actor")
+    value = TerminalP4Input(
+        logical=selected.stack.logical,
+        actor_user_id=actor_user_id,
+        claim_attempt=running.claim.attempt,
+        producer=P4EffectProducerData(
+            creator_sequence=issue.sequence,
+            creator_generation=issue.generation,
+            creator_operation_id=issue.creator_operation_id,
+            creator_operation_epoch=issue.creator_operation_epoch,
+        ),
+        checkpoint_id=selected.checkpoint_id,
+        cursor=selected.stack.cursor,
+        issue=issue,
+        issued_effect_key=key,
+        prior_prefix=prior.accumulator,
+        source_evidence=compose.evidence,
+        response=response,
+        recorder=recorder,
+        effect_frontier=selected.stack.effect_frontier,
+        prepared=prepared,
+        semantic_input_sha256=sha256(p4_semantic_input(prepared, env_ref_names=env_ref_names).encode("utf-8")).hexdigest(),
+    )
+    document = encode_terminal_p4_input(value, env_ref_names=env_ref_names)
+    _require_terminal_source_on_connection(conn, value, env_ref_names=env_ref_names)
+    p4_key = f"batch:{issue.response.digest}:p4"
+    if (
+        conn.execute(
+            select(effects.c.effect_key).where(effects.c.session_id == sid, effects.c.operation_id == oid, effects.c.effect_key == p4_key)
+        ).one_or_none()
+        is not None
+    ):
+        raise ContinuationCASConflict("terminal P4 is already prepared; never replay its business call")
+    put_chunk(
+        conn,
+        session_id=sid,
+        operation_id=oid,
+        key=terminal_p4_input_key(p4_key),
+        payload=document.canonical.encode("utf-8"),
+        codec=document.reference.codec,
+    )
+    conn.execute(
+        insert(effects).values(
+            session_id=sid,
+            operation_id=oid,
+            effect_key=p4_key,
+            input_sha256=value.semantic_input_sha256,
+            owner="session_sql",
+            disposition="prepared",
+            creator_sequence=issue.sequence,
+            creator_generation=issue.generation,
+            action_json=bound_action_json(
+                selected.stack,
+                action_owner="primary_turn" if selected.stack.active_action_json is not None else None,
+                read_tool_name=None,
+                read_tool_arguments_json=None,
+            ),
+        )
+    )
+    return ContinuationOwnerCommit(running, p4_key, value.semantic_input_sha256, selected.checkpoint_id, selected.stack.cursor)
+
+
+def _terminal_result_document(
+    source: StoredTerminalP4Preparation | StoredTerminalP4Application,
+    receipt: PersistedComposerTurnReceipt,
+    *,
+    env_ref_names: frozenset[str],
+) -> TerminalP4Document:
+    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+    from elspeth.web.composer.continuation_p4_application import _project_recorder
+    from elspeth.web.composer.continuation_terminal_p4_data import (
+        TerminalP4Result,
+        decode_terminal_p4_input,
+        encode_terminal_p4_result,
+    )
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
+
+    if type(source) is not StoredTerminalP4Preparation:
+        raise AuditIntegrityError("terminal P4 result cannot replace an existing application")
+    value = decode_terminal_p4_input(source.input_document, env_ref_names=env_ref_names)
+    decoded, outcome = decode_p4_receipt(canonical_json(receipt.model_dump(mode="json")), env_ref_names=env_ref_names)
+    snapshot = decode_recorder_snapshot(value.recorder)
+    following = _project_recorder(snapshot, value.prepared, ReadmittedP4Result(decoded, outcome, None), env_ref_names=env_ref_names)
+    return encode_terminal_p4_result(
+        TerminalP4Result(input=source.input_document.reference, receipt=receipt, drained=following.drained),
+        input_document=source.input_document,
+        env_ref_names=env_ref_names,
+    )
+
+
+def _read_terminal_p4_transaction_outcome(
+    conn: Connection,
+    observation: P4WriterObservation,
+    application: StoredTerminalP4Application,
+    *,
+    env_ref_names: frozenset[str],
+) -> AuditOutcome:
+    from elspeth.web.composer.continuation_terminal_p4_data import decode_terminal_p4_input, decode_terminal_p4_result
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+    commit = observation.commit
+    source = read_terminal_p4_source_on_connection(
+        conn, session_id=commit.running.claim.session_id, operation_id=commit.running.claim.operation_id, env_ref_names=env_ref_names
+    )
+    if type(source) is not StoredTerminalP4Application or source != application or observation.candidate is None:
+        raise AuditIntegrityError("terminal P4 readback changed the actual writer's two candidates")
+    value = decode_terminal_p4_input(source.input_document, env_ref_names=env_ref_names)
+    result = decode_terminal_p4_result(source.result_document, input_document=source.input_document, env_ref_names=env_ref_names)
+    receipt, retained = decode_p4_receipt(canonical_json(result.receipt.model_dump(mode="json")), env_ref_names=env_ref_names)
+    actual = decode_audit_outcome_data(
+        encode_audit_outcome_data(observation.candidate, prepared=observation.prepared, env_ref_names=env_ref_names),
+        prepared=observation.prepared,
+        env_ref_names=env_ref_names,
+    )
+    if (
+        actual != retained
+        or value.claim_attempt != commit.running.claim.attempt
+        or value.producer.creator_sequence != commit.running.claim.segment_sequence
+        or value.producer.creator_generation != commit.running.claim.ownership_generation
+        or value.producer.creator_operation_id != commit.running.session_operation_context.fence.operation_id
+        or value.producer.creator_operation_epoch != commit.running.session_operation_context.fence.operation_epoch
+        or receipt.input_sha256 != commit.input_sha256
+        or value.checkpoint_id != commit.expected_checkpoint_id
+        or value.cursor != commit.expected_cursor
+    ):
+        raise AuditIntegrityError("terminal P4 readback changed its actual physical owner/outcome")
+    observation.readback = ReadmittedP4Result(receipt, retained, None)
+    observation.committed = True
+    return observation.candidate
+
+
+def read_lost_terminal_p4_on_connection(
+    conn: Connection, *, session_id: str, operation_id: str
+) -> StoredTerminalP4Preparation | StoredTerminalP4Application | None:
+    """Use the current owner's credential policy for the same closed SQL proof."""
+    from elspeth.web.sessions.models import sessions_table, user_secrets_table
+
+    session = conn.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
+    names = frozenset(
+        conn.execute(
+            select(user_secrets_table.c.name).where(
+                user_secrets_table.c.user_id == session.user_id,
+                user_secrets_table.c.auth_provider_type == session.auth_provider_type,
+            )
+        ).scalars()
+    )
+    return read_terminal_p4_source_on_connection(conn, session_id=UUID(session_id), operation_id=operation_id, env_ref_names=names)
+
+
+def terminal_service_failure(source: StoredTerminalP4Application, *, request_id: str | None) -> ComposerOperationError:
+    """Project safe terminal DATA without reconstructing a native exception."""
+    from elspeth.web.composer.continuation_terminal_p4_data import decode_terminal_p4_result
+    from elspeth.web.sessions.composer_operation_errors import _generic_failure, _http_error
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+    if type(source) is not StoredTerminalP4Application:
+        raise AuditIntegrityError("terminal service disposition requires its actual completed DATA mode")
+    result = decode_terminal_p4_result(source.result_document, input_document=source.input_document, env_ref_names=source.env_ref_names)
+    if result.receipt.unwind_audit_failed:
+        return _http_error(
+            500,
+            {
+                "error_type": "audit_integrity_error",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+                "request_id": request_id,
+            },
+            "audit_integrity_error",
+        )
+    return _generic_failure(request_id=request_id, diagnostic_id=str(UUID(source.input_document.reference.digest[:32])))

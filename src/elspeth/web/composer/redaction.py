@@ -4323,6 +4323,18 @@ def redact_tool_call_response(
         telemetry.response_projection_limit(tool_name=tool_name, scope="row")
         return dict(_RESPONSE_PROJECTION_LIMIT)
 
+    # The dispatcher owns this exact value-free refusal for every registered
+    # session service. It is neither an arbitrary tool payload nor a crash row.
+    if (
+        set(response) == {"success", "status", "reason"}
+        and response["success"] is False
+        and type(response["status"]) is str
+        and response["status"] == "SERVICE_FAILURE"
+        and type(response["reason"]) is str
+        and response["reason"] == "service_failure"
+    ):
+        return {"success": False, "status": "SERVICE_FAILURE", "reason": "service_failure"}
+
     # --- Type-driven path ---
     if entry.argument_model is not None:
         # Spec §4.2.4: manifest_dispatch is a per-invocation, walker-wide beacon.

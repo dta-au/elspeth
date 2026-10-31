@@ -24,6 +24,7 @@ from elspeth.web.composer.continuation_owed_evidence import restore_owed_p4_evid
 from elspeth.web.composer.continuation_owed_p4 import materialize_owed_p4_env_inventory
 from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_chunk
 from elspeth.web.composer.continuation_prepared_p4 import encode_prepared_p4, prepared_p4_members
+from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
 from elspeth.web.composer.withheld_replies import withheld_reply_envelope
@@ -47,7 +48,7 @@ from tests.unit.web.sessions.test_continuation_p4_owner import completed_cut, re
 operation_store = test_composer_operation_authority.operation_store
 
 
-def persist_retained_library_cut(service, running, prepared, commit):
+def persist_retained_library_cut(service, running, prepared, commit, *, expected_unavailable=False):
     """Real business rows and low-level retention, deliberately before application.
 
     Normal continuation persistence retains and applies atomically. These owed
@@ -76,7 +77,14 @@ def persist_retained_library_cut(service, running, prepared, commit):
         expected_current_state_id=prepared.expected_current_state_id,
         plugin_crash_pending=prepared.crash_pending,
     )
-    assert not outcome.unwind_audit_failed and outcome.assistant_id is not None
+    assert outcome.unwind_audit_failed is expected_unavailable
+    if expected_unavailable:
+        assert prepared.crash_pending and outcome.assistant_id is None and outcome.checkpoint is None
+        assert outcome.published_tool_rows == ()
+        with locked_session_transaction(service._engine, sid) as conn, service._session_write_lock(conn, sid):
+            retain_p4_result_on_connection(conn, commit, prepared=prepared, outcome=outcome, base_sequence=None, created_at=None)
+        return outcome
+    assert outcome.assistant_id is not None
     with locked_session_transaction(service._engine, sid) as conn, service._session_write_lock(conn, sid):
         assistant = conn.execute(
             select(chat_messages).where(
@@ -128,7 +136,16 @@ def persist_retained_library_cut(service, running, prepared, commit):
 
 
 async def committed_evidence_case(
-    store, *, graph=False, reader_service=None, joint=False, current=None, call_id="owned-p4-call", persist_result=True
+    store,
+    *,
+    graph=False,
+    reader_service=None,
+    joint=False,
+    current=None,
+    call_id="owned-p4-call",
+    persist_result=True,
+    materialization: CurrentContinuationMessageProducers | None = None,
+    crash_pending=False,
 ):
     engine, _repository, authority, service, sid = store
     if current is None:
@@ -151,6 +168,7 @@ async def committed_evidence_case(
         running,
         selected.stack,
         graph=graph,
+        crash_pending=crash_pending,
         initial_state=restored.evidence.effects.latest_verified_state,
         call_id=call_id,
         current_state_id=restored.evidence.effects.latest_committed_state_id,
@@ -189,6 +207,7 @@ async def committed_evidence_case(
         drained=restored.drained,
         env_ref_names=inventory.names,
         data=RestoredBatchData(pending_batch, accumulator, response.tool_batch.calls) if joint else None,
+        materialization=materialization,
     )
     evidence = encode_turn_evidence(snapshot, env_ref_names=inventory.names)
     audit = encode_recorder_snapshot(restored.recorder.snapshot_for_continuation(drained=restored.drained))

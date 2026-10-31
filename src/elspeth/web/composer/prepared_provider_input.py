@@ -12,7 +12,7 @@ import hashlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Self, cast
 
 from elspeth.contracts.bounded_serialization import BoundedCanonicalSize, bounded_canonical_json_size
 from elspeth.contracts.errors import AuditIntegrityError
@@ -83,11 +83,40 @@ class _ObjectView(ReadonlyJsonObject):
         return self.source[key]
 
 
-@dataclass(frozen=True, slots=True)
 class _ArrayView(ReadonlyJsonArray):
-    source: Sequence[GuardedProviderMessage] = field(repr=False)
+    """Read-only bindings over the original live messages and cache selection."""
+
+    __slots__ = ("_initialized", "cache_indexes", "excluded", "source")
+
+    source: Sequence[GuardedProviderMessage]
     excluded: frozenset[str]
-    cache_indexes: tuple[int, ...] = ()
+    cache_indexes: tuple[int, ...]
+    _initialized: bool
+
+    def __new__(cls, source: Sequence[GuardedProviderMessage], excluded: frozenset[str], cache_indexes: tuple[int, ...] = ()) -> Self:
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "_initialized", False)
+        return instance
+
+    def __init__(self, source: Sequence[GuardedProviderMessage], excluded: frozenset[str], cache_indexes: tuple[int, ...] = ()) -> None:
+        if self._initialized:
+            raise AttributeError("_ArrayView cannot be reinitialized")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "excluded", excluded)
+        object.__setattr__(self, "cache_indexes", cache_indexes)
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("_ArrayView has read-only bindings")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("_ArrayView has read-only bindings")
+
+    def __eq__(self, other: object) -> bool:
+        if type(other) is not type(self):
+            return NotImplemented
+        actual = other
+        return (self.source, self.excluded, self.cache_indexes) == (actual.source, actual.excluded, actual.cache_indexes)
 
     def __len__(self) -> int:
         return len(self.source)

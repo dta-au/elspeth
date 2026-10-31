@@ -354,4 +354,7 @@ Thumbs.db
 
 # FINAL RULE: keep .gitkeep files everywhere (overrides earlier ignores).
 !.gitkeep
+
+# Remove these at the end of the composer refactor.
 evals/composer-battery/planner_probe.py
+.claude/h2*/

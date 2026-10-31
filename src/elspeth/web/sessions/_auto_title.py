@@ -30,7 +30,7 @@ import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 from uuid import UUID
 
 import httpx
@@ -42,6 +42,7 @@ from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_provider_context import PrivateProviderContext
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY, PromptGuardMode, PromptGuardTrust
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer import provider_gateway
@@ -391,9 +392,15 @@ class PreparedAutoTitleRequest:
     value is neither a durable descriptor nor a dispatch/current-owner grant.
     """
 
-    kwargs: dict[str, Any]
-    audit_messages: list[dict[str, str | PromptGuardTrust]]
+    kwargs: Mapping[str, Any]
     user_prompt: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "kwargs")
+
+    @property
+    def audit_messages(self) -> Sequence[Mapping[str, str | PromptGuardTrust]]:
+        return cast("Sequence[Mapping[str, str | PromptGuardTrust]]", self.kwargs["messages"])
 
 
 def prepare_auto_title_request(
@@ -423,7 +430,7 @@ def prepare_auto_title_request(
     if seed is not None:
         kwargs["seed"] = seed
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
-    return PreparedAutoTitleRequest(kwargs, audit_messages, user_message)
+    return PreparedAutoTitleRequest(kwargs, user_message)
 
 
 async def maybe_auto_title_session(

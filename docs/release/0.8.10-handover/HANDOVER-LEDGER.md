@@ -1,4 +1,18 @@
-# 0.8.10 COLD-START STATUS REPORT (handover ledger)
+# 0.8.10 handover ledger
+
+## Current handover position — 27 October 2026
+
+The [direct-source delivery audit](../0.8.10-delivery-audit-2026-10-27.md) supersedes status assertions in the 25 October snapshot below. It covers all 18 original groups, 51 U-units and later subdivisions. Original groups: **1 landed on release, 9 integrating, 7 coding, 1 started**. The U inventory is 31 integrating, 12 coding, 5 started and 3 waiting to integrate. The protected final main merge is separately **not started**.
+
+Native local main/cached origin-main remain `3b28d537b`; shared assembly is `69a01e134`. Root retains the 81 staged T5e paths and source/index/ref custody. Common `19c0fe3` has 138 tracked changes; U-22 `dff61742` has 11. Current clean candidates include U-38c `680a056b`, Stop `2ed25b0`, U-37 prep `b144ad0`, U-45 part2 `d4c9cd1` and T5f `0d319d7`. The audit records exact source identities and evidence limits.
+
+John directed graceful engineering shutdown and allowed this report to continue. The audit did not inspect or control running processes, so this paragraph does not certify that every process stopped; Root owns that evidence. Historical lane owners are not automatically revived. `/root/u30_receiving` is the capacity coordinator; U-45 part2 belongs to `/root/u35b_protocol_batch`. Old fixed ceilings, slot rules and blanket serial defaults are superseded by John's ruling and measured coordinator allocation.
+
+The foundation DEFAULT receipt has no terminal pytest result; the separate PostgreSQL receipt completed RED (exit1, frozen=yes). Neither qualifies the release. V2 driver/recovery, U-22/U-24, U-31/U-32 operator bounds, U-45, contract/exception/residue work and release surfaces remain open. Signing is suspended; operator installation/qualification is post-release. Emmy can page John for a concrete console-only step; none was required by this audit.
+
+## Historical cold-start record — 25 October 2026
+
+Everything below is preserved historical evidence, including old refs, process statements, owners, counts and commands. It is not a current restart runbook. Use the current [work-package report](../../../0.8.10-work-packages.md), [master plan](../0.8.10-master-plan.md) and [finishing sequence](../0.8.10-finishing-and-landing-sequence.md) with Root's live custody before engineering resumption.
 
 - **Written:** 2026-10-25 09:34 AEDT, by the coordinator "0.8.10 - Main", at the pause. Revised at about 10:15 with the COLD-START-REVIEW.md fixes (41 findings; the application list is in STATUS).
 - **Measured at:** target `release/0.8.10-assembly` @ `d7ad18596`. Every SHA below was read from git at 09:33.

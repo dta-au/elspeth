@@ -878,6 +878,23 @@ def recover_segment_on_connection(
     The retained cut is classified and sized before any write. A cut holding
     unresolved work raises ``ContinuationCutNotResumable`` with nothing written.
     """
+    from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+    from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
+    from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+    terminal = read_lost_terminal_p4_on_connection(conn, session_id=session_id, operation_id=operation_id)
+    if type(terminal) is StoredTerminalP4Preparation:
+        raise ComposerTerminalSQLCompletionUnknown("terminal P4 preparation has no actual completion; replay is forbidden")
+    if terminal is not None:
+        from elspeth.web.composer.continuation import ToolBatchFrame
+
+        issued = decode_continuation_snapshot(load_snapshot(conn, session_id=session_id, operation_id=operation_id).payload_json).frames[-1]
+        if type(issued) is not ToolBatchFrame:
+            raise AuditIntegrityError("terminal recovery lost its actual issued batch")
+        raise ContinuationCutNotResumable(
+            "terminal service completion cannot resume its issued business call", effect_ids=(f"batch:{issued.response.digest}:p4",)
+        )
     expected_generation = segment.generation
     stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
     action_json, policy_hash = _retained_successor_action(
@@ -1117,6 +1134,15 @@ def validate_lost_continuation_on_connection(conn: Connection, *, session_id: st
         ).scalars()
     )
     top = stack.frames[-1]
+    from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Preparation
+    from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+    terminal = read_terminal_p4_source_on_connection(conn, session_id=UUID(session_id), operation_id=operation_id, env_ref_names=names)
+    if type(terminal) is StoredTerminalP4Preparation:
+        raise ComposerTerminalSQLCompletionUnknown("lost terminal P4 preparation has no actual completion")
+    if terminal is not None:
+        return ()
     if (
         session.archived_at is not None
         and type(top) is InitializeFrame

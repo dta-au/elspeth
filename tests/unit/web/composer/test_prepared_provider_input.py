@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import replace
+from types import MemberDescriptorType
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -39,7 +40,7 @@ from elspeth.web.composer import provider_gateway, reply_preparation
 from elspeth.web.composer import service as composer_service
 from elspeth.web.composer.advisor_content import PreparedAdvisorContent
 from elspeth.web.composer.continuation_message_builders import reply_instruction_message
-from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
+from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, plan_anthropic_cache_markers
 from elspeth.web.composer.prepared_provider_input import PreparedProviderInput, prepare_provider_input
 from elspeth.web.composer.prompt_guard import PromptGuardMount, prompt_guard_user_scope
 from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
@@ -111,6 +112,333 @@ def _verify(prepared: PreparedProviderInput, **kwargs) -> None:
         user_prompt=prepared.genuine_user,
         **kwargs,
     )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("source", "excluded", "cache_indexes", "delete_source", "delete_excluded", "delete_cache_indexes", "reinitialize", "extra"),
+)
+def test_array_view_preserves_live_sources_defaults_and_closed_bindings(change):
+    first = {"role": "system", "content": "Policy", "cache_control": {"old": True}}
+    second = {"role": "user", "content": "Original", PROMPT_GUARD_TRUST_KEY: PromptGuardTrust.REFERENCE}
+    source = [first, second]
+    excluded = frozenset({PROMPT_GUARD_TRUST_KEY})
+    indexes = (0,)
+    view = preparation._ArrayView(source=source, excluded=excluded, cache_indexes=indexes)
+    assert view.source is source and view.excluded is excluded and view.cache_indexes is indexes
+    projected = tuple(view)
+    assert projected[0].source is first and projected[1].source is second
+    assert dict(projected[0].items()) == {"role": "system", "content": "Policy", "cache_control": {"type": "ephemeral"}}
+    assert dict(projected[1].items()) == {"role": "user", "content": "Original"}
+    default = preparation._ArrayView(source, excluded)
+    assert default.cache_indexes == ()
+    assert dict(next(iter(default)).items())["cache_control"] is first["cache_control"]
+    assert type(preparation._ArrayView.__dict__["source"]) is MemberDescriptorType
+    assert type(preparation._ArrayView.__dict__["excluded"]) is MemberDescriptorType
+    assert type(preparation._ArrayView.__dict__["cache_indexes"]) is MemberDescriptorType
+    assert preparation._ArrayView.__getattribute__ is object.__getattribute__
+    foreign_source = [dict(message) for message in source]
+    foreign_excluded = frozenset(key for key in excluded)
+    foreign_indexes = tuple(index for index in indexes)
+    equal_view = preparation._ArrayView(foreign_source, foreign_excluded, foreign_indexes)
+    assert equal_view == view and equal_view.source is not view.source
+
+    class OtherArrayView(preparation._ArrayView):
+        __slots__ = ()
+
+    assert view.__eq__(OtherArrayView(source, excluded, indexes)) is NotImplemented
+    assert OtherArrayView(source, excluded, indexes) == OtherArrayView(foreign_source, foreign_excluded, foreign_indexes)
+    assert view.__eq__(source) is NotImplemented
+    with pytest.raises(AttributeError):
+        if change == "source":
+            view.source = foreign_source
+        elif change == "excluded":
+            view.excluded = foreign_excluded
+        elif change == "cache_indexes":
+            view.cache_indexes = foreign_indexes
+        elif change == "delete_source":
+            del view.source
+        elif change == "delete_excluded":
+            del view.excluded
+        elif change == "delete_cache_indexes":
+            del view.cache_indexes
+        elif change == "reinitialize":
+            view.__init__(foreign_source, foreign_excluded, foreign_indexes)
+        else:
+            view.__setattr__("unexpected", source)
+    assert view.source is source and view.excluded is excluded and view.cache_indexes is indexes
+    with pytest.raises(AttributeError):
+        view._initialized = False
+    with pytest.raises(AttributeError):
+        del view._initialized
+    with pytest.raises(AttributeError):
+        view.__init__(source, excluded, indexes)
+
+    first["content"] = "Changed policy"
+    late = {"role": "assistant", "content": "Later"}
+    source.append(late)
+    current = tuple(view)
+    assert len(view) == 3 and current[-1].source is late
+    assert current[0]["content"] == "Changed policy"
+    assert "cache_control" not in current[-1]
+    expected = [
+        {"role": "system", "content": "Changed policy", "cache_control": {"type": "ephemeral"}},
+        {"role": "user", "content": "Original"},
+        late,
+    ]
+    measured = preparation.bounded_canonical_json_size({"messages": view, "tools": []}, limit=10_000)
+    assert measured.admitted_bytes == _size(expected)
+
+
+@pytest.mark.parametrize("change", ("source", "tail", "delete_source", "delete_tail", "reinitialize", "extra"))
+def test_extended_messages_keep_live_tail_and_slice_bindings(change):
+    first = {"role": "system", "content": "Policy"}
+    second = {"role": "user", "content": "Question"}
+    third = {"role": "assistant", "content": "Answer"}
+    source = [first, second, third]
+    tail = reply_instruction_message()
+    view = reply_preparation._ExtendedMessages(source=source, tail=tail)
+    assert view.source is source and view.tail is tail and len(view) == 4
+    assert view[0] is first and view[-4] is first and view[-1] is tail
+    assert tuple(view) == (first, second, third, tail)
+    assert tuple(reversed(view)) == (tail, third, second, first)
+    for invalid in (4, -5):
+        with pytest.raises(IndexError):
+            view[invalid]
+    sliced = view[1:]
+    nested = sliced[::-1][1:]
+    assert type(sliced) is reply_preparation._MessageSlice and sliced.source is view
+    assert type(nested) is reply_preparation._MessageSlice and nested.source is view
+    assert nested.positions == range(1, 4)[::-1][1:]
+    assert nested[0] is third and nested[-1] is second
+    assert type(reply_preparation._ExtendedMessages.__dict__["source"]) is MemberDescriptorType
+    assert type(reply_preparation._ExtendedMessages.__dict__["tail"]) is MemberDescriptorType
+    assert reply_preparation._ExtendedMessages.__getattribute__ is object.__getattribute__
+    foreign_source, foreign_tail = list(source), dict(tail)
+    equal_view = reply_preparation._ExtendedMessages(foreign_source, foreign_tail)
+    assert equal_view == view and equal_view.source is not source and equal_view.tail is not tail
+
+    class OtherExtendedMessages(reply_preparation._ExtendedMessages):
+        __slots__ = ()
+
+    assert view.__eq__(OtherExtendedMessages(source, tail)) is NotImplemented
+    assert OtherExtendedMessages(source, tail) == OtherExtendedMessages(foreign_source, foreign_tail)
+    assert view.__eq__(source) is NotImplemented
+    with pytest.raises(AttributeError):
+        if change == "source":
+            view.source = foreign_source
+        elif change == "tail":
+            view.tail = foreign_tail
+        elif change == "delete_source":
+            del view.source
+        elif change == "delete_tail":
+            del view.tail
+        elif change == "reinitialize":
+            view.__init__(foreign_source, foreign_tail)
+        else:
+            view.__setattr__("unexpected", source)
+    assert view.source is source and view.tail is tail
+    with pytest.raises(AttributeError):
+        view._initialized = False
+    with pytest.raises(AttributeError):
+        del view._initialized
+    with pytest.raises(AttributeError):
+        view.__init__(source, tail)
+
+    replacement = {"role": "user", "content": "Updated question"}
+    late = {"role": "assistant", "content": "Later answer"}
+    source[1] = replacement
+    source.append(late)
+    assert len(view) == 5 and view[-1] is tail and view[-2] is late
+    assert nested[-1] is replacement
+    assert sliced[-1] is late, "a stored positional slice still borrows the current source"
+    tail["content"] = "Updated instruction"
+    assert view[-1]["content"] == "Updated instruction"
+
+
+@pytest.mark.parametrize("change", ("source", "positions", "delete_source", "delete_positions", "reinitialize", "extra"))
+def test_message_slice_keeps_original_source_positions_and_live_aliases(change):
+    source = [{"role": "user", "content": f"Message {index}"} for index in range(5)]
+    positions = range(0, 5, 2)
+    view = reply_preparation._MessageSlice(source=source, positions=positions)
+    assert view.source is source and view.positions is positions and len(view) == 3
+    assert view[0] is source[0] and view[-1] is source[4]
+    assert all(actual is source[index] for actual, index in zip(view, positions, strict=True))
+    nested = view[::-1][1:]
+    assert type(nested) is reply_preparation._MessageSlice and nested.source is source
+    assert nested.positions == positions[::-1][1:]
+    assert nested[0] is source[2] and nested[-1] is source[0]
+    for invalid in (3, -4):
+        with pytest.raises(IndexError):
+            view[invalid]
+    assert type(reply_preparation._MessageSlice.__dict__["source"]) is MemberDescriptorType
+    assert type(reply_preparation._MessageSlice.__dict__["positions"]) is MemberDescriptorType
+    assert reply_preparation._MessageSlice.__getattribute__ is object.__getattribute__
+    foreign_source, foreign_positions = list(source), range(0, 5, 2)
+    equal_view = reply_preparation._MessageSlice(foreign_source, foreign_positions)
+    assert equal_view == view and equal_view.source is not source
+
+    class OtherMessageSlice(reply_preparation._MessageSlice):
+        __slots__ = ()
+
+    assert view.__eq__(OtherMessageSlice(source, positions)) is NotImplemented
+    assert OtherMessageSlice(source, positions) == OtherMessageSlice(foreign_source, foreign_positions)
+    assert view.__eq__(source) is NotImplemented
+    with pytest.raises(AttributeError):
+        if change == "source":
+            view.source = foreign_source
+        elif change == "positions":
+            view.positions = foreign_positions
+        elif change == "delete_source":
+            del view.source
+        elif change == "delete_positions":
+            del view.positions
+        elif change == "reinitialize":
+            view.__init__(foreign_source, foreign_positions)
+        else:
+            view.__setattr__("unexpected", source)
+    assert view.source is source and view.positions is positions
+    with pytest.raises(AttributeError):
+        view._initialized = False
+    with pytest.raises(AttributeError):
+        del view._initialized
+    with pytest.raises(AttributeError):
+        view.__init__(source, positions)
+
+    replacement = {"role": "user", "content": "Replacement"}
+    source[2] = replacement
+    assert view[1] is replacement and nested[0] is replacement
+    source.pop()
+    assert len(view) == 3, "the selected positional range is fixed while its source remains live"
+    with pytest.raises(IndexError):
+        view[-1]
+
+
+@pytest.mark.parametrize("change", ("source", "delete_source", "reinitialize", "extra"))
+def test_reply_roles_borrow_current_messages_without_changing_quoted_content(change):
+    first = {"role": "system", "content": "Policy"}
+    historical = {"role": "tool", "tool_call_id": "history", "content": "Original evidence"}
+    tool_calls = {"role": "assistant", "content": "", "tool_calls": []}
+    source = [first, historical, tool_calls]
+    view = reply_preparation._ReplyRoles(source=source)
+    assert view.source is source and len(view) == 3 and view[0] is first
+    assert view[1] == {"role": "user", "content": ""}
+    assert view[-1] == {"role": "assistant", "content": ""}
+    assert historical["content"] == "Original evidence" and tool_calls["tool_calls"] == []
+    sliced = view[::-1][1:]
+    assert type(sliced) is reply_preparation._MessageSlice and sliced.source is view
+    assert tuple(sliced) == ({"role": "user", "content": ""}, first)
+    assert type(reply_preparation._ReplyRoles.__dict__["source"]) is MemberDescriptorType
+    assert reply_preparation._ReplyRoles.__getattribute__ is object.__getattribute__
+    foreign_source = [dict(message) for message in source]
+    equal_view = reply_preparation._ReplyRoles(foreign_source)
+    assert equal_view == view and equal_view.source is not source
+
+    class OtherReplyRoles(reply_preparation._ReplyRoles):
+        __slots__ = ()
+
+    assert view.__eq__(OtherReplyRoles(source)) is NotImplemented
+    assert OtherReplyRoles(source) == OtherReplyRoles(foreign_source)
+    assert view.__eq__(source) is NotImplemented
+    with pytest.raises(AttributeError):
+        if change == "source":
+            view.source = foreign_source
+        elif change == "delete_source":
+            del view.source
+        elif change == "reinitialize":
+            view.__init__(foreign_source)
+        else:
+            view.__setattr__("unexpected", source)
+    assert view.source is source
+    with pytest.raises(AttributeError):
+        view._initialized = False
+    with pytest.raises(AttributeError):
+        del view._initialized
+    with pytest.raises(AttributeError):
+        view.__init__(source)
+
+    replacement = {"role": "user", "content": CATALOG_CONTEXT_PREFIX + "New catalog"}
+    source[1] = replacement
+    source.append({"role": "user", "content": "Later question"})
+    assert len(view) == 4 and view[1] is replacement and view[-1] is source[-1]
+    assert sliced[0] is replacement and historical["content"] == "Original evidence"
+    plan = plan_anthropic_cache_markers(view, (), mark_history_tail=True)
+    assert plan.message_indexes == (0, 1, 3)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("source", "prefix", "suffix", "cache", "delete_source", "delete_prefix", "delete_suffix", "delete_cache", "reinitialize", "extra"),
+)
+def test_sized_messages_keep_live_framing_cache_owner_and_exact_wire_size(change):
+    historical = {"role": "tool", "tool_call_id": "history", "content": 'Evidence é\\"\n'}
+    source = [{"role": "system", "content": "Policy"}, historical]
+    instruction = reply_instruction_message()
+    candidate = reply_preparation._ExtendedMessages(source, instruction)
+    prefix, suffix = composer_service._REPLY_ONLY_HISTORY_PREFIX, composer_service._REPLY_ONLY_HISTORY_SUFFIX
+    cache = plan_anthropic_cache_markers(reply_preparation._ReplyRoles(candidate), (), mark_history_tail=True)
+    view = reply_preparation._SizedMessages(source=candidate, prefix=prefix, suffix=suffix, cache=cache)
+    assert view.source is candidate and view.prefix is prefix and view.suffix is suffix and view.cache is cache
+    items = tuple(view)
+    assert items[0].message is source[0] and items[0].text is None
+    assert items[1].message is historical and items[1].text.prefix is prefix and items[1].text.suffix is suffix
+    assert items[-1].message is instruction
+    prospective = preparation.bounded_canonical_json_size({"messages": view, "tools": []}, limit=10_000)
+    packet, _raw = _prepare_reply(source, cache=True)
+    assert prospective.admitted_bytes == packet.byte_count == _size(packet.evidence.messages)
+    assert packet.cache_plan == cache and packet.cache_plan.message_indexes == (0, 2)
+    assert type(reply_preparation._SizedMessages.__dict__["source"]) is MemberDescriptorType
+    assert type(reply_preparation._SizedMessages.__dict__["prefix"]) is MemberDescriptorType
+    assert type(reply_preparation._SizedMessages.__dict__["suffix"]) is MemberDescriptorType
+    assert type(reply_preparation._SizedMessages.__dict__["cache"]) is MemberDescriptorType
+    assert reply_preparation._SizedMessages.__getattribute__ is object.__getattribute__
+    foreign_source = reply_preparation._ExtendedMessages(list(source), dict(instruction))
+    foreign_cache = replace(cache)
+    equal_view = reply_preparation._SizedMessages(foreign_source, prefix, suffix, foreign_cache)
+    assert equal_view == view and equal_view.source is not candidate and equal_view.cache is not cache
+
+    class OtherSizedMessages(reply_preparation._SizedMessages):
+        __slots__ = ()
+
+    assert view.__eq__(OtherSizedMessages(candidate, prefix, suffix, cache)) is NotImplemented
+    assert OtherSizedMessages(candidate, prefix, suffix, cache) == OtherSizedMessages(foreign_source, prefix, suffix, foreign_cache)
+    assert view.__eq__(candidate) is NotImplemented
+    with pytest.raises(AttributeError):
+        if change == "source":
+            view.source = foreign_source
+        elif change == "prefix":
+            view.prefix = prefix + "changed"
+        elif change == "suffix":
+            view.suffix = suffix + "changed"
+        elif change == "cache":
+            view.cache = foreign_cache
+        elif change == "delete_source":
+            del view.source
+        elif change == "delete_prefix":
+            del view.prefix
+        elif change == "delete_suffix":
+            del view.suffix
+        elif change == "delete_cache":
+            del view.cache
+        elif change == "reinitialize":
+            view.__init__(foreign_source, prefix + "changed", suffix + "changed", foreign_cache)
+        else:
+            view.__setattr__("unexpected", source)
+    assert view.source is candidate and view.prefix is prefix and view.suffix is suffix and view.cache is cache
+    with pytest.raises(AttributeError):
+        view._initialized = False
+    with pytest.raises(AttributeError):
+        del view._initialized
+    with pytest.raises(AttributeError):
+        view.__init__(candidate, prefix, suffix, cache)
+
+    historical["content"] += " Later 🧵"
+    current = preparation.bounded_canonical_json_size({"messages": view, "tools": []}, limit=10_000)
+    updated, _raw = _prepare_reply(source, cache=True)
+    assert current.admitted_bytes == updated.byte_count == _size(updated.evidence.messages)
+    assert current.admitted_bytes != prospective.admitted_bytes and view.cache is cache
+    source.append({"role": "user", "content": "Later question"})
+    assert len(view) == 4 and tuple(view)[-1].message is instruction
 
 
 @pytest.mark.parametrize("value", [0, -1, True, False, "2097152", 2.0])

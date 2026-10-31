@@ -30,7 +30,7 @@ from elspeth.web.credential_guard import require_no_credential_material, require
 from elspeth.web.sessions.continuation import HistoricalEffectLocator
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_application_graph import ApplicationGraph
+    from elspeth.web.composer.continuation_application_graph import ApplicationGraph, ApplicationRecorderSource
 
 
 class RetainedBlobPage(ContinuationValue):
@@ -440,7 +440,7 @@ class AdmittedTurnEvidence:
 
     def take_graph(self) -> ApplicationGraph | None:
         """Transfer once, after proving exposed nested values still match source."""
-        from elspeth.web.composer.continuation_application_graph import encode_application_graph
+        from elspeth.web.composer.continuation_application_graph import admit_application_recorder_source, encode_application_graph
 
         with self._graph_lock:
             if self._graph_taken:
@@ -453,7 +453,8 @@ class AdmittedTurnEvidence:
                     if self.snapshot.application_entry is None
                     else self.snapshot.application_entry.graph_json
                 )
-                if encode_application_graph(self._graph, env_ref_names=self.env_ref_names) != original:
+                recorder_source = admit_application_recorder_source(self.recorder_chunk, env_ref_names=self.env_ref_names)
+                if encode_application_graph(self._graph, env_ref_names=self.env_ref_names, recorder_source=recorder_source) != original:
                     raise AuditIntegrityError("admitted graph changed its original values or alias partition")
             object.__setattr__(self, "_graph_taken", True)
             return self._graph
@@ -526,23 +527,14 @@ def _select_recorder_chunk(snapshot: TurnEvidenceFields, chunks: tuple[PrivateCh
     return actual
 
 
-def _require_recorder_chunk(snapshot: TurnEvidenceFields, chunk: PrivateChunk, *, env_ref_names: frozenset[str]) -> None:
-    from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
-    from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+def _require_recorder_chunk(
+    snapshot: TurnEvidenceFields, chunk: PrivateChunk, *, env_ref_names: frozenset[str]
+) -> ApplicationRecorderSource:
+    from elspeth.web.composer.continuation_application_graph import admit_application_recorder_source
 
     if type(chunk) is not PrivateChunk or chunk.reference != snapshot.recorder or chunk.reference.codec != "composer.audit-buffer.v1":
         raise AuditIntegrityError("evidence recorder differs from its original closed source")
-    if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
-        utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
-    ):
-        raise AuditIntegrityError("evidence recorder exceeds its original complete document bound")
-    decode_recorder_snapshot(chunk)
-    require_no_credential_material(
-        chunk.canonical,
-        surface="composer_continuation_evidence_recorder",
-        env_ref_names=env_ref_names,
-        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
-    )
+    return admit_application_recorder_source(chunk, env_ref_names=env_ref_names)
 
 
 def require_evidence_fields_admission(
@@ -563,7 +555,7 @@ def require_evidence_fields_admission(
     from elspeth.web.composer.continuation_retention import validate_retained_model
 
     validate_retained_model(snapshot)
-    _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
+    recorder_source = _require_recorder_chunk(snapshot, recorder_chunk, env_ref_names=env_ref_names)
     require_no_credential_material_in_state(
         state_from_evidence_json(snapshot.effects.initial_state_json),
         surface="composer_continuation_evidence_initial_state",
@@ -576,7 +568,7 @@ def require_evidence_fields_admission(
     )
     from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
 
-    graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)
+    graph = require_evidence_application_links(snapshot, env_ref_names=env_ref_names, sources=sources, recorder_source=recorder_source)
     _require_evidence_metadata(snapshot, env_ref_names=env_ref_names)
     return graph
 

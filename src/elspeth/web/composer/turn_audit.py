@@ -36,6 +36,7 @@ from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
 
 
 def _serialize_response_via_walker(
@@ -283,6 +284,7 @@ async def persist_turn_audit(
     required_work: RequiredWorkBinding | None = None,
     turn_evidence: TurnEvidence | None = None,
     continuation: ContinuationLiveP4 | None = None,
+    terminal_completion: TerminalServiceCompletion | None = None,
 ) -> _PersistOutcome:
     """Phase P4 of the compose loop — redact then persist the turn audit.
 
@@ -323,6 +325,9 @@ async def persist_turn_audit(
         redact_failure_response,
         redact_tool_call_arguments,
     )
+
+    if terminal_completion is not None and continuation is None:
+        raise AuditIntegrityError("terminal service publication cannot use a non-continuation writer")
 
     redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...] = ()
     for index, tool_outcome in enumerate(tool_outcomes):
@@ -586,7 +591,18 @@ async def persist_turn_audit(
                     crash_pending=crash_pending,
                     env_ref_names=continuation.inventory.names,
                 )
-                commit = await continuation.prepare(prepared)
+                if terminal_completion is None:
+                    commit = await continuation.prepare(prepared)
+                else:
+                    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+
+                    if type(terminal_completion) is not TerminalServiceCompletion:
+                        raise AuditIntegrityError("terminal publication requires its exact native service completion")
+                    terminal_completion.require_p4(continuation)
+                    # The terminal P4 owner/SQL/application implementation is a
+                    # separate required join. Never encode/clear the live failure
+                    # or fall through to the legacy writer when it is unavailable.
+                    commit = await continuation.prepare_terminal(prepared, terminal_completion)
                 checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
                     RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
                 )
@@ -783,6 +799,10 @@ async def persist_turn_audit(
             if effects_before is None:
                 raise AuditIntegrityError("continuation publication lost its actual before effects owner")
             await finish_live_p4_application(continuation, effects_before=effects_before)
+            if terminal_completion is not None and result.unwind_audit_failed:
+                continuation.raise_after_publication(
+                    AuditIntegrityError("Service failure audit row could not be persisted", failed_turn=result.failed_turn)
+                )
     except BaseException as exc:
         if checkpoint_projection is not None:
             checkpoint_projection.complete_owned(exc)

@@ -1,13 +1,14 @@
 """Real failed dispatch custody, portable prefix and terminal append controls."""
 
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.continuation_application_graph import capture_application_recorder_source
 from elspeth.web.composer.continuation_batch_data import decode_coupled_batch_data, encode_coupled_batch_data
 from tests.unit.web.sessions.test_continuation_checkpoint_outcome import coordinator as _coordinator
 from tests.unit.web.sessions.test_continuation_live_phases import _advance, _phase_case
@@ -429,7 +430,7 @@ async def test_actual_advisor_feedback_then_primary_failure_keeps_distinct_origi
 async def test_actual_session_inner_publication_preserves_owner_before_outer_completion(operation_store, tmp_path, monkeypatch, kind):
     from elspeth.web.composer import tools
     from elspeth.web.composer.continuation_message_family_recipes import ToolFeedbackMessageRecipe, ToolResultMessageRecipe
-    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication, _FeedbackMessageProvenance
     from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
     from elspeth.web.composer.protocol import ToolArgumentError
     from elspeth.web.composer.tools._common import ToolResult
@@ -438,7 +439,7 @@ async def test_actual_session_inner_publication_preserves_owner_before_outer_com
     async with _advisor_case(
         operation_store, tmp_path, monkeypatch, tool_name="request_interpretation_review", tool_arguments=arguments, bound_base=True
     ) as (owner, _running, sdk):
-        calls, publications = [], []
+        calls, publications, pending_feedback = [], [], []
         original = ToolArgumentError(argument="llm_draft", expected="a string", actual_type="missing")
         actual_result, actual_feedback = (
             ContinuationToolMessagePublication.register_result,
@@ -457,8 +458,45 @@ async def test_actual_session_inner_publication_preserves_owner_before_outer_com
                 data={"message": "actual handler result"},
             )
 
+        def closed_publication(publication):
+            assert type(publication) is ContinuationToolMessagePublication
+            producers, completion, batch, call = publication.producers, publication.completion, publication.batch, publication.call
+            recorder, messages, catalog = publication.recorder, publication.messages, publication.catalog
+            copied = ContinuationToolMessagePublication(producers, completion, batch, call, recorder, messages, catalog)
+            assert copied == publication and copied is not publication and copied.messages is messages
+            with pytest.raises(FrozenInstanceError):
+                publication.messages = []
+            with pytest.raises(FrozenInstanceError):
+                del publication.call
+            with pytest.raises(FrozenInstanceError):
+                publication._sealed = False
+            with pytest.raises(FrozenInstanceError):
+                publication.extra = object()
+            with pytest.raises(FrozenInstanceError, match="reinitialized"):
+                ContinuationToolMessagePublication.__init__(publication, producers, completion, batch, call, recorder, [], catalog)
+            with pytest.raises(AttributeError):
+                _ = publication.__dict__
+            assert publication.producers is producers and publication.completion is completion
+            assert publication.batch is batch and publication.call is call
+            assert publication.recorder is recorder and publication.messages is messages and publication.catalog is catalog
+            publication.require_call(
+                recorder=recorder, audit=call.audit, tool_name=call.tool_name, tool_call_id=call.tool_call.id, messages=messages
+            )
+            object.__setattr__(publication, "messages", list(messages))
+            try:
+                with pytest.raises(AuditIntegrityError, match="actual issued call/recorder/message owners"):
+                    publication.require_call(
+                        recorder=recorder, audit=call.audit, tool_name=call.tool_name, tool_call_id=call.tool_call.id, messages=messages
+                    )
+            finally:
+                object.__setattr__(publication, "messages", messages)
+            publication.require_call(
+                recorder=recorder, audit=call.audit, tool_name=call.tool_name, tool_call_id=call.tool_call.id, messages=messages
+            )
+
         def result(self, **kwargs):
             assert len(self.batch.tool_outcomes) == self.call.index
+            closed_publication(self)
             value = actual_result(self, **kwargs)
             assert value is kwargs["message"]
             publications.append(value)
@@ -466,8 +504,52 @@ async def test_actual_session_inner_publication_preserves_owner_before_outer_com
 
         def feedback(self, **kwargs):
             assert len(self.batch.tool_outcomes) == self.call.index
+            closed_publication(self)
             value = actual_feedback(self, **kwargs)
             assert value is kwargs["message"]
+            record = next(item for item in self.producers._feedback_produced if item.message is value)
+            assert type(record) is _FeedbackMessageProvenance and record.outcome is None
+            pending_feedback.append(record)
+            copied = _FeedbackMessageProvenance(
+                record.message,
+                record.recipe,
+                record.keys,
+                record.role,
+                record.call_id,
+                record.body,
+                record.selector,
+                record.call,
+                record.invocation,
+                record.authoring,
+                record.outcome,
+            )
+            assert copied == record and copied is not record and copied.message is value
+            with pytest.raises(FrozenInstanceError):
+                record.message = {}
+            with pytest.raises(FrozenInstanceError):
+                del record.authoring
+            with pytest.raises(FrozenInstanceError):
+                record._sealed = False
+            with pytest.raises(FrozenInstanceError):
+                record.extra = object()
+            with pytest.raises(FrozenInstanceError, match="reinitialized"):
+                _FeedbackMessageProvenance.__init__(
+                    record,
+                    {},
+                    record.recipe,
+                    record.keys,
+                    record.role,
+                    record.call_id,
+                    record.body,
+                    record.selector,
+                    record.call,
+                    record.invocation,
+                    record.authoring,
+                    None,
+                )
+            with pytest.raises(AttributeError):
+                _ = record.__dict__
+            assert record == copied and record.message is value and record.outcome is None
             publications.append(value)
             return value
 
@@ -480,6 +562,48 @@ async def test_actual_session_inner_publication_preserves_owner_before_outer_com
         assert any(item is publications[0] for item in runtime.live.llm_messages)
         wire, recipe = runtime.materialization.capture_message(publications[0])
         assert type(recipe) is (ToolResultMessageRecipe if kind == "result" else ToolFeedbackMessageRecipe)
+        if kind == "arg_error":
+            pending = pending_feedback[0]
+            bound = next(item for item in runtime.materialization._feedback_produced if item.message is publications[0])
+            assert bound is not pending and pending.outcome is None
+            assert bound.outcome is runtime.graph.batch.batch.tool_outcomes[0]
+            following = pending.with_outcome(bound.outcome)
+            assert following == bound and following is not bound
+            original_bindings = (
+                pending.message,
+                pending.recipe,
+                pending.keys,
+                pending.role,
+                pending.call_id,
+                pending.body,
+                pending.selector,
+                pending.call,
+                pending.invocation,
+                pending.authoring,
+            )
+            for successor in (bound, following):
+                successor_bindings = (
+                    successor.message,
+                    successor.recipe,
+                    successor.keys,
+                    successor.role,
+                    successor.call_id,
+                    successor.body,
+                    successor.selector,
+                    successor.call,
+                    successor.invocation,
+                    successor.authoring,
+                )
+                assert all(actual is original for actual, original in zip(successor_bindings, original_bindings, strict=True))
+            object.__setattr__(bound, "body", "Changed original feedback body")
+            try:
+                with pytest.raises(AuditIntegrityError, match="ordered source/field identities"):
+                    runtime.materialization.capture_message(publications[0])
+            finally:
+                object.__setattr__(bound, "body", pending.body)
+            assert runtime.materialization.capture_message(publications[0]) == (wire, recipe)
+        else:
+            assert not pending_feedback
         assert runtime.graph.batch.batch.tool_outcomes[0].call is runtime.graph.batch.calls[0]
         assert not owner.failure_custody.completed
         restored = await restore_continuation_runtime(
@@ -799,9 +923,13 @@ async def test_actual_session_feedback_binds_only_its_original_outer_outcome_onc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ("source_copy", "message_copy", "request_copy", "foreign_cohort"))
+@pytest.mark.parametrize("change", ("source_copy", "message_copy", "request_copy", "foreign_cohort", "source_slot", "cohort_slot"))
 async def test_actual_cold_feedback_refuses_copied_or_cross_cohort_sources(operation_store, tmp_path, monkeypatch, change):
-    from elspeth.web.composer.continuation_message_families import CurrentContinuationMessageFamilies
+    from elspeth.web.composer.continuation_message_families import (
+        CurrentContinuationMessageFamilies,
+        _RestoredFamilyCohort,
+        _ToolFeedbackFamilySource,
+    )
     from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
     from tests.unit.web.sessions.test_continuation_live_phases import stored_rows
 
@@ -829,15 +957,60 @@ async def test_actual_cold_feedback_refuses_copied_or_cross_cohort_sources(opera
                 return returned
             reached.append(returned)
             request, source = returned.feedback[0]
+            source_message = source.message
+            source_recipe, source_call, source_outcome, source_invocation = source.recipe, source.call, source.outcome, source.invocation
+            messages, feedback, sources = returned.messages, returned.feedback, returned.sources
+            equal_cohort = _RestoredFamilyCohort(messages, feedback, sources)
+            assert equal_cohort == returned and equal_cohort is not returned
+            assert equal_cohort.messages is messages and equal_cohort.feedback is feedback and equal_cohort.sources is sources
+            with pytest.raises(FrozenInstanceError):
+                source.message = {}
+            with pytest.raises(FrozenInstanceError):
+                del source.invocation
+            with pytest.raises(FrozenInstanceError):
+                source._sealed = False
+            with pytest.raises(FrozenInstanceError):
+                source.extra = object()
+            with pytest.raises(FrozenInstanceError, match="reinitialized"):
+                _ToolFeedbackFamilySource.__init__(source, source.recipe, source.call, source.outcome, source.invocation, {})
+            with pytest.raises(AttributeError):
+                _ = source.__dict__
+            assert source.message is source_message and source.recipe is source_recipe and source.recipe == request
+            assert source.call is source_call and source.outcome is source_outcome and source.invocation is source_invocation
+            with pytest.raises(FrozenInstanceError):
+                returned.messages = ()
+            with pytest.raises(FrozenInstanceError):
+                del returned.feedback
+            with pytest.raises(FrozenInstanceError):
+                returned._sealed = False
+            with pytest.raises(FrozenInstanceError):
+                returned.extra = object()
+            with pytest.raises(FrozenInstanceError, match="reinitialized"):
+                _RestoredFamilyCohort.__init__(returned, (), (), ())
+            with pytest.raises(AttributeError):
+                _ = returned.__dict__
+            assert returned.messages is messages and returned.feedback is feedback and returned.sources is sources
             if change == "source_copy":
-                return replace(returned, feedback=((request, replace(source)), *returned.feedback[1:]))
+                copied = _ToolFeedbackFamilySource(source.recipe, source.call, source.outcome, source.invocation, source.message)
+                assert copied == source and copied is not source and copied.message is source.message
+                forged = _RestoredFamilyCohort(returned.messages, ((request, copied), *returned.feedback[1:]), returned.sources)
+                assert forged == returned and forged is not returned
+                return forged
             if change == "message_copy":
-                return replace(returned, messages=tuple(dict(item) if item is source.message else item for item in returned.messages))
+                return _RestoredFamilyCohort(
+                    tuple(dict(item) if item is source.message else item for item in returned.messages), returned.feedback, returned.sources
+                )
             if change == "request_copy":
-                return replace(returned, feedback=((request.model_copy(), source), *returned.feedback[1:]))
+                return _RestoredFamilyCohort(returned.messages, ((request.model_copy(), source), *returned.feedback[1:]), returned.sources)
+            if change == "source_slot":
+                object.__setattr__(source, "message", dict(source.message))
+                return returned
+            if change == "cohort_slot":
+                object.__setattr__(returned, "sources", ())
+                return returned
             foreign = actual(self, requests)
             assert foreign is not returned and foreign.feedback[0][1] is not source
-            return replace(returned, feedback=foreign.feedback)
+            return _RestoredFamilyCohort(returned.messages, foreign.feedback, returned.sources)
 
         before = stored_rows(operation_store[0])
         monkeypatch.setattr(CurrentContinuationMessageFamilies, "_restore_cohort", cohort)
@@ -857,11 +1030,14 @@ async def test_real_issued_progress_cancellation_keeps_primary_and_cause(operati
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
         entered = asyncio.Event()
         cause, secondary = RuntimeError("original cancellation cause"), RuntimeError("actual cancellation audit failure")
-        observed, records, dispatches = [], [], []
+        observed, records, dispatches, producer_tasks = [], [], [], []
         actual_finish = tool_batch.finish_cancelled
         actual_record = BufferingRecorder.record_with_failure_observation
 
         async def progress(*args, **kwargs):
+            producer = asyncio.current_task()
+            assert producer is not None
+            producer_tasks.append(producer)
             entered.set()
             try:
                 await asyncio.Event().wait()
@@ -892,7 +1068,10 @@ async def test_real_issued_progress_cancellation_keeps_primary_and_cause(operati
         task = asyncio.create_task(_advance(owner))
         try:
             await asyncio.wait_for(entered.wait(), 5)
-            task.cancel("actual issued progress cancellation")
+            stage = owner.business_stage
+            assert stage is not None and producer_tasks == [stage.task]
+            assert stage.task is not task and not stage.task.done()
+            stage.task.cancel("actual issued progress cancellation")
             with pytest.raises(BaseException) as caught:
                 await task
             assert len(observed) == 1 and observed[0].__cause__ is cause
@@ -905,7 +1084,10 @@ async def test_real_issued_progress_cancellation_keeps_primary_and_cause(operati
             assert not dispatches and len(sdk) == 1
         finally:
             if not task.done():
-                task.cancel()
+                stage = owner.business_stage
+                assert stage is not None and stage.task is not task
+                assert not producer_tasks or producer_tasks == [stage.task]
+                stage.task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
@@ -1000,6 +1182,10 @@ async def test_actual_context_refusal_has_portable_allowance_proof(operation_sto
                         drained=owner.runtime.drained,
                         data=data,
                         env_ref_names=owner.runtime.env_ref_names,
+                        recorder_source=capture_application_recorder_source(
+                            owner.runtime.live.recorder.snapshot_for_continuation(drained=owner.runtime.drained),
+                            env_ref_names=owner.runtime.env_ref_names,
+                        ),
                     )
                 else:
                     encode_coupled_batch_data(
@@ -1312,7 +1498,11 @@ def _changed_feedback_checkpoint(conn, running, selected, inventory, change):
         )
         message["content"] = json.dumps(altered)
         changed_graph = replace(graph, recorder=recorder)
-        graph_json = encode_application_graph(changed_graph, env_ref_names=inventory.names)
+        graph_json = encode_application_graph(
+            changed_graph,
+            env_ref_names=inventory.names,
+            recorder_source=capture_application_recorder_source(recorder, env_ref_names=inventory.names),
+        )
     else:
         assert change in ("body_order", "body_whitespace")
         message["content"] = (
@@ -1683,10 +1873,12 @@ async def test_terminal_failure_validator_requires_exact_actual_handoff(coordina
     from elspeth.web import async_workers
     from elspeth.web.async_workers import run_required_sql_finish_once
     from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
-    from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
+    from elspeth.web.required_work import RequiredWorkSource, RequiredWorkSubphase, RequiredWorkTicket
 
     first = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL)
     original, value = RuntimeError("actual terminal physical error"), object()
+    cause = ValueError("actual terminal physical prior cause")
+    original.__cause__ = cause
     entered, release = threading.Event(), threading.Event()
 
     def physical():
@@ -1707,7 +1899,11 @@ async def test_terminal_failure_validator_requires_exact_actual_handoff(coordina
             await asyncio.sleep(0)
             release.set()
         actual = await task
-        assert coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=actual) is (mode == "no_submit")
+        assert first.key.subphase is RequiredWorkSubphase.SQL_INITIAL and first.key.sql_attempt_ordinal == 0
+        assert coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=actual, expected_sql_attempt_ordinal=0) is (
+            mode == "no_submit"
+        )
+        coordinator.validate_recovery_terminal_sql_outcome(ticket=first, actual_outcome=actual)
         if mode in ("raised", "no_submit"):
             assert type(actual) is RequiredSQLRaised and actual.error is original
             counterfeit = RequiredSQLRaised(original, actual.deferred_cancellations)
@@ -1717,20 +1913,86 @@ async def test_terminal_failure_validator_requires_exact_actual_handoff(coordina
         if mode == "cancelled":
             assert actual.deferred_cancellations[0].args == ("actual terminal caller cancellation",)
         with pytest.raises(AuditIntegrityError, match="actual finish-once carrier"):
-            coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=counterfeit)
+            coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=counterfeit, expected_sql_attempt_ordinal=0)
         copy = RequiredWorkTicket(first.key, coordinator=coordinator)
         with pytest.raises(AuditIntegrityError, match="exact registered source authority"):
-            coordinator.validate_terminal_failure_sql_outcome(ticket=copy, actual_outcome=actual)
+            coordinator.validate_terminal_failure_sql_outcome(ticket=copy, actual_outcome=actual, expected_sql_attempt_ordinal=0)
         second = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=1)
         next_actual = await run_required_sql_finish_once(second, physical)
-        coordinator.validate_terminal_failure_sql_outcome(ticket=second, actual_outcome=next_actual)
+        assert second.key.subphase is RequiredWorkSubphase.SQL_RETRY and second.key.sql_attempt_ordinal == 1
+        coordinator.validate_terminal_failure_sql_outcome(ticket=second, actual_outcome=next_actual, expected_sql_attempt_ordinal=1)
+        assert original.__cause__ is cause
+        with pytest.raises(AuditIntegrityError, match="exact registered source authority"):
+            coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=actual, expected_sql_attempt_ordinal=1)
+        with pytest.raises(AuditIntegrityError, match="exact registered source authority"):
+            coordinator.validate_terminal_failure_sql_outcome(ticket=second, actual_outcome=next_actual, expected_sql_attempt_ordinal=0)
+        with pytest.raises(AuditIntegrityError, match="exact registered source authority"):
+            coordinator.validate_recovery_terminal_sql_outcome(ticket=second, actual_outcome=next_actual)
+        for invalid in (-1, 2, False, True):
+            with pytest.raises(AuditIntegrityError, match="exact bounded ordinal"):
+                coordinator.validate_terminal_failure_sql_outcome(
+                    ticket=second, actual_outcome=next_actual, expected_sql_attempt_ordinal=invalid
+                )
+        retry_copy = RequiredWorkTicket(second.key, coordinator=coordinator)
+        with pytest.raises(AuditIntegrityError, match="exact registered source authority"):
+            coordinator.validate_terminal_failure_sql_outcome(ticket=retry_copy, actual_outcome=next_actual, expected_sql_attempt_ordinal=1)
         with pytest.raises(AuditIntegrityError, match="actual finish-once carrier"):
-            coordinator.validate_terminal_failure_sql_outcome(ticket=second, actual_outcome=actual)
+            coordinator.validate_terminal_failure_sql_outcome(ticket=second, actual_outcome=actual, expected_sql_attempt_ordinal=1)
         coordinator.assert_completed()
     finally:
         release.set()
         if not task.done():
             await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("source", "readback", "producer", "issuer", "transition", "semantic", "recurrence"))
+async def test_terminal_failure_validator_refuses_other_registered_scope(coordinator, change):
+    from elspeth.web.async_workers import run_required_sql_finish_once
+    from elspeth.web.required_sql_outcomes import RequiredSQLReturned
+    from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkSource
+
+    value = object()
+    first = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL)
+    actual = await run_required_sql_finish_once(first, lambda: value)
+    assert type(actual) is RequiredSQLReturned and actual.value is value
+    assert coordinator.validate_terminal_failure_sql_outcome(ticket=first, actual_outcome=actual, expected_sql_attempt_ordinal=0) is False
+    issuer = coordinator
+    if change == "source":
+        other = coordinator.reserve(RequiredWorkSource.OPERATION_TERMINAL_SQL)
+    elif change == "readback":
+        other = coordinator.reserve(RequiredWorkSource.TERMINAL_WRITER_READ_SQL)
+    elif change == "producer":
+        other = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, producer=True)
+    elif change == "issuer":
+        issuer = RequiredWorkCoordinator(coordinator.authority)
+        other = issuer.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL)
+        assert other.key == first.key and other is not first
+    elif change == "transition":
+        other = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, transition_ordinal=1)
+    elif change == "semantic":
+        other = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, semantic_ordinal=1)
+    else:
+        assert change == "recurrence"
+        other = coordinator.reserve(RequiredWorkSource.TERMINAL_FAILURE_SQL, recurrence_ordinal=1)
+    if change == "producer":
+        # This real producer ticket is not SQL transport. Its process-local
+        # completion cannot make the healthy SQL carrier its own handoff.
+        other.complete_owned()
+        other_actual = actual
+    else:
+        other_actual = await run_required_sql_finish_once(other, lambda: value)
+        assert type(other_actual) is RequiredSQLReturned and other_actual.value is value
+    if change == "issuer":
+        assert (
+            issuer.validate_terminal_failure_sql_outcome(ticket=other, actual_outcome=other_actual, expected_sql_attempt_ordinal=0) is False
+        )
+    message = "terminal invocation" if change in ("transition", "semantic", "recurrence") else "exact registered source authority"
+    with pytest.raises(AuditIntegrityError, match=message):
+        coordinator.validate_terminal_failure_sql_outcome(ticket=other, actual_outcome=other_actual, expected_sql_attempt_ordinal=0)
+    if issuer is not coordinator:
+        issuer.assert_completed()
+    coordinator.assert_completed()
 
 
 @pytest.mark.asyncio
@@ -1767,7 +2029,9 @@ def test_terminal_failure_validator_refuses_unjoined_unknown(coordinator):
     error = RuntimeError("actual unknown-submission marker control")
     ticket.observe_submission_unknown(error)
     with pytest.raises(AuditIntegrityError, match="actual finish-once carrier"):
-        coordinator.validate_terminal_failure_sql_outcome(ticket=ticket, actual_outcome=RequiredSQLRaised(error, ()))
+        coordinator.validate_terminal_failure_sql_outcome(
+            ticket=ticket, actual_outcome=RequiredSQLRaised(error, ()), expected_sql_attempt_ordinal=0
+        )
     with pytest.raises(RequiredWorkIncomplete):
         coordinator.assert_completed()
 
@@ -2719,6 +2983,10 @@ async def test_actual_successful_refusal_requires_original_aliases_and_correlati
             drained=owner.runtime.drained,
             data=data,
             env_ref_names=owner.runtime.env_ref_names,
+            recorder_source=capture_application_recorder_source(
+                owner.runtime.live.recorder.snapshot_for_continuation(drained=owner.runtime.drained),
+                env_ref_names=owner.runtime.env_ref_names,
+            ),
         )
         if change == "none":
             assert source.invocation is owner.failure_custody.invocation
@@ -2741,13 +3009,9 @@ async def test_actual_successful_refusal_requires_original_aliases_and_correlati
                 with conn.begin_nested() as savepoint:
                     envelope = dict(row.tool_calls[0])
                     envelope["check"] = dict(envelope["check"], audit_id=str(uuid4()))
-                    assert (
-                        conn.execute(
-                            update(messages).where(messages.c.id == row.id).values(tool_calls=[envelope], content=canonical_json(envelope))
-                        ).rowcount
-                        == 1
-                    )
-                    with pytest.raises(AuditIntegrityError, match="guard"):
+                    assert conn.execute(update(messages).where(messages.c.id == row.id).values(tool_calls=[envelope])).rowcount == 1
+                    assert conn.execute(select(messages.c.content).where(messages.c.id == row.id)).scalar_one() == row.content
+                    with pytest.raises(AuditIntegrityError, match=r"^failed Advisor guard lost its actual durable audit$"):
                         read_tool_failure_source_on_connection(conn, running, env_ref_names=owner.runtime.env_ref_names)
                     savepoint.rollback()
                 assert read_tool_failure_source_on_connection(conn, running, env_ref_names=owner.runtime.env_ref_names) is not None
@@ -2768,6 +3032,10 @@ async def test_actual_successful_refusal_requires_original_aliases_and_correlati
                     drained=owner.runtime.drained,
                     data=data,
                     env_ref_names=owner.runtime.env_ref_names,
+                    recorder_source=capture_application_recorder_source(
+                        owner.runtime.live.recorder.snapshot_for_continuation(drained=owner.runtime.drained),
+                        env_ref_names=owner.runtime.env_ref_names,
+                    ),
                 )
             assert owner.authority.read_continuation_tool_failure(running, env_ref_names=owner.runtime.env_ref_names) is not None
         assert len(sdk) == (2 if kind == "cost" else 1)

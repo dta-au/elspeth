@@ -17,6 +17,78 @@ from tests.helpers import web_worker_whole_scope_origin as worker_origin
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
 
 ROOT = Path(__file__).parents[3]
+
+
+@pytest.mark.parametrize("fault", ("receiver", "operation", "actor", "provider", "failure", "missing", "extra"))
+def test_actual_owner_cancel_failure_handoff_preserves_exact_original_targets(fault):
+    path = "src/elspeth/web/sessions/routes/composer/operations.py"
+    source = fencing._parse_source(path, (ROOT / path).read_text())
+    method = fencing._reserve_node_at(source, "cancel_composer_operation")
+    calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "run_sync_in_worker"
+        and any(keyword.arg == "cancelled_failure" for keyword in node.keywords)
+    ]
+    assert len(calls) == 1
+    original = calls[0]
+    assert fencing._reserve_owner_cancel_failure_transport(original)
+    changed = copy.deepcopy(original)
+    if fault == "receiver":
+        changed.args[0].attr = "request_cancel"
+    elif fault == "missing":
+        changed.keywords.pop()
+    elif fault == "extra":
+        changed.keywords.append(ast.keyword(arg="callback", value=ast.Name(id="foreign", ctx=ast.Load())))
+    else:
+        name = {"operation": "operation_id", "actor": "actor_user_id", "provider": "auth_provider_type", "failure": "cancelled_failure"}[
+            fault
+        ]
+        keyword = next(item for item in changed.keywords if item.arg == name)
+        keyword.value = ast.Name(id="foreign", ctx=ast.Load())
+    assert not fencing._reserve_owner_cancel_failure_transport(changed)
+    assert fencing._reserve_owner_cancel_failure_transport(original)
+
+
+@pytest.mark.parametrize("fault", ("default", "type", "position", "veto"))
+def test_native_service_failure_field_requires_exact_none_partition_and_veto(reviewed_reserve_units, fault):
+    units = reviewed_reserve_units
+    batch_path = "src/elspeth/web/composer/tool_batch.py"
+    data_path = "src/elspeth/web/composer/continuation_batch_data.py"
+
+    def partition(sources):
+        batch = next(unit for unit in sources if unit.path == batch_path)
+        classes = {name: fencing._reserve_node_at(batch, name) for name in fencing._reserve_BATCH_CARRIER_SOURCES}
+        return fencing._reserve_batch_retained_field_partition(sources, classes)
+
+    failures, fields = partition(units)
+    assert not failures and fields, failures
+    assert "service_failure" not in fields["ContinuationBatchState"]
+    assert "manual_advisor_allowance" not in fields["ContinuationBatchState"]
+    path = data_path if fault == "veto" else batch_path
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source)
+    if fault == "veto":
+        joint = fencing._reserve_node_at(changed, "_joint")
+        assert ast.unparse(joint.body[2].test) == "batch.service_failure is not None"
+        joint.body[2].test = ast.Constant(value=False)
+    else:
+        declaration = fencing._reserve_node_at(changed, "ContinuationBatchState")
+        field = next(node for node in declaration.body if isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == "service_failure")
+        if fault == "default":
+            field.value = ast.Constant(value="foreign")
+        elif fault == "type":
+            field.annotation = ast.parse("BaseException | None", mode="eval").body
+        else:
+            declaration.body.remove(field)
+            declaration.body.append(field)
+    failures, refused = partition(tuple(changed if unit.path == path else unit for unit in units))
+    assert failures and not refused
+    assert partition(units) == ([], fields)
+
+
 TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/sessions/service.py"
 PROTOCOL = "src/elspeth/web/sessions/protocol.py"
@@ -25,6 +97,11 @@ TRANSCRIPT_READER = "src/elspeth/web/composer/transcript_blob_reader.py"
 
 
 def _source_units(paths: tuple[str, ...]) -> tuple[fencing.SourceUnit, ...]:
+    # Complete ordinary-dispatch fixtures now include the actual moved body.
+    # Keep existing caller indices stable and never synthesize its receipt.
+    ordinary_paths = set(compose._METHOD_PATHS) - {compose.FINALIZATION}
+    if ordinary_paths.issubset(paths) and compose.FINALIZATION not in paths:
+        paths = (*paths, compose.FINALIZATION)
     return tuple(fencing._parse_source(path, (ROOT / path).read_text()) for path in paths)
 
 
@@ -237,6 +314,7 @@ def _retained_transfer_units() -> tuple[fencing.SourceUnit, ...]:
                     terminal.WORKERS,
                     terminal.AUTHORITY,
                     "src/elspeth/web/composer/audit_storage.py",
+                    "src/elspeth/web/sessions/composer_finalization.py",
                 }
             )
         )
@@ -308,6 +386,504 @@ def test_retained_failure_supplier_roots_allow_unchanged_sibling_imports() -> No
         (*_retained_transfer_units(), sibling), fencing._reserve_RETAINED_FAILURE_ORIGINS
     )
     assert not any(sibling.path in failure for failure in failures), failures
+
+
+def test_retained_failure_branch_dependency_keeps_only_original_receiver_and_calls() -> None:
+    units = _retained_transfer_units()
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert failures == [], "the real retained-transfer positive is a prerequisite, not an opposition RED"
+    assert len(calls) == 4
+    audit_path = "src/elspeth/web/composer/audit_storage.py"
+    assert fencing._reserve_RETAINED_FAILURE_SUPPLIERS[audit_path] == (
+        "ComposerOperationFailureFacts",
+        "private_operation_failure_draft",
+    )
+    assert "elspeth.web.composer.audit_storage.RetainedOperationFailureFacts" not in fencing._reserve_RETAINED_FAILURE_ORIGINS
+    service = next(unit for unit in units if unit.path == SERVICE)
+    method = fencing._reserve_node_at(service, "SessionServiceImpl.fail_composer_async_operation")
+    guards = [
+        statement
+        for statement in method.body
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test)
+        == "operation_failure_facts is not None and type(operation_failure_facts) is not ComposerOperationFailureFacts"
+    ]
+    assert len(guards) == 1
+    assert isinstance(guards[0].body[0], ast.Raise)
+    actual = {
+        (unit.path, ast.unparse(node.func))
+        for unit in units
+        for node in ast.walk(unit.tree)
+        if isinstance(node, ast.Call) and (unit.path, id(node)) in calls
+    }
+    assert actual == {
+        (TURN, "lease.create_task"),
+        (TURN, "_capture_retained_operation_read"),
+        (TURN, "_read_retained_operation_context"),
+        (SERVICE, "private_operation_failure_draft"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("location", "imports", "effect"),
+    (
+        pytest.param(
+            "local",
+            "",
+            "global RetainedOperationFailureFacts\n RetainedOperationFailureFacts = ComposerOperationFailureFacts",
+            id="deferred-global",
+        ),
+        pytest.param(
+            "local",
+            "",
+            "import elspeth.web.composer.audit_storage as storage\n storage.RetainedOperationFailureFacts = storage.ComposerOperationFailureFacts",
+            id="qualified-local",
+        ),
+        pytest.param(
+            "sibling",
+            "from elspeth.web.composer import audit_storage as storage\nalias = storage\n",
+            "alias.RetainedOperationFailureFacts = alias.ComposerOperationFailureFacts",
+            id="sibling-module-alias",
+        ),
+        pytest.param(
+            "sibling",
+            "from elspeth.web.composer.audit_storage import RetainedOperationFailureFacts as Retained\n",
+            "Retained.__bases__ = (foreign,)",
+            id="sibling-class-alias",
+        ),
+    ),
+)
+def test_retained_failure_branch_dependency_refuses_rebinding(location: str, imports: str, effect: str) -> None:
+    units = _retained_transfer_units()
+    original_failures, original_calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert original_failures == [], "the real retained-transfer positive is a prerequisite, not an opposition RED"
+    assert len(original_calls) == 4
+    audit = next(unit for unit in units if unit.path == "src/elspeth/web/composer/audit_storage.py")
+    selected = {
+        name: fencing.stable_ast_dump(fencing._reserve_node_at(audit, name))
+        for name in fencing._reserve_RETAINED_FAILURE_SUPPLIERS[audit.path]
+    }
+    path = audit.path if location == "local" else "src/elspeth/retained_branch_dependency_adversary.py"
+    prefix = audit.source + "\n" if location == "local" else imports
+    harmless = fencing._parse_source(path, prefix + "def branch_dependency_opponent():\n return None\n")
+    control = tuple(harmless if unit.path == path else unit for unit in units) if location == "local" else (*units, harmless)
+    assert fencing._reserve_retained_failure_transfer_receipts(control)[0] == []
+    opponent = fencing._parse_source(path, prefix + "def branch_dependency_opponent():\n " + effect + "\n")
+    assert fencing.stable_ast_dump(opponent.tree) != fencing.stable_ast_dump(harmless.tree)
+    mutated = tuple(opponent if unit.path == path else unit for unit in units) if location == "local" else (*units, opponent)
+    changed_audit = next(unit for unit in mutated if unit.path == audit.path)
+    assert all(fencing.stable_ast_dump(fencing._reserve_node_at(changed_audit, name)) == shape for name, shape in selected.items())
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(mutated)
+    assert failures, "the classification dependency must not be rebound behind unchanged selected supplier bodies"
+    assert all(failure.startswith("retained/private transfer branch dependency ") for failure in failures), failures
+    assert calls == frozenset()
+    assert fencing._reserve_retained_failure_transfer_receipts(units) == ([], original_calls)
+
+
+@pytest.mark.parametrize("field", ("bases", "metaclass", "decorator", "type_parameters"))
+def test_retained_failure_branch_dependency_refuses_declaration_header(field: str) -> None:
+    units = _retained_transfer_units()
+    original_failures, original_calls = fencing._reserve_retained_failure_transfer_receipts(units)
+    assert original_failures == [], "the real retained-transfer positive is a prerequisite, not an opposition RED"
+    assert len(original_calls) == 4
+    audit = next(unit for unit in units if unit.path == "src/elspeth/web/composer/audit_storage.py")
+    changed = fencing._parse_source(audit.path, audit.source)
+    declaration = fencing._reserve_node_at(changed, "RetainedOperationFailureFacts")
+    assert isinstance(declaration, ast.ClassDef)
+    assert not declaration.bases and not declaration.keywords and not declaration.type_params
+    assert [ast.unparse(item) for item in declaration.decorator_list] == ["dataclass(frozen=True, slots=True)"]
+    original_header = fencing.stable_ast_dump(declaration)
+    if field == "bases":
+        declaration.bases = [ast.Name(id="ComposerOperationFailureFacts", ctx=ast.Load())]
+    elif field == "metaclass":
+        declaration.keywords = [ast.keyword(arg="metaclass", value=ast.Name(id="foreign", ctx=ast.Load()))]
+    elif field == "decorator":
+        declaration.decorator_list = [ast.Name(id="foreign", ctx=ast.Load())]
+    else:
+        declaration.type_params = ast.parse("class Probe[SessionOperationContext]:\n pass\n").body[0].type_params
+    ast.fix_missing_locations(changed.tree)
+    assert fencing.stable_ast_dump(declaration) != original_header
+    assert all(
+        fencing.stable_ast_dump(fencing._reserve_node_at(changed, name)) == fencing.stable_ast_dump(fencing._reserve_node_at(audit, name))
+        for name in fencing._reserve_RETAINED_FAILURE_SUPPLIERS[audit.path]
+    )
+    mutated = tuple(changed if unit.path == audit.path else unit for unit in units)
+    failures, calls = fencing._reserve_retained_failure_transfer_receipts(mutated)
+    assert failures, "the classification dependency must retain its actual closed declaration header"
+    assert all(failure.startswith("retained/private transfer branch dependency ") for failure in failures), failures
+    assert calls == frozenset()
+    assert fencing._reserve_retained_failure_transfer_receipts(units) == ([], original_calls)
+
+
+@pytest.mark.parametrize("fault", ("missing", "foreign", "swapped", "constant", "none", "coroutine_default"))
+def test_p4_title_limit_refuses_wrong_actual_forwarding(fault: str) -> None:
+    original = _source_units((TURN,))[0]
+    method = fencing._reserve_node_at(original, "_run_composer_turn")
+    invoke = method.body[36].body[24]
+    title = receiver.composer_title_prelude(invoke)
+    dispatch = receiver.composer_dispatch_calls(invoke)
+    assert title is invoke.body[0] and dispatch is not None
+    changed = fencing._parse_source(TURN, original.source)
+    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
+    child = candidate.body[0].body[2]
+    call = next(node for node in ast.walk(child) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session")
+    argument = next(keyword for keyword in call.keywords if keyword.arg == "max_prepared_request_bytes")
+    assert ast.unparse(argument.value) == "settings.composer_max_prepared_request_bytes"
+    if fault == "missing":
+        call.keywords.remove(argument)
+    elif fault == "foreign":
+        argument.value.value = ast.Name(id="foreign_settings", ctx=ast.Load())
+    elif fault == "swapped":
+        argument.value.attr = "composer_max_tool_calls_per_turn"
+    elif fault == "constant":
+        argument.value = ast.Constant(value=2 * 1024 * 1024)
+    elif fault == "none":
+        argument.value = ast.Constant(value=None)
+    else:
+        child.args.args.append(ast.arg(arg="limit"))
+        child.args.defaults.append(copy.deepcopy(argument.value))
+    ast.fix_missing_locations(changed.tree)
+    assert receiver.composer_title_prelude(candidate) is None
+    assert receiver.composer_dispatch_calls(candidate) is None
+    assert receiver.composer_title_prelude(invoke) is title
+    assert receiver.composer_dispatch_calls(invoke) == dispatch
+
+
+@pytest.mark.parametrize("method_name", ("compose", "compose_recovery"))
+@pytest.mark.parametrize("fault", ("budget", "missing_budget", "message", "unknown_keyword"))
+def test_p4_paired_call_arguments_and_default_escape_remain_closed(method_name: str, fault: str) -> None:
+    original = _source_units((TURN,))[0]
+    invoke = fencing._reserve_node_at(original, "_run_composer_turn").body[36].body[24]
+    dispatch = receiver.composer_dispatch_calls(invoke)
+    assert dispatch is not None
+    changed = fencing._parse_source(TURN, original.source)
+    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
+    calls = receiver.composer_dispatch_calls(candidate)
+    assert calls is not None
+    call = next(node for node in calls if node.func.attr == method_name)
+    budget = next(keyword for keyword in call.keywords if keyword.arg == "budget_seconds")
+    assert ast.unparse(budget.value) == "compose_budget_seconds"
+    if fault == "budget":
+        budget.value = ast.parse("budget_anchor.remaining_at_running_seconds", mode="eval").body
+    elif fault == "missing_budget":
+        call.keywords.remove(budget)
+    elif fault == "message":
+        if method_name == "compose":
+            assert ast.unparse(call.args[0]) == "message_text"
+            call.args[0] = ast.Name(id="foreign_message", ctx=ast.Load())
+        else:
+            message = next(keyword for keyword in call.keywords if keyword.arg == "message")
+            assert ast.unparse(message.value) == "message_text"
+            message.value = ast.Name(id="foreign_message", ctx=ast.Load())
+    else:
+        call.keywords.append(ast.keyword(arg="foreign_argument", value=ast.Name(id="provider_owner", ctx=ast.Load())))
+    ast.fix_missing_locations(changed.tree)
+    assert receiver.composer_title_prelude(candidate) is candidate.body[0]
+    assert receiver.composer_dispatch_calls(candidate) is None
+    assert receiver.composer_dispatch_calls(invoke) == dispatch
+
+
+@pytest.mark.parametrize("fault", ("condition", "graph_guard", "extra_effect"))
+def test_p4_paired_dispatch_keeps_actual_closed_branches(fault: str) -> None:
+    original = _source_units((TURN,))[0]
+    invoke = fencing._reserve_node_at(original, "_run_composer_turn").body[36].body[24]
+    dispatch = receiver.composer_dispatch_calls(invoke)
+    assert dispatch is not None
+    changed = fencing._parse_source(TURN, original.source)
+    candidate = fencing._reserve_node_at(changed, "_run_composer_turn").body[36].body[24]
+    branch = candidate.body[2]
+    assert isinstance(branch, ast.If) and ast.unparse(branch.test) == "recovery_context.malformed_head"
+    if fault == "condition":
+        branch.test = ast.Constant(value=True)
+    elif fault == "graph_guard":
+        del branch.orelse[0]
+    else:
+        branch.body.insert(0, ast.parse("foreign(provider_owner)").body[0])
+    ast.fix_missing_locations(changed.tree)
+    assert receiver.composer_dispatch_calls(candidate) is None
+    assert receiver.composer_dispatch_calls(invoke) == dispatch
+
+
+def test_composer_finalization_namespace_serializes_actual_clone_with_typed_ellipsis() -> None:
+    unit = _source_units((compose.FINALIZATION,))[0]
+    clone = fencing._parse_source(unit.path, unit.source)
+    method = fencing._reserve_node_at(unit, "_turn_audit_cohort_drafts")
+    assert any(isinstance(node, ast.Constant) and node.value is Ellipsis for node in ast.walk(method.returns))
+    actual = compose._finalization_namespace_shape(unit.tree)
+    assert len(actual) == 64
+    assert compose._finalization_namespace_shape(clone.tree) == actual
+    assert compose._canonical_ast(ast.Constant(value=Ellipsis)) == [
+        "Constant",
+        [["value", {"literal_type": "ellipsis"}]],
+    ]
+    marker_literal = ast.parse("{'literal_type': 'ellipsis'}", mode="eval").body
+    assert compose._canonical_ast(marker_literal) != compose._canonical_ast(ast.Constant(value=Ellipsis))
+
+
+@pytest.mark.parametrize("replacement", ("Ellipsis", "...", None))
+def test_composer_finalization_namespace_distinguishes_actual_ellipsis_from_source_values(replacement: str | None) -> None:
+    unit = _source_units((compose.FINALIZATION,))[0]
+    expected = compose._finalization_namespace_shape(unit.tree)
+    changed = fencing._parse_source(unit.path, unit.source)
+    method = fencing._reserve_node_at(changed, "_turn_audit_cohort_drafts")
+    targets = [node for node in ast.walk(method.returns) if isinstance(node, ast.Constant) and node.value is Ellipsis]
+    assert targets, "the opposed Ellipsis must be in a real retained return annotation"
+    targets[0].value = replacement
+    assert compose._finalization_namespace_shape(changed.tree) != expected
+    assert compose._finalization_namespace_shape(unit.tree) == expected
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    (
+        (None, ["Constant", []]),
+        ("Ellipsis", ["Constant", [["value", "Ellipsis"]]]),
+        (True, ["Constant", [["value", True]]]),
+        (7, ["Constant", [["value", 7]]]),
+    ),
+)
+def test_composer_canonical_literal_addition_preserves_existing_constant_shape(literal: object, expected: list[object]) -> None:
+    assert compose._canonical_ast(ast.Constant(value=literal)) == expected
+
+
+@pytest.mark.parametrize("fault", ("live-freeze", "missing-nested-freeze", "wrong-thaw"))
+def test_composer_moved_finalizer_value_boundaries_refuse_after_only_source_shapes_are_rebound(monkeypatch, fault):
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert not failures and receipt is not None, failures
+    path = compose.FINALIZATION
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source)
+    method = fencing._reserve_node_at(changed, "settle_composer_result")
+    if fault == "wrong-thaw":
+        calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "deep_thaw"
+        ]
+        assert len(calls) == 4
+        calls[0].args[0] = ast.Name(id="settings", ctx=ast.Load())
+        monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, path, compose._method_shape(method))
+    else:
+        initializer = fencing._reserve_node_at(changed, "ComposerFinalizationInputs.__post_init__")
+        call = initializer.body[0].value
+        if fault == "live-freeze":
+            call.args[1] = ast.Constant(value="lease")
+        else:
+            assert ast.unparse(call.args[-1]) == "'chat_ingress_inputs'"
+            call.args.pop()
+    ast.fix_missing_locations(changed.tree)
+    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", compose._finalization_namespace_shape(changed.tree))
+    failures, refused = compose.compose_proposal_local_transfers(tuple(changed if unit.path == path else unit for unit in units))
+    assert failures and refused is None
+    assert any("value freeze" in failure or "value thaw" in failure for failure in failures), failures
+
+
+def test_composer_moved_finalizer_receipt_identifies_only_actual_wrapper_nodes() -> None:
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [], "the actual complete-body prerequisites must close before moved-finalizer oppositions"
+    assert receipt is not None
+    turn = next(unit for unit in units if unit.path == TURN)
+    expected = {
+        name: (TURN, id(node))
+        for name in ("ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider")
+        for node in ast.walk(turn.tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    }
+    assert set(expected) == {"ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider"}
+    assert receipt["moved_finalization"] == expected
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("service", "lease", "running", "observation", "provider_binding", "budget_anchor", "result", "duplicate", "owner"),
+)
+def test_composer_moved_finalizer_refuses_changed_actual_handoff(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [] and receipt is not None
+    original_shape = compose._REVIEWED_METHOD_SHAPES[TURN]
+    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == TURN else unit for unit in units)
+    turn = next(unit for unit in mutated if unit.path == TURN)
+    method = fencing._reserve_node_at(turn, "_run_composer_turn")
+    wrapper = next(node for node in ast.walk(method) if isinstance(node, ast.AsyncFunctionDef) and node.name == "settle_post_provider")
+    handoff = wrapper.body[0].value.value
+    assert isinstance(handoff, ast.Call) and ast.unparse(handoff.func) == "settle_composer_result"
+    constructor = handoff.args[0]
+    assert isinstance(constructor, ast.Call) and ast.unparse(constructor.func) == "ComposerFinalizationInputs"
+    if fault == "result":
+        assert ast.unparse(handoff.args[1]) == "result"
+        handoff.args[1] = ast.Name(id="foreign_result", ctx=ast.Load())
+    elif fault == "duplicate":
+        wrapper.body.insert(0, ast.Expr(value=ast.Await(value=copy.deepcopy(handoff))))
+    elif fault == "owner":
+        owners = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Assign)
+            and ast.unparse(node).startswith("continuation = lease.create_task(_capture_freeform_child(settle_post_provider(result))")
+        ]
+        assert len(owners) == 1
+        owners[0].value.func.value = ast.Name(id="foreign_lease", ctx=ast.Load())
+    else:
+        argument = next(keyword for keyword in constructor.keywords if keyword.arg == fault)
+        assert ast.unparse(argument.value) == fault
+        argument.value = ast.Name(id="foreign_" + fault, ctx=ast.Load())
+    ast.fix_missing_locations(turn.tree)
+    # Re-admit only the changed caller's whole-body pin: the finite join must
+    # distinguish the actual owner/argument/once-only obligation itself.
+    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
+    failures, refused = compose.compose_proposal_local_transfers(mutated)
+    assert failures and refused is None
+    monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, original_shape)
+    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+
+
+@pytest.mark.parametrize("fault", ("base", "metaclass", "decorator", "default", "descriptor"))
+def test_composer_moved_finalizer_refuses_nonplain_constructor(fault: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [] and receipt is not None
+    original_namespace_shape = compose._FINALIZATION_NAMESPACE_SHAPE
+    path = "src/elspeth/web/sessions/composer_finalization.py"
+    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == path else unit for unit in units)
+    source = next(unit for unit in mutated if unit.path == path)
+    cls = fencing._reserve_node_at(source, "ComposerFinalizationInputs")
+    assert isinstance(cls, ast.ClassDef)
+    if fault == "base":
+        cls.bases = [ast.Name(id="foreign", ctx=ast.Load())]
+    elif fault == "metaclass":
+        cls.keywords = [ast.keyword(arg="metaclass", value=ast.Name(id="foreign", ctx=ast.Load()))]
+    elif fault == "decorator":
+        cls.decorator_list = [ast.Name(id="foreign", ctx=ast.Load())]
+    elif fault == "default":
+        field = next(node for node in cls.body if isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == "lease")
+        assert field.value is None
+        field.value = ast.Call(func=ast.Name(id="foreign", ctx=ast.Load()), args=[], keywords=[])
+    else:
+        cls.body.extend(ast.parse("def __getattribute__(self, name):\n return foreign(name)\n").body)
+    ast.fix_missing_locations(source.tree)
+    # Constructor obligations must survive deliberately re-admitted source
+    # seals; this does not grant the changed declaration or its effects.
+    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", compose._finalization_namespace_shape(source.tree))
+    failures, refused = compose.compose_proposal_local_transfers(mutated)
+    assert failures and refused is None
+    monkeypatch.setattr(compose, "_FINALIZATION_NAMESPACE_SHAPE", original_namespace_shape)
+    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+
+
+@pytest.mark.parametrize("fault", ("forwarding", "checkpoint", "audit", "cancellation", "response", "return"))
+def test_composer_moved_finalizer_preserves_complete_selected_body(fault: str) -> None:
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [] and receipt is not None
+    path = "src/elspeth/web/sessions/composer_finalization.py"
+    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == path else unit for unit in units)
+    source = next(unit for unit in mutated if unit.path == path)
+    method = fencing._reserve_node_at(source, "settle_composer_result")
+    if fault == "forwarding":
+        target = next(node for node in method.body if isinstance(node, ast.Assign) and ast.unparse(node) == "lease = inputs.lease")
+        target.value = ast.Name(id="foreign_lease", ctx=ast.Load())
+    elif fault in {"checkpoint", "audit"}:
+        spelling = "checkpoint_projection.complete_owned()" if fault == "checkpoint" else "observation.audit_cohort_durable = True"
+        targets = [node for node in ast.walk(method) if isinstance(node, (ast.Assign, ast.Expr)) and ast.unparse(node) == spelling]
+        assert targets
+        target = targets[-1]
+        if isinstance(target, ast.Assign):
+            target.value = ast.Constant(value=False)
+        else:
+            target.value = ast.Constant(value=None)
+    elif fault in {"cancellation", "response"}:
+        spelling = "_join_shielded_task_after_cancellation" if fault == "cancellation" else "_message_with_state_response"
+        targets = [node for node in ast.walk(method) if isinstance(node, ast.Name) and node.id == spelling]
+        assert targets
+        targets[-1].id = "foreign"
+    else:
+        assert isinstance(method.body[-1], ast.Return) and ast.unparse(method.body[-1].value) == "record"
+        method.body[-1].value = ast.Name(id="foreign", ctx=ast.Load())
+    ast.fix_missing_locations(source.tree)
+    failures, refused = compose.compose_proposal_local_transfers(mutated)
+    assert failures and refused is None
+    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+
+
+@pytest.mark.parametrize("fault", ("missing", "duplicate", "foreign_path", "foreign_import"))
+def test_composer_moved_finalizer_refuses_source_substitution(fault: str) -> None:
+    units = _retained_transfer_units()
+    failures, receipt = compose.compose_proposal_local_transfers(units)
+    assert failures == [] and receipt is not None
+    path = "src/elspeth/web/sessions/composer_finalization.py"
+    source = next(unit for unit in units if unit.path == path)
+    if fault == "missing":
+        mutated = tuple(unit for unit in units if unit.path != path)
+    elif fault == "duplicate":
+        mutated = (*units, fencing._parse_source(path, source.source))
+    elif fault == "foreign_path":
+        mutated = (
+            *(unit for unit in units if unit.path != path),
+            fencing._parse_source("src/elspeth/foreign_finalization.py", source.source),
+        )
+    else:
+        mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == TURN else unit for unit in units)
+        turn = next(unit for unit in mutated if unit.path == TURN)
+        imports = [
+            node
+            for node in turn.tree.body
+            if isinstance(node, ast.ImportFrom)
+            and node.module == "elspeth.web.sessions.composer_finalization"
+            and any(alias.name == "settle_composer_result" for alias in node.names)
+        ]
+        assert len(imports) == 1
+        imports[0].module = "foreign.finalization"
+    failures, refused = compose.compose_proposal_local_transfers(mutated)
+    assert failures and refused is None
+    assert compose.compose_proposal_local_transfers(units)[1] == receipt
+
+
+@pytest.mark.parametrize(
+    ("name", "field", "fault"),
+    (
+        ("persist_compose_turn", "continuation_observation", "default"),
+        ("persist_continuation_compose_turn", "continuation_observation", "annotation"),
+        ("_readback_continuation_p4_transaction", "observation", "annotation"),
+        ("_retain_unavailable_continuation_p4", "observation", "default"),
+        ("fail_continuation_tool_operation", "failure_projection_work", "annotation"),
+        ("persist_continuation_compose_turn", "", "return"),
+    ),
+)
+def test_terminal_p4_declaration_roles_survive_readmitted_namespace(
+    name: str, field: str, fault: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    units = _retained_transfer_units()
+    assert terminal.terminal_sql_local_contracts(units)[0] == []
+    original_namespace = terminal.NAMESPACE_GRAMMAR
+    mutated = tuple(fencing._parse_source(unit.path, unit.source) if unit.path == SERVICE else unit for unit in units)
+    source = next(unit for unit in mutated if unit.path == SERVICE)
+    cls = fencing._reserve_node_at(source, terminal.CLASS)
+    method = fencing._reserve_node_at(source, terminal.CLASS + "." + name)
+    if fault == "return":
+        assert ast.unparse(method.returns) == "RequiredSQLFinishOnce[CommittedContinuationP4]"
+        method.returns = ast.Name(id="AuditOutcome", ctx=ast.Load())
+    elif fault == "annotation":
+        argument = next(argument for argument in (*method.args.args, *method.args.kwonlyargs) if argument.arg == field)
+        assert argument.annotation is not None
+        argument.annotation = ast.Name(id="foreign", ctx=ast.Load())
+    else:
+        index = next(index for index, argument in enumerate(method.args.kwonlyargs) if argument.arg == field)
+        default = method.args.kw_defaults[index]
+        if name == "_retain_unavailable_continuation_p4":
+            assert default is None
+            method.args.kw_defaults[index] = ast.Constant(value=None)
+        else:
+            assert isinstance(default, ast.Constant) and default.value is None
+            method.args.kw_defaults[index] = ast.Constant(value=False)
+    ast.fix_missing_locations(source.tree)
+    monkeypatch.setattr(terminal, "NAMESPACE_GRAMMAR", terminal.namespace_grammar(cls))
+    failures, _ = terminal.terminal_sql_local_contracts(mutated)
+    assert any("reviewed P4" in failure and name in failure for failure in failures), failures
+    monkeypatch.setattr(terminal, "NAMESPACE_GRAMMAR", original_namespace)
+    assert terminal.terminal_sql_local_contracts(units)[0] == []
 
 
 @pytest.mark.parametrize(
@@ -532,6 +1108,11 @@ def test_transcript_blob_reader_call_is_under_the_reviewed_source_guard() -> Non
             "src/elspeth/web/coordination/composer_operation_authority.py",
             "21ce974db2b688f578141feb109a49abb96721deb9b7b1ba27111bbb4f09b66b",
         ),
+        (PROTOCOL, "5f453f3e66948e45e526fc770086498386d2c14868374fc9c55bcda15dec913d"),
+        (
+            "src/elspeth/web/coordination/composer_operation_authority.py",
+            "f4da24239a18419aca382174e42dbbcba9d7cefb3da02a93d0a8a8c216076891",
+        ),
         ("src/elspeth/web/sessions/composer_operation_errors.py", "990f34740742ced097f6199cf174cfe9e3e79a9071ea3d8102d492bcc89ddc19"),
         ("src/elspeth/web/sessions/composer_operations.py", "895edd79e2c73867f8a22d5d5ed44dc325dcb0a3fba3c484b6a1666492474f01"),
         (TURN, "387e76e614f5835265f5940c61f0c96342933fc3ecacdd23843ae7b54b15c3ce"),
@@ -554,6 +1135,52 @@ def test_previous_source_guard_refuses_current_source(path: str, old_digest: str
         assert check(sources) == ["full source changed " + path]
 
 
+@pytest.mark.parametrize(
+    ("path", "symbol", "before", "after"),
+    (
+        (
+            PROTOCOL,
+            "SessionOperationAuthority.reconcile_unavailable_composer_segment",
+            "candidate: ContinuationRecoveryCandidate",
+            "candidate: object",
+        ),
+        (
+            PROTOCOL,
+            "SessionOperationAuthority.settle_lost_inactive_continuation",
+            "candidate: ContinuationInactiveCandidate",
+            "candidate: object",
+        ),
+        *(
+            (
+                "src/elspeth/web/coordination/composer_operation_authority.py",
+                "ComposerAsyncOperationAuthority." + method,
+                before,
+                after,
+            )
+            for method in ("list_recoverable_segments", "list_inactive_continuations")
+            for before, after in (
+                ("from elspeth.web.sessions.continuation_recovery_candidates import", "from foreign.recovery import"),
+                ("self._engine", "other._engine"),
+                ("limit=limit", "limit=1"),
+            )
+        ),
+    ),
+)
+def test_reviewed_u39_source_guard_seals_exact_candidate_and_discovery_transfers(path, symbol, before, after):
+    sources = {item: (ROOT / item).read_text() for item in fencing._reserve_FULL_SOURCE_PATHS}
+    assert fencing._reserve_full_source_failures(sources) == []
+    original = fencing._parse_source(path, sources[path])
+    node = fencing._reserve_node_at(original, symbol)
+    assert isinstance(node, ast.FunctionDef)
+    segment = ast.get_source_segment(original.source, node)
+    assert segment is not None and segment.count(before) == 1 and original.source.count(segment) == 1
+    changed = dict(sources)
+    changed[path] = original.source.replace(segment, segment.replace(before, after, 1), 1)
+    assert changed[path] != sources[path]
+    assert fencing._reserve_full_source_failures(changed) == ["full source changed " + path]
+    assert fencing._reserve_full_source_failures(sources) == []
+
+
 def test_retained_operation_context_cannot_be_replaced_at_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
     units = _source_units((TURN, compose.SERVICE, compose.PROPOSALS, compose.SETTLEMENT))
     assert compose.compose_proposal_local_transfers(units)[0] == []
@@ -566,7 +1193,7 @@ def test_retained_operation_context_cannot_be_replaced_at_dispatch(monkeypatch: 
     context.value = ast.Name(id="foreign_context", ctx=ast.Load())
     assert compose.compose_proposal_local_transfers(units)[0] == ["composer complete executed method grammar changed " + TURN]
     monkeypatch.setitem(compose._REVIEWED_METHOD_SHAPES, TURN, compose._method_shape(compose._strip_inert_annotations(method, TURN)))
-    assert compose.compose_proposal_local_transfers(units)[0] == ["composer retained operation context argument changed"]
+    assert compose.compose_proposal_local_transfers(units)[0] == ["composer turn exact paired call arguments or closed branches changed"]
 
 
 @pytest.mark.parametrize(
@@ -1501,7 +2128,7 @@ def test_provider_mint_callable_escape_remains_an_unclosed_common_premise() -> N
 
 
 def test_worker_six_actual_sources_refuse_one_valid_reserve_target_change() -> None:
-    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN))
+    units = _source_units((worker_origin.APP, worker_origin.WORKER, worker_origin.TURN, "src/elspeth/web/coordination/lifecycle.py"))
     failures, receipt = worker_six.worker_six_local_contracts(units)
     assert failures == []
     assert len(receipt["reserve_calls"]) == len(receipt["per_call"]) == 6
@@ -1624,14 +2251,16 @@ def test_nominal_mutation_revocation_handler_is_exact(fault: str) -> None:
     invoke = method.body[36].body[24]
     assert receiver.composer_title_prelude(invoke) is not None
     assert receiver.composer_dispatch_calls(invoke) is not None
-    handler = invoke.handlers[11]
-    assert ast.unparse(handler.type) == "ComposerMutationAuthorityRevoked"
+    handlers = [handler for handler in invoke.handlers if ast.unparse(handler.type) == "ComposerMutationAuthorityRevoked"]
+    assert len(handlers) == 1
+    handler = handlers[0]
+    index = invoke.handlers.index(handler)
     if fault == "type":
         handler.type.id = "Exception"
     elif fault == "missing":
-        del invoke.handlers[11]
+        del invoke.handlers[index]
     elif fault == "order":
-        invoke.handlers[11], invoke.handlers[12] = invoke.handlers[12], invoke.handlers[11]
+        invoke.handlers[index], invoke.handlers[index + 1] = invoke.handlers[index + 1], invoke.handlers[index]
     elif fault == "sidecar":
         handler.body[0].value.func.id = "foreign_calls"
     elif fault == "reason":
@@ -3899,10 +4528,18 @@ def test_annotation_dictionary_view_grant_requires_actual_fresh_dictionary_and_d
 
 
 def test_actual_annotation_owners_return_fresh_builtin_dictionaries_with_retained_values():
+    from collections.abc import Mapping
     from inspect import get_annotations
-    from typing import get_type_hints
+    from typing import Annotated, get_args, get_origin, get_type_hints
 
-    from elspeth.web.composer.redaction import _RepairToolCallShadowModel
+    from pydantic import BeforeValidator
+
+    from elspeth.web.composer.redaction import (
+        _RepairToolCallShadowModel,
+        _restore_fixed_repair_arguments_for_validation,
+        _SensitiveMarker,
+        _summarize_repair_arguments,
+    )
 
     raw = get_annotations(_RepairToolCallShadowModel)
     raw_again = get_annotations(_RepairToolCallShadowModel)
@@ -3911,9 +4548,17 @@ def test_actual_annotation_owners_return_fresh_builtin_dictionaries_with_retaine
     assert type(raw) is dict and type(resolved) is dict
     assert raw is not raw_again and resolved is not resolved_again
     assert raw["arguments"] is raw_again["arguments"]
-    assert resolved["arguments"] == resolved_again["arguments"]
     assert raw.items().mapping["arguments"] is raw["arguments"]
-    assert resolved.values().mapping["arguments"] is resolved["arguments"]
+    for current in (resolved, resolved_again):
+        annotation = current["arguments"]
+        assert get_origin(annotation) is Annotated
+        value_type, validator, sensitive = get_args(annotation)
+        assert value_type == Mapping[str, object]
+        assert type(validator) is BeforeValidator
+        assert validator.func is _restore_fixed_repair_arguments_for_validation
+        assert type(sensitive) is _SensitiveMarker
+        assert sensitive.summarizer is _summarize_repair_arguments
+        assert current.values().mapping["arguments"] is annotation
 
 
 @pytest.mark.landscape_fencing_regression
@@ -4378,8 +5023,19 @@ def test_run_status_literal_receipt_requires_checked_owner_and_actual_callers(be
     assert normal["failures"] == []
     assert len(normal["arguments"]) == 4
     owner = next(unit for unit in units if unit.path == "src/elspeth/web/execution/schemas.py")
-    assert owner.source.count(before) == 1
-    changed_owner = fencing._parse_source(owner.path, owner.source.replace(before, after))
+    if before == "if type(value) is not str:":
+        declaration = fencing._reserve_node_at(owner, "_status_literal_values")
+        source = ast.get_source_segment(owner.source, declaration)
+        assert source is not None and source.count(before) == 1
+        changed_source = owner.source.replace(source, source.replace(before, after), 1)
+        assert fencing._reserve_node_at(owner, "_require_run_event_mapping") is not None
+    else:
+        assert owner.source.count(before) == 1
+        changed_source = owner.source.replace(before, after)
+    changed_owner = fencing._parse_source(owner.path, changed_source)
+    assert ast.dump(fencing._reserve_node_at(changed_owner, "_require_run_event_mapping")) == ast.dump(
+        fencing._reserve_node_at(owner, "_require_run_event_mapping")
+    )
     changed = fencing._reserve_run_status_literal_metadata_receipt(tuple(changed_owner if unit is owner else unit for unit in units))
     assert changed["failures"]
     assert changed["origins"] == {}
@@ -7528,7 +8184,7 @@ def test_receiving_batch_partition_retains_every_wire_field_and_only_one_settled
     assert failures == []
     actual = tuple(node.target.id for node in classes["ContinuationBatchState"].body if isinstance(node, ast.AnnAssign))
     assert actual[-1] == "manual_advisor_allowance"
-    assert fields["ContinuationBatchState"] == actual[:-1]
+    assert fields["ContinuationBatchState"] == tuple(name for name in actual if name not in {"manual_advisor_allowance", "service_failure"})
     for name in ("ContinuationCallState", "_CallWireFacts"):
         assert fields[name] == tuple(node.target.id for node in classes[name].body if isinstance(node, ast.AnnAssign))
     failures, receipt = fencing._reserve_continuation_batch_state_receipt(units)
@@ -7564,7 +8220,7 @@ def test_receiving_batch_partition_refuses_changed_transient_declaration_or_sour
     assert fencing._reserve_batch_retained_field_partition(units, _receiving_batch_classes(units))[0] == []
 
 
-@pytest.mark.parametrize("fault", ("include_live_owner", "omit_spent", "reorder"))
+@pytest.mark.parametrize("fault", ("include_live_owner", "include_service_failure", "omit_spent", "reorder"))
 def test_receiving_batch_wire_registry_cannot_hide_or_retain_another_field(fault):
     units = fencing._production_units()
     assert fencing._reserve_continuation_batch_state_receipt(units)[0] == []
@@ -7575,6 +8231,8 @@ def test_receiving_batch_wire_registry_cannot_hide_or_retain_another_field(fault
         fields = next(value for key, value in zip(registry.keys, registry.values, strict=True) if key.value == "ContinuationBatchState")
         if fault == "include_live_owner":
             fields.elts.append(ast.Constant(value="manual_advisor_allowance"))
+        elif fault == "include_service_failure":
+            fields.elts.append(ast.Constant(value="service_failure"))
         elif fault == "omit_spent":
             fields.elts = [item for item in fields.elts if item.value != "advisor_calls_used"]
         else:
@@ -7594,12 +8252,12 @@ def test_receiving_batch_partition_requires_the_actual_nominal_settled_capture_g
 
     def change(unit):
         joint = fencing._reserve_node_at(unit, "_joint")
-        guard = joint.body[2]
+        guard = joint.body[3]
         assert ast.unparse(guard.test) == "batch.manual_advisor_allowance is not None"
         if fault == "missing":
             joint.body.remove(guard)
         elif fault == "late":
-            joint.body.append(joint.body.pop(2))
+            joint.body.append(joint.body.pop(3))
         elif fault == "count":
             guard.body[-1].value.keywords[0].value = ast.Constant(value=0)
         elif fault == "receiver":
@@ -7715,6 +8373,2154 @@ def test_receiving_handoff_return_permission_does_not_admit_other_self_reservati
     failures, receipt = fencing._reserve_coordinator_self_call_receipts(changed)
     assert failures and receipt == frozenset()
     assert fencing._reserve_coordinator_self_slice_failures(units) == []
+
+
+def _receiving_deadline_opposition(path, symbol, before, after, diagnostic):
+    units = fencing._production_units()
+    assert fencing._reserve_coordinator_self_slice_failures(units) == []
+    original_failures, original_receipt = fencing._reserve_coordinator_self_call_receipts(units)
+    assert original_failures == [] and original_receipt
+    original = next(unit for unit in units if unit.path == path)
+    source_bytes = original.source.encode("utf-8")
+    start, end = 0, len(source_bytes)
+    if symbol is not None:
+        node = fencing._reserve_node_at(original, symbol)
+        assert isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        assert node.end_lineno is not None and node.end_col_offset is not None
+        # AST columns are UTF-8 byte offsets. Bind to the named class/member's
+        # actual span: identical getter text in another class is not a locator.
+        lines = source_bytes.splitlines(keepends=True)
+        start = sum(map(len, lines[: node.lineno - 1])) + node.col_offset
+        end = sum(map(len, lines[: node.end_lineno - 1])) + node.end_col_offset
+        assert source_bytes[start:end].decode("utf-8") == ast.get_source_segment(original.source, node)
+    selected = source_bytes[start:end].decode("utf-8")
+    assert selected.count(before) == 1 and before != after
+    replacement = selected.replace(before, after, 1).encode("utf-8")
+    changed_bytes = source_bytes[:start] + replacement + source_bytes[end:]
+    assert changed_bytes[:start] == source_bytes[:start]
+    assert changed_bytes[start + len(replacement) :] == source_bytes[end:]
+    changed_source = changed_bytes.decode("utf-8")
+    assert changed_source != original.source
+    changed_unit = fencing._parse_source(path, changed_source)
+    if symbol is not None:
+        changed_node = fencing._reserve_node_at(changed_unit, symbol)
+        assert isinstance(changed_node, (ast.ClassDef, ast.FunctionDef))
+        assert ast.get_source_segment(changed_source, changed_node) == replacement.decode("utf-8")
+    changed = tuple(changed_unit if unit is original else unit for unit in units)
+    # Deliberately enter below _reserve_recipe_failures: a stale source recipe
+    # cannot supply the expected semantic refusal or hide a broken positive.
+    assert fencing._reserve_coordinator_self_slice_failures(changed) == [diagnostic]
+    failures, receipt = fencing._reserve_coordinator_self_call_receipts(changed)
+    assert failures == ["owned coordinator receiver source is unqualified"] and receipt == frozenset()
+    assert fencing._reserve_coordinator_self_slice_failures(units) == []
+    assert fencing._reserve_coordinator_self_call_receipts(units) == ([], original_receipt)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after", "diagnostic"),
+    (
+        (
+            "RequiredWorkCoordinator.__init__",
+            "sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None",
+            "sql_deadline_owner: ContinuationSQLDeadlineOwner | None = False",
+            "owned coordinator method binding or authority getter changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None",
+            "sql_deadline_owner: ContinuationSQLDeadlineOwner | None",
+            "owned coordinator method binding or authority getter changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "*, sql_deadline_owner:",
+            "*extra, sql_deadline_owner:",
+            "owned coordinator method binding or authority getter changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "type(authority) is not RequiredWorkAuthority",
+            "not isinstance(authority, RequiredWorkAuthority)",
+            "owned coordinator exact authority guard is missing",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "RequiredAuthorityKind.DURABLE_COMPOSE",
+            "RequiredAuthorityKind.MANUAL_PREVIEW",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner",
+            "not isinstance(sql_deadline_owner, ContinuationSQLDeadlineOwner)",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "sql_deadline_owner.validate_context(",
+            "other.validate_context(",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "authority.context",
+            "other.context",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "operation_id=authority.durable_operation_id",
+            "operation_id=None",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "attempt=authority.claim_attempt",
+            "attempt=None",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "if sql_deadline_owner is not None:",
+            "self._sql_deadline_owner = sql_deadline_owner\n        if sql_deadline_owner is not None:",
+            "owned coordinator SQL deadline context guard changed",
+        ),
+        (
+            "RequiredWorkCoordinator.__init__",
+            "self._sql_deadline_owner = sql_deadline_owner",
+            "self._sql_deadline_owner = None",
+            "owned coordinator constructor has an unreviewed value after guard",
+        ),
+        (
+            "RequiredWorkCoordinator",
+            '        "_sql_deadline_owner",\n',
+            "",
+            "owned coordinator SQL deadline storage layout changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            ", sql_deadline_owner=self._sql_deadline_owner",
+            "",
+            "owned coordinator key/ticket registration origin changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            "sql_deadline_owner=self._sql_deadline_owner",
+            "sql_deadline_owner=other",
+            "owned coordinator key/ticket registration origin changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            "with self._lock:",
+            "with other._lock:",
+            "owned coordinator physical lock origin changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            "self._release_prepared or key in self._tickets",
+            "key in self._tickets",
+            "owned coordinator key/ticket registration origin changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            "self._tickets[key] = ticket",
+            "self._tickets[other] = ticket",
+            "owned coordinator key/ticket registration origin changed",
+        ),
+        (
+            "RequiredWorkCoordinator.reserve",
+            "return ticket",
+            "return other",
+            "owned coordinator key/ticket registration origin changed",
+        ),
+    ),
+)
+def test_receiving_deadline_coordinator_keeps_original_owner_and_reservation(symbol, before, after, diagnostic):
+    _receiving_deadline_opposition("src/elspeth/web/required_work.py", symbol, before, after, diagnostic)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        (
+            "type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner",
+            "not isinstance(sql_deadline_owner, ContinuationSQLDeadlineOwner)",
+        ),
+        ("or coordinator is None", "or False"),
+        ("coordinator.sql_deadline_owner is not sql_deadline_owner", "coordinator.sql_deadline_owner != sql_deadline_owner"),
+        ("sql_deadline_owner.validate_context(", "other.validate_context("),
+        ("key.authority.context", "other.context"),
+        ("operation_id=key.authority.durable_operation_id", "operation_id=None"),
+        ("attempt=key.authority.claim_attempt", "attempt=None"),
+        ("self._sql_deadline_owner = sql_deadline_owner", "self._sql_deadline_owner = None"),
+        (
+            "if sql_deadline_owner is not None:",
+            "self._sql_deadline_owner = sql_deadline_owner\n        if sql_deadline_owner is not None:",
+        ),
+    ),
+)
+def test_receiving_deadline_ticket_requires_same_coordinator_and_context(before, after):
+    _receiving_deadline_opposition(
+        "src/elspeth/web/required_work.py",
+        "RequiredWorkTicket.__init__",
+        before,
+        after,
+        "owned SQL deadline ticket identity or context changed",
+    )
+
+
+@pytest.mark.parametrize("class_name", ("RequiredWorkCoordinator", "RequiredWorkTicket"))
+def test_receiving_deadline_getter_cannot_substitute_an_equal_or_foreign_owner(class_name):
+    _receiving_deadline_opposition(
+        "src/elspeth/web/required_work.py",
+        class_name + ".sql_deadline_owner",
+        "return self._sql_deadline_owner",
+        "return other",
+        "owned SQL deadline getter changed",
+    )
+
+
+@pytest.mark.parametrize("class_name", ("RequiredWorkCoordinator", "RequiredWorkTicket", "ContinuationSQLDeadlineOwner"))
+@pytest.mark.parametrize("operation", ("store", "delete", "reflect"))
+def test_receiving_deadline_validated_owner_cannot_be_rebound(class_name, operation):
+    deadline = class_name == "ContinuationSQLDeadlineOwner"
+    path = "src/elspeth/web/sessions/continuation_sql_deadline.py" if deadline else "src/elspeth/web/required_work.py"
+    field = "running" if deadline else "_sql_deadline_owner"
+    effect = {
+        "store": f"self.{field} = other",
+        "delete": f"del self.{field}",
+        "reflect": f"setattr(self, '{field}', other)",
+    }[operation]
+    # Insert an ordinary extra method, rather than corrupting a getter first.
+    before = "    def __init__("
+    after = f"    def replace_deadline(self):\n        {effect}\n\n" + before
+    diagnostic = "owned SQL deadline protected field is rebound"
+    if class_name == "RequiredWorkCoordinator":
+        diagnostic = (
+            "owned coordinator reflected self mutation is unreviewed"
+            if operation == "reflect"
+            else "owned coordinator protected field is rebound outside constructor"
+        )
+    _receiving_deadline_opposition(path, class_name, before, after, diagnostic)
+
+
+def test_receiving_deadline_ticket_constructor_cannot_replace_owner_after_validation():
+    _receiving_deadline_opposition(
+        "src/elspeth/web/required_work.py",
+        "RequiredWorkTicket.__init__",
+        "self._lock = RLock()",
+        "self._sql_deadline_owner = other\n        self._lock = RLock()",
+        "owned SQL deadline protected field is rebound",
+    )
+
+
+@pytest.mark.parametrize("class_name", ("RequiredWorkCoordinator", "RequiredWorkTicket", "ContinuationSQLDeadlineOwner"))
+def test_receiving_deadline_owner_access_cannot_be_intercepted(class_name):
+    path = (
+        "src/elspeth/web/sessions/continuation_sql_deadline.py"
+        if class_name == "ContinuationSQLDeadlineOwner"
+        else "src/elspeth/web/required_work.py"
+    )
+    diagnostic = (
+        "owned coordinator method binding or authority getter changed"
+        if class_name == "RequiredWorkCoordinator"
+        else "owned SQL deadline class or descriptor binding changed"
+    )
+    _receiving_deadline_opposition(
+        path,
+        class_name,
+        "    def __init__(",
+        "    def __getattribute__(self, name):\n        return other\n\n    def __init__(",
+        diagnostic,
+    )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after"),
+    (
+        ("validate_context", "context is not self.running.session_operation_context", "context != self.running.session_operation_context"),
+        ("validate_context", "or operation_id != self.running.claim.operation_id", "or False"),
+        ("validate_context", "or attempt != self.running.claim.attempt", "or False"),
+        ("validate_context", "self.running.claim.operation_id", "other.claim.operation_id"),
+        ("__init__", "type(running) is not ComposerOperationRunning", "not isinstance(running, ComposerOperationRunning)"),
+        ("__init__", "running, policy, drain_signal", "other, policy, drain_signal"),
+    ),
+)
+def test_receiving_deadline_validator_requires_actual_running_identity(symbol, before, after):
+    _receiving_deadline_opposition(
+        "src/elspeth/web/sessions/continuation_sql_deadline.py",
+        "ContinuationSQLDeadlineOwner." + symbol,
+        before,
+        after,
+        "owned SQL deadline running context contract changed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    (
+        (
+            "src/elspeth/web/required_work.py",
+            "from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner",
+            "from foreign.deadline import ContinuationSQLDeadlineOwner",
+        ),
+        (
+            "src/elspeth/web/sessions/continuation_sql_deadline.py",
+            "from elspeth.web.sessions.composer_operations import ComposerOperationRunning",
+            "from foreign.operations import ComposerOperationRunning",
+        ),
+    ),
+)
+def test_receiving_deadline_nominal_type_is_bound_to_its_actual_import(path, before, after):
+    _receiving_deadline_opposition(path, None, before, after, "owned SQL deadline imported binding changed")
+
+
+def _receiving_p4_custody_opposition(path, symbol, before, after, diagnostic, *, call_name=None):
+    units = fencing._production_units()
+    failures, original_receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [] and original_receipt["receiver_uses"] and len(original_receipt["native_calls"]) == 4
+    original = next(unit for unit in units if unit.path == path)
+    node = fencing._reserve_node_at(original, symbol)
+    assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    if call_name is not None:
+        calls = [part for part in ast.walk(node) if isinstance(part, ast.Call) and ast.unparse(part.func) == call_name]
+        assert len(calls) == 1
+        node = calls[0]
+    segment = ast.get_source_segment(original.source, node)
+    assert segment is not None and segment.count(before) == 1 and before != after
+    assert original.source.count(segment) == 1
+    changed_source = original.source.replace(segment, segment.replace(before, after, 1), 1)
+    assert changed_source != original.source
+    changed_unit = fencing._parse_source(path, changed_source)
+    changed = tuple(changed_unit if unit is original else unit for unit in units)
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(changed)
+    assert failures == ["P4 batch custody " + diagnostic] and receipt == {}
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], original_receipt)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after", "diagnostic"),
+    (
+        (
+            "_execute_continuation_call_live",
+            "failure_custody.batch is not batch",
+            "failure_custody.batch != batch",
+            "actual batch/call/audit identity changed",
+        ),
+        (
+            "_execute_continuation_call_live",
+            "failure_custody.call is not call",
+            "failure_custody.call != call",
+            "actual batch/call/audit identity changed",
+        ),
+        ("_execute_continuation_call_live", "else failure_custody.observation", "else other.observation", "observation origin changed"),
+        (
+            "_execute_continuation_call_live",
+            "observation.require(recorder, call.audit)",
+            "observation.require(other, call.audit)",
+            "actual batch/call/audit identity changed",
+        ),
+        (
+            "_execute_continuation_call_live",
+            "on_provider_dispatch=reservation.dispatch",
+            "on_provider_dispatch=other.dispatch",
+            "physical dispatch callback changed",
+        ),
+        ("_execute_continuation_call_live", "reservation.close()", "pass", "manual reservation finally close changed"),
+        (
+            "_execute_continuation_call_live",
+            "batch, call, recorder, llm_messages, ctx.policy_catalog",
+            "batch, call, other, llm_messages, ctx.policy_catalog",
+            "publication owner/context changed",
+        ),
+        (
+            "_execute_continuation_call_live",
+            "publication.register_feedback(serialized=tool_feedback_json, message=feedback_message)",
+            "publication.register_feedback(serialized=tool_feedback_json, message=other)",
+            "exact feedback/outcome publication changed",
+        ),
+        ("_execute_continuation_call_live", "tool_index=call.index", "tool_index=0", "exact result publication changed"),
+        (
+            "_execute_continuation_call_live",
+            "except BaseException as error:",
+            "except Exception as error:",
+            "original/grouped exception transfer changed",
+        ),
+        (
+            "_execute_continuation_call_live",
+            "raise combined from combined.__cause__\n        raise",
+            "raise error\n        raise",
+            "original/grouped exception transfer changed",
+        ),
+        (
+            "_execute_continuation_call_live",
+            "if failure_custody is None:\n            batch.plugin_crash",
+            "if failure_custody is not None:\n            batch.plugin_crash",
+            "failure-owned copyback changed",
+        ),
+        (
+            "_finish_continuation_batch_live",
+            "failure_custody.batch is not batch",
+            "failure_custody.batch != batch",
+            "completed failure origin changed",
+        ),
+        (
+            "_finish_continuation_batch_live",
+            "advisor_origin = failure_custody.original",
+            "advisor_origin = other",
+            "completed failure origin changed",
+        ),
+        (
+            "_finish_continuation_batch_live",
+            "if not isinstance(advisor_origin, Exception):",
+            "if False:",
+            "completed failure origin changed",
+        ),
+    ),
+)
+def test_receiving_p4_batch_custody_preserves_exact_dispatch_and_failure_transfers(symbol, before, after, diagnostic):
+    _receiving_p4_custody_opposition("src/elspeth/web/composer/tool_batch.py", symbol, before, after, diagnostic)
+
+
+@pytest.mark.parametrize("replacement", ("failure_observation=None", "other_observation=observation"))
+def test_receiving_p4_advisor_forwards_the_same_actual_failure_observation(replacement):
+    _receiving_p4_custody_opposition(
+        "src/elspeth/web/composer/tool_batch.py",
+        "_execute_continuation_call_live",
+        "failure_observation=observation",
+        replacement,
+        "exact observation forwarding changed",
+        call_name="ctx.advisor_checkpoint._call_advisor_for_tool",
+    )
+
+
+@pytest.mark.parametrize("method", ("_execute_continuation_call_live", "_finish_continuation_batch_live"))
+def test_receiving_p4_custody_default_cannot_be_foreign(method):
+    _receiving_p4_custody_opposition(
+        "src/elspeth/web/composer/tool_batch.py",
+        method,
+        "failure_custody: ContinuationToolFailureCustody | None = None",
+        "failure_custody: ContinuationToolFailureCustody | None = foreign",
+        "native signature changed " + method,
+    )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after", "diagnostic"),
+    (
+        (
+            "ContinuationLivePhases._execute_one_owned",
+            "inventory.running, self.work, result.response, batch, data.calls, live.recorder, call",
+            "inventory.running, self.work, result.response, other, data.calls, live.recorder, call",
+            "actual issued custody constructor/forwarding changed",
+        ),
+        (
+            "ContinuationLivePhases._execute_one_owned",
+            "failure_custody=self.failure_custody",
+            "failure_custody=other",
+            "actual issued custody constructor/forwarding changed",
+        ),
+        (
+            "ContinuationLivePhases._persist_batch",
+            "failure_custody=self.failure_custody",
+            "failure_custody=other",
+            "actual finish custody forwarding changed",
+        ),
+    ),
+)
+def test_receiving_p4_actual_native_callers_keep_the_original_custody(symbol, before, after, diagnostic):
+    _receiving_p4_custody_opposition("src/elspeth/web/composer/continuation_live_phases.py", symbol, before, after, diagnostic)
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol", "before", "after", "diagnostic"),
+    (
+        (
+            "src/elspeth/web/composer/continuation_tool_failure.py",
+            "ContinuationToolFailureCustody.__post_init__",
+            "self.batch.current_call is not self.call",
+            "self.batch.current_call != self.call",
+            "nominal supplier identity changed",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_tool_failure.py",
+            "ContinuationDispatchFailureObservation.require",
+            "recorder is not self.owner.recorder",
+            "recorder != self.owner.recorder",
+            "nominal supplier identity changed",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_tool_failure.py",
+            "ContinuationToolFailureCustody.failure",
+            "return combine_failure_objects(original, *self.errors)",
+            "return error",
+            "exception supplier changed ContinuationToolFailureCustody.failure",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_prompt_producers.py",
+            "ContinuationToolMessagePublication.require_call",
+            "self.messages is not messages",
+            "self.messages != messages",
+            "publication supplier identity changed",
+        ),
+    ),
+)
+def test_receiving_p4_suppliers_cannot_substitute_equal_owners_or_drop_original_errors(path, symbol, before, after, diagnostic):
+    _receiving_p4_custody_opposition(path, symbol, before, after, diagnostic)
+
+
+@pytest.fixture(scope="module")
+def receiving_attachment_prerequisite_units():
+    return fencing._production_units()
+
+
+def _receiving_runtime_initialization_opposition(units, path, symbol, before, after, diagnostic):
+    transfers = fencing._reserve_continuation_transfers
+    failures, positive = transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    assert positive["checked_nodes"]
+    original = next(unit for unit in units if unit.path == path)
+    owner = transfers._custody_node_at(original, symbol)
+    assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+    segment = ast.get_source_segment(original.source, owner)
+    assert segment is not None and segment.count(before) == 1 and before != after
+    assert original.source.count(segment) == 1
+    changed = fencing._parse_source(path, original.source.replace(segment, segment.replace(before, after, 1), 1))
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = transfers.runtime_initialization_prerequisite_transfers(mutated)
+    assert failures == [diagnostic]
+    assert refused == {}
+    assert transfers.runtime_initialization_prerequisite_transfers(units) == ([], positive)
+
+
+def test_receiving_runtime_initialization_prerequisites_have_a_direct_positive(receiving_attachment_prerequisite_units):
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_continuation_transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    assert set(receipt) == {"checked_nodes"}
+    assert receipt["checked_nodes"]
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["checked_nodes"] <= actual
+    # No selected-definition, SQL, callback or native effect permission.
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after"),
+    (
+        ("_restore_live", "attachments = source.attachments", "attachments = foreign.attachments"),
+        (
+            "_restore_live",
+            "authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)",
+            "None",
+        ),
+        (
+            "_restore_live",
+            "finish_read.require_selection(selected, inventory)\n        finish_read.read_runtime(authority)",
+            "finish_read.read_runtime(authority)\n        finish_read.require_selection(selected, inventory)",
+        ),
+        (
+            "restore_continuation_runtime",
+            "type(finish_read) is not ContinuationFinishRead",
+            "not isinstance(finish_read, ContinuationFinishRead)",
+        ),
+        (
+            "restore_continuation_runtime",
+            "finish_read.require_selection(selected, inventory)",
+            "finish_read.require_selection(foreign, inventory)",
+        ),
+        ("restore_continuation_runtime", "else finish_read.read_runtime(authority)", "else finish_read.read_runtime(foreign)"),
+        (
+            "restore_continuation_runtime",
+            "finish_read: ContinuationFinishRead | None = None",
+            "finish_read: ContinuationFinishRead | None = foreign",
+        ),
+        (
+            "restore_continuation_runtime",
+            "required_work=required_work, finish_read=finish_read",
+            "required_work=required_work, finish_read=None",
+        ),
+        (
+            "restore_continuation_runtime",
+            "progress=progress,\n            finish_read=finish_read,",
+            "progress=progress,\n            finish_read=None,",
+        ),
+        (
+            "restore_continuation_runtime",
+            "required_work,\n        ContinuationRuntimeSource,",
+            "foreign,\n        ContinuationRuntimeSource,",
+        ),
+        ("restore_continuation_runtime", "if type(result) is not RestoredContinuationRuntime:", "if False:"),
+    ),
+)
+def test_receiving_runtime_finish_read_keeps_actual_nominal_owners(receiving_attachment_prerequisite_units, symbol, before, after):
+    path = fencing._reserve_continuation_transfers.RUNTIME
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        path,
+        symbol,
+        before,
+        after,
+        "runtime initialization exact caller changed " + path + ":" + symbol,
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("source.admitted_evidence.snapshot is not source.evidence", "source.admitted_evidence.snapshot != source.evidence"),
+        ("decode_recorder_snapshot(source.admitted_evidence.recorder_chunk)", "decode_recorder_snapshot(foreign)"),
+        ("prior_application_entry=source.evidence.application_entry", "prior_application_entry=None"),
+        (
+            "materialization=runtime.materialization,\n        mandatory_retention=True,",
+            "materialization=runtime.materialization,\n        mandatory_retention=False,",
+        ),
+        (
+            "encode_turn_evidence(admitted, env_ref_names=names, mandatory_retention=True)",
+            "encode_turn_evidence(admitted, env_ref_names=names)",
+        ),
+        (
+            "encode_message_shelf(shelf.transcript, mandatory_retention=True, env_ref_names=names)",
+            "encode_message_shelf(shelf.transcript, mandatory_retention=False, env_ref_names=names)",
+        ),
+        ('codec="composer.tools.v1", value=live.tools', 'codec="composer.tools.v1", value=foreign'),
+        ('codec="composer.state.v1", value=live.state.to_dict()', 'codec="composer.state.v1", value=foreign'),
+        ('"current_indexes": shelf.transcript.current_indexes', '"current_indexes": foreign'),
+        (
+            'encode_mandatory_private_chunk(codec="composer.tools.v1", value=live.tools, env_ref_names=names)',
+            'encode_mandatory_private_chunk(codec="composer.tools.v1", value=live.tools, env_ref_names=frozenset())',
+        ),
+        ("audit = admitted.recorder_chunk", "audit = foreign"),
+        ("captured_graph = admitted.graph", "captured_graph = runtime.graph"),
+        ("invocations=actual_recorder.invocations[: len(current_recorder.invocations)]", "invocations=actual_recorder.invocations"),
+    ),
+)
+def test_receiving_runtime_capture_keeps_admitted_snapshot_and_mandatory_inputs(receiving_attachment_prerequisite_units, before, after):
+    path = fencing._reserve_continuation_transfers.RUNTIME
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        path,
+        "_capture_owners",
+        before,
+        after,
+        "runtime initialization exact caller changed " + path + ":_capture_owners",
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("[refused, failure]", "[failure]"),
+        ("[refused, failure]", "[refused]"),
+        ("except BaseException as failure:", "except Exception as failure:"),
+        ("except ComposerContextUnsupported as refused:", "except Exception as refused:"),
+        ("state=live.state", "state=foreign"),
+        ("source.evidence.effects.latest_verified_state_json", "foreign"),
+        ("live.recorder.invocations[runtime.drained.invocations :]", "live.recorder.invocations"),
+        ("live.recorder.llm_calls[runtime.drained.llm_calls :]", "live.recorder.llm_calls"),
+        ("failed_turn=live.failed_turn", "failed_turn=None"),
+        (
+            "source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory)",
+            "source = foreign",
+        ),
+        (
+            "try:\n                authority.read_continuation_runtime(running, selected=selected, inventory=inventory)",
+            "try:\n                pass",
+        ),
+        (
+            "authority.read_continuation_runtime(running, selected=selected, inventory=inventory)\n        return captured",
+            "return captured",
+        ),
+        ("            ) from refused", "            ) from None"),
+        ("_registered_read(work, CapturedContinuationRuntime, capture)", "_registered_read(foreign, CapturedContinuationRuntime, capture)"),
+    ),
+)
+def test_receiving_runtime_capture_failure_preserves_both_original_outcomes(receiving_attachment_prerequisite_units, before, after):
+    path = fencing._reserve_continuation_transfers.RUNTIME
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        path,
+        "capture_continuation_runtime_owners",
+        before,
+        after,
+        "runtime initialization exact caller changed " + path + ":capture_continuation_runtime_owners",
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("expected_recorder=empty_recorder", "expected_recorder=None"),
+        (
+            "BufferingRecorder().snapshot_for_continuation(drained=RecorderDrainCursors())",
+            "live.recorder.snapshot_for_continuation(drained=owners.drained)",
+        ),
+        (
+            "mandatory_retention=True,\n        expected_recorder=empty_recorder",
+            "mandatory_retention=False,\n        expected_recorder=empty_recorder",
+        ),
+        ("audit = admitted.recorder_chunk", "audit = empty_recorder"),
+        ("canonical=original.snapshot.initial_state_json", "canonical=foreign"),
+        ("materialization.inputs.source is not source", "materialization.inputs.source != source"),
+    ),
+)
+def test_receiving_initial_capture_preserves_the_actual_empty_recorder(receiving_attachment_prerequisite_units, before, after):
+    path = fencing._reserve_continuation_transfers.INITIAL_DATA
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        path,
+        "capture_initial_composition",
+        before,
+        after,
+        "runtime initialization exact caller changed " + path + ":capture_initial_composition",
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ("inputs.admitted_evidence,", "snapshot,"),
+        ("_require_same_sources(before, after)", "pass"),
+        ("env_ref_names=inventory.names,", "env_ref_names=frozenset(),"),
+    ),
+)
+def test_receiving_first_runtime_uses_the_actual_admitted_evidence(receiving_attachment_prerequisite_units, before, after):
+    path = fencing._reserve_continuation_transfers.FIRST_RUNTIME
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        path,
+        "_restore_first_graph",
+        before,
+        after,
+        "runtime initialization exact caller changed " + path + ":_restore_first_graph",
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "diagnostic"),
+    (
+        ("recorder_chunk != expected_recorder", "False", "moved empty-recorder guard changed"),
+        (
+            "expected_recorder: PrivateChunk | None = None",
+            "expected_recorder: PrivateChunk | None = foreign",
+            "moved capture signature changed",
+        ),
+        (
+            "recorder.snapshot_for_continuation(drained=drained)",
+            "recorder.snapshot_for_continuation(drained=foreign)",
+            "moved empty-recorder guard changed",
+        ),
+        (
+            "capture_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)",
+            "capture_application_recorder_source(foreign, env_ref_names=env_ref_names)",
+            "moved empty-recorder guard changed",
+        ),
+        ("recorder_snapshot=recorder_snapshot,", "recorder_snapshot=foreign,", "moved empty-recorder guard changed"),
+        ("mandatory_retention or prior_application_entry is not None", "mandatory_retention", "moved history/admitted return changed"),
+        ("fields.application_entry is None", "False", "moved history/admitted return changed"),
+        ("[: len(prior_application_entry.applications)]", "[: 0]", "moved history/admitted return changed"),
+        (
+            "!= prior_application_entry.applications",
+            "!= prior_application_entry.applications[::-1]",
+            "moved history/admitted return changed",
+        ),
+        ("recorder_chunk=recorder_chunk)", "recorder_chunk=foreign)", "moved history/admitted return changed"),
+        ("source_chunks=(recorder_chunk, *sources.chunks)", "source_chunks=(recorder_chunk,)", "moved history/admitted return changed"),
+        (
+            "snapshot,\n        env_ref_names=env_ref_names,",
+            "foreign,\n        env_ref_names=env_ref_names,",
+            "moved history/admitted return changed",
+        ),
+        ("recorder=recorder_chunk.reference,", "recorder=foreign,", "moved fields forwarding changed recorder"),
+        ("application_entry=application_entry,", "application_entry=foreign,", "moved fields forwarding changed application_entry"),
+        ("joint_graph_json=joint_graph_json,", "joint_graph_json=foreign,", "moved fields forwarding changed joint_graph_json"),
+        (
+            "logical=logical,",
+            "logical=(application_entry := foreign),",
+            "moved fields supplier/local binding changed application_entry",
+        ),
+        (
+            "historical_application_count=0 if application_entry is None else len(application_entry.applications)",
+            "historical_application_count=0",
+            "moved fields forwarding changed historical_application_count",
+        ),
+    ),
+)
+def test_receiving_capture_supplier_preserves_moved_recorder_and_history_guards(
+    receiving_attachment_prerequisite_units, before, after, diagnostic
+):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        before,
+        after,
+        "runtime initialization " + diagnostic,
+    )
+
+
+@pytest.mark.parametrize(
+    ("addition", "diagnostic"),
+    (
+        ("recorder_chunk = foreign", "moved capture binding changed recorder_chunk"),
+        ("prior_application_entry = None", "moved capture binding changed prior_application_entry"),
+        ("expected_recorder = None", "moved capture binding changed expected_recorder"),
+        ("capture_fields = foreign", "moved capture binding changed capture_fields"),
+        ("ce = foreign", "moved capture supplier shadowed ce"),
+        ("return foreign", "moved capture early/deferred return changed"),
+        ("recorder_chunk.reference = foreign", "moved capture owner member changed"),
+    ),
+)
+def test_receiving_capture_supplier_keeps_moved_guard_bindings(receiving_attachment_prerequisite_units, addition, diagnostic):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        "    effects = owner.effects",
+        "    " + addition + "\n    effects = owner.effects",
+        "runtime initialization " + diagnostic,
+    )
+
+
+def test_receiving_capture_supplier_refuses_nested_producer_transcript_materialization(receiving_attachment_prerequisite_units):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        "request_id=owner.request_id,",
+        "request_id=(owner.transcript.snapshot_for_continuation(\n"
+        "                messages, materialization=materialization, mandatory_retention=mandatory_retention\n"
+        "            ), owner.request_id)[1],",
+        "runtime initialization moved transcript materialization site/order changed",
+    )
+
+
+def test_receiving_capture_supplier_refuses_nested_materialization_with_changed_arguments(receiving_attachment_prerequisite_units):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        "request_id=owner.request_id,",
+        "request_id=(owner.transcript.snapshot_for_continuation(\n"
+        "                foreign, materialization=materialization, mandatory_retention=False\n"
+        "            ), owner.request_id)[1],",
+        "runtime initialization moved transcript materialization site/order changed",
+    )
+
+
+def test_receiving_capture_supplier_refuses_nested_fields_supplier_alias_rebinding(receiving_attachment_prerequisite_units):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        "request_id=owner.request_id,",
+        "request_id=((ce := foreign), owner.request_id)[1],",
+        "runtime initialization moved fields supplier/local binding changed ce",
+    )
+
+
+def test_receiving_capture_supplier_refuses_early_duplicate_transcript_materialization(receiving_attachment_prerequisite_units):
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        "    recorder_snapshot = recorder.snapshot_for_continuation(drained=drained)",
+        "    owner.transcript.snapshot_for_continuation(\n"
+        "        messages, materialization=materialization, mandatory_retention=mandatory_retention\n"
+        "    )\n"
+        "    recorder_snapshot = recorder.snapshot_for_continuation(drained=drained)",
+        "runtime initialization moved transcript materialization site/order changed",
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "label"),
+    (
+        ("recorder.snapshot_for_continuation(drained=drained)", "recorder snapshot"),
+        ("capture_application_recorder_source(recorder_snapshot, env_ref_names=env_ref_names)", "recorder source capture"),
+        (
+            "capture_joint_evidence_graph(owner=owner, recorder=recorder, drained=drained, data=data, "
+            "env_ref_names=env_ref_names, recorder_snapshot=recorder_snapshot, recorder_source=recorder_source)",
+            "joint-graph capture",
+        ),
+        ("P4ApplicationSources(application_entry, owner._portable_p4_sources)", "application sources"),
+        ("capture_fields()", "fields production"),
+        (
+            "owner.transcript.snapshot_for_continuation(foreign, materialization=materialization, mandatory_retention=False)",
+            "transcript materialization",
+        ),
+        (
+            "ce.require_evidence_fields_admission(foreign, env_ref_names=env_ref_names, sources=sources, recorder_chunk=recorder_chunk)",
+            "fields admission",
+        ),
+        ("ce.TurnEvidenceSnapshot(**foreign, transcript=foreign)", "snapshot construction"),
+        (
+            "ce.admit_turn_evidence(foreign, env_ref_names=env_ref_names, mandatory_retention=mandatory_retention, "
+            "source_chunks=(recorder_chunk, *sources.chunks))",
+            "evidence admission",
+        ),
+    ),
+)
+def test_receiving_capture_supplier_refuses_extra_direct_moved_calls(receiving_attachment_prerequisite_units, expression, label):
+    # Insert after the local producer definition, before the history guard.
+    # Matching the callee must also catch duplicates with different arguments.
+    original = "    fields = capture_fields() if mandatory_retention or prior_application_entry is not None else None"
+    _receiving_runtime_initialization_opposition(
+        receiving_attachment_prerequisite_units,
+        fencing._reserve_continuation_transfers.EVIDENCE_GRAPH,
+        "capture_turn_evidence",
+        original,
+        "    " + expression + "\n" + original,
+        "runtime initialization moved " + label + " site/order changed",
+    )
+
+
+@pytest.mark.parametrize("fault", ("recorder_after_fields", "history_after_transcript"))
+def test_receiving_capture_supplier_keeps_guard_order(receiving_attachment_prerequisite_units, fault):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, positive = transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    original = next(unit for unit in units if unit.path == transfers.EVIDENCE_GRAPH)
+    changed = fencing._parse_source(original.path, original.source)
+    owner = transfers._custody_node_at(changed, "capture_turn_evidence")
+    assert isinstance(owner, ast.FunctionDef)
+    if fault == "recorder_after_fields":
+        starts = [
+            index
+            for index, node in enumerate(owner.body)
+            if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "recorder_snapshot"
+        ]
+        assert len(starts) == 1
+        prefix = owner.body[starts[0] : starts[0] + 5]
+        assert ast.dump(ast.Module(body=prefix, type_ignores=[])) == ast.dump(ast.parse(transfers._CAPTURE_RECORDER_GUARD))
+        del owner.body[starts[0] : starts[0] + 5]
+        fields = [node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "capture_fields"]
+        assert len(fields) == 1
+        position = owner.body.index(fields[0]) + 1
+        owner.body[position:position] = prefix
+        diagnostic = "runtime initialization moved recorder/fields/history order changed"
+    else:
+        tail = owner.body[-6:]
+        assert ast.dump(ast.Module(body=tail, type_ignores=[])) == ast.dump(ast.parse(transfers._CAPTURE_HISTORY_GUARD_AND_RETURN))
+        owner.body[-5], owner.body[-4] = owner.body[-4], owner.body[-5]
+        diagnostic = "runtime initialization moved history/admitted return changed"
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = transfers.runtime_initialization_prerequisite_transfers(mutated)
+    assert failures == [diagnostic]
+    assert refused == {}
+    assert transfers.runtime_initialization_prerequisite_transfers(units) == ([], positive)
+
+
+@pytest.mark.parametrize("fault", ("missing", "duplicate", "supplier_rebound"))
+def test_receiving_runtime_initialization_requires_its_actual_supplier_units(receiving_attachment_prerequisite_units, fault):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, positive = transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    if fault == "supplier_rebound":
+        path = "src/elspeth/web/composer/continuation_finish_reads.py"
+        original = next(unit for unit in units if unit.path == path)
+        changed = fencing._parse_source(path, original.source + "\nContinuationFinishRead, other = foreign\n")
+        mutated = tuple(changed if unit is original else unit for unit in units)
+        diagnostic = "runtime initialization supplier definition changed " + path + ":ContinuationFinishRead"
+    else:
+        original = next(unit for unit in units if unit.path == transfers.EVIDENCE_GRAPH)
+        mutated = tuple(unit for unit in units if unit is not original) if fault == "missing" else (*units, original)
+        diagnostic = "runtime initialization prerequisite source set missing or duplicated"
+    failures, refused = transfers.runtime_initialization_prerequisite_transfers(mutated)
+    assert failures == [diagnostic]
+    assert refused == {}
+    assert transfers.runtime_initialization_prerequisite_transfers(units) == ([], positive)
+
+
+@pytest.mark.parametrize(
+    ("path", "name"),
+    (
+        ("src/elspeth/web/composer/continuation_runtime.py", "encode_mandatory_private_chunk"),
+        ("src/elspeth/web/composer/continuation_composition_initialization_data.py", "capture_turn_evidence"),
+        ("src/elspeth/web/composer/continuation_first_runtime.py", "_finish_current_evidence"),
+        ("src/elspeth/web/composer/continuation_evidence_graph.py", "ce"),
+    ),
+)
+def test_receiving_runtime_initialization_keeps_canonical_supplier_bindings(receiving_attachment_prerequisite_units, path, name):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, positive = transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source + "\n" + name + " = foreign\n")
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = transfers.runtime_initialization_prerequisite_transfers(mutated)
+    assert failures == ["runtime initialization canonical supplier changed " + path + ":" + name]
+    assert refused == {}
+    assert transfers.runtime_initialization_prerequisite_transfers(units) == ([], positive)
+
+
+def test_receiving_runtime_initialization_receipt_stays_on_the_supplied_ast(receiving_attachment_prerequisite_units):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, original_receipt = transfers.runtime_initialization_prerequisite_transfers(units)
+    assert failures == [], failures
+    original = next(unit for unit in units if unit.path == transfers.EVIDENCE_GRAPH)
+    detached = fencing._parse_source(original.path, original.source)
+    changed = tuple(detached if unit is original else unit for unit in units)
+    failures, receipt = transfers.runtime_initialization_prerequisite_transfers(changed)
+    assert failures == [], failures
+    old_sites = {site for site in original_receipt["checked_nodes"] if site[0] == original.path}
+    current_sites = {site for site in receipt["checked_nodes"] if site[0] == original.path}
+    assert old_sites and current_sites and old_sites.isdisjoint(current_sites)
+    actual = {(unit.path, id(node)) for unit in changed for node in ast.walk(unit.tree)}
+    assert receipt["checked_nodes"] <= actual
+    assert set(receipt) == {"checked_nodes"}
+
+
+def _receiving_attachment_projection_inner(units):
+    """Exercise the inner grammar without substituting outer source seals."""
+    transfers = fencing._reserve_continuation_transfers
+    index = {unit.path: unit for unit in units}
+    assert len(index) == len(units)
+    selected = {}
+    for path, symbol in (
+        (transfers.ATTACHMENT_APPLICATION, "require_attachment_projection"),
+        (transfers.ATTACHMENT_APPLICATION, "admit_attachment_application"),
+        (transfers.FINISHER, "finish_current_attachment_result"),
+    ):
+        owner = transfers._custody_node_at(index[path], symbol)
+        assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+        selected[path, symbol] = owner
+    failures, receipt = [], transfers._empty()
+    transfers._attachment_projection_transfers(units, failures, index, selected, receipt)
+    return transfers._finish(failures, receipt)
+
+
+def _receiving_attachment_projection_inner_opposition(units, before, after, diagnostics):
+    failures, positive = _receiving_attachment_projection_inner(units)
+    assert failures == [], failures
+    assert positive["native_calls"]
+    path = fencing._reserve_continuation_transfers.ATTACHMENT_APPLICATION
+    original = next(unit for unit in units if unit.path == path)
+    owner = fencing._reserve_node_at(original, "require_attachment_projection")
+    assert isinstance(owner, ast.FunctionDef)
+    segment = ast.get_source_segment(original.source, owner)
+    assert segment is not None and segment.count(before) == 1 and before != after
+    assert original.source.count(segment) == 1
+    changed = fencing._parse_source(path, original.source.replace(segment, segment.replace(before, after, 1), 1))
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = _receiving_attachment_projection_inner(mutated)
+    assert failures == ["continuation attachment projection " + detail for detail in diagnostics]
+    assert refused == {}
+    assert _receiving_attachment_projection_inner(units) == ([], positive)
+
+
+def test_receiving_attachment_projection_v2_inner_has_actual_positive(receiving_attachment_prerequisite_units):
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = _receiving_attachment_projection_inner(units)
+    assert failures == [], failures
+    assert receipt["native_calls"] and receipt["data_constructor_calls"]
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["native_calls"] | receipt["data_constructor_calls"] <= actual
+    # This does not certify outer _select, the full helper or global effects.
+
+
+@pytest.mark.parametrize(
+    ("name", "before", "after"),
+    (
+        (
+            "before_admitted",
+            "before_admitted = require_admitted_turn_evidence(before, env_ref_names=env_ref_names)",
+            "before_admitted = require_admitted_turn_evidence(after, env_ref_names=env_ref_names)",
+        ),
+        (
+            "after_admitted",
+            "after_admitted = require_admitted_turn_evidence(after, env_ref_names=env_ref_names)",
+            "after_admitted = require_admitted_turn_evidence(before, env_ref_names=env_ref_names)",
+        ),
+        ("before_snapshot", "before_snapshot = before_admitted.snapshot", "before_snapshot = after_admitted.snapshot"),
+        ("old", "old = before_admitted.graph", "old = after_admitted.graph"),
+        ("new", "new = after_admitted.graph", "new = before_admitted.graph"),
+        (
+            "expected_admitted",
+            "expected_admitted = admit_turn_evidence(expected, env_ref_names=env_ref_names, source_chunks=(recorder_chunk, *before.sources.chunks))",
+            "expected_admitted = admit_turn_evidence(expected, env_ref_names=env_ref_names, source_chunks=(recorder_chunk,))",
+        ),
+    ),
+)
+def test_receiving_attachment_projection_v2_inner_keeps_admitted_identity_chain(
+    receiving_attachment_prerequisite_units, name, before, after
+):
+    diagnostics = [] if name == "expected_admitted" else ["actual admitted owner prefix changed"]
+    diagnostics.append("actual selected identity assignment changed " + name)
+    _receiving_attachment_projection_inner_opposition(receiving_attachment_prerequisite_units, before, after, diagnostics)
+
+
+@pytest.mark.parametrize("name", ("before_admitted", "after_admitted", "before_snapshot", "old", "new", "expected_admitted"))
+def test_receiving_attachment_projection_v2_inner_refuses_owner_rebinding(receiving_attachment_prerequisite_units, name):
+    _receiving_attachment_projection_inner_opposition(
+        receiving_attachment_prerequisite_units,
+        "    return new",
+        "    " + name + " = foreign\n    return new",
+        ["selected identity rebound " + name],
+    )
+
+
+def test_receiving_attachment_projection_v2_inner_keeps_admission_before_projection(receiving_attachment_prerequisite_units):
+    _receiving_attachment_projection_inner_opposition(
+        receiving_attachment_prerequisite_units,
+        "    before_admitted = require_admitted_turn_evidence(before, env_ref_names=env_ref_names)\n"
+        "    after_admitted = require_admitted_turn_evidence(after, env_ref_names=env_ref_names)\n"
+        "    before_snapshot = before_admitted.snapshot",
+        "    before_snapshot = before_admitted.snapshot\n"
+        "    before_admitted = require_admitted_turn_evidence(before, env_ref_names=env_ref_names)\n"
+        "    after_admitted = require_admitted_turn_evidence(after, env_ref_names=env_ref_names)",
+        ["actual admitted owner prefix changed"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        (
+            "encode_turn_evidence(after_admitted, env_ref_names=env_ref_names)",
+            "encode_turn_evidence(before_admitted, env_ref_names=env_ref_names)",
+        ),
+        (
+            "encode_turn_evidence(after_admitted, env_ref_names=env_ref_names)",
+            "encode_turn_evidence(expected_admitted, env_ref_names=env_ref_names)",
+        ),
+        (
+            "encode_turn_evidence(after_admitted, env_ref_names=env_ref_names)",
+            "encode_turn_evidence(after_admitted, env_ref_names=frozenset())",
+        ),
+        (
+            "encode_turn_evidence(after_admitted, env_ref_names=env_ref_names)",
+            "encode_application_graph(new, env_ref_names=env_ref_names, recorder_source=recorder_source)",
+        ),
+        (
+            "encode_turn_evidence(\n        expected_admitted, env_ref_names=env_ref_names\n    )",
+            "encode_turn_evidence(before_admitted, env_ref_names=env_ref_names)",
+        ),
+    ),
+)
+def test_receiving_attachment_projection_v2_inner_keeps_complete_evidence_comparison(
+    receiving_attachment_prerequisite_units, before, after
+):
+    _receiving_attachment_projection_inner_opposition(
+        receiving_attachment_prerequisite_units, before, after, ["complete evidence/transcript comparison changed"]
+    )
+
+
+@pytest.mark.parametrize("name", ("require_admitted_turn_evidence", "admit_turn_evidence"))
+@pytest.mark.parametrize("fault", ("foreign_import", "rebound"))
+def test_receiving_attachment_projection_v2_inner_keeps_canonical_admission_suppliers(receiving_attachment_prerequisite_units, name, fault):
+    units = receiving_attachment_prerequisite_units
+    failures, positive = _receiving_attachment_projection_inner(units)
+    assert failures == [], failures
+    assert positive["native_calls"]
+    path = fencing._reserve_continuation_transfers.ATTACHMENT_APPLICATION
+    original = next(unit for unit in units if unit.path == path)
+    source = original.source
+    if fault == "foreign_import":
+        imported = "    " + name + ",\n"
+        assert source.count(imported) == 1
+        source = source.replace(imported, "", 1) + "\nfrom foreign import " + name + "\n"
+    else:
+        source += "\n" + name + " = foreign\n"
+    changed = fencing._parse_source(path, source)
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = _receiving_attachment_projection_inner(mutated)
+    assert failures == ["continuation attachment projection canonical supplier changed " + name]
+    assert refused == {}
+    assert _receiving_attachment_projection_inner(units) == ([], positive)
+
+
+def test_receiving_attachment_prerequisite_semantics_have_a_direct_positive(receiving_attachment_prerequisite_units):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, receipt = transfers.attachment_prerequisite_transfers(units)
+    assert failures == [], failures
+    assert receipt["checked_definitions"]
+    actual = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["checked_definitions"] <= actual
+    # This finite semantic verdict deliberately makes no _select/seal or
+    # native-dispatch permission claim.
+    assert set(receipt) == {"checked_definitions"}
+
+
+_ATTACHMENT_SQL_PREREQUISITE_CASES = (
+    ("_history", "running.claim.session_id", "foreign", "history-session"),
+    ("_history", "running.claim.operation_id", "foreign", "history-operation"),
+    ("_history_data", "selected.stack.frames[0] is not compose", "selected.stack.frames[0] != compose", "history-identity"),
+    ("_history_data", "selected=selected", "selected=foreign", "history-selected"),
+    ("_history_data", "names=names", "names=foreign", "history-names"),
+    ("_history_data", "conn, session_id=session_id", "foreign, session_id=session_id", "history-connection"),
+    ("_history_data", "    ).history", "    )", "history-result"),
+    ("_effect", "running.claim.session_id", "foreign", "effect-session-forwarding"),
+    ("_effect", "selected, key, digest", "selected, key, foreign", "effect-digest-forwarding"),
+    ("_effect_data", "effects.c.session_id == str(session_id)", "effects.c.session_id == str(foreign)", "effect-query-session"),
+    ("_effect_data", "effects.c.operation_id == operation_id", "effects.c.operation_id == foreign", "effect-query-operation"),
+    ("_effect_data", "effects.c.effect_key == key", "effects.c.effect_key == foreign", "effect-query-key"),
+    ("_effect_data", 'or row.owner != "read"', "or False", "effect-owner"),
+    ("_effect_data", "or row.input_sha256 != digest", "or False", "effect-input"),
+    *(
+        ("_effect_data", "or row." + field + " is not None", "or False", "effect-forbidden-" + field)
+        for field in (
+            "action_json",
+            "provider_attempt_id",
+            "physical_sequence",
+            "physical_generation",
+            "requested_model",
+            "response_finished_at",
+            "committed_state_ids_json",
+            "graph_sha256",
+        )
+    ),
+    ("_effect_data", "or len(frontier) != 1", "or False", "effect-frontier-singleton"),
+    ("_effect_data", "(row.disposition, row.receipt_key)", "(foreign, row.receipt_key)", "effect-frontier-disposition"),
+    ("_effect_data", "(row.disposition, row.receipt_key)", "(row.disposition, foreign)", "effect-frontier-receipt"),
+    ("_effect_data", 'item.disposition not in ("committed", "refused")', "False", "effect-unrelated-unresolved"),
+    ("_effect_data", "return row", "return foreign", "effect-original-row"),
+    (
+        "verify_attachment_result_source_on_connection",
+        "session_id=running.claim.session_id",
+        "session_id=foreign",
+        "verify-session-forwarding",
+    ),
+    ("verify_attachment_result_source_on_connection", "snapshot=snapshot", "snapshot=foreign", "verify-snapshot-forwarding"),
+    ("verify_attachment_result_data_on_connection", "snapshot.checkpoint_id != selected.checkpoint_id", "False", "verify-checkpoint"),
+    ("verify_attachment_result_data_on_connection", "or snapshot.cursor != selected.stack.cursor", "or False", "verify-cursor"),
+    (
+        "verify_attachment_result_data_on_connection",
+        "or snapshot.payload_json != encode_continuation_snapshot(selected.stack)",
+        "or False",
+        "verify-payload",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "or selected.stack.logical.session_id != str(session_id)",
+        "or False",
+        "verify-session",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "or selected.stack.logical.operation_id != operation_id",
+        "or False",
+        "verify-operation",
+    ),
+    ("verify_attachment_result_data_on_connection", "_input(selected, names)", "_input(foreign, names)", "verify-original-input"),
+    (
+        "verify_attachment_result_data_on_connection",
+        "_effect_data(conn, session_id, operation_id, selected, key, digest)",
+        "_effect_data(conn, session_id, operation_id, selected, key, foreign)",
+        "verify-original-effect",
+    ),
+    ("verify_attachment_result_data_on_connection", 'row.disposition != "committed"', "False", "verify-committed"),
+    ("verify_attachment_result_data_on_connection", "or row.result_chunk_key is None", "or False", "verify-result-key"),
+    ("verify_attachment_result_data_on_connection", 'frame.phase != "result_retained"', "False", "verify-applied-cut"),
+    ("verify_attachment_result_data_on_connection", "or frame.settled_effect_ids.count(key) != 1", "or False", "verify-applied-once"),
+    ("verify_attachment_result_data_on_connection", 'frame.phase != "effect_reconciling"', "False", "verify-pending-cut"),
+    ("verify_attachment_result_data_on_connection", "or len(pending) != 1", "or False", "verify-pending-singleton"),
+    ("verify_attachment_result_data_on_connection", 'or pending[0].kind != "read"', "or False", "verify-pending-kind"),
+    ("verify_attachment_result_data_on_connection", "or pending[0].effect_key != key", "or False", "verify-pending-key"),
+    (
+        "verify_attachment_result_data_on_connection",
+        'or matches[0].reference.codec != "composer.owner-result.v1"',
+        "or False",
+        "verify-codec",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "or private_chunk_key(matches[0]) != row.result_chunk_key",
+        "or False",
+        "verify-private-key",
+    ),
+    ("verify_attachment_result_data_on_connection", "stored_codec != chunk.reference.codec", "False", "verify-stored-codec"),
+    ("verify_attachment_result_data_on_connection", ') != chunk.canonical.encode("utf-8")', ") != foreign", "verify-stored-bytes"),
+    (
+        "verify_attachment_result_data_on_connection",
+        'row.receipt_key != f"attachment-result:{chunk.reference.digest}"',
+        "False",
+        "verify-receipt",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "attempts.c.sequence == row.creator_sequence",
+        "attempts.c.sequence == foreign",
+        "verify-creator-sequence",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "attempts.c.generation == row.creator_generation",
+        "attempts.c.generation == foreign",
+        "verify-creator-generation",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "creator.session_operation_id, creator.session_operation_epoch",
+        "foreign, creator.session_operation_epoch",
+        "verify-original-physical-owner",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "require_attachment_read_audit(prepared, read_audit, names=names)",
+        "pass",
+        "verify-read-audit",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "decode_read_owner_result(publication.result_json, env_ref_names=names)",
+        "decode_read_owner_result(foreign, env_ref_names=names)",
+        "verify-retained-result",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "_result(retained, prepared, names)",
+        "_result(foreign, prepared, names)",
+        "verify-result-owner",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "_history_data(conn, session_id, operation_id, selected, compose, names)",
+        "_history_data(conn, session_id, operation_id, foreign, compose, names)",
+        "verify-history-owner",
+    ),
+    (
+        "verify_attachment_result_data_on_connection",
+        "applied and _retained_history(history, key, retained) != history",
+        "False",
+        "verify-applied-history",
+    ),
+)
+
+
+def _receiving_attachment_prerequisite_opposition(units, path, symbol, before, after):
+    transfers = fencing._reserve_continuation_transfers
+    failures, original_receipt = transfers.attachment_prerequisite_transfers(units)
+    assert failures == [], failures
+    assert original_receipt["checked_definitions"]
+    original = next(unit for unit in units if unit.path == path)
+    owner = fencing._reserve_node_at(original, symbol)
+    assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+    segment = ast.get_source_segment(original.source, owner)
+    assert segment is not None and segment.count(before) == 1 and before != after
+    assert original.source.count(segment) == 1
+    source = original.source.replace(segment, segment.replace(before, after, 1), 1)
+    changed = fencing._parse_source(path, source)
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = transfers.attachment_prerequisite_transfers(mutated)
+    assert failures == ["attachment prerequisite exact transfer changed " + path + ":" + symbol]
+    assert refused == {}
+    assert transfers.attachment_prerequisite_transfers(units) == ([], original_receipt)
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after", "obligation"),
+    _ATTACHMENT_SQL_PREREQUISITE_CASES,
+    ids=[case[3] for case in _ATTACHMENT_SQL_PREREQUISITE_CASES],
+)
+def test_receiving_attachment_moved_sql_obligations(receiving_attachment_prerequisite_units, symbol, before, after, obligation):
+    assert obligation
+    _receiving_attachment_prerequisite_opposition(
+        receiving_attachment_prerequisite_units,
+        "src/elspeth/web/sessions/continuation_attachment_result.py",
+        symbol,
+        before,
+        after,
+    )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after"),
+    (
+        ("validate_native_thinking_blocks", "type(value) not in (list, tuple)", "False"),
+        ("validate_native_thinking_blocks", "not isinstance(block, Mapping)", "False"),
+        ("validate_native_thinking_blocks", "set(block) != fields", "False"),
+        ("validate_native_thinking_blocks", "any(type(block[key]) is not str for key in fields)", "False"),
+        ("validate_native_thinking_blocks", "utf8_size(block[key])", "utf8_size('')"),
+        (
+            "validate_native_thinking_blocks",
+            'raise ComposerAdmissionRefused("Provider thinking state contains invalid UTF-8 text.") from None',
+            "pass",
+        ),
+        ("validate_native_thinking_blocks", "if not block[opaque_key]:", "if False:"),
+        (
+            "validate_native_thinking_blocks",
+            'raise ComposerAdmissionRefused("Provider thinking state contains an unsupported native block.")',
+            "continue",
+        ),
+        ("scan_native_thinking_blocks", "validate_native_thinking_blocks(value)", "validate_native_thinking_blocks(foreign)"),
+        ("scan_native_thinking_blocks", "current = {key: block[key] for key in block}", "current = {}"),
+        ("scan_native_thinking_blocks", 'surface="composer_provider_thinking"', 'surface="foreign"'),
+        ("scan_native_thinking_blocks", "max(utf8_size(text) for text in current.values())", "1"),
+        ("scan_native_thinking_blocks", "utf8_size(text)", "len(text)"),
+        ("parse_native_thinking_blocks", "validate_native_thinking_blocks(value)", "pass"),
+        (
+            "native_thinking_blocks",
+            "scan_native_thinking_blocks(value)\n    return parse_native_thinking_blocks(value)",
+            "parse_native_thinking_blocks(value)\n    scan_native_thinking_blocks(value)\n    return []",
+        ),
+    ),
+)
+def test_receiving_attachment_thinking_preserves_complete_admission(receiving_attachment_prerequisite_units, symbol, before, after):
+    _receiving_attachment_prerequisite_opposition(
+        receiving_attachment_prerequisite_units, "src/elspeth/web/composer/provider_thinking.py", symbol, before, after
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "symbol", "before", "after"),
+    (
+        (
+            "continuation_attachment_application.py",
+            "require_attachment_projection",
+            "require_admitted_turn_evidence(before, env_ref_names=env_ref_names)",
+            "require_admitted_turn_evidence(after, env_ref_names=env_ref_names)",
+        ),
+        (
+            "continuation_attachment_application.py",
+            "require_attachment_projection",
+            "new = after_admitted.graph",
+            "new = before_admitted.graph",
+        ),
+        (
+            "continuation_attachment_application.py",
+            "require_attachment_projection",
+            "source_chunks=(recorder_chunk, *before.sources.chunks)",
+            "source_chunks=(recorder_chunk,)",
+        ),
+        (
+            "continuation_attachment_application.py",
+            "require_attachment_projection",
+            '"recorder": recorder_chunk.reference',
+            '"recorder": foreign',
+        ),
+        (
+            "continuation_attachment_application.py",
+            "require_attachment_projection",
+            "encode_turn_evidence(after_admitted, env_ref_names=env_ref_names)",
+            "encode_turn_evidence(expected_admitted, env_ref_names=env_ref_names)",
+        ),
+        (
+            "continuation_attachment_application.py",
+            "admit_attachment_application",
+            "canonical=value.before_evidence_json",
+            "canonical=value.after_evidence_json",
+        ),
+        ("continuation_attachment_application.py", "admit_attachment_application", "before.snapshot.logical != root.logical", "False"),
+        (
+            "continuation_attachment_application_driver.py",
+            "apply_current_attachment_runtime",
+            "history = current_source.attachments",
+            "history = runtime.attachments",
+        ),
+        (
+            "continuation_attachment_application_driver.py",
+            "apply_current_attachment_runtime",
+            "current_source.selected is not selected",
+            "current_source.selected != selected",
+        ),
+        (
+            "continuation_attachment_application_driver.py",
+            "apply_current_attachment_runtime",
+            "work,\n        ContinuationRuntimeSource,",
+            "foreign,\n        ContinuationRuntimeSource,",
+        ),
+        (
+            "continuation_attachment_application_driver.py",
+            "apply_current_attachment_runtime",
+            "authority.read_continuation_runtime(running, selected=selected, inventory=inventory)",
+            "authority.read_continuation_runtime(running, selected=foreign, inventory=inventory)",
+        ),
+        (
+            "continuation_attachment_finisher.py",
+            "finish_current_attachment_result",
+            "require_admitted_turn_evidence(before, env_ref_names=inventory.names).graph",
+            "require_admitted_turn_evidence(before, env_ref_names=frozenset()).graph",
+        ),
+    ),
+)
+def test_receiving_attachment_v2_and_current_history_keep_actual_owners(
+    receiving_attachment_prerequisite_units, path, symbol, before, after
+):
+    _receiving_attachment_prerequisite_opposition(
+        receiving_attachment_prerequisite_units, "src/elspeth/web/composer/" + path, symbol, before, after
+    )
+
+
+@pytest.mark.parametrize("side", ("before", "after"))
+def test_receiving_attachment_v2_decoders_keep_each_original_source_chunk_set(receiving_attachment_prerequisite_units, side):
+    before = (
+        "canonical=value." + side + "_evidence_json, env_ref_names=env_ref_names),\n"
+        "        env_ref_names=env_ref_names,\n        source_chunks=source_chunks,"
+    )
+    _receiving_attachment_prerequisite_opposition(
+        receiving_attachment_prerequisite_units,
+        "src/elspeth/web/composer/continuation_attachment_application.py",
+        "admit_attachment_application",
+        before,
+        before.replace("source_chunks=source_chunks", "source_chunks=()"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "module"),
+    (("utf8_size", "elspeth.contracts.bounded_serialization"), ("require_no_credential_material", "elspeth.web.credential_guard")),
+)
+@pytest.mark.parametrize("fault", ("foreign_import", "rebound", "missing_source", "shadowed_definition"))
+def test_receiving_attachment_thinking_supplier_binding_is_not_permission(receiving_attachment_prerequisite_units, name, module, fault):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, receipt = transfers.attachment_prerequisite_transfers(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/provider_thinking.py"
+    supplier_path = "src/" + module.replace(".", "/") + ".py"
+    if fault == "missing_source":
+        mutated = tuple(unit for unit in units if unit.path != supplier_path)
+        assert len(mutated) == len(units) - 1
+        diagnostic = "attachment prerequisite supplier source missing " + supplier_path
+    else:
+        target_path = supplier_path if fault == "shadowed_definition" else path
+        original = next(unit for unit in units if unit.path == target_path)
+        if fault == "foreign_import":
+            old = "from " + module + " import " + name
+            assert original.source.count(old) == 1
+            source = original.source.replace(old, "from foreign.supplier import " + name, 1)
+        else:
+            source = original.source + "\n" + name + " = foreign\n"
+        changed = fencing._parse_source(target_path, source)
+        mutated = tuple(changed if unit is original else unit for unit in units)
+        diagnostic = (
+            "attachment prerequisite supplier definition changed " + supplier_path + ":" + name
+            if fault == "shadowed_definition"
+            else "attachment prerequisite supplier binding changed " + path + ":" + name
+        )
+    failures, refused = transfers.attachment_prerequisite_transfers(mutated)
+    assert failures == [diagnostic]
+    assert refused == {}
+    assert transfers.attachment_prerequisite_transfers(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        (
+            "from elspeth.web.sessions.continuation_p4_application_store import _private_chunk_for_operation_on_connection",
+            "from foreign.store import _private_chunk_for_operation_on_connection",
+        ),
+        ("_text_data(conn, session_id, operation_id, private_chunk_key(actual)) != actual.canonical", "False"),
+        (
+            "_private_chunk_for_operation_on_connection(conn, session_id, operation_id, ref)",
+            "_private_chunk_for_operation_on_connection(conn, session_id, foreign, ref)",
+        ),
+        ("for ref in attachment_history_dependencies(fields)", "for ref in set(attachment_history_dependencies(fields))"),
+        ("env_ref_names=names, source_chunks=chunks", "env_ref_names=names, source_chunks=()"),
+        ("return AttachmentHistorySources(history, chunks)", "return AttachmentHistorySources(history, ())"),
+    ),
+)
+def test_receiving_attachment_history_sql_supplier_keeps_bytes_and_occurrences(receiving_attachment_prerequisite_units, before, after):
+    _receiving_attachment_prerequisite_opposition(
+        receiving_attachment_prerequisite_units,
+        "src/elspeth/web/sessions/continuation_attachment_application.py",
+        "load_attachment_history_data_on_connection",
+        before,
+        after,
+    )
+
+
+@pytest.mark.parametrize("shadow", ("ContinuationLivePhases = foreign", "ContinuationLivePhases: object = foreign"))
+def test_receiving_p4_custody_lookup_refuses_shadowed_actual_phase_owner(receiving_attachment_prerequisite_units, shadow):
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source + "\n" + shadow + "\n")
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    assert fencing._reserve_p4_batch_custody_receipt(mutated) == (["P4 batch custody native definition changed"], {})
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    (
+        "ContinuationLivePhases, other = foreign",
+        "for ContinuationLivePhases in foreign:\n    pass",
+        "with foreign as ContinuationLivePhases:\n    pass",
+        "if foreign:\n    ContinuationLivePhases = foreign",
+        "import foreign as ContinuationLivePhases",
+        "(ContinuationLivePhases := foreign)",
+    ),
+    ids=("tuple", "for", "with", "conditional", "import", "named-expression"),
+)
+def test_receiving_p4_custody_lookup_refuses_indirect_phase_owner_rebinding(receiving_attachment_prerequisite_units, shadow):
+    # Root received the original-positive/six-negative RED before the lexical
+    # owner lookup repair. Keep the same concrete refusals on the repair.
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source + "\n" + shadow + "\n")
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    assert fencing._reserve_p4_batch_custody_receipt(mutated) == (["P4 batch custody native definition changed"], {})
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "effect",
+    (
+        "ContinuationLivePhases._execute_one_owned = foreign",
+        "del ContinuationLivePhases._execute_one_owned",
+        "ContinuationLivePhases._execute_one_owned, other = foreign",
+        "if foreign:\n    ContinuationLivePhases._persist_batch = foreign",
+        "for ContinuationLivePhases._execute_one_owned in foreign:\n    pass",
+        "with foreign as ContinuationLivePhases._execute_one_owned:\n    pass",
+    ),
+    ids=("assign", "delete", "tuple", "conditional", "for", "with"),
+)
+def test_receiving_p4_custody_lookup_refuses_qualified_member_mutation(receiving_attachment_prerequisite_units, effect):
+    # Root measured all six original-positive/qualified-effect negatives RED
+    # before this exact enclosing-execution attribute-effect check was added.
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source + "\n" + effect + "\n")
+    assert ast.dump(changed.tree) != ast.dump(original.tree)
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    assert fencing._reserve_p4_batch_custody_receipt(mutated) == (["P4 batch custody native definition changed"], {})
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        "ContinuationLivePhases.unrelated_review_probe = foreign",
+        "def deferred_review_probe():\n    ContinuationLivePhases._execute_one_owned = foreign",
+    ),
+    ids=("unselected-member", "deferred-effect"),
+)
+def test_receiving_p4_custody_local_lookup_does_not_claim_global_effect_closure(receiving_attachment_prerequisite_units, source):
+    units = receiving_attachment_prerequisite_units
+    failures, original_receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    changed = fencing._parse_source(path, original.source + "\n" + source + "\n")
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(mutated)
+    assert failures == [], failures
+    assert receipt["native_calls"]
+    (added,) = changed.tree.body[len(original.tree.body) :]
+    added_sites = {(path, id(node)) for node in ast.walk(added)}
+    assert not added_sites.intersection(receipt["receiver_uses"] | receipt["native_calls"] | receipt["native_uses"])
+    assert receipt["execute_reference"] not in added_sites
+    # The local proof issues no permission for either new effect. Whether the
+    # assembled origin/effect proof refuses it is a separate receiving claim.
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], original_receipt)
+
+
+@pytest.mark.parametrize("shadow", ("_execute_one_owned, other = foreign", "if foreign:\n    _execute_one_owned = foreign"))
+def test_receiving_p4_custody_lookup_checks_each_actual_class_namespace(receiving_attachment_prerequisite_units, shadow):
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+
+    def change(unit):
+        owner = fencing._reserve_node_at(unit, "ContinuationLivePhases")
+        assert isinstance(owner, ast.ClassDef)
+        owner.body.extend(ast.parse(shadow).body)
+
+    mutated = _receiving_changed_units(units, path, change)
+    assert fencing._reserve_p4_batch_custody_receipt(mutated) == (["P4 batch custody native definition changed"], {})
+    assert fencing._reserve_p4_batch_custody_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize("fault", ("call_model", "ctx", "acc", "llm_messages", "batch", "missing", "extra", "duplicate", "foreign"))
+def test_receiving_p4_initializer_keeps_original_owners_after_phase_source_rebind(
+    receiving_attachment_prerequisite_units, monkeypatch, fault
+):
+    continuation = fencing._reserve_continuation_transfers
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = continuation.p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    primary = fencing._reserve_node_at(original, "ContinuationLivePhases._primary_for_phase")
+    (initializer,) = [
+        node for node in ast.walk(primary) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_initialize_continuation_batch_live"
+    ]
+    assert (path, id(initializer)) in receipt["native_calls"]
+    assert (path, id(initializer.func)) in receipt["native_uses"]
+
+    def change(unit):
+        owner = fencing._reserve_node_at(unit, "ContinuationLivePhases._primary_for_phase")
+        (statement,) = [
+            node
+            for node in owner.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Await)
+            and isinstance(node.value.value, ast.Call)
+            and ast.unparse(node.value.value.func) == "_initialize_continuation_batch_live"
+        ]
+        call = statement.value.value
+        if fault == "missing":
+            call.keywords.pop()
+        elif fault == "extra":
+            call.keywords.append(ast.keyword(arg="foreign", value=ast.Constant(None)))
+        elif fault == "duplicate":
+            owner.body.insert(owner.body.index(statement), copy.deepcopy(statement))
+        elif fault == "foreign":
+            call.func = ast.Name(id="foreign_initializer", ctx=ast.Load())
+        else:
+            keyword = next(keyword for keyword in call.keywords if keyword.arg == fault)
+            keyword.value = ast.Name(id="foreign_owner", ctx=ast.Load())
+
+    mutated = _receiving_changed_units(units, path, change)
+    changed = next(unit for unit in mutated if unit.path == path)
+    cls = fencing._reserve_node_at(changed, "ContinuationLivePhases")
+    with monkeypatch.context() as patch:
+        patch.setitem(continuation.OWNER_TEMPLATES, "phases.ContinuationLivePhases", ast.unparse(cls))
+        assert continuation.p4_batch_custody_receipt(mutated) == (["P4 batch custody actual initializer owner arguments changed"], {})
+    assert continuation.p4_batch_custody_receipt(units) == ([], receipt)
+
+
+@pytest.mark.parametrize(
+    "fault", ("projection", "caller", "branch", "sql_source", "ordinal", "slots", "physical", "context", "guard_order")
+)
+def test_receiving_terminal_reserve_tickets_keep_original_owner_after_body_rebind(monkeypatch, fault):
+    continuation = fencing._reserve_continuation_transfers
+    units = _source_units(tuple(dict.fromkeys(path for path, _symbol in continuation.TERMINAL_RESERVE_BODY_BINDINGS)))
+    failures, receipt = continuation.terminal_failure_reserve_transfers(units)
+    assert failures == [], failures
+    assert len(receipt["reserve_calls"]) == 2
+    driver_fault = fault in {"projection", "caller", "branch"}
+    path, symbol = (
+        ("src/elspeth/web/sessions/continuation_driver.py", "_SegmentDriver")
+        if driver_fault
+        else ("src/elspeth/web/sessions/continuation_tool_failure.py", "fail_continuation_tool_operation")
+    )
+
+    def change(unit):
+        if driver_fault:
+            owner = fencing._reserve_node_at(unit, "_SegmentDriver.settle")
+            if fault == "branch":
+                (branch,) = [node for node in owner.body if isinstance(node, ast.If) and ast.unparse(node.test) == "owns_failure"]
+                branch.test = ast.Constant(True)
+            else:
+                (call,) = [
+                    node
+                    for node in ast.walk(owner)
+                    if isinstance(node, ast.Call)
+                    and ast.unparse(node.func)
+                    == (
+                        "self.work.coordinator.reserve"
+                        if fault == "projection"
+                        else "self.services.session_service.fail_continuation_tool_operation"
+                    )
+                ]
+                if fault == "projection":
+                    call.args[0] = ast.Attribute(
+                        value=ast.Name(id="RequiredWorkSource", ctx=ast.Load()), attr="TERMINAL_FAILURE_SQL", ctx=ast.Load()
+                    )
+                else:
+                    next(keyword for keyword in call.keywords if keyword.arg == "failure_projection_work").value = ast.Name(
+                        id="foreign_ticket", ctx=ast.Load()
+                    )
+        else:
+            owner = fencing._reserve_node_at(unit, symbol)
+            (loop,) = [node for node in owner.body if isinstance(node, ast.For) and ast.unparse(node.target) == "slot"]
+            if fault == "slots":
+                loop.iter.args[0] = ast.Constant(3)
+            elif fault == "physical":
+                loop.body[2].body[0].value.value.args[0] = ast.Name(id="foreign_ticket", ctx=ast.Load())
+            elif fault in {"context", "guard_order"}:
+                (guard,) = [
+                    node
+                    for node in owner.body
+                    if isinstance(node, ast.If) and "authority.context is not running.session_operation_context" in ast.unparse(node.test)
+                ]
+                if fault == "context":
+                    guard.test = ast.Constant(False)
+                else:
+                    owner.body.remove(guard)
+                    owner.body.append(guard)
+            else:
+                call = loop.body[0].body[1].value
+                if fault == "sql_source":
+                    call.args[0].attr = "TERMINAL_FAILURE_PROJECTION"
+                else:
+                    call.keywords[0].value = ast.Constant(0)
+
+    mutated = _receiving_changed_units(units, path, change)
+    changed = next(unit for unit in mutated if unit.path == path)
+    declaration = fencing._reserve_node_at(changed, symbol)
+    with monkeypatch.context() as patch:
+        patch.setitem(continuation.TERMINAL_RESERVE_BODY_BINDINGS, (path, symbol), continuation._digest(declaration))
+        failures, rejected = continuation.terminal_failure_reserve_transfers(mutated)
+        assert rejected == {} and any(
+            failure.startswith("terminal reserve original") or "physical slots" in failure for failure in failures
+        ), failures
+        assert not any("complete source changed" in failure for failure in failures)
+    assert continuation.terminal_failure_reserve_transfers(units) == ([], receipt)
+
+
+@pytest.mark.parametrize("fault", ("deadline", "authority", "coordinator", "adoption_context", "adoption_work", "retained", "lease_source"))
+def test_receiving_started_owner_keeps_exact_custody_after_body_rebind(monkeypatch, fault):
+    paths = (worker_six.WORKER, "src/elspeth/web/coordination/lifecycle.py")
+    units = _source_units(paths)
+    failures, receipt = worker_six.continuation_start_owner_contract(units)
+    assert failures == [] and receipt is not None, failures
+    sites = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    assert receipt["supplier_arguments"]
+    for path, call_id, argument_id in receipt["supplier_arguments"]:
+        call = sites[path, call_id]
+        assert isinstance(call, ast.Call)
+        assert any(id(argument) == argument_id for argument in (*call.args, *(keyword.value for keyword in call.keywords)))
+    path = paths[1] if fault == "lease_source" else paths[0]
+
+    def change(unit):
+        if fault == "lease_source":
+            owner = fencing._reserve_node_at(unit, "ContinuationLeaseAdoption.join")
+            (call,) = [
+                node for node in ast.walk(owner) if isinstance(node, ast.Call) and ast.unparse(node.func) == "self.required_work.reserve"
+            ]
+            call.args[0].attr = "LEASE_RELEASE"
+            return
+        owner = fencing._reserve_node_at(unit, "ComposerAsyncWorker._job_v2")
+        if fault == "retained":
+            (stored,) = [
+                node
+                for node in ast.walk(owner)
+                if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "self._continuation_adoptions[key]"
+            ]
+            stored.value = ast.Name(id="foreign_adoption", ctx=ast.Load())
+            return
+        constructor = {
+            "deadline": "ContinuationSQLDeadlineOwner",
+            "authority": "RequiredWorkAuthority",
+            "coordinator": "RequiredWorkCoordinator",
+            "adoption_context": "ContinuationLeaseAdoption",
+            "adoption_work": "ContinuationLeaseAdoption",
+        }[fault]
+        (call,) = [node for node in ast.walk(owner) if isinstance(node, ast.Call) and ast.unparse(node.func) == constructor]
+        if fault in {"authority", "adoption_context"}:
+            call.args[1] = ast.Name(id="foreign_context", ctx=ast.Load())
+        else:
+            keyword = {"deadline": "drain_signal", "coordinator": "sql_deadline_owner", "adoption_work": "required_work"}[fault]
+            next(item for item in call.keywords if item.arg == keyword).value = ast.Name(id="foreign_owner", ctx=ast.Load())
+
+    mutated = _receiving_changed_units(units, path, change)
+    changed = next(unit for unit in mutated if unit.path == path)
+    symbol = "ContinuationLeaseAdoption" if fault == "lease_source" else "ComposerAsyncWorker._job_v2"
+    declaration = fencing._reserve_node_at(changed, symbol)
+    with monkeypatch.context() as patch:
+        patch.setitem(worker_six.CONTINUATION_OWNER_GRAMMARS, symbol, worker_six.grammar(declaration))
+        failures, rejected = worker_six.continuation_start_owner_contract(mutated)
+        assert failures and rejected is None
+        assert not any("complete source changed" in failure for failure in failures), failures
+    assert worker_six.continuation_start_owner_contract(units) == ([], receipt)
+
+
+@pytest.mark.parametrize("fault", ("service", "work", "phases_provider", "phases_lease", "store"))
+def test_receiving_driver_provider_store_keeps_exact_original_owners_after_body_rebind(monkeypatch, fault):
+    path = "src/elspeth/web/sessions/continuation_driver.py"
+    units = _source_units((path,))
+    failures, receipt = provider.provider_driver_constructor_contract(units)
+    assert failures == [] and receipt is not None, failures
+    sites = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    assert len(receipt["owner_constructor_stores"]) == len(receipt["owner_constructor_calls"]) == 1
+    for site in receipt["owner_constructor_stores"]:
+        assert isinstance(sites[site], ast.Assign) and ast.unparse(sites[site].targets[0]) == "self.provider"
+
+    def change(unit):
+        owner = fencing._reserve_node_at(unit, "_SegmentDriver.__init__")
+        if fault == "store":
+            (stored,) = [node for node in owner.body if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "self.provider"]
+            stored.targets[0].attr = "foreign_provider"
+        else:
+            name = "ContinuationLivePhases" if fault.startswith("phases_") else "ProviderInvocationOwner"
+            (call,) = [node for node in ast.walk(owner) if isinstance(node, ast.Call) and ast.unparse(node.func) == name]
+            if fault.startswith("phases_"):
+                call.args[3 if fault == "phases_provider" else 4] = ast.Name(id="foreign_owner", ctx=ast.Load())
+            else:
+                next(
+                    keyword for keyword in call.keywords if keyword.arg == ("service" if fault == "service" else "required_work")
+                ).value = ast.Name(id="foreign_owner", ctx=ast.Load())
+
+    mutated = _receiving_changed_units(units, path, change)
+    constructor = fencing._reserve_node_at(mutated[0], "_SegmentDriver.__init__")
+    with monkeypatch.context() as patch:
+        patch.setitem(provider.CONTRACTS, provider.DRIVER + ":_SegmentDriver.__init__", ast.unparse(constructor))
+        failures, rejected = provider.provider_driver_constructor_contract(mutated)
+        assert failures and rejected is None
+        assert "provider driver complete constructor changed" not in failures
+    assert provider.provider_driver_constructor_contract(units) == ([], receipt)
+
+
+def test_receiving_p4_custody_binds_issue_and_completion_as_distinct_original_branches(receiving_attachment_prerequisite_units):
+    units = receiving_attachment_prerequisite_units
+    failures, receipt = fencing._reserve_p4_batch_custody_receipt(units)
+    assert failures == [], failures
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    original = next(unit for unit in units if unit.path == path)
+    owner = fencing._reserve_node_at(original, "ContinuationLivePhases._execute_one_owned")
+    prepared = [node for node in owner.body if isinstance(node, ast.If) and ast.unparse(node.test) == "preparation == 'prepared'"]
+    assert len(prepared) == 2
+    issued, completed = prepared
+    assert owner.body[-2] is completed
+    (execute,) = [
+        node for node in ast.walk(issued) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_execute_continuation_call_live"
+    ]
+    assert receipt["execute_reference"] == (path, id(execute.func))
+    assert (path, id(execute)) in receipt["native_calls"]
+    assert not any(
+        isinstance(node, ast.Call) and ast.unparse(node.func) == "_execute_continuation_call_live" for node in ast.walk(completed)
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ('disposition="committed", receipt_id=receipt', 'disposition="dispatched", receipt_id=receipt'),
+        ('"settled_effect_ids": (*top.settled_effect_ids, issued_effect_key)', '"settled_effect_ids": top.settled_effect_ids'),
+        ('"tool_completed" if preparation == "prepared" else "tool_preparation_completed"', '"tool_preparation_completed"'),
+    ),
+)
+def test_receiving_p4_custody_preserves_the_actual_completion_branch(before, after):
+    _receiving_p4_custody_opposition(
+        "src/elspeth/web/composer/continuation_live_phases.py",
+        "ContinuationLivePhases._execute_one_owned",
+        before,
+        after,
+        "actual issued/completed phase layout changed",
+    )
+
+
+@pytest.mark.parametrize("fault", ("missing", "duplicate", "shadow"))
+def test_receiving_attachment_prerequisite_owner_cannot_be_substituted(receiving_attachment_prerequisite_units, fault):
+    units = receiving_attachment_prerequisite_units
+    transfers = fencing._reserve_continuation_transfers
+    failures, receipt = transfers.attachment_prerequisite_transfers(units)
+    assert failures == [], failures
+    path = transfers.CHECKPOINT
+    original = next(unit for unit in units if unit.path == path)
+    if fault == "missing":
+        mutated = tuple(unit for unit in units if unit is not original)
+        diagnostic = "attachment prerequisite source set missing or duplicated"
+    elif fault == "duplicate":
+        mutated = (*units, fencing._parse_source(path, original.source))
+        diagnostic = "attachment prerequisite source set missing or duplicated"
+    else:
+        assert fault == "shadow"
+        changed = fencing._parse_source(path, original.source + "\n_effect_data: object = foreign\n")
+        mutated = tuple(changed if unit is original else unit for unit in units)
+        diagnostic = "attachment prerequisite exact transfer changed " + path + ":_effect_data"
+    assert transfers.attachment_prerequisite_transfers(mutated) == ([diagnostic], {})
+    assert transfers.attachment_prerequisite_transfers(units) == ([], receipt)
+
+
+def _receiving_attachment_positive(units):
+    transfers = fencing._reserve_continuation_transfers
+    failures, receipt = transfers.attachment_local_transfers(units)
+    # This is deliberately the direct helper, without global recipe/seal gates
+    # or replacement selection facts. Its actual prerequisites must pass first.
+    assert failures == [], failures
+    assert receipt
+    return receipt
+
+
+def _receiving_attachment_execute_reference(units, path, symbol):
+    unit = next(unit for unit in units if unit.path == path)
+    owner = fencing._reserve_node_at(unit, symbol)
+    assert isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef))
+    calls = [node for node in ast.walk(owner) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_execute_continuation_call_live"]
+    assert len(calls) == 1
+    return path, id(calls[0].func)
+
+
+def test_receiving_attachment_inventory_joins_only_the_actual_p4_execute_reference():
+    units = fencing._production_units()
+    receipt = _receiving_attachment_positive(units)
+    transfers = fencing._reserve_continuation_transfers
+    phase_path = "src/elspeth/web/composer/continuation_live_phases.py"
+    ordinary = _receiving_attachment_execute_reference(units, transfers.BATCH, "run_tool_batch")
+    retained = _receiving_attachment_execute_reference(units, transfers.FINISHER, "finish_current_attachment_result")
+    issued = _receiving_attachment_execute_reference(units, phase_path, "ContinuationLivePhases._execute_one_owned")
+    assert len({ordinary, retained, issued}) == 3
+    assert transfers._references(units, {"_execute_continuation_call_live"}) == {ordinary, retained, issued}
+    assert {retained, issued} <= receipt["native_uses"]
+    original = next(unit for unit in units if unit.path == phase_path)
+    changed = fencing._parse_source(
+        phase_path, original.source + "\nasync def foreign_attachment_dispatch():\n    await _execute_continuation_call_live()\n"
+    )
+    mutated = tuple(changed if unit is original else unit for unit in units)
+    failures, refused = transfers.attachment_local_transfers(mutated)
+    assert failures == ["continuation attachment native reference inventory changed"]
+    assert refused == {}
+    assert _receiving_attachment_positive(units) == receipt
+
+
+@pytest.mark.parametrize(
+    ("fault", "diagnostic"),
+    (
+        ("foreign_batch", "actual issued custody constructor/forwarding changed"),
+        ("foreign_call", "actual issued custody constructor/forwarding changed"),
+        ("foreign_context", "actual issued custody constructor/forwarding changed"),
+        ("foreign_custody", "actual issued custody constructor/forwarding changed"),
+        ("rebound_batch", "actual issued source rebound batch"),
+        ("missing_retention", "actual issued custody constructor/forwarding changed"),
+        ("late_retention", "actual issued custody constructor/forwarding changed"),
+    ),
+)
+def test_receiving_attachment_p4_caller_keeps_original_issue_and_custody(fault, diagnostic):
+    units = fencing._production_units()
+    receipt = _receiving_attachment_positive(units)
+    transfers = fencing._reserve_continuation_transfers
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+
+    def change(unit):
+        owner = fencing._reserve_node_at(unit, "ContinuationLivePhases._execute_one_owned")
+        candidates = [node for node in owner.body if isinstance(node, ast.If) and ast.unparse(node.test) == "preparation == 'prepared'"]
+        assert len(candidates) == 2 and owner.body[-2] is candidates[1]
+        (prepared,) = [
+            branch
+            for branch in candidates
+            if any(isinstance(node, ast.Call) and ast.unparse(node.func) == "_execute_continuation_call_live" for node in ast.walk(branch))
+        ]
+        assert prepared is candidates[0]
+        retention, custody, dispatch = prepared.body[-3:]
+        assert isinstance(retention, ast.Expr) and isinstance(retention.value, ast.Await)
+        assert ast.unparse(retention.value.value.func) == "self._retain"
+        assert isinstance(custody, ast.Assign) and ast.unparse(custody.value.func) == "ContinuationToolFailureCustody"
+        assert isinstance(dispatch, ast.Expr) and isinstance(dispatch.value, ast.Await)
+        assert ast.unparse(dispatch.value.value.func) == "_execute_continuation_call_live"
+        if fault in {"foreign_batch", "foreign_call"}:
+            position = 3 if fault == "foreign_batch" else 6
+            assert ast.unparse(custody.value.args[position]) == ("batch" if position == 3 else "call")
+            custody.value.args[position] = ast.Name(id="foreign", ctx=ast.Load())
+        elif fault in {"foreign_context", "foreign_custody"}:
+            argument = "ctx" if fault == "foreign_context" else "failure_custody"
+            (keyword,) = [item for item in dispatch.value.value.keywords if item.arg == argument]
+            assert ast.unparse(keyword.value) == ("context" if argument == "ctx" else "self.failure_custody")
+            keyword.value = ast.Name(id="foreign", ctx=ast.Load())
+        elif fault == "rebound_batch":
+            prepared.body.insert(len(prepared.body) - 3, ast.parse("batch = foreign").body[0])
+        elif fault == "missing_retention":
+            prepared.body.remove(retention)
+        else:
+            assert fault == "late_retention"
+            prepared.body[-3:] = [custody, retention, dispatch]
+
+    changed = _receiving_changed_units(units, path, change)
+    failures, refused = transfers.attachment_local_transfers(changed)
+    assert failures == ["P4 batch custody " + diagnostic]
+    assert refused == {}
+    assert _receiving_attachment_positive(units) == receipt
+
+
+def test_receiving_attachment_receipt_rejects_a_detached_p4_reference(monkeypatch):
+    units = fencing._production_units()
+    original_receipt = _receiving_attachment_positive(units)
+    detached = tuple(fencing._parse_source(unit.path, unit.source) for unit in units)
+    detached_receipt = _receiving_attachment_positive(detached)
+    transfers = fencing._reserve_continuation_transfers
+    path = "src/elspeth/web/composer/continuation_live_phases.py"
+    symbol = "ContinuationLivePhases._execute_one_owned"
+    actual_reference = _receiving_attachment_execute_reference(units, path, symbol)
+    detached_reference = _receiving_attachment_execute_reference(detached, path, symbol)
+    assert actual_reference != detached_reference
+    original_references = transfers._references
+    calls = []
+
+    def detached_inventory(supplied, names):
+        references = original_references(supplied, names)
+        if names == {"_execute_continuation_call_live"}:
+            assert supplied is units
+            assert actual_reference in references and detached_reference not in references
+            calls.append(actual_reference)
+            return (references - {actual_reference}) | {detached_reference}
+        return references
+
+    # Use the existing inventory seam, not a future producer attribute or an
+    # injected permission argument. Only the P4 node identity is substituted.
+    with monkeypatch.context() as patch:
+        patch.setattr(transfers, "_references", detached_inventory)
+        failures, refused = transfers.attachment_local_transfers(units)
+    assert calls == [actual_reference]
+    assert failures == ["continuation attachment native reference inventory changed"]
+    assert refused == {}
+    assert _receiving_attachment_positive(units) == original_receipt
+    assert _receiving_attachment_positive(detached) == detached_receipt
+
+
+@pytest.mark.parametrize(
+    "fault", ("retained_default", "custody_default", "attachment_context", "attachment_registration", "ordinary_sibling")
+)
+def test_receiving_attachment_default_and_registration_remain_exact(fault):
+    units = fencing._production_units()
+    receipt = _receiving_attachment_positive(units)
+    transfers = fencing._reserve_continuation_transfers
+    original = next(unit for unit in units if unit.path == transfers.BATCH)
+    execute = fencing._reserve_node_at(original, "_execute_continuation_call_live")
+    defaults = dict(zip((arg.arg for arg in execute.args.kwonlyargs), execute.args.kw_defaults, strict=True))
+    assert isinstance(defaults["retained_attachment"], ast.Constant) and defaults["retained_attachment"].value is None
+    assert isinstance(defaults["failure_custody"], ast.Constant) and defaults["failure_custody"].value is None
+    assert receipt["retained_defaults"] == {(transfers.BATCH, id(defaults["retained_attachment"]))}
+    assert (transfers.BATCH, id(defaults["failure_custody"])) not in receipt["retained_defaults"]
+
+    def change(unit):
+        owner = fencing._reserve_node_at(unit, "_execute_continuation_call_live")
+        if fault in {"retained_default", "custody_default"}:
+            name = "retained_attachment" if fault == "retained_default" else "failure_custody"
+            position = [arg.arg for arg in owner.args.kwonlyargs].index(name)
+            owner.args.kw_defaults[position] = ast.Name(id="foreign", ctx=ast.Load())
+            return
+        (registration,) = [
+            node
+            for node in ast.walk(owner)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "retained_attachment is not None"
+            and any(
+                isinstance(child, ast.Call) and ast.unparse(child.func) == "ctx.message_producers.register_attachment_message"
+                for child in ast.walk(node)
+            )
+        ]
+        if fault == "attachment_context":
+            assert isinstance(registration.body[0], ast.If)
+            registration.body[0].test = ast.Constant(value=False)
+        elif fault == "attachment_registration":
+            (call,) = [
+                node
+                for node in ast.walk(registration)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == "ctx.message_producers.register_attachment_message"
+            ]
+            (keyword,) = [item for item in call.keywords if item.arg == "call"]
+            assert ast.unparse(keyword.value) == "tool_call"
+            keyword.value = ast.Name(id="foreign", ctx=ast.Load())
+        else:
+            assert fault == "ordinary_sibling" and len(registration.orelse) == 1
+            sibling = registration.orelse[0]
+            assert isinstance(sibling, ast.If)
+            sibling.test = ast.Constant(value=False)
+
+    changed = _receiving_changed_units(units, transfers.BATCH, change)
+    failures, refused = transfers.attachment_local_transfers(changed)
+    if fault in {"retained_default", "custody_default"}:
+        assert failures == ["continuation attachment declaration namespace changed " + transfers.BATCH]
+    elif fault == "ordinary_sibling":
+        assert failures == ["P4 batch custody exact result publication changed"]
+    else:
+        assert failures == ["continuation attachment selected admission/registration changed"]
+    assert refused == {}
+    assert _receiving_attachment_positive(units) == receipt
 
 
 def test_receiving_batch_partition_does_not_omit_an_additional_live_field():
@@ -8244,7 +11050,87 @@ def test_receiving_seven_boundary_local_producers_have_current_positives():
         pytest.fail("Current boundary prerequisites failed:\n" + "\n".join(failures), pytrace=False)
 
 
-@pytest.mark.parametrize("method_name", ("_consume_continuation_handoff", "consume_continuation_handoff"))
+@pytest.mark.parametrize("fault", ("missing", "shared", "moved", "duplicate_slot", "foreign_slot"))
+def test_receiving_continuation_stage_list_is_fresh_and_exactly_owned(fault):
+    path = "src/elspeth/web/coordination/lifecycle.py"
+    original = _source_units((path,))[0]
+    assert family._check_contracts(original, family._lease_contracts())[0] == []
+    cls = family._find(original.tree, "SessionOperationLease")
+    slots = next(
+        node.value for node in cls.body if isinstance(node, ast.Assign) and any(receiver.name(t, "__slots__") for t in node.targets)
+    )
+    names = tuple(node.value for node in slots.elts)
+    assert names.count("_continuation_stages") == 1
+    assert family._owned_class(original, "SessionOperationLease", names, ("final",)) == []
+    changed = fencing._parse_source(path, original.source)
+    constructor = family._find(changed.tree, "SessionOperationLease.__init__")
+    (allocation,) = [
+        node for node in constructor.body if isinstance(node, ast.AnnAssign) and ast.unparse(node.target) == "self._continuation_stages"
+    ]
+    assert isinstance(allocation.value, ast.List) and allocation.value.elts == []
+    if fault == "missing":
+        constructor.body.remove(allocation)
+    elif fault == "shared":
+        allocation.value = ast.Name(id="shared_stages", ctx=ast.Load())
+    elif fault == "moved":
+        constructor.body.remove(allocation)
+        constructor.body.insert(0, allocation)
+    else:
+        changed_cls = family._find(changed.tree, "SessionOperationLease")
+        changed_slots = next(
+            node.value
+            for node in changed_cls.body
+            if isinstance(node, ast.Assign) and any(receiver.name(t, "__slots__") for t in node.targets)
+        )
+        changed_slots.elts.append(ast.Constant("_continuation_stages" if fault == "duplicate_slot" else "foreign"))
+    changed = _receiving_reparse_mutated_unit(changed)
+    if fault in {"duplicate_slot", "foreign_slot"}:
+        assert family._owned_class(changed, "SessionOperationLease", names, ("final",)) == [
+            "SessionOperationLease: owned slot/descriptor namespace changed"
+        ]
+    else:
+        assert (
+            "SessionOperationLease.__init__: closed execution contract changed (guard/transfer/effect/branch)"
+            in family._check_contracts(changed, family._lease_contracts())[0]
+        )
+    assert family._check_contracts(original, family._lease_contracts())[0] == []
+
+
+@pytest.mark.parametrize("fault", ("missing", "required", "foreign_default", "extra"))
+def test_receiving_public_handoff_deadline_retains_exact_optional_header(fault):
+    path = "src/elspeth/web/coordination/lifecycle.py"
+    original = _source_units((path,))[0]
+    cls = family._find(original.tree, "SessionOperationLease")
+    slots = next(
+        node.value for node in cls.body if isinstance(node, ast.Assign) and any(receiver.name(t, "__slots__") for t in node.targets)
+    )
+    names = tuple(node.value for node in slots.elts)
+    method = family._find(original.tree, "SessionOperationLease.consume_continuation_handoff")
+    assert family._owned_method_definition_failures(original, cls, method, names) == []
+    changed = fencing._parse_source(path, original.source)
+    selected = family._find(changed.tree, "SessionOperationLease.consume_continuation_handoff")
+    assert [parameter.arg for parameter in selected.args.kwonlyargs] == ["deadline"]
+    if fault == "missing":
+        selected.args.kwonlyargs.clear()
+        selected.args.kw_defaults.clear()
+    elif fault == "required":
+        selected.args.kw_defaults[0] = None
+    elif fault == "foreign_default":
+        selected.args.kw_defaults[0] = ast.Call(func=ast.Name(id="foreign_deadline", ctx=ast.Load()), args=[], keywords=[])
+    else:
+        selected.args.kwonlyargs.append(ast.arg(arg="foreign"))
+        selected.args.kw_defaults.append(ast.Constant(None))
+    changed = _receiving_reparse_mutated_unit(changed)
+    changed_cls = family._find(changed.tree, "SessionOperationLease")
+    changed_method = family._find(changed.tree, "SessionOperationLease.consume_continuation_handoff")
+    assert family._owned_method_definition_failures(changed, changed_cls, changed_method, names) == [
+        "SessionOperationLease.consume_continuation_handoff: unsupported class method definition scope/descriptor"
+    ]
+
+
+@pytest.mark.parametrize(
+    "method_name", ("_consume_continuation_handoff", "consume_continuation_handoff", "create_continuation_stage", "join_continuation_stage")
+)
 @pytest.mark.parametrize("fault", ("name", "bound", "default", "variadic", "extra", "descriptor", "eager_default", "other_method"))
 def test_receiving_handoff_generic_definition_roles_are_exact(method_name, fault):
     path = "src/elspeth/web/coordination/lifecycle.py"
@@ -8264,7 +11150,8 @@ def test_receiving_handoff_generic_definition_roles_are_exact(method_name, fault
     elif fault == "bound":
         selected.type_params[0].bound = ast.Call(func=ast.Name(id="foreign_bound", ctx=ast.Load()), args=[], keywords=[])
     elif fault == "default":
-        selected.type_params[0].default_value = ast.Call(func=ast.Name(id="foreign_default", ctx=ast.Load()), args=[], keywords=[])
+        default_attack = ast.Call(func=ast.Name(id="foreign_default", ctx=ast.Load()), args=[], keywords=[])
+        selected.type_params[0].default_value = default_attack
     elif fault == "variadic":
         selected.type_params = [ast.TypeVarTuple(name="T")]
     elif fault == "extra":
@@ -8277,9 +11164,16 @@ def test_receiving_handoff_generic_definition_roles_are_exact(method_name, fault
         assert fault == "other_method"
         selected.name = "unreviewed_handoff"
     changed_name = selected.name
-    changed = _receiving_reparse_mutated_unit(changed)
+    if fault == "default":
+        # Python 3.12 cannot round-trip PEP 696 source. This case attacks the
+        # parsed owner's metadata directly; no source-support claim follows.
+        assert selected.type_params[0].default_value is default_attack
+    else:
+        changed = _receiving_reparse_mutated_unit(changed)
     changed_cls = family._find(changed.tree, "SessionOperationLease")
     changed_method = family._find(changed.tree, "SessionOperationLease." + changed_name)
+    if fault == "default":
+        assert changed_method is selected and changed_method.type_params[0].default_value is default_attack
     assert family._owned_method_definition_failures(changed, changed_cls, changed_method, names) == [
         "SessionOperationLease." + changed_name + ": unsupported class method definition scope/descriptor"
     ]

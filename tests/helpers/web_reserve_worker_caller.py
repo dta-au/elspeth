@@ -21,11 +21,11 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 # Application grammar is the actual header and entire executable prefix through
 # the direct constructor statement. No tail or source coordinates authorize it.
 REVIEWED_GRAMMARS = {
-    "ComposerAsyncWorker.__init__": "97e2ea8a5b6b2833eff8c5cb5df2fa99380efed05c2110f25f8dfa7571fa30b4",
+    "ComposerAsyncWorker.__init__": "7675240c07be3c1db3e375b6ecb8b85aa0d7c890a4e3cfa2c1761adbe64ea402",
     "ComposerAsyncWorker._job": "ebe08f000b83f6477d3035666cce0d85aaf8f85290c8bdceebf4a91b6bc21ab2",
     "ComposerAsyncWorker._run_started": "3bac6518c02e38c7556a14d4b2db4d98d07fe26f623486fd93d158f8af13804f",
-    "ComposerAsyncWorker._run_started_under_lease": "a2897fd9340d2b0fac5ae8d83a1e5af1c692f3c69bc79850835b558448b995b5",
-    "_create_app": "d885e4c335b48c7db438899512557934dd193e6e402ba745147fd724ee2cea5c",
+    "ComposerAsyncWorker._run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
+    "_create_app": "2c4a5bf83deefeaa62e0d35b1556f6542b7ecaa8e9af5b93ef27e37e41beaa98",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
@@ -236,6 +236,139 @@ def dependencies():
     return [{"identity": identity, "requirement": requirement, "qualification": "UNKNOWN"} for identity, requirement in requirements]
 
 
+def worker_namespace_contract(worker_class):
+    """Keep the actual ordinary worker namespace and its one exact getter."""
+    if (
+        not isinstance(worker_class, ast.ClassDef)
+        or worker_class.bases
+        or worker_class.keywords
+        or worker_class.decorator_list
+        or worker_class.type_params
+    ):
+        return ["worker caller: unsupported worker class construction/namespace"]
+    lookup = {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
+    declarations = [
+        node
+        for node in worker_class.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and type(node.value.value) is str)
+    ]
+    if any(not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name in lookup for node in declarations):
+        return ["worker caller: unsupported worker member/descriptor declaration"]
+    expected_property = ast.parse(
+        "@property\ndef drain_deadline(self) -> ComposerDrainDeadline | None:\n    return self._drain_deadline"
+    ).body[0]
+    getters = [node for node in declarations if node.name == "drain_deadline"]
+    if len(getters) != 1 or ast.dump(getters[0]) != ast.dump(expected_property):
+        return ["worker caller: exact original drain deadline property changed"]
+    for member in declarations:
+        if member is getters[0]:
+            continue
+        defaults = member.args.defaults + [node for node in member.args.kw_defaults if node is not None]
+        if (
+            member.type_params
+            or any(not isinstance(node, ast.Constant) for node in defaults)
+            or any(chain(node) != ("staticmethod",) for node in member.decorator_list)
+        ):
+            return ["worker caller: unsupported worker definition-time member effect " + member.name]
+    return []
+
+
+def _drain_owner_transfer(app, init, constructor):
+    """Bind only the actual optional owner, event and worker field transfer."""
+    arguments = [keyword.value for keyword in constructor.keywords if keyword.arg == "drain_signal"]
+    events = [keyword.value for keyword in constructor.keywords if keyword.arg == "instance_draining"]
+    if (
+        len(arguments) != 1
+        or chain(arguments[0]) != ("drain_signal",)
+        or len(events) != 1
+        or chain(events[0]) != ("app", "state", "instance_draining")
+    ):
+        return ["worker caller: original drain owner/event constructor transfer changed"], None
+    expected_guard = ast.parse(
+        "if drain_signal is not None and (type(drain_signal) is not ComposerDrainSignal "
+        "or drain_signal.draining is not instance_draining):\n"
+        "    raise AuditIntegrityError('Composer worker changed its actual process drain signal')"
+    ).body[0]
+    guards = [node for node in init.body if isinstance(node, ast.If) and ast.dump(node) == ast.dump(expected_guard)]
+    expected_store = ast.parse("self._drain_signal = drain_signal").body[0]
+    stores = [node for node in init.body if ast.dump(node) == ast.dump(expected_store)]
+    state_store = [
+        node for node in app.body if ast.dump(node) == ast.dump(ast.parse("app.state.instance_draining = instance_draining").body[0])
+    ]
+    if len(guards) != 1 or len(stores) != 1 or init.body.index(guards[0]) >= init.body.index(stores[0]) or len(state_store) != 1:
+        return ["worker caller: nominal original drain owner/event guard or store changed"], None
+    for function in (app, init):
+        defaults = dict(zip((arg.arg for arg in function.args.kwonlyargs), function.args.kw_defaults, strict=True))
+        if (
+            "drain_signal" not in defaults
+            or not isinstance(defaults["drain_signal"], ast.Constant)
+            or defaults["drain_signal"].value is not None
+        ):
+            return ["worker caller: optional drain owner default changed"], None
+    return [], {
+        "argument": (APP, id(arguments[0])),
+        "event_argument": (APP, id(events[0])),
+        "guard": (WORKER, id(guards[0])),
+        "store": (WORKER, id(stores[0])),
+        "event_store": (APP, id(state_store[0])),
+    }
+
+
+def _terminal_handoff(under, call):
+    """Retain the real return before cleanup and refuse a second settlement."""
+    assignments = [
+        node
+        for node in ast.walk(under)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and chain(node.targets[0]) == ("terminal",)
+        and isinstance(node.value, ast.Await)
+        and node.value.value is call
+    ]
+    if len(assignments) != 1:
+        return ["worker caller: actual terminal return assignment changed"], None
+    assignment = assignments[0]
+    blocks = [
+        value for owner in ast.walk(under) for _field, value in ast.iter_fields(owner) if isinstance(value, list) and assignment in value
+    ]
+    expected = ast.parse(
+        "if type(terminal) is not ComposerOperationRecord:\n"
+        "    raise AuditIntegrityError('Owned composer turn returned without a nominal terminal receipt')\n"
+        "settlement.terminal_receipt = terminal"
+    ).body
+    if len(blocks) != 1:
+        return ["worker caller: actual terminal return scope changed"], None
+    following = blocks[0][blocks[0].index(assignment) + 1 : blocks[0].index(assignment) + 3]
+    if [ast.dump(node) for node in following] != [ast.dump(node) for node in expected]:
+        return ["worker caller: exact terminal receipt handoff changed"], None
+    guard_source = "if _terminal_completion_unknown(exc) or settlement.terminal_receipt is not None:\n    raise"
+    expected_guard = ast.parse(guard_source).body[0]
+    handlers = [
+        node
+        for node in ast.walk(under)
+        if isinstance(node, ast.ExceptHandler)
+        and chain(node.type) == ("BaseException",)
+        and node.name == "exc"
+        and any(ast.dump(statement) == ast.dump(expected_guard) for statement in node.body)
+    ]
+    if len(handlers) != 1:
+        return ["worker caller: retained terminal no-replay guard changed"], None
+    guard = next(node for node in handlers[0].body if ast.dump(node) == ast.dump(expected_guard))
+    failure = [
+        node
+        for node in handlers[0].body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and chain(node.value.func) == ("_owned_deadline_failure",)
+    ]
+    if len(failure) != 1 or handlers[0].body.index(guard) >= handlers[0].body.index(failure[0]):
+        return ["worker caller: retained terminal guard no longer precedes failure settlement"], None
+    return [], {
+        "assignment": (WORKER, id(assignment)),
+        "nominal_guard": (WORKER, id(following[0])),
+        "receipt_store": (WORKER, id(following[1])),
+        "no_replay_guard": (WORKER, id(guard)),
+    }
+
+
 def worker_caller_local_contracts(units):
     """Return failures plus conditional same-AST facts, never local admission."""
     receipt = dict.fromkeys(RECEIPT_KEYS)
@@ -305,27 +438,18 @@ def worker_caller_local_contracts(units):
     under = selected["ComposerAsyncWorker._run_started_under_lease"]
     wrapper = selected["run_composer_turn"]
     worker_class, _ = find(index[WORKER].tree, "ComposerAsyncWorker")
-    if worker_class.bases or worker_class.keywords or worker_class.decorator_list or worker_class.type_params:
-        return ["worker caller: unsupported worker class construction/namespace"], receipt
-    lookup = {"__new__", "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__get__", "__set__", "__delete__"}
-    declarations = [
-        n for n in worker_class.body if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and type(n.value.value) is str)
-    ]
-    if any(not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) or n.name in lookup for n in declarations):
-        return ["worker caller: unsupported worker member/descriptor declaration"], receipt
-    for member in declarations:
-        defaults = member.args.defaults + [n for n in member.args.kw_defaults if n is not None]
-        if (
-            member.type_params
-            or any(not isinstance(n, ast.Constant) for n in defaults)
-            or any(chain(n) != ("staticmethod",) for n in member.decorator_list)
-        ):
-            return ["worker caller: unsupported worker definition-time member effect " + member.name], receipt
+    namespace_failures = worker_namespace_contract(worker_class)
+    if namespace_failures:
+        return namespace_failures, receipt
     store = next(n for n in init.body if isinstance(n, ast.Assign) and chain(n.targets[0]) == ("self", "_app"))
     app_constructor = direct_call_statement(app.body, ("app", "state", "composer_async_worker"), ("ComposerAsyncWorker",)).value
     keyword_values = [n.value for n in app_constructor.keywords if n.arg == "app"]
     if len(keyword_values) != 1 or chain(keyword_values[0]) != ("app",):
         return ["worker caller: same-call exact app keyword changed"], receipt
+    drain_failures, drain = _drain_owner_transfer(app, init, app_constructor)
+    if drain_failures:
+        return drain_failures, receipt
+    receipt["drain_owner_transfer"] = drain
     # Local class namespace write forms are conservative refusals. No inference
     # about an outside alias or callback is drawn from their absence.
     for node in ast.walk(worker_class):
@@ -396,6 +520,10 @@ def worker_caller_local_contracts(units):
             failures.append("worker caller: exact awaited transfer changed " + key)
         else:
             receipt[key] = (TURN if owner is wrapper else WORKER, id(calls[0]))
+            if owner is under:
+                handoff_failures, handoff = _terminal_handoff(under, calls[0])
+                failures.extend(handoff_failures)
+                receipt["terminal_handoff"] = handoff
     if failures:
         return failures, receipt
     receipt.update(

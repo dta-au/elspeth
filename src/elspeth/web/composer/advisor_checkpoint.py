@@ -28,6 +28,7 @@ from elspeth.contracts.prompt_guard import (
 from elspeth.contracts.provider_rejection import SafeRequestRejection
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer import advisor_context as _advisor_context
 from elspeth.web.composer import advisor_policy as _advisor_policy
 from elspeth.web.composer import provider_gateway
@@ -40,6 +41,7 @@ from elspeth.web.composer._compose_loop_carriers import (
     _AdvisorFirstPartyFailure,
     _AdvisorProviderFailure,
     _AdvisorReviewState,
+    _ServiceFailure,
 )
 from elspeth.web.composer.advisor_abandonment import AdvisorAbandonmentContextUnavailable, AdvisorAbandonmentReview
 from elspeth.web.composer.advisor_audit import (
@@ -404,6 +406,10 @@ class AdvisorCheckpointOwner:
                 on_provider_dispatch=on_provider_dispatch,
                 failure_observation=failure_observation,
             )
+        except AsyncWorkerAdmissionTimeoutError as exc:
+            if failure_observation is not None:
+                failure_observation.observe_execution_failure(exc)
+            return _AdvisorFirstPartyFailure(original_exc=exc)
         except TimeoutError:
             raise
         except AdvisorAbandonmentContextUnavailable as exc:
@@ -419,6 +425,8 @@ class AdvisorCheckpointOwner:
                 )
             return _AdvisorProviderFailure(error_class=type(exc).__name__)
         except Exception as exc:
+            if isinstance(exc, _ServiceFailure) and failure_observation is not None:
+                failure_observation.observe_execution_failure(exc)
             return _AdvisorFirstPartyFailure(original_exc=exc)
         if is_abandonment:
             decision = parse_advisor_abandonment_response(guidance)

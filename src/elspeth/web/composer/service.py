@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.composer.turn_effects import BlobDeliveryAttempt, TurnEvidence
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
@@ -1570,6 +1571,7 @@ class ComposerServiceImpl:
         required_work: RequiredWorkBinding | None = None,
         turn_evidence: TurnEvidence | None = None,
         continuation: ContinuationLiveP4 | None = None,
+        terminal_completion: TerminalServiceCompletion | None = None,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
         from elspeth.web.composer.turn_audit import persist_turn_audit
@@ -1616,6 +1618,7 @@ class ComposerServiceImpl:
             required_work=required_work,
             turn_evidence=turn_evidence,
             continuation=continuation,
+            terminal_completion=terminal_completion,
         )
 
     async def _dispatch_tool_batch(
@@ -2974,6 +2977,7 @@ class ComposerServiceImpl:
                             not _cancellation_requested.is_set()
                             and dispatch_result.advisor_compose_timeout is None
                             and dispatch_result.advisor_failure is None
+                            and dispatch_result.service_failure is None
                             and dispatch_result.authority_revocation is None
                         ):
                             try:
@@ -3017,7 +3021,11 @@ class ComposerServiceImpl:
                                 assistant_message=dispatch_result.assistant_message,
                                 raw_assistant_content=dispatch_result.raw_assistant_content,
                                 assistant_tool_calls=dispatch_result.assistant_tool_calls,
-                                crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
+                                crash_pending=(
+                                    dispatch_result.plugin_crash is not None
+                                    or dispatch_result.advisor_failure is not None
+                                    or dispatch_result.service_failure is not None
+                                ),
                                 session_id=session_id,
                                 session_operation_context=session_operation_context,
                                 current_state_id=_current_state_id,
@@ -3030,7 +3038,18 @@ class ComposerServiceImpl:
                                 required_work=required_work,
                                 turn_evidence=turn_evidence,
                             )
-                        except (AuditIntegrityError, IntegrityError) as p4_direct_failure:
+                        except BaseException as p4_direct_failure:
+                            if dispatch_result.service_failure is not None:
+                                from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+                                # A thrown await does not establish rollback or
+                                # authorize an audit replay. Keep both original
+                                # objects and their prior causes for the real
+                                # publication/operation owner to classify.
+                                combined = combine_failure_objects(p4_direct_failure, dispatch_result.service_failure)
+                                raise combined from combined.__cause__
+                            if not isinstance(p4_direct_failure, (AuditIntegrityError, IntegrityError)):
+                                raise
                             refused = dispatch_result.advisor_failure
                             if not isinstance(refused, ComposerContextUnsupported):
                                 raise
@@ -3164,6 +3183,27 @@ class ComposerServiceImpl:
                     for elision_index in sorted(pending_advisor_elision_indices, reverse=True):
                         del llm_messages[elision_index]
                     pending_advisor_elision_indices = []
+                if dispatch.service_failure is not None:
+                    from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+                    companions: list[BaseException] = list(pending_checkpoint_failures)
+                    if deferred_cancel is not None:
+                        companions.append(deferred_cancel)
+                    if persist.unwind_audit_failed:
+                        publication_failure = AuditIntegrityError(
+                            "Service failure audit row could not be persisted", failed_turn=failed_turn
+                        )
+                        combined = combine_failure_objects(publication_failure, dispatch.service_failure, *companions)
+                        if not isinstance(combined, Exception):
+                            raise combined from combined.__cause__
+                        # This explicit returned disposition owns an unpublished
+                        # current suffix; do not include prior committed turns.
+                        raise ComposerToolFailure(
+                            combined, tool_invocations=dispatch.private_invocations, llm_calls=recorder.llm_calls
+                        ) from combined
+                    combined = combine_failure_objects(dispatch.service_failure, *companions)
+                    raise combined from combined.__cause__
+
                 if dispatch.plugin_crash is not None:
                     # Plugin-crash propagation discipline (plan §5.7): the
                     # capture in P3 already snapshotted `state` after every

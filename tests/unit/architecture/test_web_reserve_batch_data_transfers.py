@@ -38,6 +38,17 @@ def _change(path: str, before: str, after: str) -> tuple[_Source, ...]:
     return tuple(changed if unit.path == path else unit for unit in _units())
 
 
+def _change_symbol(path: str, symbol: str, before: str, after: str) -> tuple[_Source, ...]:
+    original = next(unit for unit in _units() if unit.path == path)
+    declaration = helper.receiver.find(original.tree, symbol)
+    assert declaration is not None
+    source = ast.get_source_segment(original.source, declaration)
+    assert source is not None and source.count(before) == 1
+    assert original.source.count(source) == 1
+    changed = _parse(path, original.source.replace(source, source.replace(before, after)))
+    return tuple(changed if unit.path == path else unit for unit in _units())
+
+
 def _rebind_body(monkeypatch, units, path, symbol):
     unit = next(unit for unit in units if unit.path == path)
     scope = unit.tree.body
@@ -99,7 +110,7 @@ def test_current_batch_data_receipt_has_actual_source_sites_and_separate_import_
             "application selected cut changed",
         ),
         (
-            "_decode_graph",
+            "_decode_graph_values",
             'members["audit"] = None',
             'members["audit"] = foreign_audit',
             "portable audit separation changed",
@@ -123,7 +134,7 @@ def test_current_batch_data_receipt_has_actual_source_sites_and_separate_import_
             "selected memory root identity changed",
         ),
         (
-            "_encode",
+            "_encode_values",
             "    identities: dict[int, int] = {}",
             "    from foreign.module import unexpected_supplier\n    identities: dict[int, int] = {}",
             "local import role inventory changed",
@@ -140,7 +151,7 @@ def test_data_structural_checks_survive_only_the_mutated_body_binding(monkeypatc
     positive_failures, positive = helper.batch_data_local_contracts(_units())
     assert not positive_failures, positive_failures
     assert positive
-    changed = _change(helper.DATA, before, after)
+    changed = _change_symbol(helper.DATA, symbol, before, after)
     _rebind_body(monkeypatch, changed, helper.DATA, symbol)
     failures, receipt = helper.batch_data_local_contracts(changed)
     assert any(diagnostic in failure for failure in failures), failures
@@ -194,7 +205,11 @@ def test_data_receipt_refuses_unqualified_extra_schema_constructor():
         ),
         (helper.DISCOVERY, "from dataclasses import dataclass, replace", "from foreign_dataclasses import dataclass, replace"),
         (helper.RECEIPTS, "_INVOCATION = TypeAdapter(ComposerToolInvocation)", "_INVOCATION = TypeAdapter(RetainedToolReceipt)"),
-        (helper.APPLICATION, '"application_llm": ComposerLLMCall,', '"application_llm": ComposerPlannerAttempt,'),
+        (
+            helper.APPLICATION,
+            "from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDialect",
+            "from elspeth.contracts.composer_llm_audit import ComposerPlannerAttempt as ComposerLLMCall, ToolContractDialect",
+        ),
         (helper.FAMILIES, "from typing import TYPE_CHECKING, Any", "from foreign_typing import TYPE_CHECKING, Any"),
     ],
 )
@@ -236,3 +251,48 @@ def test_data_receipt_refuses_missing_or_duplicate_source():
         failures, receipt = helper.batch_data_local_contracts(changed)
         assert failures
         assert not receipt
+
+
+@pytest.mark.parametrize(
+    ("symbol", "before", "after", "diagnostic"),
+    [
+        ("_encode", "        result_tools,", "        {},", "directional encode caller changed"),
+        ("_decode_graph", "        recorder_source=recorder_source,", "        recorder_source=None,", "directional decode caller changed"),
+        (
+            "_decode_graph_values",
+            "type(slot) is not int or not 0 <= slot < len(recorder_source.snapshot.llm_calls)",
+            "not isinstance(slot, int) or not 0 <= slot < len(recorder_source.snapshot.llm_calls)",
+            "exact recorder-slot guard changed",
+        ),
+        ("_decode_graph_values", "if slot in claimed_llm_slots:", "if False:", "recorder-slot claim order changed"),
+        (
+            "_decode_graph_values",
+            "actual_slots.get(id(restored[index])) != slot",
+            "False",
+            "canonical recorder-slot identity changed",
+        ),
+    ],
+)
+def test_directional_core_keeps_original_arguments_and_complete_slot_joins(monkeypatch, symbol, before, after, diagnostic):
+    failures, healthy = helper.batch_data_local_contracts(_units())
+    assert not failures and healthy, failures
+    units = _change_symbol(helper.DATA, symbol, before, after)
+    _rebind_body(monkeypatch, units, helper.DATA, symbol)
+    failures, receipt = helper.batch_data_local_contracts(units)
+    assert any(diagnostic in failure for failure in failures), failures
+    assert not any("selected body changed" in failure for failure in failures), failures
+    assert not receipt
+
+
+@pytest.mark.parametrize("symbol", ("encode_application_graph", "decode_application_graph"))
+def test_actual_application_caller_cannot_replace_original_decoder_after_body_rebind(monkeypatch, symbol):
+    failures, receipt = helper.batch_data_local_contracts(_units())
+    assert not failures and receipt, failures
+    changed = _change_symbol(
+        helper.APPLICATION, symbol, "_decode_graph_values(encoded, env_ref_names,", "foreign_decoder(encoded, env_ref_names,"
+    )
+    _rebind_body(monkeypatch, changed, helper.APPLICATION, symbol)
+    failures, refused = helper.batch_data_local_contracts(changed)
+    assert any("application external DATA caller changed " + symbol in failure for failure in failures), failures
+    assert not any("selected body changed" in failure for failure in failures), failures
+    assert not refused

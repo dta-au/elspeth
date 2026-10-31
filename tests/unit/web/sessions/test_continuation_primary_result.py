@@ -662,7 +662,11 @@ async def test_actual_prepared_input_refuses_coherently_rehashed_foreign_wire_af
 
 @pytest.mark.asyncio
 async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_current_graph(operation_store, tmp_path, monkeypatch):
-    from elspeth.web.composer.continuation_application_graph import ApplicationGraph, encode_application_graph
+    from elspeth.web.composer.continuation_application_graph import (
+        ApplicationGraph,
+        admit_application_recorder_source,
+        encode_application_graph,
+    )
     from elspeth.web.composer.continuation_batch_data import RestoredBatchData
 
     def remove_appended_call(original: ApplicationGraph, appended: ApplicationGraph) -> ApplicationGraph:
@@ -692,9 +696,10 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         old_chunk = next(chunk for chunk in kwargs["selected"].chunks if chunk.reference == old_frame.evidence)
         old_evidence = decode_turn_evidence(old_chunk, env_ref_names=kwargs["inventory"].names, source_chunks=kwargs["selected"].chunks)
         old_snapshot = old_evidence.snapshot
+        original_recorder_source = admit_application_recorder_source(old_evidence.recorder_chunk, env_ref_names=kwargs["inventory"].names)
         assert old_snapshot.application_entry is not None and old_snapshot.joint_graph_json is None
         before = require_evidence_application_links(
-            old_snapshot, env_ref_names=kwargs["inventory"].names, recorder_chunk=old_evidence.recorder_chunk, sources=old_evidence.sources
+            old_snapshot, env_ref_names=kwargs["inventory"].names, recorder_source=original_recorder_source, sources=old_evidence.sources
         )
         assert before is not None and before.cuts and before.selected.batch.phase == "complete"
         work = inventory_work(running)
@@ -718,6 +723,7 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
             source_chunks=selected.chunks,
         )
         new_snapshot = new_evidence.snapshot
+        new_recorder_source = admit_application_recorder_source(new_evidence.recorder_chunk, env_ref_names=inventory.names)
         projected = append_primary_call_to_evidence(
             old_evidence, call=result.outcome.audit_call, recorder=result.buffer, env_ref_names=inventory.names
         )
@@ -732,18 +738,20 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         assert new_snapshot.application_entry.applications == old_snapshot.application_entry.applications
         assert new_snapshot.historical_application_count == old_snapshot.historical_application_count
         assert new_snapshot.effect_locators == old_snapshot.effect_locators
-        admit_journal_values(new_snapshot.application_entry, env_ref_names=inventory.names, sources=new_evidence.sources)
+        admit_journal_values(
+            new_snapshot.application_entry, env_ref_names=inventory.names, sources=new_evidence.sources, recorder_source=new_recorder_source
+        )
         after = require_evidence_application_links(
-            new_snapshot, env_ref_names=inventory.names, recorder_chunk=new_evidence.recorder_chunk, sources=new_evidence.sources
+            new_snapshot, env_ref_names=inventory.names, recorder_source=new_recorder_source, sources=new_evidence.sources
         )
         assert after is not None and len(after.cuts) == len(before.cuts)
         assert after.effects is after.cuts[-1].effects_after
         assert after.selected.accumulator is after.cuts[-1].data.accumulator
         assert after.selected.calls is after.cuts[-1].data.calls
         historical = remove_appended_call(before, after)
-        assert encode_application_graph(before, env_ref_names=inventory.names) == encode_application_graph(
-            historical, env_ref_names=inventory.names
-        )
+        assert encode_application_graph(
+            before, env_ref_names=inventory.names, recorder_source=original_recorder_source
+        ) == encode_application_graph(historical, env_ref_names=inventory.names, recorder_source=original_recorder_source)
         # The pure complete owner must also distinguish equal but nonshared
         # tuple roots: equality alone would miss this historical alias drift.
         equal_calls = (*historical.selected.calls,)
@@ -751,9 +759,9 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         split_alias = replace(
             historical, selected=RestoredBatchData(historical.selected.batch, historical.selected.accumulator, equal_calls)
         )
-        assert encode_application_graph(split_alias, env_ref_names=inventory.names) != encode_application_graph(
-            before, env_ref_names=inventory.names
-        )
+        assert encode_application_graph(
+            split_alias, env_ref_names=inventory.names, recorder_source=original_recorder_source
+        ) != encode_application_graph(before, env_ref_names=inventory.names, recorder_source=original_recorder_source)
         for prior, retained in zip(before.cuts, after.cuts, strict=True):
             assert encode_recorder_snapshot(prior.recorder_before) == encode_recorder_snapshot(retained.recorder_before)
             assert encode_recorder_snapshot(prior.recorder_after) == encode_recorder_snapshot(retained.recorder_after)
@@ -775,8 +783,9 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         # snapshot. This grants no SDK/right to invoke at that pending cut.
         joint = kwargs["prior_joint_snapshot"]
         assert joint.snapshot.joint_graph_json is not None and joint.snapshot.application_entry is None
+        joint_recorder_source = admit_application_recorder_source(joint.recorder_chunk, env_ref_names=inventory.names)
         original_joint = require_evidence_application_links(
-            joint.snapshot, env_ref_names=inventory.names, recorder_chunk=joint.recorder_chunk, sources=joint.sources
+            joint.snapshot, env_ref_names=inventory.names, recorder_source=joint_recorder_source, sources=joint.sources
         )
         assert original_joint is not None and not original_joint.cuts
         original_buffer = decode_recorder_snapshot(joint.recorder_chunk)
@@ -787,13 +796,15 @@ async def test_next_actual_primary_extends_real_applied_p4_history_and_cold_curr
         new_joint = require_evidence_application_links(
             extended_joint.snapshot,
             env_ref_names=inventory.names,
-            recorder_chunk=extended_joint.recorder_chunk,
+            recorder_source=admit_application_recorder_source(extended_joint.recorder_chunk, env_ref_names=inventory.names),
             sources=extended_joint.sources,
         )
         assert extended_joint.snapshot.application_entry is None and extended_joint.snapshot.joint_graph_json is not None
         assert new_joint is not None and not new_joint.cuts and new_joint.selected.batch.phase == "p4_pending"
-        assert encode_application_graph(original_joint, env_ref_names=inventory.names) == encode_application_graph(
-            remove_appended_call(original_joint, new_joint), env_ref_names=inventory.names
+        assert encode_application_graph(
+            original_joint, env_ref_names=inventory.names, recorder_source=joint_recorder_source
+        ) == encode_application_graph(
+            remove_appended_call(original_joint, new_joint), env_ref_names=inventory.names, recorder_source=joint_recorder_source
         )
         assert encode_recorder_snapshot(new_joint.recorder) == encode_recorder_snapshot(joint_buffer)
         assert len(sdk) == 1

@@ -15,10 +15,12 @@ from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
 from elspeth.web.composer.continuation_p4_application import HistoricalP4Application, _project_recorder
 from elspeth.web.composer.continuation_p4_outcome import decode_audit_outcome_data, encode_audit_outcome_data
 from elspeth.web.composer.turn_effects import PersistedTurnEffects
-from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
+from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application, StoredTerminalP4Application
 
 
-async def finish_live_p4_application(owner: ContinuationLiveP4, *, effects_before: PersistedTurnEffects) -> StoredP4Application:
+async def finish_live_p4_application(
+    owner: ContinuationLiveP4, *, effects_before: PersistedTurnEffects
+) -> StoredP4Application | StoredTerminalP4Application:
     if (
         type(owner) is not ContinuationLiveP4
         or type(effects_before) is not PersistedTurnEffects
@@ -37,6 +39,56 @@ async def finish_live_p4_application(owner: ContinuationLiveP4, *, effects_befor
     if committed.audit_outcome is not owner.publication.audit_outcome:
         raise AuditIntegrityError("warm P4 replaced its actual committed publication")
     value = committed.application
+    if type(value) is StoredTerminalP4Application:
+        from elspeth.contracts.hashing import canonical_json
+        from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+        from elspeth.web.composer.continuation_terminal_p4_data import decode_terminal_p4_input, decode_terminal_p4_result
+        from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result, decode_p4_receipt
+
+        if owner.terminal_completion is None:
+            raise AuditIntegrityError("terminal P4 application lost its original native completion")
+        owner.terminal_completion.require_p4(owner)
+        source = decode_terminal_p4_input(value.input_document, env_ref_names=inventory.names)
+        result_data = decode_terminal_p4_result(value.result_document, input_document=value.input_document, env_ref_names=inventory.names)
+        receipt, outcome = decode_p4_receipt(canonical_json(result_data.receipt.model_dump(mode="json")), env_ref_names=inventory.names)
+        actual = decode_audit_outcome_data(
+            encode_audit_outcome_data(owner.publication.audit_outcome, prepared=owner.prepared, env_ref_names=inventory.names),
+            prepared=owner.prepared,
+            env_ref_names=inventory.names,
+        )
+        snapshot = recorder.snapshot_for_continuation(drained=runtime.drained)
+        retained = decode_recorder_snapshot(source.recorder)
+        if (
+            receipt.effect_key != owner.commit.effect_key
+            or receipt.input_sha256 != owner.commit.input_sha256
+            or actual != outcome
+            or snapshot.drained != retained.drained
+            or any(
+                current[: len(previous)] != previous
+                for previous, current in (
+                    (retained.invocations, snapshot.invocations),
+                    (retained.llm_calls, snapshot.llm_calls),
+                    (retained.planner_attempts, snapshot.planner_attempts),
+                    (retained.withheld_replies, snapshot.withheld_replies),
+                    (retained.visible_tool_events, snapshot.visible_tool_events),
+                    (retained.private_candidates, snapshot.private_candidates),
+                    (retained.private_authorings, snapshot.private_authorings),
+                )
+            )
+        ):
+            raise AuditIntegrityError("terminal P4 projection changed its actual prepared publication/recorder")
+        following = _project_recorder(snapshot, owner.prepared, ReadmittedP4Result(receipt, outcome, None), env_ref_names=inventory.names)
+        if (
+            following.drained != result_data.drained
+            or evidence.effects is not effects_after
+            or recorder.snapshot_for_continuation(drained=runtime.drained) != snapshot
+        ):
+            raise AuditIntegrityError("terminal P4 projection changed its exact published slices")
+        owner.application = value
+        owner.runtime = replace(runtime, graph=runtime.graph.with_drained(following.drained), drained=following.drained)
+        return value
+    if type(value) is not StoredP4Application:
+        raise AuditIntegrityError("warm P4 lost its closed application owner")
     result = value.bundle.result
     record = value.bundle.entry.applications[-1]
     if record.effect_key != owner.commit.effect_key or result.receipt.input_sha256 != owner.commit.input_sha256:
@@ -88,7 +140,7 @@ async def finish_live_p4_application(owner: ContinuationLiveP4, *, effects_befor
     owner.application = value
     owner.runtime = replace(
         runtime,
-        graph=replace(runtime.graph, batch=data, drained=following.drained),
+        graph=runtime.graph.with_batch_and_drained(data, following.drained),
         drained=following.drained,
     )
     return value

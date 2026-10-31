@@ -1,11 +1,15 @@
 """Actual prepared/quiescent graph identities; DATA alone grants no current owner."""
 
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer import continuation_application_graph as graph_codec
 from elspeth.web.composer.continuation_application_graph import ApplicationGraph, decode_application_graph, encode_application_graph
 from elspeth.web.composer.continuation_audit_buffer import RecorderDrainCursors
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData, decode_prepared_batch_data
@@ -20,6 +24,146 @@ from tests.unit.web.composer.test_turn_effects import CONTEXT
 from tests.unit.web.coordination import test_composer_operation_authority
 
 operation_store = test_composer_operation_authority.operation_store
+
+
+def _recorder_source_graph(*, repeated=False):
+    evidence, _messages, recorder, _logical, _policy = rich_evidence()
+    batch, accumulator, calls = actual_cut()
+    snapshot = recorder.snapshot_for_continuation(drained=RecorderDrainCursors())
+    original = snapshot.llm_calls[0]
+    equal = original if repeated else replace(original)
+    assert equal == original and (equal is original) is repeated
+    graph = ApplicationGraph(
+        RestoredBatchData(batch, accumulator, calls), evidence.effects, replace(snapshot, llm_calls=(original, equal)), ()
+    )
+    source = graph_codec.capture_application_recorder_source(graph.recorder, env_ref_names=frozenset())
+    return graph, source
+
+
+@pytest.mark.parametrize("repeated", (False, True))
+def test_application_graph_source_preserves_complete_llm_values_and_actual_aliases(repeated):
+    graph, source = _recorder_source_graph(repeated=repeated)
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+    payload = json.loads(encoded)
+    assert payload["schema_version"] == "composer.evidence-batch-graph.v2"
+    assert payload["recorder_source"] == source.chunk.reference.model_dump(mode="json")
+    atoms = [node for node in payload["nodes"] if node["kind"] == "application_llm"]
+    assert [node["value"] for node in atoms] == (
+        [[["recorder_slot", {"scalar": 0}]]] if repeated else [[["recorder_slot", {"scalar": 0}]], [["recorder_slot", {"scalar": 1}]]]
+    )
+    # Cold admission starts from the complete original recorder bytes, whose
+    # value codec need not preserve Python aliases. The graph owns that partition.
+    cold_source = graph_codec.admit_application_recorder_source(source.chunk, env_ref_names=frozenset())
+    restored = decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=cold_source)
+    left, right = restored.recorder.llm_calls
+    assert left == graph.recorder.llm_calls[0] and right == graph.recorder.llm_calls[1]
+    assert (left is right) is repeated
+    assert left is not graph.recorder.llm_calls[0]
+    assert left.private_failure == graph.recorder.llm_calls[0].private_failure
+    assert left.private_diagnostics == graph.recorder.llm_calls[0].private_diagnostics
+    assert left.private_request == graph.recorder.llm_calls[0].private_request
+    assert encode_application_graph(restored, env_ref_names=frozenset(), recorder_source=cold_source) == encoded
+
+
+@pytest.mark.parametrize("change", ("digest", "length", "codec", "bool", "negative", "outside", "extra", "old_format", "swapped"))
+def test_application_graph_source_refuses_wrong_origin_and_noncanonical_slots(change):
+    graph, source = _recorder_source_graph()
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+    assert decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=source).recorder == graph.recorder
+    payload = json.loads(encoded)
+    atoms = [node for node in payload["nodes"] if node["kind"] == "application_llm"]
+    if change == "digest":
+        payload["recorder_source"]["digest"] = "f" * 64
+    elif change == "length":
+        payload["recorder_source"]["byte_length"] += 1
+    elif change == "codec":
+        payload["recorder_source"]["codec"] = "composer.state.v1"
+    elif change == "old_format":
+        payload["schema_version"] = "composer.evidence-batch-graph.v1"
+        del payload["recorder_source"]
+        for atom in atoms:
+            slot = atom["value"][0][1]["scalar"]
+            atom["value"] = [
+                ["canonical", {"scalar": graph_codec._atom_json(graph.recorder.llm_calls[slot], type(graph.recorder.llm_calls[slot]))}]
+            ]
+    elif change == "extra":
+        atoms[0]["value"].append(["canonical", {"scalar": "{}"}])
+    elif change == "swapped":
+        atoms[0]["value"][0][1]["scalar"], atoms[1]["value"][0][1]["scalar"] = 1, 0
+    else:
+        atoms[0]["value"][0][1]["scalar"] = {"bool": True, "negative": -1, "outside": 2}[change]
+    with pytest.raises(AuditIntegrityError):
+        decode_application_graph(canonical_json(payload), env_ref_names=frozenset(), recorder_source=source)
+
+
+def test_application_graph_duplicate_slot_refuses_before_another_full_atom_construction(monkeypatch):
+    graph, source = _recorder_source_graph()
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+    original = graph_codec.construct_application_llm
+    slots = []
+
+    def observed(actual_source, slot):
+        slots.append(slot)
+        return original(actual_source, slot)
+
+    monkeypatch.setattr(graph_codec, "construct_application_llm", observed)
+    decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=source)
+    assert slots == [0, 1]
+    slots.clear()
+    payload = json.loads(encoded)
+    atoms = [node for node in payload["nodes"] if node["kind"] == "application_llm"]
+    atoms[1]["value"][0][1]["scalar"] = 0
+    with pytest.raises(AuditIntegrityError, match=r"distinct.*slot"):
+        decode_application_graph(canonical_json(payload), env_ref_names=frozenset(), recorder_source=source)
+    assert slots == [0]
+
+
+def test_application_graph_source_is_fresh_for_environment_and_complete_recorder():
+    graph, source = _recorder_source_graph()
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+    with pytest.raises(AuditIntegrityError, match="environment"):
+        decode_application_graph(encoded, env_ref_names=frozenset({"DIFFERENT_ENVIRONMENT"}), recorder_source=source)
+    changed = replace(graph.recorder, llm_calls=(*graph.recorder.llm_calls, replace(graph.recorder.llm_calls[0], call_id="later-call")))
+    other = graph_codec.capture_application_recorder_source(changed, env_ref_names=frozenset())
+    with pytest.raises(AuditIntegrityError):
+        decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=other)
+    with pytest.raises(AuditIntegrityError):
+        encode_application_graph(replace(graph, recorder=changed), env_ref_names=frozenset(), recorder_source=source)
+
+
+@pytest.mark.parametrize("change", ("foreign", "float_length", "bool_length", "malformed_digest"))
+def test_application_recorder_source_requires_the_nominal_strict_original_reference(change):
+    _graph, source = _recorder_source_graph()
+    assert graph_codec.admit_application_recorder_source(source.chunk, env_ref_names=frozenset()).chunk == source.chunk
+    reference = source.chunk.reference
+    if change == "foreign":
+        reference = SimpleNamespace(codec=reference.codec, digest=reference.digest, byte_length=reference.byte_length)
+    elif change == "float_length":
+        reference = reference.model_copy(update={"byte_length": float(reference.byte_length)})
+    elif change == "bool_length":
+        reference = reference.model_copy(update={"byte_length": True})
+    else:
+        reference = reference.model_copy(update={"digest": "malformed"})
+    with pytest.raises(AuditIntegrityError):
+        graph_codec.admit_application_recorder_source(replace(source.chunk, reference=reference), env_ref_names=frozenset())
+
+
+@pytest.mark.parametrize("route", ("encode", "decode"))
+def test_application_recorder_source_refuses_late_private_nested_changes(route):
+    graph, source = _recorder_source_graph()
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+    assert decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=source).recorder == graph.recorder
+    context = source.snapshot.llm_calls[0].private_request
+    assert context is not None and context.canonical is not None
+    assert context == graph.recorder.llm_calls[0].private_request
+    assert context is not graph.recorder.llm_calls[0].private_request
+    # Nominal frozen owners still owe current complete-source agreement.
+    object.__setattr__(context, "canonical", canonical_json({"messages": [{"role": "user", "content": "changed private tail"}]}))
+    with pytest.raises(AuditIntegrityError, match="complete original fields"):
+        if route == "encode":
+            encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=source)
+        else:
+            decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=source)
 
 
 def active_graph(monkeypatch, *, shared=True):
@@ -90,13 +234,14 @@ def test_quiescent_graph_retains_full_counters_and_aliases_without_invented_audi
     graph = ApplicationGraph(
         RestoredBatchData(batch, acc, calls), evidence.effects, recorder.snapshot_for_continuation(drained=RecorderDrainCursors()), ()
     )
-    encoded = encode_application_graph(graph, env_ref_names=frozenset())
-    restored = decode_application_graph(encoded, env_ref_names=frozenset())
+    recorder_source = graph_codec.capture_application_recorder_source(graph.recorder, env_ref_names=frozenset())
+    encoded = encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=recorder_source)
+    restored = decode_application_graph(encoded, env_ref_names=frozenset(), recorder_source=recorder_source)
     assert restored.selected_audit is None and restored.selected_dialect is None
     assert restored.selected.batch.next_tool_index == batch.next_tool_index
     assert restored.selected.batch.tool_outcomes[0].response is restored.selected.batch.tool_outcomes[1].response
     assert restored.selected.accumulator.authority_revocation == acc.authority_revocation
-    assert encode_application_graph(restored, env_ref_names=frozenset()) == encoded
+    assert encode_application_graph(restored, env_ref_names=frozenset(), recorder_source=recorder_source) == encoded
 
 
 @pytest.mark.parametrize("change", ("audit", "dialect", "actor", "call_alias", "live_exception"))
@@ -110,8 +255,13 @@ def test_active_graph_refuses_independent_broken_owner_after_positive(monkeypatc
         data.audit,
         data.dialect,
     )
+    recorder_source = graph_codec.capture_application_recorder_source(graph.recorder, env_ref_names=frozenset())
     assert (
-        decode_application_graph(encode_application_graph(graph, env_ref_names=frozenset()), env_ref_names=frozenset()).selected_audit
+        decode_application_graph(
+            encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=recorder_source),
+            env_ref_names=frozenset(),
+            recorder_source=recorder_source,
+        ).selected_audit
         == data.audit
     )
     if change == "audit":
@@ -138,7 +288,7 @@ def test_active_graph_refuses_independent_broken_owner_after_positive(monkeypatc
     else:
         data.batch.advisor_failure = RuntimeError("original exception cannot be made portable")
     with pytest.raises(AuditIntegrityError):
-        encode_application_graph(graph, env_ref_names=frozenset())
+        encode_application_graph(graph, env_ref_names=frozenset(), recorder_source=recorder_source)
 
 
 @asynccontextmanager
@@ -262,10 +412,11 @@ async def test_active_graph_keeps_actual_prior_p4_cuts_and_recorder_prefix(opera
         assert bundle.entry == actual.entry
         assert bundle.evidence_chunk == actual.evidence_chunk and bundle.batch_chunk == actual.batch_chunk
         assert bundle.audit_chunk == actual.audit_chunk and bundle.state_chunk == actual.state_chunk
+        recorder_source = graph_codec.admit_application_recorder_source(bundle.audit_chunk, env_ref_names=values["env_ref_names"])
         previous = require_evidence_application_links(
             bundle.evidence_after.snapshot,
             env_ref_names=values["env_ref_names"],
-            recorder_chunk=bundle.evidence_after.recorder_chunk,
+            recorder_source=recorder_source,
             sources=bundle.evidence_after.sources,
         )
         assert previous is not None and previous.cuts
@@ -276,8 +427,8 @@ async def test_active_graph_keeps_actual_prior_p4_cuts_and_recorder_prefix(opera
             selected_audit=prepared.audit,
             selected_dialect=prepared.dialect,
         )
-        encoded = encode_application_graph(changed, env_ref_names=values["env_ref_names"])
-        restored = decode_application_graph(encoded, env_ref_names=values["env_ref_names"])
+        encoded = encode_application_graph(changed, env_ref_names=values["env_ref_names"], recorder_source=recorder_source)
+        restored = decode_application_graph(encoded, env_ref_names=values["env_ref_names"], recorder_source=recorder_source)
         entry = bundle.entry.model_copy(update={"graph_json": encoded})
         require_portable_p4_application(
             entry,
@@ -286,6 +437,7 @@ async def test_active_graph_keeps_actual_prior_p4_cuts_and_recorder_prefix(opera
             producer=values["producer"],
             env_ref_names=values["env_ref_names"],
             source_chunks=bundle.evidence_after.sources.chunks,
+            recorder_source=recorder_source,
         )
         assert entry.applications == bundle.entry.applications
         assert restored.effects is restored.cuts[-1].effects_after
@@ -295,7 +447,7 @@ async def test_active_graph_keeps_actual_prior_p4_cuts_and_recorder_prefix(opera
             assert encode_recorder_snapshot(after.recorder_before) == encode_recorder_snapshot(before.recorder_before)
             assert encode_recorder_snapshot(after.recorder_after) == encode_recorder_snapshot(before.recorder_after)
             assert after.data.batch.p4_input_json == before.data.batch.p4_input_json
-        assert encode_application_graph(restored, env_ref_names=values["env_ref_names"]) == encoded
+        assert encode_application_graph(restored, env_ref_names=values["env_ref_names"], recorder_source=recorder_source) == encoded
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 """One production owner for Composer response, review and terminal settlement.
 
-Inputs retain the actual live owners and provider outcome. They are DATA;
-current SQL fences and phase owners remain responsible for every write.
+Inputs retain the actual live owners and provider outcome alongside detached
+provenance values. Current SQL fences and phase owners authorize every write.
 """
 
 from __future__ import annotations
@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
@@ -20,6 +21,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
@@ -118,8 +120,8 @@ class ComposerFinalizationInputs:
     observation: ComposerTurnObservation
     progress_sink: ComposerProgressSink
     state: CompositionState | None
-    chat_ingress: CompositionIngressRecord
-    chat_ingress_inputs: list[ChatIngressInput]
+    chat_ingress: Mapping[str, object]
+    chat_ingress_inputs: Sequence[Mapping[str, object]]
     prior_completion_gates_facts: CompletionGateFacts | None
     state_record: CompositionStateRecord | None
     budget_anchor: ComposerBudgetAnchor | ContinuationFinalizationBudget
@@ -131,6 +133,9 @@ class ComposerFinalizationInputs:
     plugin_snapshot: PluginAvailabilitySnapshot
     profile_registry: OperatorProfileRegistry
     required_work: RequiredWorkCoordinator
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "chat_ingress", "chat_ingress_inputs")
 
 
 def _message_with_state_response(
@@ -324,8 +329,8 @@ async def settle_composer_result(
     # messages.py:361-570 / compose.py:200-385, ending in the R2 composite.
     _post_compose_updates: ComposerPostComposeUpdates = {
         "repair_turns_used": result.repair_turns_used,
-        "ingress": chat_ingress,
-        "chat_ingress_inputs": chat_ingress_inputs,
+        "ingress": cast("CompositionIngressRecord", deep_thaw(chat_ingress)),
+        "chat_ingress_inputs": cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs)),
     }
     if prior_completion_gates_facts is not None:
         _post_compose_updates["completion_gates"] = completion_gates_meta_from_facts(prior_completion_gates_facts)
@@ -437,8 +442,8 @@ async def settle_composer_result(
                     profile_registry=profile_registry,
                     catalog=services.catalog_service,
                     session_operation_context=lease.context,
-                    ingress=chat_ingress,
-                    chat_ingress_inputs=chat_ingress_inputs,
+                    ingress=cast("CompositionIngressRecord", deep_thaw(chat_ingress)),
+                    chat_ingress_inputs=cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs)),
                     required_audit=True,
                     required_work=required_work,
                 ),

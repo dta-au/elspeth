@@ -13,21 +13,26 @@ from typing import Any
 
 from pydantic import TypeAdapter
 
+from elspeth.contracts.bounded_serialization import utf8_size
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateFailureFacts
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ToolContractDialect
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.audit import PrivatePlannerCandidate
+from elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES
+from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.composer.continuation_audit_buffer import (
     RecorderDrainCursors,
     RecorderSnapshot,
     RetainedVisibleLink,
+    decode_recorder_snapshot,
     encode_recorder_snapshot,
 )
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData
-from elspeth.web.composer.continuation_codec import owned_json
+from elspeth.web.composer.continuation_codec import PrivateChunk, owned_json, verify_private_chunk
 from elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit
+from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.turn_effects import PersistedBatchEffects, PersistedTurnEffects, authored_state_hash
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
@@ -54,8 +59,111 @@ class ApplicationGraph:
     selected_dialect: ToolContractDialect | None = None
 
 
+@dataclass(frozen=True, slots=True, init=False, eq=False)
+class ApplicationRecorderSource:
+    """Complete source-admitted recorder DATA; never a SQL/publication owner."""
+
+    chunk: PrivateChunk
+    snapshot: RecorderSnapshot
+    env_ref_names: frozenset[str]
+
+    def __init__(self, source: RecorderSnapshot | PrivateChunk, *, env_ref_names: frozenset[str]) -> None:
+        _require_source_environment(env_ref_names)
+        if type(source) is RecorderSnapshot:
+            chunk = encode_recorder_snapshot(source)
+        elif type(source) is PrivateChunk:
+            chunk = source
+        else:
+            raise TypeError("application recorder requires its actual complete source")
+        _require_source_chunk(chunk)
+        # The full original decoder owns all nested constructors and fields.
+        snapshot = decode_recorder_snapshot(chunk)
+        _require_source_credentials(chunk, env_ref_names)
+        object.__setattr__(self, "chunk", chunk)
+        object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "env_ref_names", env_ref_names)
+
+
+def _require_source_environment(env_ref_names: frozenset[str]) -> None:
+    if type(env_ref_names) is not frozenset or any(type(name) is not str for name in env_ref_names):
+        raise TypeError("application recorder requires its closed environment-name set")
+
+
+def _require_source_chunk(chunk: PrivateChunk) -> None:
+    if type(chunk) is not PrivateChunk or type(chunk.reference) is not PrivateChunkRef:
+        raise AuditIntegrityError("application recorder lost its complete original source role")
+    if (type(chunk.canonical), type(chunk.reference.codec), type(chunk.reference.digest), type(chunk.reference.byte_length)) != (
+        str,
+        str,
+        str,
+        int,
+    ) or chunk.reference.codec != "composer.audit-buffer.v1":
+        raise AuditIntegrityError("application recorder lost its complete original source role")
+    if not 0 <= chunk.reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or (
+        utf8_size(chunk.canonical, limit=CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES) != chunk.reference.byte_length
+    ):
+        raise AuditIntegrityError("application recorder exceeds its original complete document bound")
+    verify_private_chunk(chunk.reference, chunk.canonical)
+
+
+def _require_source_credentials(chunk: PrivateChunk, env_ref_names: frozenset[str]) -> None:
+    require_no_credential_material(
+        chunk.canonical,
+        surface="composer_continuation_evidence_recorder",
+        env_ref_names=env_ref_names,
+        max_string_bytes=JSON_MAX_TOTAL_UTF8_BYTES,
+    )
+
+
+def capture_application_recorder_source(snapshot: RecorderSnapshot, *, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
+    if type(snapshot) is not RecorderSnapshot:
+        raise TypeError("application recorder capture requires its actual snapshot")
+    return ApplicationRecorderSource(snapshot, env_ref_names=env_ref_names)
+
+
+def admit_application_recorder_source(chunk: PrivateChunk, *, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
+    if type(chunk) is not PrivateChunk:
+        raise TypeError("application recorder admission requires its actual source chunk")
+    return ApplicationRecorderSource(chunk, env_ref_names=env_ref_names)
+
+
+def require_application_recorder_source(source: ApplicationRecorderSource, env_ref_names: frozenset[str]) -> ApplicationRecorderSource:
+    _require_source_environment(env_ref_names)
+    if type(source) is not ApplicationRecorderSource:
+        raise TypeError("application graph requires its actual source-admitted recorder")
+    _require_source_environment(source.env_ref_names)
+    if source.env_ref_names != env_ref_names:
+        raise AuditIntegrityError("application recorder changed its admitted environment")
+    _require_source_chunk(source.chunk)
+    if type(source.snapshot) is not RecorderSnapshot or encode_recorder_snapshot(source.snapshot) != source.chunk:
+        raise AuditIntegrityError("application recorder changed its complete original fields")
+    _require_source_credentials(source.chunk, env_ref_names)
+    return source
+
+
+def application_recorder_slots(graph: ApplicationGraph, source: ApplicationRecorderSource) -> dict[int, int]:
+    if encode_recorder_snapshot(graph.recorder) != source.chunk:
+        raise AuditIntegrityError("application graph differs from its complete original recorder source")
+    slots: dict[int, int] = {}
+    for index, call in enumerate(graph.recorder.llm_calls):
+        if type(call) is not ComposerLLMCall:
+            raise TypeError("application recorder lost its actual LLM owner")
+        slots.setdefault(id(call), index)
+    return slots
+
+
+def construct_application_llm(source: ApplicationRecorderSource, slot: int) -> ComposerLLMCall:
+    """Fresh complete DTO per graph node, independently of source-cell aliases."""
+    if type(slot) is not int or not 0 <= slot < len(source.snapshot.llm_calls):
+        raise AuditIntegrityError("application LLM lost its exact recorder slot")
+    encoded = _atom_json(source.snapshot.llm_calls[slot], ComposerLLMCall)
+    restored = TypeAdapter(ComposerLLMCall).validate_json(encoded, strict=True, extra="forbid")
+    if _atom_json(restored, ComposerLLMCall) != encoded:
+        raise AuditIntegrityError("application LLM changed its complete original fields")
+    return restored
+
+
 _ATOMS: dict[str, type[Any]] = {
-    "application_llm": ComposerLLMCall,
     "application_planner": ComposerPlannerAttempt,
     "application_candidate": PrivatePlannerCandidate,
     "application_withheld": WithheldReply,
@@ -76,7 +184,11 @@ def _atom_json(value: Any, owner: type[Any]) -> str:
     return encoded
 
 
-def application_members(value: Any) -> tuple[str, dict[str, Any]] | None:
+def application_members(value: Any, *, recorder_slots: dict[int, int] | None = None) -> tuple[str, dict[str, Any]] | None:
+    if type(value) is ComposerLLMCall:
+        if recorder_slots is None or id(value) not in recorder_slots:
+            raise AuditIntegrityError("application LLM has no actual recorder identity slot")
+        return "application_llm", {"recorder_slot": recorder_slots[id(value)]}
     if type(value) is ApplicationGraphCut:
         return "application_cut", {
             "data": value.data,
@@ -282,26 +394,28 @@ def application_result_tools(graph: ApplicationGraph, env_ref_names: frozenset[s
     return result_tools
 
 
-def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozenset[str]) -> str:
+def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozenset[str], recorder_source: ApplicationRecorderSource) -> str:
     from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode, _encode_values
 
-    encoded = _encode(graph.selected, env_ref_names, application=graph)
-    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True)
+    encoded = _encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source)
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True, recorder_source=recorder_source)
     if (
         type(restored) is not ApplicationGraph
-        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored) != encoded
+        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored, recorder_source=recorder_source) != encoded
     ):
         raise AuditIntegrityError("application constructors changed the actual alias partition")
     return encoded
 
 
-def decode_application_graph(encoded: str, *, env_ref_names: frozenset[str]) -> ApplicationGraph:
+def decode_application_graph(
+    encoded: str, *, env_ref_names: frozenset[str], recorder_source: ApplicationRecorderSource
+) -> ApplicationGraph:
     from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode_values
 
-    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True)
+    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True, recorder_source=recorder_source)
     if (
         type(restored) is not ApplicationGraph
-        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored) != encoded
+        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored, recorder_source=recorder_source) != encoded
     ):
         raise AuditIntegrityError("application graph lost complete values or aliases")
     return restored

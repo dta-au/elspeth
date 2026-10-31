@@ -42,7 +42,7 @@ from elspeth.web.composer.continuation_runtime import (
     restore_continuation_runtime,
 )
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
-from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
+from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody, TerminalServiceCompletion
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.tool_batch import (
     BatchAccumulator,
@@ -111,6 +111,7 @@ class ContinuationLivePhases:
     cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
     business_stage: ContinuationStage[None] | None = None
     failure_custody: ContinuationToolFailureCustody | None = None
+    terminal_completion: TerminalServiceCompletion | None = None
 
     def observe_stop(self) -> None:
         self.cancellation_requested.set()
@@ -326,7 +327,7 @@ class ContinuationLivePhases:
         await _initialize_continuation_batch_live(
             call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch
         )
-        self.runtime = runtime = replace(runtime, graph=replace(runtime.graph, batch=data))
+        self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data))
         captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
         chunk = encode_private_chunk(
             codec="composer.coupled-batch-data.v1",
@@ -374,10 +375,8 @@ class ContinuationLivePhases:
             issued_effect_key = f"tool:{result.response.reference.digest}:{call.index}"
             self.runtime = runtime = replace(
                 runtime,
-                graph=replace(
-                    runtime.graph,
-                    selected_audit=capture_dispatch_audit(call.audit, env_ref_names=inventory.names),
-                    selected_dialect=context.tool_contract_dialect,
+                graph=runtime.graph.with_selected_dispatch(
+                    capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
                 ),
             )
             captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
@@ -418,12 +417,29 @@ class ContinuationLivePhases:
             batch.last_runtime_preflight,
             batch.advisor_calls_used,
         )
+        if batch.service_failure is not None:
+            custody = self.failure_custody
+            if preparation != "prepared" or custody is None or issued_effect_key is None or self.runtime is None:
+                raise AuditIntegrityError("service completion lost its actual issued native phase")
+            if self.terminal_completion is not None:
+                raise AuditIntegrityError("service completion cannot replace another native terminal owner")
+            try:
+                self.terminal_completion = TerminalServiceCompletion(custody, self.runtime, context, result.outcome, issued_effect_key)
+                # This failed batch cannot be encoded or restored. Its last valid
+                # issued SQL cut is only a source bookmark for terminal P4 proof.
+                await self._persist_batch(self.runtime.source.selected)
+            except BaseException as error:
+                combined = custody.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
+            return
         if self.runtime is None:
             raise AuditIntegrityError("completed tool lost its retained runtime")
         runtime = self.runtime
         inventory = runtime.materialization.inventory
         selected = runtime.source.selected
-        self.runtime = runtime = replace(runtime, graph=replace(runtime.graph, selected_audit=None, selected_dialect=None))
+        self.runtime = runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
         captured = (
             await self._capture_issued_finish(runtime, selected=selected, inventory=inventory)
             if preparation == "prepared"
@@ -458,15 +474,27 @@ class ContinuationLivePhases:
         )
 
     async def _persist_batch(self, selected: SelectedContinuationState) -> None:
-        phase_read = await self._current_phase_read(selected)
-        runtime, inventory = phase_read.runtime, phase_read.inventory
+        terminal = self.terminal_completion
+        if terminal is None:
+            phase_read = await self._current_phase_read(selected)
+            runtime, inventory = phase_read.runtime, phase_read.inventory
+            result = await self._primary_for_phase(runtime, inventory, selected)
+            context = await build_runtime_tool_batch_context(
+                runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read
+            )
+            call_model = result.outcome
+        else:
+            terminal.require_native()
+            if self.runtime is not terminal.runtime or selected is not terminal.runtime.source.selected or terminal.p4 is not None:
+                raise terminal.custody.failure(AuditIntegrityError("terminal P4 cannot replace or replay its actual native completion"))
+            runtime = terminal.runtime
+            inventory = runtime.materialization.inventory
+            context, call_model = terminal.context, terminal.call_model
         data = runtime.graph.batch
         if data is None or data.batch.phase != "dispatch_ready":
             raise AuditIntegrityError("live P4 lost its actual completed batch/provider owners")
-        result = await self._primary_for_phase(runtime, inventory, selected)
-        context = await build_runtime_tool_batch_context(runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read)
         dispatch, advisor_calls = _finish_continuation_batch_live(
-            call_model=result.outcome,
+            call_model=call_model,
             ctx=context,
             acc=data.accumulator,
             batch=data.batch,
@@ -482,6 +510,8 @@ class ContinuationLivePhases:
             runtime,
             withheld_replies=live.recorder.withheld_replies[runtime.drained.withheld_replies :],
         )
+        if terminal is not None:
+            terminal.bind_p4(owner)
 
         async def publish() -> None:
             deadline_owner = self.work.coordinator.sql_deadline_owner
@@ -508,6 +538,7 @@ class ContinuationLivePhases:
                     crash_pending=(
                         dispatch.plugin_crash is not None
                         or dispatch.advisor_failure is not None
+                        or dispatch.service_failure is not None
                         or (
                             data.batch.retained_failure is not None
                             and data.batch.retained_failure.kind in ("plugin_crash", "advisor_failure")
@@ -525,6 +556,7 @@ class ContinuationLivePhases:
                     required_work=self.work,
                     turn_evidence=live.turn_evidence,
                     continuation=owner,
+                    terminal_completion=terminal,
                 )
             except BaseException as failure:
                 original = failure if self.failure_custody is None else self.failure_custody.failure(failure)
@@ -567,6 +599,9 @@ class ContinuationLivePhases:
 
     async def finish_owed_prefix(self, selected: SelectedContinuationState) -> None:
         """Finish an actual retained prefix; the SQL owner proves durable Stop."""
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return
         top = selected.stack.frames[-1]
         if type(top) is not ToolBatchFrame or top.phase != "tool_ready" or top.accumulator.codec != "composer.coupled-batch-data.v1":
             return
@@ -581,6 +616,9 @@ class ContinuationLivePhases:
             await self._persist_batch(selected)
 
     async def advance(self, selected: SelectedContinuationState) -> None:
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return
         top = selected.stack.frames[-1]
         if type(top) is ComposeFrame and top.phase == "response_retained":
             await self._initialize_batch(selected)

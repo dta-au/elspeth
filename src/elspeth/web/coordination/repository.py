@@ -5249,7 +5249,13 @@ class _SessionOperationAuthorityRepository:
             if old is None:
                 return "unchanged"
             validate_lost_continuation_on_connection(conn, session_id=str(candidate.session_id), operation_id=candidate.operation_id)
-            if old.parent.cancel_requested_at is None and not old.archived:
+            from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection, terminal_service_failure
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+            terminal_source = read_lost_terminal_p4_on_connection(
+                conn, session_id=str(candidate.session_id), operation_id=candidate.operation_id
+            )
+            if old.parent.cancel_requested_at is None and not old.archived and terminal_source is None:
                 try:
                     recover_segment_on_connection(
                         conn,
@@ -5268,6 +5274,8 @@ class _SessionOperationAuthorityRepository:
             outcome = (
                 request_cancelled_error(request_id=old.parent.request_id)
                 if old.parent.cancel_requested_at is not None
+                else terminal_service_failure(terminal_source, request_id=old.parent.request_id)
+                if type(terminal_source) is StoredTerminalP4Application
                 else worker_lost_error(request_id=old.parent.request_id)
             )
             context = (
@@ -5380,9 +5388,15 @@ class _SessionOperationAuthorityRepository:
             if history is not None and (history.revoked_at is None or history.outcome is None):
                 raise AuditIntegrityError("inactive non-running segment retains an unrevoked attempt")
             validate_lost_continuation_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
+            from elspeth.web.sessions.continuation_p4 import read_lost_terminal_p4_on_connection, terminal_service_failure
+            from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application
+
+            terminal_source = read_lost_terminal_p4_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
             outcome = (
                 request_cancelled_error(request_id=parent.request_id)
                 if parent.cancel_requested_at is not None
+                else terminal_service_failure(terminal_source, request_id=parent.request_id)
+                if type(terminal_source) is StoredTerminalP4Application
                 else worker_lost_error(request_id=parent.request_id)
             )
             settle_segment_on_connection(

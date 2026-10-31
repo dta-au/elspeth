@@ -33,14 +33,14 @@ NAMESPACE_BINDINGS = {
     GENERATION: "751ab26e95174f401516201af1d272fbfcb43f3be392396a4d245f8293c80c2d",
     DISCOVERY: "7cfe3766949f87ed815e0e2664920858ed642439a47aca74fbd812de9d3db33a",
     RECEIPTS: "cf0bedc32c03f9afe9affd14b327206ebadeb16b745bd64cb7c8820fde5d6e8a",
-    APPLICATION: "bdc934504350d6857652df5a63b2f8c82724e0310f7d65a723a42b55ef621158",
-    FAMILIES: "55a2f2bf501c8cd0aef46f361be81572e36feec53853736dcfcb8b38860cf609",
+    APPLICATION: "2f0209d195a69dba129d4e8059f8884c7cc6ccc1da5bd9da306c4c6c9761c669",
+    FAMILIES: "6c7a933a70a7b2e35213a3434a746415ea4424b2260d9afd097afcf718cda51a",
 }
 
-TOP_LEVEL_IMPORT_SOURCE = "from __future__ import annotations\nfrom dataclasses import dataclass\nfrom types import MappingProxyType\nfrom typing import TYPE_CHECKING, Any, NoReturn\nfrom pydantic import TypeAdapter\nfrom pydantic import ValidationError as ModelValidationError\nfrom elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateToolAuthoring, ToolArgumentErrorCategory\nfrom elspeth.contracts.composer_llm_audit import ToolContractDialect\nfrom elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation\nfrom elspeth.contracts.enums import AuditCharacteristic\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.freeze import FrozenJsonArray\nfrom elspeth.contracts.hashing import canonical_json\nfrom elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority\nfrom elspeth.contracts.provider_rejection import SafeRequestRejection\nfrom elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSchemaInfo, PluginSecretRequirement, PluginSummary\nfrom elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome\nfrom elspeth.web.composer._schema_response_grammar import JSONSchemaSnapshot, KnobSchemaSnapshot\nfrom elspeth.web.composer.audit import DispatchAudit\nfrom elspeth.web.composer.authority_hashing import composer_authority_canonical_json\nfrom elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, bounded_json_loads\nfrom elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk\nfrom elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit, capture_dispatch_audit, decode_dispatch_audit, encode_dispatch_audit, re_admit_dispatch_audit\nfrom elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials\nfrom elspeth.web.composer.continuation_tool_batch import RetainedBatchFailure, _decode_validation, _read_json_value, _state_from_tool_json, _validation_json, encode_tool_result_value\nfrom elspeth.web.composer.continuation_tool_receipts import decode_retained_tool_receipt, require_receipt_result\nfrom elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, admit_discovery_result\nfrom elspeth.web.composer.manual_advisor_allowance import ManualAdvisorAllowance\nfrom elspeth.web.composer.pipeline_custody import inline_custody_audit_projection\nfrom elspeth.web.composer.state import CompositionState, ValidationSummary\nfrom elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts\nfrom elspeth.web.composer.tools._common import ToolResult\nfrom elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT, AdmittedPluginSchemaResponse, PluginSchemaSnapshot, SchemaSecretRequirement\nfrom elspeth.web.composer.tools._registry import response_contract_for\nfrom elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments\nfrom elspeth.web.credential_guard import require_no_credential_material\nfrom elspeth.web.execution.schemas import SemanticEdgeContractResponse, ValidationCheck, ValidationError, ValidationReadiness, ValidationReadinessBlocker, ValidationResult, ValidationWarning"
+TOP_LEVEL_IMPORT_SOURCE = "from __future__ import annotations\nfrom dataclasses import dataclass\nfrom types import MappingProxyType\nfrom typing import TYPE_CHECKING, Any, NoReturn\nfrom pydantic import TypeAdapter\nfrom pydantic import ValidationError as ModelValidationError\nfrom elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus, PrivateFailureFacts, PrivateToolAuthoring, ToolArgumentErrorCategory\nfrom elspeth.contracts.composer_llm_audit import ToolContractDialect\nfrom elspeth.contracts.composer_mutation import ComposerMutationCeiling, ComposerMutationRevocation\nfrom elspeth.contracts.enums import AuditCharacteristic\nfrom elspeth.contracts.errors import AuditIntegrityError\nfrom elspeth.contracts.freeze import FrozenJsonArray\nfrom elspeth.contracts.hashing import canonical_json\nfrom elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority\nfrom elspeth.contracts.provider_rejection import SafeRequestRejection\nfrom elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSchemaInfo, PluginSecretRequirement, PluginSummary\nfrom elspeth.web.composer._compose_loop_carriers import _AdmittedToolCall, _AdmittedToolFunction, _ToolOutcome\nfrom elspeth.web.composer._schema_response_grammar import JSONSchemaSnapshot, KnobSchemaSnapshot\nfrom elspeth.web.composer.audit import DispatchAudit\nfrom elspeth.web.composer.authority_hashing import composer_authority_canonical_json\nfrom elspeth.web.composer.bounded_json import JSON_MAX_TOTAL_UTF8_BYTES, bounded_json_loads\nfrom elspeth.web.composer.continuation import PrivateChunkRef\nfrom elspeth.web.composer.continuation_codec import PrivateChunk, encode_private_chunk, owned_json, verify_private_chunk\nfrom elspeth.web.composer.continuation_dispatch_audit import PortableDispatchAudit, capture_dispatch_audit, decode_dispatch_audit, encode_dispatch_audit, re_admit_dispatch_audit\nfrom elspeth.web.composer.continuation_result_credentials import require_retained_argument_credentials, require_retained_result_credentials\nfrom elspeth.web.composer.continuation_tool_batch import RetainedAdvisorRefusalSource, RetainedBatchFailure, _decode_validation, _read_json_value, _response_contract, _state_from_tool_json, _validation_json, encode_tool_result_value\nfrom elspeth.web.composer.continuation_tool_receipts import decode_retained_tool_receipt, require_receipt_result\nfrom elspeth.web.composer.discovery_response import AdmittedDiscoveryResult, admit_discovery_result\nfrom elspeth.web.composer.manual_advisor_allowance import ManualAdvisorAllowance\nfrom elspeth.web.composer.pipeline_custody import inline_custody_audit_projection\nfrom elspeth.web.composer.state import CompositionState, ValidationSummary\nfrom elspeth.web.composer.tool_batch import BatchAccumulator, ContinuationBatchState, ContinuationCallState, _CallWireFacts\nfrom elspeth.web.composer.tools._common import ToolResult\nfrom elspeth.web.composer.tools._generation_schema_response import PLUGIN_SCHEMA_RESPONSE_CONTRACT, AdmittedPluginSchemaResponse, PluginSchemaSnapshot, SchemaSecretRequirement\nfrom elspeth.web.composer.tools._registry import response_contract_for\nfrom elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments\nfrom elspeth.web.credential_guard import require_no_credential_material\nfrom elspeth.web.execution.schemas import SemanticEdgeContractResponse, ValidationCheck, ValidationError, ValidationReadiness, ValidationReadinessBlocker, ValidationResult, ValidationWarning"
 
 TYPE_ONLY_IMPORT_SOURCE = """if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_application_graph import ApplicationGraph
+    from elspeth.web.composer.continuation_application_graph import ApplicationGraph, ApplicationRecorderSource
 """
 # Owner, exact import statement, exact containing phase, protected origins.
 # The original two local suppliers remain independently checked by the fence.
@@ -64,23 +64,51 @@ LOCAL_SUPPLIER_SPECS = (
         ("elspeth.web.composer.continuation_application_graph.application_result_tools",),
     ),
     (
-        "_encode.visit",
+        "_encode_values",
+        "from elspeth.web.composer.continuation_application_graph import application_recorder_slots, require_application_recorder_source",
+        "application is not None",
+        (
+            "elspeth.web.composer.continuation_application_graph.application_recorder_slots",
+            "elspeth.web.composer.continuation_application_graph.require_application_recorder_source",
+        ),
+    ),
+    (
+        "_encode_values.visit",
         "from elspeth.web.composer.continuation_application_graph import application_members",
         "application is not None",
         ("elspeth.web.composer.continuation_application_graph.application_members",),
     ),
     (
-        "_decode_graph.visit",
+        "_encode_values.visit",
+        "from elspeth.web.composer.continuation_application_graph import application_members",
+        "type(value) is ComposerToolInvocation",
+        ("elspeth.web.composer.continuation_application_graph.application_members",),
+    ),
+    (
+        "_decode_graph_values",
+        "from elspeth.web.composer.continuation_application_graph import require_application_recorder_source",
+        "application",
+        ("elspeth.web.composer.continuation_application_graph.require_application_recorder_source",),
+    ),
+    (
+        "_decode_graph_values.visit",
+        "from elspeth.web.composer.continuation_application_graph import construct_application_llm",
+        "kind == 'application_llm'",
+        ("elspeth.web.composer.continuation_application_graph.construct_application_llm",),
+    ),
+    (
+        "_decode_graph_values.visit",
         "from elspeth.web.composer.continuation_application_graph import construct_application_member",
-        "application and kind.startswith('application_')",
+        "(application and kind.startswith('application_')) or kind == 'application_invocation'",
         ("elspeth.web.composer.continuation_application_graph.construct_application_member",),
     ),
     (
-        "_decode_graph",
-        "from elspeth.web.composer.continuation_application_graph import ApplicationGraph, application_result_tools",
+        "_decode_graph_values",
+        "from elspeth.web.composer.continuation_application_graph import ApplicationGraph, application_recorder_slots, application_result_tools",
         "application",
         (
             "elspeth.web.composer.continuation_application_graph.ApplicationGraph",
+            "elspeth.web.composer.continuation_application_graph.application_recorder_slots",
             "elspeth.web.composer.continuation_application_graph.application_result_tools",
         ),
     ),
@@ -135,11 +163,13 @@ SCHEMA_FIELDS = {
     "KnobSchemaSnapshot": ("fields",),
 }
 BODY_BINDINGS = {
-    (DATA, "_joint"): "a39cbad77fd1570d20a60f7b567e58cad41ef30d9b67c89809ab2492490d1a14",
-    (DATA, "_members"): "b4406a99a77da442f965150f6eb0401b7f3c305cdef72e882e3be5a5526fce9b",
-    (DATA, "_construct"): "dc220972a08512ef6755a371ab94b86189951ee8c4d60d8243d2c905e268b7e1",
-    (DATA, "_encode"): "3c9054aed0b4e568f277f86e09adc31a6c59b9f69df70fc45fe2a9d9e22805d3",
-    (DATA, "_decode_graph"): "0d3443758fb82c95c9733e1f21c504c0b876779f85e7e38c0775f90db3433641",
+    (DATA, "_joint"): "94b29607e677c56c8b7d7336ddebfafa5e4e906589c2848d9843bd7c558aaa8e",
+    (DATA, "_members"): "20ee877a13ff20360c371547c3293e307fe9e4c13d64f6d72ceb2fbde5622851",
+    (DATA, "_construct"): "29e25e9a6fb0b8a3f89cdf92659df05eed43b7d213037a2a217940d62b26ba3d",
+    (DATA, "_encode"): "b9232e264c1c5b65c260db030488895a732d0d2f274e10e80854b9af4218833b",
+    (DATA, "_decode_graph"): "b42e0e16e1250c4a393f8a1a9c48acc2fb6e049917c35a51de1bb0aab6bcd489",
+    (DATA, "_encode_values"): "c0136bcc24072d9083576e89cb55700116fcef5c33f90d824a2334088827cb0f",
+    (DATA, "_decode_graph_values"): "ed2a64e77c4bae7f1ab81a9616672045e6bbd25e2b79615480ff6a33ff873254",
     (DATA, "_check_prepared"): "b6e6d4170dbb040db8b6e15f6f33fe47e45e41eec1d22538f0c2ac7356e2d423",
     (DATA, "RestoredMemoryCompletionBatchData"): "e0a778360a43a417f9d1bf8733c772f323e6167d99d18e818b486268d9cb9a13",
     (DATA, "_check_memory_completion"): "3e05ed91305f48c6ad280a38cb95b93b6b3e50b36103b225f6ec5f3cb3c16f48",
@@ -182,15 +212,24 @@ BODY_BINDINGS = {
     (RECEIPTS, "require_receipt_result"): "3e207f927d73012bd0d65d6289b1081d61d3738a134d092949ae1353dd5115f0",
     (APPLICATION, "ApplicationGraphCut"): "69f4e3c832572e424c8b4c3934c210c51f61cb2c5923b33b5e028fc7bbebf8e9",
     (APPLICATION, "ApplicationGraph"): "c04a53fba0584d86e7380bdd690819677a5c20f72a470dd509a5b2c952e3f5d4",
+    (APPLICATION, "ApplicationRecorderSource"): "18f04ae52a559c0a700e0e174eee11499edeee64005ea9451bfd1382d0881547",
+    (APPLICATION, "_require_source_environment"): "4250c1045487039b3734a80304e3ca551c6b449356536ceda11eb7c3473c9e21",
+    (APPLICATION, "_require_source_chunk"): "a0fd3cabbade96edf38d9ef740d6c1ddcf6333256cf7d6df8898cf1e997bc61f",
+    (APPLICATION, "_require_source_credentials"): "e230d7605324b4992061e82c46da1f91432bff3d0a247df087aa6b410e88c26b",
+    (APPLICATION, "capture_application_recorder_source"): "2c30870331665726c24c01616128cd33dfa54685ad74cdc830579bb67ae1fe41",
+    (APPLICATION, "admit_application_recorder_source"): "4bc7de23a334690724e751448b65f252630ba5cca6251b672ef6611405843db5",
+    (APPLICATION, "require_application_recorder_source"): "2d8a36b0b5110058d8cada81ddac0423b2e962016bf1199fe13d762f60acb888",
+    (APPLICATION, "application_recorder_slots"): "59b9e19bfde75a5964b54223a8cb3333c1c37c041510d8ab9025244ef11be92d",
+    (APPLICATION, "construct_application_llm"): "4fa9b476730c315e5f10ecefaa46b2a5361757d2a87d0ed5cc42a34d92330f8d",
     (APPLICATION, "_atom_json"): "d8c18d01bfc09accf187f3876e6401dde588c3f3813035709c4ce2267f41f8a5",
     (APPLICATION, "_admit_effects"): "3e2128ea596b8ca5dcbd6bb52eb63c5be4a191c62de7464949b130d2d084bf63",
-    (APPLICATION, "application_members"): "1ea98aafb0082f0d95154c7a7dd9b745b4c7c68470b2f6618005f6633fca002a",
+    (APPLICATION, "application_members"): "31c097108ada7fc208e28ab6e85d448fdc86e9c98581ef068fcdfe30e9b9bb41",
     (APPLICATION, "construct_application_member"): "a7558aa72ccd92def9b8dd9cbec7ac3f627596eb9fb24370b2f233d93b73813e",
-    (APPLICATION, "application_result_tools"): "a8d2308aeee7e4a19ec74cc0f8df7aa87ea3015c13a50a899895ba953b5a3a8d",
-    (APPLICATION, "encode_application_graph"): "88baf0d7b600da91104b55903a998ec417c2429d88ff1d320dedf45d988b407b",
-    (APPLICATION, "decode_application_graph"): "3d5d71cdbcbe1961b6d4d0e42a91842f1a13a9403523ecc673030f02994d968f",
-    (FAMILIES, "_read_current_sources"): "fbcd6ec71f370f1be5ae4215ae368ff5ef0a2c8b03ba48f22f71c4abde8dfa05",
-    (FAMILIES, "_actual_chunk"): "bb0e04421731daaf1e03f81aae060558fb207f269f444b1d96c8bd8c1d45b015",
+    (APPLICATION, "application_result_tools"): "3c4ebe6b6f9abb0d2837cbe97d8685eb6ac4ea5baa18bd29d36639a5c9bbc13e",
+    (APPLICATION, "encode_application_graph"): "a7ec2416bbb7bf6ffb4b4838db3d16afa510718a19a380c6a83480c05d882b8e",
+    (APPLICATION, "decode_application_graph"): "a2c5c1315453a1dcd60796db8ab6aeac5f25c56c3041b847b5155d20609948b2",
+    (FAMILIES, "_read_current_sources"): "f0544018d62a54f58d4466d72092078a54f694633ef9642b1d5753768a538ddf",
+    (FAMILIES, "_actual_chunk"): "b1dfd2e12b4f719f73afb8767c094e92b0ee53a41ed0c4fec1463691c6a34286",
 }
 
 SITE_KEYS = (
@@ -337,6 +376,7 @@ def _bind(units, failures, receipt):
                 "RetainedToolReceipt",
                 "ApplicationGraphCut",
                 "ApplicationGraph",
+                "ApplicationRecorderSource",
             }
             else ast.FunctionDef
         )
@@ -504,8 +544,30 @@ def _signatures(selected, failures):
         "_joint": (("data", "env_ref_names", "prepared"), ("memory_completion",), ("None",), ("False",)),
         "_members": (("value", "selected_tool"), (), ("None",), ()),
         "_construct": (("kind", "members"), (), (), ()),
-        "_encode": (("data", "env_ref_names", "prepared"), ("memory_completion", "application"), ("None",), ("False", "None")),
-        "_decode_graph": (("encoded", "env_ref_names"), ("prepared", "memory_completion", "application"), (), ("False", "False", "False")),
+        "_encode": (
+            ("data", "env_ref_names", "prepared"),
+            ("memory_completion", "application", "recorder_source"),
+            ("None",),
+            ("False", "None", "None"),
+        ),
+        "_encode_values": (
+            ("data", "env_ref_names", "result_tools", "prepared"),
+            ("memory_completion", "application", "recorder_source"),
+            ("None",),
+            ("False", "None", "None"),
+        ),
+        "_decode_graph": (
+            ("encoded", "env_ref_names"),
+            ("prepared", "memory_completion", "application", "recorder_source"),
+            (),
+            ("False", "False", "False", "None"),
+        ),
+        "_decode_graph_values": (
+            ("encoded", "env_ref_names"),
+            ("prepared", "memory_completion", "application", "recorder_source"),
+            (),
+            ("False", "False", "False", "None"),
+        ),
         "_check_prepared": (("data", "retained", "dialect", "env_ref_names"), ("memory_completion",), (), ("False",)),
         "_check_memory_completion": (("data", "audit", "env_ref_names", "result_tools"), (), (), ()),
         "encode_memory_completion_batch_data": (
@@ -547,7 +609,7 @@ def _signatures(selected, failures):
 
 
 def _memory_and_application(unit, selected, failures, receipt):
-    joint, encode, decode = (selected[DATA, name] for name in ("_joint", "_encode", "_decode_graph"))
+    joint, encode, decode = (selected[DATA, name] for name in ("_joint", "_encode", "_decode_graph_values"))
     _one(
         failures,
         receipt,
@@ -645,9 +707,15 @@ class RestoredMemoryCompletionBatchData:
             _sites(receipt, "external_data_uses", DATA, [call.func])
     for owner, expression in (
         ("_encode", "application_result_tools(application, env_ref_names)"),
-        ("_encode", "application_members(value)"),
-        ("_decode_graph", "construct_application_member(kind, members)"),
-        ("_decode_graph", "application_result_tools(application_value, env_ref_names)"),
+        ("_encode_values", "application_members(value, recorder_slots=recorder_slots)"),
+        ("_encode_values", "application_members(value)"),
+        ("_encode_values", "require_application_recorder_source(recorder_source, env_ref_names)"),
+        ("_encode_values", "application_recorder_slots(application, recorder_source)"),
+        ("_decode_graph_values", "require_application_recorder_source(recorder_source, env_ref_names)"),
+        ("_decode_graph_values", "construct_application_member(kind, members)"),
+        ("_decode_graph_values", "construct_application_llm(recorder_source, slot)"),
+        ("_decode_graph_values", "application_result_tools(application_value, env_ref_names)"),
+        ("_decode_graph_values", "application_recorder_slots(application_value, recorder_source)"),
     ):
         call = _one(
             failures,
@@ -663,9 +731,9 @@ class RestoredMemoryCompletionBatchData:
         if call is not None:
             _sites(receipt, "application_uses", DATA, [call.func])
     for owner, expression in (
-        ("_decode_graph", "RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)"),
-        ("_decode_graph", "ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)"),
-        ("_decode_graph", "ApplicationGraph(data, effects, recorder, cuts)"),
+        ("_decode_graph_values", "RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)"),
+        ("_decode_graph_values", "ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)"),
+        ("_decode_graph_values", "ApplicationGraph(data, effects, recorder, cuts)"),
         ("encode_memory_completion_batch_data", "RestoredBatchData(batch, accumulator, calls)"),
         ("encode_restored_memory_completion_batch_data", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
         ("require_selected_memory_completion", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
@@ -737,21 +805,108 @@ def _constructor_entry_references(units):
     return found
 
 
+def _directional_core_transfers(selected, failures, receipt):
+    """The original caller owns result contracts; the cores return DATA only."""
+    for symbol, source, diagnostic in (
+        (
+            "_encode",
+            "return _encode_values(data, env_ref_names, result_tools, prepared, memory_completion=memory_completion, application=application, recorder_source=recorder_source)",
+            "directional encode caller changed",
+        ),
+        (
+            "_decode_graph",
+            "return _decode_graph_values(encoded, env_ref_names, prepared=prepared, memory_completion=memory_completion, application=application, recorder_source=recorder_source)[0]",
+            "directional decode caller changed",
+        ),
+    ):
+        statement = _one(failures, receipt, "member_uses", DATA, selected[DATA, symbol], ast.Return, source, diagnostic)
+        if statement is not None:
+            call = statement.value.value if isinstance(statement.value, ast.Subscript) else statement.value
+            _require(failures, isinstance(call, ast.Call), diagnostic)
+            if isinstance(call, ast.Call):
+                _sites(receipt, "external_data_calls", DATA, [call])
+                _sites(receipt, "external_data_uses", DATA, [call.func])
+    decode = selected[DATA, "_decode_graph_values"]
+    _one(
+        failures,
+        receipt,
+        "member_uses",
+        DATA,
+        decode,
+        ast.If,
+        'if type(slot) is not int or not 0 <= slot < len(recorder_source.snapshot.llm_calls):\n    _fail("application LLM has an invalid original recorder slot")',
+        "exact recorder-slot guard changed",
+    )
+    visitors = [node for node in decode.body if isinstance(node, ast.FunctionDef) and node.name == "visit"]
+    claims = (
+        'if slot in claimed_llm_slots:\n    _fail("distinct application LLM nodes claim the same recorder slot")',
+        "claimed_llm_slots[slot] = index",
+        "from elspeth.web.composer.continuation_application_graph import construct_application_llm",
+        "result = construct_application_llm(recorder_source, slot)",
+    )
+    windows = []
+    if len(visitors) == 1:
+        for branch in ast.walk(visitors[0]):
+            if not isinstance(branch, ast.If) or not _same(branch.test, "kind == 'application_llm'", expression=True):
+                continue
+            for index in range(len(branch.body) - len(claims) + 1):
+                if all(_same(node, expected) for node, expected in zip(branch.body[index : index + len(claims)], claims, strict=True)):
+                    windows.append(branch.body[index : index + len(claims)])
+    _require(failures, len(windows) == 1, "recorder-slot claim order changed")
+    _one(
+        failures,
+        receipt,
+        "member_uses",
+        DATA,
+        decode,
+        ast.If,
+        'if any(actual_slots.get(id(restored[index])) != slot for slot, index in claimed_llm_slots.items()):\n    _fail("application LLM changed its canonical first recorder identity slot")',
+        "canonical recorder-slot identity changed",
+    )
+    for symbol, source in (
+        ("application_recorder_slots", "slots.setdefault(id(call), index)"),
+        ("construct_application_llm", 'restored = TypeAdapter(ComposerLLMCall).validate_json(encoded, strict=True, extra="forbid")'),
+        (
+            "require_application_recorder_source",
+            'if type(source.snapshot) is not RecorderSnapshot or encode_recorder_snapshot(source.snapshot) != source.chunk:\n    raise AuditIntegrityError("application recorder changed its complete original fields")',
+        ),
+    ):
+        kind = ast.Expr if symbol == "application_recorder_slots" else ast.Assign if symbol == "construct_application_llm" else ast.If
+        _one(
+            failures,
+            receipt,
+            "member_uses",
+            APPLICATION,
+            selected[APPLICATION, symbol],
+            kind,
+            source,
+            "complete recorder source transfer changed " + symbol,
+        )
+
+
 def _external_calls(selected, failures, receipt):
     for name in ("encode_application_graph", "decode_application_graph"):
         owner = selected[APPLICATION, name]
+        expected = {
+            "_decode_graph_values(encoded, env_ref_names, application=True, recorder_source=recorder_source)",
+            "_encode_values(restored.selected, env_ref_names, result_tools, application=restored, recorder_source=recorder_source)",
+        }
+        if name == "encode_application_graph":
+            expected.add("_encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source)")
+        actual = []
         for node in ast.walk(owner):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id not in {"_encode", "_decode_graph"}:
+            if (
+                not isinstance(node, ast.Call)
+                or not isinstance(node.func, ast.Name)
+                or node.func.id not in {"_encode", "_encode_values", "_decode_graph_values"}
+            ):
                 continue
             expression = ast.unparse(node)
-            allowed = {
-                "_encode(graph.selected, env_ref_names, application=graph)",
-                "_encode(restored.selected, env_ref_names, application=restored)",
-                "_decode_graph(encoded, env_ref_names, application=True)",
-            }
-            _require(failures, expression in allowed, "application external DATA caller changed " + name)
+            actual.append(expression)
+            _require(failures, expression in expected, "application external DATA caller changed " + name)
             _sites(receipt, "external_data_calls", APPLICATION, [node])
             _sites(receipt, "external_data_uses", APPLICATION, [node.func])
+        _require(failures, len(actual) == len(expected) and set(actual) == expected, "application external DATA caller changed " + name)
     memory = _one(
         failures,
         receipt,
@@ -779,13 +934,14 @@ def batch_data_local_contracts(units):
     _schema_members(unit, selected, failures, receipt)
     _signatures(selected, failures)
     _memory_and_application(unit, selected, failures, receipt)
+    _directional_core_transfers(selected, failures, receipt)
     _external_calls(selected, failures, receipt)
     native = _one(
         failures,
         receipt,
         "external_data_calls",
         DATA,
-        selected[DATA, "_decode_graph"],
+        selected[DATA, "_decode_graph_values"],
         ast.Call,
         "_construct(kind, members)",
         "actual constructor entry call changed",

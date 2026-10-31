@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -32,8 +33,11 @@ from elspeth.web.sessions._persist_payload import AuditOutcome
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
 from elspeth.web.sessions.continuation import ContinuationOwnerCommit
 from elspeth.web.sessions.continuation_p4 import P4WriterObservation
-from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4, StoredP4Application
+from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4, StoredP4Application, StoredTerminalP4Application
 from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
 
 
 @dataclass(slots=True)
@@ -53,8 +57,9 @@ class ContinuationLiveP4:
     publication: _PersistOutcome | None = field(default=None, init=False)
     captured: CapturedContinuationRuntime | None = field(default=None, init=False)
     application_sql: RequiredSQLFinishOnce[StoredP4Application] | None = field(default=None, init=False)
-    application: StoredP4Application | None = field(default=None, init=False)
+    application: StoredP4Application | StoredTerminalP4Application | None = field(default=None, init=False)
     writer_observation: P4WriterObservation | None = field(default=None, init=False)
+    terminal_completion: TerminalServiceCompletion | None = field(default=None, init=False)
     _checkpoint_ticket: RequiredWorkTicket | None = field(default=None, init=False, repr=False)
     deferred_failures: list[BaseException] = field(default_factory=list, init=False)
     deferred_cancellations: list[asyncio.CancelledError] = field(default_factory=list, init=False)
@@ -107,7 +112,7 @@ class ContinuationLiveP4:
                 if not previous:
                     self.runtime.live.recorder.record_visible_tool_event(actual[0], row.visible_event)
         pending_data = RestoredBatchData(pending, self.data.accumulator, self.data.calls)
-        runtime = replace(self.runtime, graph=replace(self.runtime.graph, batch=pending_data))
+        runtime = replace(self.runtime, graph=self.runtime.graph.with_batch(pending_data))
 
         def read_source() -> ContinuationRuntimeSource:
             try:
@@ -172,6 +177,73 @@ class ContinuationLiveP4:
             self.commit, self.prepared = outcome.value, prepared
             self.writer_observation = P4WriterObservation(outcome.value, prepared)
             self.data.batch.phase, self.data.batch.p4_input_json = pending.phase, pending.p4_input_json
+        except BaseException as error:
+            projection.complete_owned(error)
+            raise
+        projection.complete_owned()
+        return outcome.value
+
+    async def prepare_terminal(self, prepared: PreparedP4Value, completion: TerminalServiceCompletion) -> ContinuationOwnerCommit:
+        from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+
+        if type(completion) is not TerminalServiceCompletion or self.preparation is not None or self.prepared is not None:
+            raise AuditIntegrityError("terminal P4 cannot replace its native completion or preparation")
+        completion.require_p4(self)
+        names = await _read_current_env_names(
+            self.runtime.materialization.service._advisor_checkpoint, self.selected.stack.logical.session_id
+        )
+        self.inventory = CurrentContinuationEnvInventory(self.inventory.running, self.inventory.selection, names)
+        members = prepared_p4_members(prepared, env_ref_names=names)
+        recorded = self.runtime.live.recorder.invocations
+        linked = self.runtime.live.recorder.visible_tool_events
+        for expected, row in zip(members.invocations, members.redacted_rows, strict=True):
+            actual = tuple(invocation for invocation in recorded if invocation.tool_call_id == expected.tool_call_id)
+            if len(actual) != 1 or actual[0] != expected:
+                raise AuditIntegrityError("terminal P4 redaction changed its actual recorded invocation")
+            if row.visible_event is not None:
+                previous = tuple(event for invocation, event in linked if invocation is actual[0])
+                if previous and previous != (row.visible_event,):
+                    raise AuditIntegrityError("terminal P4 redaction changed its actual visible event")
+                if not previous:
+                    self.runtime.live.recorder.record_visible_tool_event(actual[0], row.visible_event)
+        sql, projection = self.work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+        )
+        try:
+            outcome = await run_required_sql_finish_once(
+                sql,
+                self.authority.prepare_terminal_continuation_p4,
+                self.inventory.running,
+                completion=completion,
+                prepared=prepared,
+                env_ref_names=names,
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        self.preparation = outcome
+        self._retain_cancellations(outcome)
+        try:
+            self.work.coordinator.validate_continuation_sql_outcome(
+                ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            projection.complete_without_submission()
+            self.raise_after_publication(outcome.error)
+        if type(outcome) is not RequiredSQLReturned:
+            projection.complete_without_submission()
+            raise AuditIntegrityError("terminal P4 preparation returned another physical outcome")
+        projection.begin_projection()
+        try:
+            completion.require_p4(self)
+            if type(outcome.value) is not ContinuationOwnerCommit or outcome.value.running is not self.inventory.running:
+                raise AuditIntegrityError("terminal P4 preparation changed its actual current owner")
+            self.commit, self.prepared = outcome.value, prepared
+            self.writer_observation = P4WriterObservation(outcome.value, prepared)
+            self.terminal_completion = completion
         except BaseException as error:
             projection.complete_owned(error)
             raise

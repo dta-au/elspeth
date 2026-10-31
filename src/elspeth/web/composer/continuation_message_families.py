@@ -6,8 +6,8 @@ ordinary evidence reader retains its full current admission and journal check.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import FrozenInstanceError, dataclass
+from typing import TYPE_CHECKING, Any, Self
 
 from sqlalchemy import Connection, select
 
@@ -74,30 +74,199 @@ class _CompletedToolSource:
     original: AdmittedTurnEvidence
 
 
-@dataclass(frozen=True, slots=True)
 class _ToolResultFamilySource:
+    """Closed bindings to the original live result and message owners."""
+
+    __slots__ = (
+        "_sealed",
+        "call",
+        "message",
+        "recipe",
+        "result",
+    )
+
     recipe: ToolResultMessageRecipe
     call: _AdmittedToolCall
     result: ToolResult
     message: dict[str, Any]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        recipe: ToolResultMessageRecipe,
+        call: _AdmittedToolCall,
+        result: ToolResult,
+        message: dict[str, object],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        recipe: ToolResultMessageRecipe,
+        call: _AdmittedToolCall,
+        result: ToolResult,
+        message: dict[str, object],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_ToolResultFamilySource cannot be reinitialized")
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "result", result)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_ToolResultFamilySource bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_ToolResultFamilySource bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _ToolResultFamilySource or type(other) is not _ToolResultFamilySource:
+            return NotImplemented
+        return (
+            self.recipe,
+            self.call,
+            self.result,
+            self.message,
+        ) == (
+            other.recipe,
+            other.call,
+            other.result,
+            other.message,
+        )
 
 
-@dataclass(frozen=True, slots=True)
 class _ToolFeedbackFamilySource:
+    """Closed bindings to the original live feedback and message owners."""
+
+    __slots__ = (
+        "_sealed",
+        "call",
+        "invocation",
+        "message",
+        "outcome",
+        "recipe",
+    )
+
     recipe: ToolFeedbackMessageRecipe
     call: _AdmittedToolCall
     outcome: _ToolOutcome
     invocation: ComposerToolInvocation
     message: dict[str, Any]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        recipe: ToolFeedbackMessageRecipe,
+        call: _AdmittedToolCall,
+        outcome: _ToolOutcome,
+        invocation: ComposerToolInvocation,
+        message: dict[str, object],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        recipe: ToolFeedbackMessageRecipe,
+        call: _AdmittedToolCall,
+        outcome: _ToolOutcome,
+        invocation: ComposerToolInvocation,
+        message: dict[str, object],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_ToolFeedbackFamilySource cannot be reinitialized")
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "invocation", invocation)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_ToolFeedbackFamilySource bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_ToolFeedbackFamilySource bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _ToolFeedbackFamilySource or type(other) is not _ToolFeedbackFamilySource:
+            return NotImplemented
+        return (
+            self.recipe,
+            self.call,
+            self.outcome,
+            self.invocation,
+            self.message,
+        ) == (
+            other.recipe,
+            other.call,
+            other.outcome,
+            other.invocation,
+            other.message,
+        )
 
 
-@dataclass(frozen=True, slots=True)
 class _RestoredFamilyCohort:
-    """One reconstruction's DATA aliases; contains no current capability."""
+    """One reconstruction's original mutable message aliases; never a write grant."""
+
+    __slots__ = (
+        "_sealed",
+        "feedback",
+        "messages",
+        "sources",
+    )
 
     messages: tuple[dict[str, Any], ...]
     feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...]
     sources: tuple[_ToolFeedbackFamilySource, ...]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        messages: tuple[dict[str, Any], ...],
+        feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...],
+        sources: tuple[_ToolFeedbackFamilySource, ...],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        messages: tuple[dict[str, Any], ...],
+        feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...],
+        sources: tuple[_ToolFeedbackFamilySource, ...],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_RestoredFamilyCohort cannot be reinitialized")
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "feedback", feedback)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_RestoredFamilyCohort bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_RestoredFamilyCohort bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _RestoredFamilyCohort or type(other) is not _RestoredFamilyCohort:
+            return NotImplemented
+        return (
+            self.messages,
+            self.feedback,
+            self.sources,
+        ) == (
+            other.messages,
+            other.feedback,
+            other.sources,
+        )
 
 
 def _actual_chunk(conn: Connection, running: ComposerOperationRunning, reference: PrivateChunkRef) -> PrivateChunk:
@@ -210,7 +379,7 @@ def _read_current_sources(
                 data = RestoredBatchData(completed.batch, completed.accumulator, completed.calls)
             else:
                 raise AuditIntegrityError("message family source has no implemented selected batch payload")
-        elif accumulator.reference.codec == "composer.applied-p4-batch.v1":
+        elif accumulator.reference.codec == "composer.applied-p4-batch.v2":
             require_selected_applied_batch_chunk(accumulator, evidence=admitted, env_ref_names=inventory.names)
             if graph is None:
                 raise AuditIntegrityError("message family source lost its selected applied graph")

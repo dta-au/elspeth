@@ -238,7 +238,7 @@ def validate_continuation_structure_data_on_connection(
         if (
             type(top) is ToolBatchFrame
             and top.phase == "result_retained"
-            and top.accumulator.codec == "composer.applied-p4-batch.v1"
+            and top.accumulator.codec == "composer.applied-p4-batch.v2"
             and set(ambiguous) == set(tool_unresolved)
             and not root.pending_owner_results
             and not root.pending_settlement_ids
@@ -653,7 +653,7 @@ def next_continuation_action_policy(
             or effect_key in top.settled_effect_ids
         ):
             raise AuditIntegrityError("next allowance cannot retry a prepared or unknown business effect")
-    elif top.phase == "result_retained" and top.accumulator.codec == "composer.applied-p4-batch.v1":
+    elif top.phase == "result_retained" and top.accumulator.codec == "composer.applied-p4-batch.v2":
         if root.pending_owner_results or effect_key not in top.settled_effect_ids:
             raise AuditIntegrityError("next allowance lost its actual settled P4 application cut")
     else:

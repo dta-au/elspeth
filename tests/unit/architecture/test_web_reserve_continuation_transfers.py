@@ -39,7 +39,12 @@ def _changed(path: str, before: str, after: str) -> tuple[_Source, ...]:
 
 @pytest.mark.parametrize(
     "check",
-    [helper.iteration_local_transfers, helper.attachment_local_transfers, helper.initialization_local_transfers],
+    [
+        helper.iteration_local_transfers,
+        helper.attachment_local_transfers,
+        helper.initialization_local_transfers,
+        helper.closed_source_record_transfers,
+    ],
 )
 def test_actual_continuation_transfer_receipts_belong_to_supplied_source(check):
     units = _units()
@@ -54,6 +59,57 @@ def test_actual_continuation_transfer_receipts_belong_to_supplied_source(check):
     assert not detached_failures, detached_failures
     for key in helper.SITE_KEYS:
         assert not receipt[key] & detached_receipt[key], key
+
+
+def test_closed_source_record_receipt_keeps_generic_reflector_and_plain_class_refusals():
+    units = _units()
+    failures, receipt = helper.closed_source_record_transfers(units)
+    assert not failures and receipt, failures
+    nodes = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+    raw_writes = [nodes[site] for site in receipt["constructor_calls"] if ast.unparse(nodes[site].func) == "object.__setattr__"]
+    assert raw_writes and all(helper.receiver.HARMFUL_REFLECTOR(node) for node in raw_writes)
+    for key in helper.CLOSED_SOURCE_RECORDS:
+        group, name = key.split(".", 1)
+        unit = next(unit for unit in units if unit.path == helper.RECORD_PATHS[group])
+        assert not helper.receiver.plain_class(helper._find(unit.tree, name))
+
+
+@pytest.mark.parametrize("fault", ("copy", "reinit", "default", "equality", "successor", "allocator"))
+def test_closed_source_record_refuses_changed_transfer_after_only_its_complete_source_is_rebound(monkeypatch, fault):
+    units = _units()
+    failures, receipt = helper.closed_source_record_transfers(units)
+    assert not failures and receipt, failures
+    path = helper.EVIDENCE_GRAPH
+    original = next(unit for unit in units if unit.path == path)
+    changed = _parse(path, original.source)
+    cls = helper._find(changed.tree, "RestoredTurnEvidence")
+    methods = {node.name: node for node in cls.body if isinstance(node, ast.FunctionDef)}
+    if fault == "copy":
+        writes = [
+            node
+            for node in ast.walk(methods["__init__"])
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "object.__setattr__"
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "messages"
+        ]
+        assert len(writes) == 1
+        writes[0].args[2] = ast.parse("list(messages)", mode="eval").body
+    elif fault == "reinit":
+        methods["__init__"].body[0].test = ast.Constant(value=False)
+    elif fault == "default":
+        methods["__init__"].args.defaults[-1] = ast.Constant(value="foreign")
+    elif fault == "equality":
+        methods["__eq__"].body[0].test = ast.Constant(value=False)
+    elif fault == "successor":
+        methods["with_selected_dispatch"].body[0].value.args[1] = ast.List(elts=[], ctx=ast.Load())
+    else:
+        methods["__new__"].body[0].value.args[0] = ast.Name(id="foreign", ctx=ast.Load())
+    ast.fix_missing_locations(changed.tree)
+    monkeypatch.setitem(helper.OWNER_TEMPLATES, "graph.RestoredTurnEvidence", ast.unparse(cls))
+    failures, refused = helper.closed_source_record_transfers(tuple(changed if unit.path == path else unit for unit in units))
+    assert failures and not refused
+    assert not any("complete declaration/binding changed" in failure for failure in failures), failures
 
 
 def test_iteration_receipt_closes_only_the_actual_publisher_nominal_use():
@@ -519,8 +575,8 @@ def test_continuation_structural_transfer_refuses_after_rebinding_only_changed_d
         (
             helper.ATTACHMENT_APPLICATION,
             "require_attachment_projection",
-            "if encode_application_graph(new, env_ref_names=env_ref_names) != expected_json:",
-            "if encode_application_graph(new, env_ref_names=env_ref_names) == expected_json:",
+            "if encode_application_graph(new, env_ref_names=env_ref_names, recorder_source=recorder_source) != expected_json:",
+            "if encode_application_graph(new, env_ref_names=env_ref_names, recorder_source=recorder_source) == expected_json:",
             "complete successor graph comparison changed",
         ),
         (

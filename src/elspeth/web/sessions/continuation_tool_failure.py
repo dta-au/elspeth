@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
     from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
+    from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application, StoredTerminalP4Preparation
     from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -88,7 +89,7 @@ class RetainedToolFailureSource:
 
 @dataclass(frozen=True, slots=True)
 class ContinuationToolFailureRead:
-    source: RetainedToolFailureSource | None
+    source: RetainedToolFailureSource | StoredTerminalP4Preparation | StoredTerminalP4Application | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,7 +266,15 @@ def _read_tool_failure_selection_on_connection(
 
 def read_tool_failure_source_on_connection(
     conn: Connection, running: ComposerOperationRunning, *, env_ref_names: frozenset[str]
-) -> RetainedToolFailureSource | None:
+) -> RetainedToolFailureSource | StoredTerminalP4Preparation | StoredTerminalP4Application | None:
+    from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
+
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    terminal = read_terminal_p4_source_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
+    )
+    if terminal is not None:
+        return terminal
     return _read_tool_failure_selection_on_connection(conn, running, env_ref_names=env_ref_names).source
 
 
@@ -898,7 +907,9 @@ async def fail_continuation_tool_operation(
         physical_ticket = sql
         try:
             actual = await run_required_sql_finish_once(sql, write)
-            no_submission = required_work.validate_terminal_failure_sql_outcome(ticket=sql, actual_outcome=actual)
+            no_submission = required_work.validate_terminal_failure_sql_outcome(
+                ticket=sql, actual_outcome=actual, expected_sql_attempt_ordinal=slot
+            )
         except BaseException as error:
             failure = unknown("failed terminal has no exact joined physical handoff", error)
             raise failure from failure.__cause__

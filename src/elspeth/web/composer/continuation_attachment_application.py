@@ -11,7 +11,11 @@ from dataclasses import replace
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation import ContinuationFrameStack
-from elspeth.web.composer.continuation_application_graph import ApplicationGraph, encode_application_graph
+from elspeth.web.composer.continuation_application_graph import (
+    ApplicationGraph,
+    admit_application_recorder_source,
+    encode_application_graph,
+)
 from elspeth.web.composer.continuation_attachment_application_values import AttachmentApplicationData
 from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, RestoredPreparedBatchData, encode_restored_prepared_batch_data
@@ -213,8 +217,9 @@ def require_attachment_projection(
         selected_audit=None,
         selected_dialect=None,
     )
-    expected_json = encode_application_graph(expected_graph, env_ref_names=env_ref_names)
-    if encode_application_graph(new, env_ref_names=env_ref_names) != expected_json:
+    recorder_source = admit_application_recorder_source(after.recorder_chunk, env_ref_names=env_ref_names)
+    expected_json = encode_application_graph(expected_graph, env_ref_names=env_ref_names, recorder_source=recorder_source)
+    if encode_application_graph(new, env_ref_names=env_ref_names, recorder_source=recorder_source) != expected_json:
         raise AuditIntegrityError("attachment projection changed its complete batch/recorder/history identity graph")
     expected = _register_page(before_snapshot, call_id=call.tool_call.id, admitted=admitted)
     message = attachment_result_message(call=call.tool_call, result=nominal)

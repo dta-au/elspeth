@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy import Connection, select
@@ -10,7 +11,11 @@ from sqlalchemy import Connection, select
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.composer.continuation import ComposeFrame, PrivateChunkRef, ToolBatchFrame
-from elspeth.web.composer.continuation_application_graph import ApplicationGraph, encode_application_graph
+from elspeth.web.composer.continuation_application_graph import (
+    ApplicationGraph,
+    admit_application_recorder_source,
+    encode_application_graph,
+)
 from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
 from elspeth.web.composer.continuation_codec import (
     PrivateChunk,
@@ -54,6 +59,9 @@ from elspeth.web.sessions.models import composer_continuation_checkpoints_table 
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 
+if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_terminal_p4_data import TerminalP4Document
+
 
 @dataclass(frozen=True, slots=True)
 class StoredP4Application:
@@ -62,20 +70,44 @@ class StoredP4Application:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredTerminalP4Preparation:
+    """A retained terminal input, with no assertion of physical completion."""
+
+    input_document: TerminalP4Document
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTerminalP4Application:
+    """Closed terminal DATA; never a portable successor or write witness."""
+
+    input_document: TerminalP4Document
+    result_document: TerminalP4Document
+    env_ref_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedContinuationP4:
     """The actual physical owner's two outputs, published only after commit."""
 
     audit_outcome: AuditOutcome
-    application: StoredP4Application
+    application: StoredP4Application | StoredTerminalP4Application
 
 
 def apply_committing_p4_application_on_connection(
     conn: Connection, commit: ContinuationOwnerCommit, *, env_ref_names: frozenset[str]
-) -> StoredP4Application:
+) -> StoredP4Application | StoredTerminalP4Application:
     """Finish the real newly retained receipt inside its existing transaction."""
+    from elspeth.web.sessions.continuation_p4 import read_terminal_p4_source_on_connection
     from elspeth.web.sessions.continuation_selection import load_private_chunks
 
     running = commit.running
+    terminal = read_terminal_p4_source_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, env_ref_names=env_ref_names
+    )
+    if terminal is not None:
+        if type(terminal) is not StoredTerminalP4Application:
+            raise AuditIntegrityError("terminal P4 application has no actual retained result")
+        return terminal
     stored = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
     root = decode_continuation_snapshot(stored.payload_json)
     selected = SelectedContinuationState(
@@ -327,6 +359,7 @@ def require_p4_application_journal_data_on_connection(
             source_chunks=(original_audit, *admitted.sources.chunks),
         )
         before_snapshot = before_admitted.snapshot
+        original_recorder_source = admit_application_recorder_source(before_admitted.recorder_chunk, env_ref_names=env_ref_names)
         cut = graph.cuts[index]
         before_graph = ApplicationGraph(cut.data, cut.effects_before, cut.recorder_before, graph.cuts[:index])
         retained_graph = (
@@ -337,7 +370,8 @@ def require_p4_application_journal_data_on_connection(
         if (
             before_snapshot.logical != entry.logical
             or before_snapshot.actor_user_id != snapshot.actor_user_id
-            or retained_graph != encode_application_graph(before_graph, env_ref_names=env_ref_names)
+            or retained_graph
+            != encode_application_graph(before_graph, env_ref_names=env_ref_names, recorder_source=original_recorder_source)
             or before_snapshot.effects != retained_effects(cut.effects_before)
             or before_snapshot.recorder != old_compose[0].audit_buffer
             or before_admitted.recorder_chunk != encode_recorder_snapshot(cut.recorder_before)

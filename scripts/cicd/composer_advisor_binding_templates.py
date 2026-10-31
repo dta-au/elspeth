@@ -4,6 +4,16 @@ These are syntax contracts, not hashes or executable substitutes. Compare ASTs
 with locations/comments excluded; re-review intentional source changes.
 """
 
+CLOSED_SOURCE_RECORDS = (
+    "graph.RestoredTurnEvidence",
+    "families._ToolResultFamilySource",
+    "families._ToolFeedbackFamilySource",
+    "families._RestoredFamilyCohort",
+    "producers._FeedbackMessageProvenance",
+    "producers.ContinuationToolMessagePublication",
+    "producers.CurrentMessageProduction",
+)
+
 TEMPLATES: dict[str, str] = {
     "batch.run_tool_batch": r'''async def run_tool_batch(
     *,
@@ -136,28 +146,11 @@ TEMPLATES: dict[str, str] = {
     )
 
     # Append the assistant message (with tool_calls metadata)
-    from elspeth.web.composer.provider_thinking import attach_provider_thinking
+    from elspeth.web.composer.continuation_message_family_builders import native_assistant_message
 
-    llm_messages.append(
-        attach_provider_thinking(
-            {
-                "role": "assistant",
-                "content": assistant_message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in assistant_tool_calls
-                ],
-            },
-            completion.provider_metadata.thinking_blocks,
-        )
-    )
+    assistant_wire = native_assistant_message(completion)
+    _register_continuation_assistant_message(ctx, call_model, assistant_wire)
+    llm_messages.append(assistant_wire)
 
     # Execute each tool call, tracking whether this turn has
     # budgeted discovery or mutation work. Advisor-only turns are
@@ -176,6 +169,7 @@ TEMPLATES: dict[str, str] = {
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
     advisor_failure: Exception | None = None
+    service_failure: _ServiceFailure | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
@@ -195,6 +189,7 @@ TEMPLATES: dict[str, str] = {
     batch.plugin_crash = plugin_crash
     batch.plugin_crash_cause = plugin_crash_cause
     batch.advisor_failure = advisor_failure
+    batch.service_failure = service_failure
     batch.advisor_compose_timeout = advisor_compose_timeout
     batch.pre_state_id = pre_state_id
     batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -206,8 +201,7 @@ TEMPLATES: dict[str, str] = {
     batch.assistant_message_index = assistant_message_index
     batch.mixed_abandonment_batch = mixed_abandonment_batch
     batch.provider_model_version = provider_model_version
-    batch.phase = "call_ready" if assistant_tool_calls else "dispatch_ready"
-''',
+    batch.phase = "call_ready" if assistant_tool_calls else "dispatch_ready"''',
     "batch._prepare_continuation_call_live": r'''async def _prepare_continuation_call_live(
     *,
     call_model: _CallModelOutcome,
@@ -231,6 +225,7 @@ TEMPLATES: dict[str, str] = {
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
     advisor_compose_timeout = batch.advisor_compose_timeout
     pre_state_id = batch.pre_state_id
     decoded_args_by_call_id = batch.decoded_args_by_call_id
@@ -274,6 +269,8 @@ TEMPLATES: dict[str, str] = {
                 decoded_args_by_call_id[tool_call.id] = unknown_audit_arguments
                 _replace_llm_tool_call_arguments(
                     llm_messages,
+                    ctx=ctx,
+                    call_model=call_model,
                     tool_call_id=tool_call.id,
                     arguments=unknown_audit_arguments,
                     dialect=ctx.tool_contract_dialect,
@@ -391,6 +388,8 @@ TEMPLATES: dict[str, str] = {
                     # tool-call contract cannot replay malformed JSON arguments.
                     _replace_llm_tool_call_arguments(
                         llm_messages,
+                        ctx=ctx,
+                        call_model=call_model,
                         tool_call_id=tool_call.id,
                         arguments=replay_arguments,
                         dialect=ctx.tool_contract_dialect,
@@ -545,6 +544,8 @@ TEMPLATES: dict[str, str] = {
                     decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
                     _replace_llm_tool_call_arguments(
                         llm_messages,
+                        ctx=ctx,
+                        call_model=call_model,
                         tool_call_id=tool_call.id,
                         arguments=audit_arguments,
                         dialect=ctx.tool_contract_dialect,
@@ -595,7 +596,7 @@ TEMPLATES: dict[str, str] = {
                 call_wire_facts.wire_conformant = decoded.wire_conformant
             else:
                 arguments = cast(dict[str, Any], decoded_arguments)
-            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call.id)
+            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call.id, ctx=ctx, call_model=call_model)
             try:
                 private_arguments_canonical = canonical_json(arguments)
                 if tool_name == "set_pipeline":
@@ -635,6 +636,8 @@ TEMPLATES: dict[str, str] = {
             if audit_arguments is not arguments:
                 _replace_llm_tool_call_arguments(
                     llm_messages,
+                    ctx=ctx,
+                    call_model=call_model,
                     tool_call_id=tool_call.id,
                     arguments=audit_arguments,
                     dialect=ctx.tool_contract_dialect,
@@ -702,6 +705,7 @@ TEMPLATES: dict[str, str] = {
         batch.plugin_crash = plugin_crash
         batch.plugin_crash_cause = plugin_crash_cause
         batch.advisor_failure = advisor_failure
+        batch.service_failure = service_failure
         batch.advisor_compose_timeout = advisor_compose_timeout
         batch.pre_state_id = pre_state_id
         batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -718,8 +722,7 @@ TEMPLATES: dict[str, str] = {
     if len(tool_outcomes) != before:
         raise AuditIntegrityError("tool preparation produced more than one actual outcome")
     batch.stop_issued_batch = True
-    return "stop"
-''',
+    return "stop"''',
     "batch._execute_continuation_call_live": r'''async def _execute_continuation_call_live(
     *,
     call_model: _CallModelOutcome,
@@ -728,9 +731,30 @@ TEMPLATES: dict[str, str] = {
     llm_messages: list[dict[str, Any]],
     batch: ContinuationBatchState,
     call: ContinuationCallState,
+    retained_attachment: AttachmentResultCheckpoint | None = None,
+    failure_custody: ContinuationToolFailureCustody | None = None,
 ) -> Literal["applied"]:
     """Execute the original suffix with the actual caller's revocation owner."""
+    if retained_attachment is not None:
+        from elspeth.web.sessions.continuation_attachment_result import AttachmentResultCheckpoint
+
+        if (
+            type(retained_attachment) is not AttachmentResultCheckpoint
+            or not retained_attachment.history_applied
+            or retained_attachment.prepared.batch is not batch
+            or retained_attachment.prepared.accumulator is not acc
+            or batch.current_call is not call
+            or call.tool_name not in ("read_attachment", "get_blob_content")
+            or retained_attachment.result.updated_state is not call.pre_state
+            or call_model.completion.tool_batch.calls != retained_attachment.prepared.calls
+        ):
+            raise AuditIntegrityError("retained attachment execution changed its actual selected read graph")
     recorder = ctx.recorder
+    observation = None if failure_custody is None else failure_custody.observation
+    if failure_custody is not None and observation is not None:
+        if call.audit is None or failure_custody.batch is not batch or failure_custody.call is not call:
+            raise AuditIntegrityError("issued failure custody changed its actual batch/call")
+        observation.require(recorder, call.audit)
     anti_anchor = ctx.anti_anchor
     discovery_cache = ctx.discovery_cache
     runtime_preflight_cache = ctx.runtime_preflight_cache
@@ -756,6 +780,7 @@ TEMPLATES: dict[str, str] = {
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
     advisor_compose_timeout = batch.advisor_compose_timeout
     pre_state_id = batch.pre_state_id
     decoded_args_by_call_id = batch.decoded_args_by_call_id
@@ -775,6 +800,25 @@ TEMPLATES: dict[str, str] = {
     audit = call.audit
     before = len(tool_outcomes)
     ran_to_end = False
+    from elspeth.web.composer.continuation_prompt_producers import ContinuationToolMessagePublication
+
+    publication = None
+    if ctx.message_producers is not None:
+        ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
+        publication = ContinuationToolMessagePublication(
+            ctx.message_producers, call_model.completion, batch, call, recorder, llm_messages, ctx.policy_catalog
+        )
+
+    def _append_issued_feedback(serialized: str) -> None:
+        message = {
+            "role": "tool",
+            "tool_call_id": call.tool_call.id,
+            "content": serialized,
+            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(serialized),
+        }
+        if publication is not None:
+            publication.register_feedback(serialized=serialized, message=message)
+        llm_messages.append(message)
 
     def _append_tool_outcome(
         *,
@@ -795,6 +839,44 @@ TEMPLATES: dict[str, str] = {
             error_message=error_message,
             post_version=post_version,
         )
+
+    def _complete_service_failure(original: _ServiceFailure) -> None:
+        nonlocal service_failure, all_cache_hits
+        from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+        if failure_custody is not None:
+            failure_custody.observe_primary(original)
+            if (
+                observation is None
+                or not observation.execution_failed
+                or observation.returned
+                or failure_custody.errors
+                or failure_custody.original is not original
+            ):
+                raise failure_custody.failure(original)
+        payload = {"success": False, "status": "SERVICE_FAILURE", "reason": "service_failure"}
+        try:
+            invocation = finish_success(audit, result_payload=payload, version_after=state.version)
+            if observation is None:
+                recorder.record(invocation)
+            else:
+                recorder.record_with_failure_observation(invocation, observation)
+            _append_tool_outcome(response=payload, error_class=None, error_category=None, error_message=None, post_version=state.version)
+            if failure_custody is not None:
+                failure_custody.promote_completed_service_failure(original)
+        except BaseException as secondary:
+            if failure_custody is not None:
+                combined = failure_custody.failure(secondary)
+                if combined is secondary:
+                    raise
+                raise combined from combined.__cause__
+            combined = combine_failure_objects(original, secondary)
+            if combined is secondary:
+                raise
+            raise combined from combined.__cause__
+        service_failure = original
+        batch.service_failure = original
+        all_cache_hits = False
 
     try:
         for tool_call in (call.tool_call,):
@@ -856,6 +938,7 @@ TEMPLATES: dict[str, str] = {
                         ),
                         audit=audit,
                         recorder=recorder,
+                        failure_observation=observation,
                     )
                     try:
                         cached_admitted = (
@@ -908,16 +991,20 @@ TEMPLATES: dict[str, str] = {
                     # gained schema knowledge but did not change state.
                     # The §7.7 anchor is broken only by mutation
                     # progress, so tracker stays untouched here.
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": cached_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
-                                cached_admitted if cached_admitted is not None else cached_result, cached_json
-                            ),
-                        }
+                    cached_message = tool_result_message(
+                        call_id=tool_call.id,
+                        result=cached_admitted if cached_admitted is not None else cached_result,
+                        serialized=cached_json,
                     )
+                    if ctx.message_producers is not None and tool_name == "get_plugin_schema":
+                        ctx.message_producers.require_context(
+                            session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id
+                        )
+                        schema_admitted = (
+                            cached_admitted if cached_admitted is not None else admit_discovery_result(tool_name, cached_result)
+                        )
+                        ctx.message_producers.register_schema_message(call=tool_call, admitted=schema_admitted, message=cached_message)
+                    llm_messages.append(cached_message)
                     continue
 
             all_cache_hits = False
@@ -1045,7 +1132,7 @@ TEMPLATES: dict[str, str] = {
                     candidate = finalization.candidate
                     if finalization.changed:
                         audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
-                        audit = rebind_dispatch_arguments(audit, audit_arguments)
+                        audit = rebind_dispatch_arguments(audit, audit_arguments, failure_observation=observation)
                         decoded_args_by_call_id[tool_call.id] = audit_arguments
                         transcript_arguments = (
                             redact_tool_call_arguments(tool_name, arguments, telemetry=ctx.redaction_telemetry)
@@ -1054,6 +1141,8 @@ TEMPLATES: dict[str, str] = {
                         )
                         _replace_llm_tool_call_arguments(
                             llm_messages,
+                            ctx=ctx,
+                            call_model=call_model,
                             tool_call_id=tool_call.id,
                             arguments=transcript_arguments,
                             dialect=ctx.tool_contract_dialect,
@@ -1152,7 +1241,7 @@ TEMPLATES: dict[str, str] = {
                             candidate = finalization.candidate
                             if finalization.changed:
                                 audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
-                                audit = rebind_dispatch_arguments(audit, audit_arguments)
+                                audit = rebind_dispatch_arguments(audit, audit_arguments, failure_observation=observation)
                                 decoded_args_by_call_id[tool_call.id] = audit_arguments
                                 redacted_arguments = redact_tool_call_arguments(
                                     tool_name,
@@ -1161,6 +1250,8 @@ TEMPLATES: dict[str, str] = {
                                 )
                                 _replace_llm_tool_call_arguments(
                                     llm_messages,
+                                    ctx=ctx,
+                                    call_model=call_model,
                                     tool_call_id=tool_call.id,
                                     arguments=redacted_arguments if candidate.prepared_inline_blob is not None else audit_arguments,
                                     dialect=ctx.tool_contract_dialect,
@@ -1188,7 +1279,7 @@ TEMPLATES: dict[str, str] = {
                                 # From this point forward every authority-bearing
                                 # and externally visible copy uses source.blob_id.
                                 arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
-                                audit = rebind_dispatch_arguments(audit, arguments)
+                                audit = rebind_dispatch_arguments(audit, arguments, failure_observation=observation)
                                 decoded_args_by_call_id[tool_call.id] = arguments
                                 # Authority retains the exact review draft. Only its
                                 # redacted projection belongs in provider history.
@@ -1199,6 +1290,8 @@ TEMPLATES: dict[str, str] = {
                                 )
                                 _replace_llm_tool_call_arguments(
                                     llm_messages,
+                                    ctx=ctx,
+                                    call_model=call_model,
                                     tool_call_id=tool_call.id,
                                     arguments=redacted_arguments,
                                     dialect=ctx.tool_contract_dialect,
@@ -1432,6 +1525,7 @@ TEMPLATES: dict[str, str] = {
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     else:
                         if type(ctx.session_operation_context) is not SessionOperationContext:
@@ -1458,6 +1552,7 @@ TEMPLATES: dict[str, str] = {
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     proposals_this_turn += 1
                     proposal_result = ToolResult(
@@ -1518,7 +1613,12 @@ TEMPLATES: dict[str, str] = {
                 # pre-proposal work. All fall through to the canonical
                 # dispatch/outcome path below.
 
-            await _await_started_tool_stage(emit_progress(progress, tool_started_progress_event(tool_name)), audit=audit, recorder=recorder)
+            await _await_started_tool_stage(
+                emit_progress(progress, tool_started_progress_event(tool_name)),
+                audit=audit,
+                recorder=recorder,
+                failure_observation=observation,
+            )
 
             # Advisor escape-hatch interception. The request_advisor_hint
             # tool is intercepted here BEFORE execute_tool() because the
@@ -1574,19 +1674,20 @@ TEMPLATES: dict[str, str] = {
                     )
                     anti_anchor.record_failure(tool_name, audit.arguments_hash, category=advisor_arg_error.category)
                     tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_rejection_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
                 budget = ctx.advisor_max_calls_per_compose
-                if advisor_calls_used >= budget:
+                if batch.manual_advisor_allowance is None:
+                    batch.manual_advisor_allowance = ManualAdvisorAllowance(limit=budget, used=advisor_calls_used)
+                allowance = batch.manual_advisor_allowance
+                if type(allowance) is not ManualAdvisorAllowance:
+                    raise AuditIntegrityError("Manual Advisor admission lost its nominal allowance owner")
+                if allowance.limit != budget:
+                    raise AuditIntegrityError("Manual Advisor allowance changed during its issued batch")
+                advisor_calls_used = allowance.used
+                if allowance.available <= 0:
                     budget_payload = {
                         "status": "BUDGET_EXHAUSTED",
                         "budget_used": advisor_calls_used,
@@ -1618,14 +1719,7 @@ TEMPLATES: dict[str, str] = {
                     # the LLM repeating an identical request, it's the
                     # operator's policy refusing further hints.
                     tool_feedback_json = json.dumps(advisor_feedback_payload(budget_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
@@ -1679,14 +1773,7 @@ TEMPLATES: dict[str, str] = {
                         post_version=state.version,
                     )
                     tool_feedback_json = json.dumps(advisor_feedback_payload(deadline_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
                     continue
 
@@ -1694,44 +1781,49 @@ TEMPLATES: dict[str, str] = {
                 effective_advisor_timeout = min(advisor_timeout, remaining)
                 advisor_deadline_limited = remaining <= advisor_timeout
 
-                # F2: consume budget BEFORE the outbound call, not after.
-                # The cost guard's purpose is to bound outbound LiteLLM
-                # calls regardless of outcome. Counting only successes
-                # would let a flaky provider rack up unlimited failed
-                # outbound calls until anti-anchor or the discovery-
-                # turn limit fired. ARG_ERROR (above) and pre-call compose
-                # timeout (above) do NOT consume advisor budget because no
-                # outbound advisor call is made.
-                advisor_calls_used += 1
+                # Reserve before awaiting preparation. Commit at the physical
+                # dispatch callback, irrespective of provider result or later
+                # audit-buffer failure. Release every undispatched exit before
+                # the outer timeout/failure classification reads the allowance.
+                reservation = allowance.reserve()
+                if reservation is None:
+                    raise AuditIntegrityError("Manual Advisor admission lost its reserved allowance")
 
                 abandonment_context = None
                 try:
-                    if ctx.turn_evidence is not None:
-                        ctx.turn_evidence.transcript.observe_messages(llm_messages)
-                    if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
-                        if ctx.turn_evidence is None or user_message_content is None:
-                            raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
-                        abandonment_context = ctx.turn_evidence.abandonment_context(
-                            request=user_message_content,
-                            current_state=state,
-                            plugin_snapshot=ctx.plugin_snapshot,
-                            messages=llm_messages,
-                        )
-                    advisor_outcome = await _await_started_tool_stage(
-                        ctx.advisor_checkpoint._call_advisor_for_tool(
-                            advisor_arg_error,
+                    try:
+                        if ctx.turn_evidence is not None:
+                            ctx.turn_evidence.transcript.observe_messages(llm_messages)
+                        if advisor_arg_error.trigger == ADVISOR_TRIGGER_CANNOT_COMPLETE:
+                            if ctx.turn_evidence is None or user_message_content is None:
+                                raise AuditIntegrityError("Abandonment review requires current request-owned evidence")
+                            abandonment_context = ctx.turn_evidence.abandonment_context(
+                                request=user_message_content,
+                                current_state=state,
+                                plugin_snapshot=ctx.plugin_snapshot,
+                                messages=llm_messages,
+                            )
+                        advisor_outcome = await _await_started_tool_stage(
+                            ctx.advisor_checkpoint._call_advisor_for_tool(
+                                advisor_arg_error,
+                                recorder=recorder,
+                                timeout=effective_advisor_timeout,
+                                provider_owner=ctx.provider_owner,
+                                abandonment_context=abandonment_context,
+                                advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
+                                current_state=state,
+                                session_id=ctx.session_id,
+                                session_operation_context=ctx.session_operation_context,
+                                on_provider_dispatch=reservation.dispatch,
+                                failure_observation=observation,
+                            ),
+                            audit=audit,
                             recorder=recorder,
-                            timeout=effective_advisor_timeout,
-                            provider_owner=ctx.provider_owner,
-                            abandonment_context=abandonment_context,
-                            advisor_transcript=ctx.turn_evidence.transcript.snapshot() if ctx.turn_evidence is not None else None,
-                            current_state=state,
-                            session_id=ctx.session_id,
-                            session_operation_context=ctx.session_operation_context,
-                        ),
-                        audit=audit,
-                        recorder=recorder,
-                    )
+                            failure_observation=observation,
+                        )
+                    finally:
+                        reservation.close()
+                        advisor_calls_used = allowance.used
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     # Lifecycle exceptions: do not absorb. Propagate so
                     # cancellation and shutdown work normally; the inner
@@ -1763,6 +1855,8 @@ TEMPLATES: dict[str, str] = {
                             post_version=state.version,
                         )
                         advisor_compose_timeout = "in_flight"
+                        if failure_custody is not None:
+                            failure_custody.consume_nonprimary()
                         break
                     # Advisor-specific timeout with compose budget still
                     # remaining: return structured tool feedback so the
@@ -1790,15 +1884,10 @@ TEMPLATES: dict[str, str] = {
                     )
                     anti_anchor.record_failure(tool_name, audit.arguments_hash)
                     tool_feedback_json = json.dumps(advisor_feedback_payload(advisor_error_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
+                    if failure_custody is not None:
+                        failure_custody.consume_nonprimary()
                     continue
 
                 except Exception as advisor_context_error:
@@ -1806,9 +1895,8 @@ TEMPLATES: dict[str, str] = {
 
                 if type(advisor_outcome) is _AdvisorProviderFailure:
                     # The service owns the Tier-3 provider taxonomy and returns
-                    # this explicit recoverable outcome. Budget was already
-                    # consumed above: the outbound attempt counts whether or not
-                    # it produced guidance.
+                    # this explicit recoverable outcome. Only an actual
+                    # dispatch spends the reservation, regardless of guidance.
                     # Advisor failure IS counted for §7.7 anchor
                     # tracking — repeated identical failed advisor
                     # calls indicate the LLM is spamming a broken
@@ -1863,15 +1951,10 @@ TEMPLATES: dict[str, str] = {
                         )
                         anti_anchor.record_failure(tool_name, audit.arguments_hash)
                         tool_feedback_json = json.dumps(advisor_feedback_payload(request_rejection_payload))
-                    llm_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_feedback_json,
-                            PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                        }
-                    )
+                    _append_issued_feedback(tool_feedback_json)
                     turn_has_discovery = True
+                    if failure_custody is not None:
+                        failure_custody.consume_nonprimary()
                     continue
 
                 if type(advisor_outcome) is _AdvisorFirstPartyFailure:
@@ -1880,28 +1963,79 @@ TEMPLATES: dict[str, str] = {
                     # driver re-raise this exact exception object after the tool
                     # row has been published.
                     first_party_exc = advisor_outcome.original_exc
+                    if failure_custody is not None:
+                        failure_custody.observe_primary(first_party_exc)
+                        if failure_custody.errors or isinstance(first_party_exc, BaseExceptionGroup):
+                            raise failure_custody.failure(first_party_exc)
+                    if isinstance(first_party_exc, _ServiceFailure):
+                        _complete_service_failure(first_party_exc)
+                        break
+                    if isinstance(first_party_exc, ComposerContextUnsupported):
+                        context_payload = {
+                            "success": False,
+                            "outbound_call_made": False,
+                            "error_type": "composer_context_unsupported",
+                            "failure_code": "context_unsupported",
+                            "reason": first_party_exc.reason,
+                            "detail": first_party_exc.to_payload()["detail"],
+                            "budget_used": advisor_calls_used,
+                            "budget_remaining": budget - advisor_calls_used,
+                        }
+                        context_invocation = finish_success(audit, result_payload=context_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(context_invocation)
+                        else:
+                            recorder.record_with_failure_observation(context_invocation, observation)
+                        _append_tool_outcome(
+                            response=context_payload,
+                            error_class=None,
+                            error_category=None,
+                            error_message=None,
+                            post_version=state.version,
+                        )
+                        advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure", original=first_party_exc, refusal="context_unsupported", allowance_limit=budget
+                            )
+                        break
                     if isinstance(first_party_exc, CommonProviderCostRefused):
-                        refusal_payload = {
+                        cost_refusal_payload = {
                             "success": False,
                             "status": "PROVIDER_POLICY_REFUSED",
                             "code": first_party_exc.code,
                             "outbound_call_made": first_party_exc.call_id is not None,
                         }
-                        recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                        cost_invocation = finish_success(audit, result_payload=cost_refusal_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(cost_invocation)
+                        else:
+                            recorder.record_with_failure_observation(cost_invocation, observation)
                         _append_tool_outcome(
-                            response=refusal_payload,
+                            response=cost_refusal_payload,
                             error_class=None,
                             error_category=None,
                             error_message=None,
                             post_version=state.version,
                         )
                         advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure",
+                                original=first_party_exc,
+                                refusal="provider_cost_refused",
+                                provider_call_id=first_party_exc.call_id,
+                            )
                         break
                     if isinstance(first_party_exc, PromptGuardRefused):
                         # The tool completed with a semantic refusal. It is neither
                         # provider-outage feedback nor a plugin implementation fault.
                         refusal_payload = {"success": False, "outbound_call_made": False, **first_party_exc.to_payload()}
-                        recorder.record(finish_success(audit, result_payload=refusal_payload, version_after=state.version))
+                        guard_invocation = finish_success(audit, result_payload=refusal_payload, version_after=state.version)
+                        if observation is None:
+                            recorder.record(guard_invocation)
+                        else:
+                            recorder.record_with_failure_observation(guard_invocation, observation)
                         _append_tool_outcome(
                             response=refusal_payload,
                             error_class=None,
@@ -1910,8 +2044,16 @@ TEMPLATES: dict[str, str] = {
                             post_version=state.version,
                         )
                         advisor_failure = first_party_exc
+                        if failure_custody is not None:
+                            failure_custody.promote_completed_failure(
+                                kind="advisor_failure", original=first_party_exc, refusal="prompt_guard_refused"
+                            )
                         break
-                    recorder.record(finish_plugin_crash(audit, exc=first_party_exc))
+                    advisor_invocation = finish_plugin_crash(audit, exc=first_party_exc)
+                    if observation is None:
+                        recorder.record(advisor_invocation)
+                    else:
+                        recorder.record_with_failure_observation(advisor_invocation, observation)
                     _append_tool_outcome(
                         response=None,
                         error_class=type(first_party_exc).__name__,
@@ -1920,6 +2062,8 @@ TEMPLATES: dict[str, str] = {
                         post_version=state.version,
                     )
                     advisor_failure = first_party_exc
+                    if failure_custody is not None:
+                        failure_custody.promote_completed_failure(kind="advisor_failure", original=first_party_exc)
                     break
 
                 if type(advisor_outcome) is not _AdvisorCallSuccess:
@@ -2002,6 +2146,8 @@ TEMPLATES: dict[str, str] = {
                 }
                 if abandonment_context is not None and ctx.turn_evidence is not None:
                     ctx.turn_evidence.seal_abandonment_feedback(abandonment_context, feedback_message)
+                if publication is not None:
+                    publication.register_feedback(serialized=tool_feedback_json, message=feedback_message)
                 llm_messages.append(feedback_message)
                 continue
 
@@ -2026,7 +2172,7 @@ TEMPLATES: dict[str, str] = {
                 # owner without being recategorized as a handler crash.
                 try:
                     review_preflight = await _await_started_tool_stage(
-                        _pending_review_runtime_findings(state, ctx), audit=audit, recorder=recorder
+                        _pending_review_runtime_findings(state, ctx), audit=audit, recorder=recorder, failure_observation=observation
                     )
                 except ComposerRuntimePreflightError as preflight_exc:
                     raise ComposerRuntimePreflightError(
@@ -2036,6 +2182,7 @@ TEMPLATES: dict[str, str] = {
                         llm_calls=recorder.llm_calls,
                         failed_turn=preflight_exc.failed_turn,
                     ) from preflight_exc.original_exc
+                handler_failure: _ServiceHandlerFailure | None = None
                 try:
                     session_aware_outcome = await _await_started_tool_stage(
                         ctx.session_tools._dispatch_session_aware_tool(
@@ -2053,10 +2200,15 @@ TEMPLATES: dict[str, str] = {
                             anti_anchor=anti_anchor,
                             policy_catalog=ctx.policy_catalog,
                             review_preflight=review_preflight,
+                            failure_observation=observation,
+                            publication=publication,
                         ),
                         audit=audit,
                         recorder=recorder,
+                        failure_observation=observation,
                     )
+                except _ServiceHandlerFailure as marker:
+                    handler_failure = marker
                 except (AssertionError, MemoryError, RecursionError, SystemError):
                     # Same narrow-class discipline as the sync execute_tool
                     # handler below: interpreter/Tier-1 invariant states must
@@ -2066,6 +2218,11 @@ TEMPLATES: dict[str, str] = {
                     # Tier-1 audit invariant — same passthrough as the sync path.
                     raise
                 except Exception as tool_exc:
+                    if isinstance(tool_exc, _ServiceFailure):
+                        # Only the inner handler's owned marker can close a
+                        # service refusal. Result/audit/post-handler failures
+                        # retain their real owner without inventing completion.
+                        raise
                     # elspeth-9c01c943a5: the session-aware dispatch converts
                     # ToolArgumentError internally, so any exception reaching
                     # here is a plugin/service bug. Without this capture it
@@ -2074,7 +2231,17 @@ TEMPLATES: dict[str, str] = {
                     # it through the same plugin-crash carrier as the sync
                     # path so the turn persists and the route layer answers
                     # with the coded envelope.
-                    recorder.record(finish_plugin_crash(audit, exc=tool_exc))
+                    if failure_custody is not None:
+                        failure_custody.observe_primary(tool_exc)
+                        if failure_custody.errors or observation is None or not observation.execution_failed:
+                            combined = failure_custody.failure(tool_exc)
+                            if combined is tool_exc:
+                                raise
+                            raise combined from combined.__cause__
+                        recorded_crash = finish_plugin_crash(audit, exc=tool_exc)
+                        recorder.record_with_failure_observation(recorded_crash, observation)
+                    else:
+                        recorder.record(finish_plugin_crash(audit, exc=tool_exc))
                     _append_tool_outcome(
                         response=None,
                         error_class=type(tool_exc).__name__,
@@ -2090,6 +2257,22 @@ TEMPLATES: dict[str, str] = {
                         llm_calls=recorder.llm_calls,
                     )
                     plugin_crash_cause = tool_exc
+                    if failure_custody is not None:
+                        failure_custody.promote_completed_failure(kind="plugin_crash", original=tool_exc, wrapper=plugin_crash)
+                    break
+                if handler_failure is not None:
+                    if (
+                        type(handler_failure) is not _ServiceHandlerFailure
+                        or handler_failure.audit is not audit
+                        or handler_failure.tool_call_id != tool_call.id
+                    ):
+                        raise AuditIntegrityError(
+                            "service handler failure changed its actual issued audit/call"
+                        ) from handler_failure.original
+                    # Leave the marker's exception suite before audit closure.
+                    # A real secondary must keep its own context, never acquire
+                    # this private routing marker as an implicit exception link.
+                    _complete_service_failure(handler_failure.original)
                     break
                 all_cache_hits = False
                 _append_tool_outcome(
@@ -2099,6 +2282,8 @@ TEMPLATES: dict[str, str] = {
                     error_message=session_aware_outcome.error_message,
                     post_version=session_aware_outcome.post_version,
                 )
+                if publication is not None and session_aware_outcome.result is None:
+                    publication.bind_completed_outcome(tool_outcomes[-1])
                 if session_aware_outcome.is_discovery:
                     turn_has_discovery = True
                 else:
@@ -2136,10 +2321,18 @@ TEMPLATES: dict[str, str] = {
                         session_operation_context=ctx.session_operation_context,
                     )
                 except asyncio.CancelledError as cancellation:
-                    recorder.record(finish_cancelled(audit, exc=cancellation))
+                    if observation is not None:
+                        observation.observe_primary(cancellation)
+                        recorder.record_with_failure_observation(finish_cancelled(audit, exc=cancellation), observation)
+                    else:
+                        recorder.record(finish_cancelled(audit, exc=cancellation))
                     raise
                 except ComposerRuntimePreflightError as preflight_exc:
-                    recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                    if observation is not None:
+                        observation.observe_primary(preflight_exc.original_exc)
+                        recorder.record_with_failure_observation(finish_plugin_crash(audit, exc=preflight_exc.original_exc), observation)
+                    else:
+                        recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
                     raise ComposerRuntimePreflightError.capture(
                         preflight_exc.original_exc,
                         state=state,
@@ -2187,9 +2380,16 @@ TEMPLATES: dict[str, str] = {
                             ),
                             audit=audit,
                             recorder=recorder,
+                            failure_observation=observation,
                         )
                     except ComposerRuntimePreflightError as preflight_exc:
-                        recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
+                        if observation is not None:
+                            observation.observe_primary(preflight_exc.original_exc)
+                            recorder.record_with_failure_observation(
+                                finish_plugin_crash(audit, exc=preflight_exc.original_exc), observation
+                            )
+                        else:
+                            recorder.record(finish_plugin_crash(audit, exc=preflight_exc.original_exc))
                         raise ComposerRuntimePreflightError.capture(
                             preflight_exc.original_exc,
                             state=state,
@@ -2283,11 +2483,14 @@ TEMPLATES: dict[str, str] = {
                 _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
                 _preproposal_exception: BaseException | None = preproposal_exception,
                 _auto_mutation: ComposerMutationCeiling | None = auto_mutation,
+                _retained_attachment: AttachmentResultCheckpoint | None = retained_attachment,
             ) -> Any:
                 if _preproposal_exception is not None:
                     raise _preproposal_exception
                 if _prevalidated_unapplied_result is not None:
                     return _prevalidated_unapplied_result
+                if _retained_attachment is not None:
+                    return admit_discovery_result(_tool_name, _retained_attachment.result)
                 try:
                     dispatched_result = await run_sync_in_worker(
                         execute_tool,
@@ -2373,6 +2576,7 @@ TEMPLATES: dict[str, str] = {
                     do_dispatch=_do_dispatch,
                     version_after_provider=_version_after,
                     arg_error_payload_factory=_arg_error_payload_factory,
+                    failure_observation=observation,
                 )
             except ToolArgumentError as exc:
                 # The audit record was already written by the helper.
@@ -2415,14 +2619,7 @@ TEMPLATES: dict[str, str] = {
                 )
                 anti_anchor.record_failure(tool_name, audit.arguments_hash, category=exc.category)
                 tool_feedback_json = json.dumps(arg_error_payload)
-                llm_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_feedback_json,
-                        PROMPT_GUARD_CONTENT_PARTS_KEY: json_content_parts(tool_feedback_json),
-                    }
-                )
+                _append_issued_feedback(tool_feedback_json)
                 continue
             except (AssertionError, MemoryError, RecursionError, SystemError):
                 # Plugin-ownership policy exception — DOCUMENTED DIVERGENCE.
@@ -2526,6 +2723,11 @@ TEMPLATES: dict[str, str] = {
                 # takes the recorder buffer (including the helper's
                 # final crash record) so the route handler's
                 # ``_handle_plugin_crash`` gets the complete sequence.
+                if failure_custody is not None and (failure_custody.errors or observation is None or not observation.execution_failed):
+                    combined = failure_custody.failure(tool_exc)
+                    if combined is tool_exc:
+                        raise
+                    raise combined from combined.__cause__
                 _append_tool_outcome(
                     response=None,
                     error_class=type(tool_exc).__name__,
@@ -2541,6 +2743,8 @@ TEMPLATES: dict[str, str] = {
                     llm_calls=recorder.llm_calls,
                 )
                 plugin_crash_cause = tool_exc
+                if failure_custody is not None:
+                    failure_custody.promote_completed_failure(kind="plugin_crash", original=tool_exc, wrapper=plugin_crash)
                 break
 
             # SUCCESS path — the helper already recorded
@@ -2657,16 +2861,38 @@ TEMPLATES: dict[str, str] = {
                 cache_key = _make_cache_key(tool_name, arguments)
                 discovery_cache[cache_key] = _cached_discovery_payload(admitted_result if admitted_result is not None else result)
 
-            llm_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result_json,
-                    PROMPT_GUARD_CONTENT_PARTS_KEY: tool_result_content_parts(
-                        admitted_result if admitted_result is not None else result, result_json
-                    ),
-                }
+            result_message = tool_result_message(
+                call_id=tool_call.id,
+                result=admitted_result if admitted_result is not None else result,
+                serialized=result_json,
             )
+            if ctx.message_producers is not None and tool_name == "get_plugin_schema" and result.success:
+                ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
+                schema_admitted = admitted_result if admitted_result is not None else admit_discovery_result(tool_name, result)
+                ctx.message_producers.register_schema_message(call=tool_call, admitted=schema_admitted, message=result_message)
+            if retained_attachment is not None:
+                if ctx.message_producers is None or admitted_result is None:
+                    raise AuditIntegrityError("retained attachment result lost its actual current message producer")
+                from elspeth.web.composer.continuation_codec import encode_continuation_response
+
+                # Actual original completion/audit; the caller binds this exact
+                # response to the retained selected ToolBatchFrame before entry.
+                response_source = encode_continuation_response(call_model.completion, audit_call=call_model.audit_call)
+                ctx.message_producers.register_attachment_message(
+                    response=response_source, call=tool_call, result=admitted_result.to_tool_result(), message=result_message
+                )
+            elif ctx.message_producers is not None and not (tool_name == "get_plugin_schema" and result.success):
+                ctx.message_producers.require_context(session_id=session_id, context=ctx.session_operation_context, actor_user_id=user_id)
+                ctx.message_producers.register_tool_result_message(
+                    completion=call_model.completion,
+                    tool_index=call.index,
+                    call=tool_call,
+                    result=admitted_result if admitted_result is not None else result,
+                    serialized=result_json,
+                    message=result_message,
+                    catalog=ctx.policy_catalog,
+                )
+            llm_messages.append(result_message)
 
             if not is_discovery_tool(tool_name):
                 turn_has_mutation = True
@@ -2684,6 +2910,15 @@ TEMPLATES: dict[str, str] = {
 
         else:
             ran_to_end = True
+    except BaseException as error:
+        if failure_custody is not None:
+            if failure_custody.original is None:
+                failure_custody.observe_primary(error)
+            combined = failure_custody.failure(error)
+            if combined is error:
+                raise
+            raise combined from combined.__cause__
+        raise
     finally:
         batch.state = state
         batch.last_validation = last_validation
@@ -2693,9 +2928,11 @@ TEMPLATES: dict[str, str] = {
         batch.turn_has_discovery = turn_has_discovery
         batch.all_cache_hits = all_cache_hits
         batch.tool_outcomes = tool_outcomes
-        batch.plugin_crash = plugin_crash
-        batch.plugin_crash_cause = plugin_crash_cause
-        batch.advisor_failure = advisor_failure
+        if failure_custody is None:
+            batch.plugin_crash = plugin_crash
+            batch.plugin_crash_cause = plugin_crash_cause
+            batch.advisor_failure = advisor_failure
+        batch.service_failure = service_failure
         batch.advisor_compose_timeout = advisor_compose_timeout
         batch.pre_state_id = pre_state_id
         batch.decoded_args_by_call_id = decoded_args_by_call_id
@@ -2711,14 +2948,14 @@ TEMPLATES: dict[str, str] = {
         raise AuditIntegrityError("completed tool call has no exact single actual outcome")
     call.phase = "applied"
     batch.stop_issued_batch = batch.stop_issued_batch or not ran_to_end
-    return "applied"
-''',
+    return "applied"''',
     "batch._finish_continuation_batch_live": r'''def _finish_continuation_batch_live(
     *,
     call_model: _CallModelOutcome,
     ctx: ToolBatchContext,
     acc: BatchAccumulator,
     batch: ContinuationBatchState,
+    failure_custody: ContinuationToolFailureCustody | None = None,
 ) -> tuple[_DispatchOutcome, int]:
     """Project the actual complete issued batch and executed prefix."""
     state = batch.state
@@ -2733,6 +2970,21 @@ TEMPLATES: dict[str, str] = {
     plugin_crash = batch.plugin_crash
     plugin_crash_cause = batch.plugin_crash_cause
     advisor_failure = batch.advisor_failure
+    service_failure = batch.service_failure
+    if failure_custody is not None and failure_custody.completed:
+        if failure_custody.batch is not batch:
+            raise AuditIntegrityError("batch finish changed its original native failure custody")
+        plugin_crash = failure_custody.wrapper
+        plugin_crash_cause = failure_custody.original if plugin_crash is not None else None
+        advisor_origin = failure_custody.original
+        if batch.service_failure is not None:
+            if advisor_origin is not batch.service_failure:
+                raise AuditIntegrityError("service finish replaced its actual native original")
+            service_failure = batch.service_failure
+        if batch.retained_failure is not None and batch.retained_failure.kind == "advisor_failure":
+            if not isinstance(advisor_origin, Exception):
+                raise AuditIntegrityError("Advisor finish lost its actual handled exception")
+            advisor_failure = advisor_origin
     advisor_compose_timeout = batch.advisor_compose_timeout
     mutation_success_observed = batch.mutation_success_observed
     pre_state_id = batch.pre_state_id
@@ -2757,6 +3009,7 @@ TEMPLATES: dict[str, str] = {
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
         advisor_failure=advisor_failure,
+        service_failure=service_failure,
         advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,
@@ -2765,8 +3018,7 @@ TEMPLATES: dict[str, str] = {
         pre_state_id=pre_state_id,
         authority_revocation=acc.authority_revocation,
     )
-    return dispatch, advisor_calls_used
-''',
+    return dispatch, advisor_calls_used''',
     "batch.ContinuationBatchState": r"""@dataclass(slots=True)
 class ContinuationBatchState:
     state: CompositionState
@@ -2789,6 +3041,7 @@ class ContinuationBatchState:
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
     advisor_failure: Exception | None = None
+    service_failure: _ServiceFailure | None = None
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = None
     decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -2804,7 +3057,9 @@ class ContinuationBatchState:
     p4_receipt_json: str | None = None
     p4_input_json: str | None = None
     p4_verification_failed: bool = False
-""",
+    # Live-only reservation owner. The continuation codec retains the spent
+    # integer above; a checkpoint is taken only after the active stage closes.
+    manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)""",
     "batch.ContinuationCallState": r"""@dataclass(slots=True)
 class ContinuationCallState:
     index: int
@@ -2905,6 +3160,7 @@ class ToolBatchContext:
     composition_turns_used: int = 0
     discovery_turns_used: int = 0
     failed_turn: FailedTurnMetadata | None = None
+    message_producers: CurrentContinuationMessageProducers | None = None
 ''',
     "batch.BatchAccumulator": r'''@dataclass(slots=True)
 class BatchAccumulator:
@@ -2923,7 +3179,13 @@ class BatchAccumulator:
     advisor_calls_used: int
     authority_revocation: ComposerMutationRevocation | None = None
 ''',
-    "batch._retain_llm_tool_argument_parts": r'''def _retain_llm_tool_argument_parts(llm_messages: Sequence[dict[str, Any]], *, tool_call_id: str) -> None:
+    "batch._retain_llm_tool_argument_parts": r'''def _retain_llm_tool_argument_parts(
+    llm_messages: Sequence[dict[str, Any]],
+    *,
+    tool_call_id: str,
+    ctx: ToolBatchContext | None = None,
+    call_model: _CallModelOutcome | None = None,
+) -> None:
     """Attach all-untrusted semantic units only after argument admission."""
     for message in reversed(llm_messages):
         if message["role"] != "assistant" or "tool_calls" not in message:
@@ -2940,6 +3202,10 @@ class BatchAccumulator:
             message[PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY] = tuple(
                 sorted((*[part for part in existing if part.tool_call_index != index], entry), key=lambda part: part.tool_call_index)
             )
+            if ctx is not None:
+                if call_model is None:
+                    raise AuditIntegrityError("argument registration lost its actual provider outcome")
+                _register_continuation_assistant_message(ctx, call_model, message, tool_call_id=tool_call_id)
             return
     raise AuditIntegrityError("Admitted tool argument was not present in the active LLM transcript")
 ''',
@@ -3955,12 +4221,28 @@ class DecodedArguments:
         if frozen is not value:
             object.__setattr__(instance, name, frozen)
 ''',
-    "batch._await_started_tool_stage": r'''async def _await_started_tool_stage[T](awaitable: Awaitable[T], *, audit: DispatchAudit, recorder: BufferingRecorder) -> T:
+    "batch._await_started_tool_stage": r'''async def _await_started_tool_stage[T](
+    awaitable: Awaitable[T],
+    *,
+    audit: DispatchAudit,
+    recorder: BufferingRecorder,
+    failure_observation: ContinuationDispatchFailureObservation | None = None,
+) -> T:
     """Close a started dispatch when one unaudited async stage cancels."""
     try:
         return await awaitable
     except asyncio.CancelledError as cancellation:
-        recorder.record(finish_cancelled(audit, exc=cancellation))
+        if failure_observation is None:
+            recorder.record(finish_cancelled(audit, exc=cancellation))
+        else:
+            failure_observation.observe_primary(cancellation)
+            try:
+                recorder.record_with_failure_observation(finish_cancelled(audit, exc=cancellation), failure_observation)
+            except BaseException as error:
+                combined = failure_observation.owner.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
         raise
 ''',
     "boundary.trust_boundary": r'''def trust_boundary(
@@ -4109,6 +4391,7 @@ provider. It is derived from S once, at import, by one pure walk per
 :class:`ToolContractDialect`, and is never hand-written:
 
 * ``none`` is S unchanged, except that the web ``set_pipeline`` arguments
+  disclose the runtime naming constraints and
   carry a required ``{"pipeline": <flat document>}`` envelope. LiteLLM's
   Anthropic and Bedrock adapters keep unions nested below a property but
   discard root-level ``oneOf``, so the flat set_pipeline schema would lose
@@ -4162,6 +4445,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.tools._dispatch import _TOOL_SCHEMA_BY_NAME, WIRE_KEYWORD_ALLOWLIST, get_tool_definitions
+from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.strict_profile import StrictViolationKind, check_openai_strict
 
 __all__ = [
@@ -4182,7 +4466,6 @@ __all__ = [
     "loop_tool_count",
     "omission_instruction_matches",
     "project_tool",
-    "stamp_planner_terminal",
     "strict_capable_tool_count",
     "wire_limits_report",
     "wire_tool_definitions",
@@ -4920,11 +5203,23 @@ def build_wire_tool_defs(
     return MappingProxyType(defs)
 
 
+def _build_loop_wire_tool_defs() -> Mapping[ToolContractDialect, Mapping[str, WireTool]]:
+    """Build owned wire contracts from the naming-disclosed registry copy.
+
+    Projection, size checks and wire-conformance validators must consume this
+    same document. Adding disclosures only after projection would leave the
+    decoder classifying against a different schema from the one sent.
+    """
+    definitions = get_tool_definitions()
+    for definition in definitions:
+        if definition["name"] == "set_pipeline":
+            definition["parameters"] = canonical_set_pipeline_schema()
+            return build_wire_tool_defs(definitions, limits=OPENAI_STRICT_LIMITS)
+    raise WireProjectionError("Compose loop must advertise set_pipeline")
+
+
 # Built once, at import, in registry order (``wire_secret_ref`` last).
-_WIRE_TOOL_DEFS: Final[Mapping[ToolContractDialect, Mapping[str, WireTool]]] = build_wire_tool_defs(
-    get_tool_definitions(),
-    limits=OPENAI_STRICT_LIMITS,
-)
+_WIRE_TOOL_DEFS: Final[Mapping[ToolContractDialect, Mapping[str, WireTool]]] = _build_loop_wire_tool_defs()
 
 _WIRE_LIMITS_REPORTS: Final[Mapping[ToolContractDialect, WireLimitsReport]] = MappingProxyType(
     {dialect: _limits_report(dialect, tools) for dialect, tools in _WIRE_TOOL_DEFS.items()}
@@ -4965,18 +5260,6 @@ def wire_tool_definitions(dialect: ToolContractDialect) -> list[dict[str, Any]]:
             function["strict"] = tool.strict_capable
         tools.append({"type": "function", "function": function})
     return tools
-
-
-def stamp_planner_terminal(definition: Mapping[str, Any], dialect: ToolContractDialect) -> dict[str, Any]:
-    """Return a copy of the planner terminal tool stamped for ``dialect``.
-
-    The terminal is never strict-capable in S1: ``openai_strict`` gets an
-    explicit ``strict: false``; ``none`` gets an unchanged copy.
-    """
-    stamped = deepcopy(dict(definition))
-    if dialect == ToolContractDialect.OPENAI_STRICT:
-        stamped["function"]["strict"] = False
-    return stamped
 
 
 # ---------------------------------------------------------------- decode / encode
@@ -5156,4 +5439,5407 @@ class EmptyArgumentsMarker:
     if errors:
         raise _schema_tool_argument_error(tool_name, errors, _closed_root_schema(tool_name))
 ''',
+}
+
+
+OWNER_TEMPLATES: dict[str, str] = {
+    "batch._register_continuation_assistant_message": r"""def _register_continuation_assistant_message(
+    ctx: ToolBatchContext,
+    call_model: _CallModelOutcome,
+    message: dict[str, Any],
+    *,
+    tool_call_id: str | None = None,
+) -> None:
+    if ctx.message_producers is None:
+        return
+    from elspeth.web.composer.continuation_codec import encode_continuation_response
+
+    ctx.message_producers.require_context(session_id=ctx.session_id, context=ctx.session_operation_context, actor_user_id=ctx.user_id)
+    if call_model.audit_call is None:
+        raise AuditIntegrityError("current tool message lost its original physical audit")
+    response = encode_continuation_response(call_model.completion, audit_call=call_model.audit_call)
+    ctx.message_producers.register_tool_call_message(
+        response=response,
+        completion=call_model.completion,
+        message=message,
+        tool_call_id=tool_call_id,
+    )
+""",
+    "batch._replace_llm_tool_call_arguments": r'''def _replace_llm_tool_call_arguments(
+    llm_messages: Sequence[dict[str, Any]],
+    *,
+    tool_call_id: str,
+    arguments: Mapping[str, Any],
+    dialect: ToolContractDialect,
+    semantic: bool,
+    ctx: ToolBatchContext | None = None,
+    call_model: _CallModelOutcome | None = None,
+) -> None:
+    """Replace the latest assistant call with custody-safe arguments.
+
+    The compose loop appends the provider-authored assistant message before
+    dispatch.  A subsequent provider turn must not receive raw inline bytes
+    from that history after ELSPETH has intercepted them for proposal custody.
+    ``arguments`` are always the flat internal shape; set_pipeline is
+    re-enveloped only while serializing the provider transcript.
+
+    ``semantic`` says whether ``arguments`` are the tool's semantic arguments
+    (encoded back to the wire form of ``dialect`` through
+    ``encode_semantic_arguments``) or a redaction sentinel, which keeps the
+    plain ``{"pipeline": ...}`` wrap. In S1 both give the same bytes, because
+    set_pipeline is non-strict on every dialect.
+
+    The transcript keeps the model's key order: map order in ``sources``,
+    ``row_union.branches`` and ``coalesce.branches`` is semantic, so a sorted
+    re-serialisation would show the model an order it never authored.
+    """
+    for message in reversed(llm_messages):
+        if "role" not in message or message["role"] != "assistant":
+            continue
+        tool_calls = message["tool_calls"] if "tool_calls" in message else None
+        if type(tool_calls) is not list:
+            continue
+        for call in tool_calls:
+            if type(call) is not dict:
+                continue
+            if "id" not in call or call["id"] != tool_call_id:
+                continue
+            function = call["function"] if "function" in call else None
+            if type(function) is not dict:
+                raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            if "name" not in function or type(function["name"]) is not str:
+                raise AuditIntegrityError("Assistant tool call has malformed function envelope")
+            function_name = function["name"]
+            provider_arguments: Mapping[str, Any]
+            if function_name != "set_pipeline":
+                provider_arguments = arguments
+            elif semantic:
+                provider_arguments = encode_semantic_arguments(function_name, dialect, arguments)
+            else:
+                provider_arguments = {"pipeline": arguments}
+            encoded = json.dumps(provider_arguments, separators=(",", ":"))
+            function["arguments"] = encoded
+            _retain_llm_tool_argument_parts(llm_messages, tool_call_id=tool_call_id, ctx=ctx, call_model=call_model)
+            return
+    raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
+''',
+    "builders.native_assistant_message": r'''def native_assistant_message(completion: _AdmittedLLMCompletion) -> dict[str, Any]:
+    """The existing actual tool-batch assistant construction, unchanged."""
+    if type(completion) is not _AdmittedLLMCompletion:
+        raise TypeError("native assistant construction requires its actual admitted completion")
+    return attach_provider_thinking(
+        {
+            "role": "assistant",
+            "content": completion.message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in completion.tool_batch.calls
+            ],
+        },
+        completion.provider_metadata.thinking_blocks,
+    )
+''',
+    "producers.CurrentContinuationMessageProducers.require_context": r"""def require_context(self, *, session_id: str | None, context: object, actor_user_id: str | None) -> None:
+    if (
+        session_id != self.inputs.bootstrap.logical.session_id
+        or context is not self.inventory.running.session_operation_context
+        or actor_user_id != self.inputs.bootstrap.actor_user_id
+    ):
+        raise AuditIntegrityError("live message producer crossed its actual current context")
+""",
+    "producers.CurrentContinuationMessageProducers.__post_init__": r"""def __post_init__(self) -> None:
+    from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+
+    if (
+        type(self.service) is not ComposerServiceImpl
+        or type(self.authority) is not ComposerAsyncOperationAuthority
+        or type(self.selected) is not SelectedContinuationState
+        or type(self.inventory) is not CurrentContinuationEnvInventory
+        or type(self.inputs) not in (_CurrentProducerInputs, _ReadyProducerInputs)
+    ):
+        raise AuditIntegrityError("message producer requires its actual current owners")
+    if self.finish_read is not None:
+        if type(self.finish_read) is not ContinuationFinishRead:
+            raise AuditIntegrityError("message producer received a foreign owed-finish facet")
+        self.finish_read.require_selection(self.selected, self.inventory)
+    sessions = self.service._require_sessions_service()
+    if type(sessions) is not SessionServiceImpl or sessions._engine is not self.authority._engine:
+        raise AuditIntegrityError("message producer crossed actual session stores")
+    states = producer_input_states(self.inputs.producer_inputs, env_ref_names=self.inventory.names)
+    for entry in self.inputs.producer_inputs.schema_inputs:
+        self._schema_inputs.append(
+            (
+                _AdmittedToolCall(entry.tool_call_id, _AdmittedToolFunction("get_plugin_schema", entry.raw_arguments)),
+                states[entry.state_index],
+            )
+        )
+""",
+    "producers.CurrentContinuationMessageProducers.advance_current": r'''def advance_current(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
+    """Rebind one live producer after its real same-owner SQL transition.
+
+    Fresh source admission precedes installation. Existing SDK message and
+    schema objects stay owned here; this read never dispatches or restores
+    replacements for those objects, and cannot cross a physical adoption.
+    """
+    if (
+        type(selected) is not SelectedContinuationState
+        or type(inventory) is not CurrentContinuationEnvInventory
+        or type(self.inputs) is not _CurrentProducerInputs
+        or inventory.running is not self.inventory.running
+        or inventory.running.session_operation_context is not self.inventory.running.session_operation_context
+        or inventory.names != self.inventory.names
+    ):
+        raise AuditIntegrityError("live message advance changed its actual running/context/inventory owners")
+    before, after = self.selected.stack, selected.stack
+    if (
+        after.logical != before.logical
+        or after.cursor <= before.cursor
+        or after.admission_policy_json != before.admission_policy_json
+        or after.policy_hash != before.policy_hash
+        or after.mutation_ceiling != before.mutation_ceiling
+        or after.provider_cost_policy != before.provider_cost_policy
+    ):
+        raise AuditIntegrityError("live message advance changed its request, retained policy or predecessor order")
+    selected.__post_init__()
+    from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+    finish_read = None if self.finish_read is None else ContinuationFinishRead(inventory.running, selected, inventory)
+    with locked_session_transaction(self.authority._engine, str(inventory.running.claim.session_id)) as conn:
+        from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
+
+        try:
+            actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+        except ComposerOperationCancelledDuringTurn:
+            finish_read = ContinuationFinishRead(inventory.running, selected, inventory)
+            actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+        if (
+            actual.bootstrap != self.inputs.bootstrap
+            or actual.bootstrap.actor_user_id != self.inputs.bootstrap.actor_user_id
+            or actual.producer_inputs != capture_continuation_producer_inputs(tuple(self._schema_inputs), env_ref_names=inventory.names)
+        ):
+            raise AuditIntegrityError("live message advance changed its original actor or actual schema history")
+    # No callbacks, allocation of SDK objects or await between these writes.
+    # A failed SQL read/transaction leaves every old binding intact.
+    self.selected, self.inventory, self.inputs, self.finish_read = selected, inventory, actual, finish_read
+''',
+    "producers.ContinuationToolMessagePublication": r'''class ContinuationToolMessagePublication:
+    """Closed bindings to actual live issued owners for capture, never a write grant."""
+
+    __slots__ = (
+        "_sealed",
+        "batch",
+        "call",
+        "catalog",
+        "completion",
+        "messages",
+        "producers",
+        "recorder",
+    )
+
+    producers: CurrentContinuationMessageProducers
+    completion: _AdmittedLLMCompletion
+    batch: ContinuationBatchState
+    call: ContinuationCallState
+    recorder: BufferingRecorder
+    messages: list[dict[str, Any]]
+    catalog: PolicyCatalogView
+    _sealed: bool
+
+    def __new__(
+        cls,
+        producers: CurrentContinuationMessageProducers,
+        completion: _AdmittedLLMCompletion,
+        batch: ContinuationBatchState,
+        call: ContinuationCallState,
+        recorder: BufferingRecorder,
+        messages: list[dict[str, object]],
+        catalog: PolicyCatalogView,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        producers: CurrentContinuationMessageProducers,
+        completion: _AdmittedLLMCompletion,
+        batch: ContinuationBatchState,
+        call: ContinuationCallState,
+        recorder: BufferingRecorder,
+        messages: list[dict[str, object]],
+        catalog: PolicyCatalogView,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("ContinuationToolMessagePublication cannot be reinitialized")
+        object.__setattr__(self, "producers", producers)
+        object.__setattr__(self, "completion", completion)
+        object.__setattr__(self, "batch", batch)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "recorder", recorder)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "catalog", catalog)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("ContinuationToolMessagePublication bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("ContinuationToolMessagePublication bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not ContinuationToolMessagePublication or type(other) is not ContinuationToolMessagePublication:
+            return NotImplemented
+        return (
+            self.producers,
+            self.completion,
+            self.batch,
+            self.call,
+            self.recorder,
+            self.messages,
+            self.catalog,
+        ) == (
+            other.producers,
+            other.completion,
+            other.batch,
+            other.call,
+            other.recorder,
+            other.messages,
+            other.catalog,
+        )
+
+    def require_call(
+        self, *, recorder: BufferingRecorder, audit: DispatchAudit | None, tool_name: str, tool_call_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
+        from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState
+
+        if (
+            type(self.producers) is not CurrentContinuationMessageProducers
+            or type(self.completion) is not _AdmittedLLMCompletion
+            or type(self.batch) is not ContinuationBatchState
+            or type(self.call) is not ContinuationCallState
+            or type(self.recorder) is not BufferingRecorder
+            or self.recorder is not recorder
+            or self.messages is not messages
+            or self.batch.current_call is not self.call
+            or self.call.audit is not audit
+            or type(audit) is not DispatchAudit
+            or (self.call.tool_name, self.call.tool_call.id) != (tool_name, tool_call_id)
+            or not 0 <= self.call.index < len(self.completion.tool_batch.calls)
+            or self.completion.tool_batch.calls[self.call.index] is not self.call.tool_call
+        ):
+            raise AuditIntegrityError("tool publication changed its actual issued call/recorder/message owners")
+
+    def register_feedback(self, *, serialized: str, message: dict[str, Any]) -> dict[str, Any]:
+        return self.producers.register_tool_feedback_message(publication=self, serialized=serialized, message=message)
+
+    def bind_completed_outcome(self, outcome: _ToolOutcome) -> None:
+        self.producers._bind_feedback_outcome(self, outcome)
+
+    def register_result(self, *, result: ToolResult, serialized: str, message: dict[str, Any]) -> dict[str, Any]:
+        self.require_call(
+            recorder=self.recorder,
+            audit=self.call.audit,
+            tool_name=self.call.tool_name,
+            tool_call_id=self.call.tool_call.id,
+            messages=self.messages,
+        )
+        return self.producers.register_tool_result_message(
+            completion=self.completion,
+            tool_index=self.call.index,
+            call=self.call.tool_call,
+            result=result,
+            serialized=serialized,
+            message=message,
+            catalog=self.catalog,
+        )''',
+    "producers.CurrentMessageProduction": r'''class CurrentMessageProduction:
+    """Stable membership of actual live messages registered by their owner.
+
+    The original mutable mappings and producer stay strongly referenced: their
+    identity and complete wire remain subject to the existing registry checks.
+    """
+
+    __slots__ = (
+        "_sealed",
+        "messages",
+        "producers",
+    )
+
+    producers: CurrentContinuationMessageProducers
+    messages: tuple[Mapping[str, Any], ...] | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        producers: CurrentContinuationMessageProducers,
+        messages: tuple[Mapping[str, Any], ...] | None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        producers: CurrentContinuationMessageProducers,
+        messages: tuple[Mapping[str, Any], ...] | None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("CurrentMessageProduction cannot be reinitialized")
+        object.__setattr__(self, "producers", producers)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("CurrentMessageProduction bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("CurrentMessageProduction bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not CurrentMessageProduction or type(other) is not CurrentMessageProduction:
+            return NotImplemented
+        return (
+            self.producers,
+            self.messages,
+        ) == (
+            other.producers,
+            other.messages,
+        )''',
+    "producers._produce_current_messages": r"""def _produce_current_messages(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    retained_shelf: MessageShelfSnapshot | None,
+    initial: bool,
+    finish_read: ContinuationFinishRead | None = None,
+) -> CurrentMessageProduction:
+    from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot, encode_message_shelf
+    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+
+    if type(service) is not ComposerServiceImpl or type(authority) is not ComposerAsyncOperationAuthority:
+        raise AuditIntegrityError("message production requires actual service and SQL authority owners")
+    if type(selected) is not SelectedContinuationState or type(inventory) is not CurrentContinuationEnvInventory:
+        raise AuditIntegrityError("message production requires actual current selection and inventory")
+    if finish_read is not None and initial:
+        raise AuditIntegrityError("owed-finish restoration cannot create a new initial dialogue")
+    with locked_session_transaction(authority._engine, str(inventory.running.claim.session_id)) as conn:
+        inputs = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+    owner = CurrentContinuationMessageProducers(service, authority, selected, inventory, inputs, finish_read=finish_read)
+    if retained_shelf is not None:
+        if (
+            type(retained_shelf) is not MessageShelfSnapshot
+            or encode_message_shelf(retained_shelf).canonical != inputs.evidence_messages_json
+            or initial
+        ):
+            raise AuditIntegrityError("message production changed the selected evidence shelf")
+        messages = owner.restore_shelf(retained_shelf)
+        return CurrentMessageProduction(owner, tuple(messages[index] for index in retained_shelf.current_indexes))
+    return CurrentMessageProduction(owner, tuple(owner.initial_messages()) if initial else None)
+""",
+    "producers.load_current_message_producers": r"""async def load_current_message_producers(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    retained_shelf: MessageShelfSnapshot | None = None,
+    initial: bool = False,
+    finish_read: ContinuationFinishRead | None = None,
+) -> CurrentMessageProduction:
+    if type(required_work) is not RequiredWorkBinding or type(inventory) is not CurrentContinuationEnvInventory:
+        raise AuditIntegrityError("message production lost its required-work/current inventory")
+    running = required_work.running
+    if type(running) is not ComposerOperationRunning or inventory.running is not running:
+        raise AuditIntegrityError("message production changed its current running owner")
+    required_work.validate_context(running.session_operation_context)
+    custody = required_work.coordinator.authority
+    if (
+        custody.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+        or custody.durable_operation_id != running.claim.operation_id
+        or custody.claim_attempt != running.claim.attempt
+    ):
+        raise AuditIntegrityError("message production changed its required-work claim")
+    sql, projection = required_work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
+    try:
+        outcome = await run_required_sql_finish_once(
+            sql,
+            _produce_current_messages,
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            retained_shelf=retained_shelf,
+            initial=initial,
+            finish_read=finish_read,
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    try:
+        required_work.coordinator.validate_continuation_sql_outcome(
+            ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_READ_SQL, actual_outcome=outcome
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    errors: list[BaseException] = []
+    actual: CurrentMessageProduction | None = None
+    if type(outcome) is RequiredSQLRaised:
+        projection.complete_without_submission()
+        errors.append(outcome.error)
+    elif type(outcome) is RequiredSQLReturned:
+        projection.begin_projection()
+        try:
+            if type(outcome.value) is not CurrentMessageProduction:
+                raise AuditIntegrityError("message projection lost its actual produced owner")
+            actual = outcome.value
+        except BaseException as error:
+            projection.complete_owned(error)
+            errors.append(error)
+        else:
+            projection.complete_owned()
+    else:
+        projection.complete_without_submission()
+        errors.append(AuditIntegrityError("message production returned an unknown SQL outcome"))
+    for cancellation in outcome.deferred_cancellations:
+        if all(cancellation is not original for original in errors):
+            errors.append(cancellation)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Continuation current message outcomes", errors)
+    if actual is None:
+        raise AuditIntegrityError("message production lost its result")
+    return actual
+""",
+    "failure.ContinuationToolFailureCustody.__post_init__": r"""def __post_init__(self) -> None:
+    if (
+        self.work.running is not self.running
+        or self.call.tool_call is not self.calls[self.call.index]
+        or self.batch.current_call is not self.call
+        or self.call.audit is None
+    ):
+        raise AuditIntegrityError("tool failure custody changed its actual issued owners")
+    self.observation = ContinuationDispatchFailureObservation(self, self.call.audit)
+""",
+    "failure.ContinuationDispatchFailureObservation.require": r"""def require(self, recorder: BufferingRecorder, audit: DispatchAudit) -> None:
+    if recorder is not self.owner.recorder or audit is not self.audit:
+        raise AuditIntegrityError("dispatch failure observation belongs to another actual audit")
+""",
+    "runtime.RestoredContinuationRuntime": r"""@dataclass(frozen=True, slots=True)
+class RestoredContinuationRuntime:
+    live: _ComposeIterationState
+    bindings: _ComposeIterationBindings
+    graph: RestoredTurnEvidence
+    materialization: CurrentContinuationMessageProducers
+    source: ContinuationRuntimeSource
+    drained: RecorderDrainCursors
+    attachments: ContinuationAttachmentHistory
+    env_ref_names: frozenset[str]
+""",
+    "runtime._CurrentPhaseRead": r'''@dataclass(frozen=True, slots=True)
+class _CurrentPhaseRead:
+    """One phase's actual read cohort; every use still re-enters SQL proof."""
+
+    runtime: RestoredContinuationRuntime
+    selected: SelectedContinuationState
+    inventory: CurrentContinuationEnvInventory
+    finish_read: ContinuationFinishRead | None
+''',
+    "runtime._registered_read": r"""async def _registered_read[T](work: RequiredWorkBinding, owner: type[T], operation: Callable[[], T]) -> T:
+    sql, projection = work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
+    try:
+        outcome = await run_required_sql_finish_once(sql, operation)
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    try:
+        work.coordinator.validate_continuation_sql_outcome(
+            ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_READ_SQL, actual_outcome=outcome
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    failures: list[BaseException] = []
+    result: T | None = None
+    if type(outcome) is RequiredSQLRaised:
+        projection.complete_without_submission()
+        failures.append(outcome.error)
+    elif type(outcome) is RequiredSQLReturned:
+        projection.begin_projection()
+        try:
+            if type(outcome.value) is not owner:
+                raise AuditIntegrityError("runtime projection changed its actual nominal returned owner")
+            result = outcome.value
+        except BaseException as error:
+            projection.complete_owned(error)
+            failures.append(error)
+        else:
+            projection.complete_owned()
+    else:
+        projection.complete_without_submission()
+        raise AuditIntegrityError("runtime returned an unfamiliar required-SQL outcome")
+    for cancellation in outcome.deferred_cancellations:
+        if all(cancellation is not original for original in failures):
+            failures.append(cancellation)
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("Continuation runtime original outcomes", failures)
+    if result is None:
+        raise AuditIntegrityError("runtime lost its complete returned owner")
+    return result
+""",
+    "runtime._restore_live": r"""def _restore_live(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    source: ContinuationRuntimeSource,
+    graph: RestoredTurnEvidence,
+    materialization: CurrentContinuationMessageProducers,
+    monotonic_before_read: float,
+    progress: ComposerProgressSink | None,
+    finish_read: ContinuationFinishRead | None = None,
+) -> RestoredContinuationRuntime:
+    from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
+
+    _index, frame = _compose(selected)
+    names = inventory.names
+    original = source.original
+    initial = graph.evidence.effects.initial_state
+    if frame.state.codec != "composer.state.v1":
+        raise AuditIntegrityError("runtime current state changed its actual closed codec")
+    selected_state = runtime_chunk(selected, frame.state).canonical
+    if graph.batch is not None:
+        state = graph.batch.batch.state
+    else:
+        from elspeth.web.composer.continuation_evidence import state_from_evidence_json
+
+        state = state_from_evidence_json(selected_state)
+    if (
+        canonical_json(state.to_dict()) != selected_state
+        or runtime_chunk(selected, frame.initial_state).canonical != original.snapshot.initial_state_json
+        or canonical_json(initial.to_dict()) != original.snapshot.initial_state_json
+        or initial.version != frame.initial_version
+        or frame.current_state_id != graph.evidence.effects.latest_committed_state_id
+    ):
+        raise AuditIntegrityError("runtime changed original base or actual shared state/frontier")
+    require_no_credential_material_in_state(state, surface="current continuation runtime state", env_ref_names=names)
+    if runtime_chunk(selected, frame.audit_buffer) != encode_recorder_snapshot(
+        graph.recorder.snapshot_for_continuation(drained=graph.drained)
+    ):
+        raise AuditIntegrityError("runtime recorder differs from its one shared evidence graph")
+    if runtime_chunk(selected, frame.transcript) != encode_message_shelf(source.evidence.transcript):
+        raise AuditIntegrityError("runtime transcript differs from its complete selected shelf")
+    expected_messages = canonical_json(
+        {"messages_json": source.evidence.transcript.messages_json, "current_indexes": source.evidence.transcript.current_indexes}
+    )
+    if runtime_chunk(selected, frame.messages).canonical != expected_messages:
+        raise AuditIntegrityError("runtime messages differ from the shared selected transcript")
+    snapshot, catalog = service._policy_context.build(original.snapshot.actor_user_id)
+    current = catalog.validate_composition_state(state)
+    if canonical_json(current.authored_state.to_dict()) != selected_state:
+        raise AuditIntegrityError("current policy requires authored-state reinspection before runtime restore")
+    composition_scope_for_operation(
+        state,
+        session_id=selected.stack.logical.session_id,
+        session_operation_context=inventory.running.session_operation_context,
+        session_operation_authority=service._require_sessions_service().session_operation_authority,
+    )
+    tools = composer_loop_tool_definitions(service._planner_dialect)
+    if (
+        frame.tools is None
+        or frame.tools.codec != "composer.tools.v1"
+        or runtime_chunk(selected, frame.tools).canonical != canonical_json(tools)
+    ):
+        raise AuditIntegrityError("runtime tool contract changed and requires current reacquisition")
+    if graph.selected_dialect is not None and graph.selected_dialect is not service._planner_dialect:
+        raise AuditIntegrityError("runtime prepared wire dialect changed and requires current reacquisition")
+    values = iteration_values(source.iteration, env_ref_names=names)
+    cache_history = decode_continuation_caches(runtime_chunk(selected, frame.caches), env_ref_names=names)
+    if cache_history.session_id != selected.stack.logical.session_id:
+        raise AuditIntegrityError("runtime cache history belongs to another session")
+    caches = restore_continuation_caches(cache_history, env_ref_names=names)
+    attachments = source.attachments
+    if (frame.persisted_assistant_message_id is None) != (frame.persisted_assistant_content is None):
+        raise AuditIntegrityError("runtime lost its paired persisted assistant identity/content")
+    if any(type(index) is not int or not 0 <= index < len(graph.messages) for index in frame.pending_advisor_elision_indices):
+        raise AuditIntegrityError("runtime pending Advisor elision lost its exact message positions")
+    ceiling = selected.stack.mutation_ceiling.materialize()
+    ceiling.validate_context(inventory.running.session_operation_context)
+    live = _ComposeIterationState(
+        state=state,
+        initial_version=frame.initial_version,
+        llm_messages=graph.messages,
+        tools=tools,
+        recorder=graph.recorder,
+        composition_turns_used=frame.composition_slice,
+        discovery_turns_used=frame.discovery_slice,
+        mutation_success_seen=frame.mutation_success_seen,
+        discovery_cache=caches.discovery,
+        last_validation=current.validation,
+        runtime_preflight_cache=caches.preflight,
+        last_runtime_preflight=caches.last_preflight,
+        anti_anchor=AntiAnchorTracker.for_continuation(source.iteration.anti_anchor),
+        advisor_calls_used=frame.advisor_calls,
+        repair_turns_used=frame.repair_turns,
+        advisor_checkpoint_passes_used=frame.advisor_checkpoint_passes,
+        advisor_review_state=values.advisor_review,
+        persisted_assistant_message_id=frame.persisted_assistant_message_id,
+        persisted_assistant_content=frame.persisted_assistant_content,
+        persisted_tool_call_turn=frame.persisted_tool_call_turn,
+        failed_turn=values.failed_turn,
+        current_state_id=frame.current_state_id,
+        advisor_repair_context_introduced=frame.advisor_repair_context_introduced,
+        pending_advisor_elision_indices=list(frame.pending_advisor_elision_indices),
+        turn_evidence=graph.evidence,
+        continuation_cache_history=caches.history,
+    )
+    bindings = _ComposeIterationBindings(
+        message=original.message,
+        session_id=selected.stack.logical.session_id,
+        user_id=original.snapshot.actor_user_id,
+        user_message_id=selected.stack.logical.original_user_message_id,
+        deadline=monotonic_before_read + source.timing.hard_remaining_seconds,
+        progress=progress,
+        plugin_snapshot=snapshot,
+        policy_catalog=catalog,
+        mutation_ceiling=ceiling,
+        session_operation_context=inventory.running.session_operation_context,
+        completion_gates=original.completion_gates,
+        diagnostics=None,
+        required_work=work,
+        provider_owner=provider_owner,
+        ingress=compartment_ingress_record(original.message, own_compartment_id=service._settings.compartment_id),
+        chat_ingress_inputs=_chat_ingress_inputs_for_compose(
+            original.message,
+            list(original.history),
+            user_message_id=selected.stack.logical.original_user_message_id,
+            own_compartment_id=service._settings.compartment_id,
+        ),
+        actor=f"composer-web:user-{original.snapshot.actor_user_id}",
+        session_scope=f"session:{selected.stack.logical.session_id}",
+    )
+    # A later read can only shorten admission; never use its newer remaining
+    # observation to renew the monotonic anchor or original logical budgets.
+    if finish_read is None:
+        authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+    else:
+        finish_read.require_selection(selected, inventory)
+        finish_read.read_runtime(authority)
+    service._schema_disclosure.restore_session_for_continuation(
+        source.iteration.disclosure,
+        session_id=selected.stack.logical.session_id,
+        catalog_hash=snapshot.snapshot_hash,
+        policy_hash=snapshot.policy_hash,
+    )
+    return RestoredContinuationRuntime(live, bindings, graph, materialization, source, graph.drained, attachments, names)
+""",
+    "runtime.restore_continuation_runtime": r"""async def restore_continuation_runtime(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    progress: ComposerProgressSink | None = None,
+    finish_read: ContinuationFinishRead | None = None,
+) -> RestoredContinuationRuntime:
+    from elspeth.web.composer.service import ComposerServiceImpl
+
+    running = _work_owners(authority, inventory, required_work)
+    if (
+        type(service) is not ComposerServiceImpl
+        or type(provider_owner) is not ProviderInvocationOwner
+        or provider_owner.required_work is not required_work
+        or provider_owner.service is not service._require_sessions_service()
+    ):
+        raise AuditIntegrityError("runtime lost actual current service/provider-work custody")
+    monotonic_before_read = time.monotonic()
+    if finish_read is not None:
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+        if type(finish_read) is not ContinuationFinishRead:
+            raise AuditIntegrityError("runtime restore received a foreign owed-finish facet")
+        finish_read.require_selection(selected, inventory)
+    source = await _registered_read(
+        required_work,
+        ContinuationRuntimeSource,
+        lambda: (
+            authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+            if finish_read is None
+            else finish_read.read_runtime(authority)
+        ),
+    )
+    if type(source) is not ContinuationRuntimeSource:
+        raise AuditIntegrityError("runtime source returned another nominal owner")
+    production = await load_current_message_producers(
+        service=service, authority=authority, selected=selected, inventory=inventory, required_work=required_work, finish_read=finish_read
+    )
+    graph = await restore_current_turn_evidence(
+        service=service,
+        authority=authority,
+        selected=selected,
+        inventory=inventory,
+        required_work=required_work,
+        materialization=production.producers,
+    )
+    result = await _registered_read(
+        required_work,
+        RestoredContinuationRuntime,
+        lambda: _restore_live(
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            work=required_work,
+            provider_owner=provider_owner,
+            source=source,
+            graph=graph,
+            materialization=production.producers,
+            monotonic_before_read=monotonic_before_read,
+            progress=progress,
+            finish_read=finish_read,
+        ),
+    )
+    if type(result) is not RestoredContinuationRuntime:
+        raise AuditIntegrityError("runtime restore returned another nominal owner")
+    return result
+""",
+    "runtime.build_runtime_tool_batch_context": r"""async def build_runtime_tool_batch_context(
+    runtime: RestoredContinuationRuntime,
+    *,
+    cancellation_requested: asyncio.Event,
+    phase_read: _CurrentPhaseRead | None = None,
+) -> ToolBatchContext:
+    if type(runtime) is not RestoredContinuationRuntime or type(cancellation_requested) is not asyncio.Event:
+        raise AuditIntegrityError("runtime dispatch context requires its actual owners")
+    live, bindings = runtime.live, runtime.bindings
+    service = runtime.materialization.service
+    work = bindings.required_work
+    if type(work) is not RequiredWorkBinding:
+        raise AuditIntegrityError("runtime context lost its required-work binding")
+    authority = runtime.materialization.authority
+    selected, inventory = runtime.source.selected, runtime.materialization.inventory
+    finish_read: ContinuationFinishRead | None = None
+    if phase_read is not None:
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+        if (
+            type(phase_read) is not _CurrentPhaseRead
+            or phase_read.runtime is not runtime
+            or phase_read.selected is not selected
+            or type(phase_read.inventory) is not CurrentContinuationEnvInventory
+        ):
+            raise AuditIntegrityError("runtime context replaced its actual phase read cohort")
+        inventory, finish_read = phase_read.inventory, phase_read.finish_read
+        if finish_read is not None:
+            if type(finish_read) is not ContinuationFinishRead:
+                raise AuditIntegrityError("runtime context received a foreign owed-read facet")
+            finish_read.require_selection(selected, inventory)
+    running = _work_owners(authority, inventory, work)
+    if (
+        bindings.session_operation_context is not running.session_operation_context
+        or bindings.session_id != str(running.claim.session_id)
+        or selected.stack.logical.session_id != str(running.claim.session_id)
+        or selected.stack.logical.operation_id != running.claim.operation_id
+        or (finish_read is not None and finish_read.running is not running)
+    ):
+        raise AuditIntegrityError("runtime context crossed its actual phase session/current owner")
+
+    def read_source() -> ContinuationRuntimeSource:
+        if finish_read is not None:
+            finish_read.require_selection(selected, inventory)
+            source = finish_read.read_runtime(authority)
+        else:
+            source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+        if type(source) is not ContinuationRuntimeSource or source.selected is not selected:
+            raise AuditIntegrityError("runtime context lost its actual selected SQL read")
+        return source
+
+    sessions = service._require_sessions_service()
+    await _registered_read(work, ContinuationRuntimeSource, read_source)
+    sid = UUID(runtime.source.selected.stack.logical.session_id)
+    preferences = await sessions.get_composer_preferences(sid)
+    await _registered_read(work, ContinuationRuntimeSource, read_source)
+    ceiling = bindings.mutation_ceiling
+    if ceiling is None or bindings.session_operation_context is not running.session_operation_context:
+        raise AuditIntegrityError("runtime context lost its original mutation ceiling/current fence")
+    ceiling.validate_context(running.session_operation_context)
+    if ceiling.request_id != live.turn_evidence.request_id:
+        raise AuditIntegrityError("runtime dispatch crossed its original logical request")
+    return ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
+        ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=live.recorder,
+        anti_anchor=live.anti_anchor,
+        discovery_cache=live.discovery_cache,
+        runtime_preflight_cache=live.runtime_preflight_cache,
+        session_id=bindings.session_id,
+        session_operation_context=bindings.session_operation_context,
+        user_id=bindings.user_id,
+        user_message_id=bindings.user_message_id,
+        user_message_content=bindings.message,
+        current_state_id=live.current_state_id,
+        actor=bindings.actor,
+        initial_version=live.initial_version,
+        deadline=bindings.deadline,
+        progress=bindings.progress,
+        session_scope=bindings.session_scope,
+        turn_sessions_service=sessions,
+        turn_session_uuid=sid,
+        turn_preferences=preferences,
+        mutation_ceiling=ceiling,
+        review_required=not ceiling.permits_auto(preferences.trust_mode),
+        cancellation_requested=cancellation_requested,
+        plugin_snapshot=bindings.plugin_snapshot,
+        policy_catalog=bindings.policy_catalog,
+        tool_contract_dialect=service._planner_dialect,
+        turn_evidence=live.turn_evidence,
+        session_operation_authority=sessions.session_operation_authority,
+        provider_owner=bindings.provider_owner,
+        composition_turns_used=live.composition_turns_used,
+        discovery_turns_used=live.discovery_turns_used,
+        failed_turn=live.failed_turn,
+        message_producers=runtime.materialization,
+    )
+""",
+    "first.FirstRuntimeGraph": r"""@dataclass(frozen=True, slots=True)
+class FirstRuntimeGraph:
+    source: FirstRuntimeSources
+    graph: RestoredTurnEvidence
+    materialization: CurrentContinuationMessageProducers
+""",
+    "first._restore_first_graph": r"""def _restore_first_graph(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    work: RequiredWorkBinding,
+    expected: FirstRuntimeSources,
+) -> FirstRuntimeGraph:
+    _require_current_reader_service(service, authority)
+    running = _work_owners(authority, inventory, work)
+    with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+        before = read_first_runtime_sources_on_connection(conn, service, running, selected=selected, inventory=inventory)
+        _require_same_sources(expected, before)
+    # Nothing from the ended SQL window is a live admission capability.
+    # These are provisional values; all DATA are independently reread below.
+    inputs, snapshot = before.inputs, before.runtime.evidence
+    producer = CurrentContinuationMessageProducers(service, authority, selected, inventory, inputs)
+    producer.require_context(
+        session_id=selected.stack.logical.session_id,
+        context=running.session_operation_context,
+        actor_user_id=inputs.bootstrap.actor_user_id,
+    )
+    evidence, initial, latest = _begin_current_evidence(snapshot, context=running.session_operation_context)
+    history = AdvisorTranscriptOwner._continuation_history(
+        snapshot.transcript,
+        session_id=snapshot.session_id,
+        actor_user_id=snapshot.actor_user_id,
+        request_id=snapshot.request_id,
+        request=snapshot.transcript.request,
+    )
+    # Actual initial/policy/schema/content-scope callbacks remain outside SQL.
+    shelf = producer._rebuild_shelf(snapshot.transcript, inputs=inputs)
+    evidence.transcript, messages = AdvisorTranscriptOwner._from_continuation_shelf(
+        snapshot.transcript, request=snapshot.transcript.request, history=history, shelf=shelf
+    )
+    reader = CurrentTranscriptBlobReader.from_service(
+        service, session_id=str(running.claim.session_id), context=running.session_operation_context
+    )
+    graph = _finish_current_evidence(
+        inputs.admitted_evidence,
+        context=running.session_operation_context,
+        owner=evidence,
+        initial=initial,
+        latest=latest,
+        messages=messages,
+        reader=reader,
+        env_ref_names=inventory.names,
+    )
+    # This fresh complete SQL window is AFTER shelf/graph callbacks and BEFORE
+    # any live callback. No earlier currentness/decode survives as authority.
+    with locked_session_transaction(authority._engine, str(running.claim.session_id)) as conn:
+        after = read_first_runtime_sources_on_connection(conn, service, running, selected=selected, inventory=inventory)
+        _require_same_sources(before, after)
+    return FirstRuntimeGraph(expected, graph, producer)
+""",
+    "first._registered_graph": r"""async def _registered_graph(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    work: RequiredWorkBinding,
+    expected: FirstRuntimeSources,
+) -> FirstRuntimeGraph:
+    sql, projection = work.reserve_pair(RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_READ_PROJECTION)
+    try:
+        outcome = await run_required_sql_finish_once(
+            sql,
+            _restore_first_graph,
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            work=work,
+            expected=expected,
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    # The original evidence projection owns nominality, error grouping and
+    # identity-deduplicated deferred cancellation before any live submission.
+    return _finish_evidence_projection(work, sql, projection, outcome, expected=FirstRuntimeGraph)
+""",
+    "first.restore_first_continuation_runtime": r"""async def restore_first_continuation_runtime(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: SelectedContinuationState,
+    inventory: CurrentContinuationEnvInventory,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    progress: ComposerProgressSink | None = None,
+) -> RestoredContinuationRuntime:
+    from elspeth.web.composer.service import ComposerServiceImpl
+
+    _work_owners(authority, inventory, required_work)
+    if (
+        type(service) is not ComposerServiceImpl
+        or type(provider_owner) is not ProviderInvocationOwner
+        or provider_owner.required_work is not required_work
+        or provider_owner.service is not service._require_sessions_service()
+    ):
+        raise AuditIntegrityError("runtime lost actual current service/provider-work custody")
+    monotonic_before_read = time.monotonic()
+    source = await _registered_read(
+        required_work,
+        FirstRuntimeSources,
+        lambda: _read_first_sources(service=service, authority=authority, selected=selected, inventory=inventory, work=required_work),
+    )
+    # Real pre-callback finish-once/projection handoff: cancellation retained
+    # during source/loading work is raised BEFORE the graph worker can start.
+    # The graph worker performs a NEW current read after this await; source is
+    # comparison DATA only, never cross-window currentness or a renewed clock.
+    restored = await _registered_graph(
+        service=service, authority=authority, selected=selected, inventory=inventory, work=required_work, expected=source
+    )
+    # REQUIRED cancellation/error/projection handoff: the actual existing
+    # finish-once owner raises originals BEFORE this second worker is submitted.
+    # Never combine these operations in a single noncancellable worker.
+    return await _registered_read(
+        required_work,
+        RestoredContinuationRuntime,
+        lambda: _restore_live(
+            service=service,
+            authority=authority,
+            selected=selected,
+            inventory=inventory,
+            work=required_work,
+            provider_owner=provider_owner,
+            source=restored.source.runtime,
+            graph=restored.graph,
+            materialization=restored.materialization,
+            monotonic_before_read=monotonic_before_read,
+            progress=progress,
+        ),
+    )
+""",
+    "phases.ContinuationLivePhases._tool_context": r"""async def _tool_context(self, runtime: RestoredContinuationRuntime) -> ToolBatchContext:
+    context = await build_runtime_tool_batch_context(runtime, cancellation_requested=self.cancellation_requested)
+    owner = self.work.coordinator.sql_deadline_owner
+    if owner is not None:
+        if owner.running is not runtime.materialization.inventory.running:
+            raise AuditIntegrityError("tool context changed its actual original timing owner")
+        now = time.monotonic()
+        remaining = owner.remaining_dispatch(monotonic_now=now)
+        if remaining <= 0:
+            raise TimeoutError("tool action exhausted its original dispatch allowance")
+        context = replace(context, deadline=min(context.deadline, now + remaining))
+    return context
+""",
+    "phases.ContinuationLivePhases.bind_initial": r"""def bind_initial(self, runtime: RestoredContinuationRuntime) -> None:
+    if (
+        self.runtime is not None
+        or type(runtime) is not RestoredContinuationRuntime
+        or runtime.materialization.service is not self.service
+        or runtime.materialization.authority is not self.authority
+        or runtime.bindings.required_work is not self.work
+        or runtime.bindings.provider_owner is not self.provider_owner
+    ):
+        raise AuditIntegrityError("live phase initialization changed its actual runtime owners")
+    self.runtime = runtime
+""",
+    "phases.ContinuationLivePhases.current": r"""async def current(self, selected: SelectedContinuationState) -> tuple[RestoredContinuationRuntime, CurrentContinuationEnvInventory]:
+    phase = await self._current_phase_read(selected)
+    return phase.runtime, phase.inventory
+""",
+    "phases.ContinuationLivePhases._current_phase_read": r"""async def _current_phase_read(self, selected: SelectedContinuationState) -> _CurrentPhaseRead:
+    running = self.work.running
+    if type(running) is not ComposerOperationRunning or running.session_operation_context is not self.lease.context:
+        raise AuditIntegrityError("live phase lost its actual running/physical owner")
+    finish_read: ContinuationFinishRead | None = None
+    try:
+        inventory = await materialize_continuation_env_inventory(
+            advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
+        )
+    except ComposerOperationCancelledDuringTurn:
+        names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
+        inventory = CurrentContinuationEnvInventory(
+            running,
+            ContinuationEnvSelection(selected.checkpoint_id, selected.stack.cursor, encode_continuation_snapshot(selected.stack)),
+            names,
+        )
+        finish_read = ContinuationFinishRead(running, selected, inventory)
+
+    def read_source() -> ContinuationRuntimeSource:
+        nonlocal finish_read
+        if finish_read is not None:
+            return finish_read.read_runtime(self.authority)
+        try:
+            return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+        except ComposerOperationCancelledDuringTurn:
+            finish_read = ContinuationFinishRead(running, selected, inventory)
+            return finish_read.read_runtime(self.authority)
+
+    source = await _registered_read(self.work, ContinuationRuntimeSource, read_source)
+    if self.runtime is None:
+        self.runtime = await restore_continuation_runtime(
+            service=self.service,
+            authority=self.authority,
+            selected=selected,
+            inventory=inventory,
+            required_work=self.work,
+            provider_owner=self.provider_owner,
+            finish_read=finish_read,
+        )
+    elif self.runtime.source.selected != selected:
+        runtime = self.runtime
+
+        def refresh() -> RestoredContinuationRuntime:
+            fresh = read_source()
+            _require_runtime_source_refresh(source, fresh)
+            runtime.materialization.advance_current(selected, inventory)
+            following = replace(runtime, source=fresh)
+            # Retain the actual fresh source before the async SQL bridge can
+            # defer cancellation. No live messages/graph objects are rebuilt.
+            self.runtime = following
+            return following
+
+        await _registered_read(self.work, RestoredContinuationRuntime, refresh)
+    else:
+        # Same SQL cut can arrive as a fresh selected object, including a
+        # warm owner which has just observed durable Stop. Carry that
+        # exact read choice without replacing live owners or their clocks.
+        _require_runtime_source_refresh(self.runtime.source, source)
+        self.runtime = replace(self.runtime, source=source)
+    if self.runtime is None:
+        raise AuditIntegrityError("live phase source lost its actual runtime")
+    if self.runtime.source.selected is not selected:
+        raise AuditIntegrityError("live phase read lost its actual fresh selection")
+    if finish_read is not None:
+        finish_read.require_selection(selected, inventory)
+    return _CurrentPhaseRead(self.runtime, selected, inventory, finish_read)
+""",
+    "phases.ContinuationLivePhases._retain": r"""async def _retain(
+    self, captured: CapturedContinuationRuntime, inventory: CurrentContinuationEnvInventory, transition: BatchTransition
+) -> None:
+    def retain() -> StoredContinuationSnapshot:
+        stored = retain_batch_transition(
+            self.authority, inventory.running, captured=captured, inventory=inventory, transition=transition
+        )
+        # Preserve the actual committing owner's return on its physical
+        # thread before bridge delivery can surface a caller cancellation.
+        self.latest_snapshot = stored
+        return stored
+
+    stored = await _registered(
+        work=self.work,
+        source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+        operation=retain,
+        expected=StoredContinuationSnapshot,
+    )
+    selected = await load_selected_continuation(
+        authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+    )
+    await self.current(selected)
+""",
+    "phases.ContinuationLivePhases._execute_one_owned": r"""async def _execute_one_owned(self, selected: SelectedContinuationState) -> None:
+    runtime, inventory = await self.current(selected)
+    data = runtime.graph.batch
+    if data is None:
+        raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
+    result = await self._primary_for_phase(runtime, inventory, selected)
+    batch, accumulator, live = data.batch, data.accumulator, runtime.live
+    if batch.phase != "call_ready" or batch.current_call is not None or batch.next_tool_index >= len(data.calls):
+        raise AuditIntegrityError("live dispatch lost its actual unissued next call")
+    context = await self._tool_context(runtime)
+    call = ContinuationCallState(batch.next_tool_index, data.calls[batch.next_tool_index], batch.state, batch.state.version)
+    batch.current_call, batch.phase = call, "call_active"
+    preparation = await _prepare_continuation_call_live(
+        call_model=result.outcome, ctx=context, llm_messages=live.llm_messages, batch=batch, call=call
+    )
+    issued_effect_key: str | None = None
+    if preparation == "prepared":
+        if call.audit is None:
+            raise AuditIntegrityError("tool preparation lost its actual dispatch audit")
+        # Prepared DATA precedes the SQL issue owner. The canonical writer
+        # binds this locator to its actual checkpoint/event/physical fence;
+        # it must never be injected into the pure prepared call codec.
+        issued_effect_key = f"tool:{result.response.reference.digest}:{call.index}"
+        self.runtime = runtime = replace(
+            runtime,
+            graph=runtime.graph.with_selected_dispatch(
+                capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
+            ),
+        )
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        top = captured.stack.frames[-1]
+        if type(top) is not ToolBatchFrame:
+            raise AuditIntegrityError("prepared tool capture changed its actual frame family")
+        root = captured.stack.model_copy(
+            update={
+                "frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "effect_reconciling"})),
+                "effect_frontier": (
+                    *captured.stack.effect_frontier,
+                    EffectFrontierEntry(effect_id=issued_effect_key, disposition="dispatched", receipt_id=None),
+                ),
+            }
+        )
+        await self._retain(CapturedContinuationRuntime(selected, root, captured.chunks), inventory, "tool_issued")
+        self.failure_custody = ContinuationToolFailureCustody(
+            inventory.running, self.work, result.response, batch, data.calls, live.recorder, call
+        )
+        await _execute_continuation_call_live(
+            call_model=result.outcome,
+            ctx=context,
+            acc=accumulator,
+            llm_messages=live.llm_messages,
+            batch=batch,
+            call=call,
+            failure_custody=self.failure_custody,
+        )
+    if preparation == "stop":
+        batch.current_call, batch.phase = None, "dispatch_ready"
+        return
+    batch.next_tool_index += 1
+    batch.current_call = None
+    batch.phase = "dispatch_ready" if batch.stop_issued_batch or batch.next_tool_index == len(data.calls) else "call_ready"
+    live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = (
+        batch.state,
+        batch.last_validation,
+        batch.last_runtime_preflight,
+        batch.advisor_calls_used,
+    )
+    if batch.service_failure is not None:
+        custody = self.failure_custody
+        if preparation != "prepared" or custody is None or issued_effect_key is None or self.runtime is None:
+            raise AuditIntegrityError("service completion lost its actual issued native phase")
+        if self.terminal_completion is not None:
+            raise AuditIntegrityError("service completion cannot replace another native terminal owner")
+        try:
+            self.terminal_completion = TerminalServiceCompletion(custody, self.runtime, context, result.outcome, issued_effect_key)
+            # This failed batch cannot be encoded or restored. Its last valid
+            # issued SQL cut is only a source bookmark for terminal P4 proof.
+            await self._persist_batch(self.runtime.source.selected)
+        except BaseException as error:
+            combined = custody.failure(error)
+            if combined is error:
+                raise
+            raise combined from combined.__cause__
+        return
+    if self.runtime is None:
+        raise AuditIntegrityError("completed tool lost its retained runtime")
+    runtime = self.runtime
+    inventory = runtime.materialization.inventory
+    selected = runtime.source.selected
+    self.runtime = runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
+    captured = (
+        await self._capture_issued_finish(runtime, selected=selected, inventory=inventory)
+        if preparation == "prepared"
+        else await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+    )
+    top = captured.stack.frames[-1]
+    if type(top) is not ToolBatchFrame:
+        raise AuditIntegrityError("completed tool capture changed its actual frame family")
+    root = captured.stack.model_copy(update={"frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "tool_ready"}))})
+    if preparation == "prepared":
+        if issued_effect_key is None:
+            raise AuditIntegrityError("completed tool lost its actual issued effect locator")
+        receipt = f"tool-result:{top.accumulator.digest}"
+        root = root.model_copy(
+            update={
+                "effect_frontier": tuple(
+                    EffectFrontierEntry(effect_id=entry.effect_id, disposition="committed", receipt_id=receipt)
+                    if entry.effect_id == issued_effect_key
+                    else entry
+                    for entry in root.effect_frontier
+                ),
+                "frames": (
+                    *root.frames[:-1],
+                    root.frames[-1].model_copy(update={"settled_effect_ids": (*top.settled_effect_ids, issued_effect_key)}),
+                ),
+            }
+        )
+    await self._retain(
+        CapturedContinuationRuntime(selected, root, captured.chunks),
+        inventory,
+        "tool_completed" if preparation == "prepared" else "tool_preparation_completed",
+    )""",
+    "initial._bind_first_state_on_connection": r'''def _bind_first_state_on_connection(
+    conn: Connection,
+    service: ComposerServiceImpl,
+    running: ComposerOperationRunning,
+    runtime: RestoredContinuationRuntime,
+) -> RestoredContinuationRuntime:
+    """Join the *proven first cut* to its already restored actual evidence state.
+
+    This is not an equality-based general alias restoration. The real event,
+    full forward transition, original references and absence of provider/batch
+    progress are admitted on this current connection before the one assignment.
+    """
+    selected, inventory = runtime.source.selected, runtime.materialization.inventory
+    source = read_composition_initialization_source_on_connection(conn, service, running, selected=selected, inventory=inventory)
+    if not source.initialized or runtime.graph.batch is not None:
+        raise AuditIntegrityError("first-state alias join requires its actual unconsumed initialization event")
+    frame = selected.stack.frames[0]
+    effects = runtime.graph.evidence.effects
+    reader = runtime.graph.evidence.transcript._blob_reader
+    if (
+        type(frame) is not ComposeFrame
+        or frame.initial_state != frame.state
+        or effects.initial_state is not effects.latest_verified_state
+        or canonical_json(effects.initial_state.to_dict()) != source.original.snapshot.initial_state_json
+        or canonical_json(runtime.live.state.to_dict()) != source.original.snapshot.initial_state_json
+        or runtime.live.turn_evidence is not runtime.graph.evidence
+        or runtime.live.llm_messages is not runtime.graph.messages
+        or runtime.live.recorder is not runtime.graph.recorder
+        or runtime.bindings.session_operation_context is not running.session_operation_context
+        or type(reader) is not CurrentTranscriptBlobReader
+        or reader.service is not service
+        or reader.context is not running.session_operation_context
+    ):
+        raise AuditIntegrityError("first-state alias join changed the actual current shared graph/reader")
+    reader.require_for_evidence(runtime.graph.evidence)
+    runtime.live.state = effects.initial_state
+    from elspeth.web.sessions.continuation_composition_initialization import _read_composition_initialization_source_on_connection
+
+    # Repeat EVERY actual current/original/event/TITLE SQL predicate after the
+    # pure alias assignment. Only the first-value pure projection is shared:
+    # its complete selected/chunk/original inputs must remain exactly equal
+    # on this same connection; a changed metadata input refuses, never renews.
+    after = _read_composition_initialization_source_on_connection(conn, service, running, selected=selected, inventory=inventory)
+    if not source.same_original_source(after) or source.original != after.original:
+        raise AuditIntegrityError("first-state alias changed its actual complete current source")
+    return runtime
+''',
+    "initial._consume": r"""async def _consume(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: StoredContinuationSnapshot,
+    work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    progress: ComposerProgressSink | None,
+) -> RestoredContinuationRuntime:
+    running = work.running
+    if type(running) is not ComposerOperationRunning:
+        raise AuditIntegrityError("first Compose consumption lost its actual current running owner")
+    complete = await load_selected_continuation(authority=authority, running=running, selected=selected, required_work=work)
+    inventory = await materialize_continuation_env_inventory(
+        advisor=service._advisor_checkpoint, authority=authority, selected=complete, required_work=work
+    )
+    runtime = await restore_continuation_runtime(
+        service=service,
+        authority=authority,
+        selected=complete,
+        inventory=inventory,
+        required_work=work,
+        provider_owner=provider_owner,
+        progress=progress,
+    )
+    running = _work_owners(authority, inventory, work)
+
+    def bind() -> RestoredContinuationRuntime:
+        with locked_session_transaction(_sessions(service)._engine, str(running.claim.session_id)) as conn:
+            return _bind_first_state_on_connection(conn, service, running, runtime)
+
+    return await _registered(
+        work=work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=bind, expected=RestoredContinuationRuntime
+    )
+""",
+    "initial.initialize_continuation_composition": r"""async def initialize_continuation_composition(
+    *,
+    service: ComposerServiceImpl,
+    authority: ComposerAsyncOperationAuthority,
+    selected: StoredContinuationSnapshot,
+    required_work: RequiredWorkBinding,
+    provider_owner: ProviderInvocationOwner,
+    progress: ComposerProgressSink | None = None,
+) -> RestoredContinuationRuntime:
+    if (
+        type(service) is not ComposerServiceImpl
+        or type(authority) is not ComposerAsyncOperationAuthority
+        or type(selected) is not StoredContinuationSnapshot
+        or type(required_work) is not RequiredWorkBinding
+        or type(provider_owner) is not ProviderInvocationOwner
+        or provider_owner.required_work is not required_work
+        or provider_owner.service is not _sessions(service)
+        or _sessions(service)._engine is not authority._engine
+    ):
+        raise AuditIntegrityError("first Compose initialization requires actual service/SQL/provider-work owners")
+    running = required_work.running
+    custody = required_work.coordinator.authority
+    if (
+        type(running) is not ComposerOperationRunning
+        or custody.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+        or custody.durable_operation_id != running.claim.operation_id
+        or custody.claim_attempt != running.claim.attempt
+    ):
+        raise AuditIntegrityError("first Compose initialization changed its current required-work claim")
+    required_work.validate_context(running.session_operation_context)
+    root = decode_continuation_snapshot(selected.payload_json)
+    policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
+    clock = ContinuationActionClock(policy.actions.session_sql)
+    clock.finish_preparation()
+
+    async def prepare() -> PreparedCompositionInitialization | CurrentCompositionInitializationSource:
+        return await _prepare(service=service, authority=authority, selected=selected, work=required_work)
+
+    prepared = await clock.run("physical", prepare)
+
+    async def retain_and_consume() -> RestoredContinuationRuntime:
+        current = selected
+        if type(prepared) is PreparedCompositionInitialization:
+            current = await _registered(
+                work=required_work,
+                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+                operation=lambda: authority.publish_composition_initialization(
+                    running, composer=service, owners=prepared.owners, captured=prepared.captured
+                ),
+                expected=StoredContinuationSnapshot,
+            )
+        return await _consume(
+            service=service, authority=authority, selected=current, work=required_work, provider_owner=provider_owner, progress=progress
+        )
+
+    runtime = await clock.run("retention", retain_and_consume)
+    if type(prepared) is PreparedCompositionInitialization:
+        await emit_progress(
+            progress,
+            ComposerProgressEvent(
+                phase="starting",
+                headline="I'm reading your request and current pipeline.",
+                evidence=(
+                    "The current pipeline state is prepared for the composer.",
+                    "The pipeline composer skill pack and deployment overlay are included.",
+                ),
+                likely_next="ELSPETH will ask the model for the next safe pipeline action.",
+            ),
+        )
+    return runtime
+""",
+    "driver._SegmentDriver.__init__": r"""def __init__(
+    self, worker: ComposerAsyncWorker, services: ComposerAppServices, running: ComposerOperationRunning, lease: SessionOperationLease
+):
+    if type(services.composer_service) is not ComposerServiceImpl or type(lease.required_work) is not RequiredWorkCoordinator:
+        raise AuditIntegrityError("V2 driver requires its actual Composer and required-work owners")
+    if lease.context is not running.session_operation_context:
+        raise AuditIntegrityError("V2 driver changed its exact started context")
+    self.worker, self.services, self.running, self.lease = worker, services, running, lease
+    self.service = services.composer_service
+    self.authority = services.composer_operation_authority
+    self.work = RequiredWorkBinding(lease.required_work, 0, 0, RequiredWorkRole.TURN, running)
+    self.provider = ProviderInvocationOwner(service=services.session_service, required_work=self.work)
+    self.phases = ContinuationLivePhases(self.service, self.authority, self.work, self.provider, lease)
+    sql_deadline = lease.required_work.sql_deadline_owner
+    if sql_deadline is None:
+        raise AuditIntegrityError("V2 driver lost its actual SQL timing owner")
+    self.sql_deadline = sql_deadline
+    self._consumed_native: list[BaseException] = []
+    self._committed_failure: CommittedContinuationFailure | None = None
+""",
+    "driver._SegmentDriver.advance": r"""async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> MessageWithStateResponse | None:
+    root, top = selected.stack, selected.stack.frames[-1]
+    if type(top) is InitializeFrame:
+        if top.ingress_phase == "reserved":
+            if root.logical.kind != "compose_message":
+                await self.service.advance_continuation_phase(
+                    owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider
+                )
+                return None
+            request = SendMessageRequest.model_validate_json(top.request_json)
+            sql, projection = self.work.reserve_pair(RequiredWorkSource.INGRESS_SQL, RequiredWorkSource.INGRESS_PROJECTION)
+            try:
+                ingress_result = await self.services.session_service.add_message_with_transcript(
+                    self.running.claim.session_id,
+                    "user",
+                    request.content,
+                    operation_id=UUID(self.running.claim.operation_id),
+                    requested_state_id=request.state_id,
+                    composition_state_id=request.state_id,
+                    writer_principal="route_user_message",
+                    session_operation_context=self.running.session_operation_context,
+                    running=self.running,
+                    required_work=sql,
+                    continuation=stored,
+                )
+                if type(ingress_result) is not ContinuationIngressCheckpoint:
+                    raise AuditIntegrityError("V2 ingress returned another actual owner")
+            except BaseException as original:
+                projection.complete_owned(original)
+                raise
+            projection.complete_owned()
+            return None
+        if top.ingress_phase == "inserted":
+            await prepare_pretitle_bootstrap(service=self.service, authority=self.authority, selected=stored, required_work=self.work)
+            return None
+        if top.ingress_phase == "title_pending":
+            if top.provider_effect_key is None:
+                prepared = await prepare_current_title_provider(
+                    service=self.service, authority=self.authority, selected=stored, required_work=self.work
+                )
+                await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)
+            else:
+                current = await settle_current_title_result(service=self.service, running=self.running, required_work=self.work)
+                await apply_current_title_success(service=self.service, selected=current.selected, required_work=self.work)
+            return None
+        runtime = await initialize_continuation_composition(
+            service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
+        )
+        self.phases.bind_initial(runtime)
+        return None
+    if type(top) is ComposeFrame and top.phase == "action_ready":
+        if self.phases.runtime is None:
+            runtime = await initialize_continuation_composition(
+                service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
+            )
+            self.phases.bind_initial(runtime)
+        else:
+            runtime, _inventory = await self.phases.current(selected)
+        policy = runtime.source.policy
+        # This packet owns delivery preflight only. The current SQL-backed
+        # PRIMARY factory separately admits its original producer messages.
+        _messages, _tools, delivery, _delivery_input = self.service._prepare_primary_delivery(
+            messages=runtime.live.llm_messages,
+            tools=runtime.live.tools,
+            recorder=runtime.live.recorder,
+            turn_evidence=runtime.live.turn_evidence,
+            state=runtime.live.state,
+            failed_turn=runtime.live.failed_turn,
+        )
+        primary_result = await run_continuation_primary(
+            service=self.service,
+            authority=self.authority,
+            selected=runtime.source.selected,
+            producers=runtime.materialization,
+            messages=runtime.live.llm_messages,
+            tools=runtime.live.tools,
+            recorder=runtime.live.recorder,
+            drained=runtime.drained,
+            required_work=self.work,
+            provider_owner=self.provider,
+            timeout=policy.actions.primary.total,
+        )
+        if delivery is not None:
+            runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
+        self.phases.accept_primary(primary_result)
+        return None
+    await self.service.advance_continuation_phase(
+        owner=self.phases, authority=self.authority, selected=selected, work=self.work, provider_owner=self.provider
+    )
+    return None
+""",
+    "service.ComposerServiceImpl._dispatch_tool_batch": r'''async def _dispatch_tool_batch(
+    self,
+    *,
+    call_model: _CallModelOutcome,
+    mutation_ceiling: ComposerMutationCeiling | None,
+    state: CompositionState,
+    last_validation: ValidationSummary | None,
+    last_runtime_preflight: ValidationResult | None,
+    llm_messages: list[dict[str, Any]],
+    recorder: BufferingRecorder,
+    anti_anchor: AntiAnchorTracker,
+    discovery_cache: dict[str, _CachedDiscoveryPayload],
+    runtime_preflight_cache: _RuntimePreflightCache,
+    session_id: str | None,
+    session_operation_context: SessionOperationContext | None = None,
+    user_id: str | None,
+    user_message_id: str | None,
+    user_message_content: str | None,
+    current_state_id: str | None,
+    actor: str,
+    initial_version: int,
+    deadline: float,
+    progress: ComposerProgressSink | None,
+    session_scope: str,
+    advisor_calls_used: int,
+    cancellation_requested: asyncio.Event,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+    composition_turns_used: int,
+    discovery_turns_used: int,
+    failed_turn: FailedTurnMetadata | None,
+    provider_owner: ProviderInvocationOwner | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    message_producers: CurrentContinuationMessageProducers | None = None,
+) -> tuple[_DispatchOutcome, int]:
+    """Phase P3 of the compose loop — delegates to :func:`tool_batch.run_tool_batch`."""
+    from elspeth.web.composer.tool_batch import (
+        BatchAccumulator,
+        ToolBatchContext,
+        ToolBatchCustody,
+        ToolBatchProvenance,
+        run_tool_batch,
+    )
+
+    turn_sessions_service = self._require_sessions_service() if session_id is not None else None
+    turn_session_uuid = UUID(session_id) if session_id is not None else None
+    turn_preferences = (
+        await turn_sessions_service.get_composer_preferences(turn_session_uuid)
+        if turn_sessions_service is not None and turn_session_uuid is not None
+        else None
+    )
+    review_required = False
+    if turn_session_uuid is not None:
+        if type(mutation_ceiling) is not ComposerMutationCeiling or turn_preferences is None:
+            raise AuditIntegrityError("Session mutation dispatch lost its request ceiling")
+        if mutation_ceiling.session_id != str(turn_session_uuid):
+            raise AuditIntegrityError("Mutation dispatch crossed sessions")
+        if session_operation_context is not None:
+            mutation_ceiling.validate_context(session_operation_context)
+        if turn_evidence is not None and mutation_ceiling.request_id != turn_evidence.request_id:
+            raise AuditIntegrityError("Mutation dispatch crossed logical requests")
+        review_required = not mutation_ceiling.permits_auto(turn_preferences.trust_mode)
+    elif mutation_ceiling is not None:
+        raise AuditIntegrityError("Sessionless mutation dispatch received a mutation ceiling")
+    ctx = ToolBatchContext(
+        session_tools=self._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=self._model,
+            provider=self._availability.provider,
+            skill_hash=self._composer_skill_hash,
+        ),
+        custody=ToolBatchCustody(
+            data_dir=self._data_dir,
+            session_engine=self._session_engine,
+            secret_service=self._secret_service,
+            secret_wiring_policy=self._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=self._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=self._redaction_telemetry,
+        preflight=self._preflight,
+        schema_disclosure=self._schema_disclosure,
+        advisor_checkpoint=self._advisor_checkpoint,
+        provider_owner=provider_owner,
+        advisor_max_calls_per_compose=self._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=self._settings.composer_advisor_timeout_seconds,
+        recorder=recorder,
+        anti_anchor=anti_anchor,
+        discovery_cache=discovery_cache,
+        runtime_preflight_cache=runtime_preflight_cache,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        user_id=user_id,
+        user_message_id=user_message_id,
+        user_message_content=user_message_content,
+        current_state_id=current_state_id,
+        actor=actor,
+        initial_version=initial_version,
+        deadline=deadline,
+        progress=progress,
+        session_scope=session_scope,
+        turn_sessions_service=turn_sessions_service,
+        turn_session_uuid=turn_session_uuid,
+        turn_preferences=turn_preferences,
+        mutation_ceiling=mutation_ceiling,
+        review_required=review_required,
+        cancellation_requested=cancellation_requested,
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        tool_contract_dialect=self._planner_dialect,
+        session_operation_authority=(turn_sessions_service.session_operation_authority if turn_sessions_service is not None else None),
+        composition_turns_used=composition_turns_used,
+        discovery_turns_used=discovery_turns_used,
+        failed_turn=failed_turn,
+        turn_evidence=turn_evidence,
+        message_producers=message_producers,
+    )
+    acc = BatchAccumulator(
+        state=state,
+        last_validation=last_validation,
+        last_runtime_preflight=last_runtime_preflight,
+        advisor_calls_used=advisor_calls_used,
+    )
+    return await run_tool_batch(
+        call_model=call_model,
+        ctx=ctx,
+        acc=acc,
+        llm_messages=llm_messages,
+    )
+''',
+    "service.ComposerServiceImpl._advance_live_compose_iteration": r"""async def _advance_live_compose_iteration(
+    self,
+    live: _ComposeIterationState,
+    bindings: _ComposeIterationBindings,
+) -> ComposerResult | None:
+    state = live.state
+    initial_version = live.initial_version
+    llm_messages = live.llm_messages
+    tools = live.tools
+    recorder = live.recorder
+    composition_turns_used = live.composition_turns_used
+    discovery_turns_used = live.discovery_turns_used
+    mutation_success_seen = live.mutation_success_seen
+    discovery_cache = live.discovery_cache
+    last_validation = live.last_validation
+    runtime_preflight_cache = live.runtime_preflight_cache
+    last_runtime_preflight = live.last_runtime_preflight
+    anti_anchor = live.anti_anchor
+    advisor_calls_used = live.advisor_calls_used
+    repair_turns_used = live.repair_turns_used
+    advisor_checkpoint_passes_used = live.advisor_checkpoint_passes_used
+    advisor_review_state = live.advisor_review_state
+    persisted_assistant_message_id = live.persisted_assistant_message_id
+    persisted_assistant_content = live.persisted_assistant_content
+    persisted_tool_call_turn = live.persisted_tool_call_turn
+    failed_turn = live.failed_turn
+    current_state_id = live.current_state_id
+    advisor_repair_context_introduced = live.advisor_repair_context_introduced
+    pending_advisor_elision_indices = live.pending_advisor_elision_indices
+    turn_evidence = live.turn_evidence
+    message = bindings.message
+    session_id = bindings.session_id
+    user_id = bindings.user_id
+    user_message_id = bindings.user_message_id
+    deadline = bindings.deadline
+    progress = bindings.progress
+    plugin_snapshot = bindings.plugin_snapshot
+    policy_catalog = bindings.policy_catalog
+    mutation_ceiling = bindings.mutation_ceiling
+    session_operation_context = bindings.session_operation_context
+    completion_gates = bindings.completion_gates
+    diagnostics = bindings.diagnostics
+    required_work = bindings.required_work
+    provider_owner = bindings.provider_owner
+    ingress = bindings.ingress
+    # The bindings hold a frozen sequence; the audit path takes its own list.
+    chat_ingress_inputs = None if bindings.chat_ingress_inputs is None else list(bindings.chat_ingress_inputs)
+    actor = bindings.actor
+    session_scope = bindings.session_scope
+    for _continuation_iteration in (None,):
+        try:
+            # The compose-loop audit path captures the state id observed
+            # before the provider call and passes this exact value to
+            # persist_compose_turn_async as expected_current_state_id.
+            call_model = await self._call_model_turn(
+                llm_messages=llm_messages,
+                tools=tools,
+                state=state,
+                initial_version=initial_version,
+                deadline=deadline,
+                recorder=recorder,
+                progress=progress,
+                message=message,
+                composition_turns_used=composition_turns_used,
+                discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
+                provider_owner=provider_owner,
+                turn_evidence=turn_evidence,
+            )
+            recovery_result = self._terminal_recovery_result(
+                call_model.completion, state, recorder, prior_tools_persisted=persisted_tool_call_turn
+            )
+            if recovery_result is not None:
+                return recovery_result
+            # If no tool calls, the LLM is done — apply the final gate and return
+            if not call_model.completion.tool_batch.calls:
+                # A repair gate below may answer this reply with a user-role
+                # injection and continue. The reply has to be in the provider
+                # context first, or the next call shows a repair message
+                # answering an assistant turn the model cannot see. Appended
+                # BEFORE the gate so the gate's own
+                # ``advisor_injection_index = len(llm_messages)`` stays exact,
+                # and withdrawn again on ``action="return"``, where the reply
+                # is published rather than superseded and the provider context
+                # is left exactly as it was. A blank reply is skipped:
+                # providers reject empty assistant content, and there are no
+                # words to keep.
+                superseded_reply = call_model.completion.message.content or ""
+                superseded_reply_index: int | None = None
+                if superseded_reply.strip():
+                    superseded_reply_index = len(llm_messages)
+                    llm_messages.append({"role": "assistant", "content": superseded_reply})
+                terminate = await self._completion._try_terminate_no_tools(
+                    assistant_message=call_model.completion.message,
+                    turn_evidence=turn_evidence,
+                    session_operation_context=session_operation_context,
+                    message=message,
+                    llm_messages=llm_messages,
+                    state=state,
+                    session_id=session_id,
+                    current_state_id=current_state_id,
+                    initial_version=initial_version,
+                    user_id=user_id,
+                    last_runtime_preflight=last_runtime_preflight,
+                    runtime_preflight_cache=runtime_preflight_cache,
+                    session_scope=session_scope,
+                    mutation_success_seen=mutation_success_seen,
+                    recorder=recorder,
+                    progress=progress,
+                    repair_turns_used=repair_turns_used,
+                    persisted_assistant_message_id=persisted_assistant_message_id,
+                    persisted_assistant_content=persisted_assistant_content,
+                    persisted_tool_call_turn=persisted_tool_call_turn,
+                    advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                    plugin_snapshot=plugin_snapshot,
+                    advisor_review_state=advisor_review_state,
+                    deadline=deadline,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
+                    completion_gates=completion_gates,
+                    provider_owner=provider_owner,
+                )
+                if terminate.advisor_review_state is not None:
+                    advisor_review_state = terminate.advisor_review_state
+                if terminate.action == "return":
+                    if superseded_reply_index is not None:
+                        del llm_messages[superseded_reply_index]
+                    # Offensive guard (explicit raise, not assert): ``python -O``
+                    # strips assert statements. The contract between
+                    # ``_dispatch_terminate_phase`` and this caller is that
+                    # ``result`` is non-None whenever ``action == "return"``;
+                    # a None here would be a compose-loop bug, not a recoverable
+                    # state. Routed to the HTTP-500 static-detail handler at
+                    # ``routes/composer.py:905`` via :class:`InvariantError`
+                    # (B1-sanitised response body).
+                    if terminate.result is None:
+                        raise InvariantError(
+                            "_dispatch_terminate_phase returned action='return' with result=None — "
+                            "the terminate-phase contract requires result to be set whenever the "
+                            "phase signals a return."
+                        )
+                    public_result = terminate.result
+                    if advisor_repair_context_introduced:
+                        public_result = await self._completion._qualified_advisor_repair_public_result(
+                            public_result,
+                            user_id=user_id,
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                            cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            plugin_snapshot=plugin_snapshot,
+                            publication_binding=terminate.publication_binding,
+                            turn_evidence=turn_evidence,
+                            user_message=message,
+                        )
+                    return self._completion._append_checkpoint_receipt(public_result, turn_evidence=turn_evidence)
+                repair_turns_used += terminate.repair_turns_delta
+                advisor_checkpoint_passes_used += terminate.advisor_passes_delta
+                # The gate superseded this reply: it is never published, so keep
+                # the model's words as a non-rendered audit row.
+                if superseded_reply_index is not None:
+                    await self._completion._persist_withheld_reply(
+                        "repair_gate_superseded",
+                        superseded_reply,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                    )
+                if terminate.advisor_injection_index is not None:
+                    advisor_repair_context_introduced = True
+                    if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE:
+                        pending_advisor_elision_indices.append(terminate.advisor_injection_index)
+                        # Elide the superseded reply WITH the advisor message it
+                        # was answered by. Dropping only the injection would
+                        # leave this reply directly before the repair turn's
+                        # assistant tool-call message — two consecutive
+                        # assistant messages, which some providers reject.
+                        if superseded_reply_index is not None:
+                            pending_advisor_elision_indices.append(superseded_reply_index)
+                continue
+
+            cancellation_requested = asyncio.Event()
+            pre_batch_state = state
+
+            async def _dispatch_and_persist_tool_turn(
+                _call_model: _CallModelOutcome = call_model,
+                _state: CompositionState = state,
+                _last_validation: ValidationSummary | None = last_validation,
+                _last_runtime_preflight: ValidationResult | None = last_runtime_preflight,
+                _current_state_id: str | None = current_state_id,
+                _advisor_calls_used: int = advisor_calls_used,
+                _cancellation_requested: asyncio.Event = cancellation_requested,
+                _persisted_tool_call_turn: bool = persisted_tool_call_turn,
+                _persisted_assistant_message_id: str | None = persisted_assistant_message_id,
+                _persisted_assistant_content: str | None = persisted_assistant_content,
+                _advisor_repair_context_introduced: bool = advisor_repair_context_introduced,
+                _composition_turns_used: int = composition_turns_used,
+                _discovery_turns_used: int = discovery_turns_used,
+                _failed_turn: FailedTurnMetadata | None = failed_turn,
+            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool, BaseException | None]:
+                invocation_start = len(recorder.invocations)
+                try:
+                    dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
+                        call_model=_call_model,
+                        mutation_ceiling=mutation_ceiling,
+                        session_operation_context=session_operation_context,
+                        state=_state,
+                        last_validation=_last_validation,
+                        last_runtime_preflight=_last_runtime_preflight,
+                        llm_messages=llm_messages,
+                        recorder=recorder,
+                        anti_anchor=anti_anchor,
+                        discovery_cache=discovery_cache,
+                        runtime_preflight_cache=runtime_preflight_cache,
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_message_id=user_message_id,
+                        user_message_content=message,
+                        current_state_id=_current_state_id,
+                        actor=actor,
+                        initial_version=initial_version,
+                        deadline=deadline,
+                        progress=progress,
+                        session_scope=session_scope,
+                        advisor_calls_used=_advisor_calls_used,
+                        cancellation_requested=_cancellation_requested,
+                        plugin_snapshot=plugin_snapshot,
+                        policy_catalog=policy_catalog,
+                        composition_turns_used=_composition_turns_used,
+                        discovery_turns_used=_discovery_turns_used,
+                        failed_turn=_failed_turn,
+                        provider_owner=provider_owner,
+                        turn_evidence=turn_evidence,
+                    )
+                except ComposerRuntimePreflightError as preflight_failure:
+                    raise ComposerRuntimePreflightError(
+                        original_exc=preflight_failure.original_exc,
+                        partial_state=preflight_failure.partial_state,
+                        tool_invocations=recorder.invocations[invocation_start:],
+                        llm_calls=preflight_failure.llm_calls,
+                        failed_turn=preflight_failure.failed_turn,
+                    ) from preflight_failure.original_exc
+                except (AssertionError, MemoryError, RecursionError, SystemError, AuditIntegrityError) as fatal_failure:
+                    current_invocations = recorder.invocations[invocation_start:]
+                    if not current_invocations:
+                        raise
+                    raise ComposerToolFailure(
+                        fatal_failure,
+                        tool_invocations=current_invocations,
+                        llm_calls=recorder.llm_calls,
+                    ) from fatal_failure
+                except asyncio.CancelledError as cancellation:
+                    # P4 has not started. Earlier loop turns are already durable
+                    # and must never be rebound by this batch's fallback drain.
+                    raise ComposerToolCancellation(
+                        cancellation,
+                        tool_invocations=recorder.invocations[invocation_start:],
+                        llm_calls=recorder.llm_calls,
+                    ) from cancellation
+                if diagnostics is not None:
+                    diagnostics.tool_outcomes = dispatch_result.tool_outcomes
+                    diagnostics.pre_state_id = dispatch_result.pre_state_id
+
+                # Do not start a new advisory call after cancellation. If an
+                # advisory call was already running when cancellation landed,
+                # the enclosing shield lets it finish and P4 still publishes
+                # the completed audit prefix.
+                early_advisor_message_count = len(llm_messages)
+                early_checkpoint_deadline_expired = False
+                early_checkpoint_failure: BaseException | None = None
+                try:
+                    if (
+                        not _cancellation_requested.is_set()
+                        and dispatch_result.advisor_compose_timeout is None
+                        and dispatch_result.advisor_failure is None
+                        and dispatch_result.service_failure is None
+                        and dispatch_result.authority_revocation is None
+                    ):
+                        try:
+                            await self._advisor_checkpoint._maybe_run_early_checkpoint(
+                                state=dispatch_result.state,
+                                prev_state=_state,
+                                session_id=session_id,
+                                llm_messages=llm_messages,
+                                recorder=recorder,
+                                progress=progress,
+                                deadline=deadline,
+                                session_operation_context=session_operation_context,
+                                provider_owner=provider_owner,
+                                turn_evidence=turn_evidence,
+                            )
+                        except _AdvisorCheckpointComposeDeadlineExpired:
+                            # The driver converts this signal after persistence
+                            # and after plugin/cancellation primacy checks.
+                            early_checkpoint_deadline_expired = True
+                        except (Exception, asyncio.CancelledError, BaseExceptionGroup) as checkpoint_failure:
+                            # Defer the exact failure until P4's committed
+                            # metadata has reached the driver. This is cleanup
+                            # custody, not classification as a provider outage.
+                            early_checkpoint_failure = checkpoint_failure
+                finally:
+                    # The tool batch already ran. Its audit must be persisted
+                    # even when an internal advisor failure unwinds this turn.
+                    # A successful tool remains successful; the separate
+                    # checkpoint failure propagates after this mandatory work.
+                    early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
+                    turn_evidence.transcript.observe_messages(llm_messages)
+                    try:
+                        persist_result = await self._persist_turn_audit(
+                            tool_outcomes=dispatch_result.tool_outcomes,
+                            mutation_ceiling=mutation_ceiling,
+                            authority_revocation=dispatch_result.authority_revocation,
+                            base_state=_state,
+                            decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
+                            private_authorings=dispatch_result.private_authorings,
+                            private_invocations=dispatch_result.private_invocations,
+                            assistant_message=dispatch_result.assistant_message,
+                            raw_assistant_content=dispatch_result.raw_assistant_content,
+                            assistant_tool_calls=dispatch_result.assistant_tool_calls,
+                            crash_pending=(
+                                dispatch_result.plugin_crash is not None
+                                or dispatch_result.advisor_failure is not None
+                                or dispatch_result.service_failure is not None
+                            ),
+                            session_id=session_id,
+                            session_operation_context=session_operation_context,
+                            current_state_id=_current_state_id,
+                            persisted_tool_call_turn=_persisted_tool_call_turn,
+                            persisted_assistant_message_id=_persisted_assistant_message_id,
+                            persisted_assistant_content=_persisted_assistant_content,
+                            ingress=ingress,
+                            chat_ingress_inputs=chat_ingress_inputs,
+                            advisor_repair_context_introduced=_advisor_repair_context_introduced,
+                            required_work=required_work,
+                            turn_evidence=turn_evidence,
+                        )
+                    except BaseException as p4_direct_failure:
+                        if dispatch_result.service_failure is not None:
+                            from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+                            # A thrown await does not establish rollback or
+                            # authorize an audit replay. Keep both original
+                            # objects and their prior causes for the real
+                            # publication/operation owner to classify.
+                            combined = combine_failure_objects(p4_direct_failure, dispatch_result.service_failure)
+                            raise combined from combined.__cause__
+                        if not isinstance(p4_direct_failure, (AuditIntegrityError, IntegrityError)):
+                            raise
+                        refused = dispatch_result.advisor_failure
+                        if not isinstance(refused, ComposerContextUnsupported):
+                            raise
+                        if isinstance(p4_direct_failure, IntegrityError):
+                            # The SQL transaction owner rethrows this native
+                            # constraint failure only after rollback. Retain
+                            # that exact SQL error under integrity primacy.
+                            current_publication_failure = AuditIntegrityError(
+                                "Advisor failure audit row could not be persisted",
+                                failed_turn=FailedTurnMetadata(
+                                    assistant_message_id=None,
+                                    tool_calls_attempted=len(dispatch_result.assistant_tool_calls),
+                                    tool_responses_persisted=0,
+                                ),
+                            )
+                            previous_cause: BaseException | None = p4_direct_failure
+                            unpublished = True
+                        else:
+                            current_publication_failure = p4_direct_failure
+                            previous_cause = p4_direct_failure.__cause__
+                            failed_publication = p4_direct_failure.failed_turn
+                            unpublished = (
+                                isinstance(previous_cause, SQLAlchemyError)
+                                and type(failed_publication) is FailedTurnMetadata
+                                and failed_publication.assistant_message_id is None
+                                and failed_publication.tool_responses_persisted == 0
+                            )
+                        current_publication_failure.__cause__ = (
+                            refused
+                            if previous_cause is None
+                            else BaseExceptionGroup("Advisor refusal and original P4 failure", (refused, previous_cause))
+                        )
+                        if not unpublished:
+                            # A throw alone does not prove rollback. In
+                            # particular, never replay a committed P4 after
+                            # a later outcome/projection validation failure,
+                            # or infer rollback from forensic metadata alone.
+                            raise
+                        # Native SQL failure plus the P4 owner's zero-row
+                        # disposition preserve the exact current suffix for
+                        # the existing audit-only recovery consumer.
+                        current_invocations = recorder.invocations[invocation_start:]
+                        if tuple(item.tool_call_id for item in current_invocations) != tuple(
+                            outcome.call.id for outcome in dispatch_result.tool_outcomes
+                        ):
+                            raise InvariantError(
+                                "Advisor publication failure lost its exact current invocation cohort"
+                            ) from p4_direct_failure
+                        raise ComposerToolFailure(
+                            current_publication_failure,
+                            tool_invocations=current_invocations,
+                            llm_calls=recorder.llm_calls,
+                        ) from current_publication_failure
+                    if diagnostics is not None:
+                        diagnostics.redacted_assistant_tool_calls = persist_result.redacted_assistant_tool_calls
+                        diagnostics.redacted_tool_rows = persist_result.redacted_tool_rows
+                        diagnostics.audit_outcome = persist_result.audit_outcome
+                return (
+                    dispatch_result,
+                    persist_result,
+                    updated_advisor_calls_used,
+                    early_advisor_context_introduced,
+                    early_checkpoint_deadline_expired,
+                    early_checkpoint_failure,
+                )
+
+            (
+                (
+                    dispatch,
+                    persist,
+                    advisor_calls_used,
+                    early_advisor_context_introduced,
+                    early_checkpoint_deadline_expired,
+                    early_checkpoint_failure,
+                ),
+                deferred_cancel,
+            ) = await _await_tool_turn_with_deferred_cancellation(
+                _dispatch_and_persist_tool_turn(),
+                cancellation_requested=cancellation_requested,
+            )
+            if early_advisor_context_introduced:
+                advisor_repair_context_introduced = True
+            # State the driver still owns across iterations updates from
+            # the dispatch carrier; persist + classify consume the rest
+            # of the dispatch fields directly.
+            state = dispatch.state if persist.authority_revocation is None else pre_batch_state
+            if persist.authority_revocation is None:
+                last_validation = dispatch.last_validation
+                last_runtime_preflight = dispatch.last_runtime_preflight
+                if dispatch.mutation_success_observed:
+                    mutation_success_seen = True
+                advisor_review_state = _record_advisor_repair_mutations(
+                    advisor_review_state,
+                    dispatch.tool_outcomes,
+                )
+            current_state_id = persist.current_state_id
+            persisted_assistant_message_id = persist.persisted_assistant_message_id
+            persisted_assistant_content = persist.persisted_assistant_content
+            persisted_tool_call_turn = persist.persisted_tool_call_turn
+            failed_turn = persist.failed_turn
+            pending_checkpoint_failures = tuple(
+                failure for failure in (early_checkpoint_failure, persist.effect_verification_failure) if failure is not None
+            )
+            # Finalize-context elision drain (Task 6 Step 3). Gated on
+            # ``dispatch.mutation_success_observed`` — NOT merely "a tool-call
+            # turn dispatched" — because a discovery-only turn (get_plugin_schema,
+            # preview_pipeline, list_*) or an all-ARG_ERROR turn makes tool
+            # calls without repairing anything. Draining on those would wipe
+            # the advisor findings from context before any fix landed, so the
+            # model's next no-tool reply "repairs" nothing, the END gate
+            # re-flags on unchanged state, and the run needlessly blocks
+            # (review finding 1). Only a turn that actually mutated state
+            # counts as the repair the model was asked for.
+            #
+            # Residual (documented, not closed): a repair spanning TWO
+            # mutating turns (e.g. a discovery turn to inspect the schema,
+            # then the mutating fix on the turn after) still loses the
+            # advisor text after the FIRST mutating turn, even though the
+            # second mutating turn is still part of the same repair attempt.
+            # Narrowed to the common single-mutating-turn case, not closed
+            # for the general multi-turn repair case.
+            if pending_advisor_elision_indices and dispatch.mutation_success_observed and persist.authority_revocation is None:
+                # Interleaved-turn boundary (review finding 3): a turn that
+                # emits BOTH prose and tool_calls keeps that prose verbatim in
+                # the appended assistant message (tool_batch.py) — elision
+                # only removes the injected advisor message itself, never the
+                # model's own reasoning/rebuttal prose from an interleaved
+                # turn. Deliberate: reasoning continuity for the model's own
+                # words outweighs a second-order anchoring risk that the
+                # Steps 1-2 output-contract clause already covers.
+                for elision_index in sorted(pending_advisor_elision_indices, reverse=True):
+                    del llm_messages[elision_index]
+                pending_advisor_elision_indices = []
+            if dispatch.service_failure is not None:
+                from elspeth.web.composer.continuation_tool_failure import combine_failure_objects
+
+                companions: list[BaseException] = list(pending_checkpoint_failures)
+                if deferred_cancel is not None:
+                    companions.append(deferred_cancel)
+                if persist.unwind_audit_failed:
+                    publication_failure = AuditIntegrityError(
+                        "Service failure audit row could not be persisted", failed_turn=failed_turn
+                    )
+                    combined = combine_failure_objects(publication_failure, dispatch.service_failure, *companions)
+                    if not isinstance(combined, Exception):
+                        raise combined from combined.__cause__
+                    # This explicit returned disposition owns an unpublished
+                    # current suffix; do not include prior committed turns.
+                    raise ComposerToolFailure(
+                        combined, tool_invocations=dispatch.private_invocations, llm_calls=recorder.llm_calls
+                    ) from combined
+                combined = combine_failure_objects(dispatch.service_failure, *companions)
+                raise combined from combined.__cause__
+
+            if dispatch.plugin_crash is not None:
+                # Plugin-crash propagation discipline (plan §5.7): the
+                # capture in P3 already snapshotted `state` after every
+                # prior successful tool-call mutation. If persistence
+                # succeeded, re-capture with the post-persist failed_turn
+                # so the route layer's _handle_plugin_crash sees the
+                # complete partial-state story; otherwise raise the
+                # original capture as-is.
+                if persisted_tool_call_turn:
+                    persisted_plugin_crash = ComposerPluginCrashError.capture(
+                        dispatch.plugin_crash.original_exc,
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=(),
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if dispatch.plugin_crash_cause is None:
+                        if pending_checkpoint_failures:
+                            raise persisted_plugin_crash from BaseExceptionGroup(
+                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                            )
+                        raise persisted_plugin_crash
+                    if pending_checkpoint_failures:
+                        raise persisted_plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures",
+                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                        )
+                    raise persisted_plugin_crash from dispatch.plugin_crash_cause
+                if persist.unwind_audit_failed:
+                    # P4 rolled back. Preserve only this unpersisted turn's
+                    # suffix: recorder.invocations is request-cumulative, so
+                    # carrying the full buffer after an earlier successful P4
+                    # would duplicate already committed rows when the route
+                    # drains the crash.
+                    current_invocation_count = len(dispatch.tool_outcomes)
+                    if current_invocation_count == 0 or current_invocation_count > len(dispatch.plugin_crash.tool_invocations):
+                        raise InvariantError("plugin crash dispatch must carry one invocation per current-turn tool outcome")
+                    unpersisted_plugin_crash = ComposerPluginCrashError.capture(
+                        dispatch.plugin_crash.original_exc,
+                        state=state,
+                        initial_version=initial_version,
+                        tool_invocations=dispatch.plugin_crash.tool_invocations[-current_invocation_count:],
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if dispatch.plugin_crash_cause is None:
+                        if pending_checkpoint_failures:
+                            raise unpersisted_plugin_crash from BaseExceptionGroup(
+                                "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                            )
+                        raise unpersisted_plugin_crash
+                    if pending_checkpoint_failures:
+                        raise unpersisted_plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures",
+                            (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                        )
+                    raise unpersisted_plugin_crash from dispatch.plugin_crash_cause
+                # No session/audit target was configured, so nothing in the
+                # request-cumulative crash carrier has been persisted yet.
+                if dispatch.plugin_crash_cause is None:
+                    if pending_checkpoint_failures:
+                        raise dispatch.plugin_crash from BaseExceptionGroup(
+                            "Tool failure retained checkpoint failures", pending_checkpoint_failures
+                        )
+                    raise dispatch.plugin_crash
+                if pending_checkpoint_failures:
+                    raise dispatch.plugin_crash from BaseExceptionGroup(
+                        "Tool failure retained checkpoint failures",
+                        (dispatch.plugin_crash_cause, *pending_checkpoint_failures),
+                    )
+                raise dispatch.plugin_crash from dispatch.plugin_crash_cause
+
+            if dispatch.advisor_failure is not None:
+                # The advisor boundary deliberately preserves unclassified
+                # controlled-code faults instead of laundering them into a
+                # provider outage. P3 closed the current invocation, and P4
+                # reported its publication disposition. Failed publication
+                # is a Tier-1 integrity fault that takes primacy while the
+                # audit-only recovery owner retains unpublished evidence.
+                if persist.unwind_audit_failed:
+                    publication_failure = AuditIntegrityError(
+                        "Advisor failure audit row could not be persisted",
+                        failed_turn=failed_turn,
+                    )
+                    if isinstance(dispatch.advisor_failure, ComposerContextUnsupported):
+                        # P4 explicitly rolled back this issued batch. The
+                        # recorder is request-cumulative, so recover only
+                        # the current dispatch's original invocation cohort.
+                        # The audit-only route consumer must never replay a
+                        # previous successful P4 or save rolled-back state.
+                        current_invocations = dispatch.private_invocations
+                        if tuple(item.tool_call_id for item in current_invocations) != tuple(
+                            outcome.call.id for outcome in dispatch.tool_outcomes
+                        ):
+                            raise InvariantError("Advisor rollback lost its exact current invocation cohort")
+                        retained_failures: tuple[BaseException, ...] = (dispatch.advisor_failure,)
+                        if persist.effect_verification_failure is not None:
+                            retained_failures += (persist.effect_verification_failure,)
+                        if deferred_cancel is not None:
+                            retained_failures += (deferred_cancel,)
+                        publication_failure.__cause__ = (
+                            retained_failures[0]
+                            if len(retained_failures) == 1
+                            else BaseExceptionGroup("Advisor refusal and P4 rollback outcomes", retained_failures)
+                        )
+                        raise ComposerToolFailure(
+                            publication_failure,
+                            tool_invocations=current_invocations,
+                            llm_calls=recorder.llm_calls,
+                        ) from publication_failure
+                    raise publication_failure from dispatch.advisor_failure
+                if isinstance(dispatch.advisor_failure, (PromptGuardRefused, ComposerContextUnsupported)):
+                    advisor_refusal = dispatch.advisor_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    advisor_refusal.__cause__ = dispatch.advisor_failure
+                    if deferred_cancel is not None and isinstance(advisor_refusal, ComposerContextUnsupported):
+                        # Required P4 work has completed, but an input
+                        # refusal cannot consume the caller's cancellation.
+                        # Keep the refusal and required-effect failure in
+                        # its cause, where integrity reduction still wins.
+                        attach_llm_calls(deferred_cancel, recorder)
+                        cancellation_causes: tuple[BaseException, ...] = (advisor_refusal,)
+                        if persist.effect_verification_failure is not None:
+                            cancellation_causes += (persist.effect_verification_failure,)
+                        if deferred_cancel.__cause__ is not None:
+                            cancellation_causes += (deferred_cancel.__cause__,)
+                        raise deferred_cancel from BaseExceptionGroup(
+                            "Manual Advisor context refusal and deferred cancellation outcomes", cancellation_causes
+                        )
+                    if persist.effect_verification_failure is not None:
+                        advisor_refusal.__cause__ = dispatch.advisor_failure
+                        raise BaseExceptionGroup(
+                            "Manual advisor guard refusal and committed effect verification failure",
+                            (advisor_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise advisor_refusal from dispatch.advisor_failure
+                if persist.effect_verification_failure is not None:
+                    prior_cause = dispatch.advisor_failure.__cause__
+                    raise dispatch.advisor_failure from BaseExceptionGroup(
+                        "Advisor failure and committed effect verification failure",
+                        (persist.effect_verification_failure,)
+                        if prior_cause is None
+                        else (prior_cause, persist.effect_verification_failure),
+                    )
+                raise dispatch.advisor_failure
+
+            if deferred_cancel is not None:
+                # P3's in-flight tool and P4's atomic audit publication are
+                # now complete. Preserve any LLM-call audit carried by this
+                # compose request, then resume the original cancellation at
+                # the first safe checkpoint before P5 or another model turn.
+                attach_llm_calls(deferred_cancel, recorder)
+                if pending_checkpoint_failures:
+                    prior_cause = deferred_cancel.__cause__
+                    raise deferred_cancel from BaseExceptionGroup(
+                        "Caller cancellation retained checkpoint failures",
+                        pending_checkpoint_failures if prior_cause is None else (prior_cause, *pending_checkpoint_failures),
+                    )
+                raise deferred_cancel
+
+            if early_checkpoint_failure is not None:
+                if isinstance(early_checkpoint_failure, (PromptGuardRefused, ComposerContextUnsupported)):
+                    early_refusal = early_checkpoint_failure.with_evidence(
+                        state=state,
+                        initial_version=state.version,
+                        tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        failed_turn=failed_turn,
+                    )
+                    if persist.effect_verification_failure is not None:
+                        # P4 already committed. Keep both originals visible to
+                        # the operation reducer so a policy refusal cannot mask
+                        # failure to verify the saved effect or replay its rows.
+                        early_refusal.__cause__ = early_checkpoint_failure
+                        raise BaseExceptionGroup(
+                            "EARLY guard refusal and committed effect verification failure",
+                            (early_refusal, persist.effect_verification_failure),
+                        ) from None
+                    raise early_refusal from early_checkpoint_failure
+                attach_llm_calls(early_checkpoint_failure, recorder)
+                if persist.effect_verification_failure is not None:
+                    prior_cause = early_checkpoint_failure.__cause__
+                    raise early_checkpoint_failure from BaseExceptionGroup(
+                        "EARLY checkpoint failure retained committed effect verification failure",
+                        (persist.effect_verification_failure,)
+                        if prior_cause is None
+                        else (prior_cause, persist.effect_verification_failure),
+                    )
+                raise early_checkpoint_failure
+
+            if dispatch.advisor_compose_timeout is not None:
+                current_invocation_count = len(dispatch.tool_outcomes)
+                if current_invocation_count == 0 or current_invocation_count > len(recorder.invocations):
+                    raise InvariantError("advisor timeout dispatch must carry one invocation per current-turn tool outcome")
+                advisor_timeout = ComposerConvergenceError.capture(
+                    max_turns=composition_turns_used + discovery_turns_used,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=initial_version,
+                    # A successful P4 made the request's accumulated trail
+                    # durable, so the route must not replay it. Without a
+                    # persistence target, none of the prior turns is durable:
+                    # preserve the recorder's complete in-memory trail.
+                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                )
+                if persist.effect_verification_failure is not None:
+                    raise advisor_timeout from persist.effect_verification_failure
+                raise advisor_timeout
+
+            if early_checkpoint_deadline_expired:
+                charged_composition_turns = composition_turns_used + (1 if dispatch.turn_has_mutation else 0)
+                charged_discovery_turns = discovery_turns_used + (
+                    1 if dispatch.turn_has_discovery and not dispatch.turn_has_mutation else 0
+                )
+                early_timeout = ComposerConvergenceError.capture(
+                    max_turns=charged_composition_turns + charged_discovery_turns,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                )
+                if persist.effect_verification_failure is not None:
+                    raise early_timeout from persist.effect_verification_failure
+                raise early_timeout
+
+            if persist.effect_verification_failure is not None:
+                attach_llm_calls(persist.effect_verification_failure, recorder)
+                raise persist.effect_verification_failure
+
+            if persist.authority_revocation is not None:
+                raise ComposerMutationAuthorityRevoked(
+                    revocation=persist.authority_revocation,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                    state=state,
+                    initial_version=initial_version,
+                )
+
+            classify = await self._classify_and_budget_turn(
+                dispatch=dispatch,
+                turn_evidence=turn_evidence,
+                session_operation_context=session_operation_context,
+                persist=persist,
+                llm_messages=llm_messages,
+                tools=tools,
+                recorder=recorder,
+                anti_anchor=anti_anchor,
+                progress=progress,
+                message=message,
+                initial_version=initial_version,
+                deadline=deadline,
+                runtime_preflight_cache=runtime_preflight_cache,
+                session_scope=session_scope,
+                session_id=session_id,
+                user_id=user_id,
+                mutation_success_seen=mutation_success_seen,
+                repair_turns_used=repair_turns_used,
+                composition_turns_used=composition_turns_used,
+                discovery_turns_used=discovery_turns_used,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                plugin_snapshot=plugin_snapshot,
+                advisor_review_state=advisor_review_state,
+                completion_gates=completion_gates,
+                provider_owner=provider_owner,
+            )
+            composition_turns_used += classify.composition_turns_delta
+            discovery_turns_used += classify.discovery_turns_delta
+            advisor_checkpoint_passes_used += classify.advisor_passes_delta
+            repair_turns_used += classify.repair_turns_delta
+            if classify.action == "return":
+                # Offensive guard (explicit raise, not assert): ``python -O``
+                # strips assert statements. The contract between
+                # ``_dispatch_classify_phase`` and this caller is that
+                # ``result`` is non-None whenever ``action == "return"``
+                # (the B-4D-3 last-chance branch sets it). A None here would
+                # be a compose-loop bug. Routed to the HTTP-500 static-detail
+                # handler at ``routes/composer.py:905`` via
+                # :class:`InvariantError` (B1-sanitised response body).
+                if classify.result is None:
+                    raise InvariantError(
+                        "_dispatch_classify_phase returned action='return' with result=None — "
+                        "the classify-phase contract requires result to be set whenever the "
+                        "phase signals a return."
+                    )
+                if classify.result.graph_recovery_intent is not None:
+                    return classify.result
+                public_result = classify.result
+                if advisor_repair_context_introduced:
+                    public_result = await self._completion._qualified_advisor_repair_public_result(
+                        public_result,
+                        user_id=user_id,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        plugin_snapshot=plugin_snapshot,
+                        publication_binding=classify.publication_binding,
+                        turn_evidence=turn_evidence,
+                        user_message=message,
+                    )
+                return self._completion._append_checkpoint_receipt(public_result, turn_evidence=turn_evidence)
+            continue
+        finally:
+            live.state = state
+            live.initial_version = initial_version
+            live.llm_messages = llm_messages
+            live.tools = tools
+            live.recorder = recorder
+            live.composition_turns_used = composition_turns_used
+            live.discovery_turns_used = discovery_turns_used
+            live.mutation_success_seen = mutation_success_seen
+            live.discovery_cache = discovery_cache
+            live.last_validation = last_validation
+            live.runtime_preflight_cache = runtime_preflight_cache
+            live.last_runtime_preflight = last_runtime_preflight
+            live.anti_anchor = anti_anchor
+            live.advisor_calls_used = advisor_calls_used
+            live.repair_turns_used = repair_turns_used
+            live.advisor_checkpoint_passes_used = advisor_checkpoint_passes_used
+            live.advisor_review_state = advisor_review_state
+            live.persisted_assistant_message_id = persisted_assistant_message_id
+            live.persisted_assistant_content = persisted_assistant_content
+            live.persisted_tool_call_turn = persisted_tool_call_turn
+            live.failed_turn = failed_turn
+            live.current_state_id = current_state_id
+            live.advisor_repair_context_introduced = advisor_repair_context_introduced
+            live.pending_advisor_elision_indices = pending_advisor_elision_indices
+            live.turn_evidence = turn_evidence
+    return None""",
+    "phases.ContinuationLivePhases": r'''@dataclass(slots=True)
+class ContinuationLivePhases:
+    service: ComposerServiceImpl
+    authority: ComposerAsyncOperationAuthority
+    work: RequiredWorkBinding
+    provider_owner: ProviderInvocationOwner
+    lease: SessionOperationLease
+    runtime: RestoredContinuationRuntime | None = None
+    primary: PrimaryProviderResult | RetainedPrimaryPhaseData | None = None
+    p4: ContinuationLiveP4 | None = None
+    latest_snapshot: StoredContinuationSnapshot | None = None
+    cancellation_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    business_stage: ContinuationStage[None] | None = None
+    failure_custody: ContinuationToolFailureCustody | None = None
+    terminal_completion: TerminalServiceCompletion | None = None
+
+    def observe_stop(self) -> None:
+        self.cancellation_requested.set()
+
+    def cancel_business(self, reason: ComposerOperationCancel) -> None:
+        self.observe_stop()
+        stage = self.business_stage
+        if stage is not None and stage.task is not None and not stage.task.done():
+            stage.task.cancel(reason)
+
+    async def _tool_context(self, runtime: RestoredContinuationRuntime) -> ToolBatchContext:
+        context = await build_runtime_tool_batch_context(runtime, cancellation_requested=self.cancellation_requested)
+        owner = self.work.coordinator.sql_deadline_owner
+        if owner is not None:
+            if owner.running is not runtime.materialization.inventory.running:
+                raise AuditIntegrityError("tool context changed its actual original timing owner")
+            now = time.monotonic()
+            remaining = owner.remaining_dispatch(monotonic_now=now)
+            if remaining <= 0:
+                raise TimeoutError("tool action exhausted its original dispatch allowance")
+            context = replace(context, deadline=min(context.deadline, now + remaining))
+        return context
+
+    def bind_initial(self, runtime: RestoredContinuationRuntime) -> None:
+        if (
+            self.runtime is not None
+            or type(runtime) is not RestoredContinuationRuntime
+            or runtime.materialization.service is not self.service
+            or runtime.materialization.authority is not self.authority
+            or runtime.bindings.required_work is not self.work
+            or runtime.bindings.provider_owner is not self.provider_owner
+        ):
+            raise AuditIntegrityError("live phase initialization changed its actual runtime owners")
+        self.runtime = runtime
+
+    def accept_primary(self, result: PrimaryProviderResult) -> None:
+        if type(result) is not PrimaryProviderResult or type(result.outcome) is not _CallModelOutcome:
+            raise AuditIntegrityError("live phases lost their actual provider result")
+        self.primary = result
+
+    async def _primary_for_phase(
+        self, runtime: RestoredContinuationRuntime, inventory: CurrentContinuationEnvInventory, selected: SelectedContinuationState
+    ) -> PrimaryProviderResult | RetainedPrimaryPhaseData:
+        compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
+        if len(compose) != 1 or compose[0].pending_response is None:
+            raise AuditIntegrityError("live phase lost its actual selected paid response")
+        if self.primary is None:
+            retained = await _registered_read(
+                self.work,
+                RetainedPrimaryPhaseData,
+                partial(
+                    self.authority.read_continuation_phase_primary,
+                    inventory.running,
+                    selected=selected,
+                    reference=compose[0].pending_response,
+                    env_ref_names=inventory.names,
+                ),
+            )
+            audit = retained.outcome.audit_call
+            if audit is None:
+                raise AuditIntegrityError("cold paid phase lost its actual physical audit DATA")
+            matching = tuple(call for call in runtime.live.recorder.llm_calls if call.call_id == audit.call_id)
+            if len(matching) != 1 or matching[0] != audit:
+                raise AuditIntegrityError("cold paid phase changed its actual restored recorder identity")
+            completion = retained.outcome.completion
+            data = runtime.graph.batch
+            if data is not None:
+                if completion.tool_batch.calls != data.calls:
+                    raise AuditIntegrityError("cold paid phase changed its actual restored issued calls")
+                # Reuse the already restored SDK atoms; only owned carriers
+                # are rebound. Warm phases never take this cold DATA path.
+                completion = replace(completion, tool_batch=replace(completion.tool_batch, calls=data.calls))
+            self.primary = RetainedPrimaryPhaseData(retained.response, _CallModelOutcome(completion, matching[0]))
+        if self.primary.response.reference != compose[0].pending_response:
+            raise AuditIntegrityError("live phase replaced its original paid response")
+        return self.primary
+
+    async def current(self, selected: SelectedContinuationState) -> tuple[RestoredContinuationRuntime, CurrentContinuationEnvInventory]:
+        phase = await self._current_phase_read(selected)
+        return phase.runtime, phase.inventory
+
+    async def _current_phase_read(self, selected: SelectedContinuationState) -> _CurrentPhaseRead:
+        running = self.work.running
+        if type(running) is not ComposerOperationRunning or running.session_operation_context is not self.lease.context:
+            raise AuditIntegrityError("live phase lost its actual running/physical owner")
+        finish_read: ContinuationFinishRead | None = None
+        try:
+            inventory = await materialize_continuation_env_inventory(
+                advisor=self.service._advisor_checkpoint, authority=self.authority, selected=selected, required_work=self.work
+            )
+        except ComposerOperationCancelledDuringTurn:
+            names = await _read_current_env_names(self.service._advisor_checkpoint, selected.stack.logical.session_id)
+            inventory = CurrentContinuationEnvInventory(
+                running,
+                ContinuationEnvSelection(selected.checkpoint_id, selected.stack.cursor, encode_continuation_snapshot(selected.stack)),
+                names,
+            )
+            finish_read = ContinuationFinishRead(running, selected, inventory)
+
+        def read_source() -> ContinuationRuntimeSource:
+            nonlocal finish_read
+            if finish_read is not None:
+                return finish_read.read_runtime(self.authority)
+            try:
+                return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+            except ComposerOperationCancelledDuringTurn:
+                finish_read = ContinuationFinishRead(running, selected, inventory)
+                return finish_read.read_runtime(self.authority)
+
+        source = await _registered_read(self.work, ContinuationRuntimeSource, read_source)
+        if self.runtime is None:
+            self.runtime = await restore_continuation_runtime(
+                service=self.service,
+                authority=self.authority,
+                selected=selected,
+                inventory=inventory,
+                required_work=self.work,
+                provider_owner=self.provider_owner,
+                finish_read=finish_read,
+            )
+        elif self.runtime.source.selected != selected:
+            runtime = self.runtime
+
+            def refresh() -> RestoredContinuationRuntime:
+                fresh = read_source()
+                _require_runtime_source_refresh(source, fresh)
+                runtime.materialization.advance_current(selected, inventory)
+                following = replace(runtime, source=fresh)
+                # Retain the actual fresh source before the async SQL bridge can
+                # defer cancellation. No live messages/graph objects are rebuilt.
+                self.runtime = following
+                return following
+
+            await _registered_read(self.work, RestoredContinuationRuntime, refresh)
+        else:
+            # Same SQL cut can arrive as a fresh selected object, including a
+            # warm owner which has just observed durable Stop. Carry that
+            # exact read choice without replacing live owners or their clocks.
+            _require_runtime_source_refresh(self.runtime.source, source)
+            self.runtime = replace(self.runtime, source=source)
+        if self.runtime is None:
+            raise AuditIntegrityError("live phase source lost its actual runtime")
+        if self.runtime.source.selected is not selected:
+            raise AuditIntegrityError("live phase read lost its actual fresh selection")
+        if finish_read is not None:
+            finish_read.require_selection(selected, inventory)
+        return _CurrentPhaseRead(self.runtime, selected, inventory, finish_read)
+
+    async def _retain(
+        self, captured: CapturedContinuationRuntime, inventory: CurrentContinuationEnvInventory, transition: BatchTransition
+    ) -> None:
+        def retain() -> StoredContinuationSnapshot:
+            stored = retain_batch_transition(
+                self.authority, inventory.running, captured=captured, inventory=inventory, transition=transition
+            )
+            # Preserve the actual committing owner's return on its physical
+            # thread before bridge delivery can surface a caller cancellation.
+            self.latest_snapshot = stored
+            return stored
+
+        stored = await _registered(
+            work=self.work,
+            source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+            operation=retain,
+            expected=StoredContinuationSnapshot,
+        )
+        selected = await load_selected_continuation(
+            authority=self.authority, running=inventory.running, selected=stored, required_work=self.work
+        )
+        await self.current(selected)
+
+    async def _capture_issued_finish(
+        self, runtime: RestoredContinuationRuntime, *, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory
+    ) -> CapturedContinuationRuntime:
+        def read_source() -> ContinuationRuntimeSource:
+            try:
+                return self.authority.read_continuation_runtime(inventory.running, selected=selected, inventory=inventory)
+            except ComposerOperationCancelledDuringTurn:
+                return self.authority.read_continuation_owed_tool_runtime(inventory.running, selected=selected, inventory=inventory)
+
+        def capture() -> CapturedContinuationRuntime:
+            source = read_source()
+            captured = _capture_owners(runtime, source=source, inventory=inventory)
+            following = read_source()
+            if following.selected != source.selected or following.bootstrap != source.bootstrap or following.evidence != source.evidence:
+                raise AuditIntegrityError("issued tool capture changed its complete current source during retention")
+            return captured
+
+        return await _registered_read(self.work, CapturedContinuationRuntime, capture)
+
+    async def _initialize_batch(self, selected: SelectedContinuationState) -> None:
+        runtime, inventory = await self.current(selected)
+        result, live = await self._primary_for_phase(runtime, inventory, selected), runtime.live
+        frame = selected.stack.frames[-1]
+        if type(frame) is not ComposeFrame or frame.pending_response != result.response.reference:
+            raise AuditIntegrityError("batch initialization changed its exact original paid response")
+        self.service._enforce_tool_call_cap(
+            assistant_tool_calls=result.outcome.completion.tool_batch.calls,
+            state=live.state,
+            initial_version=live.initial_version,
+            composition_turns_used=live.composition_turns_used,
+            discovery_turns_used=live.discovery_turns_used,
+            recorder=live.recorder,
+            failed_turn=live.failed_turn,
+            persisted_tool_call_turn=live.persisted_tool_call_turn,
+        )
+        accumulator = BatchAccumulator(live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used)
+        batch = ContinuationBatchState(
+            live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used, entry_state=live.state
+        )
+        data = RestoredBatchData(batch, accumulator, result.outcome.completion.tool_batch.calls)
+        context = await self._tool_context(runtime)
+        await _initialize_continuation_batch_live(
+            call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch
+        )
+        self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data))
+        captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        chunk = encode_private_chunk(
+            codec="composer.coupled-batch-data.v1",
+            canonical=encode_coupled_batch_data(batch=batch, accumulator=accumulator, calls=data.calls, env_ref_names=inventory.names),
+            env_ref_names=inventory.names,
+        )
+        tool = ToolBatchFrame(
+            phase="tool_ready", response=result.response.reference, accumulator=chunk.reference, next_tool_index=0, settled_effect_ids=()
+        )
+        root = captured.stack.model_copy(update={"frames": (*captured.stack.frames, tool)})
+        following = CapturedContinuationRuntime(selected, root, _selected_chunks(root, captured.chunks, (chunk,)))
+        await self._retain(following, inventory, "batch_initialized")
+
+    async def _execute_one(self, selected: SelectedContinuationState) -> None:
+        previous = self.business_stage
+        if previous is not None and (previous.task is None or not previous.task.done() or not previous.observed):
+            raise AuditIntegrityError("tool dispatch cannot replace its retained physical stage")
+        self.business_stage = stage = self.lease.create_continuation_stage(
+            self._execute_one_owned(selected), name="continuation-issued-tool"
+        )
+        await self.lease.join_continuation_stage(stage)
+
+    async def _execute_one_owned(self, selected: SelectedContinuationState) -> None:
+        runtime, inventory = await self.current(selected)
+        data = runtime.graph.batch
+        if data is None:
+            raise AuditIntegrityError("live dispatch lost its actual batch/provider owners")
+        result = await self._primary_for_phase(runtime, inventory, selected)
+        batch, accumulator, live = data.batch, data.accumulator, runtime.live
+        if batch.phase != "call_ready" or batch.current_call is not None or batch.next_tool_index >= len(data.calls):
+            raise AuditIntegrityError("live dispatch lost its actual unissued next call")
+        context = await self._tool_context(runtime)
+        call = ContinuationCallState(batch.next_tool_index, data.calls[batch.next_tool_index], batch.state, batch.state.version)
+        batch.current_call, batch.phase = call, "call_active"
+        preparation = await _prepare_continuation_call_live(
+            call_model=result.outcome, ctx=context, llm_messages=live.llm_messages, batch=batch, call=call
+        )
+        issued_effect_key: str | None = None
+        if preparation == "prepared":
+            if call.audit is None:
+                raise AuditIntegrityError("tool preparation lost its actual dispatch audit")
+            # Prepared DATA precedes the SQL issue owner. The canonical writer
+            # binds this locator to its actual checkpoint/event/physical fence;
+            # it must never be injected into the pure prepared call codec.
+            issued_effect_key = f"tool:{result.response.reference.digest}:{call.index}"
+            self.runtime = runtime = replace(
+                runtime,
+                graph=runtime.graph.with_selected_dispatch(
+                    capture_dispatch_audit(call.audit, env_ref_names=inventory.names), context.tool_contract_dialect
+                ),
+            )
+            captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+            top = captured.stack.frames[-1]
+            if type(top) is not ToolBatchFrame:
+                raise AuditIntegrityError("prepared tool capture changed its actual frame family")
+            root = captured.stack.model_copy(
+                update={
+                    "frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "effect_reconciling"})),
+                    "effect_frontier": (
+                        *captured.stack.effect_frontier,
+                        EffectFrontierEntry(effect_id=issued_effect_key, disposition="dispatched", receipt_id=None),
+                    ),
+                }
+            )
+            await self._retain(CapturedContinuationRuntime(selected, root, captured.chunks), inventory, "tool_issued")
+            self.failure_custody = ContinuationToolFailureCustody(
+                inventory.running, self.work, result.response, batch, data.calls, live.recorder, call
+            )
+            await _execute_continuation_call_live(
+                call_model=result.outcome,
+                ctx=context,
+                acc=accumulator,
+                llm_messages=live.llm_messages,
+                batch=batch,
+                call=call,
+                failure_custody=self.failure_custody,
+            )
+        if preparation == "stop":
+            batch.current_call, batch.phase = None, "dispatch_ready"
+            return
+        batch.next_tool_index += 1
+        batch.current_call = None
+        batch.phase = "dispatch_ready" if batch.stop_issued_batch or batch.next_tool_index == len(data.calls) else "call_ready"
+        live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = (
+            batch.state,
+            batch.last_validation,
+            batch.last_runtime_preflight,
+            batch.advisor_calls_used,
+        )
+        if batch.service_failure is not None:
+            custody = self.failure_custody
+            if preparation != "prepared" or custody is None or issued_effect_key is None or self.runtime is None:
+                raise AuditIntegrityError("service completion lost its actual issued native phase")
+            if self.terminal_completion is not None:
+                raise AuditIntegrityError("service completion cannot replace another native terminal owner")
+            try:
+                self.terminal_completion = TerminalServiceCompletion(custody, self.runtime, context, result.outcome, issued_effect_key)
+                # This failed batch cannot be encoded or restored. Its last valid
+                # issued SQL cut is only a source bookmark for terminal P4 proof.
+                await self._persist_batch(self.runtime.source.selected)
+            except BaseException as error:
+                combined = custody.failure(error)
+                if combined is error:
+                    raise
+                raise combined from combined.__cause__
+            return
+        if self.runtime is None:
+            raise AuditIntegrityError("completed tool lost its retained runtime")
+        runtime = self.runtime
+        inventory = runtime.materialization.inventory
+        selected = runtime.source.selected
+        self.runtime = runtime = replace(runtime, graph=runtime.graph.without_selected_dispatch())
+        captured = (
+            await self._capture_issued_finish(runtime, selected=selected, inventory=inventory)
+            if preparation == "prepared"
+            else await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+        )
+        top = captured.stack.frames[-1]
+        if type(top) is not ToolBatchFrame:
+            raise AuditIntegrityError("completed tool capture changed its actual frame family")
+        root = captured.stack.model_copy(update={"frames": (*captured.stack.frames[:-1], top.model_copy(update={"phase": "tool_ready"}))})
+        if preparation == "prepared":
+            if issued_effect_key is None:
+                raise AuditIntegrityError("completed tool lost its actual issued effect locator")
+            receipt = f"tool-result:{top.accumulator.digest}"
+            root = root.model_copy(
+                update={
+                    "effect_frontier": tuple(
+                        EffectFrontierEntry(effect_id=entry.effect_id, disposition="committed", receipt_id=receipt)
+                        if entry.effect_id == issued_effect_key
+                        else entry
+                        for entry in root.effect_frontier
+                    ),
+                    "frames": (
+                        *root.frames[:-1],
+                        root.frames[-1].model_copy(update={"settled_effect_ids": (*top.settled_effect_ids, issued_effect_key)}),
+                    ),
+                }
+            )
+        await self._retain(
+            CapturedContinuationRuntime(selected, root, captured.chunks),
+            inventory,
+            "tool_completed" if preparation == "prepared" else "tool_preparation_completed",
+        )
+
+    async def _persist_batch(self, selected: SelectedContinuationState) -> None:
+        terminal = self.terminal_completion
+        if terminal is None:
+            phase_read = await self._current_phase_read(selected)
+            runtime, inventory = phase_read.runtime, phase_read.inventory
+            result = await self._primary_for_phase(runtime, inventory, selected)
+            context = await build_runtime_tool_batch_context(
+                runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read
+            )
+            call_model = result.outcome
+        else:
+            terminal.require_native()
+            if self.runtime is not terminal.runtime or selected is not terminal.runtime.source.selected or terminal.p4 is not None:
+                raise terminal.custody.failure(AuditIntegrityError("terminal P4 cannot replace or replay its actual native completion"))
+            runtime = terminal.runtime
+            inventory = runtime.materialization.inventory
+            context, call_model = terminal.context, terminal.call_model
+        data = runtime.graph.batch
+        if data is None or data.batch.phase != "dispatch_ready":
+            raise AuditIntegrityError("live P4 lost its actual completed batch/provider owners")
+        dispatch, advisor_calls = _finish_continuation_batch_live(
+            call_model=call_model,
+            ctx=context,
+            acc=data.accumulator,
+            batch=data.batch,
+            failure_custody=self.failure_custody,
+        )
+        live, bindings = runtime.live, runtime.bindings
+        self.p4 = owner = ContinuationLiveP4(
+            self.authority,
+            selected,
+            inventory,
+            self.work,
+            data,
+            runtime,
+            withheld_replies=live.recorder.withheld_replies[runtime.drained.withheld_replies :],
+        )
+        if terminal is not None:
+            terminal.bind_p4(owner)
+
+        async def publish() -> None:
+            deadline_owner = self.work.coordinator.sql_deadline_owner
+            if deadline_owner is not None:
+                if deadline_owner.running is not inventory.running:
+                    raise AuditIntegrityError("P4 finishing changed its actual original timing owner")
+                # This retained child only finishes the actual existing batch;
+                # its SQL owner still proves all current/pre-Stop authority.
+                # Spend the original action's reserve without restarting D.
+                deadline_owner.begin_settlement()
+            original: BaseException | None = None
+            try:
+                await self.service._persist_turn_audit(
+                    tool_outcomes=dispatch.tool_outcomes,
+                    mutation_ceiling=bindings.mutation_ceiling,
+                    authority_revocation=dispatch.authority_revocation,
+                    base_state=data.batch.entry_state,
+                    decoded_args_by_call_id=dispatch.decoded_args_by_call_id,
+                    private_authorings=dispatch.private_authorings,
+                    private_invocations=dispatch.private_invocations,
+                    assistant_message=dispatch.assistant_message,
+                    raw_assistant_content=dispatch.raw_assistant_content,
+                    assistant_tool_calls=dispatch.assistant_tool_calls,
+                    crash_pending=(
+                        dispatch.plugin_crash is not None
+                        or dispatch.advisor_failure is not None
+                        or dispatch.service_failure is not None
+                        or (
+                            data.batch.retained_failure is not None
+                            and data.batch.retained_failure.kind in ("plugin_crash", "advisor_failure")
+                        )
+                    ),
+                    session_id=bindings.session_id,
+                    session_operation_context=bindings.session_operation_context,
+                    current_state_id=live.current_state_id,
+                    persisted_tool_call_turn=live.persisted_tool_call_turn,
+                    persisted_assistant_message_id=live.persisted_assistant_message_id,
+                    persisted_assistant_content=live.persisted_assistant_content,
+                    ingress=bindings.ingress,
+                    chat_ingress_inputs=None if bindings.chat_ingress_inputs is None else list(bindings.chat_ingress_inputs),
+                    advisor_repair_context_introduced=live.advisor_repair_context_introduced,
+                    required_work=self.work,
+                    turn_evidence=live.turn_evidence,
+                    continuation=owner,
+                    terminal_completion=terminal,
+                )
+            except BaseException as failure:
+                original = failure if self.failure_custody is None else self.failure_custody.failure(failure)
+            finally:
+                # turn_audit retains actual committed publication before a
+                # deferred cancellation or verification failure may escape.
+                persist = owner.publication
+                if persist is not None:
+                    live.current_state_id = persist.current_state_id
+                    live.persisted_assistant_message_id = persist.persisted_assistant_message_id
+                    live.persisted_assistant_content = persist.persisted_assistant_content
+                    live.persisted_tool_call_turn, live.failed_turn = persist.persisted_tool_call_turn, persist.failed_turn
+                    live.advisor_calls_used = advisor_calls
+            if owner.publication is not None:
+                # The one checkpoint projection reconciled both actual SQL
+                # outputs before completing. Never submit a second apply here.
+                self.runtime = owner.runtime
+                if original is not None:
+                    raise original
+            elif original is not None:
+                raise original
+            try:
+                owner.raise_after_publication()
+            except BaseException as failure:
+                if self.failure_custody is not None:
+                    combined = self.failure_custody.failure(failure)
+                    if combined is failure:
+                        raise
+                    raise combined from combined.__cause__
+                raise
+            custody = self.failure_custody
+            if custody is not None and custody.completed:
+                if custody.wrapper is not None:
+                    raise custody.wrapper from custody.original
+                if custody.original is not None:
+                    raise custody.original
+
+        critical = self.lease.create_continuation_stage(publish(), name="continuation-required-p4")
+        await self.lease.join_continuation_stage(critical)
+
+    async def finish_owed_prefix(self, selected: SelectedContinuationState) -> None:
+        """Finish an actual retained prefix; the SQL owner proves durable Stop."""
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return
+        top = selected.stack.frames[-1]
+        if type(top) is not ToolBatchFrame or top.phase != "tool_ready" or top.accumulator.codec != "composer.coupled-batch-data.v1":
+            return
+        runtime, _inventory = await self.current(selected)
+        data = runtime.graph.batch
+        if data is None or not data.batch.tool_outcomes:
+            return
+        if data.batch.phase == "call_ready":
+            data.batch.stop_issued_batch = True
+            data.batch.phase = "dispatch_ready"
+        if data.batch.phase == "dispatch_ready":
+            await self._persist_batch(selected)
+
+    async def advance(self, selected: SelectedContinuationState) -> None:
+        if self.terminal_completion is not None:
+            await self._persist_batch(selected)
+            return
+        top = selected.stack.frames[-1]
+        if type(top) is ComposeFrame and top.phase == "response_retained":
+            await self._initialize_batch(selected)
+            return
+        if type(top) is ToolBatchFrame and top.phase == "tool_ready":
+            runtime, _inventory = await self.current(selected)
+            if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "call_ready":
+                await self._execute_one(selected)
+                return
+            if runtime.graph.batch is not None and runtime.graph.batch.batch.phase == "dispatch_ready":
+                await self._persist_batch(selected)
+                return
+        raise AuditIntegrityError("selected phase has no matching live tool action")''',
+    "p4.ContinuationLiveP4": r'''@dataclass(slots=True)
+class ContinuationLiveP4:
+    authority: ComposerAsyncOperationAuthority
+    selected: SelectedContinuationState
+    inventory: CurrentContinuationEnvInventory
+    work: RequiredWorkBinding
+    data: RestoredBatchData
+    runtime: RestoredContinuationRuntime
+    withheld_replies: tuple[WithheldReply, ...] = ()
+    commit: ContinuationOwnerCommit | None = field(default=None, init=False)
+    prepared: PreparedP4Value | None = field(default=None, init=False)
+    preparation: RequiredSQLFinishOnce[ContinuationOwnerCommit] | None = field(default=None, init=False)
+    physical: RequiredSQLFinishOnce[CommittedContinuationP4] | None = field(default=None, init=False)
+    committed_outcome: CommittedContinuationP4 | None = field(default=None, init=False)
+    publication: _PersistOutcome | None = field(default=None, init=False)
+    captured: CapturedContinuationRuntime | None = field(default=None, init=False)
+    application_sql: RequiredSQLFinishOnce[StoredP4Application] | None = field(default=None, init=False)
+    application: StoredP4Application | StoredTerminalP4Application | None = field(default=None, init=False)
+    writer_observation: P4WriterObservation | None = field(default=None, init=False)
+    terminal_completion: TerminalServiceCompletion | None = field(default=None, init=False)
+    _checkpoint_ticket: RequiredWorkTicket | None = field(default=None, init=False, repr=False)
+    deferred_failures: list[BaseException] = field(default_factory=list, init=False)
+    deferred_cancellations: list[asyncio.CancelledError] = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.authority) is not ComposerAsyncOperationAuthority
+            or type(self.selected) is not SelectedContinuationState
+            or type(self.inventory) is not CurrentContinuationEnvInventory
+            or type(self.work) is not RequiredWorkBinding
+            or type(self.data) is not RestoredBatchData
+            or type(self.runtime) is not RestoredContinuationRuntime
+            or self.runtime.graph.batch is not self.data
+            or self.runtime.bindings.required_work is not self.work
+            or self.work.running is None
+            or self.inventory.running is not self.work.running
+        ):
+            raise AuditIntegrityError("live P4 lost its actual current phase owners")
+        self.work.validate_context(self.inventory.running.session_operation_context)
+
+    def _retain_cancellations[T](self, outcome: RequiredSQLFinishOnce[T]) -> None:
+        for cancellation in outcome.deferred_cancellations:
+            if all(cancellation is not previous for previous in self.deferred_cancellations):
+                self.deferred_cancellations.append(cancellation)
+
+    async def prepare(self, prepared: PreparedP4Value) -> ContinuationOwnerCommit:
+        if self.preparation is not None or self.prepared is not None:
+            raise AuditIntegrityError("live P4 preparation cannot replace a retained physical outcome")
+        names = await _read_current_env_names(
+            self.runtime.materialization.service._advisor_checkpoint, self.selected.stack.logical.session_id
+        )
+        self.inventory = CurrentContinuationEnvInventory(self.inventory.running, self.inventory.selection, names)
+        pending = replace(
+            self.data.batch, phase="p4_pending", p4_input_json=encode_prepared_p4(prepared, env_ref_names=self.inventory.names)
+        )
+        chunk = encode_p4_pending_batch_chunk(
+            batch=pending, accumulator=self.data.accumulator, calls=self.data.calls, env_ref_names=self.inventory.names
+        )
+        members = prepared_p4_members(prepared, env_ref_names=self.inventory.names)
+        recorded = self.runtime.live.recorder.invocations
+        linked = self.runtime.live.recorder.visible_tool_events
+        for expected, row in zip(members.invocations, members.redacted_rows, strict=True):
+            actual = tuple(invocation for invocation in recorded if invocation.tool_call_id == expected.tool_call_id)
+            if len(actual) != 1 or actual[0] != expected:
+                raise AuditIntegrityError("P4 redaction lost its actual recorded invocation")
+            if row.visible_event is not None:
+                previous = tuple(event for invocation, event in linked if invocation is actual[0])
+                if previous and previous != (row.visible_event,):
+                    raise AuditIntegrityError("P4 redaction replaced its actual visible event")
+                if not previous:
+                    self.runtime.live.recorder.record_visible_tool_event(actual[0], row.visible_event)
+        pending_data = RestoredBatchData(pending, self.data.accumulator, self.data.calls)
+        runtime = replace(self.runtime, graph=self.runtime.graph.with_batch(pending_data))
+
+        def read_source() -> ContinuationRuntimeSource:
+            try:
+                return self.authority.read_continuation_runtime(self.inventory.running, selected=self.selected, inventory=self.inventory)
+            except ComposerOperationCancelledDuringTurn:
+                # A real durable Stop selects the separate read facet. It must
+                # prove immutable pre-Stop issue ordering again; no caller flag
+                # or old frontier grants the pending P4 write.
+                return self.authority.read_continuation_owed_batch_runtime(
+                    self.inventory.running, selected=self.selected, inventory=self.inventory
+                )
+
+        def capture() -> CapturedContinuationRuntime:
+            source = read_source()
+            captured = _capture_owners(runtime, source=source, inventory=self.inventory)
+            actual = read_source()
+            if actual.selected != source.selected or actual.bootstrap != source.bootstrap or actual.evidence != source.evidence:
+                raise AuditIntegrityError("P4 capture changed its complete current source during retention")
+            self.captured = captured
+            return captured
+
+        captured = await _registered_read(self.work, CapturedContinuationRuntime, capture)
+        top = captured.stack.frames[-1]
+        if type(top) is not ToolBatchFrame:
+            raise AuditIntegrityError("P4 capture lost its actual completed batch frame")
+        sql, projection = self.work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+        )
+        try:
+            outcome = await run_required_sql_finish_once(
+                sql,
+                self.authority.prepare_continuation_p4,
+                self.inventory.running,
+                expected_checkpoint_id=self.selected.checkpoint_id,
+                expected_cursor=self.selected.stack.cursor,
+                pending_batch=chunk,
+                env_ref_names=self.inventory.names,
+                captured=captured,
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        self.preparation = outcome
+        self._retain_cancellations(outcome)
+        try:
+            self.work.coordinator.validate_continuation_sql_outcome(
+                ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            projection.complete_without_submission()
+            self.raise_after_publication(outcome.error)
+        if type(outcome) is not RequiredSQLReturned:
+            projection.complete_without_submission()
+            raise AuditIntegrityError("live P4 preparation returned another physical outcome")
+        projection.begin_projection()
+        try:
+            if type(outcome.value) is not ContinuationOwnerCommit or outcome.value.running is not self.inventory.running:
+                raise AuditIntegrityError("live P4 preparation changed its actual current owner")
+            self.commit, self.prepared = outcome.value, prepared
+            self.writer_observation = P4WriterObservation(outcome.value, prepared)
+            self.data.batch.phase, self.data.batch.p4_input_json = pending.phase, pending.p4_input_json
+        except BaseException as error:
+            projection.complete_owned(error)
+            raise
+        projection.complete_owned()
+        return outcome.value
+
+    async def prepare_terminal(self, prepared: PreparedP4Value, completion: TerminalServiceCompletion) -> ContinuationOwnerCommit:
+        from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+
+        if type(completion) is not TerminalServiceCompletion or self.preparation is not None or self.prepared is not None:
+            raise AuditIntegrityError("terminal P4 cannot replace its native completion or preparation")
+        completion.require_p4(self)
+        names = await _read_current_env_names(
+            self.runtime.materialization.service._advisor_checkpoint, self.selected.stack.logical.session_id
+        )
+        self.inventory = CurrentContinuationEnvInventory(self.inventory.running, self.inventory.selection, names)
+        members = prepared_p4_members(prepared, env_ref_names=names)
+        recorded = self.runtime.live.recorder.invocations
+        linked = self.runtime.live.recorder.visible_tool_events
+        for expected, row in zip(members.invocations, members.redacted_rows, strict=True):
+            actual = tuple(invocation for invocation in recorded if invocation.tool_call_id == expected.tool_call_id)
+            if len(actual) != 1 or actual[0] != expected:
+                raise AuditIntegrityError("terminal P4 redaction changed its actual recorded invocation")
+            if row.visible_event is not None:
+                previous = tuple(event for invocation, event in linked if invocation is actual[0])
+                if previous and previous != (row.visible_event,):
+                    raise AuditIntegrityError("terminal P4 redaction changed its actual visible event")
+                if not previous:
+                    self.runtime.live.recorder.record_visible_tool_event(actual[0], row.visible_event)
+        sql, projection = self.work.reserve_pair(
+            RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+        )
+        try:
+            outcome = await run_required_sql_finish_once(
+                sql,
+                self.authority.prepare_terminal_continuation_p4,
+                self.inventory.running,
+                completion=completion,
+                prepared=prepared,
+                env_ref_names=names,
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        self.preparation = outcome
+        self._retain_cancellations(outcome)
+        try:
+            self.work.coordinator.validate_continuation_sql_outcome(
+                ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
+            )
+        except BaseException:
+            projection.complete_without_submission()
+            raise
+        if type(outcome) is RequiredSQLRaised:
+            projection.complete_without_submission()
+            self.raise_after_publication(outcome.error)
+        if type(outcome) is not RequiredSQLReturned:
+            projection.complete_without_submission()
+            raise AuditIntegrityError("terminal P4 preparation returned another physical outcome")
+        projection.begin_projection()
+        try:
+            completion.require_p4(self)
+            if type(outcome.value) is not ContinuationOwnerCommit or outcome.value.running is not self.inventory.running:
+                raise AuditIntegrityError("terminal P4 preparation changed its actual current owner")
+            self.commit, self.prepared = outcome.value, prepared
+            self.writer_observation = P4WriterObservation(outcome.value, prepared)
+            self.terminal_completion = completion
+        except BaseException as error:
+            projection.complete_owned(error)
+            raise
+        projection.complete_owned()
+        return outcome.value
+
+    def bind_checkpoint_ticket(self, ticket: RequiredWorkTicket) -> None:
+        """Capture this P4's actual reservation before its physical invocation.
+
+        This pointer grants no write. The service and transaction still prove
+        source/current authority, and acceptance separately proves its Future.
+        """
+        coordinator = self.work.coordinator
+        with coordinator._lock:
+            if self._checkpoint_ticket is not None or self.physical is not None:
+                raise AuditIntegrityError("live P4 checkpoint ticket is already bound or observed")
+            coordinator._registered(ticket, RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
+            running = self.inventory.running
+            self.work.validate_context(running.session_operation_context)
+            if (
+                self.work.running is not running
+                or self.commit is None
+                or self.commit.running is not running
+                or self.prepared is None
+                or self.writer_observation is None
+                or self.writer_observation.commit is not self.commit
+                or self.writer_observation.prepared is not self.prepared
+                or ticket.key.authority.context != running.session_operation_context
+                or ticket.key.authority.durable_operation_id != running.claim.operation_id
+                or ticket.key.authority.claim_attempt != running.claim.attempt
+                or ticket.key.transition_ordinal != self.work.transition_ordinal
+                or ticket.key.semantic_ordinal != self.work.semantic_ordinal
+                or ticket.key.subphase is not RequiredWorkSubphase.SQL_INITIAL
+                or ticket.key.sql_attempt_ordinal != 0
+            ):
+                raise AuditIntegrityError("live P4 checkpoint ticket crossed its actual prepared scope")
+            with ticket._lock:
+                if (
+                    ticket._complete
+                    or ticket._future is not None
+                    or ticket._submission_unknown
+                    or ticket._projection_started
+                    or ticket._finish_once_handoff is not None
+                ):
+                    raise AuditIntegrityError("live P4 checkpoint binding must precede physical submission")
+                self._checkpoint_ticket = ticket
+
+    def accept_physical(self, ticket: RequiredWorkTicket, outcome: RequiredSQLFinishOnce[CommittedContinuationP4]) -> AuditOutcome:
+        with self.work.coordinator._lock:
+            if self.physical is not None:
+                raise AuditIntegrityError("live P4 cannot replace its retained physical SQL result")
+            self.physical = outcome
+            self._retain_cancellations(outcome)
+            if self.writer_observation is not None:
+                self.deferred_failures.extend(self.writer_observation.prior_errors)
+            if self.writer_observation is not None and self.writer_observation.original_error is not None:
+                self.deferred_failures.append(self.writer_observation.original_error)
+            if self._checkpoint_ticket is None or ticket is not self._checkpoint_ticket:
+                raise AuditIntegrityError("live P4 replaced its actual bound checkpoint ticket")
+            self.work.coordinator.validate_compose_checkpoint_sql_outcome(ticket=ticket, actual_outcome=outcome)
+        if type(outcome) is RequiredSQLRaised:
+            self.raise_after_publication(outcome.error)
+        if type(outcome) is not RequiredSQLReturned or type(outcome.value) is not CommittedContinuationP4:
+            raise AuditIntegrityError("live P4 returned a foreign physical publication")
+        observed = self.writer_observation
+        if (
+            observed is None
+            or not observed.committed
+            or outcome.value.audit_outcome is not observed.candidate
+            or outcome.value.application is not observed.application_candidate
+        ):
+            raise AuditIntegrityError("live P4 replaced its actual committing owner's outputs")
+        self.committed_outcome = outcome.value
+        return outcome.value.audit_outcome
+
+    def raise_after_publication(self, original: BaseException | None = None) -> None:
+        errors: list[BaseException] = [] if original is None else [original]
+        errors.extend(failure for failure in self.deferred_failures if failure is not original)
+        errors.extend(cancellation for cancellation in self.deferred_cancellations if cancellation is not original)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Live P4 retained outcomes", errors)''',
+    "service.ComposerServiceImpl._persist_turn_audit": r'''async def _persist_turn_audit(
+    self,
+    *,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+    mutation_ceiling: ComposerMutationCeiling | None,
+    authority_revocation: ComposerMutationRevocation | None,
+    base_state: CompositionState,
+    decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
+    assistant_message: _AdmittedAssistantMessage,
+    raw_assistant_content: str | None,
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
+    crash_pending: bool,
+    session_id: str | None,
+    session_operation_context: SessionOperationContext | None = None,
+    current_state_id: str | None,
+    persisted_tool_call_turn: bool,
+    persisted_assistant_message_id: str | None,
+    # REQUIRED (no default): the content of the row named by
+    # ``persisted_assistant_message_id``. Threading the id without it is the
+    # shape that silently regresses to re-emitting already-persisted prose
+    # (elspeth-d581b3da7f), so a missed site must fail loudly here rather
+    # than default to None.
+    persisted_assistant_content: str | None,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    advisor_repair_context_introduced: bool = False,
+    required_work: RequiredWorkBinding | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    continuation: ContinuationLiveP4 | None = None,
+    terminal_completion: TerminalServiceCompletion | None = None,
+) -> _PersistOutcome:
+    """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
+    from elspeth.web.composer.turn_audit import persist_turn_audit
+
+    persisted_assistant_message = assistant_message
+    persisted_raw_assistant_content = raw_assistant_content
+    if advisor_repair_context_introduced:
+        # The assistant row below holds the fixed status line, so the
+        # turn's own prose is kept as a non-rendered audit row first.
+        await self._completion._persist_withheld_reply(
+            "advisor_repair_tool_turn",
+            assistant_message.content or "",
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        persisted_assistant_message = _AdmittedAssistantMessage(
+            content=_ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE,
+        )
+        persisted_raw_assistant_content = None
+
+    return await persist_turn_audit(
+        sessions_service=self._sessions_service,
+        redaction_telemetry=self._redaction_telemetry,
+        tool_outcomes=tool_outcomes,
+        mutation_ceiling=mutation_ceiling,
+        authority_revocation=authority_revocation,
+        base_state=base_state,
+        decoded_args_by_call_id=decoded_args_by_call_id,
+        private_authorings=private_authorings,
+        private_invocations=private_invocations,
+        assistant_message=persisted_assistant_message,
+        raw_assistant_content=persisted_raw_assistant_content,
+        assistant_tool_calls=assistant_tool_calls,
+        crash_pending=crash_pending,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        current_state_id=current_state_id,
+        persisted_tool_call_turn=persisted_tool_call_turn,
+        persisted_assistant_message_id=persisted_assistant_message_id,
+        persisted_assistant_content=persisted_assistant_content,
+        ingress=ingress,
+        chat_ingress_inputs=chat_ingress_inputs,
+        assistant_row_uses_current_dispatch=not advisor_repair_context_introduced,
+        required_work=required_work,
+        turn_evidence=turn_evidence,
+        continuation=continuation,
+        terminal_completion=terminal_completion,
+    )''',
+    "turn_audit.persist_turn_audit": r'''async def persist_turn_audit(
+    *,
+    sessions_service: SessionServiceProtocol | None,
+    redaction_telemetry: RedactionTelemetry,
+    tool_outcomes: tuple[_ToolOutcome, ...],
+    mutation_ceiling: ComposerMutationCeiling | None,
+    authority_revocation: ComposerMutationRevocation | None,
+    base_state: CompositionState,
+    decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
+    private_authorings: tuple[PrivateToolAuthoring, ...],
+    private_invocations: tuple[ComposerToolInvocation, ...],
+    assistant_message: _AdmittedAssistantMessage,
+    raw_assistant_content: str | None,
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
+    crash_pending: bool,
+    session_id: str | None,
+    session_operation_context: SessionOperationContext | None,
+    current_state_id: str | None,
+    persisted_tool_call_turn: bool,
+    persisted_assistant_message_id: str | None,
+    persisted_assistant_content: str | None,
+    assistant_row_uses_current_dispatch: bool,
+    ingress: CompositionIngressRecord | None = None,
+    chat_ingress_inputs: list[ChatIngressInput] | None = None,
+    required_work: RequiredWorkBinding | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    continuation: ContinuationLiveP4 | None = None,
+    terminal_completion: TerminalServiceCompletion | None = None,
+) -> _PersistOutcome:
+    """Phase P4 of the compose loop — redact then persist the turn audit.
+
+    Two sub-steps that share an invariant (a mid-step raise must leave
+    the DB in its pre-step shape):
+
+    1. **Redaction (pure / async).** Walks ``tool_outcomes`` via the
+       redaction manifest and builds the immutable
+       ``redacted_assistant_tool_calls`` / ``redacted_tool_rows`` shapes
+       the persister expects.
+    2. **Persistence.** Calls
+       ``sessions_service.persist_compose_turn_async`` exactly once
+       when ``session_id`` is set. The AuditIntegrityError catch
+       stamps ``failed_turn`` with ``tool_responses_persisted=0`` and
+       re-raises so the route handler sees the partial-write story.
+       Unwind-audit invariants are checked after the persist returns;
+       failures raise additional AuditIntegrityError(s).
+
+    Crash propagation is intentionally *not* in this helper. P3 supplies a
+    discriminated carrier (plugin crash or first-party advisor failure), and
+    the driver raises it only after this phase publishes the closed row.
+
+    ``assistant_row_uses_current_dispatch`` is the caller-owned P4
+    disposition for whether ``assistant_message`` still contains the current
+    dispatch's model prose. It is required because the caller performs the
+    advisor-repair substitution; row presence cannot recover that fact.
+    """
+    from pydantic import ValidationError as PydanticValidationError
+
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.web.composer.pipeline_custody import (
+        inline_custody_audit_projection,
+        inline_custody_manifest_redaction_input,
+    )
+    from elspeth.web.composer.redaction import (
+        MANIFEST,
+        redact_arg_error_response,
+        redact_failure_response,
+        redact_tool_call_arguments,
+    )
+
+    if terminal_completion is not None and continuation is None:
+        raise AuditIntegrityError("terminal service publication cannot use a non-continuation writer")
+
+    redacted_assistant_tool_calls: tuple[Mapping[str, Any], ...] = ()
+    for index, tool_outcome in enumerate(tool_outcomes):
+        tc = tool_outcome.call
+        decoded_args: dict[str, Any]
+        persisted_arguments: Mapping[str, Any]
+        if tc.id in decoded_args_by_call_id:
+            # deep_thaw restores plain dict/list types from any
+            # MappingProxyType / tuple introduced by the carrier's
+            # freeze_fields contract. redact_tool_call_arguments has a
+            # ``dict[str, Any]`` signature and json.dumps cannot serialise
+            # MappingProxyType, so the thaw here is load-bearing once
+            # _DispatchOutcome carries frozen args.
+            decoded_args = deep_thaw(decoded_args_by_call_id[tc.id])
+        elif tool_outcome.error_class is not None:
+            try:
+                decoded_json = bounded_json_loads(
+                    tc.function.arguments,
+                    label="composer tool-call arguments",
+                )
+            except (TypeError, ValueError):
+                decoded_args = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": tool_outcome.error_class,
+                }
+            else:
+                decoded_args = (
+                    # bounded_json_loads forwards to json.loads with no
+                    # object_hook and no object_pairs_hook at this call site,
+                    # so a decoded object is always an exact dict, never a
+                    # subclass.
+                    {"_decoded_non_object": decoded_json}
+                    if type(decoded_json) is not dict
+                    else {
+                        "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                        "error_class": tool_outcome.error_class,
+                    }
+                )
+        else:
+            decoded_args = {"_raw_arguments": tc.function.arguments}
+        is_arg_error = tool_outcome.error_class is not None and not (crash_pending and index == len(tool_outcomes) - 1)
+        if is_arg_error:
+            arg_error_projection = redact_arg_error_response(
+                error_class=tool_outcome.error_class,
+                error_category=tool_outcome.error_category,
+                error_message=None,
+            )
+            persisted_arguments = {
+                "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                "error_class": arg_error_projection["error_class"],
+                "field_count": len(decoded_args),
+            }
+        elif tc.function.name in MANIFEST:
+            try:
+                redaction_input = (
+                    inline_custody_manifest_redaction_input(decoded_args) if tc.function.name == "set_pipeline" else decoded_args
+                )
+                persisted_arguments = redact_tool_call_arguments(
+                    tc.function.name,
+                    redaction_input,
+                    telemetry=redaction_telemetry,
+                )
+                if tc.function.name == "set_pipeline":
+                    persisted_arguments = cast(
+                        dict[str, Any],
+                        inline_custody_audit_projection(persisted_arguments),
+                    )
+            except PydanticValidationError:
+                if tool_outcome.error_class is None:
+                    raise
+                failure_projection = redact_failure_response(
+                    status=ComposerToolStatus.PLUGIN_CRASH.value,
+                    error_class=tool_outcome.error_class,
+                    error_message=tool_outcome.error_message,
+                )
+                persisted_arguments = {
+                    "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
+                    "error_class": failure_projection["error_class"],
+                    "field_count": len(decoded_args),
+                }
+        else:
+            persisted_arguments = unknown_tool_arguments_redaction(telemetry=redaction_telemetry)
+        redacted_assistant_tool_calls = (
+            *redacted_assistant_tool_calls,
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": json.dumps(persisted_arguments),
+                },
+                # The call's wire facts (D1): which strict key was sent for the
+                # tool and whether its raw arguments conformed to the W they
+                # were sent under. Always present; null when not applicable.
+                "strict_sent": tool_outcome.strict_sent,
+                "wire_conformant": tool_outcome.wire_conformant,
+            },
+        )
+
+    def visible_event_for(outcome: _ToolOutcome, display_result: str) -> VisibleToolEvent | None:
+        if session_operation_context is None:
+            return None
+        authoring = next((item for item in private_authorings if item.tool_call_id == outcome.call.id), None)
+        received, effective, selected = (
+            turn_evidence.transcript.current_tool_strings(outcome.call.id, outcome.call.function.name)
+            if turn_evidence is not None
+            else (None, None, None)
+        )
+        display_call = next(item for item in redacted_assistant_tool_calls if item["id"] == outcome.call.id)
+        return VisibleToolEvent.capture(
+            context=session_operation_context,
+            request_id=turn_evidence.request_id if turn_evidence is not None else None,
+            tool_call_id=outcome.call.id,
+            tool_name=outcome.call.function.name,
+            received_arguments=received if received is not None else authoring.raw_arguments if authoring is not None else None,
+            effective_arguments=effective if effective is not None else outcome.call.function.arguments,
+            selected_result=selected,
+            display_arguments=display_call["function"]["arguments"],
+            display_result=display_result,
+        )
+
+    redacted_rows: list[RedactedToolRow] = []
+    for index, tool_outcome in enumerate(tool_outcomes):
+        display_result = _serialize_response_via_walker(
+            tool_outcome,
+            telemetry=redaction_telemetry,
+            failure_status=(
+                None
+                if tool_outcome.error_class is None
+                else (
+                    ComposerToolStatus.PLUGIN_CRASH if crash_pending and index == len(tool_outcomes) - 1 else ComposerToolStatus.ARG_ERROR
+                )
+            ),
+        )
+        redacted_rows.append(
+            RedactedToolRow(
+                tool_call_id=tool_outcome.call.id,
+                content=display_result,
+                composition_state_payload=(
+                    _state_payload_for_compose_turn(tool_outcome.response, ingress=ingress, chat_ingress_inputs=chat_ingress_inputs)
+                    if tool_outcome.post_version > tool_outcome.pre_version
+                    else None
+                ),
+                visible_event=visible_event_for(tool_outcome, display_result),
+            )
+        )
+    redacted_tool_rows = tuple(redacted_rows)
+    revoked_tool_rows = (
+        _revoked_graph_rows(
+            rows=redacted_tool_rows,
+            outcomes=tool_outcomes,
+            base_state=base_state,
+            redaction_telemetry=redaction_telemetry,
+        )
+        if session_id is not None
+        else redacted_tool_rows
+    )
+    failed_turn: FailedTurnMetadata | None = None
+    unwind_audit_failed = False
+    checkpoint_projection = None
+    effect_verification_failure = None
+    audit_outcome: AuditOutcome | None = None
+    effects_before = turn_evidence.effects if turn_evidence is not None else None
+    if session_id is not None:
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Compose turn audit persistence requires exact session operation authority")
+        if sessions_service is None:
+            raise RuntimeError("sessions_service not wired")
+        from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, private_failure_evidence
+        from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence, diagnostic_evidence_identity
+
+        authorings = {authoring.tool_call_id: authoring for authoring in private_authorings}
+        invocations = {invocation.tool_call_id: invocation for invocation in private_invocations}
+        expected_ids = {outcome.call.id for outcome in tool_outcomes}
+        if (
+            set(authorings) != expected_ids
+            or len(authorings) != len(private_authorings)
+            or set(invocations) != expected_ids
+            or len(invocations) != len(private_invocations)
+        ):
+            raise AuditIntegrityError("private tool checkpoint lost its exact authoring or invocation set")
+        private_tool_evidence = []
+        for outcome in tool_outcomes:
+            authoring = authorings[outcome.call.id]
+            invocation = invocations[outcome.call.id]
+            if invocation.tool_name != outcome.call.function.name:
+                raise AuditIntegrityError("private tool checkpoint invocation names another tool")
+            if invocation.private_authoring is not None and invocation.private_authoring != authoring:
+                raise AuditIntegrityError("private tool checkpoint receipt differs from its invocation")
+            if invocation.result_canonical is not None:
+                if invocation.result_hash is None:
+                    raise AuditIntegrityError("private tool checkpoint result has no binding")
+                _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="private checkpoint result")
+            elif invocation.result_hash is not None:
+                raise AuditIntegrityError("private tool checkpoint absent result has a hash")
+            private_tool_evidence.append(
+                build_private_tool_evidence(
+                    session_id=session_id,
+                    operation_id=session_operation_context.fence.operation_id,
+                    operation_epoch=session_operation_context.fence.operation_epoch,
+                    tool_call_id=outcome.call.id,
+                    tool_name=outcome.call.function.name,
+                    status=invocation.status.value,
+                    arguments_canonical=authoring.arguments_canonical,
+                    authority_arguments_canonical=authoring.authority_arguments_canonical,
+                    raw_arguments=authoring.raw_arguments,
+                    result_canonical=invocation.result_canonical,
+                    error_category=outcome.error_category.value if outcome.error_category is not None else None,
+                )
+            )
+        private_tool_failures = tuple(
+            private_failure_evidence(
+                invocation.private_failure,
+                identity=diagnostic_evidence_identity("tool-failure", invocation.tool_call_id),
+                tool_call_id=invocation.tool_call_id,
+                status="tool_failure",
+                context=session_operation_context,
+            )
+            for invocation in private_invocations
+            if invocation.private_failure is not None
+        )
+        checkpoint_sql = checkpoint_projection = None
+        if required_work is not None:
+            if type(required_work) is not RequiredWorkBinding:
+                raise AuditIntegrityError("Compose checkpoint requires a nominal required-work binding")
+            required_work.validate_context(session_operation_context)
+            if continuation is None:
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
+        try:
+            if continuation is not None:
+                from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+                from elspeth.web.composer.continuation_prepared_p4 import capture_prepared_p4
+
+                if (
+                    type(continuation) is not ContinuationLiveP4
+                    or continuation.work is not required_work
+                    or continuation.inventory.running.session_operation_context is not session_operation_context
+                    or type(required_work) is not RequiredWorkBinding
+                ):
+                    raise AuditIntegrityError("V2 P4 publication changed its retained current phase/ticket owners")
+                prepared = capture_prepared_p4(
+                    context=session_operation_context,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_calls=redacted_assistant_tool_calls,
+                    redacted_rows=redacted_tool_rows,
+                    revoked_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    withheld_replies=continuation.withheld_replies,
+                    invocations=private_invocations,
+                    authorings=private_authorings,
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    assistant_row_uses_current_dispatch=assistant_row_uses_current_dispatch,
+                    crash_pending=crash_pending,
+                    env_ref_names=continuation.inventory.names,
+                )
+                if terminal_completion is None:
+                    commit = await continuation.prepare(prepared)
+                else:
+                    from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
+
+                    if type(terminal_completion) is not TerminalServiceCompletion:
+                        raise AuditIntegrityError("terminal publication requires its exact native service completion")
+                    terminal_completion.require_p4(continuation)
+                    # The terminal P4 owner/SQL/application implementation is a
+                    # separate required join. Never encode/clear the live failure
+                    # or fall through to the legacy writer when it is unavailable.
+                    commit = await continuation.prepare_terminal(prepared, terminal_completion)
+                checkpoint_sql, checkpoint_projection = required_work.reserve_pair(
+                    RequiredWorkSource.COMPOSE_CHECKPOINT_SQL, RequiredWorkSource.COMPOSE_CHECKPOINT_PROJECTION
+                )
+                try:
+                    continuation.bind_checkpoint_ticket(checkpoint_sql)
+                except BaseException as original:
+                    # This exact local reservation has not reached the physical
+                    # service call. Preserve its real no-submission failure;
+                    # the existing outer handler closes the paired projection.
+                    try:
+                        checkpoint_sql.complete_without_submission(original)
+                    except BaseException as cleanup:
+                        if cleanup is original:
+                            raise
+                        raise BaseExceptionGroup("P4 checkpoint binding and no-submission cleanup", (original, cleanup)) from None
+                    raise
+                physical = await sessions_service.persist_continuation_compose_turn(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                    continuation=commit,
+                    continuation_prepared=prepared,
+                    continuation_env_ref_names=continuation.inventory.names,
+                    required_work=checkpoint_sql,
+                    continuation_observation=continuation.writer_observation,
+                )
+                audit_outcome = continuation.accept_physical(checkpoint_sql, physical)
+            elif checkpoint_sql is None:
+                audit_outcome = await sessions_service.persist_compose_turn_async(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                )
+            else:
+                audit_outcome = await sessions_service.persist_compose_turn_async(
+                    session_id=session_id,
+                    assistant_content=assistant_message.content or "",
+                    raw_content=raw_assistant_content,
+                    redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+                    redacted_tool_rows=redacted_tool_rows,
+                    revoked_tool_rows=revoked_tool_rows,
+                    mutation_ceiling=mutation_ceiling,
+                    authority_revocation=authority_revocation,
+                    private_tool_evidence=tuple(private_tool_evidence),
+                    private_tool_failures=private_tool_failures,
+                    rejection_records=build_rejection_records(tool_outcomes),
+                    parent_composition_state_id=current_state_id,
+                    expected_current_state_id=current_state_id,
+                    writer_principal="compose_loop",
+                    plugin_crash_pending=crash_pending,
+                    session_operation_context=session_operation_context,
+                    required_work=checkpoint_sql,
+                )
+        except AuditIntegrityError as exc:
+            if checkpoint_projection is not None and checkpoint_sql is not None and checkpoint_sql.complete:
+                checkpoint_projection.complete_without_submission()
+            exc.failed_turn = FailedTurnMetadata(
+                assistant_message_id=None,
+                tool_calls_attempted=len(assistant_tool_calls),
+                tool_responses_persisted=0,
+            )
+            raise
+        except BaseException:
+            if checkpoint_projection is not None and checkpoint_sql is not None and checkpoint_sql.complete:
+                checkpoint_projection.complete_without_submission()
+            raise
+        if checkpoint_projection is not None:
+            checkpoint_projection.begin_projection()
+        if type(audit_outcome) is not AuditOutcome:
+            failure = AuditIntegrityError("Compose checkpoint returned a foreign audit outcome")
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
+        if audit_outcome.assistant_id is not None and audit_outcome.published_assistant_content is None:
+            failure = AuditIntegrityError("Committed P4 omitted its actual publication content")
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
+        unwind_audit_failed = audit_outcome.unwind_audit_failed
+        effect_verification_failure = audit_outcome.continuation_retention_failure
+        authority_revocation = audit_outcome.authority_revocation
+        redacted_tool_rows = audit_outcome.published_tool_rows
+        current_state_id = audit_outcome.current_state_id
+        failed_turn = FailedTurnMetadata(
+            assistant_message_id=audit_outcome.assistant_id,
+            tool_calls_attempted=len(assistant_tool_calls),
+            tool_responses_persisted=0 if audit_outcome.assistant_id is None else len(redacted_tool_rows),
+        )
+        if audit_outcome.assistant_id is None and not crash_pending:
+            failure = AuditIntegrityError(
+                "persist_compose_turn_async returned unwind_audit_failed without an in-flight plugin crash",
+                failed_turn=failed_turn,
+            )
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
+        if audit_outcome.assistant_id is None and not audit_outcome.unwind_audit_failed:
+            failure = AuditIntegrityError(
+                "persist_compose_turn_async returned no assistant id without the unwind-audit-failed disposition",
+                failed_turn=failed_turn,
+            )
+            if checkpoint_projection is not None:
+                checkpoint_projection.complete_owned(failure)
+            raise failure
+        persisted_assistant_message_id = audit_outcome.assistant_id
+        # Publication selection occurs under the SQL lock. Adopt its actual
+        # committed bytes rather than inferring them from the candidate.
+        persisted_assistant_content = audit_outcome.published_assistant_content
+        # The unwind-failure outcome means the transaction rolled back: no
+        # assistant or tool row survived, so the driver must retain the
+        # in-flight invocation evidence on the propagated plugin crash.
+        persisted_tool_call_turn = audit_outcome.assistant_id is not None
+        if turn_evidence is not None and audit_outcome.checkpoint_disposition == "committed":
+            try:
+                witness = audit_outcome.checkpoint
+                if witness is None or audit_outcome.assistant_id is None:
+                    raise AuditIntegrityError("New compose checkpoint is missing its committed row witness")
+                expected_state = next(
+                    (
+                        outcome.response.updated_state
+                        for outcome in reversed(tool_outcomes)
+                        if outcome.post_version > outcome.pre_version
+                        and isinstance(outcome.response, ToolResult)
+                        and outcome.response.updated_state is not None
+                    ),
+                    None,
+                )
+                if expected_state is None:
+                    raise AuditIntegrityError("Committed compose checkpoint has no corresponding dispatched state")
+                turn_evidence.accept_checkpoint(
+                    witness,
+                    expected_state=expected_state,
+                    tool_call_ids=tuple(item.call.id for item in tool_outcomes),
+                    assistant_message_id=audit_outcome.assistant_id,
+                )
+            except Exception as exc:
+                # These rows already committed. Return the real metadata and
+                # propagate after the driver records it, never use rollback or
+                # unpersisted-suffix handling for a comparison failure.
+                if isinstance(exc, AuditIntegrityError):
+                    effect_verification_failure = exc
+                else:
+                    effect_verification_failure = AuditIntegrityError("Committed compose effect verification failed")
+                    effect_verification_failure.__cause__ = exc
+                effect_verification_failure.failed_turn = failed_turn
+                turn_evidence.mark_verification_unavailable()
+    try:
+        result = _PersistOutcome(
+            current_state_id=current_state_id,
+            persisted_assistant_message_id=persisted_assistant_message_id,
+            persisted_assistant_content=persisted_assistant_content,
+            persisted_tool_call_turn=persisted_tool_call_turn,
+            persisted_assistant_matches_current_dispatch=(
+                persisted_assistant_message_id is not None and assistant_row_uses_current_dispatch and authority_revocation is None
+            ),
+            unwind_audit_failed=unwind_audit_failed,
+            failed_turn=failed_turn,
+            redacted_assistant_tool_calls=redacted_assistant_tool_calls,
+            redacted_tool_rows=redacted_tool_rows,
+            audit_outcome=audit_outcome,
+            effect_verification_failure=effect_verification_failure,
+            authority_revocation=authority_revocation,
+        )
+        if continuation is not None:
+            from elspeth.web.composer.continuation_live_p4_application import finish_live_p4_application
+
+            continuation.publication = result
+            if effects_before is None:
+                raise AuditIntegrityError("continuation publication lost its actual before effects owner")
+            await finish_live_p4_application(continuation, effects_before=effects_before)
+            if terminal_completion is not None and result.unwind_audit_failed:
+                continuation.raise_after_publication(
+                    AuditIntegrityError("Service failure audit row could not be persisted", failed_turn=result.failed_turn)
+                )
+    except BaseException as exc:
+        if checkpoint_projection is not None:
+            checkpoint_projection.complete_owned(exc)
+        raise
+    if checkpoint_projection is not None:
+        checkpoint_projection.complete_owned(effect_verification_failure)
+    if continuation is not None:
+        continuation.raise_after_publication()
+    return result''',
+    "p4_application.finish_live_p4_application": r"""async def finish_live_p4_application(
+    owner: ContinuationLiveP4, *, effects_before: PersistedTurnEffects
+) -> StoredP4Application | StoredTerminalP4Application:
+    if (
+        type(owner) is not ContinuationLiveP4
+        or type(effects_before) is not PersistedTurnEffects
+        or owner.prepared is None
+        or owner.commit is None
+        or owner.publication is None
+        or owner.publication.audit_outcome is None
+        or owner.committed_outcome is None
+        or owner.application is not None
+    ):
+        raise AuditIntegrityError("warm P4 application lost its actual writer/preparation/projection")
+    runtime, inventory = owner.runtime, owner.inventory
+    evidence, recorder = runtime.live.turn_evidence, runtime.live.recorder
+    effects_after = evidence.effects
+    committed = owner.committed_outcome
+    if committed.audit_outcome is not owner.publication.audit_outcome:
+        raise AuditIntegrityError("warm P4 replaced its actual committed publication")
+    value = committed.application
+    if type(value) is StoredTerminalP4Application:
+        from elspeth.contracts.hashing import canonical_json
+        from elspeth.web.composer.continuation_audit_buffer import decode_recorder_snapshot
+        from elspeth.web.composer.continuation_terminal_p4_data import decode_terminal_p4_input, decode_terminal_p4_result
+        from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result, decode_p4_receipt
+
+        if owner.terminal_completion is None:
+            raise AuditIntegrityError("terminal P4 application lost its original native completion")
+        owner.terminal_completion.require_p4(owner)
+        source = decode_terminal_p4_input(value.input_document, env_ref_names=inventory.names)
+        result_data = decode_terminal_p4_result(value.result_document, input_document=value.input_document, env_ref_names=inventory.names)
+        receipt, outcome = decode_p4_receipt(canonical_json(result_data.receipt.model_dump(mode="json")), env_ref_names=inventory.names)
+        actual = decode_audit_outcome_data(
+            encode_audit_outcome_data(owner.publication.audit_outcome, prepared=owner.prepared, env_ref_names=inventory.names),
+            prepared=owner.prepared,
+            env_ref_names=inventory.names,
+        )
+        snapshot = recorder.snapshot_for_continuation(drained=runtime.drained)
+        retained = decode_recorder_snapshot(source.recorder)
+        if (
+            receipt.effect_key != owner.commit.effect_key
+            or receipt.input_sha256 != owner.commit.input_sha256
+            or actual != outcome
+            or snapshot.drained != retained.drained
+            or any(
+                current[: len(previous)] != previous
+                for previous, current in (
+                    (retained.invocations, snapshot.invocations),
+                    (retained.llm_calls, snapshot.llm_calls),
+                    (retained.planner_attempts, snapshot.planner_attempts),
+                    (retained.withheld_replies, snapshot.withheld_replies),
+                    (retained.visible_tool_events, snapshot.visible_tool_events),
+                    (retained.private_candidates, snapshot.private_candidates),
+                    (retained.private_authorings, snapshot.private_authorings),
+                )
+            )
+        ):
+            raise AuditIntegrityError("terminal P4 projection changed its actual prepared publication/recorder")
+        following = _project_recorder(snapshot, owner.prepared, ReadmittedP4Result(receipt, outcome, None), env_ref_names=inventory.names)
+        if (
+            following.drained != result_data.drained
+            or evidence.effects is not effects_after
+            or recorder.snapshot_for_continuation(drained=runtime.drained) != snapshot
+        ):
+            raise AuditIntegrityError("terminal P4 projection changed its exact published slices")
+        owner.application = value
+        owner.runtime = replace(runtime, graph=runtime.graph.with_drained(following.drained), drained=following.drained)
+        return value
+    if type(value) is not StoredP4Application:
+        raise AuditIntegrityError("warm P4 lost its closed application owner")
+    result = value.bundle.result
+    record = value.bundle.entry.applications[-1]
+    if record.effect_key != owner.commit.effect_key or result.receipt.input_sha256 != owner.commit.input_sha256:
+        raise AuditIntegrityError("warm P4 changed its actual committed application/result")
+    actual = decode_audit_outcome_data(
+        encode_audit_outcome_data(owner.publication.audit_outcome, prepared=owner.prepared, env_ref_names=inventory.names),
+        prepared=owner.prepared,
+        env_ref_names=inventory.names,
+    )
+    if actual != result.outcome:
+        raise AuditIntegrityError("warm P4 projection replaced its actual physical writer outcome")
+    snapshot = recorder.snapshot_for_continuation(drained=runtime.drained)
+    following = _project_recorder(snapshot, owner.prepared, result, env_ref_names=inventory.names)
+    from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
+
+    root = decode_continuation_snapshot(value.snapshot.payload_json)
+    compose, frame = root.frames[0], root.frames[-1]
+    if type(compose) is not ComposeFrame or type(frame) is not ToolBatchFrame:
+        raise AuditIntegrityError("warm P4 application changed its actual phase family")
+    application = HistoricalP4Application(
+        record.checkpoint_id,
+        owner.commit.effect_key,
+        owner.data,
+        result,
+        recorder,
+        snapshot,
+        following,
+        effects_before,
+        effects_after,
+        owner.publication.effect_verification_failure,
+    )
+    if (
+        evidence.effects is not effects_after
+        or recorder.snapshot_for_continuation(drained=runtime.drained) != snapshot
+        or retained_effects(effects_after) != value.bundle.evidence_after.snapshot.effects
+        or following != value.bundle.recorder_after
+        or application.effect_key in evidence._historical_p4_applications
+    ):
+        raise AuditIntegrityError("warm P4 projection differs from its actual checked SQL application")
+    evidence._historical_p4_applications[application.effect_key] = application
+    data = retain_portable_application_on_live_evidence(
+        owner=evidence,
+        recorder=recorder,
+        application=application,
+        bundle=value.bundle,
+        env_ref_names=inventory.names,
+    )
+    owner.data = data
+    owner.application = value
+    owner.runtime = replace(
+        runtime,
+        graph=runtime.graph.with_batch_and_drained(data, following.drained),
+        drained=following.drained,
+    )
+    return value""",
+    "phases.ContinuationLivePhases._initialize_batch": r"""async def _initialize_batch(self, selected: SelectedContinuationState) -> None:
+    runtime, inventory = await self.current(selected)
+    result, live = await self._primary_for_phase(runtime, inventory, selected), runtime.live
+    frame = selected.stack.frames[-1]
+    if type(frame) is not ComposeFrame or frame.pending_response != result.response.reference:
+        raise AuditIntegrityError("batch initialization changed its exact original paid response")
+    self.service._enforce_tool_call_cap(
+        assistant_tool_calls=result.outcome.completion.tool_batch.calls,
+        state=live.state,
+        initial_version=live.initial_version,
+        composition_turns_used=live.composition_turns_used,
+        discovery_turns_used=live.discovery_turns_used,
+        recorder=live.recorder,
+        failed_turn=live.failed_turn,
+        persisted_tool_call_turn=live.persisted_tool_call_turn,
+    )
+    accumulator = BatchAccumulator(live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used)
+    batch = ContinuationBatchState(
+        live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used, entry_state=live.state
+    )
+    data = RestoredBatchData(batch, accumulator, result.outcome.completion.tool_batch.calls)
+    context = await self._tool_context(runtime)
+    await _initialize_continuation_batch_live(
+        call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch
+    )
+    self.runtime = runtime = replace(runtime, graph=runtime.graph.with_batch(data))
+    captured = await capture_continuation_runtime_owners(runtime, selected=selected, inventory=inventory)
+    chunk = encode_private_chunk(
+        codec="composer.coupled-batch-data.v1",
+        canonical=encode_coupled_batch_data(batch=batch, accumulator=accumulator, calls=data.calls, env_ref_names=inventory.names),
+        env_ref_names=inventory.names,
+    )
+    tool = ToolBatchFrame(
+        phase="tool_ready", response=result.response.reference, accumulator=chunk.reference, next_tool_index=0, settled_effect_ids=()
+    )
+    root = captured.stack.model_copy(update={"frames": (*captured.stack.frames, tool)})
+    following = CapturedContinuationRuntime(selected, root, _selected_chunks(root, captured.chunks, (chunk,)))
+    await self._retain(following, inventory, "batch_initialized")""",
+    "phases.ContinuationLivePhases._persist_batch": r"""async def _persist_batch(self, selected: SelectedContinuationState) -> None:
+    terminal = self.terminal_completion
+    if terminal is None:
+        phase_read = await self._current_phase_read(selected)
+        runtime, inventory = phase_read.runtime, phase_read.inventory
+        result = await self._primary_for_phase(runtime, inventory, selected)
+        context = await build_runtime_tool_batch_context(
+            runtime, cancellation_requested=self.cancellation_requested, phase_read=phase_read
+        )
+        call_model = result.outcome
+    else:
+        terminal.require_native()
+        if self.runtime is not terminal.runtime or selected is not terminal.runtime.source.selected or terminal.p4 is not None:
+            raise terminal.custody.failure(AuditIntegrityError("terminal P4 cannot replace or replay its actual native completion"))
+        runtime = terminal.runtime
+        inventory = runtime.materialization.inventory
+        context, call_model = terminal.context, terminal.call_model
+    data = runtime.graph.batch
+    if data is None or data.batch.phase != "dispatch_ready":
+        raise AuditIntegrityError("live P4 lost its actual completed batch/provider owners")
+    dispatch, advisor_calls = _finish_continuation_batch_live(
+        call_model=call_model,
+        ctx=context,
+        acc=data.accumulator,
+        batch=data.batch,
+        failure_custody=self.failure_custody,
+    )
+    live, bindings = runtime.live, runtime.bindings
+    self.p4 = owner = ContinuationLiveP4(
+        self.authority,
+        selected,
+        inventory,
+        self.work,
+        data,
+        runtime,
+        withheld_replies=live.recorder.withheld_replies[runtime.drained.withheld_replies :],
+    )
+    if terminal is not None:
+        terminal.bind_p4(owner)
+
+    async def publish() -> None:
+        deadline_owner = self.work.coordinator.sql_deadline_owner
+        if deadline_owner is not None:
+            if deadline_owner.running is not inventory.running:
+                raise AuditIntegrityError("P4 finishing changed its actual original timing owner")
+            # This retained child only finishes the actual existing batch;
+            # its SQL owner still proves all current/pre-Stop authority.
+            # Spend the original action's reserve without restarting D.
+            deadline_owner.begin_settlement()
+        original: BaseException | None = None
+        try:
+            await self.service._persist_turn_audit(
+                tool_outcomes=dispatch.tool_outcomes,
+                mutation_ceiling=bindings.mutation_ceiling,
+                authority_revocation=dispatch.authority_revocation,
+                base_state=data.batch.entry_state,
+                decoded_args_by_call_id=dispatch.decoded_args_by_call_id,
+                private_authorings=dispatch.private_authorings,
+                private_invocations=dispatch.private_invocations,
+                assistant_message=dispatch.assistant_message,
+                raw_assistant_content=dispatch.raw_assistant_content,
+                assistant_tool_calls=dispatch.assistant_tool_calls,
+                crash_pending=(
+                    dispatch.plugin_crash is not None
+                    or dispatch.advisor_failure is not None
+                    or dispatch.service_failure is not None
+                    or (
+                        data.batch.retained_failure is not None
+                        and data.batch.retained_failure.kind in ("plugin_crash", "advisor_failure")
+                    )
+                ),
+                session_id=bindings.session_id,
+                session_operation_context=bindings.session_operation_context,
+                current_state_id=live.current_state_id,
+                persisted_tool_call_turn=live.persisted_tool_call_turn,
+                persisted_assistant_message_id=live.persisted_assistant_message_id,
+                persisted_assistant_content=live.persisted_assistant_content,
+                ingress=bindings.ingress,
+                chat_ingress_inputs=None if bindings.chat_ingress_inputs is None else list(bindings.chat_ingress_inputs),
+                advisor_repair_context_introduced=live.advisor_repair_context_introduced,
+                required_work=self.work,
+                turn_evidence=live.turn_evidence,
+                continuation=owner,
+                terminal_completion=terminal,
+            )
+        except BaseException as failure:
+            original = failure if self.failure_custody is None else self.failure_custody.failure(failure)
+        finally:
+            # turn_audit retains actual committed publication before a
+            # deferred cancellation or verification failure may escape.
+            persist = owner.publication
+            if persist is not None:
+                live.current_state_id = persist.current_state_id
+                live.persisted_assistant_message_id = persist.persisted_assistant_message_id
+                live.persisted_assistant_content = persist.persisted_assistant_content
+                live.persisted_tool_call_turn, live.failed_turn = persist.persisted_tool_call_turn, persist.failed_turn
+                live.advisor_calls_used = advisor_calls
+        if owner.publication is not None:
+            # The one checkpoint projection reconciled both actual SQL
+            # outputs before completing. Never submit a second apply here.
+            self.runtime = owner.runtime
+            if original is not None:
+                raise original
+        elif original is not None:
+            raise original
+        try:
+            owner.raise_after_publication()
+        except BaseException as failure:
+            if self.failure_custody is not None:
+                combined = self.failure_custody.failure(failure)
+                if combined is failure:
+                    raise
+                raise combined from combined.__cause__
+            raise
+        custody = self.failure_custody
+        if custody is not None and custody.completed:
+            if custody.wrapper is not None:
+                raise custody.wrapper from custody.original
+            if custody.original is not None:
+                raise custody.original
+
+    critical = self.lease.create_continuation_stage(publish(), name="continuation-required-p4")
+    await self.lease.join_continuation_stage(critical)""",
+    "p4.ContinuationLiveP4.__post_init__": r"""def __post_init__(self) -> None:
+    if (
+        type(self.authority) is not ComposerAsyncOperationAuthority
+        or type(self.selected) is not SelectedContinuationState
+        or type(self.inventory) is not CurrentContinuationEnvInventory
+        or type(self.work) is not RequiredWorkBinding
+        or type(self.data) is not RestoredBatchData
+        or type(self.runtime) is not RestoredContinuationRuntime
+        or self.runtime.graph.batch is not self.data
+        or self.runtime.bindings.required_work is not self.work
+        or self.work.running is None
+        or self.inventory.running is not self.work.running
+    ):
+        raise AuditIntegrityError("live P4 lost its actual current phase owners")
+    self.work.validate_context(self.inventory.running.session_operation_context)
+""",
+    "p4.ContinuationLiveP4._retain_cancellations": r"""def _retain_cancellations[T](self, outcome: RequiredSQLFinishOnce[T]) -> None:
+    for cancellation in outcome.deferred_cancellations:
+        if all(cancellation is not previous for previous in self.deferred_cancellations):
+            self.deferred_cancellations.append(cancellation)
+""",
+    "p4.ContinuationLiveP4.prepare": r"""async def prepare(self, prepared: PreparedP4Value) -> ContinuationOwnerCommit:
+    if self.preparation is not None or self.prepared is not None:
+        raise AuditIntegrityError("live P4 preparation cannot replace a retained physical outcome")
+    names = await _read_current_env_names(
+        self.runtime.materialization.service._advisor_checkpoint, self.selected.stack.logical.session_id
+    )
+    self.inventory = CurrentContinuationEnvInventory(self.inventory.running, self.inventory.selection, names)
+    pending = replace(
+        self.data.batch, phase="p4_pending", p4_input_json=encode_prepared_p4(prepared, env_ref_names=self.inventory.names)
+    )
+    chunk = encode_p4_pending_batch_chunk(
+        batch=pending, accumulator=self.data.accumulator, calls=self.data.calls, env_ref_names=self.inventory.names
+    )
+    members = prepared_p4_members(prepared, env_ref_names=self.inventory.names)
+    recorded = self.runtime.live.recorder.invocations
+    linked = self.runtime.live.recorder.visible_tool_events
+    for expected, row in zip(members.invocations, members.redacted_rows, strict=True):
+        actual = tuple(invocation for invocation in recorded if invocation.tool_call_id == expected.tool_call_id)
+        if len(actual) != 1 or actual[0] != expected:
+            raise AuditIntegrityError("P4 redaction lost its actual recorded invocation")
+        if row.visible_event is not None:
+            previous = tuple(event for invocation, event in linked if invocation is actual[0])
+            if previous and previous != (row.visible_event,):
+                raise AuditIntegrityError("P4 redaction replaced its actual visible event")
+            if not previous:
+                self.runtime.live.recorder.record_visible_tool_event(actual[0], row.visible_event)
+    pending_data = RestoredBatchData(pending, self.data.accumulator, self.data.calls)
+    runtime = replace(self.runtime, graph=self.runtime.graph.with_batch(pending_data))
+
+    def read_source() -> ContinuationRuntimeSource:
+        try:
+            return self.authority.read_continuation_runtime(self.inventory.running, selected=self.selected, inventory=self.inventory)
+        except ComposerOperationCancelledDuringTurn:
+            # A real durable Stop selects the separate read facet. It must
+            # prove immutable pre-Stop issue ordering again; no caller flag
+            # or old frontier grants the pending P4 write.
+            return self.authority.read_continuation_owed_batch_runtime(
+                self.inventory.running, selected=self.selected, inventory=self.inventory
+            )
+
+    def capture() -> CapturedContinuationRuntime:
+        source = read_source()
+        captured = _capture_owners(runtime, source=source, inventory=self.inventory)
+        actual = read_source()
+        if actual.selected != source.selected or actual.bootstrap != source.bootstrap or actual.evidence != source.evidence:
+            raise AuditIntegrityError("P4 capture changed its complete current source during retention")
+        self.captured = captured
+        return captured
+
+    captured = await _registered_read(self.work, CapturedContinuationRuntime, capture)
+    top = captured.stack.frames[-1]
+    if type(top) is not ToolBatchFrame:
+        raise AuditIntegrityError("P4 capture lost its actual completed batch frame")
+    sql, projection = self.work.reserve_pair(
+        RequiredWorkSource.CONTINUATION_STATE_SQL, RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+    )
+    try:
+        outcome = await run_required_sql_finish_once(
+            sql,
+            self.authority.prepare_continuation_p4,
+            self.inventory.running,
+            expected_checkpoint_id=self.selected.checkpoint_id,
+            expected_cursor=self.selected.stack.cursor,
+            pending_batch=chunk,
+            env_ref_names=self.inventory.names,
+            captured=captured,
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    self.preparation = outcome
+    self._retain_cancellations(outcome)
+    try:
+        self.work.coordinator.validate_continuation_sql_outcome(
+            ticket=sql, expected_source=RequiredWorkSource.CONTINUATION_STATE_SQL, actual_outcome=outcome
+        )
+    except BaseException:
+        projection.complete_without_submission()
+        raise
+    if type(outcome) is RequiredSQLRaised:
+        projection.complete_without_submission()
+        self.raise_after_publication(outcome.error)
+    if type(outcome) is not RequiredSQLReturned:
+        projection.complete_without_submission()
+        raise AuditIntegrityError("live P4 preparation returned another physical outcome")
+    projection.begin_projection()
+    try:
+        if type(outcome.value) is not ContinuationOwnerCommit or outcome.value.running is not self.inventory.running:
+            raise AuditIntegrityError("live P4 preparation changed its actual current owner")
+        self.commit, self.prepared = outcome.value, prepared
+        self.writer_observation = P4WriterObservation(outcome.value, prepared)
+        self.data.batch.phase, self.data.batch.p4_input_json = pending.phase, pending.p4_input_json
+    except BaseException as error:
+        projection.complete_owned(error)
+        raise
+    projection.complete_owned()
+    return outcome.value""",
+    "p4.ContinuationLiveP4.bind_checkpoint_ticket": r'''def bind_checkpoint_ticket(self, ticket: RequiredWorkTicket) -> None:
+    """Capture this P4's actual reservation before its physical invocation.
+
+    This pointer grants no write. The service and transaction still prove
+    source/current authority, and acceptance separately proves its Future.
+    """
+    coordinator = self.work.coordinator
+    with coordinator._lock:
+        if self._checkpoint_ticket is not None or self.physical is not None:
+            raise AuditIntegrityError("live P4 checkpoint ticket is already bound or observed")
+        coordinator._registered(ticket, RequiredWorkSource.COMPOSE_CHECKPOINT_SQL)
+        running = self.inventory.running
+        self.work.validate_context(running.session_operation_context)
+        if (
+            self.work.running is not running
+            or self.commit is None
+            or self.commit.running is not running
+            or self.prepared is None
+            or self.writer_observation is None
+            or self.writer_observation.commit is not self.commit
+            or self.writer_observation.prepared is not self.prepared
+            or ticket.key.authority.context != running.session_operation_context
+            or ticket.key.authority.durable_operation_id != running.claim.operation_id
+            or ticket.key.authority.claim_attempt != running.claim.attempt
+            or ticket.key.transition_ordinal != self.work.transition_ordinal
+            or ticket.key.semantic_ordinal != self.work.semantic_ordinal
+            or ticket.key.subphase is not RequiredWorkSubphase.SQL_INITIAL
+            or ticket.key.sql_attempt_ordinal != 0
+        ):
+            raise AuditIntegrityError("live P4 checkpoint ticket crossed its actual prepared scope")
+        with ticket._lock:
+            if (
+                ticket._complete
+                or ticket._future is not None
+                or ticket._submission_unknown
+                or ticket._projection_started
+                or ticket._finish_once_handoff is not None
+            ):
+                raise AuditIntegrityError("live P4 checkpoint binding must precede physical submission")
+            self._checkpoint_ticket = ticket
+''',
+    "p4.ContinuationLiveP4.accept_physical": r"""def accept_physical(self, ticket: RequiredWorkTicket, outcome: RequiredSQLFinishOnce[CommittedContinuationP4]) -> AuditOutcome:
+    with self.work.coordinator._lock:
+        if self.physical is not None:
+            raise AuditIntegrityError("live P4 cannot replace its retained physical SQL result")
+        self.physical = outcome
+        self._retain_cancellations(outcome)
+        if self.writer_observation is not None:
+            self.deferred_failures.extend(self.writer_observation.prior_errors)
+        if self.writer_observation is not None and self.writer_observation.original_error is not None:
+            self.deferred_failures.append(self.writer_observation.original_error)
+        if self._checkpoint_ticket is None or ticket is not self._checkpoint_ticket:
+            raise AuditIntegrityError("live P4 replaced its actual bound checkpoint ticket")
+        self.work.coordinator.validate_compose_checkpoint_sql_outcome(ticket=ticket, actual_outcome=outcome)
+    if type(outcome) is RequiredSQLRaised:
+        self.raise_after_publication(outcome.error)
+    if type(outcome) is not RequiredSQLReturned or type(outcome.value) is not CommittedContinuationP4:
+        raise AuditIntegrityError("live P4 returned a foreign physical publication")
+    observed = self.writer_observation
+    if (
+        observed is None
+        or not observed.committed
+        or outcome.value.audit_outcome is not observed.candidate
+        or outcome.value.application is not observed.application_candidate
+    ):
+        raise AuditIntegrityError("live P4 replaced its actual committing owner's outputs")
+    self.committed_outcome = outcome.value
+    return outcome.value.audit_outcome
+""",
+    "p4.ContinuationLiveP4.raise_after_publication": r"""def raise_after_publication(self, original: BaseException | None = None) -> None:
+    errors: list[BaseException] = [] if original is None else [original]
+    errors.extend(failure for failure in self.deferred_failures if failure is not original)
+    errors.extend(cancellation for cancellation in self.deferred_cancellations if cancellation is not original)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Live P4 retained outcomes", errors)
+""",
+    "graph.RestoredTurnEvidence": r'''class RestoredTurnEvidence:
+    """Original live evidence owners with closed bindings, never a frozen DATA snapshot."""
+
+    __slots__ = (
+        "_sealed",
+        "applications",
+        "batch",
+        "drained",
+        "evidence",
+        "messages",
+        "recorder",
+        "selected_audit",
+        "selected_dialect",
+    )
+
+    evidence: TurnEvidence
+    messages: list[dict[str, Any]]
+    recorder: BufferingRecorder
+    drained: RecorderDrainCursors
+    batch: RestoredBatchData | None
+    applications: PortableP4ApplicationEntry | None
+    selected_audit: PortableDispatchAudit | None
+    selected_dialect: ToolContractDialect | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        evidence: TurnEvidence,
+        messages: list[dict[str, object]],
+        recorder: BufferingRecorder,
+        drained: RecorderDrainCursors,
+        batch: RestoredBatchData | None = None,
+        applications: PortableP4ApplicationEntry | None = None,
+        selected_audit: PortableDispatchAudit | None = None,
+        selected_dialect: ToolContractDialect | None = None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        evidence: TurnEvidence,
+        messages: list[dict[str, object]],
+        recorder: BufferingRecorder,
+        drained: RecorderDrainCursors,
+        batch: RestoredBatchData | None = None,
+        applications: PortableP4ApplicationEntry | None = None,
+        selected_audit: PortableDispatchAudit | None = None,
+        selected_dialect: ToolContractDialect | None = None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("RestoredTurnEvidence cannot be reinitialized")
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "recorder", recorder)
+        object.__setattr__(self, "drained", drained)
+        object.__setattr__(self, "batch", batch)
+        object.__setattr__(self, "applications", applications)
+        object.__setattr__(self, "selected_audit", selected_audit)
+        object.__setattr__(self, "selected_dialect", selected_dialect)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("RestoredTurnEvidence bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("RestoredTurnEvidence bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not RestoredTurnEvidence or type(other) is not RestoredTurnEvidence:
+            return NotImplemented
+        return (
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        ) == (
+            other.evidence,
+            other.messages,
+            other.recorder,
+            other.drained,
+            other.batch,
+            other.applications,
+            other.selected_audit,
+            other.selected_dialect,
+        )
+
+    def with_batch(self, batch: RestoredBatchData) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_drained(self, drained: RecorderDrainCursors) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            drained,
+            self.batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_batch_and_drained(self, batch: RestoredBatchData, drained: RecorderDrainCursors) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            drained,
+            batch,
+            self.applications,
+            self.selected_audit,
+            self.selected_dialect,
+        )
+
+    def with_selected_dispatch(self, audit: PortableDispatchAudit, dialect: ToolContractDialect) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            audit,
+            dialect,
+        )
+
+    def without_selected_dispatch(self) -> RestoredTurnEvidence:
+        return RestoredTurnEvidence(
+            self.evidence,
+            self.messages,
+            self.recorder,
+            self.drained,
+            self.batch,
+            self.applications,
+            None,
+            None,
+        )''',
+    "families._ToolResultFamilySource": r'''class _ToolResultFamilySource:
+    """Closed bindings to the original live result and message owners."""
+
+    __slots__ = (
+        "_sealed",
+        "call",
+        "message",
+        "recipe",
+        "result",
+    )
+
+    recipe: ToolResultMessageRecipe
+    call: _AdmittedToolCall
+    result: ToolResult
+    message: dict[str, Any]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        recipe: ToolResultMessageRecipe,
+        call: _AdmittedToolCall,
+        result: ToolResult,
+        message: dict[str, object],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        recipe: ToolResultMessageRecipe,
+        call: _AdmittedToolCall,
+        result: ToolResult,
+        message: dict[str, object],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_ToolResultFamilySource cannot be reinitialized")
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "result", result)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_ToolResultFamilySource bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_ToolResultFamilySource bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _ToolResultFamilySource or type(other) is not _ToolResultFamilySource:
+            return NotImplemented
+        return (
+            self.recipe,
+            self.call,
+            self.result,
+            self.message,
+        ) == (
+            other.recipe,
+            other.call,
+            other.result,
+            other.message,
+        )''',
+    "families._ToolFeedbackFamilySource": r'''class _ToolFeedbackFamilySource:
+    """Closed bindings to the original live feedback and message owners."""
+
+    __slots__ = (
+        "_sealed",
+        "call",
+        "invocation",
+        "message",
+        "outcome",
+        "recipe",
+    )
+
+    recipe: ToolFeedbackMessageRecipe
+    call: _AdmittedToolCall
+    outcome: _ToolOutcome
+    invocation: ComposerToolInvocation
+    message: dict[str, Any]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        recipe: ToolFeedbackMessageRecipe,
+        call: _AdmittedToolCall,
+        outcome: _ToolOutcome,
+        invocation: ComposerToolInvocation,
+        message: dict[str, object],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        recipe: ToolFeedbackMessageRecipe,
+        call: _AdmittedToolCall,
+        outcome: _ToolOutcome,
+        invocation: ComposerToolInvocation,
+        message: dict[str, object],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_ToolFeedbackFamilySource cannot be reinitialized")
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "invocation", invocation)
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_ToolFeedbackFamilySource bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_ToolFeedbackFamilySource bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _ToolFeedbackFamilySource or type(other) is not _ToolFeedbackFamilySource:
+            return NotImplemented
+        return (
+            self.recipe,
+            self.call,
+            self.outcome,
+            self.invocation,
+            self.message,
+        ) == (
+            other.recipe,
+            other.call,
+            other.outcome,
+            other.invocation,
+            other.message,
+        )''',
+    "families._RestoredFamilyCohort": r'''class _RestoredFamilyCohort:
+    """One reconstruction's original mutable message aliases; never a write grant."""
+
+    __slots__ = (
+        "_sealed",
+        "feedback",
+        "messages",
+        "sources",
+    )
+
+    messages: tuple[dict[str, Any], ...]
+    feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...]
+    sources: tuple[_ToolFeedbackFamilySource, ...]
+    _sealed: bool
+
+    def __new__(
+        cls,
+        messages: tuple[dict[str, Any], ...],
+        feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...],
+        sources: tuple[_ToolFeedbackFamilySource, ...],
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        messages: tuple[dict[str, Any], ...],
+        feedback: tuple[tuple[ToolFeedbackMessageRecipe, _ToolFeedbackFamilySource], ...],
+        sources: tuple[_ToolFeedbackFamilySource, ...],
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_RestoredFamilyCohort cannot be reinitialized")
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "feedback", feedback)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_RestoredFamilyCohort bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_RestoredFamilyCohort bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _RestoredFamilyCohort or type(other) is not _RestoredFamilyCohort:
+            return NotImplemented
+        return (
+            self.messages,
+            self.feedback,
+            self.sources,
+        ) == (
+            other.messages,
+            other.feedback,
+            other.sources,
+        )''',
+    "producers._FeedbackMessageProvenance": r'''class _FeedbackMessageProvenance:
+    """Original live alias/source facts with closed bindings and no enclosing wire copy."""
+
+    __slots__ = (
+        "_sealed",
+        "authoring",
+        "body",
+        "call",
+        "call_id",
+        "invocation",
+        "keys",
+        "message",
+        "outcome",
+        "recipe",
+        "role",
+        "selector",
+    )
+
+    message: dict[str, Any]
+    recipe: ToolFeedbackMessageRecipe
+    keys: tuple[str, ...]
+    role: str
+    call_id: str
+    body: str
+    selector: tuple[str, str, int, int, str, str]
+    call: _AdmittedToolCall
+    invocation: ComposerToolInvocation
+    authoring: PrivateToolAuthoring
+    outcome: _ToolOutcome | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        message: dict[str, object],
+        recipe: ToolFeedbackMessageRecipe,
+        keys: tuple[str, ...],
+        role: str,
+        call_id: str,
+        body: str,
+        selector: tuple[str, str, int, int, str, str],
+        call: _AdmittedToolCall,
+        invocation: ComposerToolInvocation,
+        authoring: PrivateToolAuthoring,
+        outcome: _ToolOutcome | None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        message: dict[str, object],
+        recipe: ToolFeedbackMessageRecipe,
+        keys: tuple[str, ...],
+        role: str,
+        call_id: str,
+        body: str,
+        selector: tuple[str, str, int, int, str, str],
+        call: _AdmittedToolCall,
+        invocation: ComposerToolInvocation,
+        authoring: PrivateToolAuthoring,
+        outcome: _ToolOutcome | None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_FeedbackMessageProvenance cannot be reinitialized")
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "keys", keys)
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "call_id", call_id)
+        object.__setattr__(self, "body", body)
+        object.__setattr__(self, "selector", selector)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "invocation", invocation)
+        object.__setattr__(self, "authoring", authoring)
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_FeedbackMessageProvenance bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_FeedbackMessageProvenance bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _FeedbackMessageProvenance or type(other) is not _FeedbackMessageProvenance:
+            return NotImplemented
+        return (
+            self.message,
+            self.recipe,
+            self.keys,
+            self.role,
+            self.call_id,
+            self.body,
+            self.selector,
+            self.call,
+            self.invocation,
+            self.authoring,
+            self.outcome,
+        ) == (
+            other.message,
+            other.recipe,
+            other.keys,
+            other.role,
+            other.call_id,
+            other.body,
+            other.selector,
+            other.call,
+            other.invocation,
+            other.authoring,
+            other.outcome,
+        )
+
+    def with_outcome(self, outcome: _ToolOutcome) -> _FeedbackMessageProvenance:
+        return _FeedbackMessageProvenance(
+            self.message,
+            self.recipe,
+            self.keys,
+            self.role,
+            self.call_id,
+            self.body,
+            self.selector,
+            self.call,
+            self.invocation,
+            self.authoring,
+            outcome,
+        )''',
+    "producers.CurrentContinuationMessageProducers._bind_feedback_outcome": r'''def _bind_feedback_outcome(self, publication: ContinuationToolMessagePublication, outcome: _ToolOutcome) -> None:
+    """Complete a private session-inner DATA pair, once, before capture."""
+    if type(publication) is not ContinuationToolMessagePublication or publication.producers is not self:
+        raise AuditIntegrityError("feedback completion lost its original publication owner")
+    publication.require_call(
+        recorder=publication.recorder,
+        audit=publication.call.audit,
+        tool_name=publication.call.tool_name,
+        tool_call_id=publication.call.tool_call.id,
+        messages=publication.messages,
+    )
+    call, batch = publication.call, publication.batch
+    if (
+        type(outcome) is not _ToolOutcome
+        or len(batch.tool_outcomes) != call.index + 1
+        or batch.tool_outcomes[call.index] is not outcome
+        or outcome.call is not call.tool_call
+    ):
+        raise AuditIntegrityError("feedback completion replaced its actual outer outcome/list identity")
+    entries = tuple((index, item) for index, item in enumerate(self._feedback_produced) if item.call is call.tool_call)
+    if len(entries) != 1:
+        raise AuditIntegrityError("feedback completion has no unique actual inner producer")
+    index, record = entries[0]
+    top = self.selected.stack.frames[-1]
+    if (
+        record.outcome is not None
+        or type(top) is not ToolBatchFrame
+        or top.phase != "effect_reconciling"
+        or top.response != record.recipe.response
+        or top.next_tool_index != call.index
+        or record.recipe.tool_index != call.index
+        or record.authoring is not batch.private_authorings_by_call[call.tool_call.id]
+        or sum(item is record.invocation for item in publication.recorder.invocations) != 1
+        or sum(item is record.message for item in publication.messages) != 1
+    ):
+        raise AuditIntegrityError("feedback completion changed or duplicated its original inner source")
+    bound = record.with_outcome(outcome)
+    self._feedback_view(bound)
+    self._feedback_produced[index] = bound''',
+    "failure.ContinuationToolFailureCustody.promote_completed_service_failure": r'''def promote_completed_service_failure(self, original: _ServiceFailure) -> None:
+    """Close only the actual handler's audited refusal; retain no descriptor."""
+    self.observe_primary(original)
+    observation = self.observation
+    invocation = observation.stored
+    if (
+        not isinstance(original, _ServiceFailure)
+        or self.completed
+        or self.errors
+        or self.original is not original
+        or observation.owner is not self
+        or self.call.audit is not observation.audit
+        or not observation.execution_failed
+        or observation.returned
+        or invocation is None
+        or not observation.appended
+        or not self.batch.tool_outcomes
+        or self.batch.retained_failure is not None
+        or self.batch.plugin_crash is not None
+        or self.batch.advisor_failure is not None
+    ):
+        raise AuditIntegrityError("service completion lost its one actual handler origin/audit")
+    outcome = self.batch.tool_outcomes[-1]
+    if outcome.call is not self.call.tool_call:
+        raise AuditIntegrityError("service completion changed its actual issued outcome")
+    _require_service_failure_output(outcome, invocation)
+    self.invocation = invocation
+    self.batch.service_failure = original
+    self.batch.stop_issued_batch = True
+    self.completed = True''',
+    "failure.TerminalServiceCompletion": r'''@dataclass(slots=True)
+class TerminalServiceCompletion:
+    """One live issued completion; neither portable DATA nor a SQL permission.
+
+    Seal before a P4 owner exists. The same actual owner binds later and must
+    reprove its immutable issue/prefix/fence in authoritative terminal P4 SQL.
+    """
+
+    custody: ContinuationToolFailureCustody = field(repr=False)
+    runtime: RestoredContinuationRuntime = field(repr=False)
+    context: ToolBatchContext = field(repr=False)
+    call_model: _CallModelOutcome = field(repr=False)
+    issued_effect_key: str
+    p4: ContinuationLiveP4 | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.require_native()
+
+    def require_native(self) -> None:
+        from elspeth.web.composer.continuation import ToolBatchFrame
+        from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+        from elspeth.web.composer.tool_batch import ToolBatchContext
+
+        custody, runtime = self.custody, self.runtime
+        if (
+            type(custody) is not ContinuationToolFailureCustody
+            or type(runtime) is not RestoredContinuationRuntime
+            or type(self.context) is not ToolBatchContext
+            or type(self.call_model) is not _CallModelOutcome
+            or runtime.graph.batch is None
+        ):
+            raise AuditIntegrityError("terminal service completion requires its actual native owners")
+        data = runtime.graph.batch
+        batch, call, original = data.batch, custody.call, custody.original
+        top = runtime.source.selected.stack.frames[-1]
+        if (
+            not isinstance(original, _ServiceFailure)
+            or not custody.completed
+            or custody.errors
+            or custody.wrapper is not None
+            or custody.batch is not batch
+            or custody.calls is not data.calls
+            or self.call_model.completion.tool_batch.calls is not data.calls
+            or batch.service_failure is not original
+            or batch.retained_failure is not None
+            or batch.phase != "dispatch_ready"
+            or batch.current_call is not None
+            or call.phase != "applied"
+            or batch.next_tool_index != call.index + 1
+            or not batch.stop_issued_batch
+            or len(batch.tool_outcomes) != batch.next_tool_index
+            or batch.tool_outcomes[-1].call is not call.tool_call
+            or custody.invocation is None
+            or custody.observation.stored is not custody.invocation
+            or not custody.observation.appended
+            or not custody.observation.execution_failed
+            or custody.observation.returned
+            or self.context.recorder is not custody.recorder
+            or runtime.live.recorder is not custody.recorder
+            or runtime.bindings.required_work is not custody.work
+            or runtime.materialization.inventory.running is not custody.running
+            or self.context.session_operation_context is not custody.running.session_operation_context
+            or type(top) is not ToolBatchFrame
+            or top.phase != "effect_reconciling"
+            or top.next_tool_index != call.index
+            or top.response != custody.response.reference
+            or self.issued_effect_key != f"tool:{custody.response.reference.digest}:{call.index}"
+        ):
+            raise AuditIntegrityError("terminal service completion changed its actual issue/prefix/native origin")
+        _require_service_failure_output(batch.tool_outcomes[-1], custody.invocation)
+        if not any(invocation is custody.invocation for invocation in custody.recorder.invocations):
+            raise AuditIntegrityError("terminal service completion lost its actual recorded invocation")
+
+    def bind_p4(self, owner: ContinuationLiveP4) -> None:
+        if self.p4 is not None:
+            raise AuditIntegrityError("terminal service completion cannot replace its one actual P4 owner")
+        self._require_p4_owners(owner)
+        self.p4 = owner
+
+    def _require_p4_owners(self, owner: ContinuationLiveP4) -> None:
+        from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+
+        self.require_native()
+        if (
+            type(owner) is not ContinuationLiveP4
+            or owner.runtime is not self.runtime
+            or owner.data is not self.runtime.graph.batch
+            or owner.work is not self.custody.work
+            or owner.inventory.running is not self.custody.running
+            or owner.selected is not self.runtime.source.selected
+        ):
+            raise AuditIntegrityError("terminal service completion changed its actual P4/context owners")
+
+    def require_p4(self, owner: ContinuationLiveP4) -> None:
+        self._require_p4_owners(owner)
+        if self.p4 is not owner:
+            raise AuditIntegrityError("terminal service P4 does not own this native completion")''',
+    "failure._require_service_failure_output": r"""def _require_service_failure_output(outcome: _ToolOutcome, invocation: ComposerToolInvocation) -> None:
+    from elspeth.web.composer.audit_storage import _validated_canonical_mapping_pair, _validated_invocation_arguments
+
+    _validated_invocation_arguments(invocation)
+    payload = outcome.response
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"success", "status", "reason"}
+        or payload["success"] is not False
+        or type(payload["status"]) is not str
+        or payload["status"] != "SERVICE_FAILURE"
+        or type(payload["reason"]) is not str
+        or payload["reason"] != "service_failure"
+        or outcome.error_class is not None
+        or outcome.error_category is not None
+        or outcome.error_message is not None
+        or outcome.pre_version != outcome.post_version
+        or invocation.status is not ComposerToolStatus.SUCCESS
+        or invocation.private_failure is not None
+        or invocation.error_class is not None
+        or invocation.error_message is not None
+        or invocation.error_category is not None
+        or invocation.tool_call_id != outcome.call.id
+        or invocation.tool_name != outcome.call.function.name
+        or invocation.version_before != outcome.pre_version
+        or invocation.version_after != outcome.post_version
+        or invocation.strict_sent is not outcome.strict_sent
+        or invocation.wire_conformant is not outcome.wire_conformant
+        or invocation.private_authoring is None
+        or invocation.private_authoring.raw_arguments != outcome.call.function.arguments
+        or invocation.result_canonical != canonical_json(payload)
+        or invocation.result_hash is None
+    ):
+        raise AuditIntegrityError("service completion lost its exact controlled result/invocation")
+    _validated_canonical_mapping_pair(invocation.result_canonical, invocation.result_hash, label="service refusal original result")""",
+    "failure.TerminalServiceCompletion.__post_init__": r"""def __post_init__(self) -> None:
+    self.require_native()""",
+    "failure.TerminalServiceCompletion.require_native": r"""def require_native(self) -> None:
+    from elspeth.web.composer.continuation import ToolBatchFrame
+    from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+    from elspeth.web.composer.tool_batch import ToolBatchContext
+
+    custody, runtime = self.custody, self.runtime
+    if (
+        type(custody) is not ContinuationToolFailureCustody
+        or type(runtime) is not RestoredContinuationRuntime
+        or type(self.context) is not ToolBatchContext
+        or type(self.call_model) is not _CallModelOutcome
+        or runtime.graph.batch is None
+    ):
+        raise AuditIntegrityError("terminal service completion requires its actual native owners")
+    data = runtime.graph.batch
+    batch, call, original = data.batch, custody.call, custody.original
+    top = runtime.source.selected.stack.frames[-1]
+    if (
+        not isinstance(original, _ServiceFailure)
+        or not custody.completed
+        or custody.errors
+        or custody.wrapper is not None
+        or custody.batch is not batch
+        or custody.calls is not data.calls
+        or self.call_model.completion.tool_batch.calls is not data.calls
+        or batch.service_failure is not original
+        or batch.retained_failure is not None
+        or batch.phase != "dispatch_ready"
+        or batch.current_call is not None
+        or call.phase != "applied"
+        or batch.next_tool_index != call.index + 1
+        or not batch.stop_issued_batch
+        or len(batch.tool_outcomes) != batch.next_tool_index
+        or batch.tool_outcomes[-1].call is not call.tool_call
+        or custody.invocation is None
+        or custody.observation.stored is not custody.invocation
+        or not custody.observation.appended
+        or not custody.observation.execution_failed
+        or custody.observation.returned
+        or self.context.recorder is not custody.recorder
+        or runtime.live.recorder is not custody.recorder
+        or runtime.bindings.required_work is not custody.work
+        or runtime.materialization.inventory.running is not custody.running
+        or self.context.session_operation_context is not custody.running.session_operation_context
+        or type(top) is not ToolBatchFrame
+        or top.phase != "effect_reconciling"
+        or top.next_tool_index != call.index
+        or top.response != custody.response.reference
+        or self.issued_effect_key != f"tool:{custody.response.reference.digest}:{call.index}"
+    ):
+        raise AuditIntegrityError("terminal service completion changed its actual issue/prefix/native origin")
+    _require_service_failure_output(batch.tool_outcomes[-1], custody.invocation)
+    if not any(invocation is custody.invocation for invocation in custody.recorder.invocations):
+        raise AuditIntegrityError("terminal service completion lost its actual recorded invocation")""",
+    "failure.TerminalServiceCompletion.bind_p4": r"""def bind_p4(self, owner: ContinuationLiveP4) -> None:
+    if self.p4 is not None:
+        raise AuditIntegrityError("terminal service completion cannot replace its one actual P4 owner")
+    self._require_p4_owners(owner)
+    self.p4 = owner""",
+    "failure.TerminalServiceCompletion._require_p4_owners": r"""def _require_p4_owners(self, owner: ContinuationLiveP4) -> None:
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+
+    self.require_native()
+    if (
+        type(owner) is not ContinuationLiveP4
+        or owner.runtime is not self.runtime
+        or owner.data is not self.runtime.graph.batch
+        or owner.work is not self.custody.work
+        or owner.inventory.running is not self.custody.running
+        or owner.selected is not self.runtime.source.selected
+    ):
+        raise AuditIntegrityError("terminal service completion changed its actual P4/context owners")""",
+    "failure.TerminalServiceCompletion.require_p4": r"""def require_p4(self, owner: ContinuationLiveP4) -> None:
+    self._require_p4_owners(owner)
+    if self.p4 is not owner:
+        raise AuditIntegrityError("terminal service P4 does not own this native completion")""",
+}
+
+OWNER_CONSTRUCTORS: dict[str, str] = {
+    "producers.CurrentContinuationMessageProducers": r"""@dataclass(slots=True)
+class CurrentContinuationMessageProducers:
+    service: ComposerServiceImpl = field(repr=False)
+    authority: ComposerAsyncOperationAuthority = field(repr=False)
+    selected: SelectedContinuationState = field(repr=False)
+    inventory: CurrentContinuationEnvInventory = field(repr=False)
+    inputs: _CurrentProducerInputs | _ReadyProducerInputs = field(repr=False)
+    finish_read: ContinuationFinishRead | None = field(default=None, repr=False)
+    _produced: list[tuple[Mapping[str, Any], ContinuationMessageRecipe, str]] = field(default_factory=list, init=False, repr=False)
+    _schema_inputs: list[tuple[_AdmittedToolCall, CompositionState]] = field(default_factory=list, init=False, repr=False)
+    _feedback_produced: list[_FeedbackMessageProvenance] = field(default_factory=list, init=False, repr=False)
+    _tool_result_provenance: list[tuple[Mapping[str, Any], str, tuple[PromptGuardContentPart, ...], tuple[tuple[PromptGuardContentPart, str, PromptGuardTrust | None, str | None], ...]]] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+        from elspeth.web.composer.service import ComposerServiceImpl
+        from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+        if type(self.service) is not ComposerServiceImpl or type(self.authority) is not ComposerAsyncOperationAuthority or type(self.selected) is not SelectedContinuationState or (type(self.inventory) is not CurrentContinuationEnvInventory) or (type(self.inputs) not in (_CurrentProducerInputs, _ReadyProducerInputs)):
+            raise AuditIntegrityError('message producer requires its actual current owners')
+        if self.finish_read is not None:
+            if type(self.finish_read) is not ContinuationFinishRead:
+                raise AuditIntegrityError('message producer received a foreign owed-finish facet')
+            self.finish_read.require_selection(self.selected, self.inventory)
+        sessions = self.service._require_sessions_service()
+        if type(sessions) is not SessionServiceImpl or sessions._engine is not self.authority._engine:
+            raise AuditIntegrityError('message producer crossed actual session stores')
+        states = producer_input_states(self.inputs.producer_inputs, env_ref_names=self.inventory.names)
+        for entry in self.inputs.producer_inputs.schema_inputs:
+            self._schema_inputs.append((_AdmittedToolCall(entry.tool_call_id, _AdmittedToolFunction('get_plugin_schema', entry.raw_arguments)), states[entry.state_index]))
+
+    def advance_current(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
+        pass
+
+    def _require_current(self) -> _CurrentProducerInputs:
+        pass
+
+    def _require_initial_current(self) -> None:
+        pass
+
+    def _require_compose_family(self) -> None:
+        pass
+
+    def require_context(self, *, session_id: str | None, context: object, actor_user_id: str | None) -> None:
+        pass
+
+    def _register(self, message: dict[str, Any], recipe: ContinuationMessageRecipe) -> dict[str, Any]:
+        pass
+
+    def _initial(self) -> list[dict[str, Any]]:
+        pass
+
+    def initial_messages(self) -> list[dict[str, Any]]:
+        pass
+
+    def recovery_instruction(self) -> dict[str, Any]:
+        pass
+
+    def reply_instruction(self) -> dict[str, Any]:
+        pass
+
+    def tool_arguments(self, message: Mapping[str, Any]) -> dict[str, Any]:
+        pass
+
+    def register_tool_call_message(self, *, response: PrivateChunk, completion: _AdmittedLLMCompletion, message: dict[str, Any], tool_call_id: str | None=None) -> dict[str, Any]:
+        pass
+
+    def register_schema_message(self, *, call: _AdmittedToolCall, admitted: AdmittedDiscoveryResult, message: dict[str, Any]) -> dict[str, Any]:
+        pass
+
+    def snapshot_inputs(self) -> ContinuationProducerInputs:
+        pass
+
+    def register_native_message(self, *, response: PrivateChunk, completion: _AdmittedLLMCompletion, message: dict[str, Any]) -> dict[str, Any]:
+        pass
+
+    def register_failure_schema_message(self, *, response: PrivateChunk, call: _AdmittedToolCall, result: ToolResult, catalog: PolicyCatalogView, message: dict[str, Any]) -> dict[str, Any]:
+        pass
+
+    def register_attachment_message(self, *, response: PrivateChunk, call: _AdmittedToolCall, result: ToolResult, message: dict[str, Any]) -> dict[str, Any]:
+        pass
+
+    def register_tool_result_message(self, *, completion: _AdmittedLLMCompletion, tool_index: int, call: _AdmittedToolCall, result: ToolResult | AdmittedDiscoveryResult, serialized: str, message: dict[str, Any], catalog: PolicyCatalogView | None=None) -> dict[str, Any]:
+        pass
+
+    def _remember_tool_result_provenance(self, message: dict[str, Any]) -> None:
+        pass
+
+    def register_tool_feedback_message(self, *, publication: ContinuationToolMessagePublication, serialized: str, message: dict[str, Any]) -> dict[str, Any]:
+        pass
+
+    def _remember_feedback_provenance(self, *, message: dict[str, Any], recipe: ToolFeedbackMessageRecipe, call: _AdmittedToolCall, invocation: ComposerToolInvocation, authoring: PrivateToolAuthoring, outcome: _ToolOutcome | None) -> dict[str, Any]:
+        pass
+
+    def _feedback_view(self, record: _FeedbackMessageProvenance) -> OrderedObjectJSON:
+        pass
+
+    def _bind_feedback_outcome(self, publication: ContinuationToolMessagePublication, outcome: _ToolOutcome) -> None:
+        pass
+
+    def _require_tool_result_provenance(self, message: Mapping[str, Any]) -> None:
+        pass
+
+    def capture_message(self, message: Mapping[str, Any]) -> tuple[str, ContinuationMessageRecipe | None]:
+        pass
+
+    def retention_message_view(self, message: Mapping[str, Any]) -> tuple[OrderedObjectJSON, ContinuationMessageRecipe | None]:
+        pass
+
+    def _schema_message(self, index: int) -> dict[str, Any]:
+        pass
+
+    def restore_shelf(self, snapshot: MessageShelfSnapshot) -> list[dict[str, Any]]:
+        pass
+
+    def _rebuild_shelf(self, snapshot: MessageShelfSnapshot, *, inputs: _CurrentProducerInputs) -> list[dict[str, Any]]:
+        pass
+""",
+    "failure.ContinuationToolFailureCustody": r"""@dataclass(slots=True)
+class ContinuationToolFailureCustody:
+    running: ComposerOperationRunning
+    work: RequiredWorkBinding
+    response: PrivateChunk
+    batch: ContinuationBatchState
+    calls: tuple[_AdmittedToolCall, ...]
+    recorder: BufferingRecorder
+    call: ContinuationCallState
+    original: BaseException | None = None
+    errors: list[BaseException] = field(default_factory=list)
+    invocation: ComposerToolInvocation | None = None
+    wrapper: ComposerPluginCrashError | None = None
+    completed: bool = False
+    handled: list[BaseException] = field(default_factory=list)
+    observation: ContinuationDispatchFailureObservation = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.work.running is not self.running or self.call.tool_call is not self.calls[self.call.index] or self.batch.current_call is not self.call or (self.call.audit is None):
+            raise AuditIntegrityError('tool failure custody changed its actual issued owners')
+        self.observation = ContinuationDispatchFailureObservation(self, self.call.audit)
+
+    def observe_primary(self, error: BaseException) -> None:
+        pass
+
+    def observe_secondary(self, error: BaseException) -> None:
+        pass
+
+    def failure(self, error: BaseException) -> BaseException:
+        pass
+
+    def consume_nonprimary(self) -> None:
+        pass
+
+    def promote_completed_failure(self, *, kind: Literal['plugin_crash', 'advisor_failure'], original: BaseException, refusal: Literal['context_unsupported', 'provider_cost_refused', 'prompt_guard_refused'] | None=None, provider_call_id: str | None=None, allowance_limit: int | None=None, wrapper: ComposerPluginCrashError | None=None) -> None:
+        pass
+
+    def promote_completed_service_failure(self, original: _ServiceFailure) -> None:
+        pass""",
+    "failure.ContinuationDispatchFailureObservation": r"""@dataclass(slots=True)
+class ContinuationDispatchFailureObservation:
+    owner: ContinuationToolFailureCustody
+    audit: DispatchAudit
+    constructed: ComposerToolInvocation | None = None
+    stored: ComposerToolInvocation | None = None
+    appended: bool = False
+    provider_custody: ProviderCallCustody | None = None
+    returned: bool = False
+    returned_output: object = None
+    execution_failed: bool = False
+    rebinds: list[DispatchAudit] = field(default_factory=list)
+    feedback: BaseException | None = None
+
+    def observe_feedback(self, error: BaseException) -> None:
+        pass
+
+    def require(self, recorder: BufferingRecorder, audit: DispatchAudit) -> None:
+        pass
+
+    def observe_primary(self, error: BaseException) -> None:
+        pass
+
+    def observe_execution_failure(self, error: BaseException) -> None:
+        pass
+
+    def observe_returned(self, output: object) -> None:
+        pass
+
+    def require_rebind_open(self, old: DispatchAudit) -> None:
+        pass
+
+    def observe_secondary(self, error: BaseException) -> None:
+        pass
+
+    def observe_constructed_invocation(self, invocation: ComposerToolInvocation) -> None:
+        pass
+""",
 }

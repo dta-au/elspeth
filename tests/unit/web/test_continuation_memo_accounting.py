@@ -7817,43 +7817,61 @@ async def _closed_dml_trial(monkeypatch, request, engine, context, operation_id,
     _require_structure_api()
     initial_profile = sys.getprofile()
     trace = RetentionMemoTrace(monkeypatch, request)
-    trace.observe_structure(engines=(engine,), entrypoint="calibration")
-    handles = trace.structure_listener_handles()
-    coordinator = RequiredWorkCoordinator(RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, operation_id, 1))
-    ticket = coordinator.reserve(RequiredWorkSource.PIPELINE_PUBLICATION_SQL)
-    for target, name, callback, retval in listeners:
-        event.listen(target, name, callback, retval=retval)
-
-    async def operation():
-        outcome = await async_workers.run_required_sql_finish_once(ticket, work)
-        if isinstance(outcome, RequiredSQLRaised):
-            raise outcome.error
-        assert isinstance(outcome, RequiredSQLReturned), "real store/driver premise must return before the qualification assertion"
-        assert ticket.complete and not ticket.errors and async_workers.outstanding_admissions() == 0
-        return outcome.value
-
+    installed = []
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
-        timer.finish_preparation()
-        result = await timer.run("retention", operation)
-    finally:
-        for target, name, callback, _retval in reversed(listeners):
-            event.remove(target, name, callback)
-    if refused:
-        with pytest.raises(AssertionError, match="structure observation incomplete"):
+        trace.observe_structure(engines=(engine,), entrypoint="calibration")
+        handles = trace.structure_listener_handles()
+        coordinator = RequiredWorkCoordinator(RequiredWorkAuthority(RequiredAuthorityKind.DURABLE_COMPOSE, context, operation_id, 1))
+        ticket = coordinator.reserve(RequiredWorkSource.PIPELINE_PUBLICATION_SQL)
+        try:
+            for target, name, callback, retval in listeners:
+                installed.append((target, name, callback))
+                event.listen(target, name, callback, retval=retval)
+
+            async def operation():
+                outcome = await async_workers.run_required_sql_finish_once(ticket, work)
+                if isinstance(outcome, RequiredSQLRaised):
+                    raise outcome.error
+                assert isinstance(outcome, RequiredSQLReturned), "real store/driver premise must return before the qualification assertion"
+                assert ticket.complete and not ticket.errors and async_workers.outstanding_admissions() == 0
+                return outcome.value
+
+            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer.finish_preparation()
+            result = await timer.run("retention", operation)
+        finally:
+            primary, cleanup = sys.exception(), None
+            for target, name, callback in reversed(installed):
+                try:
+                    if event.contains(target, name, callback):
+                        event.remove(target, name, callback)
+                except BaseException as error:
+                    trace._observation_incomplete = True
+                    trace.errors.append("test listener cleanup interrupted")
+                    if cleanup is None:
+                        cleanup = error
+            if primary is None and cleanup is not None:
+                raise cleanup
+        if refused:
+            with pytest.raises(AssertionError, match="structure observation incomplete"):
+                trace.finish(stages=1, require_snapshot=False, require_population=False, structure_observation=True)
+        else:
+            # The actual original store/driver premises precede qualification.
             trace.finish(stages=1, require_snapshot=False, require_population=False, structure_observation=True)
-    else:
-        # The intended SELECT-only baseline RED is HERE, after native premises.
-        trace.finish(stages=1, require_snapshot=False, require_population=False, structure_observation=True)
-    snapshot = trace.structure_snapshot()
-    coordinator.assert_completed()
-    assert snapshot.required and snapshot.closed
-    assert snapshot.complete is not refused and snapshot.observation_verified is not refused
-    assert bool(snapshot.errors) is refused
-    assert all(not event.contains(target, name, callback) for target, name, callback in handles)
-    assert sys.getprofile() is initial_profile
-    assert _structure_events(snapshot, "sql_attempt"), "raw physical SQL cannot disappear on refused provenance"
-    return result, snapshot
+        snapshot = trace.structure_snapshot()
+        coordinator.assert_completed()
+        assert snapshot.required and snapshot.closed
+        assert snapshot.complete is not refused and snapshot.observation_verified is not refused
+        assert bool(snapshot.errors) is refused
+        assert all(not event.contains(target, name, callback) for target, name, callback in handles)
+        assert sys.getprofile() is initial_profile
+        assert _structure_events(snapshot, "sql_attempt"), "raw physical SQL cannot disappear on refused provenance"
+        return result, snapshot
+    except BaseException as primary:
+        # Required-work/clock owners have settled before this escape. Preserve
+        # their original primary and strict unfinished fact before pytest prints.
+        trace.close(primary=primary)
+        raise
 
 
 def _closed_dml_append(conn, context, operation_id, selected):
@@ -8469,8 +8487,567 @@ async def test_structure_dml_composed_retval_copy_cannot_borrow_current_context_
         rows = _closed_dml_rows(snapshot)
         assert len(rows) == 1 and rows[0].sql.bind_arities == (7,) and rows[0].outcome == "returned"
         assert snapshot.closed and not snapshot.complete and not snapshot.observation_verified
+        assert "publication_row_callback_return_changed" in snapshot.errors
     finally:
         repository.release(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "opposition",
+    [
+        "original",
+        "earlier-listener",
+        "missing-return",
+        "duplicate-return",
+        "generation",
+        "cache-origin",
+        "callback-origin",
+        "caller-frame",
+        "carrier",
+        "unwind",
+        "warmed-cache",
+        "warmed-source",
+        "warmed-cell",
+    ],
+)
+async def test_structure_dml_callback_return_edge_requires_its_original_receipt(monkeypatch, request, opposition):
+    from dataclasses import replace
+
+    from sqlalchemy import event
+    from sqlalchemy.sql.dml import Insert
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+    from tests.helpers import continuation_memo as helper
+
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    marker = RuntimeError("original before-cursor callback unwind")
+    entered, native, public, injections, receipts, exchanged_codes = [], [], [], [], [], []
+    payload = b"independently authored callback return edge"
+
+    def foreign(_frame, _event, _arg):
+        return None
+
+    def before(_conn, _cursor, statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            entered.append((id(parameters), id(current.parameters)))
+            if opposition == "unwind" and len(entered) == 1:
+                raise marker
+            if opposition == "warmed-source":
+                source = before.__code__
+                replacement = source.replace()
+                assert replacement is not source and replacement == source
+                before.__code__ = replacement
+                try:
+                    actual_arity = len(parameters)
+                finally:
+                    before.__code__ = source
+                injections.append(("warmed-source", actual_arity))
+            elif opposition == "warmed-cell":
+                hook = sys.getprofile()
+                assert type(hook) is FunctionType
+                cell = hook.__closure__[helper._LIFETIME_PROFILE_CELL_INDEXES[0]]
+                assert cell.cell_contents is None
+                cell.cell_contents = foreign
+                try:
+                    actual_arity = len(parameters)
+                finally:
+                    cell.cell_contents = None
+                injections.append(("warmed-cell", actual_arity))
+        return statement, parameters
+
+    def after(_conn, _cursor, _statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            assert parameters is current.parameters[0]
+            native.append((id(parameters), len(parameters)))
+
+    original = helper.RetentionMemoTrace._structure_row_profile
+
+    def observe(self, frame, observed, value, thread):
+        current = frame.f_locals.get("current") if frame.f_code is before.__code__ else None
+        target = (
+            observed == "return"
+            and current is not None
+            and type(current.invoked_statement) is Insert
+            and current.invoked_statement.table is store.chunks
+        )
+        if not target:
+            return original(self, frame, observed, value, thread)
+        # The actual original callback/caller and its native result are intact.
+        # Oppose only the numeric observer receipt/delivery, never a source or
+        # argument substitute that would prevent this native edge being reached.
+        caller = frame.f_back
+        assert caller is not None and caller.f_code is helper._STRUCTURE_SINGLE_CONTEXT.__code__
+        assert caller.f_lasti in helper._STRUCTURE_ROW_CALL_OFFSETS
+        found = self._structure_row_request(thread, caller.f_back)
+        assert found is not None
+        _request, owner = found
+        edge = owner.row_callback
+        if opposition == "warmed-cache" and injections:
+            assert edge is None and len(entered) == 2
+            assert type(value) is tuple and value[1] is caller.f_locals["effective_parameters"] is current.parameters[0]
+            return original(self, frame, observed, value, thread)
+        assert edge is not None and edge.frame == id(frame) and edge.function == id(before)
+        assert not edge.returned and owner.row_generation == edge.generation
+        if opposition != "unwind":
+            assert type(value) is tuple and len(value) == 2
+            assert value[1] is caller.f_locals["effective_parameters"] is current.parameters[0]
+        if opposition == "missing-return":
+            injections.append((edge.generation, "missing"))
+            return None
+        changes = {
+            "generation": {"generation": edge.generation + 1},
+            "callback-origin": {"function": edge.function + 1},
+            "caller-frame": {"dispatch": edge.dispatch + 1},
+            "carrier": {"carrier": (None, None, None)},
+        }.get(opposition)
+        if opposition == "cache-origin":
+            caches = helper._STRUCTURE_ROW_CALL_OFFSETS - {edge.call_offset}
+            assert caches, "the cache-origin opposition requires an actual source-bound inline cache"
+            changes = {"call_offset": min(caches)}
+        if changes is not None:
+            changed = replace(edge, **changes)
+            owner.row_callback = changed
+            thread.row_callbacks[edge.frame] = changed
+            injections.append((edge.generation, opposition))
+        original(self, frame, observed, value, thread)
+        if opposition == "warmed-cache":
+            code = frame.f_code
+            facts = self._structure_row_code_facts(code)
+            assert facts is not None and facts.anchor() is code
+            exchanged = code.replace()
+            assert exchanged is not code and exchanged == code
+            exchanged_codes.append(exchanged)
+            changed = replace(facts, anchor=helper._StructureRowCodeIdentity(exchanged))
+            self._structure_row_codes[facts.anchor] = changed
+            injections.append((edge.generation, "warmed-cache"))
+        if opposition == "duplicate-return":
+            original(self, frame, observed, value, thread)
+            injections.append((edge.generation, "duplicate"))
+        receipts.append(owner.row_callback)
+        return None
+
+    monkeypatch.setattr(helper.RetentionMemoTrace, "_structure_row_profile", observe)
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            for index in range(2):
+                try:
+                    result = store.put_chunk(
+                        conn,
+                        session_id=str(context.fence.session_id),
+                        operation_id=operation_id,
+                        key="callback-return-edge-" + str(index) if opposition == "warmed-cache" else "callback-return-edge",
+                        payload=payload,
+                        codec="control.v1",
+                    )
+                except RuntimeError as error:
+                    assert opposition == "unwind" and index == 0 and error is marker
+                    public.append("original-marker")
+                else:
+                    assert result is None
+                    public.append("returned")
+            for key in ("callback-return-edge-0", "callback-return-edge-1") if opposition == "warmed-cache" else ("callback-return-edge",):
+                assert store.read_chunk(conn, session_id=str(context.fence.session_id), operation_id=operation_id, key=key) == payload
+        assert public == (["original-marker", "returned"] if opposition == "unwind" else ["returned", "returned"])
+        assert len(native) == (2 if opposition == "warmed-cache" else 1) and all(arity == 7 for _row, arity in native)
+        assert len(entered) == (2 if opposition in ("unwind", "warmed-cache") else 1)
+        return len(payload)
+
+    earlier = opposition == "earlier-listener"
+    try:
+        if earlier:
+            event.listen(engine, "before_cursor_execute", before, retval=True)
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=opposition not in ("original", "earlier-listener"),
+            listeners=((engine, "after_cursor_execute", after, False),)
+            if earlier
+            else ((engine, "before_cursor_execute", before, True), (engine, "after_cursor_execute", after, False)),
+        )
+        assert result == len(payload)
+        if opposition in ("original", "earlier-listener"):
+            assert not injections and len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt.returned and receipt.outcome == "returned"
+            assert receipt.origin.row == entered[0][0] == native[0][0]
+            assert receipt.origin.container == entered[0][1]
+            assert receipt.call_offset == helper._STRUCTURE_ROW_CALL_OFFSET
+        elif opposition == "unwind":
+            assert not injections and [receipt.outcome for receipt in receipts] == ["unwound", "returned"]
+            assert "publication_row_callback_not_consumed" not in snapshot.errors
+            assert "publication_row_observation_incomplete" not in snapshot.errors
+        else:
+            assert len(injections) == 1, "the actual callback return must reach the declared opposition once"
+            expected = (
+                "publication_row_callback_not_consumed"
+                if opposition == "missing-return"
+                else "publication_row_callback_return_unpaired"
+                if opposition == "duplicate-return"
+                else "publication_row_code_facts_anchor_changed"
+                if opposition == "warmed-cache"
+                else "publication_row_callback_source_changed"
+                if opposition in ("warmed-source", "warmed-cell")
+                else "publication_row_callback_return_source_changed"
+            )
+            assert expected in snapshot.errors
+    finally:
+        if earlier:
+            event.remove(engine, "before_cursor_execute", before)
+        repository.release(context)
+
+
+def _expect_unfinished_trace_finalizer(monkeypatch, request):
+    register = request.addfinalizer
+
+    def capture(finalizer):
+        def strict_unfinished():
+            with pytest.raises(AssertionError, match="memo observation window was not explicitly finalized"):
+                finalizer()
+
+        register(strict_unfinished)
+
+    monkeypatch.setattr(request, "addfinalizer", capture)
+
+
+def test_structure_row_code_facts_use_weak_identity_without_retaining_constants(monkeypatch, request):
+    import gc
+    import weakref
+
+    class OpaqueConstant:
+        pass
+
+    def callback(_conn, _cursor, statement, parameters, _context, _many):
+        return statement, parameters
+
+    _expect_unfinished_trace_finalizer(monkeypatch, request)
+    prior = sys.getprofile()
+    trace = RetentionMemoTrace(monkeypatch, request)
+    try:
+        token = OpaqueConstant()
+        source = callback.__code__.replace(co_consts=(*callback.__code__.co_consts, token))
+        clone = source.replace()
+        assert source is not clone and source == clone, "the identity control must oppose structural CodeType equality"
+        source_ref, token_ref = weakref.ref(source), weakref.ref(token)
+        facts = trace._structure_row_code_facts(source)
+        cloned = trace._structure_row_code_facts(clone)
+        assert facts.anchor() is source and cloned.anchor() is clone and facts is not cloned
+        assert trace._structure_row_code_facts(source) is facts
+        eviction = facts.anchor.__callback__
+        assert eviction is not None
+        del source, token
+        gc.collect()
+        assert source_ref() is None and facts.anchor() is None
+        assert facts.anchor not in trace._structure_row_codes
+        # A stale dead-entry notification cannot remove another live code's
+        # metadata, even where CodeType's own structural equality says equal.
+        eviction(facts.anchor)
+        assert trace._structure_row_code_facts(clone) is cloned
+        del clone
+        gc.collect()
+        assert cloned.anchor() is None and token_ref() is None
+        assert cloned.anchor not in trace._structure_row_codes
+    finally:
+        trace.close()
+    assert sys.getprofile() is prior and not trace._finished
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opposition", [False, True, pytest.param("outer-receipt", id="outer-receipt")])
+async def test_structure_dml_nested_callback_audits_outer_and_unmatched_receipts(monkeypatch, request, opposition):
+    from dataclasses import replace
+
+    from sqlalchemy.sql.dml import Insert
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+    from tests.helpers import continuation_memo as helper
+
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    nesting, depths, native, injected = [], [], [], []
+    active_thread, outer_window, outer_audits = [None], [None], []
+    unmatched, oppose_outer = opposition is True, opposition == "outer-receipt"
+    payload = b"independently authored nested callback source control"
+    original = helper.RetentionMemoTrace._structure_row_profile
+
+    def observe(self, frame, observed, value, thread):
+        audit = None
+        if observed == "c_call" and frame.f_code is before.__code__:
+            depths.append(len(thread.row_callbacks))
+            if outer_window[0] is not None:
+                inner, outer, changed = outer_window[0]
+                inner_owner = thread.frames.get(inner.request)
+                audit = (
+                    thread.error_count,
+                    len(thread.errors),
+                    value is len,
+                    inner.frame == id(frame),
+                    thread.row_callbacks.get(inner.frame) is inner,
+                    thread.row_callbacks.get(outer.frame) is changed,
+                    set(thread.row_callbacks) == {inner.frame, outer.frame},
+                    inner_owner is not None and self._structure_row_source(thread, inner_owner, inner, frame),
+                )
+        original(self, frame, observed, value, thread)
+        if observed == "call" and frame.f_code is before.__code__:
+            active_thread[0] = thread
+        if audit is not None:
+            count, start, *premises = audit
+            outer_audits.append((tuple(premises), thread.error_count - count, tuple(thread.errors[start:])))
+        if unmatched and observed == "return" and frame.f_code is before.__code__ and not injected:
+            caller = frame.f_back
+            assert caller is not None
+            found = self._structure_row_request(thread, caller.f_back)
+            assert found is not None
+            edge = found[1].row_callback
+            if edge is not None:
+                assert edge.returned
+                missing = replace(edge, frame=edge.frame + 1, generation=edge.generation + 1, returned=False, outcome=None)
+                thread.row_callbacks[missing.frame] = missing
+                injected.append(missing.frame)
+
+    monkeypatch.setattr(helper.RetentionMemoTrace, "_structure_row_profile", observe)
+
+    def before(conn, _cursor, statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            if not nesting:
+                nesting.append(1)
+                assert (
+                    store.put_chunk(
+                        conn,
+                        session_id=str(context.fence.session_id),
+                        operation_id=operation_id,
+                        key="nested-row-control",
+                        payload=payload,
+                        codec="control.v1",
+                    )
+                    is None
+                )
+            elif oppose_outer:
+                thread = active_thread[0]
+                assert thread is not None
+                inner = thread.row_callbacks[id(sys._getframe())]
+                outers = [edge for edge in thread.row_callbacks.values() if edge.function == id(before) and edge.frame != inner.frame]
+                assert len(outers) == 1 and len(thread.row_callbacks) == 2
+                outer = outers[0]
+                assert outer.generation < inner.generation and outer.request != inner.request and outer.dispatch != inner.dispatch
+                assert thread.frames[outer.request].row_callback is outer
+                assert thread.frames[inner.request].row_callback is inner
+                changed = replace(outer, function=outer.function + 1)
+                outer_window[0] = inner, outer, changed
+                thread.row_callbacks[outer.frame] = changed
+                try:
+                    # Only the outer active receipt differs during this actual
+                    # C call. Restore it before either callback can unwind/return.
+                    arity = len(parameters)
+                finally:
+                    thread.row_callbacks[outer.frame] = outer
+                    outer_window[0] = None
+                assert arity == 7 and thread.row_callbacks[inner.frame] is inner
+                assert thread.frames[outer.request].row_callback is outer
+                injected.append((outer.generation, inner.generation, arity))
+            assert len(parameters) == 7
+        return statement, parameters
+
+    def after(_conn, _cursor, _statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            native.append(len(parameters))
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            assert (
+                store.put_chunk(
+                    conn,
+                    session_id=str(context.fence.session_id),
+                    operation_id=operation_id,
+                    key="outer-row-control",
+                    payload=payload,
+                    codec="control.v1",
+                )
+                is None
+            )
+            for key in ("nested-row-control", "outer-row-control"):
+                assert store.read_chunk(conn, session_id=str(context.fence.session_id), operation_id=operation_id, key=key) == payload
+        return len(payload)
+
+    try:
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=unmatched or oppose_outer,
+            listeners=((engine, "before_cursor_execute", before, True), (engine, "after_cursor_execute", after, False)),
+        )
+        assert result == len(payload) and nesting == [1] and native == [7, 7]
+        assert max(depths) >= 2, "the genuine nested call must audit both live callback generations"
+        assert len(injected) == int(unmatched or oppose_outer)
+        if unmatched:
+            assert "closed_with_active_original_owner" in snapshot.errors
+        elif oppose_outer:
+            assert outer_audits == [((True, True, True, True, True, True), 1, ("publication_row_callback_source_changed",))], (
+                "the real C event must validate the inner receipt and refuse exactly the changed outer receipt"
+            )
+            assert snapshot.errors == ("publication_row_callback_source_changed",)
+        else:
+            assert not outer_audits
+    finally:
+        repository.release(context)
+
+
+@pytest.mark.parametrize("cleanup_marker_type", [None, RuntimeError, KeyboardInterrupt, SystemExit])
+def test_memo_escaped_call_closes_owned_observers_before_real_pytest_formatting(monkeypatch, request, cleanup_marker_type):
+    engine = request.getfixturevalue("engine")
+    _expect_unfinished_trace_finalizer(monkeypatch, request)
+    before, prior = _native_monitor_state(), sys.getprofile()
+    trace = RetentionMemoTrace(monkeypatch, request)
+    trace.observe_structure(engines=(engine,), entrypoint="calibration")
+    marker = RuntimeError("escaped call retains its original primary")
+    if cleanup_marker_type is not None:
+        original_close = trace._structure_close
+        cleanup_marker = cleanup_marker_type("original cleanup interruption after actual restoration")
+
+        def interrupted(primary):
+            assert primary is marker
+            original_close(primary)
+            raise cleanup_marker
+
+        monkeypatch.setattr(trace, "_structure_close", interrupted)
+    formatted = []
+    original = request.node.repr_failure
+
+    def report(excinfo):
+        assert excinfo.value is marker and sys.getprofile() is prior
+        assert _native_monitor_state() == before
+        assert trace._closed and not trace._finished
+        assert request.config.pluginmanager.get_plugin(trace._report_name) is None
+        formatted.append(type(excinfo.value))
+        return original(excinfo)
+
+    def fail():
+        raise marker
+
+    call = pytest.CallInfo.from_call(fail, when="call")
+    original_traceback = marker.__traceback__
+    with monkeypatch.context() as patch:
+        patch.setattr(request.node, "repr_failure", report)
+        result = request.node.ihook.pytest_runtest_makereport(item=request.node, call=call)
+    assert result.failed and call.excinfo.value is marker and formatted == [RuntimeError]
+    assert marker.__traceback__ is original_traceback
+    assert str(marker) in str(result.longrepr)
+    assert trace._closed and not trace._finished and not trace._report_registered
+
+
+@pytest.mark.parametrize("after_registration", [False, True])
+def test_memo_report_registration_failure_releases_only_its_owned_resources(monkeypatch, request, after_registration):
+    _expect_unfinished_trace_finalizer(monkeypatch, request)
+    before, prior = _native_monitor_state(), sys.getprofile()
+    manager, registered = request.config.pluginmanager, []
+    original = manager.register
+    marker = RuntimeError("original report registration failure")
+
+    def register(plugin, name=None):
+        if type(plugin) is RetentionMemoTrace:
+            registered.append((name, plugin))
+            if after_registration:
+                original(plugin, name)
+            raise marker
+        return original(plugin, name)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "register", register)
+        with pytest.raises(RuntimeError) as caught:
+            RetentionMemoTrace(monkeypatch, request, require_native_bytes=True)
+        assert caught.value is marker
+    assert len(registered) == 1
+    name, trace = registered[0]
+    assert manager.get_plugin(name) is None and not trace._report_registered
+    assert _native_monitor_state() == before and sys.getprofile() is prior
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_type", [KeyboardInterrupt, SystemExit])
+async def test_structure_dml_escaped_process_control_preserves_primary_and_joins(monkeypatch, request, marker_type):
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    _expect_unfinished_trace_finalizer(monkeypatch, request)
+    manager, registered = request.config.pluginmanager, []
+    original = manager.register
+    before, prior = _native_monitor_state(), sys.getprofile()
+    marker = marker_type("original settled SQL process-control escape")
+    reached = []
+
+    def register(plugin, name=None):
+        if type(plugin) is RetentionMemoTrace:
+            registered.append(plugin)
+        return original(plugin, name)
+
+    monkeypatch.setattr(manager, "register", register)
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            assert (
+                store.put_chunk(
+                    conn,
+                    session_id=str(context.fence.session_id),
+                    operation_id=operation_id,
+                    key="original-interrupt-escape",
+                    payload=b"independently authored actual SQL before interruption",
+                    codec="control.v1",
+                )
+                is None
+            )
+            reached.append("actual-original-return")
+            raise marker
+
+    try:
+        with pytest.raises(marker_type) as caught:
+            await _closed_dml_trial(monkeypatch, request, engine, context, operation_id, work)
+        assert caught.value is marker and reached == ["actual-original-return"]
+        assert len(registered) == 1
+        trace = registered[0]
+        assert trace._closed and not trace._finished and not trace._report_registered
+        assert sys.getprofile() is prior and _native_monitor_state() == before
+        assert async_workers.outstanding_admissions() == 0
+        assert not trace._structure_submissions and len(trace._owned_hooks) == 1
+        assert _closed_dml_rows(trace.structure_snapshot())[0].sql.bind_arities == (7,)
+    finally:
+        repository.release(context)
+
+
+def test_memo_report_cleanup_preserves_a_foreign_registry_owner(monkeypatch, request):
+    _expect_unfinished_trace_finalizer(monkeypatch, request)
+    prior, manager = sys.getprofile(), request.config.pluginmanager
+    trace = RetentionMemoTrace(monkeypatch, request)
+    foreign = object()
+    assert manager.unregister(trace) is trace
+    manager.register(foreign, trace._report_name)
+    try:
+        trace.close()
+        assert manager.get_plugin(trace._report_name) is foreign
+        assert sys.getprofile() is prior and not trace._finished
+        assert "report cleanup registration changed during observation" in trace.errors
+    finally:
+        assert manager.unregister(foreign) is foreign
 
 
 @pytest.mark.asyncio
@@ -8758,12 +9335,13 @@ async def test_structure_dml_current_empty_dialect_cache_is_nominal_and_source_b
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [False, True])
-async def test_structure_dml_cache_creator_transient_code_change_is_audited_before_restore(monkeypatch, request, change):
+async def test_structure_dml_cache_creator_transient_code_change_is_audited_before_restore(monkeypatch, request, record_property, change):
     from sqlalchemy.sql import base as sql_base
     from sqlalchemy.sql.dml import Insert
 
     from elspeth.web.sessions import continuation as store
     from elspeth.web.sessions.locking import locked_session_transaction
+    from tests.helpers import continuation_memo as helper
 
     def foreign_creator(cls, key):
         raise AssertionError("transient creator must never be invoked")
@@ -8776,6 +9354,8 @@ async def test_structure_dml_cache_creator_transient_code_change_is_audited_befo
     try:
         creator = sql_base.DialectKWArgs.__dict__["_kw_reg_for_dialect_cls"].__func__
         original_code = creator.__code__
+        guards, creator_index = _guard_kind_cache_creator_premise(helper, creator)
+        record_property("guard_kind_creator_registry", (creator_index, len(guards), 1))
         assert foreign_creator.__code__ is not original_code
         intervals, native, public_returns = [], [], []
         payload = b"independently authored audited cache source interval"
@@ -8825,6 +9405,8 @@ async def test_structure_dml_cache_creator_transient_code_change_is_audited_befo
                     == payload
                 )
             assert intervals == [(change, 7)] and native == [7] and public_returns == [1, 1]
+            record_property("guard_kind_code_interval", tuple((int(changed), arity) for changed, arity in intervals))
+            record_property("guard_kind_native_public_readback", (len(native), len(public_returns), 1))
             return len(payload)
 
         result, snapshot = await _closed_dml_trial(
@@ -8852,3 +9434,469 @@ async def test_structure_dml_cache_creator_transient_code_change_is_audited_befo
                 creator.__code__ = original_code
         finally:
             repository.release(context)
+
+
+def _structure_store_visitor_predicate_mutant_code(mutation):
+    """Return Root's narrow control mutation; never install it in normal tests."""
+    import ast
+    from pathlib import Path
+    from types import CodeType
+
+    from tests.helpers import continuation_memo as helper
+
+    assert mutation in ("first-entry-only", "get-only")
+    original = helper._structure_sql_sources_current
+    assert type(original) is FunctionType and original.__globals__ is helper.__dict__
+    assert original.__closure__ is None
+    tree = ast.parse(Path(helper.__file__).read_bytes(), filename=original.__code__.co_filename)
+    functions = [node for node in tree.body if type(node) is ast.FunctionDef and node.name == original.__name__]
+    assert len(functions) == 1
+    blocks = [
+        functions[0].body[index : index + 3]
+        for index, node in enumerate(functions[0].body)
+        if type(node) is ast.Assign
+        and len(node.targets) == 1
+        and type(node.targets[0]) is ast.Name
+        and node.targets[0].id == "guards"
+        and type(node.value) is ast.Name
+        and node.value.id == "_STRUCTURE_STORE_VISITOR_GUARDS"
+    ]
+    assert len(blocks) == 1, "mutants require the exact checked original store-visitor block"
+    block = blocks[0]
+    expected = ast.parse(
+        "guards = _STRUCTURE_STORE_VISITOR_GUARDS\n"
+        "if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[3]:\n"
+        "    return False\n"
+        "for owner, name, present, function, code in guards:\n"
+        "    if ((name in owner.__dict__) is not present or owner.__dict__.get(name) is not function "
+        "or (present and (type is not _STRUCTURE_GUARD_KIND_ORIGINS[0] "
+        "or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1] or code is None or function.__code__ is not code))):\n"
+        "        return False\n"
+    ).body
+    assert [ast.dump(node) for node in block] == [ast.dump(node) for node in expected]
+    loop = block[2]
+    if mutation == "first-entry-only":
+        # Oppose only later entries in this actual predicate; all other source
+        # groups and their checks remain. The first item must be proved healthy.
+        loop.iter = ast.copy_location(
+            ast.Subscript(value=loop.iter, slice=ast.Slice(upper=ast.Constant(value=1)), ctx=ast.Load()),
+            loop.iter,
+        )
+    else:
+        # Keep None identity and original function/code handling, but remove
+        # only the absent-versus-present distinction for this same guard.
+        del loop.body[0].test.values[0]
+    ast.fix_missing_locations(tree)
+    compiled = compile(tree, original.__code__.co_filename, "exec", dont_inherit=True)
+    codes = [code for code in compiled.co_consts if type(code) is CodeType and code.co_name == original.__name__]
+    assert len(codes) == 1
+    assert codes[0].co_freevars == original.__code__.co_freevars == ()
+    assert codes[0].co_argcount == original.__code__.co_argcount == 0
+    return codes[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [False, True])
+async def test_structure_source_predicate_late_absent_slot_interval_is_audited(monkeypatch, request, record_property, change):
+    from sqlalchemy.dialects.postgresql.base import PGCompiler
+    from sqlalchemy.sql.dml import Insert
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+    from tests.helpers import continuation_memo as helper
+
+    _require_structure_api()
+    guards = helper._STRUCTURE_STORE_VISITOR_GUARDS
+    matches = [(index, fact) for index, fact in enumerate(guards) if fact[0] is PGCompiler and fact[1] == "visit_max_func"]
+    assert len(matches) == 1
+    index, (owner, name, present, function, code) = matches[0]
+    assert index > 0 and owner is PGCompiler and name == "visit_max_func"
+    assert present is False and function is None and code is None
+    assert type(PGCompiler) is type and "visit_max_func" not in PGCompiler.__dict__
+    earlier_owner, earlier_name, earlier_present, earlier_function, earlier_code = guards[0]
+    assert (earlier_name in earlier_owner.__dict__) is earlier_present
+    assert earlier_owner.__dict__.get(earlier_name) is earlier_function
+    assert not earlier_present or (type(earlier_function) is FunctionType and earlier_function.__code__ is earlier_code)
+    assert not any(owner is PGCompiler and name == "visit_max_func" for owner, name, *_facts in helper._STRUCTURE_VISITOR_GUARDS)
+    record_property("late_store_visitor_guard", (index, 0, 0, 0))
+
+    prior, monitoring = sys.getprofile(), _native_monitor_state()
+    engine = request.getfixturevalue("engine")
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    intervals, native, public_returns = [], [], []
+    payload = b"independently authored late absent compiler slot interval"
+
+    def before(_conn, _cursor, statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert not intervals and type(parameters) is tuple and len(parameters) == 7 and not many
+            assert "visit_max_func" not in PGCompiler.__dict__
+            hook = sys.getprofile()
+            assert type(hook) is FunctionType and hook.__code__ is helper._LIFETIME_PROFILE_CODE
+            trace = hook.__closure__[helper._LIFETIME_PROFILE_CELL_INDEXES[1]].cell_contents
+            assert type(trace) is RetentionMemoTrace
+            thread = trace._structure_threads[threading.get_ident()]
+            count, start = thread.error_count, len(thread.errors)
+            assert count == start == 0, "the slot opposition requires an otherwise healthy observation"
+            if change:
+                PGCompiler.visit_max_func = None
+            try:
+                # This actual builtin is the only call inside the interval.
+                # The original callback, row/carrier and native SQL stay intact.
+                arity = len(parameters)
+            finally:
+                if change:
+                    del PGCompiler.visit_max_func
+            assert "visit_max_func" not in PGCompiler.__dict__
+            errors = thread.errors[start:]
+            intervals.append((int(change), arity, thread.error_count - count, errors.count("original_source_changed")))
+        return statement, parameters
+
+    def after(_conn, _cursor, _statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert "visit_max_func" not in PGCompiler.__dict__
+            assert len(intervals) == 1 and intervals[0][:2] == (int(change), 7)
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            native.append(7)
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            for _ in range(2):
+                assert (
+                    store.put_chunk(
+                        conn,
+                        session_id=str(context.fence.session_id),
+                        operation_id=operation_id,
+                        key="late-absent-source-slot",
+                        payload=payload,
+                        codec="control.v1",
+                    )
+                    is None
+                )
+                public_returns.append(1)
+            assert (
+                store.read_chunk(conn, session_id=str(context.fence.session_id), operation_id=operation_id, key="late-absent-source-slot")
+                == payload
+            )
+        assert len(intervals) == 1 and intervals[0][:2] == (int(change), 7)
+        assert native == [7] and public_returns == [1, 1]
+        # Native premises are durable in JUnit even when Root's predicate
+        # mutant reaches the later expected-refusal assertion and turns RED.
+        record_property("late_slot_interval", tuple(intervals))
+        record_property("late_slot_native_public_readback", (len(native), len(public_returns), 1))
+        return len(payload)
+
+    try:
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=change,
+            listeners=((engine, "before_cursor_execute", before, True), (engine, "after_cursor_execute", after, False)),
+        )
+        assert result == len(payload) and intervals == [(int(change), 7, int(change), int(change))]
+        assert helper._STRUCTURE_STORE_VISITOR_GUARDS is guards and "visit_max_func" not in PGCompiler.__dict__
+        rows = _closed_dml_rows(snapshot)
+        assert len(rows) == 1 and rows[0].sql.bind_arities == (7,) and rows[0].outcome == "returned"
+        assert snapshot.closed
+        if change:
+            assert snapshot.errors == ("original_source_changed",)
+            assert not snapshot.complete and not snapshot.observation_verified
+        else:
+            assert snapshot.complete and snapshot.observation_verified and not snapshot.errors
+    finally:
+        try:
+            repository.release(context)
+        finally:
+            assert "visit_max_func" not in PGCompiler.__dict__
+            assert sys.getprofile() is prior and _native_monitor_state() == monitoring
+
+
+def _guard_kind_cache_creator_premise(helper, creator):
+    from sqlalchemy.sql import base as sql_base
+
+    guards = helper._STRUCTURE_CACHE_SLOT_GUARDS
+    origins = helper._STRUCTURE_GUARD_KIND_ORIGINS
+    assert type(origins) is tuple and len(origins) == 6
+    assert origins[0] is type and origins[1] is FunctionType and origins[5] is guards
+    assert type(creator) is FunctionType and helper._STRUCTURE_CACHE_CREATOR is creator
+    matches = [(index, row) for index, row in enumerate(guards) if row[4] is creator]
+    assert len(matches) == 1, "the code opponent requires one actual independent creator guard"
+    index, (owner, name, present, descriptor, function, code) = matches[0]
+    assert owner is sql_base.DialectKWArgs and name == "_kw_reg_for_dialect_cls" and present is True
+    assert owner.__dict__[name] is descriptor and descriptor.__func__ is function is creator and code is creator.__code__
+    assert helper._STRUCTURE_CACHE_GETTER is not creator
+    assert all(function is not creator for function, _code in helper._STRUCTURE_FUNCTION_CODES)
+    assert all(row[1] is not creator for row in helper._STRUCTURE_STORE_FUNCTIONS)
+    assert all(row[1] is not creator for row in helper._STRUCTURE_STORE_CONSTRUCTORS)
+    assert all(row[1] is not creator for row in helper._STRUCTURE_STORE_CRUD_FUNCTIONS)
+    assert all(row[4] is not creator for row in helper._STRUCTURE_STORE_SLOT_GUARDS)
+    assert all(row[3] is not creator for row in helper._STRUCTURE_STORE_VISITOR_GUARDS)
+    assert all(row[3] is not creator for row in helper._STRUCTURE_VISITOR_GUARDS)
+    return guards, index
+
+
+def _structure_guard_kind_predicate_mutant_code(mutation):
+    """Prepare only the exact cache-origin or live-code opposition for Root."""
+    import ast
+    from pathlib import Path
+    from types import CodeType
+
+    from tests.helpers import continuation_memo as helper
+
+    assert mutation in ("cache-origin", "cache-code")
+    original = helper._structure_store_cache_sources_current
+    assert type(original) is FunctionType and original.__globals__ is helper.__dict__ and original.__closure__ is None
+    tree = ast.parse(Path(helper.__file__).read_bytes(), filename=original.__code__.co_filename)
+    functions = [node for node in tree.body if type(node) is ast.FunctionDef and node.name == original.__name__]
+    assert len(functions) == 1
+    blocks = [
+        (index, functions[0].body[index : index + 3])
+        for index, node in enumerate(functions[0].body)
+        if type(node) is ast.Assign
+        and len(node.targets) == 1
+        and type(node.targets[0]) is ast.Name
+        and node.targets[0].id == "guards"
+        and type(node.value) is ast.Name
+        and node.value.id == "_STRUCTURE_CACHE_SLOT_GUARDS"
+    ]
+    assert len(blocks) == 1, "mutants require one exact checked cache-slot block"
+    index, block = blocks[0]
+    expected = ast.parse(
+        "guards = _STRUCTURE_CACHE_SLOT_GUARDS\n"
+        "if guards is not _STRUCTURE_GUARD_KIND_ORIGINS[5]:\n"
+        "    return False\n"
+        "for owner, name, present, descriptor, function, code in guards:\n"
+        "    if ((name in owner.__dict__) is not present or owner.__dict__.get(name) is not descriptor "
+        "or (type is not _STRUCTURE_GUARD_KIND_ORIGINS[0] or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1] "
+        "or (code is not None and function.__code__ is not code))):\n"
+        "        return False\n"
+    ).body
+    assert [ast.dump(node) for node in block] == [ast.dump(node) for node in expected]
+    if mutation == "cache-origin":
+        del functions[0].body[index + 1]
+    else:
+        block[2].body[0].test.values[2].values[2] = ast.copy_location(ast.Constant(value=False), block[2].body[0].test.values[2].values[2])
+    ast.fix_missing_locations(tree)
+    compiled = compile(tree, original.__code__.co_filename, "exec", dont_inherit=True)
+    codes = [code for code in compiled.co_consts if type(code) is CodeType and code.co_name == original.__name__]
+    assert len(codes) == 1 and codes[0].co_freevars == original.__code__.co_freevars == ()
+    assert codes[0].co_argcount == original.__code__.co_argcount == 0
+    return codes[0]
+
+
+def _guard_kind_mutability_trial():
+    import weakref
+
+    class Foreign:
+        pass
+
+    def original(value=1, *, errors="strict"):
+        return value, errors
+
+    def replacement(value=1, *, errors="strict"):
+        return value + 1, errors
+
+    foreign = Foreign()
+    references = weakref.ref(original), weakref.ref(foreign)
+    kind = type(original)
+    code, defaults, keyword_defaults = original.__code__, original.__defaults__, original.__kwdefaults__
+    with pytest.raises(TypeError, match="__class__ assignment"):
+        original.__class__ = Foreign
+    with pytest.raises(TypeError, match="__class__ assignment"):
+        foreign.__class__ = FunctionType
+    assert type(original) is kind is FunctionType and type(foreign) is Foreign
+    try:
+        original.__code__ = replacement.__code__
+        original.__defaults__ = (7,)
+        original.__kwdefaults__ = {"errors": "replace"}
+        assert type(original) is kind and original.__code__ is replacement.__code__
+        assert original() == (8, "replace")
+    finally:
+        original.__code__, original.__defaults__, original.__kwdefaults__ = code, defaults, keyword_defaults
+    assert original() == (1, "strict")
+    return references
+
+
+def test_structure_guard_kind_is_immutable_while_code_and_defaults_remain_mutable():
+    import gc
+
+    references = _guard_kind_mutability_trial()
+    gc.collect()
+    assert all(reference() is None for reference in references)
+
+
+def _guard_kind_refusal_operand(type, FunctionType, _STRUCTURE_GUARD_KIND_ORIGINS, code, function):
+    return (
+        type is not _STRUCTURE_GUARD_KIND_ORIGINS[0]
+        or FunctionType is not _STRUCTURE_GUARD_KIND_ORIGINS[1]
+        or (code is not None and function.__code__ is not code)
+    )
+
+
+@pytest.mark.parametrize("symbol", ["original", "type", "function-type"])
+def test_structure_guard_kind_symbol_operand_is_exact_and_independent_of_earlier_refusal(symbol):
+    import ast
+    from pathlib import Path
+
+    from tests.helpers import continuation_memo as helper
+
+    source = ast.parse(Path(helper.__file__).read_bytes())
+    predicate = next(
+        node for node in source.body if type(node) is ast.FunctionDef and node.name == "_structure_store_cache_sources_current"
+    )
+    loops = [node for node in predicate.body if type(node) is ast.For and type(node.iter) is ast.Name and node.iter.id == "guards"]
+    assert len(loops) == 1
+    actual = loops[0].body[0].test.values[2]
+    own = ast.parse(Path(__file__).read_bytes())
+    control = next(node for node in own.body if type(node) is ast.FunctionDef and node.name == "_guard_kind_refusal_operand")
+    assert ast.dump(actual) == ast.dump(control.body[0].value), "the isolated control must use the exact current operand"
+
+    def held():
+        return None
+
+    origins = helper._STRUCTURE_GUARD_KIND_ORIGINS
+    current_type = object if symbol == "type" else type
+    current_function_type = object if symbol == "function-type" else FunctionType
+    assert _guard_kind_refusal_operand(current_type, current_function_type, origins, held.__code__, held) is (symbol != "original")
+    # This deliberately isolates the new operand. A real FunctionType exchange
+    # can instead refuse at the unchanged earlier getter check, which is not
+    # evidence that this particular operand was reached on a native SQL path.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["original", "code-marker", "same-shaped", "type-binding"])
+async def test_structure_guard_kind_original_tuple_and_symbols_are_required_on_real_sql(monkeypatch, request, record_property, change):
+    from sqlalchemy.sql import base as sql_base
+    from sqlalchemy.sql.dml import Insert
+
+    from elspeth.web.sessions import continuation as store
+    from elspeth.web.sessions.locking import locked_session_transaction
+    from tests.helpers import continuation_memo as helper
+
+    def borrowed_type(value):
+        return type(value)
+
+    _require_structure_api()
+    prior, monitoring = sys.getprofile(), _native_monitor_state()
+    engine = request.getfixturevalue("engine")
+    creator = sql_base.DialectKWArgs.__dict__["_kw_reg_for_dialect_cls"].__func__
+    guards, creator_index = _guard_kind_cache_creator_premise(helper, creator)
+    original_code = creator.__code__
+    assert "type" not in helper.__dict__
+    if change == "code-marker":
+        exchanged = tuple((*row[:-1], None) if index == creator_index else row for index, row in enumerate(guards))
+        assert all(actual is expected for actual, expected in zip(exchanged[creator_index][:-1], guards[creator_index][:-1], strict=True))
+        assert exchanged[creator_index][-1] is None
+        assert all(
+            actual is expected for index, (actual, expected) in enumerate(zip(exchanged, guards, strict=True)) if index != creator_index
+        )
+    elif change == "same-shaped":
+        exchanged = tuple(row for row in guards)
+        assert all(actual is expected for actual, expected in zip(exchanged, guards, strict=True))
+    else:
+        exchanged = guards
+    assert (exchanged is guards) is (change in ("original", "type-binding"))
+    record_property("guard_kind_creator_registry", (creator_index, len(guards), 1))
+    repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
+    intervals, native, public_returns = [], [], []
+    payload = b"independently authored original guard-kind ownership"
+    variant = ("original", "code-marker", "same-shaped", "type-binding").index(change)
+
+    def before(_conn, _cursor, statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert not intervals and type(parameters) is tuple and len(parameters) == 7 and not many
+            assert helper._STRUCTURE_CACHE_SLOT_GUARDS is guards and creator.__code__ is original_code
+            hook = sys.getprofile()
+            assert type(hook) is FunctionType and hook.__code__ is helper._LIFETIME_PROFILE_CODE
+            trace = hook.__closure__[helper._LIFETIME_PROFILE_CELL_INDEXES[1]].cell_contents
+            assert type(trace) is RetentionMemoTrace
+            thread = trace._structure_threads[threading.get_ident()]
+            count, start = thread.error_count, len(thread.errors)
+            assert count == start == 0, "the kind-origin witness requires otherwise healthy source observation"
+            if change in ("code-marker", "same-shaped"):
+                helper._STRUCTURE_CACHE_SLOT_GUARDS = exchanged
+            elif change == "type-binding":
+                helper.type = borrowed_type
+            try:
+                actual_arity = len(parameters)
+            finally:
+                if change in ("code-marker", "same-shaped"):
+                    assert helper._STRUCTURE_CACHE_SLOT_GUARDS is exchanged
+                    helper._STRUCTURE_CACHE_SLOT_GUARDS = guards
+                elif change == "type-binding":
+                    assert helper.__dict__["type"] is borrowed_type
+                    del helper.type
+            errors = thread.errors[start:]
+            intervals.append((variant, actual_arity, thread.error_count - count, errors.count("original_source_changed")))
+            assert creator.__code__ is original_code and helper._STRUCTURE_CACHE_SLOT_GUARDS is guards
+            assert "type" not in helper.__dict__
+        return statement, parameters
+
+    def after(_conn, _cursor, _statement, parameters, current, many):
+        if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
+            assert type(parameters) is tuple and len(parameters) == 7 and not many
+            assert len(intervals) == 1 and intervals[0][:2] == (variant, 7)
+            assert helper._STRUCTURE_CACHE_SLOT_GUARDS is guards and creator.__code__ is original_code
+            native.append(7)
+
+    def work():
+        with locked_session_transaction(engine, str(context.fence.session_id)) as conn:
+            assert store.require_continuation_mutation(conn, context) is True
+            for _ in range(2):
+                assert (
+                    store.put_chunk(
+                        conn,
+                        session_id=str(context.fence.session_id),
+                        operation_id=operation_id,
+                        key="guard-kind-origin",
+                        payload=payload,
+                        codec="control.v1",
+                    )
+                    is None
+                )
+                public_returns.append(1)
+            assert (
+                store.read_chunk(conn, session_id=str(context.fence.session_id), operation_id=operation_id, key="guard-kind-origin")
+                == payload
+            )
+        assert len(intervals) == 1 and intervals[0][:2] == (variant, 7)
+        assert native == [7] and public_returns == [1, 1]
+        record_property("guard_kind_origin_interval", tuple(intervals))
+        record_property("guard_kind_native_public_readback", (len(native), len(public_returns), 1))
+        return len(payload)
+
+    try:
+        result, snapshot = await _closed_dml_trial(
+            monkeypatch,
+            request,
+            engine,
+            context,
+            operation_id,
+            work,
+            refused=change != "original",
+            listeners=((engine, "before_cursor_execute", before, True), (engine, "after_cursor_execute", after, False)),
+        )
+        assert result == len(payload) and snapshot.closed
+        rows = _closed_dml_rows(snapshot)
+        assert len(rows) == 1 and rows[0].sql.bind_arities == (7,) and rows[0].outcome == "returned"
+        # The helper retains at most eight error labels while counting every
+        # actual refusal. The borrowed-type control can add audited calls;
+        # its numeric total must not be mistaken for a truncated label list.
+        assert intervals[0][2] >= intervals[0][3]
+        if change == "original":
+            assert intervals == [(0, 7, 0, 0)] and snapshot.complete and snapshot.observation_verified and not snapshot.errors
+        else:
+            assert intervals[0][2] > 0 and 0 < intervals[0][3] <= 8
+            assert snapshot.errors and all(code == "original_source_changed" for code in snapshot.errors)
+            assert not snapshot.complete and not snapshot.observation_verified
+    finally:
+        try:
+            repository.release(context)
+        finally:
+            assert helper._STRUCTURE_CACHE_SLOT_GUARDS is guards and "type" not in helper.__dict__
+            assert creator.__code__ is original_code
+            assert sys.getprofile() is prior and _native_monitor_state() == monitoring

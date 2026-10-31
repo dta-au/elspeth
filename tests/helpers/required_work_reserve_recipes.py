@@ -23,10 +23,13 @@ SELECTION = {
         "make_required_work_key",
         "RequiredWorkCoordinator.__init__",
         "RequiredWorkCoordinator.authority",
+        "RequiredWorkCoordinator.sql_deadline_owner",
         "RequiredWorkCoordinator.reserve",
         "RequiredWorkTicket.__init__",
+        "RequiredWorkTicket.sql_deadline_owner",
         "RequiredWorkBinding",
     ),
+    "src/elspeth/web/sessions/continuation_sql_deadline.py": ("ContinuationSQLDeadlineOwner",),
     "src/elspeth/contracts/session_operation.py": (
         "SessionOperationKind",
         "_require_nonblank",

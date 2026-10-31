@@ -22,6 +22,7 @@ from elspeth.web.composer import continuation_attachment_application_driver as d
 from elspeth.web.composer import continuation_attachment_finisher as finisher
 from elspeth.web.composer import continuation_runtime as runtime_owner
 from elspeth.web.composer.continuation import ComposeFrame, ToolBatchFrame
+from elspeth.web.composer.continuation_application_graph import admit_application_recorder_source
 from elspeth.web.composer.continuation_attachment_application_driver import (
     apply_current_attachment_runtime,
     read_current_applied_attachment,
@@ -34,6 +35,7 @@ from elspeth.web.composer.continuation_dispatch_audit import capture_dispatch_au
 from elspeth.web.composer.continuation_env_inventory import materialize_continuation_env_inventory
 from elspeth.web.composer.continuation_evidence import admit_turn_evidence, decode_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import require_evidence_application_links
+from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence
 from elspeth.web.composer.continuation_message_shelf import decode_message_shelf
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_prompt_producers import load_current_message_producers
@@ -331,9 +333,7 @@ async def application_case(
     data = RestoredBatchData(batch, accumulator, published.outcome.completion.tool_batch.calls)
     runtime = replace(
         runtime,
-        graph=replace(
-            runtime.graph, batch=data, selected_audit=capture_dispatch_audit(original_audit), selected_dialect=ctx.tool_contract_dialect
-        ),
+        graph=runtime.graph.with_batch(data).with_selected_dispatch(capture_dispatch_audit(original_audit), ctx.tool_contract_dialect),
     )
     captured = await capture_continuation_runtime_owners(runtime, selected=current["selected"], inventory=current["inventory"])
     compose = captured.stack.frames[0]
@@ -345,7 +345,7 @@ async def application_case(
     graph = require_evidence_application_links(
         snapshot.snapshot,
         env_ref_names=current["inventory"].names,
-        recorder_chunk=snapshot.recorder_chunk,
+        recorder_source=admit_application_recorder_source(snapshot.recorder_chunk, env_ref_names=current["inventory"].names),
         sources=snapshot.sources,
     )
     assert graph is not None and graph.selected_audit is not None and graph.selected_dialect is not None
@@ -366,7 +366,42 @@ async def application_case(
         current["selected"], root, runtime_owner._selected_chunks(root, captured.chunks, (prepared, published.response))
     )
     current = await install_capture(store, current, phase_input)
-    runtime = replace(runtime, graph=replace(runtime.graph, selected_audit=graph.selected_audit))
+    runtime = replace(
+        runtime,
+        graph=RestoredTurnEvidence(
+            runtime.graph.evidence,
+            runtime.graph.messages,
+            runtime.graph.recorder,
+            runtime.graph.drained,
+            runtime.graph.batch,
+            runtime.graph.applications,
+            graph.selected_audit,
+            runtime.graph.selected_dialect,
+        ),
+    )
+    selected_owners = RestoredTurnEvidence(
+        runtime.graph.evidence,
+        runtime.graph.messages,
+        runtime.graph.recorder,
+        runtime.graph.drained,
+        runtime.graph.batch,
+        runtime.graph.applications,
+        graph.selected_audit,
+        graph.selected_dialect,
+    )
+    cleared = selected_owners.without_selected_dispatch()
+    assert cleared is not selected_owners and cleared.selected_audit is None and cleared.selected_dialect is None
+    assert selected_owners.selected_audit is graph.selected_audit and selected_owners.selected_dialect is graph.selected_dialect
+    assert cleared.evidence is selected_owners.evidence and cleared.messages is selected_owners.messages
+    assert cleared.recorder is selected_owners.recorder and cleared.drained is selected_owners.drained
+    assert cleared.batch is selected_owners.batch and cleared.applications is selected_owners.applications
+    reselected = cleared.with_selected_dispatch(graph.selected_audit, graph.selected_dialect)
+    assert reselected is not cleared and reselected == selected_owners
+    assert cleared.selected_audit is None and cleared.selected_dialect is None
+    assert reselected.selected_audit is graph.selected_audit and reselected.selected_dialect is graph.selected_dialect
+    assert reselected.evidence is cleared.evidence and reselected.messages is cleared.messages
+    assert reselected.recorder is cleared.recorder and reselected.drained is cleared.drained
+    assert reselected.batch is cleared.batch and reselected.applications is cleared.applications
     await run_attachment_result(**_read_args(current), service=current["service"], audit=original_audit)
     assert (
         await asyncio.to_thread(store[1].renew, running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS)

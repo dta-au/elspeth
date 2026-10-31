@@ -241,7 +241,7 @@ PRODUCER_GRAMMARS = {
 NAMESPACE_GRAMMARS = {
     # Includes the closed-source continuation SQL-outcome validator header;
     # current required-work source/body recipes retain its exact SQL custody.
-    "RequiredWorkCoordinator": "44b1bd6207bc1021388061afadbadf23f4644fb2ce8d9439211ebe4b2d3eb584",
+    "RequiredWorkCoordinator": "902e54d4131a717d2f1d0c2fa66d23f1c185afd312fd9a4ce021adf3e92ad3b9",
     "RequiredWorkBinding": "e4e502c55b4ecd87baa32c1165c938a6fceafd737f930b55287a87fd392164b2",
 }
 _CONTINUATION_SQL_OUTCOME_SOURCE = """def validate_continuation_sql_outcome[T](

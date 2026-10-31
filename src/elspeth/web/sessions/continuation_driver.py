@@ -50,7 +50,7 @@ from elspeth.web.sessions.composer_operations import (
 )
 from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, ComposerSegmentYieldReceipt, StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
-from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead
+from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
 from elspeth.web.sessions.schemas import MessageWithStateResponse, SendMessageRequest
 
 if TYPE_CHECKING:
@@ -187,6 +187,40 @@ class _SegmentDriver:
                 raise
             raise combined from combined.__cause__
         source, custody = failure_read.source, self.phases.failure_custody
+        from elspeth.web.sessions.continuation_p4 import terminal_service_failure
+        from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application, StoredTerminalP4Preparation
+        from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
+
+        if type(source) is StoredTerminalP4Preparation:
+            unresolved = ComposerTerminalSQLCompletionUnknown("terminal P4 preparation has no actual committed result")
+            combined = self.join_failure(unresolved)
+            raise combined from combined.__cause__
+        if type(source) is StoredTerminalP4Application:
+            failure = (
+                request_cancelled_error(request_id=record.request_id)
+                if record.cancel_requested_at is not None
+                else project_composer_operation_error(original, request_id=record.request_id)
+                if original is not None
+                else terminal_service_failure(source, request_id=record.request_id)
+            )
+            terminal = await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_STATE_SQL,
+                operation=partial(
+                    self.authority.settle_continuation_owner,
+                    self.running,
+                    outcome=failure,
+                    env_ref_names=names,
+                    deadline=self.worker.drain_deadline,
+                ),
+                expected=ComposerOperationRecord,
+            )
+            await self.worker._verify_terminal_before_release(
+                self.running, self.lease, terminal, _StartedSettlement(terminal_receipt=terminal)
+            )
+            return ContinuationSegmentSettled(terminal)
+        if source is not None and (not isinstance(source, RetainedToolFailureSource) or type(source) is not RetainedToolFailureSource):
+            raise AuditIntegrityError("continuation settlement lost its closed failure source owner")
         owns_failure = source is not None or (custody is not None and (custody.completed or original is not None))
         if owns_failure:
             if source is not None and not source.applied:

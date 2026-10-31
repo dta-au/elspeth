@@ -2273,7 +2273,6 @@ _PLUGIN_CONTEXT_METHODS = frozenset(
 _NON_LANDSCAPE_RECEIVER_OWNERS: frozenset[tuple[str, str]] = frozenset(
     {
         ("elspeth.web.sessions.protocol.SessionServiceProtocol", "update_run_status"),
-        ("elspeth.web.composer.pipeline_planner._PlannerAttemptTrail", "begin_attempt"),
         ("elspeth.engine.orchestrator.ports.CoalesceCompletionPort", "mark_blocked_barrier_terminal"),
     }
 )
@@ -11080,6 +11079,32 @@ def _reserve_selected_origin_effect_failures(
     consumers; unsupported relevant forms remain an explicit NO_GO.
     """
     receiver_members = {owner: set(members) for owner, members in (receiver_members or {}).items()}
+    # These actual constructors precede the wider boundary proof. Their local
+    # receipts admit only original same-AST transfers, independently of an
+    # unrelated TITLE or six-method contract failing later in that proof.
+    driver_failures, driver_owner = _reserve_provider_mint_contract.provider_driver_constructor_contract(units)
+    if not driver_failures and driver_owner is not None:
+        driver_nodes = {(unit.path, id(node)) for unit in units for node in ast.walk(unit.tree)}
+        if (driver_owner["owner_constructor_stores"] | driver_owner["owner_constructor_calls"]) <= driver_nodes:
+            validated_transfer_nodes = validated_transfer_nodes | driver_owner["owner_constructor_stores"]
+            protected_supplier_bindings = protected_supplier_bindings | driver_owner["class_origins"]
+            extra_roots = extra_roots | driver_owner["class_origins"]
+    start_failures, started_owner = _reserve_worker_six.continuation_start_owner_contract(units)
+    if not start_failures and started_owner is not None:
+        started_nodes = {(unit.path, id(node)): node for unit in units for node in ast.walk(unit.tree)}
+        arguments = started_owner["supplier_arguments"]
+        if all(
+            isinstance(started_nodes.get((path, call_id)), ast.Call)
+            and any(
+                id(value) == argument_id
+                for value in (
+                    *started_nodes[path, call_id].args,
+                    *(keyword.value for keyword in started_nodes[path, call_id].keywords),
+                )
+            )
+            for path, call_id, argument_id in arguments
+        ):
+            validated_supplier_arguments = validated_supplier_arguments | arguments
     approval_metadata = (
         _reserve_approval_binding_metadata_receipt(units)
         if additional_supplier_roots
@@ -16442,6 +16467,163 @@ def _reserve_selected_origin_effect_failures(
     return unresolved
 
 
+def _reserve_sql_deadline_owner_failures(units, work):
+    """Close the timing-data dependency without granting it reservation authority."""
+    selected = [unit for unit in units if unit.path == "src/elspeth/web/sessions/continuation_sql_deadline.py"]
+    if len(selected) != 1:
+        return ["owned SQL deadline source is missing or duplicated"]
+    deadline = selected[0]
+    # These finite statements describe the actual identity check, not merely a
+    # method spelling or a newly refreshed source digest. The remaining timing
+    # methods are retained by the class recipe, not granted new permissions.
+    expected_owner = ast.parse(
+        """
+class ContinuationSQLDeadlineOwner:
+    def __init__(self, running: ComposerOperationRunning, *, policy: ContinuationAdmissionPolicy,
+                 drain_signal: ComposerDrainSignal, drain_seconds: float, hard_expires_at: float) -> None:
+        if (type(running) is not ComposerOperationRunning
+            or running.claim.segment_sequence is None
+            or running.claim.ownership_generation is None
+            or type(policy) is not ContinuationAdmissionPolicy
+            or type(drain_signal) is not ComposerDrainSignal
+            or type(drain_seconds) not in (float, int)
+            or not math.isfinite(drain_seconds)
+            or drain_seconds <= COMPOSER_DRAIN_FINISH_RESERVE_SECONDS
+            or type(hard_expires_at) not in (float, int)
+            or not math.isfinite(hard_expires_at)):
+            raise AuditIntegrityError("V2 SQL timing lost its actual owner or finite retained bounds")
+        self.running, self.policy, self.drain_signal = running, policy, drain_signal
+        self.drain_seconds, self.hard_expires_at = float(drain_seconds), float(hard_expires_at)
+        self.drain_finish_reserve_seconds = COMPOSER_DRAIN_FINISH_RESERVE_SECONDS
+        self.statement_cap = min(policy.actions.session_sql.physical, self.drain_seconds - self.drain_finish_reserve_seconds)
+        self._action_expires_at = self.hard_expires_at
+        self._settlement_expires_at = self.hard_expires_at
+        self._settling = False
+        self._lock = threading.RLock()
+
+    def validate_context(self, context: SessionOperationContext, *, operation_id: str | None, attempt: int | None) -> None:
+        if (context is not self.running.session_operation_context
+            or operation_id != self.running.claim.operation_id
+            or attempt != self.running.claim.attempt):
+            raise AuditIntegrityError("SQL timing crossed its actual physical/logical owner")
+"""
+    ).body[0]
+    owner = _reserve_node_at(deadline, "ContinuationSQLDeadlineOwner")
+    ticket = _reserve_node_at(work, "RequiredWorkTicket")
+    for cls in (owner, ticket):
+        if (
+            not isinstance(cls, ast.ClassDef)
+            or cls.bases
+            or cls.keywords
+            or cls.decorator_list
+            or cls.type_params
+            or any(
+                not isinstance(member, ast.FunctionDef)
+                and not (isinstance(member, ast.Expr) and isinstance(member.value, ast.Constant) and isinstance(member.value.value, str))
+                for member in cls.body
+            )
+            or any(
+                isinstance(member, ast.FunctionDef) and member.name.startswith("__") and member.name != "__init__" for member in cls.body
+            )
+        ):
+            return ["owned SQL deadline class or descriptor binding changed"]
+    for expected in expected_owner.body:
+        actual = _reserve_node_at(deadline, "ContinuationSQLDeadlineOwner." + expected.name)
+        if actual is None or stable_ast_dump(actual) != stable_ast_dump(expected):
+            return ["owned SQL deadline running context contract changed"]
+    expected_ticket = ast.parse(
+        """
+def __init__(self, key: RequiredWorkKey, *, coordinator: RequiredWorkCoordinator | None = None,
+             sql_deadline_owner: ContinuationSQLDeadlineOwner | None = None) -> None:
+    if sql_deadline_owner is not None:
+        if (type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+            or coordinator is None
+            or coordinator.sql_deadline_owner is not sql_deadline_owner):
+            raise AuditIntegrityError("SQL timing requires its actual ticket coordinator")
+        sql_deadline_owner.validate_context(
+            key.authority.context, operation_id=key.authority.durable_operation_id, attempt=key.authority.claim_attempt)
+    self._key = key
+    self._sql_deadline_owner = sql_deadline_owner
+"""
+    ).body[0]
+    ctor = _reserve_node_at(work, "RequiredWorkTicket.__init__")
+    if (
+        not isinstance(ctor, ast.FunctionDef)
+        or ctor.decorator_list
+        or ctor.type_params
+        or stable_ast_dump(ctor.args) != stable_ast_dump(expected_ticket.args)
+        or [stable_ast_dump(n) for n in ctor.body[:3]] != [stable_ast_dump(n) for n in expected_ticket.body]
+    ):
+        return ["owned SQL deadline ticket identity or context changed"]
+    expected_getter = ast.parse(
+        """
+@property
+def sql_deadline_owner(self) -> ContinuationSQLDeadlineOwner | None:
+    return self._sql_deadline_owner
+"""
+    ).body[0]
+    for class_name in ("RequiredWorkCoordinator", "RequiredWorkTicket"):
+        getter = _reserve_node_at(work, class_name + ".sql_deadline_owner")
+        if getter is None or stable_ast_dump(getter) != stable_ast_dump(expected_getter):
+            return ["owned SQL deadline getter changed"]
+    # Later statements, including constructor suffixes, cannot replace the
+    # owners whose validation above supplies the argument-to-field origin.
+    for cls, protected, permitted in (
+        (ticket, {"_sql_deadline_owner", "sql_deadline_owner", "_key", "_coordinator"}, {id(n) for n in ctor.body[:3]}),
+        (owner, {"running", "validate_context"}, set()),
+    ):
+        for method in cls.body:
+            if not isinstance(method, ast.FunctionDef):
+                continue
+            for statement in method.body:
+                if (cls is owner and method.name == "__init__") or id(statement) in permitted:
+                    continue
+                # The original ticket coordinator store remains required by
+                # the complete constructor recipe, and is allowed only here.
+                for node in ast.walk(statement):
+                    if (
+                        cls is ticket
+                        and method is ctor
+                        and isinstance(node, ast.Attribute)
+                        and node.attr == "_coordinator"
+                        and ast.unparse(statement) == "self._coordinator = coordinator"
+                    ):
+                        continue
+                    if (
+                        isinstance(node, ast.Attribute)
+                        and isinstance(node.ctx, (ast.Store, ast.Del))
+                        and isinstance(node.value, ast.Name)
+                        and node.value.id == "self"
+                        and node.attr in protected
+                    ) or (
+                        isinstance(node, ast.Call)
+                        and ast.unparse(node.func) in {"setattr", "delattr", "object.__setattr__", "object.__delattr__"}
+                        and node.args
+                        and ast.unparse(node.args[0]) == "self"
+                    ):
+                        return ["owned SQL deadline protected field is rebound"]
+    for unit, bindings in (
+        (work, {"ContinuationSQLDeadlineOwner": "elspeth.web.sessions.continuation_sql_deadline.ContinuationSQLDeadlineOwner"}),
+        (
+            deadline,
+            {
+                "ComposerOperationRunning": "elspeth.web.sessions.composer_operations.ComposerOperationRunning",
+                "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+            },
+        ),
+    ):
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(unit.tree):
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in bindings
+                and resolver.qualified_name(node, use=node) != bindings[node.id]
+            ):
+                return ["owned SQL deadline imported binding changed"]
+    return []
+
+
 def _reserve_coordinator_self_slice_failures(units):
     """Check the reviewed constructor-to-key-to-ticket origin for owned self calls."""
     selected = [unit for unit in units if unit.path == "src/elspeth/web/required_work.py"]
@@ -16485,9 +16667,9 @@ def _reserve_coordinator_self_slice_failures(units):
         or authority_getter.args.kwarg is not None
         or [arg.arg for arg in ctor.args.args] != ["self", "authority"]
         or ctor.args.posonlyargs
-        or ctor.args.kwonlyargs
+        or [arg.arg for arg in ctor.args.kwonlyargs] != ["sql_deadline_owner"]
         or ctor.args.defaults
-        or ctor.args.kw_defaults
+        or [ast.unparse(n) if n is not None else None for n in ctor.args.kw_defaults] != ["None"]
         or ctor.args.vararg is not None
         or ctor.args.kwarg is not None
         or [arg.arg for arg in reserve.args.args] != ["self", "source"]
@@ -16533,8 +16715,37 @@ def _reserve_coordinator_self_slice_failures(units):
     ]
     if len(authority_stores) != 1 or len(ctor.body) < 2 or ctor.body[1] is not authority_stores[0]:
         return ["owned coordinator authority origin is not unique after guard"]
+    expected_owner_guard = ast.parse(
+        """
+if sql_deadline_owner is not None:
+    if (authority.authority_kind is not RequiredAuthorityKind.DURABLE_COMPOSE
+        or type(sql_deadline_owner) is not ContinuationSQLDeadlineOwner):
+        raise AuditIntegrityError("SQL timing requires its actual V2 durable coordinator")
+    sql_deadline_owner.validate_context(
+        authority.context, operation_id=authority.durable_operation_id, attempt=authority.claim_attempt)
+"""
+    ).body[0]
+    if (
+        len(ctor.body) < 3
+        or stable_ast_dump(ctor.body[2]) != stable_ast_dump(expected_owner_guard)
+        or not isinstance(ctor.args.kwonlyargs[0].annotation, ast.BinOp)
+        or ast.unparse(ctor.args.kwonlyargs[0].annotation) != "ContinuationSQLDeadlineOwner | None"
+    ):
+        return ["owned coordinator SQL deadline context guard changed"]
+    expected_slots = ast.parse(
+        "('__weakref__', '_authority', '_child_outcomes', '_child_registrations', '_invocations', '_lock', "
+        "'_manual_proposal_carrier', '_manual_proposal_close', '_proposal_children', '_release_prepared', "
+        "'_sql_deadline_owner', '_tickets', '_unused_metadata')",
+        mode="eval",
+    ).body
+    if stable_ast_dump(cls.body[0].value) != stable_ast_dump(expected_slots):
+        return ["owned coordinator SQL deadline storage layout changed"]
+    deadline_failures = _reserve_sql_deadline_owner_failures(units, unit)
+    if deadline_failures:
+        return deadline_failures
     expected_fields = [
         ("self._authority", "authority"),
+        ("self._sql_deadline_owner", "sql_deadline_owner"),
         ("self._tickets", "{}"),
         ("self._lock", "RLock()"),
         ("self._release_prepared", "False"),
@@ -16546,9 +16757,10 @@ def _reserve_coordinator_self_slice_failures(units):
         ("self._manual_proposal_close", "None"),
         ("self._manual_proposal_carrier", "None"),
     ]
-    if len(ctor.body[1:]) != len(expected_fields):
+    field_statements = [ctor.body[1], *ctor.body[3:]]
+    if len(field_statements) != len(expected_fields):
         return ["owned coordinator constructor field inventory changed"]
-    for statement, (expected_target, expected_value) in zip(ctor.body[1:], expected_fields, strict=True):
+    for statement, (expected_target, expected_value) in zip(field_statements, expected_fields, strict=True):
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             return ["owned coordinator constructor has an unreviewed effect after guard"]
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -16592,7 +16804,7 @@ def _reserve_coordinator_self_slice_failures(units):
         or not isinstance(ticket_assignment, ast.Assign)
         or len(ticket_assignment.targets) != 1
         or ast.unparse(ticket_assignment.targets[0]) != "ticket"
-        or ast.unparse(ticket_assignment.value) != "RequiredWorkTicket(key, coordinator=self)"
+        or ast.unparse(ticket_assignment.value) != "RequiredWorkTicket(key, coordinator=self, sql_deadline_owner=self._sql_deadline_owner)"
         or not isinstance(registration, ast.Assign)
         or len(registration.targets) != 1
         or ast.unparse(registration.targets[0]) != "self._tickets[key]"
@@ -16706,7 +16918,7 @@ def _reserve_coordinator_self_slice_failures(units):
             and isinstance(part.ctx, (ast.Store, ast.Del))
             and isinstance(part.value, ast.Name)
             and part.value.id == "self"
-            and part.attr in {"_authority", "_lock", "_tickets", "authority", "reserve"}
+            and part.attr in {"_authority", "_lock", "_tickets", "authority", "reserve", "_sql_deadline_owner", "sql_deadline_owner"}
             for part in ast.walk(method)
         ):
             return ["owned coordinator protected field is rebound outside constructor"]
@@ -17840,6 +18052,10 @@ def _reserve_coordinator_self_call_receipts(units):
 _reserve_MANUAL_ALLOWANCE_SOURCE = '"""Process-local reservation ownership for one manual Advisor batch.\n\nOnly the spent count is retained by continuation state. A reservation belongs\nto one live call stage, and must close before that stage can be checkpointed.\nSynchronous reserve/dispatch/close operations make overlapping async callers\nshare the same backstop without acquiring permission from audit-buffer growth.\n"""\n\nfrom __future__ import annotations\n\nfrom dataclasses import dataclass, field\nfrom typing import Literal\n\nfrom elspeth.contracts.errors import AuditIntegrityError\n\n\n@dataclass(slots=True)\nclass ManualAdvisorAllowance:\n    limit: int\n    used: int\n    _reserved: int = field(default=0, init=False, repr=False)\n    _active: int = field(default=0, init=False, repr=False)\n\n    def __post_init__(self) -> None:\n        if type(self.limit) is not int or type(self.used) is not int or self.limit < 0 or self.used < 0:\n            raise AuditIntegrityError("Manual Advisor allowance requires exact bounded accounting")\n\n    @property\n    def available(self) -> int:\n        # A lowered live policy cannot erase previously spent attempts.\n        return max(0, self.limit - self.used - self._reserved)\n\n    def reserve(self) -> ManualAdvisorReservation | None:\n        if self.available <= 0:\n            return None\n        self._reserved += 1\n        self._active += 1\n        return ManualAdvisorReservation(self)\n\n    def require_settled(self, *, used: int) -> None:\n        """A retained cut cannot erase live dispatch or refund obligations."""\n        if self._active != 0 or self._reserved != 0:\n            raise AuditIntegrityError("Manual Advisor allowance has an active reservation at the retained cut")\n        if type(used) is not int or self.used != used:\n            raise AuditIntegrityError("Manual Advisor allowance differs from its retained spent count")\n\n\n@dataclass(slots=True)\nclass ManualAdvisorReservation:\n    _owner: ManualAdvisorAllowance = field(repr=False)\n    _state: Literal["reserved", "dispatched", "closed"] = field(default="reserved", init=False)\n\n    def dispatch(self) -> None:\n        if self._state != "reserved" or self._owner._reserved <= 0:\n            raise AuditIntegrityError("Manual Advisor reservation cannot dispatch twice or after release")\n        self._owner._reserved -= 1\n        self._owner.used += 1\n        self._state = "dispatched"\n\n    def close(self) -> None:\n        if self._state == "closed":\n            raise AuditIntegrityError("Manual Advisor reservation closed twice")\n        if self._state == "reserved":\n            self._owner._reserved -= 1\n        self._owner._active -= 1\n        self._state = "closed"\n'
 
 
+def _reserve_p4_batch_custody_receipt(units):
+    return _reserve_continuation_transfers.p4_batch_custody_receipt(units)
+
+
 def _reserve_manual_advisor_allowance_receipt(units):
     """Classify one original manual allowance call, never required-work authority.
 
@@ -17867,6 +18083,9 @@ def _reserve_manual_advisor_allowance_receipt(units):
         declaration = _reserve_node_at(supplier, name)
         if not isinstance(declaration, ast.ClassDef) or not helper.owned_binding(supplier.tree, name, declaration):
             return ["manual Advisor reservation class binding changed"], frozenset()
+    custody_failures, _ = _reserve_p4_batch_custody_receipt(units)
+    if custody_failures:
+        return ["manual Advisor reservation " + failure for failure in custody_failures], frozenset()
     execute = _reserve_node_at(unit, "_execute_continuation_call_live")
     source = ast.get_source_segment(unit.source, execute) if isinstance(execute, ast.AsyncFunctionDef) else None
     if (
@@ -17936,12 +18155,14 @@ def _reserve_current_call_inventory(units):
         "src/elspeth/web/composer/continuation_initialization.py": 1,
         "src/elspeth/web/composer/continuation_title_provider.py": 1,
         "src/elspeth/web/composer/provider_quota.py": 2,
-        "src/elspeth/web/coordination/lifecycle.py": 2,
+        "src/elspeth/web/coordination/lifecycle.py": 3,
         "src/elspeth/web/operator_telemetry.py": 1,
         "src/elspeth/web/required_work.py": 8,
         "src/elspeth/web/composer/tool_batch.py": 1,
         "src/elspeth/web/sessions/composer_async_worker.py": 6,
         "src/elspeth/web/sessions/composer_turn.py": 1,
+        "src/elspeth/web/sessions/continuation_driver.py": 1,
+        "src/elspeth/web/sessions/continuation_tool_failure.py": 1,
         "src/elspeth/web/sessions/routes/_helpers.py": 3,
         "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py": 8,
         "src/elspeth/web/sessions/service.py": 2,
@@ -18501,7 +18722,7 @@ def _reserve_sink_effect_disjoint_receipts(units):
         (
             "src/elspeth/web/coordination/lifecycle.py",
             "SessionOperationLease",
-            "26b51d11536da77f6136233c989200e587c8ec2de8790b831ff446078fb43aba",
+            "374805f097bb943ebd2bb1457a00b88769d70505128933ea589d6d891e62734a",
         ),
         (
             "src/elspeth/web/coordination/lifecycle.py",
@@ -18945,6 +19166,41 @@ def _reserve_retained_failure_transfer_receipts(units):
             for node in ast.walk(unit.tree)
         ):
             return ["retained/private transfer dependency rebound " + path], frozenset()
+    # This class selects a branch in the pinned private projection. Protect
+    # only that classification dependency's binding and evaluated header;
+    # this is not a selected supplier or permission for its retained caller.
+    audit_path = "src/elspeth/web/composer/audit_storage.py"
+    audit = index[audit_path]
+    dependency_name = "RetainedOperationFailureFacts"
+    dependency_module = "elspeth.web.composer.audit_storage"
+    dependency_origin = dependency_module + "." + dependency_name
+    dependency = _reserve_node_at(audit, dependency_name)
+    expected_decorator = ast.parse("dataclass(frozen=True, slots=True)", mode="eval").body
+    if (
+        not isinstance(dependency, ast.ClassDef)
+        or dependency.bases
+        or dependency.keywords
+        or dependency.type_params
+        or len(dependency.decorator_list) != 1
+        or ast.dump(dependency.decorator_list[0], include_attributes=False) != ast.dump(expected_decorator, include_attributes=False)
+        or not _reserve_terminal_sql_transfers.owned_origin(audit.tree, dependency_name, dependency)
+    ):
+        return ["retained/private transfer branch dependency declaration changed " + dependency_origin], frozenset()
+    if _reserve_owned_source_binding_failures({dependency_module: audit}, frozenset({dependency_origin})):
+        return ["retained/private transfer branch dependency binding changed " + dependency_origin], frozenset()
+    for unit in units:
+        writes = [node for node in ast.walk(unit.tree) if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del))]
+        if not writes:
+            continue
+        # Resolve the supplied current AST afresh: opposed fixtures may append
+        # imports or aliases to an AST that already received its positive.
+        resolver = _Resolver(unit)
+        if any(
+            resolver.qualified_name(node, use=node) == dependency_origin
+            or resolver.qualified_name(node.value, use=node) == dependency_origin
+            for node in writes
+        ):
+            return ["retained/private transfer branch dependency mutated " + unit.path], frozenset()
     compose_failures, _ = _reserve_compose_proposal_transfers.compose_proposal_local_transfers(units)
     terminal_failures, _ = _reserve_terminal_sql_transfers.terminal_sql_local_contracts(units)
     if compose_failures or terminal_failures:
@@ -19035,7 +19291,7 @@ def _reserve_compose_iteration_method_source_failures(service):
     failures = []
     for name, digest in (
         ("_compose_loop", "06eb4d3415b5c64fc54b06d1c429d43b04555d1cf74a790a93febe4bda63ed47"),
-        ("_advance_live_compose_iteration", "3a371f34d4b68753fc8db8ef4937e8276c0bc3b520b5e288106a637b38f06498"),
+        ("_advance_live_compose_iteration", "5db3a4f4a720363c9a6c57c2e1d0647f01c66d584a088bcd78752c53d7f764d9"),
     ):
         method = _reserve_node_at(service, "ComposerServiceImpl." + name)
         source = ast.get_source_segment(service.source, method) if method is not None else None
@@ -19294,7 +19550,7 @@ def _reserve_compose_iteration_state_receipt(units):
 
 
 _reserve_BATCH_CARRIER_SOURCES = {
-    "ContinuationBatchState": "@dataclass(slots=True)\nclass ContinuationBatchState:\n    state: CompositionState\n    last_validation: ValidationSummary | None\n    last_runtime_preflight: ValidationResult | None\n    advisor_calls_used: int\n    entry_state: CompositionState\n    early_reviewed: bool = False\n    phase: Literal['uninitialized', 'call_ready', 'call_active', 'dispatch_ready', 'p4_pending', 'p4_result_retained', 'complete'] = 'uninitialized'\n    next_tool_index: int = 0\n    assistant_message_index: int | None = None\n    mixed_abandonment_batch: bool = False\n    provider_model_version: str = ''\n    turn_has_mutation: bool = False\n    turn_has_discovery: bool = False\n    all_cache_hits: bool = True\n    tool_outcomes: list[_ToolOutcome] = field(default_factory=list)\n    plugin_crash: ComposerPluginCrashError | None = None\n    plugin_crash_cause: BaseException | None = None\n    advisor_failure: Exception | None = None\n    advisor_compose_timeout: Literal['pre_call', 'in_flight'] | None = None\n    pre_state_id: str | None = None\n    decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)\n    private_authorings_by_call: dict[str, PrivateToolAuthoring] = field(default_factory=dict)\n    proposals_this_turn: int = 0\n    mutation_success_observed: bool = False\n    refused_resources: set[Resource] = field(default_factory=set)\n    promises_by_call: dict[str, frozenset[Resource]] = field(default_factory=dict)\n    current_call: ContinuationCallState | None = None\n    stop_issued_batch: bool = False\n    p4: _PersistOutcome | None = None\n    retained_failure: RetainedBatchFailure | None = None\n    p4_receipt_json: str | None = None\n    p4_input_json: str | None = None\n    p4_verification_failed: bool = False\n    manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)",
+    "ContinuationBatchState": "@dataclass(slots=True)\nclass ContinuationBatchState:\n    state: CompositionState\n    last_validation: ValidationSummary | None\n    last_runtime_preflight: ValidationResult | None\n    advisor_calls_used: int\n    entry_state: CompositionState\n    early_reviewed: bool = False\n    phase: Literal['uninitialized', 'call_ready', 'call_active', 'dispatch_ready', 'p4_pending', 'p4_result_retained', 'complete'] = 'uninitialized'\n    next_tool_index: int = 0\n    assistant_message_index: int | None = None\n    mixed_abandonment_batch: bool = False\n    provider_model_version: str = ''\n    turn_has_mutation: bool = False\n    turn_has_discovery: bool = False\n    all_cache_hits: bool = True\n    tool_outcomes: list[_ToolOutcome] = field(default_factory=list)\n    plugin_crash: ComposerPluginCrashError | None = None\n    plugin_crash_cause: BaseException | None = None\n    advisor_failure: Exception | None = None\n    service_failure: _ServiceFailure | None = None\n    advisor_compose_timeout: Literal['pre_call', 'in_flight'] | None = None\n    pre_state_id: str | None = None\n    decoded_args_by_call_id: dict[str, dict[str, Any]] = field(default_factory=dict)\n    private_authorings_by_call: dict[str, PrivateToolAuthoring] = field(default_factory=dict)\n    proposals_this_turn: int = 0\n    mutation_success_observed: bool = False\n    refused_resources: set[Resource] = field(default_factory=set)\n    promises_by_call: dict[str, frozenset[Resource]] = field(default_factory=dict)\n    current_call: ContinuationCallState | None = None\n    stop_issued_batch: bool = False\n    p4: _PersistOutcome | None = None\n    retained_failure: RetainedBatchFailure | None = None\n    p4_receipt_json: str | None = None\n    p4_input_json: str | None = None\n    p4_verification_failed: bool = False\n    manual_advisor_allowance: ManualAdvisorAllowance | None = field(default=None, repr=False)",
     "ContinuationCallState": """@dataclass(slots=True)
 class ContinuationCallState:
     index: int
@@ -19396,11 +19652,11 @@ _reserve_BATCH_APPEND_SOURCE = """def _append_continuation_tool_outcome(
 _reserve_BATCH_FORWARD_SOURCE = "def _append_tool_outcome(\n    *,\n    response: Any,\n    error_class: str | None,\n    error_category: ToolArgumentErrorCategory | None,\n    error_message: str | None,\n    post_version: int,\n    _batch: ContinuationBatchState = batch,\n    _call: ContinuationCallState = call,\n) -> None:\n    _append_continuation_tool_outcome(\n        _batch,\n        _call,\n        response=response,\n        error_class=error_class,\n        error_category=error_category,\n        error_message=error_message,\n        post_version=post_version,\n    )"
 
 _reserve_BATCH_HELPER_SOURCE_SHA256 = {
-    "_initialize_continuation_batch_live": "6dd1f94344edcdd450d1fa7be4b60bdbe7d8e5b6985949ca1e9876ca14d18a8e",
+    "_initialize_continuation_batch_live": "11ac4cceb8a8b0cb94bf3d199b1160bf01f1e6b634c6eb6f65b86f1831fabb6a",
     "_append_continuation_tool_outcome": "55c932802c1fddcb5e7528caf267da6d762f7f8262d7b10a3de1697836fed8ab",
-    "_prepare_continuation_call_live": "90f721d921e6221a3f92d97a428a7a67322ff331514d602041a4b56e9a37a88e",
-    "_execute_continuation_call_live": "585471212885e86f59748cbd1d7227dda3a4dcdc6ea85453c5743d2274229af9",
-    "_finish_continuation_batch_live": "cf65f88ca2b6f35a2901ff6bf64c7ac55b9ae2db533c86c2ed2be33811dabf2a",
+    "_prepare_continuation_call_live": "1b73f2df8bac7bf9e910b3e08435865127e66a3b42692bf110fb12957e979754",
+    "_execute_continuation_call_live": "1487fb97d883642bc601280d6bbacbf559983a7d142b1dc050720da797d60a59",
+    "_finish_continuation_batch_live": "912b5095839fd8abdaccf44cc011b6d4f3ef05f343cb6ed73b693c70f94e71aa",
     "run_tool_batch": "3e83918fbd76fee553994ebe8eb5754a28f5feb9ea9eda9d7f2a7e137da9e0c3",
 }
 
@@ -19412,15 +19668,17 @@ _reserve_BATCH_DATA_BODY_SHA256 = {
     "_fail": "a27ce096047d2ae619e47a5bfb37b8d0a4c962644124088721a796541dd2f6af",
     "_safe": "31ade9699d478caa899616967e4fb245462ecf2d2bc95300ed7e7d6586db735f",
     "_argument_text": "9c3289488ea8d9407017f8fbd26e73dd629fd07f71e1ae8afae2381fe85895d1",
-    "_joint": "46d77cf2a09d82e6850371ff9f73c5ef711a1ae3dba9de48ec7a8a6be4581df5",
-    "_members": "62b565b238d533c6135eb777eb883e35ae5da638eb632e9c10f3207ec7de65fe",
+    "_joint": "d6f079a93428e4b6b968eb9029592bd9d865d3aedb02b1a0d0dff459fc98d3c9",
+    "_members": "9322d0fcf93bc0b229b42c7cc4a7cf733025eac94418ee3682cd40c03f0feaca",
     "_constructor_shape": "3ecab4acb20974e7a40cfd9a5ef13782205126c9d38746aefa1eb6efdc3729be",
-    "_construct": "9531f31f1f7414c2143974c855b00f2e6292b2212f20c47c6e17e58fe8b46888",
-    "_encode": "5ab65db4cecdbf7d4c92c9e37383f654b6ba5dd1addeb3c883f48a41e3c13f4b",
-    "_decode_graph": "2c6d5266a828ed6233231a25d5205562945e5e63a2f009fb72ec55220c8a4031",
+    "_construct": "9dceb6c366e06623621d517ab26edfc065337808ea2274c753a3dba976c80614",
+    "_encode": "b78af6ccc0336aec981cf73a80c6573de232a141c79cc9f45847c36a68d89817",
+    "_decode_graph": "723a056b311131554fef5a2972d8a4c361d26f8af95c95b6c696dd327164f399",
+    "_encode_values": "b45cf8f41fc0bbbd41d52cf8f82cf05bf112db4644e3e046f9b664a8553190d8",
+    "_decode_graph_values": "cbc34ce5af0a03a0e90d9de54f6016848140b9674701e55d21eda546a1c73c60",
     "_decode": "6aba78f67fdc36059c3cfa6d7dd1dbca59b51615720b7c10a66f4875238fd747",
-    "encode_coupled_batch_data": "d0789b1938f32954f7fbd66a27dab762eccadd8024ee9ae55a365ff34ba38e1f",
-    "decode_coupled_batch_data": "2dc4f545c519ac72b9ae51e4906f795010fbada0ffea35d44e21d7df68577e79",
+    "encode_coupled_batch_data": "7f2d03c58a04cb6cd3175ac7624a2ab2f48a2b0d1e9ce0dc496acb8ce83ab3c3",
+    "decode_coupled_batch_data": "da2c969d618388621be3f038ecb92f6b8fa646627944d632d6a2a3ae06c24c66",
     "encode_coupled_batch_chunk": "94b6d12c44d222e6a2e538bb1a89cfcef9df2fa79531f0cd0791afc3aaf8e005",
     "decode_coupled_batch_chunk": "99dc82b3b3f1ffbd7acab1abdc2d5a852ccd972171ddbc3c14bc1ecd47ca5810",
     "_check_prepared": "60da77a6668297af64a8020020f6b04abed39bc906667c233a3a0b679bfceb16",
@@ -19463,6 +19721,17 @@ _reserve_BATCH_DATA_BUILTINS = (
 )
 
 
+def _reserve_owner_cancel_failure_transport(node):
+    """The actual authenticated Stop handoff; no alternate callback/target."""
+    expected = ast.parse(
+        "run_sync_in_worker(_authority(request).request_owner_cancel, "
+        "session_id=session_id, operation_id=str(operation_id), actor_user_id=user.user_id, "
+        "auth_provider_type=request.app.state.settings.auth_provider, cancelled_failure=request_cancelled_error)",
+        mode="eval",
+    ).body
+    return isinstance(node, ast.Call) and ast.dump(node, include_attributes=False) == ast.dump(expected, include_attributes=False)
+
+
 def _reserve_batch_retained_field_partition(units, classes):
     """Omit only the exact settled live reservation owner from the old wire.
 
@@ -19495,7 +19764,15 @@ def _reserve_batch_retained_field_partition(units, classes):
                 or ast.dump(transient[0], include_attributes=False) != ast.dump(expected, include_attributes=False)
             ):
                 return [prefix + "exact final live-owner declaration changed"], {}
-            members = members[:-1]
+            service_fields = [node for node in members if node.target.id == "service_failure"]
+            service_expected = ast.parse("service_failure: _ServiceFailure | None = None").body[0]
+            if (
+                len(service_fields) != 1
+                or ast.dump(service_fields[0], include_attributes=False) != ast.dump(service_expected, include_attributes=False)
+                or names.index("service_failure") != names.index("advisor_failure") + 1
+            ):
+                return [prefix + "exact native service-failure declaration changed"], {}
+            members = [node for node in members[:-1] if node is not service_fields[0]]
         fields[name] = tuple(node.target.id for node in members)
     helper = _reserve_composer_receiver
     if not helper.imported(data.tree, "ManualAdvisorAllowance", "elspeth.web.composer.manual_advisor_allowance", "ManualAdvisorAllowance"):
@@ -19507,10 +19784,12 @@ def _reserve_batch_retained_field_partition(units, classes):
         '        _fail("batch manual Advisor allowance lost its nominal live owner")\n'
         "    batch.manual_advisor_allowance.require_settled(used=batch.advisor_calls_used)"
     ).body[0]
+    service_guard = ast.parse('if batch.service_failure is not None:\n    _fail("batch cut contains a live service failure")').body[0]
     if (
         not isinstance(joint, ast.FunctionDef)
-        or len(joint.body) < 3
-        or ast.dump(joint.body[2], include_attributes=False) != ast.dump(expected_guard, include_attributes=False)
+        or len(joint.body) < 4
+        or ast.dump(joint.body[2], include_attributes=False) != ast.dump(service_guard, include_attributes=False)
+        or ast.dump(joint.body[3], include_attributes=False) != ast.dump(expected_guard, include_attributes=False)
     ):
         return [prefix + "nominal settled capture guard or order changed"], {}
     source = ast.get_source_segment(data.source, joint)
@@ -19782,7 +20061,7 @@ def _reserve_continuation_batch_data_receipt(units, classes):
         ("_members", "compare", "type(value) is ContinuationCallState"),
         ("_members", "compare", "type(value) is _CallWireFacts"),
         ("_members", "compare", "type(value) is ContinuationBatchState"),
-        ("_encode.visit", "compare", "type(value) is ContinuationCallState"),
+        ("_encode_values.visit", "compare", "type(value) is ContinuationCallState"),
         ("_check_prepared", "compare", "type(call) is not ContinuationCallState"),
         ("_check_prepared", "compare", "type(call.wire) is not _CallWireFacts"),
         ("encode_prepared_batch_data", "compare", "type(batch) is not ContinuationBatchState"),
@@ -19915,8 +20194,17 @@ def _reserve_continuation_batch_state_receipt(units):
         "run_tool_batch": ("call_model", "ctx", "acc", "llm_messages"),
         "_initialize_continuation_batch_live": ("call_model", "ctx", "acc", "llm_messages", "batch"),
         "_prepare_continuation_call_live": ("call_model", "ctx", "llm_messages", "batch", "call"),
-        "_execute_continuation_call_live": ("call_model", "ctx", "acc", "llm_messages", "batch", "call", "retained_attachment"),
-        "_finish_continuation_batch_live": ("call_model", "ctx", "acc", "batch"),
+        "_execute_continuation_call_live": (
+            "call_model",
+            "ctx",
+            "acc",
+            "llm_messages",
+            "batch",
+            "call",
+            "retained_attachment",
+            "failure_custody",
+        ),
+        "_finish_continuation_batch_live": ("call_model", "ctx", "acc", "batch", "failure_custody"),
         "_append_continuation_tool_outcome": (
             "batch",
             "call",
@@ -19946,7 +20234,12 @@ def _reserve_continuation_batch_state_receipt(units):
             and not args.defaults
             and all(
                 (isinstance(value, ast.Constant) and value.value is None)
-                if name == "_execute_continuation_call_live" and parameter.arg == "retained_attachment"
+                if (name, parameter.arg)
+                in {
+                    ("_execute_continuation_call_live", "retained_attachment"),
+                    ("_execute_continuation_call_live", "failure_custody"),
+                    ("_finish_continuation_batch_live", "failure_custody"),
+                }
                 else value is None
                 for parameter, value in zip(args.kwonlyargs, args.kw_defaults, strict=True)
             )
@@ -19973,6 +20266,9 @@ def _reserve_continuation_batch_state_receipt(units):
     if failures:
         return failures, {}
     forwarder = forwarders[0]
+    custody_failures, custody = _reserve_p4_batch_custody_receipt(units)
+    if custody_failures:
+        return custody_failures, {}
     attachment_failures, attachment = _reserve_continuation_transfers.attachment_local_transfers(units)
     if attachment_failures:
         return attachment_failures, {}
@@ -20008,8 +20304,9 @@ def _reserve_continuation_batch_state_receipt(units):
                 field_use = isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in fields[class_name]
                 capture = declaration is execute and id(node) in captured_defaults
                 retained_comparison = declaration is execute and (path, id(node)) in attachment["retained_comparison_uses"]
+                custody_transfer = (path, id(node)) in custody["receiver_uses"]
                 require(
-                    isinstance(node.ctx, ast.Load) and (field_use or capture or retained_comparison),
+                    isinstance(node.ctx, ast.Load) and (field_use or capture or retained_comparison or custody_transfer),
                     "formal receiver escaped " + name + ":" + local,
                 )
     # The local closure cannot be returned, aliased, rebound, or called with an
@@ -20040,7 +20337,7 @@ def _reserve_continuation_batch_state_receipt(units):
         and node.func.id in definitions
         and node.func.id != "run_tool_batch"
     ] + [forward_call]
-    expected_references = {(path, id(node.func)) for node in expected_calls} | attachment["native_uses"]
+    expected_references = {(path, id(node.func)) for node in expected_calls} | attachment["native_uses"] | custody["native_uses"]
     helper_names = set(definitions) - {"run_tool_batch"}
     actual_references = {
         (source.path, id(node))
@@ -20117,6 +20414,7 @@ def _reserve_continuation_batch_state_receipt(units):
         "owned_uses": owned_uses
         | data["owned_uses"]
         | attachment["native_uses"]
+        | custody["native_uses"]
         | attachment["batch_typecheck_uses"]
         | data["additional_transfers"]["batch_uses"],
         "data_calls": data["calls"] | attachment["data_constructor_calls"] | data["additional_transfers"]["constructor_calls"],
@@ -20125,7 +20423,7 @@ def _reserve_continuation_batch_state_receipt(units):
         "data_supplier_origins": data["supplier_origins"],
         "data_supplier_bindings": data["supplier_bindings"],
         "data_immutable_supplier_origins": data["immutable_supplier_origins"],
-        "calls": frozenset((path, id(node)) for node in expected_calls) | attachment["native_calls"],
+        "calls": frozenset((path, id(node)) for node in expected_calls) | attachment["native_calls"] | custody["native_calls"],
         "factory_calls": frozenset((path, id(node)) for node in factory_calls),
         "state_writes": frozenset(stores),
         "additional_transfers": attachment,
@@ -20138,6 +20436,9 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     recovery_supplier_failures, recovery_supplier = _reserve_compose_proposal_transfers.recovery_instruction_supplier_contracts(units)
     policy_supplier_failures, policy_supplier = _reserve_worker_whole_scope_origin.continuation_policy_supplier_contracts(units)
     initialization_failures, initialization = _reserve_continuation_transfers.initialization_local_transfers(units)
+    record_failures, records = _reserve_continuation_transfers.closed_source_record_transfers(units)
+    terminal_reserve_failures, terminal_reserves = _reserve_continuation_transfers.terminal_failure_reserve_transfers(units)
+    start_owner_failures, start_owner = _reserve_worker_six.continuation_start_owner_contract(units)
     title_transfer_failures, title_transfer = _reserve_title_transfers.title_provider_local_contracts(units)
     iteration_failures, iteration = _reserve_compose_iteration_state_receipt(units)
     batch_failures, batch = _reserve_continuation_batch_state_receipt(units)
@@ -20166,6 +20467,9 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         *recovery_supplier_failures,
         *policy_supplier_failures,
         *initialization_failures,
+        *record_failures,
+        *terminal_reserve_failures,
+        *start_owner_failures,
         *title_transfer_failures,
         *iteration_failures,
         *batch_failures,
@@ -20213,7 +20517,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
             <= actual_nodes
         ):
             return _reserve_ProtectedBoundary(("continuation value supplier receipt is detached from input AST",), (), (), (), ())
-    continuation_receipts = (iteration["additional_transfers"], batch["additional_transfers"], initialization)
+    continuation_receipts = (iteration["additional_transfers"], batch["additional_transfers"], initialization, records, terminal_reserves)
     for receipt in continuation_receipts:
         if not frozenset().union(*(receipt[key] for key in _reserve_continuation_transfers.SITE_KEYS)) <= actual_nodes:
             return _reserve_ProtectedBoundary(("continuation ownership receipt is detached from input AST",), (), (), (), ())
@@ -20236,7 +20540,12 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         )
     ):
         return _reserve_ProtectedBoundary(("TITLE ownership receipt is detached from input AST",), (), (), (), ())
-    continuation_calls = initialization["reserve_calls"] | title_transfer["reserve_calls"]
+    adoption_calls = start_owner["continuation_reserve_calls"]
+    if len(adoption_calls) != 1 or not adoption_calls <= actual_nodes:
+        return _reserve_ProtectedBoundary(("actual continuation adoption receipt is detached or incomplete",), (), (), (), ())
+    continuation_calls = (
+        initialization["reserve_calls"] | title_transfer["reserve_calls"] | terminal_reserves["reserve_calls"] | adoption_calls
+    )
     continuation_state_writes = iteration["additional_transfers"]["state_writes"]
     transferred = frozenset(compose["validated_transfer_nodes"])
     worker_nodes = tuple(worker[key] for key in _reserve_worker_caller.RECEIPT_KEYS)
@@ -20650,6 +20959,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         or mint["mint_return"] not in actual_nodes
         or mint["custody_constructor_call"] not in actual_nodes
         or not set(mint["owner_constructor_calls"]) <= actual_nodes
+        or not set(mint["owner_constructor_stores"]) <= actual_nodes
     ):
         return _reserve_ProtectedBoundary(("selected Web reserve transfer receipts do not share the input AST",), (), (), (), ())
     state_failures, state_reads = _reserve_app_state_slot_failures(units, receiver["app_state_install"])
@@ -20842,6 +21152,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
             mint["mint_return"],
             mint["custody_constructor_call"],
             *mint["owner_constructor_calls"],
+            *mint["owner_constructor_stores"],
             *receiver_nodes,
             iteration["call"],
             *(site for receipt in continuation_receipts for site in receipt["constructor_calls"]),
@@ -22291,7 +22602,7 @@ class _reserve_ReserveProof:
                             and r.qualified_name(transport.func, use=transport) == "elspeth.web.async_workers.run_sync_in_worker"
                             and len(transport.args) == 1
                             and isinstance(transport.args[0], ast.Attribute)
-                            and transport.args[0].attr == "request_cancel"
+                            and _reserve_owner_cancel_failure_transport(transport)
                             and isinstance(transport.args[0].value, ast.Call)
                             and isinstance(transport.args[0].value.func, ast.Name)
                             and transport.args[0].value.func.id == "_authority"
@@ -32027,23 +32338,23 @@ def test_unknown_receiver_admission_is_keyed_on_the_resolved_non_landscape_owner
     unknown-receiver row that D8.3 must thread.
     """
 
-    # (a) A parameter annotated with a pinned non-Landscape owner, reached from a
-    # nested closure the way the planner's attempt trail is.
+    # (a) A parameter annotated with a current pinned non-Landscape owner,
+    # reached through a nested closure. The retired planner is not an admission.
     planner = _parse_source(
-        "src/elspeth/web/composer/pipeline_planner.py",
+        "src/elspeth/engine/orchestrator/ports.py",
         textwrap.dedent(
             """\
-            class _PlannerAttemptTrail:
-                def begin_attempt(self, **fields): ...
+            class CoalesceCompletionPort:
+                def mark_blocked_barrier_terminal(self, **fields): ...
 
-            def _plan_pipeline_inner(*, trail: _PlannerAttemptTrail):
+            def outer(*, trail: CoalesceCompletionPort):
                 def begin_response_attempt():
-                    trail.begin_attempt(planner_call_ordinal=1)
+                    trail.mark_blocked_barrier_terminal(barrier_id="original")
                 return begin_response_attempt
             """
         ),
     )
-    assert not any("unknown mutation receiver .begin_attempt" in item for item in _mutation_callable_escapes([planner]))
+    assert not any("unknown mutation receiver .mark_blocked_barrier_terminal" in item for item in _mutation_callable_escapes([planner]))
 
     # (b) ``self.<attr>`` bound once in ``__init__`` from an annotated parameter.
     service = _parse_source(
@@ -32099,8 +32410,8 @@ def test_unknown_receiver_admission_is_keyed_on_the_resolved_non_landscape_owner
     assert any("unknown mutation receiver .update_run_status" in item for item in _mutation_callable_escapes([unresolvable_attribute]))
 
     # An unannotated parameter proves nothing, whatever it is called.
-    untyped = _parse_source(planner.path, planner.source.replace("trail: _PlannerAttemptTrail", "trail"))
-    assert any("unknown mutation receiver .begin_attempt" in item for item in _mutation_callable_escapes([untyped]))
+    untyped = _parse_source(planner.path, planner.source.replace("trail: CoalesceCompletionPort", "trail"))
+    assert any("unknown mutation receiver .mark_blocked_barrier_terminal" in item for item in _mutation_callable_escapes([untyped]))
 
     # A foreign owned type is not admitted merely because it resolves. This is the
     # ``LLMAuditParent`` shape, and it must keep rowing until D8.3 threads it.
@@ -38753,6 +39064,21 @@ def _assert_current_batch_receipt_inventory(units, receipt):
 
     native = (
         (
+            "src/elspeth/web/composer/continuation_live_phases.py",
+            "ContinuationLivePhases._execute_one_owned",
+            "_prepare_continuation_call_live(call_model=result.outcome, ctx=context, llm_messages=live.llm_messages, batch=batch, call=call)",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_live_phases.py",
+            "ContinuationLivePhases._execute_one_owned",
+            "_execute_continuation_call_live(call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch, call=call, failure_custody=self.failure_custody)",
+        ),
+        (
+            "src/elspeth/web/composer/continuation_live_phases.py",
+            "ContinuationLivePhases._persist_batch",
+            "_finish_continuation_batch_live(call_model=call_model, ctx=context, acc=data.accumulator, batch=data.batch, failure_custody=self.failure_custody)",
+        ),
+        (
             batch,
             "run_tool_batch",
             "_initialize_continuation_batch_live(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages, batch=batch)",
@@ -38799,9 +39125,9 @@ def _assert_current_batch_receipt_inventory(units, receipt):
         ),
         (data, "_construct", 'AdmittedDiscoveryResult(members["result"], members["response"], selected_contract)'),
         (data, "_construct", 'AdmittedPluginSchemaResponse(members["snapshot"], PLUGIN_SCHEMA_RESPONSE_CONTRACT)'),
-        (data, "_decode_graph", "RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)"),
-        (data, "_decode_graph", "ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)"),
-        (data, "_decode_graph", "ApplicationGraph(data, effects, recorder, cuts)"),
+        (data, "_decode_graph_values", "RestoredMemoryCompletionBatchData(batch, accumulator, calls, audit_values[0], dialect)"),
+        (data, "_decode_graph_values", "ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)"),
+        (data, "_decode_graph_values", "ApplicationGraph(data, effects, recorder, cuts)"),
         (data, "encode_memory_completion_batch_data", "RestoredBatchData(batch, accumulator, calls)"),
         (data, "encode_restored_memory_completion_batch_data", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
         (data, "require_selected_memory_completion", "RestoredBatchData(value.batch, value.accumulator, value.calls)"),
@@ -38856,7 +39182,7 @@ def _assert_current_batch_receipt_inventory(units, receipt):
         ("_members", "type(value) is ContinuationCallState"),
         ("_members", "type(value) is _CallWireFacts"),
         ("_members", "type(value) is ContinuationBatchState"),
-        ("_encode.visit", "type(value) is ContinuationCallState"),
+        ("_encode_values.visit", "type(value) is ContinuationCallState"),
         ("_check_prepared", "type(call) is not ContinuationCallState"),
         ("_check_prepared", "type(call.wire) is not _CallWireFacts"),
         ("encode_prepared_batch_data", "type(batch) is not ContinuationBatchState"),
@@ -38940,7 +39266,12 @@ def test_continuation_batch_data_receipt_closes_only_original_ast_nodes():
             "exact constructor transfer changed",
             "_construct",
         ),
-        ("    if len(restored) != len(nodes):", "    if False:", "reviewed graph body changed _decode_graph", "_decode_graph"),
+        (
+            "    if len(restored) != len(nodes):",
+            "    if False:",
+            "reviewed graph body changed _decode_graph_values",
+            "_decode_graph_values",
+        ),
     ],
 )
 def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, after, refusal, rebind, monkeypatch):

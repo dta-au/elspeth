@@ -1016,14 +1016,27 @@ class RequiredWorkCoordinator:
             self._tickets[key] = ticket
             return ticket
 
-    def _registered(self, ticket: RequiredWorkTicket, source: RequiredWorkSource) -> None:
+    def _registered(self, ticket: RequiredWorkTicket, source: RequiredWorkSource, *, expected_sql_attempt_ordinal: int = 0) -> None:
+        if type(expected_sql_attempt_ordinal) is not int or expected_sql_attempt_ordinal not in (0, 1):
+            raise AuditIntegrityError("Required SQL expectation requires an exact bounded ordinal")
+        if type(source) is not RequiredWorkSource:
+            raise AuditIntegrityError("Unused provenance lacks exact registered source authority")
+        expected_stage, expected_phase = SOURCE_MAPPING[source]
+        if expected_sql_attempt_ordinal == 1:
+            if source is not RequiredWorkSource.TERMINAL_FAILURE_SQL or expected_phase is not RequiredWorkSubphase.SQL_INITIAL:
+                raise AuditIntegrityError("Required SQL retry expectation requires its terminal source")
+            expected_phase = RequiredWorkSubphase.SQL_RETRY
         if (
             type(ticket) is not RequiredWorkTicket
+            or type(ticket.key) is not RequiredWorkKey
             or self._tickets.get(ticket.key) is not ticket
             or ticket._coordinator is not self
             or ticket.key.authority != self.authority
             or ticket.key.source is not source
-            or ticket.key.subphase is not SOURCE_MAPPING[source][1]
+            or ticket.key.stage is not expected_stage
+            or ticket.key.subphase is not expected_phase
+            or type(ticket.key.sql_attempt_ordinal) is not int
+            or ticket.key.sql_attempt_ordinal != expected_sql_attempt_ordinal
         ):
             raise AuditIntegrityError("Unused provenance lacks exact registered source authority")
 
@@ -1125,10 +1138,21 @@ class RequiredWorkCoordinator:
                     raise AuditIntegrityError("Checkpoint projection replaced actual finish-once carrier")
                 self._verify_sql_outcome(ticket, actual_outcome)
 
-    def validate_terminal_failure_sql_outcome[T](self, *, ticket: RequiredWorkTicket, actual_outcome: RequiredSQLFinishOnce[T]) -> bool:
+    def validate_terminal_failure_sql_outcome[T](
+        self,
+        *,
+        ticket: RequiredWorkTicket,
+        actual_outcome: RequiredSQLFinishOnce[T],
+        expected_sql_attempt_ordinal: int,
+    ) -> bool:
         """The failed-terminal owner consumes exactly its registered physical handoff."""
         with self._lock:
-            self._registered(ticket, RequiredWorkSource.TERMINAL_FAILURE_SQL)
+            self._registered(ticket, RequiredWorkSource.TERMINAL_FAILURE_SQL, expected_sql_attempt_ordinal=expected_sql_attempt_ordinal)
+            expected = make_required_work_key(
+                self.authority, RequiredWorkSource.TERMINAL_FAILURE_SQL, sql_attempt_ordinal=expected_sql_attempt_ordinal
+            )
+            if ticket.key != expected:
+                raise AuditIntegrityError("Failed terminal crossed its exact terminal invocation")
             with ticket._lock:
                 if ticket._finish_once_handoff is not actual_outcome:
                     raise AuditIntegrityError("Failed terminal replaced its actual finish-once carrier")

@@ -1,7 +1,7 @@
 """Join real current message producers to the original shared evidence owner."""
 
 import asyncio
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from threading import Event
 
 import pytest
@@ -12,8 +12,9 @@ from elspeth.contracts.prompt_guard import PROMPT_GUARD_TRUST_KEY
 from elspeth.web.composer import continuation_prompt_producers as producers
 from elspeth.web.composer.continuation_current_evidence import restore_current_turn_evidence
 from elspeth.web.composer.continuation_evidence import admit_turn_evidence
+from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence
 from elspeth.web.composer.continuation_evidence_restore import restore_turn_evidence
-from elspeth.web.composer.continuation_prompt_producers import load_current_message_producers
+from elspeth.web.composer.continuation_prompt_producers import CurrentMessageProduction, load_current_message_producers
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
@@ -71,6 +72,74 @@ async def test_current_materialization_restores_one_complete_evidence_shelf(oper
             materialization.capture_message(message)[0] == shelf.messages_json[index]
             for message, index in zip(messages, shelf.current_indexes, strict=True)
         )
+        kwargs["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_actual_current_source_records_close_bindings_without_freezing_live_messages(operation_store):
+    kwargs, _materialization, shelf, _recorder = await guarded_case(operation_store)
+    running = kwargs["inventory"].running
+    try:
+        production = await load_current_message_producers(**kwargs, retained_shelf=shelf)
+        assert type(production) is CurrentMessageProduction and production.messages is not None
+        restored = await restore_current_turn_evidence(**kwargs, materialization=production.producers)
+        assert type(restored) is RestoredTurnEvidence
+        messages, owner = production.messages, production.producers
+        graph_messages, evidence, recorder, drained = restored.messages, restored.evidence, restored.recorder, restored.drained
+        assert restored.evidence.transcript.snapshot_for_continuation(graph_messages, materialization=owner) == shelf
+
+        equal_production = CurrentMessageProduction(owner, tuple(dict(message) for message in messages))
+        assert equal_production == production and equal_production is not production
+        assert equal_production.messages[0] is not messages[0]
+        equal_graph = RestoredTurnEvidence(evidence, list(graph_messages), recorder, drained)
+        assert equal_graph == restored and equal_graph.messages is not graph_messages
+        assert restored.batch is restored.applications is restored.selected_audit is restored.selected_dialect is None
+        assert production != restored
+
+        with pytest.raises(FrozenInstanceError):
+            production.messages = ()
+        with pytest.raises(FrozenInstanceError):
+            del production.messages
+        with pytest.raises(FrozenInstanceError):
+            production._sealed = False
+        with pytest.raises(FrozenInstanceError):
+            production.extra = object()
+        with pytest.raises(FrozenInstanceError, match="reinitialized"):
+            CurrentMessageProduction.__init__(production, owner, ())
+        with pytest.raises(AttributeError):
+            _ = production.__dict__
+        assert production.producers is owner and production.messages is messages
+
+        with pytest.raises(FrozenInstanceError):
+            restored.messages = []
+        with pytest.raises(FrozenInstanceError):
+            del restored.evidence
+        with pytest.raises(FrozenInstanceError):
+            restored._sealed = False
+        with pytest.raises(FrozenInstanceError):
+            restored.extra = object()
+        with pytest.raises(FrozenInstanceError, match="reinitialized"):
+            RestoredTurnEvidence.__init__(restored, evidence, [], recorder, drained)
+        with pytest.raises(AttributeError):
+            _ = restored.__dict__
+        assert restored.messages is graph_messages and restored.evidence is evidence
+        assert restored.recorder is recorder and restored.drained is drained
+
+        message = messages[0]
+        assert type(message) is dict
+        original_body = message["content"]
+        assert type(original_body) is str
+        wire = owner.capture_message(message)
+        message["content"] = original_body + " Changed live payload."
+        try:
+            with pytest.raises(AuditIntegrityError):
+                owner.capture_message(message)
+        finally:
+            message["content"] = original_body
+        assert production.messages is messages and messages[0] is message and owner.capture_message(message) == wire
+        assert restored.evidence.transcript.snapshot_for_continuation(graph_messages, materialization=owner) == shelf
         kwargs["required_work"].coordinator.assert_completed()
     finally:
         operation_store[1].release(running.session_operation_context)

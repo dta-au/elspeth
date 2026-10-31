@@ -13,6 +13,7 @@ TURN = "src/elspeth/web/sessions/composer_turn.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 PROPOSALS = "src/elspeth/web/sessions/routes/composer/proposals.py"
 SETTLEMENT = "src/elspeth/web/sessions/routes/composer/pipeline_settlement.py"
+FINALIZATION = "src/elspeth/web/sessions/composer_finalization.py"
 RECOVERY_MESSAGES = "src/elspeth/web/composer/continuation_message_builders.py"
 RECOVERY_INSTRUCTION_ORIGINS = frozenset(
     {
@@ -459,15 +460,18 @@ def _source3_local_transfers(units):
     }
 
 
-# These four complete executed bodies, their definition headers, and the exact
-# selected Call grammars are reviewed as one finite producer contract. The
+# The four original complete bodies and the extracted finalizer, their headers,
+# and exact selected Call grammars form one finite producer contract. The
 # hashes bind structural ASTs, not import identity or physical custody; those
 # remain explicit common-boundary obligations in the returned receipt.
 _REVIEWED_METHOD_SHAPES = {
-    TURN: "80626ed714e47a544b5a03c79687ace8da645d59c65351dfc685458128080364",
+    TURN: "e24e67ac2fa723269ff782ddf40a194f25282279b90eb92efd5960e49a61d974",
     SERVICE: "888d117a75a50c8c4bfda3ec1a91d624e3ba82232bdd87e957dd452dc688baac",
     PROPOSALS: "23ef777eef8f72ed82e5943f633d94fdaa6d4f76cab9bd7ef9ec642adc59a8ca",
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
+    # Root derives this from the actual selected body after the finite join is
+    # reviewed. None refuses; it is never a waiver for an unreceived body.
+    FINALIZATION: "fe3ee099677b49c914de06bb58c43fbfbcb7c5b7793a0f62964c757a7c39c1b6",
 }
 _REVIEWED_RECOVERY_METHOD_SHAPE = "cb8dea7814eb14cbe8601c402db19eb544781954c26679a6780e378b3d6d35c0"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
@@ -476,7 +480,34 @@ _METHOD_PATHS = {
     SERVICE: "ComposerServiceImpl.compose",
     PROPOSALS: "accept_composition_proposal",
     SETTLEMENT: "settle_pipeline_proposal_under_compose_lock",
+    FINALIZATION: "settle_composer_result",
 }
+
+_FINALIZATION_NAMESPACE_SHAPE = "68064590d888ca71f9363c76fa2bbb1139dc9299cfd41376cced883bed92895b"
+_FINALIZATION_FIELDS = (
+    "service",
+    "session",
+    "recovery_context",
+    "lease",
+    "compose_base_state_id",
+    "running",
+    "observation",
+    "progress_sink",
+    "state",
+    "chat_ingress",
+    "chat_ingress_inputs",
+    "prior_completion_gates_facts",
+    "state_record",
+    "budget_anchor",
+    "services",
+    "turn",
+    "labels",
+    "provider_binding",
+    "settings",
+    "plugin_snapshot",
+    "profile_registry",
+    "required_work",
+)
 
 
 def _canonical_ast(value):
@@ -512,6 +543,8 @@ def _canonical_ast(value):
         return [_canonical_ast(item) for item in value]
     if isinstance(value, tuple):
         return [_canonical_ast(item) for item in value]
+    if value is Ellipsis:
+        return {"literal_type": "ellipsis"}
     return value
 
 
@@ -589,8 +622,150 @@ def _strip_inert_annotations(method, path):
     return visit(method)
 
 
+def _finalization_namespace_shape(tree):
+    """Keep evaluated namespace/headers; deferred bodies have separate guards."""
+
+    class Headers(ast.NodeTransformer):
+        def visit_FunctionDef(self, node):
+            node.body = [ast.Pass()]
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            node.body = [ast.Pass()]
+            return node
+
+        def visit_Lambda(self, node):
+            node.body = ast.Constant(value=None)
+            return node
+
+    return _method_shape(Headers().visit(_supplier_sources.copy_ast_fields(tree)))
+
+
+def _moved_finalization_contract(selected):
+    """Bind only the original turn wrapper to its complete moved supplier.
+
+    The node identities below describe the real source join, not a new SQL,
+    callback, arbitrary constructor or capability admission exception.
+    """
+    turn_unit = selected[TURN]
+    unit = selected[FINALIZATION]
+    turn = _node(turn_unit, "_run_composer_turn")
+    cls = _node(unit, "ComposerFinalizationInputs")
+    method = _node(unit, "settle_composer_result")
+    if not isinstance(turn, ast.AsyncFunctionDef) or not isinstance(cls, ast.ClassDef) or not isinstance(method, ast.AsyncFunctionDef):
+        return ["composer moved finalizer actual source declarations missing"], None
+    module = "elspeth.web.sessions.composer_finalization"
+    for name in ("ComposerFinalizationInputs", "settle_composer_result"):
+        if _supplier_sources.import_origin(turn_unit.tree, name, module, name) is None or _lexical_bindings(turn, name):
+            return ["composer moved finalizer canonical caller import changed " + name], None
+    if (
+        not _supplier_sources.owned_origin(unit.tree, "ComposerFinalizationInputs", cls)
+        or not _supplier_sources.owned_origin(unit.tree, "settle_composer_result", method)
+        or _supplier_sources.import_origin(unit.tree, "dataclass", "dataclasses", "dataclass") is None
+    ):
+        return ["composer moved finalizer owned supplier or dataclass binding changed"], None
+    fields = cls.body
+    if fields and isinstance(fields[0], ast.Expr) and isinstance(fields[0].value, ast.Constant) and type(fields[0].value.value) is str:
+        fields = fields[1:]
+    post_init = ast.parse('def __post_init__(self) -> None:\n    freeze_fields(self, "chat_ingress", "chat_ingress_inputs")').body[0]
+    if not fields or _shape(fields[-1]) != _shape(post_init):
+        return ["composer moved finalizer exact value freeze changed"], None
+    fields = fields[:-1]
+    for name in ("freeze_fields", "deep_thaw"):
+        if _supplier_sources.import_origin(unit.tree, name, "elspeth.contracts.freeze", name) is None:
+            return ["composer moved finalizer canonical value supplier changed " + name], None
+    if _supplier_sources.import_origin(unit.tree, "cast", "typing", "cast") is None:
+        return ["composer moved finalizer canonical value cast changed"], None
+    if (
+        cls.bases
+        or cls.keywords
+        or cls.type_params
+        or len(cls.decorator_list) != 1
+        or _shape(cls.decorator_list[0]) != _shape(ast.parse("dataclass(frozen=True, slots=True)", mode="eval").body)
+        or len(fields) != len(_FINALIZATION_FIELDS)
+        or any(
+            not isinstance(field, ast.AnnAssign)
+            or not isinstance(field.target, ast.Name)
+            or field.target.id != name
+            or field.value is not None
+            or field.simple != 1
+            for field, name in zip(fields, _FINALIZATION_FIELDS, strict=True)
+        )
+    ):
+        return ["composer moved finalizer constructor is not the actual plain frozen fields"], None
+    wrappers = [n for n in ast.walk(turn) if isinstance(n, ast.AsyncFunctionDef) and n.name == "settle_post_provider"]
+    arguments = ", ".join(name + "=" + name for name in _FINALIZATION_FIELDS)
+    wrapper_source = (
+        "async def settle_post_provider(result: ComposerResult | GraphRecoveryResponse) -> ComposerOperationRecord:\n"
+        "    return await settle_composer_result(ComposerFinalizationInputs(" + arguments + "), result)"
+    )
+    if len(wrappers) != 1 or not _exact(wrappers[0], wrapper_source) or len(_lexical_bindings(turn, "settle_post_provider")) != 1:
+        return ["composer moved finalizer exact original wrapper or arguments changed"], None
+    calls = {}
+    for name in ("ComposerFinalizationInputs", "settle_composer_result", "settle_post_provider"):
+        references = [n for n in ast.walk(turn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == name]
+        sites = [n for n in ast.walk(turn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == name]
+        if len(references) != 1 or len(sites) != 1 or references[0] is not sites[0].func:
+            return ["composer moved finalizer original once-only call universe changed " + name], None
+        calls[name] = sites[0]
+    owners = [
+        n for n in ast.walk(turn) if isinstance(n, ast.Assign) and any(nested is calls["settle_post_provider"] for nested in ast.walk(n))
+    ]
+    if len(owners) != 1 or not _exact(
+        owners[0],
+        "continuation = lease.create_task(_capture_freeform_child(settle_post_provider(result)), name=labels.settlement_task_name)",
+    ):
+        return ["composer moved finalizer original lease task ownership changed"], None
+    if (
+        len(method.body) < 2 + len(_FINALIZATION_FIELDS)
+        or not _exact(
+            method.body[0],
+            "from elspeth.web.sessions.composer_turn import _SETTLEMENT_TIMEOUT_DETAIL, _graph_recovery_response, _required_audit",
+        )
+        or len(_lexical_bindings(method, "inputs")) != 1
+    ):
+        return ["composer moved finalizer original supplier imports or input binding changed"], None
+    for name, statement in zip(_FINALIZATION_FIELDS, method.body[2 : 2 + len(_FINALIZATION_FIELDS)], strict=True):
+        if not _exact(statement, name + " = inputs." + name) or len(_lexical_bindings(method, name)) != 1:
+            return ["composer moved finalizer original field forwarding changed " + name], None
+    updates = ast.parse(
+        '_post_compose_updates: ComposerPostComposeUpdates = {"repair_turns_used": result.repair_turns_used, '
+        '"ingress": cast("CompositionIngressRecord", deep_thaw(chat_ingress)), '
+        '"chat_ingress_inputs": cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))}'
+    ).body[0]
+    if sum(_shape(node) == _shape(updates) for node in method.body) != 1:
+        return ["composer moved finalizer exact metadata value thaw changed"], None
+    preflight = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_handle_runtime_preflight_failure"
+    ]
+    required_values = {
+        "ingress": 'cast("CompositionIngressRecord", deep_thaw(chat_ingress))',
+        "chat_ingress_inputs": 'cast("list[ChatIngressInput]", deep_thaw(chat_ingress_inputs))',
+    }
+    if len(preflight) != 1 or any(
+        len(
+            [
+                item
+                for item in preflight[0].keywords
+                if item.arg == name and _shape(item.value) == _shape(ast.parse(value, mode="eval").body)
+            ]
+        )
+        != 1
+        for name, value in required_values.items()
+    ):
+        return ["composer moved finalizer exact preflight value thaw changed"], None
+    failures = []
+    if _finalization_namespace_shape(unit.tree) != _FINALIZATION_NAMESPACE_SHAPE:
+        failures.append("composer moved finalizer complete supplier namespace changed")
+    if failures:
+        return failures, None
+    return [], {name: (TURN, id(call)) for name, call in calls.items()}
+
+
 def compose_proposal_local_transfers(units):
-    """Bind the full four-method execution grammar before local receipts."""
+    """Bind original execution and the complete moved body before receipts."""
     selected = {}
     for unit in units:
         if unit.path not in _METHOD_PATHS:
@@ -610,6 +785,9 @@ def compose_proposal_local_transfers(units):
         "recovery_instruction_message",
     ) is None or _lexical_bindings(recovery, "recovery_instruction_message"):
         return ["composer recovery instruction supplier origin changed"], None
+    finalization_failures, finalization = _moved_finalization_contract(selected)
+    if finalization_failures:
+        return finalization_failures, None
     normalized = {}
     for path, unit in selected.items():
         if not any(
@@ -643,6 +821,7 @@ def compose_proposal_local_transfers(units):
     failures, receipt = _source3_local_transfers(tuple(normalized.values()))
     if failures:
         return failures, None
+    receipt["moved_finalization"] = finalization
     return [], receipt
 
 

@@ -56,8 +56,8 @@ POLICY_SUPPLIER_FUNCTION_ORIGINS = frozenset(
     if path != POLICY_MODELS or name == "decode_continuation_policy"
 )
 GRAMMARS = {
-    "_create_app": "1be60b7c1db10049784ebddd3087bd6a369739dea1fbdb2aa833c406ebf03c44",
-    "ComposerAsyncWorker._run_started_under_lease": "a2897fd9340d2b0fac5ae8d83a1e5af1c692f3c69bc79850835b558448b995b5",
+    "_create_app": "b57b0d1b932f77844d3474e125399ee60523f125474e255c16c04558a4e2facd",
+    "ComposerAsyncWorker._run_started_under_lease": "9102ab313b7bc66ae98b3516d9bce69be08a017686be541ad9435d06fa54e298",
     "run_composer_turn": "3076e583c646de8005d6b1e20cd0df431c22384cd0ada0e9a96bf79b0aaae07a",
 }
 SELECTED = (
@@ -426,6 +426,23 @@ def worker_whole_scope_origin_local_contracts(units):
                     "import_alias": (path, id(alias)),
                     "consumer_definition": (path, id(selected[consumer])),
                     "qualification": "ACTUAL_SOURCE_IMPORT_AND_WHOLE_SCOPE_RUNTIME_UNKNOWN",
+                }
+            )
+    if failures:
+        return failures, receipt
+    receipt["drain_owner_origins"] = []
+    for path in (APP, WORKER):
+        origin = import_origin(index[path].tree, "ComposerDrainSignal", "elspeth.web.sessions.composer_drain", "ComposerDrainSignal")
+        if origin is None:
+            failures.append("worker whole scope: actual nominal drain owner import changed " + path)
+        else:
+            statement, alias = origin
+            receipt["drain_owner_origins"].append(
+                {
+                    "source_origin": "elspeth.web.sessions.composer_drain.ComposerDrainSignal",
+                    "import_statement": (path, id(statement)),
+                    "import_alias": (path, id(alias)),
+                    "qualification": "ACTUAL_SOURCE_IMPORT_RUNTIME_OWNER_UNKNOWN",
                 }
             )
     if failures:

@@ -40,18 +40,28 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from elspeth.contracts.composer_audit import ComposerToolInvocation, PrivateToolAuthoring, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMProviderCostSource
 from elspeth.contracts.composer_mutation import ComposerMutationRevocation
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer.advisor_output import AdvisorAbandonmentResponse
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.provider_errors import ProviderRequestFailure
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow
+from elspeth.web.sessions.composer_operations import (
+    ComposerOperationCancelledDuringTurn,
+    ComposerOperationFenceLost,
+    ComposerTurnDeadlineExpired,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.composer_mutation import ComposerMutationCeiling
@@ -60,7 +70,7 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.compartments import ChatIngressInput, CompositionIngressRecord
     from elspeth.web.composer.anti_anchor import AntiAnchorTracker
-    from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
     from elspeth.web.composer.continuation_caches import ContinuationCachesSnapshot
     from elspeth.web.composer.discovery_cache import CachedDiscoveryPayload, RuntimePreflightCache
     from elspeth.web.composer.provider_quota import ProviderInvocationOwner
@@ -73,6 +83,30 @@ if TYPE_CHECKING:
 
 
 _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
+
+# Concrete first-party failures retain their native operation classification.
+# Plain TimeoutError and implementation RuntimeError/ValueError are distinct.
+_ServiceFailure = (
+    SQLAlchemyError
+    | AsyncWorkerAdmissionTimeoutError
+    | RequiredGenerationUnavailable
+    | SessionOperationFenceLost
+    | ComposerOperationFenceLost
+    | ComposerOperationCancelledDuringTurn
+    | ComposerTurnDeadlineExpired
+)
+
+
+class _ServiceHandlerFailure(Exception):
+    """Private proof of the actual session-handler throw, never portable DATA."""
+
+    def __init__(self, original: _ServiceFailure, *, audit: DispatchAudit, tool_call_id: str) -> None:
+        if not isinstance(original, _ServiceFailure):
+            raise TypeError("service handler marker requires its closed native failure family")
+        super().__init__("Registered session handler raised a service failure")
+        self.original = original
+        self.audit = audit
+        self.tool_call_id = tool_call_id
 
 
 class _ToolBatchCancellationRequested(Exception):
@@ -377,6 +411,8 @@ class _DispatchOutcome:
     # State identity at the start of this dispatch turn.
     pre_state_id: str | None
     authority_revocation: ComposerMutationRevocation | None = None
+    # Native only. A failed continuation cut must refuse this original.
+    service_failure: _ServiceFailure | None = None
 
     def __post_init__(self) -> None:
         # decoded_args_by_call_id is dict[str, dict[str, Any]] at

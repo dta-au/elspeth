@@ -36,6 +36,218 @@ def _mint_units():
     return _units(*{"src/" + key.split(":", 1)[0].replace(".", "/") + ".py" for key in mint.CONTRACTS})
 
 
+@pytest.mark.parametrize("fault", ("expression", "reference", "foreign_store", "foreign_receiver"))
+def test_provider_driver_store_requires_the_actual_assignment_target_after_constructor_rebind(monkeypatch, fault):
+    units = _units()
+    failures, receipt = mint.provider_driver_constructor_contract(units)
+    assert failures == []
+    assert receipt is not None
+    path = "src/elspeth/web/sessions/continuation_driver.py"
+    owner = _definition(units, path, "_SegmentDriver.__init__")
+    stores = [node for node in owner.body if (path, id(node)) in receipt["owner_constructor_stores"]]
+    assert len(stores) == 1
+    store = stores[0]
+    assert isinstance(store, ast.Assign) and len(store.targets) == 1
+    target = store.targets[0]
+    assert isinstance(target, ast.Attribute) and isinstance(target.ctx, ast.Store)
+    assert ast.dump(target) == ast.dump(ast.parse("self.provider = provider").body[0].targets[0])
+    assert ast.dump(target) != ast.dump(ast.parse("self.provider", mode="eval").body)
+    if fault == "expression":
+        owner.body[owner.body.index(store)] = ast.Expr(value=store.value)
+    elif fault == "reference":
+        owner.body[owner.body.index(store)] = ast.Expr(value=ast.parse("self.provider", mode="eval").body)
+    elif fault == "foreign_store":
+        store.targets[0] = ast.parse("self.foreign = provider").body[0].targets[0]
+    else:
+        store.targets[0] = ast.parse("foreign.provider = provider").body[0].targets[0]
+    monkeypatch.setitem(mint.CONTRACTS, mint.DRIVER + ":_SegmentDriver.__init__", ast.unparse(owner))
+    failures, receipt = mint.provider_driver_constructor_contract(units)
+    assert failures == ["provider driver exact work/owner/phase transfer changed"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize("fault", ("freeze-field", "independent-messages", "constructor-prompt"))
+def test_title_value_snapshot_keeps_exact_freeze_alias_and_original_prompt_after_body_rebind(monkeypatch, fault):
+    units = _units()
+    _positive(units)
+    path = "src/elspeth/web/sessions/_auto_title.py"
+    symbol = "prepare_auto_title_request" if fault == "constructor-prompt" else "PreparedAutoTitleRequest"
+    owner = _definition(units, path, symbol)
+    if fault == "freeze-field":
+        call = title._one_call(owner, "freeze_fields")
+        assert call is not None and ast.unparse(call.args[1]) == "'kwargs'"
+        call.args[1] = ast.Constant(value="user_prompt")
+    elif fault == "independent-messages":
+        getter = next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == "audit_messages")
+        result = getter.body[0].value
+        assert ast.unparse(result.args[1]) == "self.kwargs['messages']"
+        result.args[1] = ast.Call(func=ast.Name(id="deep_freeze", ctx=ast.Load()), args=[result.args[1]], keywords=[])
+    else:
+        constructor = title._one_call(owner, "PreparedAutoTitleRequest")
+        assert constructor is not None and ast.unparse(constructor.args[1]) == "user_message"
+        constructor.args[1] = ast.Constant(value="foreign")
+    monkeypatch.setitem(title.CONTRACTS, path + ":" + symbol, ast.unparse(owner))
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: exact prepared value freeze/alias/prompt changed"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "wrapper,target,position,keyword",
+    (
+        ("_chunk", "_chunk_data", 2, None),
+        ("_source_chain", "title_source_chain_data_on_connection", None, "generation"),
+        ("_require_physical", "_require_physical_data", 6, None),
+        ("_require_audit_cohort", "_require_audit_cohort_data", None, "settled"),
+        ("_read_title_result_data_on_connection", "read_title_result_data_on_connection", None, "names"),
+    ),
+)
+def test_title_moved_source_wrappers_keep_exact_original_arguments_after_body_rebind(monkeypatch, wrapper, target, position, keyword):
+    units = _units()
+    _positive(units)
+    owner = _definition(units, title.SQL, wrapper)
+    call = title._one_call(owner, target)
+    assert call is not None
+    if keyword is None:
+        call.args[position] = ast.Name(id="foreign", ctx=ast.Load())
+    else:
+        title._keyword(call, keyword).value = ast.Name(id="foreign", ctx=ast.Load())
+    monkeypatch.setitem(title.CONTRACTS, title.SQL + ":" + wrapper, ast.unparse(owner))
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: exact moved source identity/arguments changed"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "path,symbol,guard",
+    (
+        (title.SQL, "_chunk_data", "codec != ref.codec"),
+        (title.SQL, "title_source_chain_data_on_connection", "physical_ids !="),
+        (title.SQL, "_require_physical_data", "physical_row.lease_token"),
+        (title.SQL, "read_title_result_data_on_connection", "effect.receipt_key"),
+        (title.SQL, "_require_audit_cohort_data", "call.call_id is None"),
+        (title.BOOTSTRAP, "pretitle_recovery_origin_data_on_connection", "previous_attempt.revoked_at"),
+        (title.BOOTSTRAP, "require_pretitle_publication_data_on_connection", "creator.sequence"),
+        (title.BOOTSTRAP, "_require_pretitle_inserted_data_on_connection", "frame.ingress_phase"),
+    ),
+)
+def test_title_moved_source_guards_remain_complete_owned_supplier_bodies(path, symbol, guard):
+    units = _units()
+    _positive(units)
+    owner = _definition(units, path, symbol)
+    guards = [node for node in ast.walk(owner) if isinstance(node, ast.If) and guard in ast.unparse(node.test)]
+    assert len(guards) == 1
+    guards[0].test = ast.Constant(value=False)
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: complete current source contract changed " + path + ":" + symbol]
+    assert receipt is None
+
+
+@pytest.mark.parametrize("fault", ("module", "alias", "binding", "origin_input", "publication_input"))
+def test_title_moved_pretitle_imports_keep_the_actual_local_supplier_after_body_rebind(monkeypatch, fault):
+    units = _units()
+    _positive(units)
+    owner = _definition(units, title.SQL, "title_source_chain_data_on_connection")
+    imports = [
+        node
+        for node in owner.body
+        if isinstance(node, ast.ImportFrom) and node.module == "elspeth.web.sessions.continuation_bootstrap_source"
+    ]
+    assert len(imports) == 1
+    if fault == "module":
+        imports[0].module = "elspeth.web.sessions.foreign_source"
+    elif fault == "alias":
+        imports[0].names[0].asname = "foreign_source"
+    elif fault == "binding":
+        owner.body.insert(2, ast.parse("pretitle_recovery_origin_data_on_connection = foreign_source").body[0])
+    else:
+        target = (
+            "pretitle_recovery_origin_data_on_connection" if fault == "origin_input" else "require_pretitle_publication_data_on_connection"
+        )
+        call = title._one_call(owner, target)
+        assert call is not None
+        title._keyword(call, "selected").value = ast.Name(id="foreign", ctx=ast.Load())
+    monkeypatch.setitem(title.CONTRACTS, title.SQL + ":title_source_chain_data_on_connection", ast.unparse(owner))
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: exact moved source identity/arguments changed"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize(
+    "fault", ("prepare_cap", "descriptor_owner", "constructor_owner", "dispatch_cap", "dispatch_owner", "verify_prompt")
+)
+def test_title_prepared_owner_and_limit_keep_exact_forwarding_after_body_rebind(monkeypatch, fault):
+    units = _units()
+    _positive(units)
+    if fault.startswith("dispatch"):
+        path, symbol, target = title.PRODUCER, title.RUN, "_maybe_auto_title_session_required"
+    elif fault == "verify_prompt":
+        path, symbol, target = title.SQL, "title_input_descriptor", "prepared_input.verify"
+    else:
+        path, symbol = title.SQL, "prepare_title_provider_on_connection"
+        target = {
+            "prepare_cap": "prepare_provider_input",
+            "descriptor_owner": "title_input_descriptor",
+            "constructor_owner": "PreparedTitleProvider",
+        }[fault]
+    owner = _definition(units, path, symbol)
+    call = title._one_call(owner, target)
+    assert call is not None
+    if fault == "constructor_owner":
+        assert ast.unparse(call.args[-1]) == "provider_input"
+        call.args[-1] = ast.Name(id="foreign", ctx=ast.Load())
+    else:
+        keyword = {
+            "prepare_cap": "max_bytes",
+            "descriptor_owner": "prepared_input",
+            "dispatch_cap": "max_prepared_request_bytes",
+            "dispatch_owner": "prepared_input",
+            "verify_prompt": "user_prompt",
+        }[fault]
+        title._keyword(call, keyword).value = ast.Name(id="foreign", ctx=ast.Load())
+    monkeypatch.setitem(title.CONTRACTS, path + ":" + symbol, ast.unparse(owner))
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: original prepared input/cap forwarding changed"]
+    assert receipt is None
+
+
+@pytest.mark.parametrize("fault", ("prepared", "owner", "service", "running", "work", "reorder", "cancel", "frame", "extra"))
+def test_title_actual_driver_keeps_both_owned_transitions_after_body_rebind(monkeypatch, fault):
+    units = _units()
+    _positive(units)
+    owner = _definition(units, title.DRIVER, "_SegmentDriver.advance")
+    run = title._one_call(owner, title.RUN)
+    settle = title._one_call(owner, title.SETTLE)
+    assert run is not None and settle is not None
+    branches = [
+        node for node in ast.walk(owner) if isinstance(node, ast.If) and ast.unparse(node.test) == "top.provider_effect_key is None"
+    ]
+    assert len(branches) == 1
+    branch = branches[0]
+    if fault in {"prepared", "owner"}:
+        title._keyword(run, "prepared" if fault == "prepared" else "invocation_owner").value = ast.Name(id="foreign", ctx=ast.Load())
+    elif fault in {"service", "running", "work"}:
+        title._keyword(settle, "required_work" if fault == "work" else fault).value = ast.Name(id="foreign", ctx=ast.Load())
+    elif fault == "reorder":
+        branch.body.reverse()
+    elif fault == "cancel":
+        awaited = next(node for node in ast.walk(branch) if isinstance(node, ast.Await) and node.value is run)
+        awaited.value = ast.Call(
+            func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="shield", ctx=ast.Load()), args=[run], keywords=[]
+        )
+    elif fault == "frame":
+        initialize = next(
+            node for node in owner.body if isinstance(node, ast.If) and ast.unparse(node.test) == "type(top) is InitializeFrame"
+        )
+        initialize.test = ast.Constant(value=True)
+    else:
+        branch.body.append(ast.parse("await run_prepared_title_provider(prepared=prepared, invocation_owner=self.provider)").body[0])
+    monkeypatch.setitem(title.CONTRACTS, title.DRIVER + ":_SegmentDriver.advance", ast.unparse(owner))
+    failures, receipt = title.title_provider_local_contracts(units)
+    assert failures == ["TITLE transfer: actual driver preparation/owner/settlement join changed"]
+    assert receipt is None
+
+
 def test_title_receipt_binds_actual_reserve_origins_and_all_common_premises():
     units = _units()
     receipt = _positive(units)
@@ -53,7 +265,14 @@ def test_title_receipt_binds_actual_reserve_origins_and_all_common_premises():
         )
     }
     assert receipt["validated_transfer_calls"] == receipt["reserve_calls"]
-    assert receipt["entry_reference_uses"] == frozenset()
+    advance = _definition(units, title.DRIVER, "_SegmentDriver.advance")
+    actual_entries = frozenset(
+        (title.DRIVER, id(node.func))
+        for node in ast.walk(advance)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in {title.RUN, title.SETTLE}
+    )
+    assert len(actual_entries) == 2
+    assert receipt["entry_reference_uses"] == actual_entries
     assert receipt["remaining_premises"]
     assert receipt["validated_supplier_uses"] == frozenset()
     assert receipt["validated_calls"] == frozenset()

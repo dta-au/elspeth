@@ -7,8 +7,8 @@ Capture only records actual live producer outputs; it performs no provider work.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import FrozenInstanceError, dataclass, field
+from typing import TYPE_CHECKING, Any, Self
 
 from sqlalchemy import Connection, select
 
@@ -290,9 +290,23 @@ class _ReadyProducerInputs:
     source: CurrentCompositionInitializationSource
 
 
-@dataclass(frozen=True, slots=True)
 class _FeedbackMessageProvenance:
-    """Original alias/source facts, without allocating an enclosing wire."""
+    """Original live alias/source facts with closed bindings and no enclosing wire copy."""
+
+    __slots__ = (
+        "_sealed",
+        "authoring",
+        "body",
+        "call",
+        "call_id",
+        "invocation",
+        "keys",
+        "message",
+        "outcome",
+        "recipe",
+        "role",
+        "selector",
+    )
 
     message: dict[str, Any]
     recipe: ToolFeedbackMessageRecipe
@@ -305,6 +319,104 @@ class _FeedbackMessageProvenance:
     invocation: ComposerToolInvocation
     authoring: PrivateToolAuthoring
     outcome: _ToolOutcome | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        message: dict[str, object],
+        recipe: ToolFeedbackMessageRecipe,
+        keys: tuple[str, ...],
+        role: str,
+        call_id: str,
+        body: str,
+        selector: tuple[str, str, int, int, str, str],
+        call: _AdmittedToolCall,
+        invocation: ComposerToolInvocation,
+        authoring: PrivateToolAuthoring,
+        outcome: _ToolOutcome | None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        message: dict[str, object],
+        recipe: ToolFeedbackMessageRecipe,
+        keys: tuple[str, ...],
+        role: str,
+        call_id: str,
+        body: str,
+        selector: tuple[str, str, int, int, str, str],
+        call: _AdmittedToolCall,
+        invocation: ComposerToolInvocation,
+        authoring: PrivateToolAuthoring,
+        outcome: _ToolOutcome | None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("_FeedbackMessageProvenance cannot be reinitialized")
+        object.__setattr__(self, "message", message)
+        object.__setattr__(self, "recipe", recipe)
+        object.__setattr__(self, "keys", keys)
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "call_id", call_id)
+        object.__setattr__(self, "body", body)
+        object.__setattr__(self, "selector", selector)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "invocation", invocation)
+        object.__setattr__(self, "authoring", authoring)
+        object.__setattr__(self, "outcome", outcome)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("_FeedbackMessageProvenance bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("_FeedbackMessageProvenance bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not _FeedbackMessageProvenance or type(other) is not _FeedbackMessageProvenance:
+            return NotImplemented
+        return (
+            self.message,
+            self.recipe,
+            self.keys,
+            self.role,
+            self.call_id,
+            self.body,
+            self.selector,
+            self.call,
+            self.invocation,
+            self.authoring,
+            self.outcome,
+        ) == (
+            other.message,
+            other.recipe,
+            other.keys,
+            other.role,
+            other.call_id,
+            other.body,
+            other.selector,
+            other.call,
+            other.invocation,
+            other.authoring,
+            other.outcome,
+        )
+
+    def with_outcome(self, outcome: _ToolOutcome) -> _FeedbackMessageProvenance:
+        return _FeedbackMessageProvenance(
+            self.message,
+            self.recipe,
+            self.keys,
+            self.role,
+            self.call_id,
+            self.body,
+            self.selector,
+            self.call,
+            self.invocation,
+            self.authoring,
+            outcome,
+        )
 
 
 @dataclass(slots=True)
@@ -884,7 +996,7 @@ class CurrentContinuationMessageProducers:
             or sum(item is record.message for item in publication.messages) != 1
         ):
             raise AuditIntegrityError("feedback completion changed or duplicated its original inner source")
-        bound = replace(record, outcome=outcome)
+        bound = record.with_outcome(outcome)
         self._feedback_view(bound)
         self._feedback_produced[index] = bound
 
@@ -1118,9 +1230,19 @@ class CurrentContinuationMessageProducers:
         return restored
 
 
-@dataclass(frozen=True, slots=True)
 class ContinuationToolMessagePublication:
-    """Actual live issued owners for private capture, never a write grant."""
+    """Closed bindings to actual live issued owners for capture, never a write grant."""
+
+    __slots__ = (
+        "_sealed",
+        "batch",
+        "call",
+        "catalog",
+        "completion",
+        "messages",
+        "producers",
+        "recorder",
+    )
 
     producers: CurrentContinuationMessageProducers
     completion: _AdmittedLLMCompletion
@@ -1129,6 +1251,69 @@ class ContinuationToolMessagePublication:
     recorder: BufferingRecorder
     messages: list[dict[str, Any]]
     catalog: PolicyCatalogView
+    _sealed: bool
+
+    def __new__(
+        cls,
+        producers: CurrentContinuationMessageProducers,
+        completion: _AdmittedLLMCompletion,
+        batch: ContinuationBatchState,
+        call: ContinuationCallState,
+        recorder: BufferingRecorder,
+        messages: list[dict[str, object]],
+        catalog: PolicyCatalogView,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        producers: CurrentContinuationMessageProducers,
+        completion: _AdmittedLLMCompletion,
+        batch: ContinuationBatchState,
+        call: ContinuationCallState,
+        recorder: BufferingRecorder,
+        messages: list[dict[str, object]],
+        catalog: PolicyCatalogView,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("ContinuationToolMessagePublication cannot be reinitialized")
+        object.__setattr__(self, "producers", producers)
+        object.__setattr__(self, "completion", completion)
+        object.__setattr__(self, "batch", batch)
+        object.__setattr__(self, "call", call)
+        object.__setattr__(self, "recorder", recorder)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "catalog", catalog)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("ContinuationToolMessagePublication bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("ContinuationToolMessagePublication bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not ContinuationToolMessagePublication or type(other) is not ContinuationToolMessagePublication:
+            return NotImplemented
+        return (
+            self.producers,
+            self.completion,
+            self.batch,
+            self.call,
+            self.recorder,
+            self.messages,
+            self.catalog,
+        ) == (
+            other.producers,
+            other.completion,
+            other.batch,
+            other.call,
+            other.recorder,
+            other.messages,
+            other.catalog,
+        )
 
     def require_call(
         self, *, recorder: BufferingRecorder, audit: DispatchAudit | None, tool_name: str, tool_call_id: str, messages: list[dict[str, Any]]
@@ -1178,16 +1363,59 @@ class ContinuationToolMessagePublication:
         )
 
 
-@dataclass(frozen=True, slots=True)
 class CurrentMessageProduction:
     """Stable membership of actual live messages registered by their owner.
 
-    Deep-freezing the mappings would replace the objects whose identity and
-    complete original wire the producer registry must retain and verify.
+    The original mutable mappings and producer stay strongly referenced: their
+    identity and complete wire remain subject to the existing registry checks.
     """
+
+    __slots__ = (
+        "_sealed",
+        "messages",
+        "producers",
+    )
 
     producers: CurrentContinuationMessageProducers
     messages: tuple[Mapping[str, Any], ...] | None
+    _sealed: bool
+
+    def __new__(
+        cls,
+        producers: CurrentContinuationMessageProducers,
+        messages: tuple[Mapping[str, Any], ...] | None,
+    ) -> Self:
+        owner = object.__new__(cls)
+        object.__setattr__(owner, "_sealed", False)
+        return owner
+
+    def __init__(
+        self,
+        producers: CurrentContinuationMessageProducers,
+        messages: tuple[Mapping[str, Any], ...] | None,
+    ) -> None:
+        if self._sealed:
+            raise FrozenInstanceError("CurrentMessageProduction cannot be reinitialized")
+        object.__setattr__(self, "producers", producers)
+        object.__setattr__(self, "messages", messages)
+        object.__setattr__(self, "_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise FrozenInstanceError("CurrentMessageProduction bindings cannot be reassigned")
+
+    def __delattr__(self, name: str) -> None:
+        raise FrozenInstanceError("CurrentMessageProduction bindings cannot be deleted")
+
+    def __eq__(self, other: object) -> bool:
+        if type(self) is not CurrentMessageProduction or type(other) is not CurrentMessageProduction:
+            return NotImplemented
+        return (
+            self.producers,
+            self.messages,
+        ) == (
+            other.producers,
+            other.messages,
+        )
 
 
 def _produce_current_messages(
