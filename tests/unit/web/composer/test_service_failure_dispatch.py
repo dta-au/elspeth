@@ -17,6 +17,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError
 from elspeth.web.composer import session_tool as session_dispatch
@@ -249,13 +250,18 @@ async def test_completed_result_preserves_declared_discovery_and_unknown_refusal
         result = owner.runtime.graph.batch.batch.tool_outcomes[-1].response
         assert type(result) is tools.ToolResult and result.success is True
         call = owner.runtime.graph.batch.batch.tool_outcomes[-1].call
-        assert rebuild_tool_result_message(call=call, result=result) == owner.runtime.live.llm_messages[-1]
         names = owner.runtime.env_ref_names
         encoded = encode_tool_result_value("get_plugin_schema", result, env_ref_names=names)
         restored = decode_tool_result_value(encoded, pre_state=result.updated_state, env_ref_names=names)
-        assert canonical_json(admit_discovery_result("get_plugin_schema", restored).to_dict()) == canonical_json(
-            admit_discovery_result("get_plugin_schema", result).to_dict()
-        )
+        # The live outcome carries the admitted wire projection; the restored
+        # producer model must re-encode to exactly that live wire.
+        assert admit_discovery_result("get_plugin_schema", restored).response.to_wire() == deep_thaw(result.data)
+        # No rebuilt-message byte check here: production never rebuilds a successful
+        # get_plugin_schema message from retained data. tool_batch.py routes it to
+        # register_schema_message and excludes it from register_tool_result_message,
+        # and restore re-executes the tool (continuation_prompt_producers._schema_message).
+        # Retained data_json is canonical JSON, so it proves meaning, not the
+        # producer's json_schema key order.
         with pytest.raises(FrameworkBugError, match="Successful discovery response has no data"):
             encode_tool_result_value("get_plugin_schema", replace(result, data=None), env_ref_names=names)
         with pytest.raises(FrameworkBugError, match="Successful discovery response has no data"):

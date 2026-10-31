@@ -51,6 +51,7 @@ from elspeth.web.composer.continuation_tool_batch import (
     _decode_validation,
     _read_json_value,
     _response_contract,
+    _retained_discovery_result,
     _state_from_tool_json,
     _validation_json,
     encode_tool_result_value,
@@ -286,7 +287,10 @@ def _joint(
             # Select the actual nominal response owner before projecting JSON;
             # ToolResult.to_dict() may still contain PluginSchemaInfo/models.
             envelope = (
-                admit_discovery_result(outcome.call.function.name, response).to_dict()
+                admit_discovery_result(
+                    outcome.call.function.name,
+                    _retained_discovery_result(outcome.call.function.name, response, env_ref_names=env_ref_names),
+                ).to_dict()
                 if _response_contract(outcome.call.function.name) is not None
                 else response.to_dict()
             )

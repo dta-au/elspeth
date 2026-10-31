@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationError
@@ -129,6 +130,19 @@ def _response_contract(tool_name: str) -> ResponseContract | None:
         raise AuditIntegrityError("tool continuation result has no registered tool") from error
 
 
+def _retained_discovery_result(tool_name: str, result: ToolResult, *, env_ref_names: frozenset[str]) -> ToolResult:
+    """Restore a live plugin-schema outcome to its producer model before re-admission.
+
+    A live batch outcome holds ``AdmittedDiscoveryResult.to_tool_result()``,
+    whose data is the admitted wire projection frozen by ``ToolResult``. The
+    plugin-schema contract admits only its producer model, so restore it from
+    that wire exactly as ``decode_tool_result_value`` restores retained data.
+    """
+    if _response_contract(tool_name) is PLUGIN_SCHEMA_RESPONSE_CONTRACT and result.success and type(result.data) is MappingProxyType:
+        return replace(result, data=restore_retained_plugin_schema_data(deep_thaw(result.data), env_ref_names=env_ref_names))
+    return result
+
+
 def encode_tool_result_value(
     tool_name: str,
     result: ToolResult,
@@ -141,7 +155,7 @@ def encode_tool_result_value(
     _state_from_tool_json(state_json, env_ref_names=env_ref_names)
     contract = _response_contract(tool_name)
     if contract is not None:
-        admitted = admit_discovery_result(tool_name, result)
+        admitted = admit_discovery_result(tool_name, _retained_discovery_result(tool_name, result, env_ref_names=env_ref_names))
         data = None if admitted.response is None else admitted.response.to_wire()
     else:
         data = None if result.data is None else owned_json(_normalize_audit_payload(deep_thaw(result.data)))
