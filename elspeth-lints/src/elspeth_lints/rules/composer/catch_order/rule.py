@@ -19,6 +19,7 @@ _SUBCLASS_TO_SUPERCLASSES: dict[str, frozenset[str]] = {
     "ComposerAdmissionRefused": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerMutationAuthorityRevoked": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "CredentialMaterialRefused": frozenset({"ComposerAdmissionRefused", "ComposerServiceError"}) | _BROAD_SUPERTYPES,
+    "ComposerContextUnsupported": frozenset({"ComposerAdmissionRefused", "ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerPluginCrashError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerConvergenceError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
     "ComposerRuntimePreflightError": frozenset({"ComposerServiceError"}) | _BROAD_SUPERTYPES,
