@@ -1078,6 +1078,84 @@ def verify_recovery_on_connection(conn: Connection, receipt: ComposerSegmentReco
             raise AuditIntegrityError("handover did not release its physical fence")
 
 
+def validate_lost_continuation_on_connection(conn: Connection, *, session_id: str, operation_id: str) -> tuple[str, ...]:
+    """Check retained DATA under the recovery writer's original ownership proof.
+
+    This grants no running context or replay allowance. A dead owner's exact
+    attempt/fence/liveness is proved by the transaction owner before this read.
+    All selected private bytes and SQL effect bindings remain integrity checks,
+    including when Stop selects terminal disposition without a successor.
+    """
+    from elspeth.web.composer.continuation_next_action import (
+        next_continuation_action_policy,
+        validate_continuation_structure_data_on_connection,
+    )
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
+    from elspeth.web.sessions.models import sessions_table, user_secrets_table
+
+    stored = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+    stack = decode_continuation_snapshot(stored.payload_json)
+    decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+    private = load_snapshot_private_data_on_connection(conn, session_id=session_id, operation_id=operation_id, selected=stored)
+    selected = SelectedContinuationState(stored.checkpoint_id, stack, private)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == session_id, jobs.c.operation_id == operation_id)).one()
+    session = conn.execute(select(sessions_table).where(sessions_table.c.id == session_id)).one()
+    if (
+        parent.actor_user_id != session.user_id
+        or parent.kind != stack.logical.kind
+        or parent.request_hash != stack.logical.request_hash
+        or parent.base_state_id != stack.logical.base_state_id
+    ):
+        raise AuditIntegrityError("lost continuation changed its original principal/logical binding")
+    names = frozenset(
+        conn.execute(
+            select(user_secrets_table.c.name).where(
+                user_secrets_table.c.user_id == session.user_id,
+                user_secrets_table.c.auth_provider_type == session.auth_provider_type,
+            )
+        ).scalars()
+    )
+    top = stack.frames[-1]
+    if (
+        session.archived_at is not None
+        and type(top) is InitializeFrame
+        and (top.provider_effect_key is not None or top.title_response is not None)
+    ):
+        segment = conn.execute(
+            select(segments).where(
+                segments.c.session_id == session_id,
+                segments.c.operation_id == operation_id,
+                segments.c.sequence == parent.current_segment_sequence,
+            )
+        ).one()
+        if segment.state == "interrupted":
+            from elspeth.web.sessions.continuation_title_provider import validate_unclaimed_title_recovery_data_on_connection
+
+            validate_unclaimed_title_recovery_data_on_connection(
+                conn,
+                session_id=UUID(session_id),
+                operation_id=operation_id,
+                sequence=parent.current_segment_sequence,
+                generation=parent.ownership_generation,
+                selected=stored,
+                names=names,
+            )
+            next_continuation_action_policy(
+                selected=selected, policy=decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+            )
+            return tuple(entry.effect_id for entry in stack.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
+    return validate_continuation_structure_data_on_connection(
+        conn,
+        session_id=UUID(session_id),
+        operation_id=operation_id,
+        sequence=parent.current_segment_sequence,
+        generation=parent.ownership_generation,
+        selected=selected,
+        env_ref_names=names,
+    )
+
+
 def settle_segment_on_connection(
     conn: Connection,
     *,

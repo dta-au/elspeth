@@ -13,7 +13,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
@@ -208,9 +208,20 @@ if TYPE_CHECKING:
         ComposerSegmentStartObservation,
         ComposerSegmentYieldReceipt,
     )
+    from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
 
 _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
+
+
+@dataclass(frozen=True, slots=True)
+class _UnavailableComposerSegment:
+    parent: Row[Any]
+    segment: Row[Any]
+    history: Row[Any]
+    fence: Row[Any]
+    now: datetime
+    archived: bool
 
 
 class _ForkMutationConnectionResolver(Protocol):
@@ -5040,8 +5051,6 @@ class _SessionOperationAuthorityRepository:
         releases another physical fence or fabricates a current context.
         """
         from elspeth.web.sessions.continuation import recover_segment_on_connection
-        from elspeth.web.sessions.models import composer_operation_segments_table as segments
-        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 
         if type(session_id) is not UUID or type(operation_id) is not str or str(UUID(operation_id)) != operation_id:
             raise ValueError("recovery requires canonical logical operation identities")
@@ -5050,74 +5059,343 @@ class _SessionOperationAuthorityRepository:
         if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
             raise ValueError("auth_provider_type must name a browser authentication provider")
         with self._locked_transaction(str(session_id)) as conn:
-            _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
-            parent = conn.execute(
-                select(composer_async_operations_table).where(
-                    composer_async_operations_table.c.session_id == str(session_id),
-                    composer_async_operations_table.c.operation_id == operation_id,
-                    composer_async_operations_table.c.lifecycle_version == 2,
-                )
-            ).one_or_none()
-            if (
-                parent is None
-                or parent.status not in ("queued", "running")
-                or parent.ownership_generation != expected_generation
-                or parent.actor_user_id != actor_user_id
-            ):
+            unavailable = self._unavailable_composer_segment_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                expected_generation=expected_generation,
+                actor_user_id=actor_user_id,
+                auth_provider_type=auth_provider_type,
+            )
+            if unavailable is None:
                 return False
-            segment = conn.execute(
-                select(segments).where(
-                    segments.c.session_id == str(session_id),
-                    segments.c.operation_id == operation_id,
-                    segments.c.sequence == parent.current_segment_sequence,
-                )
-            ).one_or_none()
-            if segment is None or segment.state != "running" or segment.generation != expected_generation:
-                return False
-            history = conn.execute(
-                select(attempts).where(
-                    attempts.c.session_id == str(session_id),
-                    attempts.c.operation_id == operation_id,
-                    attempts.c.sequence == segment.sequence,
-                    attempts.c.generation == expected_generation,
-                )
-            ).one_or_none()
-            if (
-                history is None
-                or history.revoked_at is not None
-                or history.outcome is not None
-                or history.claim_attempt != parent.attempt
-                or history.session_operation_id != segment.session_operation_id
-                or history.session_operation_epoch != segment.session_operation_epoch
-                or history.session_operation_lease_token != segment.session_operation_lease_token
-                or history.owner_instance_id != segment.claim_owner_instance_id
-            ):
-                raise AuditIntegrityError("continuation recovery lost its exact immutable attempt")
-            now = self._database_now(conn)
-            fence = self._select_fence(conn, session_id=str(session_id))
-            if (
-                fence is None
-                or fence.operation_kind != SessionOperationKind.COMPOSE.value
-                or fence.operation_id != history.session_operation_id
-                or fence.operation_epoch != history.session_operation_epoch
-                or fence.lease_token != history.session_operation_lease_token
-                or fence.owner_instance_id != history.owner_instance_id
-            ):
-                raise AuditIntegrityError("continuation recovery lost its actual previous physical fence")
-            if fence.released_at is None:
-                if _ensure_utc(fence.lease_expires_at) > now:
-                    return False
-                if self._expired_owner_allows_takeover(conn, owner_instance_id=fence.owner_instance_id, database_now=now) is not True:
-                    return False
             recover_segment_on_connection(
                 conn,
                 session_id=str(session_id),
                 operation_id=operation_id,
+                parent=unavailable.parent,
+                segment=unavailable.segment,
+                history=unavailable.history,
+                now=unavailable.now,
+                next_eligible_at=unavailable.now,
+            )
+            return True
+
+    def _unavailable_composer_segment_on_connection(
+        self,
+        conn: Connection,
+        *,
+        session_id: UUID,
+        operation_id: str,
+        expected_generation: int,
+        actor_user_id: str,
+        auth_provider_type: str,
+        candidate: ContinuationRecoveryCandidate | None = None,
+    ) -> _UnavailableComposerSegment | None:
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if candidate is None:
+            _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
+        session = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id)).with_for_update()).one_or_none()
+        if session is None or session.user_id != actor_user_id or session.auth_provider_type != auth_provider_type:
+            return None
+        parent = conn.execute(
+            select(composer_async_operations_table).where(
+                composer_async_operations_table.c.session_id == str(session_id),
+                composer_async_operations_table.c.operation_id == operation_id,
+                composer_async_operations_table.c.lifecycle_version == 2,
+            )
+        ).one_or_none()
+        if (
+            parent is None
+            or parent.status not in ("queued", "running")
+            or parent.ownership_generation != expected_generation
+            or parent.actor_user_id != actor_user_id
+        ):
+            return None
+        segment = conn.execute(
+            select(segments).where(
+                segments.c.session_id == str(session_id),
+                segments.c.operation_id == operation_id,
+                segments.c.sequence == parent.current_segment_sequence,
+            )
+        ).one_or_none()
+        if segment is None or segment.state != "running" or segment.generation != expected_generation:
+            return None
+        history = conn.execute(
+            select(attempts).where(
+                attempts.c.session_id == str(session_id),
+                attempts.c.operation_id == operation_id,
+                attempts.c.sequence == segment.sequence,
+                attempts.c.generation == expected_generation,
+            )
+        ).one_or_none()
+        fence = self._select_fence(conn, session_id=str(session_id))
+        if candidate is not None and (
+            parent.checkpoint_id != candidate.checkpoint_id
+            or parent.attempt != candidate.claim_attempt
+            or segment.sequence != candidate.segment_sequence
+            or segment.checkpoint_id != candidate.segment_checkpoint_id
+            or history is None
+            or history.session_operation_id != candidate.session_operation_id
+            or history.session_operation_epoch != candidate.session_operation_epoch
+            or history.session_operation_lease_token != candidate.session_operation_lease_token
+            or history.owner_instance_id != candidate.owner_instance_id
+            or fence is None
+            or fence.operation_id != candidate.session_operation_id
+            or fence.operation_epoch != candidate.session_operation_epoch
+            or fence.lease_token != candidate.session_operation_lease_token
+            or fence.owner_instance_id != candidate.owner_instance_id
+        ):
+            return None
+        if candidate is not None:
+            from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
+
+            head = conn.execute(
+                select(checkpoints.c.cursor).where(
+                    checkpoints.c.session_id == str(session_id),
+                    checkpoints.c.operation_id == operation_id,
+                    checkpoints.c.checkpoint_id == candidate.checkpoint_id,
+                )
+            ).scalar_one_or_none()
+            entry = conn.execute(
+                select(checkpoints.c.cursor).where(
+                    checkpoints.c.session_id == str(session_id),
+                    checkpoints.c.operation_id == operation_id,
+                    checkpoints.c.checkpoint_id == candidate.segment_checkpoint_id,
+                )
+            ).scalar_one_or_none()
+            if head is None or entry is None or head != parent.journal_cursor or entry > head:
+                return None
+        if (
+            history is None
+            or history.revoked_at is not None
+            or history.outcome is not None
+            or history.claim_attempt != parent.attempt
+            or history.session_operation_id != segment.session_operation_id
+            or history.session_operation_epoch != segment.session_operation_epoch
+            or history.session_operation_lease_token != segment.session_operation_lease_token
+            or history.owner_instance_id != segment.claim_owner_instance_id
+        ):
+            raise AuditIntegrityError("continuation recovery lost its exact immutable attempt")
+        if (
+            fence is None
+            or fence.operation_kind != SessionOperationKind.COMPOSE.value
+            or fence.operation_id != history.session_operation_id
+            or fence.operation_epoch != history.session_operation_epoch
+            or fence.lease_token != history.session_operation_lease_token
+            or fence.owner_instance_id != history.owner_instance_id
+        ):
+            raise AuditIntegrityError("continuation recovery lost its actual previous physical fence")
+        now = self._database_now(conn)
+        if fence.released_at is None and (
+            _ensure_utc(fence.lease_expires_at) > now
+            or self._expired_owner_allows_takeover(conn, owner_instance_id=fence.owner_instance_id, database_now=now) is not True
+        ):
+            return None
+        return _UnavailableComposerSegment(parent, segment, history, fence, now, session.archived_at is not None)
+
+    def reconcile_unavailable_composer_segment(
+        self,
+        candidate: ContinuationRecoveryCandidate,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> Literal["recovered", "settled", "unchanged"]:
+        """Reprove advisory discovery and decide Stop/recovery under one lock."""
+        from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
+        from elspeth.web.sessions.composer_operation_errors import request_cancelled_error, worker_lost_error
+        from elspeth.web.sessions.continuation import (
+            recover_segment_on_connection,
+            settle_segment_on_connection,
+            validate_lost_continuation_on_connection,
+        )
+        from elspeth.web.sessions.continuation_recovery_candidates import ContinuationRecoveryCandidate
+
+        if type(candidate) is not ContinuationRecoveryCandidate:
+            raise TypeError("continuation reconciliation requires its nominal discovery observation")
+        if (
+            type(candidate.session_id) is not UUID
+            or type(candidate.operation_id) is not str
+            or str(UUID(candidate.operation_id)) != candidate.operation_id
+            or type(candidate.expected_generation) is not int
+            or candidate.expected_generation < 1
+            or type(candidate.segment_sequence) is not int
+            or candidate.segment_sequence < 1
+            or type(candidate.claim_attempt) is not int
+            or candidate.claim_attempt < 1
+        ):
+            raise ValueError("continuation reconciliation requires exact positive original identities")
+        _validate_owner(owner_instance_id)
+        _validate_lease_seconds(lease_seconds)
+        if (
+            type(auth_provider_type) is not str
+            or candidate.auth_provider_type != auth_provider_type
+            or auth_provider_type not in get_args(AuthProviderType)
+        ):
+            raise ValueError("continuation recovery must retain the configured authentication provider")
+        with self._locked_transaction(str(candidate.session_id)) as conn:
+            old = self._unavailable_composer_segment_on_connection(
+                conn,
+                session_id=candidate.session_id,
+                operation_id=candidate.operation_id,
+                expected_generation=candidate.expected_generation,
+                actor_user_id=candidate.actor_user_id,
+                auth_provider_type=auth_provider_type,
+                candidate=candidate,
+            )
+            if old is None:
+                return "unchanged"
+            validate_lost_continuation_on_connection(conn, session_id=str(candidate.session_id), operation_id=candidate.operation_id)
+            if old.parent.cancel_requested_at is None and not old.archived:
+                try:
+                    recover_segment_on_connection(
+                        conn,
+                        session_id=str(candidate.session_id),
+                        operation_id=candidate.operation_id,
+                        parent=old.parent,
+                        segment=old.segment,
+                        history=old.history,
+                        now=old.now,
+                        next_eligible_at=old.now,
+                    )
+                except ContinuationCutNotResumable:
+                    pass
+                else:
+                    return "recovered"
+            outcome = (
+                request_cancelled_error(request_id=old.parent.request_id)
+                if old.parent.cancel_requested_at is not None
+                else worker_lost_error(request_id=old.parent.request_id)
+            )
+            context = (
+                None
+                if old.archived
+                else self._advance_exclusive_fence_on_connection(
+                    conn,
+                    session_id_text=str(candidate.session_id),
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=owner_instance_id,
+                    lease_seconds=lease_seconds,
+                    composer_operation_id=candidate.operation_id,
+                )
+            )
+            settle_segment_on_connection(
+                conn,
+                session_id=str(candidate.session_id),
+                operation_id=candidate.operation_id,
+                parent=old.parent,
+                segment=old.segment,
+                history=old.history,
+                outcome=outcome,
+                settled_by="settle_lost_inactive_session" if old.archived else "settle_lost",
+                attempt_outcome="interrupted",
+                now=old.now,
+            )
+            if context is not None:
+                self._release_fence_on_connection(conn, context, database_now=self._database_now(conn))
+            return "settled"
+
+    def settle_lost_inactive_continuation(self, candidate: ContinuationInactiveCandidate, *, auth_provider_type: str) -> bool:
+        """Settle an archived non-running segment without advancing its fence."""
+        from elspeth.web.sessions.composer_operation_errors import request_cancelled_error, worker_lost_error
+        from elspeth.web.sessions.continuation import settle_segment_on_connection, validate_lost_continuation_on_connection
+        from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate
+        from elspeth.web.sessions.models import composer_operation_segments_table as segments
+        from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
+
+        if type(candidate) is not ContinuationInactiveCandidate:
+            raise TypeError("inactive settlement requires its nominal discovery observation")
+        if (
+            type(candidate.session_id) is not UUID
+            or type(candidate.operation_id) is not str
+            or str(UUID(candidate.operation_id)) != candidate.operation_id
+            or type(candidate.expected_generation) is not int
+            or candidate.expected_generation < 1
+            or type(candidate.segment_sequence) is not int
+            or candidate.segment_sequence < 1
+            or type(candidate.claim_attempt) is not int
+            or candidate.claim_attempt < 0
+        ):
+            raise ValueError("inactive settlement requires exact original identities")
+        if (
+            type(auth_provider_type) is not str
+            or candidate.auth_provider_type != auth_provider_type
+            or auth_provider_type not in get_args(AuthProviderType)
+        ):
+            raise ValueError("inactive settlement must retain the configured authentication provider")
+        sid = str(candidate.session_id)
+        with self._locked_transaction(sid) as conn:
+            session = conn.execute(select(sessions_table).where(sessions_table.c.id == sid).with_for_update()).one_or_none()
+            if (
+                session is None
+                or session.archived_at is None
+                or session.user_id != candidate.actor_user_id
+                or session.auth_provider_type != auth_provider_type
+            ):
+                return False
+            parent = conn.execute(
+                select(composer_async_operations_table).where(
+                    composer_async_operations_table.c.session_id == sid,
+                    composer_async_operations_table.c.operation_id == candidate.operation_id,
+                )
+            ).one_or_none()
+            segment = conn.execute(
+                select(segments).where(
+                    segments.c.session_id == sid,
+                    segments.c.operation_id == candidate.operation_id,
+                    segments.c.sequence == candidate.segment_sequence,
+                )
+            ).one_or_none()
+            now = self._database_now(conn)
+            if (
+                parent is None
+                or segment is None
+                or parent.lifecycle_version != 2
+                or parent.status not in ("queued", "running")
+                or parent.actor_user_id != candidate.actor_user_id
+                or parent.current_segment_sequence != candidate.segment_sequence
+                or parent.ownership_generation != candidate.expected_generation
+                or segment.generation != candidate.expected_generation
+                or parent.checkpoint_id != candidate.checkpoint_id
+                or segment.checkpoint_id != candidate.checkpoint_id
+                or parent.attempt != candidate.claim_attempt
+                or segment.state not in ("queued", "interrupted")
+                or segment.claim_token != candidate.claim_token
+                or segment.claim_owner_instance_id != candidate.claim_owner_instance_id
+                or (None if segment.claim_expires_at is None else _ensure_utc(segment.claim_expires_at)) != candidate.claim_expires_at
+                or (segment.claim_expires_at is not None and _ensure_utc(segment.claim_expires_at) > now)
+            ):
+                return False
+            history = conn.execute(
+                select(attempts).where(
+                    attempts.c.session_id == sid,
+                    attempts.c.operation_id == candidate.operation_id,
+                    attempts.c.sequence == candidate.segment_sequence,
+                    attempts.c.generation == candidate.expected_generation,
+                )
+            ).one_or_none()
+            if history is not None and (history.revoked_at is None or history.outcome is None):
+                raise AuditIntegrityError("inactive non-running segment retains an unrevoked attempt")
+            validate_lost_continuation_on_connection(conn, session_id=sid, operation_id=candidate.operation_id)
+            outcome = (
+                request_cancelled_error(request_id=parent.request_id)
+                if parent.cancel_requested_at is not None
+                else worker_lost_error(request_id=parent.request_id)
+            )
+            settle_segment_on_connection(
+                conn,
+                session_id=sid,
+                operation_id=candidate.operation_id,
                 parent=parent,
                 segment=segment,
-                history=history,
+                history=None,
+                outcome=outcome,
+                settled_by="settle_lost_inactive_session",
+                attempt_outcome="interrupted",
                 now=now,
-                next_eligible_at=now,
             )
             return True
 

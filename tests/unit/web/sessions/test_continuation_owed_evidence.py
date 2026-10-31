@@ -7,10 +7,11 @@ from hashlib import sha256
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
+from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.continuation import EffectFrontierEntry, RetainedOwnerResultRef, ToolBatchFrame
 from elspeth.web.composer.continuation_audit_buffer import encode_recorder_snapshot
 from elspeth.web.composer.continuation_batch_data import RestoredBatchData, encode_coupled_batch_chunk
@@ -25,11 +26,14 @@ from elspeth.web.composer.continuation_p4_batch import encode_p4_pending_batch_c
 from elspeth.web.composer.continuation_prepared_p4 import encode_prepared_p4, prepared_p4_members
 from elspeth.web.composer.continuation_selection import load_selected_continuation
 from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
+from elspeth.web.composer.withheld_replies import withheld_reply_envelope
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, private_chunk_key, put_chunk
+from elspeth.web.sessions.continuation_p4 import retain_p4_result_on_connection
 from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import chat_messages_table as chat_messages
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
@@ -38,9 +42,89 @@ from tests.helpers.continuation_inventory import inventory_advisor, inventory_wo
 from tests.unit.web.composer.test_transcript_blob_reader import current_service
 from tests.unit.web.coordination import test_composer_operation_authority
 from tests.unit.web.sessions.test_continuation_evidence_restore import stored_evidence, stored_rows
-from tests.unit.web.sessions.test_continuation_p4_owner import completed_cut, persist, recovered, rows
+from tests.unit.web.sessions.test_continuation_p4_owner import completed_cut, recovered, rows
 
 operation_store = test_composer_operation_authority.operation_store
+
+
+def persist_retained_library_cut(service, running, prepared, commit):
+    """Real business rows and low-level retention, deliberately before application.
+
+    Normal continuation persistence retains and applies atomically. These owed
+    reader tests exercise the separate retained DATA library seam: the ordinary
+    writer produces the real business result, then the actual immutable audit
+    cohort and retention primitive bind that result to the prepared P4 input.
+    No production application is disabled or reported complete.
+    """
+    members = prepared_p4_members(prepared)
+    sid = str(running.claim.session_id)
+    outcome = service.persist_compose_turn(
+        session_id=sid,
+        writer_principal="compose_loop",
+        session_operation_context=running.session_operation_context,
+        assistant_content=prepared.assistant_content,
+        raw_content=prepared.raw_content,
+        redacted_assistant_tool_calls=members.redacted_calls,
+        redacted_tool_rows=members.redacted_rows,
+        revoked_tool_rows=members.revoked_rows,
+        mutation_ceiling=members.mutation_ceiling,
+        authority_revocation=members.authority_revocation,
+        private_tool_evidence=members.private_tool_evidence,
+        private_tool_failures=members.private_tool_failures,
+        rejection_records=members.rejection_records,
+        parent_composition_state_id=prepared.parent_composition_state_id,
+        expected_current_state_id=prepared.expected_current_state_id,
+        plugin_crash_pending=prepared.crash_pending,
+    )
+    assert not outcome.unwind_audit_failed and outcome.assistant_id is not None
+    with locked_session_transaction(service._engine, sid) as conn, service._session_write_lock(conn, sid):
+        assistant = conn.execute(
+            select(chat_messages).where(
+                chat_messages.c.session_id == sid,
+                chat_messages.c.id == outcome.assistant_id,
+            )
+        ).one()
+        drafts = []
+        revoked = {
+            row.tool_call_id
+            for row in members.redacted_rows
+            if outcome.authority_revocation is not None and row.composition_state_payload is not None
+        }
+        for invocation in members.invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(
+                invocation,
+                authority_revoked=invocation.tool_call_id in revoked,
+            )
+            drafts.append((content, envelope))
+        drafts.extend((reply.content, withheld_reply_envelope(reply.origin, reply.content)) for reply in members.withheld_replies)
+        if drafts:
+            first = service._reserve_sequence_range(conn, sid, count=len(drafts))
+            assert first == assistant.sequence_no + 1 + 2 * len(outcome.published_tool_rows) + len(members.private_tool_failures)
+            for offset, (content, envelope) in enumerate(drafts):
+                service._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role="audit",
+                    content=content,
+                    raw_content=None,
+                    tool_calls=[envelope],
+                    sequence_no=first + offset,
+                    writer_principal="compose_loop",
+                    composition_state_id=outcome.current_state_id,
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                    created_at=assistant.created_at,
+                    session_operation_context=running.session_operation_context,
+                )
+        retain_p4_result_on_connection(
+            conn,
+            commit,
+            prepared=prepared,
+            outcome=outcome,
+            base_sequence=assistant.sequence_no,
+            created_at=assistant.created_at,
+        )
+    return outcome
 
 
 async def committed_evidence_case(
@@ -174,7 +258,7 @@ async def committed_evidence_case(
         pending_batch=pending,
     )
     if persist_result:
-        await asyncio.to_thread(persist, service, running, prepared, commit)
+        await asyncio.to_thread(persist_retained_library_cut, service, running, prepared, commit)
     selected_work = inventory_work(running)
     selected = await load_selected_continuation(
         authority=authority,

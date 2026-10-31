@@ -9,6 +9,7 @@ Other phase owners remain explicit refusals until their real producers exist.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from sqlalchemy import Connection, select
 
@@ -43,28 +44,62 @@ def validate_continuation_structure_on_connection(
     exception-to-allowance conversion. Reuse the original graph/input/receipt
     readers; a matching effect label alone cannot validate corrupted DATA.
     """
+    from elspeth.web.sessions.continuation import _require_current_continuation_running
+
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    return validate_continuation_structure_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        generation=running.claim.ownership_generation,
+        selected=selected,
+        env_ref_names=env_ref_names,
+    )
+
+
+def validate_continuation_structure_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: SelectedContinuationState,
+    env_ref_names: frozenset[str],
+) -> tuple[str, ...]:
+    """Same complete immutable admission under an independently proved SQL lock.
+
+    IDs identify retained DATA only. This function grants no live custody,
+    provider dispatch, filesystem use or mutation authority.
+    """
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
-    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_data_on_connection
     from elspeth.web.composer.continuation_prepared_p4 import p4_semantic_input
     from elspeth.web.composer.continuation_tool_batch import _read_json_value
-    from elspeth.web.sessions.continuation import _require_current_continuation_running, load_snapshot
-    from elspeth.web.sessions.continuation_p4 import _selected_prepared, read_p4_result_on_connection
-    from elspeth.web.sessions.continuation_primary import _selected_effect, _stored_input
-    from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
-    from elspeth.web.sessions.continuation_title_provider import _source_chain
+    from elspeth.web.sessions.continuation import load_snapshot
+    from elspeth.web.sessions.continuation_p4 import read_pending_p4_data_on_connection, selected_prepared_p4_data_on_connection
+    from elspeth.web.sessions.continuation_primary import (
+        selected_primary_effect_data_on_connection,
+        stored_primary_input_data_on_connection,
+    )
+    from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
+    from elspeth.web.sessions.continuation_title_provider import validate_title_source_data_on_connection
     from elspeth.web.sessions.models import composer_continuation_effects_table as effects
 
     if type(selected) is not SelectedContinuationState or type(env_ref_names) is not frozenset:
         raise TypeError("structural admission requires its actual selected DATA and source names")
     selected.__post_init__()
-    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
     root = selected.stack
+    if (root.logical.session_id, root.logical.operation_id) != (str(session_id), operation_id):
+        raise AuditIntegrityError("structural admission changed its logical SQL identity")
     stored = load_snapshot(conn, session_id=root.logical.session_id, operation_id=root.logical.operation_id)
     if (
         stored.checkpoint_id != selected.checkpoint_id
         or stored.payload_json != encode_continuation_snapshot(root)
-        or load_selected_private_chunks_on_connection(conn, running, stored) != selected.chunks
+        or load_snapshot_private_data_on_connection(conn, session_id=str(session_id), operation_id=operation_id, selected=stored)
+        != selected.chunks
     ):
         raise AuditIntegrityError("structural admission changed its actual full selected root")
     actual = conn.execute(
@@ -76,10 +111,31 @@ def validate_continuation_structure_on_connection(
         raise AuditIntegrityError("structural admission lost its exact SQL effect frontier")
     ambiguous = tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("prepared", "dispatched", "unknown"))
     top = root.frames[-1]
-    if type(top) is InitializeFrame and top.provider_effect_key is not None:
+    if type(top) is InitializeFrame and (top.provider_effect_key is not None or top.title_response is not None):
         # Includes original bootstrap, every stage/recovery event, descriptor,
         # frontier and the original physical provider/accounting cohort.
-        _source_chain(conn, running, stored, names=env_ref_names)
+        if top.ingress_phase == "ready":
+            from elspeth.web.sessions.continuation_title_application import read_applied_title_ready_immutable_data_on_connection
+
+            read_applied_title_ready_immutable_data_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                sequence=sequence,
+                generation=generation,
+                selected=stored,
+                names=env_ref_names,
+            )
+        else:
+            validate_title_source_data_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                sequence=sequence,
+                generation=generation,
+                selected=stored,
+                names=env_ref_names,
+            )
         policy = decode_continuation_policy(root.admission_policy_json, root.policy_hash)
         next_continuation_action_policy(selected=selected, policy=policy)
         return tuple(entry.effect_id for entry in root.effect_frontier if entry.disposition in ("dispatched", "unknown"))
@@ -89,14 +145,20 @@ def validate_continuation_structure_on_connection(
         # The existing reader proves full shared evidence/recorder/messages,
         # original actor/base/ingress, selected batch and prior receipts. DATA
         # stays source-admitted through the real AdmittedTurnEvidence flow.
-        admitted = read_selected_turn_evidence_graph_on_connection(conn, running, selected=selected, names=env_ref_names)
+        admitted = read_selected_turn_evidence_graph_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, selected=selected, names=env_ref_names
+        )
         if admitted.snapshot.application_entry is not None:
-            from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_on_connection
+            from elspeth.web.sessions.continuation_p4_application_store import require_p4_application_journal_data_on_connection
 
-            require_p4_application_journal_on_connection(conn, running, selected=selected, evidence=admitted, env_ref_names=env_ref_names)
-    from elspeth.web.composer.continuation_phase_transitions import validate_tool_effects_on_connection
+            require_p4_application_journal_data_on_connection(
+                conn, session_id=session_id, operation_id=operation_id, selected=selected, evidence=admitted, env_ref_names=env_ref_names
+            )
+    from elspeth.web.composer.continuation_phase_transitions import validate_tool_effects_data_on_connection
 
-    tool_unresolved = validate_tool_effects_on_connection(conn, running, selected=selected, env_ref_names=env_ref_names)
+    tool_unresolved = validate_tool_effects_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, env_ref_names=env_ref_names
+    )
     if type(top) is ToolBatchFrame and top.accumulator.codec == "composer.tool-batch.v1" and tool_unresolved:
         from elspeth.web.composer.continuation_batch_data import decode_prepared_batch_data
 
@@ -130,19 +192,22 @@ def validate_continuation_structure_on_connection(
             or ambiguous != (top.provider_effect_key,)
         ):
             raise AuditIntegrityError("structural admission lost the closed in-flight PRIMARY shape")
-        _stored, _root, frame, effect = _selected_effect(
+        _stored, _root, frame, effect = selected_primary_effect_data_on_connection(
             conn,
-            running,
+            session_id=session_id,
+            operation_id=operation_id,
             checkpoint_id=stored.checkpoint_id,
             cursor=stored.cursor,
             effect_key=top.provider_effect_key,
             input_sha256=top.provider_input_sha256,
         )
-        _stored_input(conn, running, effect, frame)
+        stored_primary_input_data_on_connection(conn, session_id=session_id, operation_id=operation_id, effect=effect, frame=frame)
         return ambiguous
     if type(top) is ToolBatchFrame and top.accumulator.codec == "composer.p4-pending-batch.v1":
         key = f"batch:{top.response.digest}:p4"
-        prepared = _selected_prepared(conn, stored, running=running, effect_key=key, env_ref_names=env_ref_names)
+        prepared = selected_prepared_p4_data_on_connection(
+            conn, stored, session_id=session_id, operation_id=operation_id, effect_key=key, env_ref_names=env_ref_names
+        )
         matching = tuple(row for row in actual if row.effect_key == key)
         if len(matching) != 1 or top.phase != "effect_reconciling" or root.pending_settlement_ids:
             raise AuditIntegrityError("structural admission lost the selected P4 effect/pending cut")
@@ -156,9 +221,10 @@ def validate_continuation_structure_on_connection(
             if set(ambiguous) != {key, *tool_unresolved} or root.pending_owner_results or effect.receipt_key is not None:
                 raise AuditIntegrityError("structural admission mixed unresolved P4 and another frontier")
             return ambiguous
-        read_p4_result_on_connection(
+        read_pending_p4_data_on_connection(
             conn,
-            running,
+            session_id=session_id,
+            operation_id=operation_id,
             expected_checkpoint_id=stored.checkpoint_id,
             expected_cursor=stored.cursor,
             effect_key=key,

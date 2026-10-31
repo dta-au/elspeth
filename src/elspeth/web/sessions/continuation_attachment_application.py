@@ -7,6 +7,7 @@ Historical application DATA and old inspections never authorize another read.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from sqlalchemy import Connection, select
 
@@ -65,7 +66,6 @@ from elspeth.web.sessions.continuation_attachment_result import (
     _chunk,
     _selected,
     read_attachment_result_on_connection,
-    verify_attachment_result_source_on_connection,
 )
 from elspeth.web.sessions.continuation_selection import load_private_chunks
 from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
@@ -95,28 +95,50 @@ def load_attachment_history_sources_on_connection(
     names: frozenset[str],
 ) -> AttachmentHistorySources:
     """Resolve closed original dependencies on the caller's physical read."""
-    from elspeth.web.sessions.continuation_p4_application_store import _private_chunk_on_connection
+    return load_attachment_history_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        names=names,
+    )
+
+
+def load_attachment_history_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    names: frozenset[str],
+) -> AttachmentHistorySources:
+    """Closed immutable dependencies; this identity grants no filesystem use."""
+    from elspeth.web.sessions.continuation_p4_application_store import _private_chunk_for_operation_on_connection
 
     compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
         raise AuditIntegrityError("attachment history lost its exact selected Compose owner")
     actual = _chunk(selected, compose[0].attachment_admissions)
-    if _text(conn, running, private_chunk_key(actual)) != actual.canonical:
+    if _text_data(conn, session_id, operation_id, private_chunk_key(actual)) != actual.canonical:
         raise AuditIntegrityError("attachment history differs from its original SQL bytes")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    sid, operation = str(session_id), operation_id
     fields = decode_attachment_history_fields(actual, session_id=sid, operation_id=operation, env_ref_names=names)
     # Preserve every occurrence and its physical work. There is no new ticket,
     # budget reset or reference deduplication before a conflicting length check.
-    chunks = tuple(_private_chunk_on_connection(conn, running, ref) for ref in attachment_history_dependencies(fields))
+    chunks = tuple(
+        _private_chunk_for_operation_on_connection(conn, session_id, operation_id, ref) for ref in attachment_history_dependencies(fields)
+    )
     history = decode_attachment_history(actual, session_id=sid, operation_id=operation, env_ref_names=names, source_chunks=chunks)
     return AttachmentHistorySources(history, chunks)
 
 
 def _text(conn: Connection, running: ComposerOperationRunning, key: str) -> str:
+    return _text_data(conn, running.claim.session_id, running.claim.operation_id, key)
+
+
+def _text_data(conn: Connection, session_id: UUID, operation_id: str, key: str) -> str:
     try:
-        return read_chunk(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=key).decode(
-            "utf-8", errors="strict"
-        )
+        return read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=key).decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise AuditIntegrityError("attachment application storage is not strict UTF-8") from error
 
@@ -139,7 +161,15 @@ def _event(value: AttachmentApplicationData) -> str:
 def _historical_source(
     conn: Connection, running: ComposerOperationRunning, value: AttachmentApplicationData, *, names: frozenset[str]
 ) -> tuple[SelectedContinuationState, AttachmentResultCheckpoint]:
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    return _historical_source_data(conn, running.claim.session_id, running.claim.operation_id, value, names=names)
+
+
+def _historical_source_data(
+    conn: Connection, session_id: UUID, operation_id: str, value: AttachmentApplicationData, *, names: frozenset[str]
+) -> tuple[SelectedContinuationState, AttachmentResultCheckpoint]:
+    from elspeth.web.sessions.continuation_attachment_result import verify_attachment_result_data_on_connection
+
+    sid, operation = str(session_id), operation_id
     row = conn.execute(
         select(checkpoints).where(
             checkpoints.c.session_id == sid,
@@ -149,7 +179,7 @@ def _historical_source(
     ).one_or_none()
     if row is None or row.cursor != value.source_cursor or row.kind != "transition":
         raise AuditIntegrityError("attachment application lost its actual predecessor checkpoint")
-    text = _text(conn, running, row.snapshot_chunk_key)
+    text = _text_data(conn, session_id, operation_id, row.snapshot_chunk_key)
     if text != value.source_snapshot_json:
         raise AuditIntegrityError("attachment application changed its complete original SQL root")
     root = decode_continuation_snapshot(text)
@@ -157,7 +187,9 @@ def _historical_source(
     selected = SelectedContinuationState(
         row.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
     )
-    original = verify_attachment_result_source_on_connection(conn, running, selected=selected, snapshot=stored, env_ref_names=names)
+    original = verify_attachment_result_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, snapshot=stored, env_ref_names=names
+    )
     frame = root.frames[-1]
     if type(frame) is not ToolBatchFrame or not original.history_applied:
         raise AuditIntegrityError("attachment application lacks its actual consumed-history predecessor")
@@ -359,14 +391,36 @@ def require_attachment_applications_on_connection(
     env_ref_names: frozenset[str],
 ) -> AttachmentHistorySources:
     """Reprove complete historical DATA and return this read's original cohort."""
+    return require_attachment_applications_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        evidence=evidence,
+        env_ref_names=env_ref_names,
+    )
+
+
+def require_attachment_applications_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    evidence: AdmittedTurnEvidence,
+    env_ref_names: frozenset[str],
+) -> AttachmentHistorySources:
+    """Immutable application/receipt sources after the caller's SQL proof."""
     compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
         raise AuditIntegrityError("attachment history requires its exact current Compose owner")
     ref = compose[0].attachment_admissions
     actual = _chunk(selected, ref)
-    if _text(conn, running, private_chunk_key(actual)) != actual.canonical:
+    if _text_data(conn, session_id, operation_id, private_chunk_key(actual)) != actual.canonical:
         raise AuditIntegrityError("attachment history differs from its actual current SQL bytes")
-    sources = load_attachment_history_sources_on_connection(conn, running, selected=selected, names=env_ref_names)
+    sources = load_attachment_history_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, names=env_ref_names
+    )
     history = sources.history
     # An absent portable entry must not erase a real completed application.
     # Inspection-only published reads legitimately have no application event.
@@ -374,13 +428,13 @@ def require_attachment_applications_on_connection(
     for stored_event in conn.execute(
         select(events)
         .where(
-            events.c.session_id == str(running.claim.session_id),
-            events.c.operation_id == running.claim.operation_id,
+            events.c.session_id == str(session_id),
+            events.c.operation_id == operation_id,
             events.c.sequence <= selected.stack.cursor,
         )
         .order_by(events.c.sequence)
     ):
-        event_text = _text(conn, running, stored_event.payload_chunk_key)
+        event_text = _text_data(conn, session_id, operation_id, stored_event.payload_chunk_key)
         event_value, event_error = parse_json_strict(event_text)
         if event_error is not None:
             raise AuditIntegrityError("attachment application encountered invalid owned event JSON")
@@ -396,7 +450,7 @@ def require_attachment_applications_on_connection(
         if not previous_cursor < value.source_cursor < selected.stack.cursor:
             raise AuditIntegrityError("attachment applications changed their actual historical order")
         previous_cursor = value.source_cursor
-        old, _original = _historical_source(conn, running, value, names=env_ref_names)
+        old, _original = _historical_source_data(conn, session_id, operation_id, value, names=env_ref_names)
         if (
             old.stack.logical != selected.stack.logical
             or old.stack.mutation_ceiling != selected.stack.mutation_ceiling
@@ -405,7 +459,7 @@ def require_attachment_applications_on_connection(
         ):
             raise AuditIntegrityError("attachment application crossed its original logical policy/ceiling")
         _require_before(old, value, names=env_ref_names)
-        sid, operation = str(running.claim.session_id), running.claim.operation_id
+        sid, operation = str(session_id), operation_id
         event = conn.execute(
             select(events).where(
                 events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == value.source_cursor + 1
@@ -419,18 +473,20 @@ def require_attachment_applications_on_connection(
         if (
             event is None
             or event.tag != "checkpoint"
-            or _text(conn, running, event.payload_chunk_key) != _event(value)
+            or _text_data(conn, session_id, operation_id, event.payload_chunk_key) != _event(value)
             or following is None
         ):
             raise AuditIntegrityError("attachment application lost its actual atomic successor/event")
-        following_text = _text(conn, running, following.snapshot_chunk_key)
+        following_text = _text_data(conn, session_id, operation_id, following.snapshot_chunk_key)
         following_root = decode_continuation_snapshot(following_text)
         following_selected = SelectedContinuationState(
             following.checkpoint_id,
             following_root,
             load_private_chunks(conn, session_id=sid, operation_id=operation, stack=following_root),
         )
-        prior_sources = load_attachment_history_sources_on_connection(conn, running, selected=old, names=env_ref_names)
+        prior_sources = load_attachment_history_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, selected=old, names=env_ref_names
+        )
         original_sources = (*prior_sources.chunks, *old.chunks, *following_selected.chunks)
         admit_attachment_application(value, env_ref_names=env_ref_names, source_chunks=original_sources)
         expected, _cohort = _after_root(old, value, names=env_ref_names, source_chunks=original_sources, history=prior_sources.history)

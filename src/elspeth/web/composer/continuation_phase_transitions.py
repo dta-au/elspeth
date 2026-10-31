@@ -8,6 +8,7 @@ session lock used by Stop, after rechecking the complete selected predecessor.
 from __future__ import annotations
 
 from typing import Literal
+from uuid import UUID
 
 from pydantic import Field
 from sqlalchemy import Connection, insert, select, update
@@ -78,7 +79,20 @@ def read_tool_issue_source_on_connection(
     call must agree. A caller's live frontier or a later marker is insufficient.
     """
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    return read_tool_issue_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        effect_key=effect_key,
+        env_ref_names=env_ref_names,
+    )
+
+
+def read_tool_issue_data_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str, env_ref_names: frozenset[str]
+) -> ToolIssueSource:
+    """Immutable issue DATA after the caller's exact SQL ownership proof."""
+    sid, operation = str(session_id), operation_id
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == effect_key)
     ).one_or_none()
@@ -164,7 +178,7 @@ def read_tool_issue_source_on_connection(
         != (EffectFrontierEntry(effect_id=effect_key, disposition="dispatched", receipt_id=None),)
     ):
         raise AuditIntegrityError("tool issue changed its actual prepared checkpoint")
-    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_on_connection
+    from elspeth.web.composer.continuation_evidence_restore import read_selected_turn_evidence_graph_data_on_connection
     from elspeth.web.sessions.continuation_selection import load_private_chunks
 
     # The immutable dispatch source includes the entire admitted graph, rather
@@ -173,7 +187,9 @@ def read_tool_issue_source_on_connection(
     issued = SelectedContinuationState(
         checkpoint.checkpoint_id, root, load_private_chunks(conn, session_id=sid, operation_id=operation, stack=root)
     )
-    read_selected_turn_evidence_graph_on_connection(conn, running, selected=issued, names=env_ref_names)
+    read_selected_turn_evidence_graph_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=issued, names=env_ref_names
+    )
     encoded = read_chunk(conn, session_id=sid, operation_id=operation, key=f"value:{issue.prepared.codec}:{issue.prepared.digest}").decode(
         "utf-8", errors="strict"
     )
@@ -200,14 +216,39 @@ def validate_tool_effects_on_connection(
     env_ref_names: frozenset[str],
 ) -> tuple[str, ...]:
     """Prove each actual tool issue/result before classifying an open effect."""
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    return validate_tool_effects_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        env_ref_names=env_ref_names,
+    )
+
+
+def validate_tool_effects_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    env_ref_names: frozenset[str],
+) -> tuple[str, ...]:
+    """Immutable source checks without granting a dispatch or live context."""
+    from elspeth.web.sessions.continuation_primary import read_committed_primary_response_data_on_connection
+
+    sid, operation = str(session_id), operation_id
     rows = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.owner == "tool_dispatch")
     ).all()
     unresolved: list[str] = []
     for effect in rows:
-        issue = read_tool_issue_source_on_connection(conn, running, effect_key=effect.effect_key, env_ref_names=env_ref_names)
-        read_committed_primary_response_for_settlement_on_connection(conn, running, selected=selected, reference=issue.response)
+        issue = read_tool_issue_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, effect_key=effect.effect_key, env_ref_names=env_ref_names
+        )
+        read_committed_primary_response_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, selected=selected, reference=issue.response
+        )
         if effect.disposition in ("dispatched", "unknown"):
             if effect.receipt_key is not None or effect.result_chunk_key is not None:
                 raise AuditIntegrityError("unresolved tool effect carries a counterfeit committed result")

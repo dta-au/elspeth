@@ -48,7 +48,7 @@ function failureOutcome(value: unknown, sessionId: string): ComposerOperationFai
   const code = failureCode(record.failure_code);
   const diagnostic = record.diagnostic_id === null ? null : canonicalUuid(record.diagnostic_id);
   if ((code === "operation_failed") !== (diagnostic !== null)) throw new ComposerOperationDecodeError("Invalid diagnostic binding");
-  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked"];
+  const categories: readonly ComposerOperationPublicFailureType[] = ["request_cancelled", "composer_operation_deadline_expired", "composer_operation_worker_lost", "operation_failed", "audit_integrity_error", "database_unavailable", "executor_unavailable", "storage_unavailable", "stale_compose_state", "fingerprint_key_missing", "secret_decryption_failed", "composer_mutation_authority_revoked"];
   const category = record.error_type === null ? null : categories.find((item) => item === record.error_type);
   if (category === undefined) throw new ComposerOperationDecodeError("Unknown public failure category");
   const requestId = record.request_id === null ? null : text(record.request_id);

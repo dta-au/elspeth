@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+from uuid import UUID
 
 from pydantic import Field, ValidationError
 from sqlalchemy import Connection, select
@@ -143,9 +144,29 @@ def _pretitle_recovery_origin(
     their current running/CAS checks. Each step must be the real recovery
     producer's exact event, interrupted attempt pair and unchanged root bytes.
     """
+    return pretitle_recovery_origin_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        selected=selected,
+        generation=generation,
+    )
+
+
+def pretitle_recovery_origin_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    selected: StoredContinuationSnapshot,
+    generation: int | None,
+) -> tuple[StoredContinuationSnapshot, int]:
+    """Immutable exact recovery lineage; IDs grant no current authorization."""
     if type(generation) is not int or generation < 1:
         raise AuditIntegrityError("pre-title recovery lost its actual generation")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    sid, operation = str(session_id), operation_id
     current = selected
     while True:
         actual = _pretitle_checkpoint_at_cursor(conn, session_id=sid, operation_id=operation, cursor=current.cursor)
@@ -165,7 +186,7 @@ def _pretitle_recovery_origin(
         except UnicodeDecodeError as error:
             raise AuditIntegrityError("pre-title recovery event is not strict UTF-8") from error
         expected_event = canonical_json(
-            {"version": 2, "same_sequence": running.claim.segment_sequence, "previous_generation": generation - 1, "generation": generation}
+            {"version": 2, "same_sequence": sequence, "previous_generation": generation - 1, "generation": generation}
         )
         if event_text != expected_event:
             raise AuditIntegrityError("pre-title recovery changed its exact claim-rebinding event")
@@ -173,7 +194,7 @@ def _pretitle_recovery_origin(
             select(attempts).where(
                 attempts.c.session_id == sid,
                 attempts.c.operation_id == operation,
-                attempts.c.sequence == running.claim.segment_sequence,
+                attempts.c.sequence == sequence,
                 attempts.c.generation == generation - 1,
             )
         ).one_or_none()
@@ -181,7 +202,7 @@ def _pretitle_recovery_origin(
             select(attempts).where(
                 attempts.c.session_id == sid,
                 attempts.c.operation_id == operation,
-                attempts.c.sequence == running.claim.segment_sequence,
+                attempts.c.sequence == sequence,
                 attempts.c.generation == generation,
             )
         ).one_or_none()
@@ -211,7 +232,28 @@ def require_pretitle_inserted_origin(
     *,
     generation: int | None,
 ) -> None:
-    origin, _generation = _pretitle_recovery_origin(conn, running, selected, generation=generation)
+    _require_pretitle_inserted_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        selected=selected,
+        generation=generation,
+    )
+
+
+def _require_pretitle_inserted_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    selected: StoredContinuationSnapshot,
+    generation: int | None,
+) -> None:
+    origin, _generation = pretitle_recovery_origin_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, sequence=sequence, selected=selected, generation=generation
+    )
     frame = decode_continuation_snapshot(origin.payload_json).frames[0]
     if (
         type(frame) is not InitializeFrame
@@ -405,13 +447,37 @@ def require_pretitle_publication_lineage_on_connection(
     generation: int,
 ) -> None:
     """Verify historical publication DATA; this does not admit a current action."""
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    require_pretitle_publication_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        selected=selected,
+        chunk=chunk,
+        generation=generation,
+    )
+
+
+def require_pretitle_publication_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    selected: StoredContinuationSnapshot,
+    chunk: PrivateChunk,
+    generation: int,
+) -> None:
+    """Original publication and source bytes after the caller's SQL proof."""
+    sid, operation = str(session_id), operation_id
     root = decode_continuation_snapshot(selected.payload_json)
     frame = root.frames[0]
     if len(root.frames) != 1 or type(frame) is not InitializeFrame or frame.bootstrap != chunk.reference:
         raise AuditIntegrityError("pre-title lineage lost its complete actual anchor")
     snapshot = decode_continuation_bootstrap(chunk)
-    published, publication_generation = _pretitle_recovery_origin(conn, running, selected, generation=generation)
+    published, publication_generation = pretitle_recovery_origin_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, sequence=sequence, selected=selected, generation=generation
+    )
     event = conn.execute(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == published.cursor)
     ).one_or_none()
@@ -456,7 +522,7 @@ def require_pretitle_publication_lineage_on_connection(
         predecessor is None
         or predecessor.cursor != publication.source_cursor
         or creator is None
-        or creator.sequence != running.claim.segment_sequence
+        or creator.sequence != sequence
         or creator.generation != publication_generation
     ):
         raise AuditIntegrityError("pre-title bootstrap lost its original predecessor/creator lineage")
@@ -471,10 +537,12 @@ def require_pretitle_publication_lineage_on_connection(
     )
     if previous_text != encode_continuation_snapshot(expected_before):
         raise AuditIntegrityError("pre-title bootstrap changed its complete actual inserted predecessor")
-    require_pretitle_inserted_origin(
+    _require_pretitle_inserted_data_on_connection(
         conn,
-        running,
-        StoredContinuationSnapshot(previous_text, predecessor.cursor, predecessor.checkpoint_id),
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        selected=StoredContinuationSnapshot(previous_text, predecessor.cursor, predecessor.checkpoint_id),
         generation=publication_generation,
     )
 

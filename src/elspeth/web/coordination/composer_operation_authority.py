@@ -128,6 +128,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_p4 import ReadmittedP4Result
     from elspeth.web.sessions.continuation_p4_application_store import StoredP4Application
     from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
+    from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
     from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
 
@@ -1817,6 +1818,16 @@ class ComposerAsyncOperationAuthority:
             if settled is None:
                 raise AuditIntegrityError("settled operation missing")
             return _record_from_row(settled)
+
+    def list_recoverable_segments(self, *, limit: int) -> tuple[ContinuationRecoveryCandidate, ...]:
+        from elspeth.web.sessions.continuation_recovery_candidates import list_recoverable_segments
+
+        return list_recoverable_segments(self._engine, limit=limit)
+
+    def list_inactive_continuations(self, *, limit: int) -> tuple[ContinuationInactiveCandidate, ...]:
+        from elspeth.web.sessions.continuation_recovery_candidates import list_inactive_continuations
+
+        return list_inactive_continuations(self._engine, limit=limit)
 
     def list_expired_queued(self, *, limit: int) -> tuple[ComposerOperationRecord, ...]:
         _bounded(limit)

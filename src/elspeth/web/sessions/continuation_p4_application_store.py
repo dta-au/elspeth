@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
 from sqlalchemy import Connection, select
 
@@ -101,12 +102,18 @@ def apply_committing_p4_application_on_connection(
 
 
 def _private_chunk_on_connection(conn: Connection, running: ComposerOperationRunning, reference: PrivateChunkRef) -> PrivateChunk:
+    return _private_chunk_for_operation_on_connection(conn, running.claim.session_id, running.claim.operation_id, reference)
+
+
+def _private_chunk_for_operation_on_connection(
+    conn: Connection, session_id: UUID, operation_id: str, reference: PrivateChunkRef
+) -> PrivateChunk:
     if not 0 <= reference.byte_length <= CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES:
         raise AuditIntegrityError("application dependency exceeds its original complete document bound")
     payload = read_private_chunk(
         conn,
-        session_id=str(running.claim.session_id),
-        operation_id=running.claim.operation_id,
+        session_id=str(session_id),
+        operation_id=operation_id,
         reference=reference,
     )
     if len(payload) > CONTINUATION_PRIVATE_DOCUMENT_MAX_UTF8_BYTES or len(payload) != reference.byte_length:
@@ -135,6 +142,32 @@ def require_p4_application_journal_on_connection(
     env_ref_names: frozenset[str],
 ) -> None:
     """Re-read and recompute every retained application after current admission."""
+    require_p4_application_journal_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        evidence=evidence,
+        env_ref_names=env_ref_names,
+    )
+
+
+def require_p4_application_journal_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    evidence: AdmittedTurnEvidence,
+    env_ref_names: frozenset[str],
+) -> None:
+    """Immutable application DATA checks after the caller's actual SQL proof.
+
+    The identity grants no live read/write authority. Both current readers and
+    unavailable-owner recovery reprove their own admission before calling.
+    """
+    if (str(session_id), operation_id) != (selected.stack.logical.session_id, selected.stack.logical.operation_id):
+        raise AuditIntegrityError("application journal changed its logical SQL identity")
     admitted = require_admitted_turn_evidence(evidence, env_ref_names=env_ref_names)
     snapshot = admitted.snapshot
     entry = snapshot.application_entry
@@ -153,8 +186,10 @@ def require_p4_application_journal_on_connection(
     if type(current_batch) is ToolBatchFrame:
         if current_batch.next_tool_index != graph.selected.batch.next_tool_index:
             raise AuditIntegrityError("application journal changed its selected tool cursor")
-        actual_batch = _private_chunk_on_connection(conn, running, current_batch.accumulator)
-        response = decode_continuation_response(_private_chunk_on_connection(conn, running, current_batch.response))
+        actual_batch = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, current_batch.accumulator)
+        response = decode_continuation_response(
+            _private_chunk_for_operation_on_connection(conn, session_id, operation_id, current_batch.response)
+        )
         if response.tool_batch.calls != graph.selected.calls:
             raise AuditIntegrityError("application journal changed its selected response calls")
         if graph.selected.batch.phase == "complete":
@@ -177,7 +212,7 @@ def require_p4_application_journal_on_connection(
             require_selected_active_batch_graph(selected, evidence, env_ref_names=env_ref_names)
         else:
             raise AuditIntegrityError("application journal has no supported selected batch cut")
-    sid, operation_id = str(running.claim.session_id), running.claim.operation_id
+    sid = str(session_id)
     for index, record in enumerate(entry.applications):
         effect = conn.execute(
             select(effects).where(
@@ -209,10 +244,10 @@ def require_p4_application_journal_on_connection(
             or creator.session_operation_epoch != record.creator_operation_epoch
         ):
             raise AuditIntegrityError("application journal changed its actual original producer")
-        result_chunk = _private_chunk_on_connection(conn, running, record.result)
-        pending_chunk = _private_chunk_on_connection(conn, running, record.pending_batch)
-        response_chunk = _private_chunk_on_connection(conn, running, record.response)
-        prepared_chunk = _private_chunk_on_connection(conn, running, record.prepared_input)
+        result_chunk = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, record.result)
+        pending_chunk = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, record.pending_batch)
+        response_chunk = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, record.response)
+        prepared_chunk = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, record.prepared_input)
         if (
             result_chunk != admitted.sources.chunk(record.result)
             or pending_chunk != admitted.sources.chunk(record.pending_batch)
@@ -233,7 +268,7 @@ def require_p4_application_journal_on_connection(
         receipt, outcome = decode_p4_receipt(result_chunk.canonical, env_ref_names=env_ref_names)
         result = verify_p4_immutable_receipt_on_connection(
             conn,
-            session_id=running.claim.session_id,
+            session_id=session_id,
             operation_id=operation_id,
             effect_key=record.effect_key,
             input_sha256=effect.input_sha256,
@@ -285,9 +320,9 @@ def require_p4_application_journal_on_connection(
             or len(old_compose) != 1
         ):
             raise AuditIntegrityError("application predecessor changed its selected frame inputs")
-        original_audit = _private_chunk_on_connection(conn, running, old_compose[0].audit_buffer)
+        original_audit = _private_chunk_for_operation_on_connection(conn, session_id, operation_id, old_compose[0].audit_buffer)
         before_admitted = decode_turn_evidence(
-            _private_chunk_on_connection(conn, running, old_compose[0].evidence),
+            _private_chunk_for_operation_on_connection(conn, session_id, operation_id, old_compose[0].evidence),
             env_ref_names=env_ref_names,
             source_chunks=(original_audit, *admitted.sources.chunks),
         )

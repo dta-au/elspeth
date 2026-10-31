@@ -341,8 +341,30 @@ def _selected_prepared(
     effect_key: str,
     env_ref_names: frozenset[str],
 ) -> PreparedP4Value:
-    sid, operation_id = str(running.claim.session_id), running.claim.operation_id
+    return selected_prepared_p4_data_on_connection(
+        conn,
+        stored,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        effect_key=effect_key,
+        env_ref_names=env_ref_names,
+    )
+
+
+def selected_prepared_p4_data_on_connection(
+    conn: Connection,
+    stored: StoredContinuationSnapshot,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    effect_key: str,
+    env_ref_names: frozenset[str],
+) -> PreparedP4Value:
+    """Immutable selected writer input; the caller separately proves admission."""
+    sid = str(session_id)
     stack = decode_continuation_snapshot(stored.payload_json)
+    if (stack.logical.session_id, stack.logical.operation_id) != (sid, operation_id):
+        raise AuditIntegrityError("P4 selected input changed its logical SQL identity")
     frame = stack.frames[-1]
     if type(frame) is not ToolBatchFrame or effect_key != f"batch:{frame.response.digest}:p4":
         raise AuditIntegrityError("P4 owner lost its exact selected batch/effect")
@@ -736,7 +758,29 @@ def read_p4_result_on_connection(
     env_ref_names: frozenset[str] = frozenset(),
 ) -> ReadmittedP4Result:
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
-    sid, operation_id = str(running.claim.session_id), running.claim.operation_id
+    return read_pending_p4_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        expected_checkpoint_id=expected_checkpoint_id,
+        expected_cursor=expected_cursor,
+        effect_key=effect_key,
+        env_ref_names=env_ref_names,
+    )
+
+
+def read_pending_p4_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    expected_checkpoint_id: str,
+    expected_cursor: int,
+    effect_key: str,
+    env_ref_names: frozenset[str],
+) -> ReadmittedP4Result:
+    """Original committed pending result DATA after the caller's SQL proof."""
+    sid = str(session_id)
     stored = require_snapshot_cas(
         conn, session_id=sid, operation_id=operation_id, expected_checkpoint_id=expected_checkpoint_id, expected_cursor=expected_cursor
     )
@@ -753,10 +797,12 @@ def read_p4_result_on_connection(
     encoded = read_chunk(conn, session_id=sid, operation_id=operation_id, key=effect.result_chunk_key).decode("utf-8", errors="strict")
     verify_private_chunk(ref, encoded)
     receipt, data = decode_p4_receipt(encoded, env_ref_names=env_ref_names)
-    selected = _selected_prepared(conn, stored, running=running, effect_key=effect_key, env_ref_names=env_ref_names)
+    selected = selected_prepared_p4_data_on_connection(
+        conn, stored, session_id=session_id, operation_id=operation_id, effect_key=effect_key, env_ref_names=env_ref_names
+    )
     return verify_p4_immutable_receipt_on_connection(
         conn,
-        session_id=running.claim.session_id,
+        session_id=session_id,
         operation_id=operation_id,
         effect_key=effect_key,
         input_sha256=effect.input_sha256,

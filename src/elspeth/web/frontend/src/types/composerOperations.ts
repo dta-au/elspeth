@@ -18,7 +18,7 @@ export type SessionCustody = Readonly<{ foreground: OperationCustody | null; unr
 /** protocolVersion is the server's echoed Composer-Operation-Version (missing echo: 1). */
 export interface ComposerOperationAck { operation_id: string; kind: OperationKind; status: OperationStatus; poll_after_ms: number; protocolVersion?: ComposerProtocolVersion }
 export interface ComposerOperationError { http_status: number; body: Record<string, unknown>; error_type: string | null; failure_code: "http_error" | "operation_failed" | "worker_lost" | "request_cancelled" | "deadline_expired"; diagnostic_id: string | null }
-export type ComposerOperationPublicFailureType = "request_cancelled" | "composer_operation_deadline_expired" | "composer_operation_worker_lost" | "operation_failed" | "audit_integrity_error" | "database_unavailable" | "storage_unavailable" | "stale_compose_state" | "fingerprint_key_missing" | "secret_decryption_failed" | "composer_mutation_authority_revoked";
+export type ComposerOperationPublicFailureType = "request_cancelled" | "composer_operation_deadline_expired" | "composer_operation_worker_lost" | "operation_failed" | "audit_integrity_error" | "database_unavailable" | "executor_unavailable" | "storage_unavailable" | "stale_compose_state" | "fingerprint_key_missing" | "secret_decryption_failed" | "composer_mutation_authority_revoked";
 export interface ComposerOperationSavedRevisions {
   attribution: "fenced" | "unstarted" | "unavailable";
   count: number | null;

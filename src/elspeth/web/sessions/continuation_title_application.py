@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+from uuid import UUID
 
 from pydantic import Field, ValidationError
 from sqlalchemy import Connection, select
@@ -33,11 +34,11 @@ from elspeth.web.sessions.continuation import (
     load_snapshot,
     read_chunk,
 )
-from elspeth.web.sessions.continuation_bootstrap_source import _pretitle_checkpoint_at_cursor, _pretitle_recovery_origin
+from elspeth.web.sessions.continuation_bootstrap_source import _pretitle_checkpoint_at_cursor, pretitle_recovery_origin_data_on_connection
 from elspeth.web.sessions.continuation_title_provider import (
-    _read_title_result_data_on_connection,
-    _require_audit_cohort,
+    _require_audit_cohort_data,
     _timing,
+    read_title_result_data_on_connection,
     require_title_creator,
 )
 from elspeth.web.sessions.models import composer_continuation_events_table as events
@@ -165,10 +166,42 @@ def _settled_source(
 ) -> tuple[PrivateChunk, DecodedTitleProviderResult]:
     # No current authority is inferred here. Callers first admit the actual
     # current root and prove the complete historical forward transition.
-    chunk, result, settled = _read_title_result_data_on_connection(conn, running, selected=selected, names=names, generation=generation)
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("TITLE source changed its original logical request/actor/eligibility")
+    return _settled_source_data(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        generation=running.claim.ownership_generation if generation is None else generation,
+        selected=selected,
+        names=names,
+    )
+
+
+def _settled_source_data(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> tuple[PrivateChunk, DecodedTitleProviderResult]:
+    chunk, result, settled = read_title_result_data_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+    )
     if not settled or decode_continuation_snapshot(selected.payload_json).pending_settlement_ids:
         raise AuditIntegrityError("TITLE application cannot consume unsettled accounting")
-    _require_audit_cohort(conn, running, result.audit_call, result.audit_drafts, settled=True)
+    _require_audit_cohort_data(conn, session_id, result.audit_call, result.audit_drafts, settled=True)
     return chunk, result
 
 
@@ -221,10 +254,42 @@ def read_applied_title_ready_data_on_connection(
     Initial Compose replay may consume this exact historical ready predecessor
     while the complete physical/effect cohort is still TITLE-only.
     """
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("TITLE source changed its original logical request/actor/eligibility")
+    return read_applied_title_ready_immutable_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+    )
+
+
+def read_applied_title_ready_immutable_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> tuple[PrivateChunk, TitleApplicationDecision, TitleApplicationEvent]:
+    """Actual ready event and paid source; no current business grant is issued."""
     if _frame(selected).ingress_phase != "ready":
         raise AuditIntegrityError("historical TITLE application has no actual ready predecessor")
-    origin, generation = _pretitle_recovery_origin(conn, running, selected, generation=generation)
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    origin, generation = pretitle_recovery_origin_data_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+    )
+    sid, operation = str(session_id), operation_id
     row = conn.execute(
         select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == origin.cursor)
     ).one_or_none()
@@ -244,7 +309,7 @@ def read_applied_title_ready_data_on_connection(
     if (
         text != canonical_json(event.model_dump(mode="json"))
         or event.predecessor_cursor + 1 != origin.cursor
-        or event.creator_sequence != running.claim.segment_sequence
+        or event.creator_sequence != sequence
         or event.creator_generation != generation
     ):
         raise AuditIntegrityError("TITLE ready changed its complete application creator/event")
@@ -267,7 +332,15 @@ def read_applied_title_ready_data_on_connection(
         event.creator_operation_epoch,
     ):
         raise AuditIntegrityError("TITLE ready lost its original application writer source")
-    chunk, result = _settled_source(conn, running, previous, names, generation)
+    chunk, result = _settled_source_data(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=previous,
+        names=names,
+    )
     decision = title_application_decision(result)
     if (
         event.result != chunk.reference

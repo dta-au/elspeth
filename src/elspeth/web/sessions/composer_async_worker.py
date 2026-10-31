@@ -73,6 +73,7 @@ from elspeth.web.sessions.composer_turn import (
 )
 from elspeth.web.sessions.continuation import ComposerSegmentStartObservation
 from elspeth.web.sessions.continuation_driver import run_continuation_segment
+from elspeth.web.sessions.continuation_recovery import reap_continuations_once
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 from elspeth.web.sessions.routes._helpers import composer_request_lifecycle
 from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
@@ -1017,12 +1018,18 @@ class ComposerAsyncWorker:
                             observation=observation,
                             budget_anchor=anchor,
                         )
+                        if type(terminal) is not ComposerOperationRecord:
+                            raise AuditIntegrityError("Owned composer turn returned without a nominal terminal receipt")
+                        # Retain the actual return before timeout/watcher
+                        # cleanup can fail; the outer owner still proves it
+                        # against its exact running authority and SQL readback.
+                        settlement.terminal_receipt = terminal
                     if turn_ticket is not None:
                         turn_ticket.complete_owned()
                 except BaseException as exc:
                     if turn_ticket is not None:
                         turn_ticket.complete_owned(exc)
-                    if _terminal_completion_unknown(exc):
+                    if _terminal_completion_unknown(exc) or settlement.terminal_receipt is not None:
                         raise
                     failure = _owned_deadline_failure(exc, timeout_scope=timeout_scope, record=record, anchor=anchor)
                     if watcher is not None:
@@ -1616,7 +1623,7 @@ class ComposerAsyncWorker:
 
     async def reap_once(self) -> int:
         services = composer_app_services(self._app)
-        count = 0
+        count = await reap_continuations_once(self)
         queued = await _owned(run_sync_in_worker(self._authority.list_expired_queued, limit=self._concurrency))
         for record in queued:
             failure = (

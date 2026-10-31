@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import Connection, Row, insert, select, update
 
@@ -176,11 +177,24 @@ def _history(
     compose: ComposeFrame,
     names: frozenset[str],
 ) -> ContinuationAttachmentHistory:
-    from elspeth.web.sessions.continuation_attachment_application import load_attachment_history_sources_on_connection
+    return _history_data(conn, running.claim.session_id, running.claim.operation_id, selected, compose, names)
+
+
+def _history_data(
+    conn: Connection,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    compose: ComposeFrame,
+    names: frozenset[str],
+) -> ContinuationAttachmentHistory:
+    from elspeth.web.sessions.continuation_attachment_application import load_attachment_history_data_on_connection
 
     if selected.stack.frames[0] is not compose:
         raise AuditIntegrityError("attachment history changed its actual selected Compose owner")
-    return load_attachment_history_sources_on_connection(conn, running, selected=selected, names=names).history
+    return load_attachment_history_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, names=names
+    ).history
 
 
 def prepare_attachment_result_on_connection(
@@ -260,10 +274,16 @@ def prepare_attachment_result_on_connection(
 
 
 def _effect(conn: Connection, running: ComposerOperationRunning, selected: SelectedContinuationState, key: str, digest: str) -> Row[Any]:
+    return _effect_data(conn, running.claim.session_id, running.claim.operation_id, selected, key, digest)
+
+
+def _effect_data(
+    conn: Connection, session_id: UUID, operation_id: str, selected: SelectedContinuationState, key: str, digest: str
+) -> Row[Any]:
     row = conn.execute(
         select(effects).where(
-            effects.c.session_id == str(running.claim.session_id),
-            effects.c.operation_id == running.claim.operation_id,
+            effects.c.session_id == str(session_id),
+            effects.c.operation_id == operation_id,
             effects.c.effect_key == key,
         )
     ).one_or_none()
@@ -447,17 +467,37 @@ def verify_attachment_result_source_on_connection(
     This does not authorize filesystem/current use. Historical application
     verification supplies an actual old SQL checkpoint, never a current grant.
     """
+    return verify_attachment_result_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        snapshot=snapshot,
+        env_ref_names=env_ref_names,
+    )
+
+
+def verify_attachment_result_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    snapshot: StoredContinuationSnapshot,
+    env_ref_names: frozenset[str],
+) -> AttachmentResultCheckpoint:
+    """Original immutable read/result joins after the caller's SQL proof."""
     names = env_ref_names
     if (
         snapshot.checkpoint_id != selected.checkpoint_id
         or snapshot.cursor != selected.stack.cursor
         or snapshot.payload_json != encode_continuation_snapshot(selected.stack)
-        or selected.stack.logical.session_id != str(running.claim.session_id)
-        or selected.stack.logical.operation_id != running.claim.operation_id
+        or selected.stack.logical.session_id != str(session_id)
+        or selected.stack.logical.operation_id != operation_id
     ):
         raise AuditIntegrityError("attachment immutable source changed its complete stored checkpoint")
     compose, frame, prepared, key, digest = _input(selected, names)
-    row = _effect(conn, running, selected, key, digest)
+    row = _effect_data(conn, session_id, operation_id, selected, key, digest)
     if row.disposition != "committed" or row.result_chunk_key is None:
         raise AuditIntegrityError("attachment result is unresolved and cannot redispatch")
     pending = selected.stack.pending_owner_results
@@ -480,13 +520,13 @@ def verify_attachment_result_source_on_connection(
     chunk = matches[0]
     stored_codec = conn.execute(
         select(chunks.c.codec).where(
-            chunks.c.session_id == str(running.claim.session_id),
-            chunks.c.operation_id == running.claim.operation_id,
+            chunks.c.session_id == str(session_id),
+            chunks.c.operation_id == operation_id,
             chunks.c.chunk_key == row.result_chunk_key,
         )
     ).scalar_one_or_none()
     if stored_codec != chunk.reference.codec or read_chunk(
-        conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=row.result_chunk_key
+        conn, session_id=str(session_id), operation_id=operation_id, key=row.result_chunk_key
     ) != chunk.canonical.encode("utf-8"):
         raise AuditIntegrityError("attachment retained bytes differ from their actual SQL source")
     if row.receipt_key != f"attachment-result:{chunk.reference.digest}":
@@ -494,8 +534,8 @@ def verify_attachment_result_source_on_connection(
     publication = decode_attachment_published_result(chunk, env_ref_names=names)
     creator = conn.execute(
         select(attempts).where(
-            attempts.c.session_id == str(running.claim.session_id),
-            attempts.c.operation_id == running.claim.operation_id,
+            attempts.c.session_id == str(session_id),
+            attempts.c.operation_id == operation_id,
             attempts.c.sequence == row.creator_sequence,
             attempts.c.generation == row.creator_generation,
         )
@@ -514,7 +554,7 @@ def verify_attachment_result_source_on_connection(
         require_attachment_read_audit(prepared, read_audit, names=names)
     retained = decode_read_owner_result(publication.result_json, env_ref_names=names)
     result = _result(retained, prepared, names)
-    history = _history(conn, running, selected, compose, names)
+    history = _history_data(conn, session_id, operation_id, selected, compose, names)
     if applied and _retained_history(history, key, retained) != history:
         raise AuditIntegrityError("consumed attachment result lacks its complete history")
     return AttachmentResultCheckpoint(snapshot, key, prepared, result, retained, history, applied, read_audit)

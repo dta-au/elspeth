@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
     from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import CommittedContinuationP4
+    from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_tool_failure import CommittedContinuationFailure
     from elspeth.web.sessions.graph_recovery import (
         CompositionGraphRead,
@@ -2466,6 +2467,21 @@ class SessionOperationAuthority(Protocol):
     records/operation contexts; a raw SQLAlchemy engine or connection is never
     part of the public authority surface.
     """
+
+    def reconcile_unavailable_composer_segment(
+        self,
+        candidate: ContinuationRecoveryCandidate,
+        *,
+        owner_instance_id: str,
+        lease_seconds: int,
+        auth_provider_type: str,
+    ) -> Literal["recovered", "settled", "unchanged"]:
+        """Reprove unavailable ownership and atomically choose Stop or recovery."""
+        ...
+
+    def settle_lost_inactive_continuation(self, candidate: ContinuationInactiveCandidate, *, auth_provider_type: str) -> bool:
+        """Settle an archived non-running segment without acquiring its fence."""
+        ...
 
     def recover_composer_segment(
         self,

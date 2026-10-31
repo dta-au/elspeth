@@ -1699,6 +1699,8 @@ def _create_app(
 
     resolved_state_mode = resolve_deployment_state_mode(settings)
     external_state = resolved_state_mode == "external-postgresql"
+    if external_state and settings.instance_id is not None:
+        raise ValueError("PostgreSQL recovery requires a fresh instance identity; omit instance_id")
     # One closed profile per deployment target names the startup hooks this
     # process boots through and the platform variables that carry its replica
     # identity (web/deployment_profiles.py); app.py never branches on the
@@ -2590,8 +2592,8 @@ def _create_app(
         return JSONResponse(
             status_code=503,
             content={
-                "detail": "Database is currently unavailable. Please retry in a moment.",
-                "error_type": "database_unavailable",
+                "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+                "error_type": "executor_unavailable",
                 "request_id": request_id,
             },
         )

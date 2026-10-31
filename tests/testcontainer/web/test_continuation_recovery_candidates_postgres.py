@@ -107,6 +107,7 @@ def test_postgres_takeover_requires_exact_owners_membership(operation_store, own
                 session_operation_lease_token=context.fence.lease_token,
                 owner_instance_id="test-owner",
                 checkpoint_id=record.checkpoint_id,
+                segment_checkpoint_id=record.checkpoint_id,
                 cancel_requested_at=None,
                 session_archived_at=None,
             ),

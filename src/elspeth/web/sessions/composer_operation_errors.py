@@ -212,7 +212,7 @@ def project_composer_operation_error(
                     "transcript_url": None,
                 }
             return _http_error(500, body, "audit_integrity_error")
-        if isinstance(leaf, (OperationalError, AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+        if isinstance(leaf, OperationalError):
             return _http_error(
                 503,
                 {
@@ -221,6 +221,16 @@ def project_composer_operation_error(
                     "request_id": request_id,
                 },
                 "database_unavailable",
+            )
+        if isinstance(leaf, (AsyncWorkerAdmissionTimeoutError, RequiredGenerationUnavailable)):
+            return _http_error(
+                503,
+                {
+                    "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+                    "error_type": "executor_unavailable",
+                    "request_id": request_id,
+                },
+                "executor_unavailable",
             )
         if isinstance(leaf, OSError) and leaf.errno in _RETRYABLE_STORAGE_ERRNOS:
             return _http_error(

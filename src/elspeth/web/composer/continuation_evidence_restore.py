@@ -7,6 +7,7 @@ historical physical identity; only this actual SQL call supplies current context
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from sqlalchemy import Connection, select
 
@@ -82,6 +83,32 @@ def read_selected_turn_evidence_graph_on_connection(
     names: frozenset[str],
 ) -> AdmittedTurnEvidence:
     """Validate selected evidence DATA after the caller proves current admission."""
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("cold evidence changed its principal or committed ingress")
+    return read_selected_turn_evidence_graph_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        names=names,
+    )
+
+
+def read_selected_turn_evidence_graph_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    names: frozenset[str],
+) -> AdmittedTurnEvidence:
+    """Immutable graph/principal DATA after a separate locked admission proof.
+
+    Archivedness is an admission concern: current readers refuse it in their
+    wrapper; lost-owner settlement proves it in its own repository transaction.
+    Every original graph, transcript, base, creator and application check stays.
+    """
     root = selected.stack
     compose = tuple(frame for frame in root.frames if type(frame) is ComposeFrame)
     if len(compose) != 1:
@@ -89,7 +116,9 @@ def read_selected_turn_evidence_graph_on_connection(
     frame = compose[0]
     if frame.initial_state.codec != "composer.state.v1" or frame.audit_buffer.codec != "composer.audit-buffer.v1":
         raise AuditIntegrityError("cold evidence changed its selected state/recorder format")
-    sid, operation_id = str(running.claim.session_id), running.claim.operation_id
+    sid = str(session_id)
+    if (root.logical.session_id, root.logical.operation_id) != (sid, operation_id):
+        raise AuditIntegrityError("cold evidence changed its logical SQL identity")
 
     def actual_chunk(reference: PrivateChunkRef) -> PrivateChunk:
         candidates = tuple(item for item in selected.chunks if item.reference == reference)
@@ -111,7 +140,6 @@ def read_selected_turn_evidence_graph_on_connection(
         parent.lifecycle_version != 2
         or parent.actor_user_id != snapshot.actor_user_id
         or principal.user_id != snapshot.actor_user_id
-        or principal.archived_at is not None
         or parent.request_hash != root.logical.request_hash
         or parent.kind != root.logical.kind
         or parent.base_state_id != root.logical.base_state_id
@@ -177,9 +205,11 @@ def read_selected_turn_evidence_graph_on_connection(
             actual_chunk(batch_frame.accumulator)
             actual_chunk(batch_frame.response)
     require_selected_active_batch_graph(selected, admitted, env_ref_names=names)
-    from elspeth.web.sessions.continuation_attachment_application import require_attachment_applications_on_connection
+    from elspeth.web.sessions.continuation_attachment_application import require_attachment_applications_data_on_connection
 
-    require_attachment_applications_on_connection(conn, running, selected=selected, evidence=admitted, env_ref_names=names)
+    require_attachment_applications_data_on_connection(
+        conn, session_id=session_id, operation_id=operation_id, selected=selected, evidence=admitted, env_ref_names=names
+    )
     return admitted
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import Connection, Row, insert, select, update
 
@@ -116,7 +117,11 @@ def _primary_frame(stack: ContinuationFrameStack) -> ComposeFrame:
 
 
 def _owned_text(conn: Connection, running: ComposerOperationRunning, key: str) -> str:
-    raw = read_chunk(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id, key=key)
+    return _owned_text_data(conn, running.claim.session_id, running.claim.operation_id, key)
+
+
+def _owned_text_data(conn: Connection, session_id: UUID, operation_id: str, key: str) -> str:
+    raw = read_chunk(conn, session_id=str(session_id), operation_id=operation_id, key=key)
     try:
         return raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
@@ -124,16 +129,20 @@ def _owned_text(conn: Connection, running: ComposerOperationRunning, key: str) -
 
 
 def _chunk(conn: Connection, running: ComposerOperationRunning, ref: PrivateChunkRef) -> PrivateChunk:
+    return _chunk_data(conn, running.claim.session_id, running.claim.operation_id, ref)
+
+
+def _chunk_data(conn: Connection, session_id: UUID, operation_id: str, ref: PrivateChunkRef) -> PrivateChunk:
     row = conn.execute(
         select(chunks.c.codec).where(
-            chunks.c.session_id == str(running.claim.session_id),
-            chunks.c.operation_id == running.claim.operation_id,
+            chunks.c.session_id == str(session_id),
+            chunks.c.operation_id == operation_id,
             chunks.c.chunk_key == f"value:{ref.codec}:{ref.digest}",
         )
     ).one_or_none()
     if row is None or row.codec != ref.codec:
         raise AuditIntegrityError("primary private source changed its SQL codec")
-    text = _owned_text(conn, running, f"value:{ref.codec}:{ref.digest}")
+    text = _owned_text_data(conn, session_id, operation_id, f"value:{ref.codec}:{ref.digest}")
     verify_private_chunk(ref, text)
     return PrivateChunk(ref, text)
 
@@ -174,13 +183,10 @@ def _input_value(canonical: str | None, digest: str) -> RetainedPrimaryInput:
     )
 
 
-def _wire_input(
-    conn: Connection,
-    running: ComposerOperationRunning,
-    frame: ComposeFrame,
-    value: RetainedPrimaryInput,
+def _wire_input_data(
+    conn: Connection, session_id: UUID, operation_id: str, frame: ComposeFrame, value: RetainedPrimaryInput
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    selected, error = parse_json_strict(_chunk(conn, running, frame.messages).canonical)
+    selected, error = parse_json_strict(_chunk_data(conn, session_id, operation_id, frame.messages).canonical)
     if (
         error is not None
         or type(selected) is not dict
@@ -204,7 +210,7 @@ def _wire_input(
     if frame.tools is not None:
         if frame.tools.codec != "composer.tools.v1":
             raise AuditIntegrityError("primary prepared input changed its actual tool codec")
-        parsed, tool_error = parse_json_strict(_chunk(conn, running, frame.tools).canonical)
+        parsed, tool_error = parse_json_strict(_chunk_data(conn, session_id, operation_id, frame.tools).canonical)
         if tool_error is not None or type(parsed) is not list:
             raise AuditIntegrityError("primary prepared input lost its complete tool schemas")
         for tool in parsed:
@@ -225,26 +231,27 @@ def _wire_input(
     return wire, tools
 
 
-def _stored_descriptor(conn: Connection, running: ComposerOperationRunning, effect: Row[Any]) -> RetainedPrimaryInput:
+def _stored_descriptor_data(conn: Connection, session_id: UUID, operation_id: str, effect: Row[Any]) -> RetainedPrimaryInput:
     key = f"provider-input:{effect.input_sha256}"
     row = conn.execute(
         select(chunks.c.codec).where(
-            chunks.c.session_id == str(running.claim.session_id),
-            chunks.c.operation_id == running.claim.operation_id,
+            chunks.c.session_id == str(session_id),
+            chunks.c.operation_id == operation_id,
             chunks.c.chunk_key == key,
         )
     ).one_or_none()
     if row is None or row.codec != "composer.provider-input.v1":
         raise AuditIntegrityError("primary prepared source changed its actual SQL input codec")
-    canonical = _owned_text(conn, running, key)
+    canonical = _owned_text_data(conn, session_id, operation_id, key)
     return _input_value(canonical, effect.input_sha256)
 
 
-def _stored_input(
-    conn: Connection, running: ComposerOperationRunning, effect: Row[Any], frame: ComposeFrame
+def stored_primary_input_data_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect: Row[Any], frame: ComposeFrame
 ) -> tuple[RetainedPrimaryInput, list[dict[str, Any]], list[dict[str, Any]]]:
-    value = _stored_descriptor(conn, running, effect)
-    wire, tools = _wire_input(conn, running, frame, value)
+    """Original complete prepared input after the caller's SQL admission."""
+    value = _stored_descriptor_data(conn, session_id, operation_id, effect)
+    wire, tools = _wire_input_data(conn, session_id, operation_id, frame, value)
     return value, wire, tools
 
 
@@ -303,7 +310,7 @@ def prepare_primary_provider_on_connection(
     if frame.phase != "action_ready" or frame.pending_response is not None or frame.provider_effect_key is not None:
         raise ContinuationCASConflict("primary preparation would replace an unresolved response/effect")
     request = _input_value(input_json, input_sha256)
-    _wire_input(conn, running, frame, request)
+    _wire_input_data(conn, running.claim.session_id, running.claim.operation_id, frame, request)
     ordinal = conn.execute(
         select(ordinals.c.next_ordinal).where(
             ordinals.c.session_id == sid,
@@ -404,10 +411,32 @@ def _selected_effect(
     input_sha256: str,
 ) -> tuple[StoredContinuationSnapshot, ContinuationFrameStack, ComposeFrame, Row[Any]]:
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    return selected_primary_effect_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        checkpoint_id=checkpoint_id,
+        cursor=cursor,
+        effect_key=effect_key,
+        input_sha256=input_sha256,
+    )
+
+
+def selected_primary_effect_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    checkpoint_id: str,
+    cursor: int,
+    effect_key: str,
+    input_sha256: str,
+) -> tuple[StoredContinuationSnapshot, ContinuationFrameStack, ComposeFrame, Row[Any]]:
+    """Exact selected PRIMARY DATA; never a current-custody admission."""
     selected = require_snapshot_cas(
         conn,
-        session_id=str(running.claim.session_id),
-        operation_id=running.claim.operation_id,
+        session_id=str(session_id),
+        operation_id=operation_id,
         expected_checkpoint_id=checkpoint_id,
         expected_cursor=cursor,
     )
@@ -426,8 +455,8 @@ def _selected_effect(
         raise AuditIntegrityError("primary effect has an unfamiliar physical family/ordinal")
     effect = conn.execute(
         select(effects).where(
-            effects.c.session_id == str(running.claim.session_id),
-            effects.c.operation_id == running.claim.operation_id,
+            effects.c.session_id == str(session_id),
+            effects.c.operation_id == operation_id,
             effects.c.effect_key == effect_key,
         )
     ).one()
@@ -512,7 +541,9 @@ def begin_primary_provider_on_connection(conn: Connection, prepared: PreparedCon
         or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
     ):
         raise ContinuationCASConflict("unresolved or foreign primary preparation cannot dispatch or retry")
-    _stored_input(conn, running, effect, frame)
+    stored_primary_input_data_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
+    )
     conn.execute(
         update(effects)
         .where(
@@ -536,9 +567,13 @@ def begin_primary_provider_on_connection(conn: Connection, prepared: PreparedCon
 
 
 def _physical_source(conn: Connection, running: ComposerOperationRunning, effect: Row[Any], call: ComposerLLMCall) -> str:
+    return _physical_source_data(conn, running.claim.session_id, running.claim.operation_id, effect, call)
+
+
+def _physical_source_data(conn: Connection, session_id: UUID, operation_id: str, effect: Row[Any], call: ComposerLLMCall) -> str:
     if type(call) is not ComposerLLMCall or call.call_id is None:
         raise AuditIntegrityError("primary result requires the actual original physical audit")
-    source = _stored_descriptor(conn, running, effect)
+    source = _stored_descriptor_data(conn, session_id, operation_id, effect)
     wire, tools = _original_wire(source)
     if (
         call.model_requested != source.model
@@ -551,14 +586,14 @@ def _physical_source(conn: Connection, running: ComposerOperationRunning, effect
         raise AuditIntegrityError("primary physical audit differs from its complete actual prepared input source")
     creator = conn.execute(
         select(attempts).where(
-            attempts.c.session_id == str(running.claim.session_id),
-            attempts.c.operation_id == running.claim.operation_id,
+            attempts.c.session_id == str(session_id),
+            attempts.c.operation_id == operation_id,
             attempts.c.sequence == effect.creator_sequence,
             attempts.c.generation == effect.creator_generation,
         )
     ).one()
     attempt = conn.execute(select(physical).where(physical.c.attempt_id == call.call_id)).one_or_none()
-    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(running.claim.session_id))).scalar_one()
+    principal = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == str(session_id))).scalar_one()
     if (
         attempt is None
         or (
@@ -570,7 +605,7 @@ def _physical_source(conn: Connection, running: ComposerOperationRunning, effect
             attempt.lease_token,
         )
         != (
-            str(running.claim.session_id),
+            str(session_id),
             "composer",
             None,
             creator.session_operation_id,
@@ -699,7 +734,9 @@ def publish_primary_provider_on_connection(
     )
     # Publication still owns the original selected input. A later audit read
     # instead joins immutable paid-input DATA after the transcript has grown.
-    _stored_input(conn, running, effect, frame)
+    stored_primary_input_data_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
+    )
     _physical_source(conn, running, effect, call)
     previous = decode_recorder_snapshot(_chunk(conn, running, frame.audit_buffer))
     if replace(previous, llm_calls=(*previous.llm_calls, call)) != recorder or not recorder.llm_calls or recorder.llm_calls[-1] is not call:
@@ -906,13 +943,46 @@ def _read_committed_primary_response_data_on_connection(
     reference: PrivateChunkRef,
 ) -> PrivateChunk:
     _require_selected_primary_source(conn, running, selected)
+    return read_committed_primary_response_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        selected=selected,
+        reference=reference,
+    )
+
+
+def read_committed_primary_response_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    selected: SelectedContinuationState,
+    reference: PrivateChunkRef,
+) -> PrivateChunk:
+    """Immutable paid-response DATA after an independent locked SQL proof."""
+    from elspeth.web.sessions.continuation_selection import load_snapshot_private_data_on_connection
+
+    expected = require_snapshot_cas(
+        conn,
+        session_id=str(session_id),
+        operation_id=operation_id,
+        expected_checkpoint_id=selected.checkpoint_id,
+        expected_cursor=selected.stack.cursor,
+    )
+    if (
+        expected.payload_json != encode_continuation_snapshot(selected.stack)
+        or load_snapshot_private_data_on_connection(conn, session_id=str(session_id), operation_id=operation_id, selected=expected)
+        != selected.chunks
+    ):
+        raise ContinuationCASConflict("primary source read changed its complete selected chunk cohort")
     if type(reference) is not PrivateChunkRef or reference.codec != "composer.response.v1":
         raise AuditIntegrityError("historical primary response lost its actual source codec")
     key = f"value:{reference.codec}:{reference.digest}"
     found = conn.execute(
         select(effects).where(
-            effects.c.session_id == str(running.claim.session_id),
-            effects.c.operation_id == running.claim.operation_id,
+            effects.c.session_id == str(session_id),
+            effects.c.operation_id == operation_id,
             effects.c.owner == "provider",
             effects.c.result_chunk_key == key,
         )
@@ -943,7 +1013,7 @@ def _read_committed_primary_response_data_on_connection(
         or (frontier[0].disposition, frontier[0].receipt_id) != ("committed", effect.receipt_key)
     ):
         raise AuditIntegrityError("historical primary response lost its exact committed current frontier")
-    response = _chunk(conn, running, reference)
+    response = _chunk_data(conn, session_id, operation_id, reference)
     completion = decode_continuation_response(response)
     call = decode_retained_physical_audit_call(response)
     if (
@@ -959,5 +1029,5 @@ def _read_committed_primary_response_data_on_connection(
     require_successful_response_audit(
         call, completion.provider_metadata, attempt_id=call.call_id, started_at=call.started_at, finished_at=call.finished_at
     )
-    _physical_source(conn, running, effect, call)
+    _physical_source_data(conn, session_id, operation_id, effect, call)
     return response

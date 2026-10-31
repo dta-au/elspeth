@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
+from uuid import UUID
 
 from pydantic import Field, ValidationError
 from sqlalchemy import Connection, Row, insert, select, update
@@ -58,10 +59,8 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_bootstrap_source import (
     _pretitle_checkpoint_at_cursor,
-    _pretitle_recovery_origin,
     read_pretitle_bootstrap_on_connection,
     require_current_prepared_title_values_on_connection,
-    require_pretitle_publication_lineage_on_connection,
 )
 from elspeth.web.sessions.models import (
     chat_messages_table as messages,
@@ -248,9 +247,13 @@ def _descriptor(chunk: PrivateChunk) -> TitleInputDescriptor:
 
 
 def _chunk(conn: Connection, running: ComposerOperationRunning, ref: PrivateChunkRef) -> PrivateChunk:
+    return _chunk_data(conn, running.claim.session_id, running.claim.operation_id, ref)
+
+
+def _chunk_data(conn: Connection, session_id: UUID, operation_id: str, ref: PrivateChunkRef) -> PrivateChunk:
     if type(ref) is not PrivateChunkRef:
         raise AuditIntegrityError("TITLE private source requires its exact nominal reference")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    sid, operation = str(session_id), operation_id
     key = f"value:{ref.codec}:{ref.digest}"
     codec = conn.execute(
         select(chunks.c.codec).where(chunks.c.session_id == sid, chunks.c.operation_id == operation, chunks.c.chunk_key == key)
@@ -487,7 +490,37 @@ def _source_chain(
     generation: int | None = None,
 ) -> tuple[TitleInputDescriptor, PrivateChunkRef, str, StoredContinuationSnapshot]:
     """Verify every exact stage and genuine recovery edge back to publication."""
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("TITLE source changed its original logical request/actor/eligibility")
+    return title_source_chain_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        generation=running.claim.ownership_generation if generation is None else generation,
+        selected=selected,
+        names=names,
+    )
+
+
+def title_source_chain_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> tuple[TitleInputDescriptor, PrivateChunkRef, str, StoredContinuationSnapshot]:
+    """Immutable TITLE source lineage after the caller proves SQL admission."""
+    from elspeth.web.sessions.continuation_bootstrap_source import (
+        pretitle_recovery_origin_data_on_connection,
+        require_pretitle_publication_data_on_connection,
+    )
+
+    sid, operation = str(session_id), operation_id
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
     ).one_or_none()
@@ -516,13 +549,13 @@ def _source_chain(
     ):
         raise AuditIntegrityError("TITLE source has another effect/ordinal/physical owner outside its complete closed cohort")
     current = selected
-    if generation is None:
-        generation = running.claim.ownership_generation
     expected_stage: str | None = None
     descriptor_ref: PrivateChunkRef | None = None
     final_stage: str | None = None
     while True:
-        origin, generation = _pretitle_recovery_origin(conn, running, current, generation=generation)
+        origin, generation = pretitle_recovery_origin_data_on_connection(
+            conn, session_id=session_id, operation_id=operation_id, sequence=sequence, selected=current, generation=generation
+        )
         row = conn.execute(
             select(events).where(events.c.session_id == sid, events.c.operation_id == operation, events.c.sequence == origin.cursor)
         ).one_or_none()
@@ -543,7 +576,7 @@ def _source_chain(
             raise AuditIntegrityError("TITLE stage event violates its owned shape") from error
         if (
             event_text != _event(transition)
-            or transition.creator_sequence != running.claim.segment_sequence
+            or transition.creator_sequence != sequence
             or transition.creator_generation != generation
             or transition.predecessor_cursor + 1 != origin.cursor
             or (expected_stage is not None and transition.stage != expected_stage)
@@ -560,7 +593,7 @@ def _source_chain(
         decode_continuation_snapshot(origin.payload_json)
         before_frame = before.frames[0]
         after_frame = _frame(origin)
-        descriptor = _descriptor(_chunk(conn, running, descriptor_ref))
+        descriptor = _descriptor(_chunk_data(conn, session_id, operation_id, descriptor_ref))
         if type(before_frame) is not InitializeFrame or before_frame.bootstrap != after_frame.bootstrap:
             raise AuditIntegrityError("TITLE stage changed its complete bootstrap owner")
         if transition.stage == "prepared":
@@ -626,8 +659,16 @@ def _source_chain(
         if transition.stage == "prepared":
             if before_frame.bootstrap is None:
                 raise AuditIntegrityError("TITLE source lost its actual original publication")
-            bootstrap = _chunk(conn, running, before_frame.bootstrap)
-            require_pretitle_publication_lineage_on_connection(conn, running, selected=prior, chunk=bootstrap, generation=generation)
+            bootstrap = _chunk_data(conn, session_id, operation_id, before_frame.bootstrap)
+            require_pretitle_publication_data_on_connection(
+                conn,
+                session_id=session_id,
+                operation_id=operation_id,
+                sequence=sequence,
+                selected=prior,
+                chunk=bootstrap,
+                generation=generation,
+            )
             snapshot = decode_continuation_bootstrap(bootstrap)
             parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
             principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at).where(sessions.c.id == sid)).one()
@@ -635,7 +676,6 @@ def _source_chain(
                 snapshot.logical != before.logical
                 or snapshot.actor_user_id != parent.actor_user_id
                 or principal.user_id != parent.actor_user_id
-                or principal.archived_at is not None
                 or before_frame.request_json != parent.request_json
                 or not snapshot.auto_title_eligible
             ):
@@ -648,6 +688,218 @@ def _source_chain(
             )
             return descriptor, descriptor_ref, final_stage, prior
         current = prior
+
+
+def validate_title_source_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> None:
+    """Validate staged input and actual retained response/accounting together."""
+    frame = _frame(selected)
+    if frame.title_response is not None:
+        _chunk_value, result, settled = read_title_result_data_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            sequence=sequence,
+            generation=generation,
+            selected=selected,
+            names=names,
+        )
+        _require_audit_cohort_data(conn, session_id, result.audit_call, result.audit_drafts, settled=settled)
+        return
+    descriptor, _reference, stage, _source = title_source_chain_data_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+    )
+    sid = str(session_id)
+    effect = conn.execute(
+        select(effects).where(
+            effects.c.session_id == sid,
+            effects.c.operation_id == operation_id,
+            effects.c.effect_key == "provider:3:0",
+        )
+    ).one()
+    if stage == "prepared":
+        if (
+            effect.disposition != "prepared"
+            or frame.title_attempt_id is not None
+            or effect.provider_attempt_id is not None
+            or effect.physical_sequence is not None
+            or effect.physical_generation is not None
+            or effect.requested_model is not None
+            or effect.response_finished_at is not None
+            or effect.receipt_key is not None
+            or effect.result_chunk_key is not None
+        ):
+            raise AuditIntegrityError("prepared TITLE carries contradictory physical/result DATA")
+        return
+    if stage != "admitted" or effect.disposition != "dispatched" or frame.title_attempt_id != effect.provider_attempt_id:
+        raise AuditIntegrityError("unresolved TITLE lost its actual staged dispatch")
+    creator = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation_id,
+            attempts.c.sequence == effect.creator_sequence,
+            attempts.c.generation == effect.creator_generation,
+        )
+    ).one_or_none()
+    original = conn.execute(select(physical).where(physical.c.attempt_id == effect.provider_attempt_id)).one_or_none()
+    actor = conn.execute(select(jobs.c.actor_user_id).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).scalar_one()
+    wire, error = parse_json_strict(descriptor.wire_json)
+    if (
+        error is not None
+        or type(wire) is not dict
+        or type(wire["options"]) is not dict
+        or creator is None
+        or original is None
+        or original.source != "auto_title"
+        or original.run_id is not None
+        or original.identity_id != actor
+        or original.session_id != sid
+        or original.operation_id != creator.session_operation_id
+        or original.operation_epoch != creator.session_operation_epoch
+        or original.lease_token != creator.session_operation_lease_token
+        or (effect.physical_sequence, effect.physical_generation) != (effect.creator_sequence, effect.creator_generation)
+        or effect.requested_model != wire["options"]["model"]
+        or effect.receipt_key is not None
+        or effect.result_chunk_key is not None
+        or effect.response_finished_at is not None
+    ):
+        raise AuditIntegrityError("unresolved TITLE changed its exact original physical source")
+
+
+def validate_unclaimed_title_recovery_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int,
+    generation: int,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> None:
+    """Admit an archived interrupted TITLE cut that has never been reclaimed.
+
+    Ordinary readers require a real following attempt for every recovery edge.
+    Archive cleanup cannot invent that attempt. Prove this one exact unclaimed
+    edge here, then reuse the unchanged original lineage on its predecessor.
+    """
+    sid = str(session_id)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
+    session = conn.execute(select(sessions).where(sessions.c.id == sid)).one()
+    segment = conn.execute(
+        select(segments).where(
+            segments.c.session_id == sid,
+            segments.c.operation_id == operation_id,
+            segments.c.sequence == sequence,
+        )
+    ).one()
+    following = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation_id,
+            attempts.c.sequence == sequence,
+            attempts.c.generation == generation,
+        )
+    ).one_or_none()
+    previous = conn.execute(
+        select(attempts).where(
+            attempts.c.session_id == sid,
+            attempts.c.operation_id == operation_id,
+            attempts.c.sequence == sequence,
+            attempts.c.generation == generation - 1,
+        )
+    ).one_or_none()
+    event = conn.execute(
+        select(events).where(
+            events.c.session_id == sid,
+            events.c.operation_id == operation_id,
+            events.c.sequence == selected.cursor,
+        )
+    ).one_or_none()
+    now = database_now(conn)
+    if (
+        generation <= 1
+        or selected.cursor <= 0
+        or parent.lifecycle_version != 2
+        or parent.status not in ("queued", "running")
+        or session.archived_at is None
+        or parent.actor_user_id != session.user_id
+        or parent.current_segment_sequence != sequence
+        or parent.ownership_generation != generation
+        or parent.checkpoint_id != selected.checkpoint_id
+        or segment.state != "interrupted"
+        or segment.generation != generation
+        or segment.checkpoint_id != selected.checkpoint_id
+        or (segment.claim_expires_at is not None and restore_utc(segment.claim_expires_at) > now)
+        or following is not None
+        or previous is None
+        or previous.revoked_at is None
+        or previous.outcome != "interrupted"
+        or previous.claim_attempt > parent.attempt
+        or previous.session_operation_id != segment.session_operation_id
+        or previous.session_operation_epoch != segment.session_operation_epoch
+        or previous.session_operation_lease_token != segment.session_operation_lease_token
+        or event is None
+        or event.tag != "recovered"
+    ):
+        raise AuditIntegrityError("inactive TITLE lost its exact unclaimed recovery ownership")
+    expected_event = canonical_json(
+        {
+            "version": 2,
+            "same_sequence": sequence,
+            "previous_generation": generation - 1,
+            "generation": generation,
+        }
+    )
+    if read_chunk(conn, session_id=sid, operation_id=operation_id, key=event.payload_chunk_key) != expected_event.encode("utf-8"):
+        raise AuditIntegrityError("inactive TITLE changed its actual recovery event")
+    current = _pretitle_checkpoint_at_cursor(conn, session_id=sid, operation_id=operation_id, cursor=selected.cursor)
+    predecessor = _pretitle_checkpoint_at_cursor(conn, session_id=sid, operation_id=operation_id, cursor=selected.cursor - 1)
+    before = decode_continuation_snapshot(predecessor.payload_json)
+    root = decode_continuation_snapshot(selected.payload_json)
+    if current != selected or selected.payload_json != encode_continuation_snapshot(before.model_copy(update={"cursor": selected.cursor})):
+        raise AuditIntegrityError("inactive TITLE changed its cursor-only recovery transition")
+    actual = conn.execute(select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation_id)).all()
+    if {(row.effect_key, row.disposition, row.receipt_key) for row in actual} != {
+        (entry.effect_id, entry.disposition, entry.receipt_id) for entry in root.effect_frontier
+    }:
+        raise AuditIntegrityError("inactive TITLE changed its actual SQL effect frontier")
+    predecessor_frame = before.frames[0]
+    if type(predecessor_frame) is InitializeFrame and predecessor_frame.ingress_phase == "ready":
+        from elspeth.web.sessions.continuation_title_application import read_applied_title_ready_immutable_data_on_connection
+
+        read_applied_title_ready_immutable_data_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            sequence=sequence,
+            generation=generation - 1,
+            selected=predecessor,
+            names=names,
+        )
+    else:
+        validate_title_source_data_on_connection(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            sequence=sequence,
+            generation=generation - 1,
+            selected=predecessor,
+            names=names,
+        )
 
 
 def admit_title_provider_on_connection(
@@ -801,6 +1053,18 @@ def _require_physical(
     source: ProviderAuditSource,
     descriptor: TitleInputDescriptor,
 ) -> None:
+    _require_physical_data(conn, running.claim.session_id, running.claim.operation_id, effect, call, source, descriptor)
+
+
+def _require_physical_data(
+    conn: Connection,
+    session_id: UUID,
+    operation_id: str,
+    effect: Row[Any],
+    call: ComposerLLMCall,
+    source: ProviderAuditSource,
+    descriptor: TitleInputDescriptor,
+) -> None:
     # The effect/physical rows are actual SQL Rows returned only by this owner.
     from elspeth.contracts.hashing import stable_hash
     from elspeth.web.composer.provider_context import capture_provider_context
@@ -832,16 +1096,14 @@ def _require_physical(
     physical_row = conn.execute(select(physical).where(physical.c.attempt_id == call.call_id)).one_or_none()
     creator = conn.execute(
         select(attempts).where(
-            attempts.c.session_id == str(running.claim.session_id),
-            attempts.c.operation_id == running.claim.operation_id,
+            attempts.c.session_id == str(session_id),
+            attempts.c.operation_id == operation_id,
             attempts.c.sequence == effect.physical_sequence,
             attempts.c.generation == effect.physical_generation,
         )
     ).one_or_none()
     actor = conn.execute(
-        select(jobs.c.actor_user_id).where(
-            jobs.c.session_id == str(running.claim.session_id), jobs.c.operation_id == running.claim.operation_id
-        )
+        select(jobs.c.actor_user_id).where(jobs.c.session_id == str(session_id), jobs.c.operation_id == operation_id)
     ).scalar_one()
     if (
         physical_row is None
@@ -849,7 +1111,7 @@ def _require_physical(
         or physical_row.source != "auto_title"
         or physical_row.run_id is not None
         or physical_row.identity_id != actor
-        or physical_row.session_id != str(running.claim.session_id)
+        or physical_row.session_id != str(session_id)
         or physical_row.attempt_id != effect.provider_attempt_id
         or (source.session_id, source.operation_id, source.operation_epoch)
         != (creator.session_id, creator.session_operation_id, creator.session_operation_epoch)
@@ -890,21 +1152,54 @@ def _read_title_result_data_on_connection(
     is usable only after its caller proves the complete actual forward/current
     lineage; it never materializes an old context or creates a current grant.
     """
-    descriptor, _ref, stage, _source = _source_chain(conn, running, selected, names=names, generation=generation)
+    principal = conn.execute(select(sessions.c.archived_at).where(sessions.c.id == str(running.claim.session_id))).one()
+    if principal.archived_at is not None:
+        raise AuditIntegrityError("TITLE source changed its original logical request/actor/eligibility")
+    return read_title_result_data_on_connection(
+        conn,
+        session_id=running.claim.session_id,
+        operation_id=running.claim.operation_id,
+        sequence=running.claim.segment_sequence,
+        generation=running.claim.ownership_generation if generation is None else generation,
+        selected=selected,
+        names=names,
+    )
+
+
+def read_title_result_data_on_connection(
+    conn: Connection,
+    *,
+    session_id: UUID,
+    operation_id: str,
+    sequence: int | None,
+    generation: int | None,
+    selected: StoredContinuationSnapshot,
+    names: frozenset[str],
+) -> tuple[PrivateChunk, DecodedTitleProviderResult, bool]:
+    """Complete immutable response/physical source after the caller's SQL proof."""
+    descriptor, _ref, stage, _source = title_source_chain_data_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        sequence=sequence,
+        generation=generation,
+        selected=selected,
+        names=names,
+    )
     if stage not in ("received", "settled"):
         raise AuditIntegrityError("TITLE response is unresolved; wait without another SDK dispatch")
     frame = _frame(selected)
     if frame.title_response is None:
         raise AuditIntegrityError("TITLE committed result lost its selected response")
-    chunk = _chunk(conn, running, frame.title_response)
+    chunk = _chunk_data(conn, session_id, operation_id, frame.title_response)
     result = decode_title_provider_result(chunk, env_ref_names=names)
     if result.completion.tool_batch.calls:
         raise AuditIntegrityError("TITLE retained result cannot introduce an unrequested tool batch")
-    sid, operation = str(running.claim.session_id), running.claim.operation_id
+    sid, operation = str(session_id), operation_id
     effect = conn.execute(
         select(effects).where(effects.c.session_id == sid, effects.c.operation_id == operation, effects.c.effect_key == "provider:3:0")
     ).one()
-    _require_physical(conn, running, effect, result.audit_call, result.source, descriptor)
+    _require_physical_data(conn, session_id, operation_id, effect, result.audit_call, result.source, descriptor)
     parent_actor = conn.execute(select(jobs.c.actor_user_id).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).scalar_one()
     snapshot = result.snapshot
     if (
@@ -936,6 +1231,12 @@ def read_title_result_on_connection(
 def _require_audit_cohort(
     conn: Connection, running: ComposerOperationRunning, call: ComposerLLMCall, drafts: tuple[AuditMessageDraft, ...], *, settled: bool
 ) -> None:
+    _require_audit_cohort_data(conn, running.claim.session_id, call, drafts, settled=settled)
+
+
+def _require_audit_cohort_data(
+    conn: Connection, session_id: UUID, call: ComposerLLMCall, drafts: tuple[AuditMessageDraft, ...], *, settled: bool
+) -> None:
     from collections.abc import Mapping
 
     from elspeth.contracts.freeze import deep_thaw
@@ -950,13 +1251,9 @@ def _require_audit_cohort(
     for draft in drafts:
         for envelope in draft.tool_calls or ():
             if is_diagnostic_evidence_envelope(envelope):
-                evidence_ids.add(
-                    ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(running.claim.session_id)).evidence_id
-                )
+                evidence_ids.add(ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id)).evidence_id)
     actual: list[object] = []
-    rows = conn.execute(
-        select(messages).where(messages.c.session_id == str(running.claim.session_id)).order_by(messages.c.sequence_no)
-    ).all()
+    rows = conn.execute(select(messages).where(messages.c.session_id == str(session_id)).order_by(messages.c.sequence_no)).all()
     for row in rows:
         # Classify this heterogeneous owned union before interpreting required
         # audit fields. An invalid known kind is corruption, not unrelated DATA.
@@ -988,7 +1285,7 @@ def _require_audit_cohort(
             ):
                 related = True
             if is_diagnostic_evidence_envelope(envelope):
-                evidence = ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(running.claim.session_id))
+                evidence = ComposerDiagnosticEvidence.from_envelope(envelope, expected_session_id=str(session_id))
                 if evidence.evidence_id in evidence_ids:
                     related = True
         if related:
@@ -1010,7 +1307,7 @@ def _require_audit_cohort(
     from elspeth.web.composer.audit import llm_call_audit_envelope
     from elspeth.web.coordination.quota_authority import _usage_entry_id
 
-    entry_id = _usage_entry_id(session_id=str(running.claim.session_id), source="auto_title", run_id=None, call_id=call.call_id)
+    entry_id = _usage_entry_id(session_id=str(session_id), source="auto_title", run_id=None, call_id=call.call_id)
     ledger = conn.execute(select(usage).where(usage.c.entry_id == entry_id)).all()
     if not settled:
         if actual or attempt.settled_at is not None or attempt.ledger_entry_id is not None or ledger:
