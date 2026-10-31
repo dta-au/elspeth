@@ -529,20 +529,42 @@ async def test_atomic_turn_projection_refuses_corrupted_actual_primary_audit(
     # Corrupt an otherwise valid actual SDK audit, never synthesize one to
     # satisfy the physical path. The residual projection must reject it.
     try:
-        with sessions_service._engine.begin() as conn:
-            conn.execute(
-                chat_messages_table.update().where(chat_messages_table.c.id == call_row.id).values(tool_calls=envelopes, content=content)
-            )
+        _tamper_chat_row(sessions_service._engine, call_row.id, tool_calls=envelopes, content=content, original_content=call_row.content)
         with pytest.raises(expected_error):
             _atomic_turn_rows(sessions_service, llm, session_id=session_id)
     finally:
-        with sessions_service._engine.begin() as conn:
-            conn.execute(
-                chat_messages_table.update()
-                .where(chat_messages_table.c.id == call_row.id)
-                .values(tool_calls=original_envelopes, content=call_row.content)
-            )
+        _tamper_chat_row(
+            sessions_service._engine, call_row.id, tool_calls=original_envelopes, content=call_row.content, original_content=content
+        )
     assert _atomic_turn_rows(sessions_service, llm, session_id=session_id) == []
+
+
+_IMMUTABLE_CONTENT_TRIGGER = "trg_chat_messages_immutable_content"
+
+
+def _tamper_chat_row(engine: Engine, row_id: str, *, tool_calls: Any, content: str, original_content: str) -> None:
+    """Rewrite one stored audit row for a corruption fixture.
+
+    ``tool_calls`` is mutable at the SQL layer. ``content`` is guarded by the
+    append-only trigger, which fires on any UPDATE naming the column, so it is
+    named only when it actually changes, and the trigger is suspended for that
+    one statement and reinstalled from its exact stored DDL. The trigger is a
+    separate defence; this fixture proves the projection's own refusal.
+    """
+    with engine.begin() as conn:
+        if content == original_content:
+            conn.execute(chat_messages_table.update().where(chat_messages_table.c.id == row_id).values(tool_calls=tool_calls))
+            return
+        trigger_sql = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = :name"), {"name": _IMMUTABLE_CONTENT_TRIGGER}
+        ).scalar_one()
+        conn.execute(text(f"DROP TRIGGER {_IMMUTABLE_CONTENT_TRIGGER}"))
+        try:
+            conn.execute(
+                chat_messages_table.update().where(chat_messages_table.c.id == row_id).values(tool_calls=tool_calls, content=content)
+            )
+        finally:
+            conn.execute(text(trigger_sql))
 
 
 def _composition_state_rows(sessions_service: SessionServiceImpl, *, session_id: str) -> list[Any]:
