@@ -20,6 +20,7 @@ from litellm.exceptions import APIError as LiteLLMAPIError
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 
@@ -46,6 +47,14 @@ def _service(tmp_path: Path, **settings_overrides: Any) -> ComposerServiceImpl:
     )
 
 
+def _assert_prepared_input(prepared: object, service: ComposerServiceImpl) -> int:
+    """The gateway prepares the exact primary input under the configured byte ceiling."""
+    limit = service._settings.composer_max_prepared_request_bytes
+    assert type(prepared) is PreparedProviderInput
+    assert (prepared.byte_limit, prepared.model, prepared.role, prepared.mode) == (limit, "gpt-5.5", "composer", "required")
+    return limit
+
+
 def _response(content: str = "reply") -> Any:
     message = type("Message", (), {"tool_calls": None, "content": content})()
     choice = type("Choice", (), {"message": message})()
@@ -65,10 +74,12 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
+    service = _service(tmp_path)
+    await service._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
 
     assert "api_base" not in captured
     assert "api_key" not in captured
+    limit = _assert_prepared_input(captured.pop("prepared_input"), service)
     # Reply-only calls omit tool schemas as well as unconfigured endpoints.
     # No reasoning key either: bare OpenAI-surface aliases stay unhinted
     # (elspeth-dc459d438e / elspeth-9a46553771).
@@ -86,6 +97,8 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         "prompt_guard_tool_argument_parts": None,
         "prompt_guard_thinking_parts": None,
         "continuation_input_sha256": None,
+        "prompt_guard_user_prompt": None,
+        "max_prepared_request_bytes": limit,
     }
 
 
@@ -143,10 +156,12 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
+    service = _service(tmp_path)
+    await service._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert "api_base" not in captured
     assert "api_key" not in captured
+    limit = _assert_prepared_input(captured.pop("prepared_input"), service)
     assert captured == {
         "model": "gpt-5.5",
         "messages": [{"role": "user", "content": "hi"}],
@@ -159,6 +174,7 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
         "prompt_guard_user_prompt": "",
         "prompt_guard_trusted_message_indexes": frozenset(),
         "prompt_guard_content_parts": None,
+        "max_prepared_request_bytes": limit,
     }
 
 
