@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2650,9 +2651,14 @@ async def test_step2_advisor_compose_timeout_persists_recovery_envelope(
 
     provider_calls = 0
 
-    async def _timeout_advisor(**_kwargs: Any) -> Any:
+    async def _timeout_advisor(*, on_provider_dispatch: Callable[[], None] | None = None, **_kwargs: Any) -> Any:
         nonlocal provider_calls
         provider_calls += 1
+        # The real gateway fires the physical-dispatch callback before SDK entry;
+        # that callback commits the reserved Advisor allowance, so an in-flight
+        # timeout spends one call. The double must keep that contract.
+        if on_provider_dispatch is not None:
+            on_provider_dispatch()
         raise TimeoutError
 
     monkeypatch.setattr("elspeth.web.composer.provider_gateway._litellm_acompletion", _timeout_advisor)
