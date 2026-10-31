@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
-![Status: 0.8.9](https://img.shields.io/badge/status-0.8.9-green.svg)
+![Status: 0.8.10](https://img.shields.io/badge/status-0.8.10-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -98,9 +98,17 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
-## What changed in 0.8.9
+## What changed in 0.8.10
 
-0.8.9 combines Composer, Azure Container Apps and engine improvements.
+0.8.10 adds default-off Composer continuation and provider-authored default or
+named attachment roots with scalar or ordered plural selectors. Public draft
+reapplication strips private custody and resolves current metadata. MCP argument
+audits retain safe evidence on capture faults, and workers retain an actual
+committed terminal return through late cleanup. See the
+[upgrade notes](docs/release/0.8.10-upgrade-notes-draft.md) for the Sessions
+78 → 79 hard cut, unchanged Landscape epoch 50 and fresh-store procedures.
+
+Existing Composer, Azure Container Apps and engine improvements remain.
 Full-replacement refusals and incremental output refusals
 retain their distinct candidate and saved-graph meanings, safe path diagnostics
 and repair guidance. Shared-link failures preserve the requested link instead
@@ -137,7 +145,7 @@ enhancements were developed under 0.8.8 and are included in 0.8.9.
 Session epoch 79 replaces session epoch 78 and retains its committed graph-review
 authority, quota custody and shared rate-limit policy binding while adding
 versioned Composer continuation segments, exact byte chunks, journal events and
-snapshots. Landscape epoch 50 replaces epoch 49 and records durable
+snapshots. Landscape epoch 50 remains unchanged and retains durable
 provider-attempt identity on run calls. Preserve epoch 75, both epoch 76
 session-store contracts, epoch 77 and epoch 78 session stores and epoch 49
 Landscape stores; use a separately provisioned epoch 79 session store and epoch
@@ -146,7 +154,7 @@ Compatible stores still require exact schema admission; unsupported stores are
 preserved and refused before incompatible writes. Backwards compatibility is
 permitted and considered from 0.8.5 within explicitly supported boundaries. This
 release authorizes no in-place migration, reset or downgrade. Package metadata
-is 0.8.9; the package version alone does not establish qualification or image
+is 0.8.10; the package version alone does not establish qualification or image
 publication. Automatic image publication from main is held; verify the release
 tag and image digest before installing a published image.
 

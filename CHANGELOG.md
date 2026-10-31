@@ -4,10 +4,10 @@ All notable changes to ELSPETH are documented here.
 
 ---
 
-## Unreleased (0.8.10)
+## 0.8.10 - 2026-10-31
 
-These entries cover the work landed on the 0.8.10 assembly so far. The remaining
-assembly units add their entries when they land.
+This entry records source changes on the 0.8.10 assembly. The dated entry and
+package version do not establish combined-release qualification or publication.
 
 ### Engine and runtime
 
@@ -60,13 +60,34 @@ assembly units add their entries when they land.
   store. Version-2 operation admission is refused unless continuation is
   enabled, and it is disabled by default, so existing clients keep the version-1
   lifecycle. The Sessions schema moves to epoch 79 (see Upgrade notes).
+- **Full replacements support provider-authored named and plural attachment
+  roots.** `set_pipeline` accepts `blob_id` or ordered `blob_ids` on its default
+  or named roots. The provider must choose the plugin explicitly; plural
+  selection requires `blob_rows`, including a one-member list. Public lists
+  contain 1–512 IDs; the private storage limit of 1,000 does not enlarge that
+  public bound. Duplicate identity or content within a list is refused, while
+  separate roots may reuse an attachment. Binding resolves current owned READY
+  blob metadata. An applied replacement publishes one graph version; a refused
+  root leaves the previous candidate unchanged. `APPROVAL_REQUIRED` remains a
+  proposal and leaves the saved graph unchanged until accepted.
+- **Public authoring projection strips private attachment custody.**
+  `get_pipeline_state(component="set_pipeline_arguments")` returns scalar IDs
+  or ordered plural IDs suitable for public reapplication. Reapplication
+  resolves current metadata and passes the strict authoring contract; it does
+  not reuse historical custody as clearance. Persisted private plural authority
+  revalidates every member against its current owned record and stored facts.
+  Metadata resolution does not establish byte integrity. See
+  [attachment selection and public projection](docs/reference/composer-tools.md#set_pipeline)
+  and the [versioned call contracts](docs/reference/composer-tool-contracts-0.8.10.md).
 - **Graph views given to models are bounded and carry complete-value
   references.** Long authored values are replaced in diagnostic graph views by a
   `complete_value_ref`. The new discovery tool `get_complete_pipeline_value`
   reads one complete value by its exact reference, re-resolving the current
   session and graph on every call. A reference is an identity, never inspection
   approval: returned content remains untrusted and must pass the actual
-  request's fresh inspection. Composer now offers 44 tools.
+  request's fresh inspection. The maintained
+  [Composer Tool Reference](docs/reference/composer-tools.md) describes the
+  advertised inventory and result envelopes.
 - **Every saved graph version publishes version-bound content applicability.**
   Each composition state records a `content_publication` binding in
   `composer_meta`: session, state, version and a storage content hash, with
@@ -76,6 +97,12 @@ assembly units add their entries when they land.
   immutable graph version. Concurrent writers on PostgreSQL are proven to
   publish whole, distinct versions, and a writer whose session lease was taken
   over is refused.
+- **Worker settlement retains an actual committed terminal return before
+  watcher cleanup.** A later cleanup fault or cancellation keeps that receipt
+  available to the existing exact-authority readback path instead of losing the
+  known committed return. Existing uncertain-completion refusals remain in
+  force, and the original cleanup failure remains observable. This does not
+  skip readback or complete outstanding required work synthetically.
 - **The inspector shows the authoritative graph content checksum.** `/state`
   responses carry `composition_content_hash`; see
   [Composer graph checksum](docs/reference/composer-graph-checksum.md).
@@ -93,14 +120,16 @@ assembly units add their entries when they land.
   unconditional fork, and reports the runtime's consistency error for incomplete
   combinations.
 - **Tool contracts state what the tools actually do (#327).**
-  - Recovery and secret tool arguments state their real length limits and that
-    whitespace-only values are rejected (TC-003, TC-007).
+  - `wire_secret_ref` documents exact raw component selectors and refuses an
+    ambiguous source rather than choosing one (TC-003).
+  - Recovery tool arguments state their real length limits and that
+    whitespace-only values are rejected (TC-007).
   - `list_secret_refs` describes `available` as metadata readiness, not
     resolution, and directs callers to `validate_secret_ref` (TC-013).
   - `get_tool_definitions` documents a breakdown measured from the live
     registry (DOC-001).
-  - The skill and the operator reference name the four tools whose results are
-    not the ordinary `ToolResult` envelope (DOC-002).
+  - The operator reference identifies results outside the ordinary `ToolResult`
+    envelope rather than treating every tool result as that envelope (DOC-002).
 - **The Composer MCP server admits saved content and withholds refused
   arguments (#327).**
   - A failed `load_session` keeps the previous diff baseline (TC-019).
@@ -109,6 +138,19 @@ assembly units add their entries when they land.
     per entry, so large session directories are not refused (TC-018).
   - When admission refuses an argument, the tool audit record stores a
     value-free stand-in instead of the refused value (TC-020).
+  - Registered tool names retain their identity. Unregistered caller names use
+    a SHA-256 identity in the audit, and unknown-tool errors do not echo the
+    caller name. The SDK's cache-miss and unlisted-tool diagnostic records keep
+    their records while replacing only the tool-name argument with that same
+    safe identity; this is not general SDK log suppression.
+  - Canonical argument evidence and its hash are published together only after
+    credential admission succeeds. Credential refusal retains priority over a
+    capture defect and keeps its value-free withheld evidence. Unexpected
+    capture, admission or refusal-evidence faults that propagate before input
+    evidence is admitted retain a complete value-free unavailable pair and
+    record `PLUGIN_CRASH`. Later tool faults retain the admitted canonical
+    evidence. See
+    [MCP call outcome contracts](docs/reference/composer-tool-contracts-0.8.10.md#tc-020--local-mcp-call-outcomes-preserve-safe-evidence).
 
 ### Security and signing
 
@@ -156,10 +198,10 @@ assembly units add their entries when they land.
 
 ### Upgrade notes
 
-**Sessions schema epoch 78 → 79 is a hard cut.** Continuation adds seven tables
+**Session epoch advances from 78 to 79 (hard cut).** Continuation adds seven tables
 and alters `composer_operations`. An existing epoch-78 Sessions store is
 refused, not migrated; deploy 0.8.10 against a fresh Sessions store and leave
-the epoch-78 database in place. Landscape stays at epoch 50. The AWS ECS and
+the epoch-78 database in place. Landscape epoch 50 remains unchanged. The AWS ECS and
 Azure Container Apps fresh-store procedures are in
 [docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
 
@@ -188,10 +230,13 @@ accepts servers on either side of this change.
 
 **New Composer refusal codes.** `complete_value_unavailable` and
 `complete_value_unsupported` report a complete-value reference that cannot be
-resolved or is outside the supported size envelope. The #327 changes add no
-new refusal codes. Their MCP refusals use the existing credential-material
-refusal, and a refused tool call's audit record now carries
-`{"_arguments_withheld": …}` in place of the arguments.
+resolved or is outside the supported size envelope. The MCP saved-content and
+argument-admission changes use the existing credential-material refusal.
+A refused tool call's audit record carries `{"_arguments_withheld": …}` in
+place of the arguments. If owned evidence preparation or admission fails
+unexpectedly before evidence is admitted, it retains
+`{"_arguments_unavailable": "evidence_not_completed"}` instead; the fault is
+audited and propagated rather than reported as success.
 
 **`--judge-transport codex-cli` now refuses.** Use `--judge-transport agent`.
 Key-bearing `elspeth-lints` verbs refuse from an editable checkout. Signing is
@@ -201,7 +246,9 @@ suspended until the protected runtime is installed after the on-prem migration.
 
 These notes describe source changes on the 0.8.10 assembly. Combined-release
 qualification, operator signature clearance, publication and deployment remain
-separate.
+separate. Automatic image publication from main remains held. Verify any
+release tag and container digest separately; this entry does not prove either
+has been published.
 
 ## 0.8.9 - 2026-10-21
 

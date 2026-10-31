@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Maintained subsystem reference for the unreleased 0.8.9 candidate.
+Maintained subsystem reference for the unreleased 0.8.10 candidate.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution

@@ -9,7 +9,7 @@ The current guidance below supersedes every legacy reset procedure later in
 this document. Those procedures are historical reference only and do not
 apply to the current candidate. They do not authorize a deployment or a reset.
 
-## Current Cutover: 0.8.9 candidate (session epoch 79, Landscape epoch 50)
+## Current Cutover: 0.8.10 candidate (session epoch 79, Landscape epoch 50)
 
 The unreleased candidate uses session epoch 79, which retains versioned Composer
 continuation segments, exact byte chunks, attributed journal events and complete

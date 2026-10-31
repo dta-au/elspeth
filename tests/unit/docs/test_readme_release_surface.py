@@ -28,7 +28,7 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
 
     assert f"Session epoch {SESSION_SCHEMA_EPOCH} replaces session epoch {SESSION_SCHEMA_EPOCH - 1}" in text
     assert "retains its committed graph-review authority" in text
-    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} replaces epoch 49" in text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH} remains unchanged" in text
     assert (
         "Preserve epoch 75, both epoch 76 session-store contracts, epoch 77 and epoch 78 session stores and epoch 49 Landscape stores"
         in text
