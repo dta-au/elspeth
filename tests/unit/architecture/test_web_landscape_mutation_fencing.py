@@ -2512,7 +2512,10 @@ def _non_landscape_scalar_attribute_read(node: ast.Attribute, resolver: _Resolve
     if node.attr != "reserve" or not isinstance(node.ctx, ast.Load):
         return False
     parent = next(_ancestors(node), None)
-    if not isinstance(parent, ast.BinOp) or not isinstance(parent.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+    arithmetic = isinstance(parent, ast.BinOp) and isinstance(parent.op, (ast.Add, ast.Sub, ast.Mult, ast.Div))
+    # A format field renders the value and retains nothing.
+    formatted = isinstance(parent, ast.FormattedValue) and parent.value is node
+    if not (arithmetic or formatted):
         return False
 
     def receiver_owner(expression: ast.expr) -> str | None:
@@ -5900,6 +5903,40 @@ _reserve_CANCEL_CONSUMERS = {
     "src/elspeth/web/sessions/composer_turn.py": "b7362a516c6191409e883a188917d7bc8c232985d597f5eb4c18d63c200e4087",
     "src/elspeth/web/sessions/composer_async_worker.py": "353466393d08fe8c5f3b6aa3c412dde363f47554b93f1ef26253618a47db2959",
 }
+
+_reserve_CANCEL_TOKEN_OWNER_PATH = "src/elspeth/web/sessions/composer_operations.py"
+
+
+def _reserve_cancel_tokens_are_immutable(unit):
+    """True only while ComposerOperationCancel keeps its reviewed frozen shape.
+
+    Immutability is judged at the language level (maintainer ruling
+    2026-11-01): a ``@final @dataclass(frozen=True, slots=True)`` whose one
+    field is the owned Enum cannot be changed through a load, so a cancel token
+    is not a mutable supplier object. The owner file is also sha-pinned by
+    reviewed-full-source-guards.json, so this shape cannot drift unreviewed.
+    """
+    if unit is None or unit.path != _reserve_CANCEL_TOKEN_OWNER_PATH:
+        return False
+    token = _reserve_node_at(unit, "ComposerOperationCancel")
+    reason = _reserve_node_at(unit, "ComposerOperationCancelReason")
+    if not isinstance(token, ast.ClassDef) or not isinstance(reason, ast.ClassDef):
+        return False
+    fields = [statement for statement in token.body if isinstance(statement, ast.AnnAssign)]
+    methods = {statement.name for statement in token.body if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return (
+        [ast.unparse(decorator) for decorator in token.decorator_list] == ["final", "dataclass(frozen=True, slots=True)"]
+        and not token.bases
+        and not token.keywords
+        and [ast.unparse(field) for field in fields] == ["reason: ComposerOperationCancelReason"]
+        and len(token.body) == len(fields) + len(methods)
+        and methods <= {"__post_init__"}
+        and [ast.unparse(base) for base in reason.bases] == ["Enum"]
+        and all(
+            isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Constant) and type(statement.value.value) is str
+            for statement in reason.body
+        )
+    )
 
 
 def _reserve_cancel_route_failures(sources):
@@ -21520,6 +21557,7 @@ class _reserve_ReserveProof:
                     protected_owned_functions.add(qualified)
                 else:
                     failures.append("selected owned supplier export is missing " + path + ":" + symbol)
+        cancel_tokens_immutable = _reserve_cancel_tokens_are_immutable(self.indexed.get(_reserve_CANCEL_TOKEN_OWNER_PATH))
         for consumer_path in _reserve_CANCEL_CONSUMERS:
             consumer = self.indexed.get(consumer_path)
             if consumer is None:
@@ -22784,7 +22822,8 @@ class _reserve_ReserveProof:
                         and unit.path in _reserve_CANCEL_CONSUMERS
                         and hashlib.sha256(unit.source.encode("utf-8")).hexdigest() == _reserve_CANCEL_CONSUMERS[unit.path]
                     )
-                    if unit.path != object_path and not reviewed_cancel_consumer:
+                    immutable_cancel_token = object_kind == "cancel-token" and cancel_tokens_immutable
+                    if unit.path != object_path and not reviewed_cancel_consumer and not immutable_cancel_token:
                         failures.append("selected mutable supplier object escape " + unit.path)
                 if isinstance(n, (ast.Name, ast.Attribute, ast.Call)) and recovered_selected_classes(n, n) & (
                     protected_owned_classes.keys() | frozen_qualified
@@ -23193,6 +23232,8 @@ class _reserve_ReserveProof:
                         if (
                             isinstance(parent, ast.Subscript)
                             or (isinstance(parent, ast.Compare) and all(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops))
+                            # Iterating the dictionary yields its keys, exactly as the admitted .keys() view does.
+                            or (isinstance(parent, ast.comprehension) and parent.iter is n)
                             or (
                                 isinstance(parent, ast.Attribute)
                                 and parent.attr in {"get", "values", "items", "keys"}
@@ -32410,6 +32451,9 @@ def test_non_landscape_receiver_owners_are_pinned_to_the_tree() -> None:
     [
         ("Bounds", "return selected.reserve + 1.0", True),
         ("Bounds", "return 1.0 + selected.reserve", True),
+        ("Bounds", 'return f"{selected.reserve:g} s"', True),
+        ("RequiredWorkCoordinator", 'return f"{selected.reserve}"', False),
+        ("", 'return f"{selected.reserve:g} s"', False),
         ("Bounds", "return selected.reserve", False),
         ("Bounds", "value = selected.reserve\n    return value", False),
         ("Bounds", "callback = selected.reserve\n    return callback(source)", False),
@@ -40565,6 +40609,39 @@ def _reserve_runtime_supplier_is_immutable(value: object) -> bool:
             continue
         return False
     return True
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "admitted"),
+    [
+        (None, None, True),
+        (
+            "@dataclass(frozen=True, slots=True)\nclass ComposerOperationCancel:",
+            "@dataclass(slots=True)\nclass ComposerOperationCancel:",
+            False,
+        ),
+        (
+            "@final\n@dataclass(frozen=True, slots=True)\nclass ComposerOperationCancel:",
+            "@dataclass(frozen=True, slots=True)\nclass ComposerOperationCancel:",
+            False,
+        ),
+        ("    reason: ComposerOperationCancelReason\n", "    reason: ComposerOperationCancelReason\n    note: list[str]\n", False),
+        (
+            "class ComposerOperationCancel:\n",
+            "class ComposerOperationCancel:\n    def __setattr__(self, name, value):\n        pass\n\n",
+            False,
+        ),
+        ("class ComposerOperationCancelReason(Enum):", "class ComposerOperationCancelReason:", False),
+    ],
+)
+def test_cancel_token_admission_requires_the_reviewed_frozen_shape(before: str | None, after: str | None, admitted: bool) -> None:
+    unit = next(unit for unit in _production_units() if unit.path == _reserve_CANCEL_TOKEN_OWNER_PATH)
+    source = unit.source
+    if before is not None:
+        assert after is not None and source.count(before) == 1
+        source = source.replace(before, after)
+    assert _reserve_cancel_tokens_are_immutable(_parse_source(unit.path, source)) is admitted
+    assert not _reserve_cancel_tokens_are_immutable(_parse_source("src/elspeth/web/other.py", unit.source))
 
 
 def test_closure_allowlist_drops_only_exact_reviewed_counts() -> None:
