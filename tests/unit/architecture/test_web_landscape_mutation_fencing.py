@@ -20461,6 +20461,41 @@ _reserve_IMMUTABLE_STDLIB_SUPPLIER_ORIGINS = frozenset({"datetime.datetime"})
 # supplier_structural_role). They are mutable, so they are not immutable origins.
 _reserve_TYPING_SUBSCRIPT_FORMS = frozenset({"typing.Required", "typing.NotRequired", "typing.Annotated"})
 
+# Reviewed allowlist for the whole-tree closure layer (maintainer ruling
+# 2026-11-01: "we fix what we can and whitelist/ignore what we can't"). A row is
+# keyed by (category, path, symbol) without its line, so unrelated edits do not
+# churn it, and each key carries its exact reviewed row count:
+# - observed count == reviewed count: those rows are allowlisted;
+# - observed count > reviewed count: every row of the key stays visible, because
+#   the new row cannot be told apart from the reviewed ones;
+# - observed count < reviewed count, for a path present in the analysed units:
+#   the entry is reported stale, so the allowlist shrinks as fixes land.
+# Rows that do not match the "<category> <path>:<line>[:<symbol>]" shape are
+# never allowlisted.
+_reserve_CLOSURE_ROW = re.compile(r"^(?P<category>.+?) (?P<path>src/\S+?\.py):\d+(?::(?P<symbol>\S+))?$")
+_reserve_CLOSURE_ALLOWLIST = {
+    (entry["category"], entry["path"], entry["symbol"]): entry["count"]
+    for entry in _reserve_json.loads((_reserve_BASE / "reviewed-closure-allowlist.json").read_text())["entries"]
+}
+
+
+def _reserve_apply_closure_allowlist(failures, unit_paths, allowlist=None):
+    """Drop exactly-reviewed closure rows; keep every other row; report stale entries."""
+    allowlist = _reserve_CLOSURE_ALLOWLIST if allowlist is None else allowlist
+    keyed = [(failure, _reserve_CLOSURE_ROW.match(failure)) for failure in failures]
+    observed = Counter((match["category"], match["path"], match["symbol"]) for _failure, match in keyed if match is not None)
+    kept = [
+        failure
+        for failure, match in keyed
+        if match is None or observed[key := (match["category"], match["path"], match["symbol"])] != allowlist.get(key)
+    ]
+    stale = [
+        f"closure allowlist entry is stale: {category} {path}:{symbol} reviewed {count} observed {observed[(category, path, symbol)]}"
+        for (category, path, symbol), count in sorted(allowlist.items(), key=lambda item: (item[0][1], item[0][0], item[0][2] or ""))
+        if path in unit_paths and observed[(category, path, symbol)] < count
+    ]
+    return [*kept, *stale]
+
 
 def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
@@ -21255,6 +21290,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     origin_failures.extend(_reserve_yaml_serializer_use_failures(yaml_adapter, protected_uses))
     if origin_diagnostics is not None:
         origin_diagnostics.finish("yaml-use-join", origin_failures, yaml_start)
+    origin_failures = _reserve_apply_closure_allowlist(origin_failures, frozenset(unit.path for unit in units))
     if origin_failures:
         return _reserve_ProtectedBoundary(origin_failures, (), (), (), (), qualified_owner_stores)
     iteration_class_uses = frozenset(
@@ -40438,6 +40474,46 @@ def _reserve_runtime_supplier_is_immutable(value: object) -> bool:
             continue
         return False
     return True
+
+
+def test_closure_allowlist_drops_only_exact_reviewed_counts() -> None:
+    allowlist = {("cat a", "src/elspeth/x.py", None): 2, ("cat b", "src/elspeth/y.py", "pkg.Sym"): 1}
+    reviewed = ["cat a src/elspeth/x.py:10", "cat a src/elspeth/x.py:20", "cat b src/elspeth/y.py:5:pkg.Sym"]
+    paths = frozenset({"src/elspeth/x.py", "src/elspeth/y.py"})
+    # Exact counts: every reviewed row is dropped, even after its line moved.
+    moved = ["cat a src/elspeth/x.py:11", "cat a src/elspeth/x.py:21", "cat b src/elspeth/y.py:9:pkg.Sym"]
+    assert _reserve_apply_closure_allowlist(reviewed, paths, allowlist) == []
+    assert _reserve_apply_closure_allowlist(moved, paths, allowlist) == []
+    # One more row under a reviewed key surfaces every row of that key.
+    extra = [*reviewed, "cat a src/elspeth/x.py:30"]
+    assert _reserve_apply_closure_allowlist(extra, paths, allowlist) == [
+        "cat a src/elspeth/x.py:10",
+        "cat a src/elspeth/x.py:20",
+        "cat a src/elspeth/x.py:30",
+    ]
+    # A new key, another symbol, or an unrecognised shape is never allowlisted.
+    novel = ["cat c src/elspeth/x.py:1", "cat b src/elspeth/y.py:5:pkg.Other", "unshaped failure"]
+    assert _reserve_apply_closure_allowlist([*reviewed, *novel], paths, allowlist) == novel
+    # A fixed row makes its entry stale only when that path was analysed.
+    fixed = reviewed[1:]
+    assert _reserve_apply_closure_allowlist(fixed, paths, allowlist) == [
+        "cat a src/elspeth/x.py:20",
+        "closure allowlist entry is stale: cat a src/elspeth/x.py:None reviewed 2 observed 1",
+    ]
+    assert _reserve_apply_closure_allowlist(reviewed[2:], frozenset({"src/elspeth/y.py"}), allowlist) == []
+
+
+def test_closure_allowlist_data_is_reviewed_and_unique() -> None:
+    entries = _reserve_json.loads((_reserve_BASE / "reviewed-closure-allowlist.json").read_text())["entries"]
+    keys = [(entry["category"], entry["path"], entry["symbol"]) for entry in entries]
+    assert len(keys) == len(set(keys)) == len(_reserve_CLOSURE_ALLOWLIST)
+    for entry in entries:
+        assert type(entry["count"]) is int and entry["count"] > 0, entry
+        assert type(entry["reason"]) is str and entry["reason"].strip(), entry
+        assert entry["path"].startswith("src/elspeth/") and entry["path"].endswith(".py"), entry
+        assert _reserve_CLOSURE_ROW.match(f"{entry['category']} {entry['path']}:1" + (f":{entry['symbol']}" if entry["symbol"] else "")), (
+            entry
+        )
 
 
 def test_immutable_stdlib_supplier_origins_are_actually_immutable() -> None:
