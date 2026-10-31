@@ -12,6 +12,7 @@ import ast
 import pytest
 from tests.helpers.web_reserve_retention import RetentionGraph, RetentionState, consumer_combinations
 from tests.unit.architecture import test_web_landscape_mutation_fencing as fencing
+from tests.unit.architecture.test_web_reserve_reviewed_contracts import _RETENTION_FIXPOINT_COMPANION_PATHS
 
 
 def _probe(source):
@@ -19,10 +20,15 @@ def _probe(source):
 
 
 def _run(probe):
-    supplier_path = "src/elspeth/contracts/prompt_guard.py"
-    supplier = fencing._parse_source(supplier_path, (fencing._repo_root() / supplier_path).read_text())
+    # A supplier root makes the proof require its fixed supplier-role record
+    # facts (CapabilityDeclaration among them). With their owner modules absent
+    # it fails closed before any retention root is evaluated, so these probes
+    # would observe nothing. Supply the same reviewed companion owners as the
+    # reviewed-contracts retention fixtures; the probe stays the only new unit.
+    paths = ("src/elspeth/contracts/prompt_guard.py", *_RETENTION_FIXPOINT_COMPANION_PATHS)
+    supplier, *companions = (fencing._parse_source(path, (fencing._repo_root() / path).read_text()) for path in paths)
     return fencing._reserve_selected_origin_effect_failures(
-        (supplier, probe),
+        (supplier, probe, *companions),
         additional_supplier_roots=frozenset({"elspeth.contracts.prompt_guard.PromptGuardTrust"}),
     )
 
