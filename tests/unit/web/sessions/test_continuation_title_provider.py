@@ -37,6 +37,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_work
 from tests.helpers.continuation_memo import RetentionMemoTrace, UncachedValidationBudget
+from tests.helpers.continuation_policy import OBSERVED_TITLE_TRIAL_RETENTION_SECONDS, observed_sql_trial_policy
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
@@ -59,6 +60,20 @@ def raw_reply(model, content="Original Café Session Title"):
             }
         ],
         usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+    )
+
+
+def seed_observed_title_trial_policy(monkeypatch):
+    """Admit the next ``title_case`` seed under the TITLE observer-trial policy.
+
+    The retained admission policy clocks the TITLE stages. An observer trial
+    opened before the TITLE provider runs its TITLE retention under the
+    observer's profile hook, so it needs the measured observer allowance
+    (tests/helpers/continuation_policy.py) instead of the production 5 s bound.
+    """
+    monkeypatch.setattr(
+        "tests.unit.web.sessions.test_continuation_initialization.minimal_continuation_policy",
+        lambda: observed_sql_trial_policy(title_retention_seconds=OBSERVED_TITLE_TRIAL_RETENTION_SECONDS),
     )
 
 
@@ -109,6 +124,7 @@ def observer(monkeypatch, *, build_inputs=None):
 async def test_actual_title_success_retains_original_full_response_and_single_accounting_without_title_write(
     operation_store, tmp_path, monkeypatch, content, request
 ):
+    seed_observed_title_trial_policy(monkeypatch)
     running, service, work, prepared, guard_requests = await title_case(operation_store, tmp_path, monkeypatch)
     expected_request = deep_thaw(prepared.request.kwargs)
     assert prepared.request.kwargs["messages"] is prepared.request.audit_messages

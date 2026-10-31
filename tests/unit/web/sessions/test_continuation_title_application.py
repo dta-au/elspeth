@@ -37,7 +37,7 @@ from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from elspeth.web.sessions.protocol import SessionRecord
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.continuation_inventory import inventory_work
-from tests.helpers.continuation_memo import RetentionMemoTrace
+from tests.helpers.continuation_memo import RetentionMemoTrace, UncachedValidationBudget
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted
 from tests.unit.web.coordination import test_composer_operation_authority as operations
 from tests.unit.web.coordination.test_continuation_p4_recovery_start import new_owners
@@ -45,6 +45,33 @@ from tests.unit.web.sessions.test_continuation_ingress import recovery_rows
 from tests.unit.web.sessions.test_continuation_title_provider import actual_title_update, observer, raw_reply, sql_rows, title_case
 
 operation_store = operations.operation_store
+
+
+def _title_application_budgets(title):
+    """Declared upper bounds for one paid TITLE application stage's uncached validation.
+
+    Exact counts measured on Python 3.13 on 2026-11-01 (invocations, attempts,
+    input characters), never padded. Every arm re-validates the settled TITLE
+    call's diagnostic correlation metadata and provider context text alike;
+    ``applied_title_decision`` (ready replay's re-derivation) reaches its
+    credential scan only for an accepted title. Re-measure if the paid TITLE
+    fixture or its audit changes.
+    """
+    return (
+        UncachedValidationBudget(1, 3, 18, 690, validator="diagnostic_correlation_metadata"),
+        UncachedValidationBudget(1, 1, 2, 822, validator="provider_context_message_text"),
+        UncachedValidationBudget(1, *title, validator="applied_title_decision"),
+    )
+
+
+# Per-arm applied_title_decision totals, keyed by the paid TITLE content.
+_APPLIED_TITLE_DECISION = {
+    "Original Café Session Title": (1, 1, 27),
+    "Rejected/Title Candidate": (1, 1, 24),
+    None: (1, 0, 0),
+    "": (1, 0, 0),
+    "Rejected! Title Candidate": (1, 0, 0),
+}
 
 
 async def paid_title(store, tmp_path, monkeypatch, content="Original Café Session Title"):
@@ -168,7 +195,7 @@ async def test_paid_title_application_preserves_original_result_and_applies_exac
         )
         assert next_continuation_action_policy(selected=structural, policy=policy) == policy.actions.session_sql
         work.coordinator.assert_completed()
-        memo_trace.finish(stages=1)
+        memo_trace.finish(stages=1, uncached_validation_limits=_title_application_budgets(_APPLIED_TITLE_DECISION[content]))
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -200,7 +227,7 @@ async def test_title_retention_postwrite_read_error_clears_memo_and_preserves_co
         assert caught.value is marker and len(read_results) == 1
         assert recovery_rows(operation_store[0]) == committed_rows[0] and len(sdk) == 1
         work.coordinator.assert_completed()
-        memo_trace.assert_closed(stages=1)
+        memo_trace.assert_closed(stages=1, uncached_validation_limits=_title_application_budgets((1, 1, 27)))
         retry_work = inventory_work(running)
         replay = await application.apply_current_title_success(service=service, selected=read_results[0].selected, required_work=retry_work)
         assert replay.applied and replay.selected == read_results[0].selected
@@ -209,7 +236,8 @@ async def test_title_retention_postwrite_read_error_clears_memo_and_preserves_co
         assert recovery_rows(operation_store[0]) == committed_rows[0]
         assert len(sdk) == 1
         retry_work.coordinator.assert_completed()
-        memo_trace.finish(stages=1)
+        # Measured: the replay adds no uncached validation; finish sees the totals closed above.
+        memo_trace.finish(stages=1, uncached_validation_limits=_title_application_budgets((1, 1, 27)))
     finally:
         operation_store[1].release(running.session_operation_context)
 
