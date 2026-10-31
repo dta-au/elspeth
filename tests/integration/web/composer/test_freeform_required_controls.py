@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -58,6 +60,7 @@ from tests.integration.web.composer.test_freeform_proposal_prevalidation import 
     _ScriptedLLM,
     _tool_turn,
 )
+from tests.unit.web.composer.conftest import _fake_llm_response
 from tests.unit.web.composer.test_planner_authoring_aids import (
     _catalog_with_llm_source,
     _compiler_manager_with_llm_source,
@@ -154,6 +157,22 @@ def _required_textract_policy(tmp_path: Path) -> tuple[PolicyCatalogView, Plugin
     return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
+@contextmanager
+def _request_policy(service: Any, view: PolicyCatalogView, snapshot: PluginAvailabilitySnapshot) -> Iterator[None]:
+    """Bind one request-scoped policy to both owners a compose turn consults.
+
+    The tool/catalog policy context and the runtime-preflight profile registry
+    come from the same deployment settings in production. Patching only the
+    former leaves preflight resolving profiles from the harness settings, which
+    configure no Textract/LLM profile, so every candidate would fail preflight.
+    """
+    with (
+        patch.object(service._policy_context, "build", return_value=(snapshot, view)),
+        patch.object(service._preflight, "_operator_profile_registry", view._profiles),
+    ):
+        yield
+
+
 def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
     return {
         "source": {
@@ -243,6 +262,46 @@ def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
         ],
         "metadata": {"name": "Textract summary", "description": "Extract, summarise, and shape one document."},
     }
+
+
+# Sites the orphaned-handoff repair names for these candidates, as
+# (kind, affected_node_id, user_term). The server stages the rows; the
+# planner owns the request_interpretation_review call for each one
+# (see test_compose_loop_interpretation_review_dispatch).
+_INLINE_SOURCE_SITE = ("invented_source", "source", "inline_source_data")
+_AUTO_WIRED_SITES = (
+    ("pipeline_decision", "prompt_shield_auto_1", REQUIRED_CONTROL_AUTO_WIRED_USER_TERM),
+    ("pipeline_decision", "content_safety_auto_1", REQUIRED_CONTROL_AUTO_WIRED_USER_TERM),
+)
+
+
+# The planner's prose replies when runtime preflight reports required-control
+# coverage on a live state the user did not ask to complete here (an
+# incomplete draft, or the unchanged base behind a staged proposal). The
+# repair notice itself says to answer such a request without editing. The
+# preflight repair spends its whole budget (_MAX_REPAIR_TURNS == 2) even after
+# a prose decline, so the turn needs two replies before the final "Done.".
+_PREFLIGHT_EXPLANATIONS = tuple(
+    _fake_llm_response(content="The live draft is not complete yet, so the required controls are not wired into it.") for _ in range(2)
+)
+
+
+def _review_turn(call_id_prefix: str, *sites: tuple[str, str, str]) -> Any:
+    """The planner's reply to the orphaned-handoff repair: one review request per site.
+
+    llm_draft is omitted, as the repair instruction requires; the server
+    resolves each staged draft itself.
+    """
+    return _fake_llm_response(
+        tool_calls=tuple(
+            {
+                "id": f"{call_id_prefix}_{index}",
+                "name": "request_interpretation_review",
+                "arguments": {"affected_node_id": node_id, "kind": kind, "user_term": user_term},
+            }
+            for index, (kind, node_id, user_term) in enumerate(sites, 1)
+        )
+    )
 
 
 def _node_plugins(candidate: dict[str, Any]) -> list[str]:
@@ -383,7 +442,7 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     initial_state = _incremental_base_state(tmp_path)
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
     ):
         result = await harness.service.compose(
@@ -459,10 +518,11 @@ async def test_auto_commit_persists_auto_wired_textract_state_and_disclosure(tmp
     llm = _ScriptedLLM(
         harness.service,
         _tool_turn("call_required_controls_auto", "set_pipeline", original),
+        _review_turn("call_review_auto", _INLINE_SOURCE_SITE, *_AUTO_WIRED_SITES),
     )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
     ):
         result = await harness.service.compose(
@@ -527,10 +587,15 @@ async def test_auto_commit_does_not_wire_an_incomplete_set_pipeline_candidate(tm
     )
     incomplete = _textract_llm_mapper_args(tmp_path)
     incomplete["outputs"] = []
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_incomplete", "set_pipeline", incomplete))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_incomplete", "set_pipeline", incomplete),
+        _review_turn("call_review_incomplete", _INLINE_SOURCE_SITE),
+        *_PREFLIGHT_EXPLANATIONS,
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -570,10 +635,14 @@ async def test_auto_commit_does_not_duplicate_already_covered_controls(tmp_path:
     for node in covered["nodes"]:
         if node["plugin"] in {"aws_bedrock_prompt_shield", "aws_bedrock_content_safety"}:
             del node["options"][INTERPRETATION_REQUIREMENTS_KEY]
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_already_covered", "set_pipeline", covered))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_already_covered", "set_pipeline", covered),
+        _review_turn("call_review_covered", _INLINE_SOURCE_SITE),
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -612,10 +681,14 @@ async def test_auto_commit_wires_controls_when_set_output_completes_incremental_
         view=view,
         snapshot=snapshot,
     )
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_complete_with_output", "set_output", output))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_complete_with_output", "set_output", output),
+        _review_turn("call_review_complete_with_output", *_AUTO_WIRED_SITES),
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
     ):
         result = await harness.service.compose(
@@ -660,10 +733,14 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
         view=view,
         snapshot=snapshot,
     )
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_review_incremental_completion", "set_output", output))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_review_incremental_completion", "set_output", output),
+        *_PREFLIGHT_EXPLANATIONS,
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
     ):
         result = await harness.service.compose(
@@ -720,10 +797,14 @@ async def test_auto_commit_wires_incremental_named_blob_sources_without_public_r
         snapshot=snapshot,
         source_count=2,
     )
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_complete_named_sources", "set_output", output))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_complete_named_sources", "set_output", output),
+        _review_turn("call_review_named_sources", *_AUTO_WIRED_SITES),
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
     ):
         result = await harness.service.compose(
@@ -838,9 +919,13 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
             session_engine=sessions._engine,
         )
     app.state.composer_service = composer
-    llm = _ScriptedLLM(composer, _tool_turn(f"call_review_{source_count}_blob_sources", "set_output", output))
+    llm = _ScriptedLLM(
+        composer,
+        _tool_turn(f"call_review_{source_count}_blob_sources", "set_output", output),
+        *_PREFLIGHT_EXPLANATIONS,
+    )
     with (
-        patch.object(composer._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(composer, view, snapshot),
         patch("litellm.acompletion", new=llm),
         patch.object(composer._advisor_checkpoint, "_run_advisor_checkpoint", new=_clean_advisor_checkpoint),
     ):
@@ -914,10 +999,14 @@ async def test_auto_commit_does_not_wire_incremental_mutation_while_pipeline_is_
         view=view,
         snapshot=snapshot,
     )
-    llm = _ScriptedLLM(harness.service, _tool_turn("call_still_incomplete", "set_metadata", {"patch": {"name": "Still incomplete"}}))
+    llm = _ScriptedLLM(
+        harness.service,
+        _tool_turn("call_still_incomplete", "set_metadata", {"patch": {"name": "Still incomplete"}}),
+        *_PREFLIGHT_EXPLANATIONS,
+    )
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         patch(
             "elspeth.web.composer.tool_batch.wire_required_controls",
@@ -962,7 +1051,7 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     failure = RuntimeError("private incremental finalizer failure detail")
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls_state", side_effect=failure) as finalizer,
@@ -1008,7 +1097,7 @@ async def test_incremental_owned_state_projection_failure_does_not_publish_propo
     failure = RuntimeError("private owned-state projection failure detail")
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.owned_composition_state_authority", side_effect=failure) as projector,
@@ -1060,7 +1149,7 @@ async def test_required_control_finalizer_failure_is_audited_without_publication
     initial_state = _incremental_base_state(tmp_path)
 
     with (
-        patch.object(harness.service._policy_context, "build", return_value=(snapshot, view)),
+        _request_policy(harness.service, view, snapshot),
         patch("litellm.acompletion", new=llm),
         _record_phase3_outcomes(harness.service) as outcome_batches,
         patch("elspeth.web.composer.tool_batch.wire_required_controls", side_effect=failure) as finalizer,
