@@ -182,7 +182,7 @@ async def test_mounted_owned_projection_domain_preserves_existing_redaction_and_
     if domain == "retryable_storage":
         assert response.status_code == 503 and response.json()["error_type"] == "storage_unavailable"
     elif domain in ("generation", "admission"):
-        assert response.status_code == 503 and response.json()["error_type"] == "database_unavailable"
+        assert response.status_code == 503 and response.json()["error_type"] == "executor_unavailable"
     else:
         assert response.status_code == 500 and response.json()["detail"]["error_type"] == "operation_failed"
     assert request_id in response.text

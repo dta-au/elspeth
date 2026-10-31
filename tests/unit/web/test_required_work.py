@@ -537,8 +537,8 @@ def test_generation_operational_rank_and_exact_safe_envelope(authority, owned):
     error = reduction.project(request_id="correlation", timeout_seconds=10)
     assert error.http_status == 503
     assert error.body == {
-        "detail": "Database is currently unavailable. Please retry in a moment.",
-        "error_type": "database_unavailable",
+        "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+        "error_type": "executor_unavailable",
         "request_id": "correlation",
     }
 
