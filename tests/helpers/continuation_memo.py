@@ -301,10 +301,28 @@ _STRUCTURE_MONITOR_API = (
     ("register_callback", sys.monitoring.register_callback),
 )
 _STRUCTURE_CODES[id(_STRUCTURE_ENGINE_CONFIGURE)] = (_STRUCTURE_ENGINE_CONFIGURE, "connection_setup")
-_STRUCTURE_SITES = {
-    function.__code__: {instruction.offset: instruction.opname for instruction in dis.get_instructions(function.__code__)}
-    for function, _role in _STRUCTURE_ROLES
-}
+
+
+def _structure_instruction_sites(code: CodeType) -> dict[int, str]:
+    """Each instruction at its start offset and at the last unit of its inline caches.
+
+    Python 3.12 reports ``f_lasti`` at an instruction's final CACHE unit when an
+    exception unwinds through it (``prev_instr`` has already passed the caches);
+    3.13 reports the instruction start. A cache unit belongs to exactly one
+    instruction, and no return or yield instruction carries caches, so the extra
+    key can only resolve an unwind to the instruction that actually raised.
+    """
+    instructions = list(dis.get_instructions(code))
+    sites: dict[int, str] = {}
+    for current, following in zip(instructions, [*instructions[1:], None], strict=True):
+        sites[current.offset] = current.opname
+        end = len(code.co_code) if following is None else following.offset
+        if end - current.offset > 2:
+            sites[end - 2] = current.opname
+    return sites
+
+
+_STRUCTURE_SITES = {function.__code__: _structure_instruction_sites(function.__code__) for function, _role in _STRUCTURE_ROLES}
 _STRUCTURE_FUNCTION_CODES = tuple((function, function.__code__) for function, _role in _STRUCTURE_ROLES) + tuple(
     (function, function.__code__)
     for function in (
