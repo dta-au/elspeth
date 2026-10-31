@@ -36,6 +36,10 @@ from elspeth.web.sessions.protocol import CompositionStateData, CompositionValid
 from tests.unit.web.composer.test_applied_component_echo import _empty_state, _json_output_arguments, _run, _state_with_source
 
 NOW = datetime(2026, 10, 23, 12, 15, tzinfo=UTC)
+# The class-only rejection ``turn_audit`` derives from a thrown dispatch.
+CRASH_REJECTION = RejectionRecord(
+    "call-1", "get_plugin_schema", "ValueError", "ValueError", json.dumps({"error_class": "ValueError", "error_message": "ValueError"})
+)
 
 
 def prepared_input(*, graph=True, output_url=None, env_ref_names=frozenset(), raw_arguments=None, nodes=()):
@@ -56,18 +60,23 @@ def prepared_input(*, graph=True, output_url=None, env_ref_names=frozenset(), ra
             call_id, tool, arguments, None, raw_arguments if raw_arguments is not None else '{ "reason": "retained authoring" }'
         )
         failure = None if index == 0 else PrivateFailureFacts(canonical_json({"error_class": "ValueError", "detail": "bounded failure"}))
+        # Index 1 is the thrown Discovery dispatch in the shape the actual
+        # crash producer (``audit.plugin_crash_invocation``) records: no
+        # response envelope, no version_after, class-only public message.
+        crashed = index == 1
+        source_result = None if crashed else result
         invocation = ComposerToolInvocation(
             tool_call_id=call_id,
             tool_name=tool,
             arguments_canonical=arguments,
             arguments_hash=sha256(arguments.encode()).hexdigest(),
-            result_canonical=result,
-            result_hash=sha256(result.encode()).hexdigest(),
-            status=ComposerToolStatus.SUCCESS if index == 0 else ComposerToolStatus.PLUGIN_CRASH,
-            error_class=None if index == 0 else "ValueError",
-            error_message=None if index == 0 else "exact failure",
+            result_canonical=source_result,
+            result_hash=None if crashed else sha256(result.encode()).hexdigest(),
+            status=ComposerToolStatus.PLUGIN_CRASH if crashed else ComposerToolStatus.SUCCESS,
+            error_class="ValueError" if crashed else None,
+            error_message="ValueError" if crashed else None,
             version_before=3,
-            version_after=4 if index == 0 and graph else 3,
+            version_after=None if crashed else (4 if graph else 3),
             started_at=NOW,
             finished_at=NOW,
             latency_ms=13,
@@ -129,7 +138,7 @@ def prepared_input(*, graph=True, output_url=None, env_ref_names=frozenset(), ra
                 tool_name=tool,
                 status=invocation.status.value,
                 arguments_canonical=arguments,
-                result_canonical=result,
+                result_canonical=source_result,
                 raw_arguments=authoring.raw_arguments,
             )
         )
@@ -165,7 +174,7 @@ def prepared_input(*, graph=True, output_url=None, env_ref_names=frozenset(), ra
         authority_revocation=revocation,
         private_tool_evidence=tuple(evidence),
         private_tool_failures=tuple(failures),
-        rejection_records=(RejectionRecord("call-1", "get_plugin_schema", "plugin_failure", "exact refusal", rows[1].content),),
+        rejection_records=(CRASH_REJECTION,),
         withheld_replies=(WithheldReply("planner_prose_unadmitted", "unpublished model words"),),
         invocations=tuple(invocations),
         authorings=tuple(authorings),
@@ -198,7 +207,7 @@ def test_complete_p4_preserves_real_rows_refusal_audit_and_private_cohorts():
     assert members.redacted_rows[0].composition_state_payload.derived_from_state_id == "parent-state"
     assert members.redacted_rows[0].composition_state_payload.data.composer_meta["nested"]["ordered"] == ("b", "a")
     assert members.withheld_replies == (WithheldReply("planner_prose_unadmitted", "unpublished model words"),)
-    assert members.rejection_records[0].planner_payload == rows[1].content
+    assert members.rejection_records == (CRASH_REJECTION,)
     assert restored.parent_composition_state_id == "parent-state"
     assert restored.expected_current_state_id == "selected-state"
     assert not restored.assistant_row_uses_current_dispatch
@@ -405,7 +414,7 @@ def test_visible_payload_closed_shape_is_required_even_with_a_matching_digest():
         encode_prepared_p4(value.model_copy(update={"redacted_rows_json": encoded_rows, "revoked_rows_json": encoded_rows}))
 
 
-def actual_result_input(tool, arguments, result, *, env_ref_names=frozenset()):
+def actual_result_input(tool, arguments, result, *, env_ref_names=frozenset(), rejection_records=()):
     """Actual owned result -> selected response -> actual public/private owners."""
     context = SessionOperationContext(SessionOperationFence("session", "creator", "fixture-lease", 7), SessionOperationKind.COMPOSE)
     arguments_json = canonical_json(arguments)
@@ -478,7 +487,7 @@ def actual_result_input(tool, arguments, result, *, env_ref_names=frozenset()):
         authority_revocation=None,
         private_tool_evidence=(private,),
         private_tool_failures=(),
-        rejection_records=(),
+        rejection_records=rejection_records,
         withheld_replies=(),
         invocations=(invocation,),
         authorings=(authoring,),

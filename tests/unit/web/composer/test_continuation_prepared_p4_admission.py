@@ -24,14 +24,15 @@ from elspeth.web.composer.continuation_result_credentials import (
 )
 from elspeth.web.composer.continuation_tool_batch import decode_tool_result_value, encode_tool_result_value
 from elspeth.web.composer.diagnostic_evidence import build_private_tool_evidence
+from elspeth.web.composer.discovery_cache import serialize_tool_result
 from elspeth.web.composer.discovery_response import admit_discovery_result
 from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.composer.visible_tool_event import VisibleToolEvent
 from elspeth.web.credential_guard import CredentialMaterialRefused
-from elspeth.web.sessions._persist_payload import RedactedToolRow
-from tests.unit.web.composer.test_applied_component_echo import _empty_state
-from tests.unit.web.composer.test_continuation_prepared_p4 import actual_result_input, prepared_input, schema_result
+from elspeth.web.sessions._persist_payload import RedactedToolRow, RejectionRecord
+from tests.unit.web.composer.test_applied_component_echo import _empty_state, _run
+from tests.unit.web.composer.test_continuation_prepared_p4 import actual_result_input, schema_result
 
 
 def _context():
@@ -198,9 +199,25 @@ def test_failed_source_field_mapper_intent_does_not_gain_transform_projection():
         _arg_error_input("upsert_node", node, raw_arguments=canonical_json(unsafe))
 
 
+def _validation_rejection_input():
+    """A real refused mutation and the rejection ``turn_audit`` derives from it.
+
+    The dispatch completed (SUCCESS) with a semantic ``success=False`` result;
+    only that ordinary rejection carries a free error code. A thrown dispatch's
+    rejection is pinned to its class (test_continuation_prepared_crash_rejection).
+    """
+    arguments = {"plugin": "no_such_plugin", "on_success": "rows", "options": {}}
+    result = _run("set_source", arguments, _empty_state())
+    assert result.success is False
+    primary = next(entry for entry in result.validation.errors if entry.error_code)
+    rejection = RejectionRecord("actual-call", "set_source", primary.error_code, primary.message, serialize_tool_result(result))
+    value, *_ = actual_result_input("set_source", arguments, result, rejection_records=(rejection,))
+    return value
+
+
 @pytest.mark.parametrize("error_code", [None, "ordinary_rejection"])
 def test_private_rejection_error_code_is_preserved_and_credential_checked(error_code):
-    value, *_ = prepared_input()
+    value = _validation_rejection_input()
     rejections = json.loads(value.rejection_records_json)
     rejections[0]["error_code"] = error_code
     clean = value.model_copy(update={"rejection_records_json": canonical_json(rejections)})

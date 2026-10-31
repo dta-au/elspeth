@@ -278,11 +278,25 @@ def test_withheld_origin_uses_its_closed_owner_and_cannot_retain_arbitrary_metad
 def test_existing_source_invocation_metadata_scan_remains_required(member):
     value, *_ = prepared_input(graph=False)
     audit = json.loads(value.source_audit_json)
-    audit["invocations"][1][member] = "ordinary-diagnostic-café"
-    clean = value.model_copy(update={"source_audit_json": canonical_json(audit)})
+    ordinary = "ordinary-diagnostic-café"
+    clean_update = {}
+    if member == "actor":
+        audit["invocations"][1][member] = ordinary
+    else:
+        # A thrown dispatch pins its class, class-only message and rejection
+        # together, so the clean positive changes the whole joined diagnostic.
+        audit["invocations"][1]["error_class"] = audit["invocations"][1]["error_message"] = ordinary
+        rejections = json.loads(value.rejection_records_json)
+        rejections[0].update(
+            error_code=ordinary, message=ordinary, planner_payload=json.dumps({"error_class": ordinary, "error_message": ordinary})
+        )
+        clean_update["rejection_records_json"] = canonical_json(rejections)
+    clean_update["source_audit_json"] = canonical_json(audit)
+    clean = value.model_copy(update=clean_update)
     _roundtrip(clean)
+    # The credential scan of each single member precedes every crash join.
     audit["invocations"][1][member] = CREDENTIAL_URI
-    _refuses_credentials(value.model_copy(update={"source_audit_json": canonical_json(audit)}))
+    _refuses_credentials(clean.model_copy(update={"source_audit_json": canonical_json(audit)}))
 
 
 def test_filtered_failure_evidence_does_not_admit_credential_bearing_original_diagnostic_metadata():
