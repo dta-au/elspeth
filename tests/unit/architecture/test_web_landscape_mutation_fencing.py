@@ -42,6 +42,7 @@ allowance.  The standalone ``register_run_leader`` wrapper is never admitted.
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import json as _reserve_json
 import re
@@ -23923,6 +23924,50 @@ def _reserve_run(units):
     }
 
 
+# Results of parameter-independent positive controls, keyed by exact input.
+# A parametrized proof test runs the same positive control for every
+# parameter; one `_reserve_run` costs ~390 s (measured 2026-11-01), so
+# recomputing it per parameter dominated the file's cost. A result holds only
+# paths, lines, symbols and strings, never AST node identities, so it is valid
+# for any tree that is equal to the one it was computed from.
+_reserve_POSITIVE_CONTROL_RUNS: dict[tuple[tuple[object, ...], ...], dict[str, object]] = {}
+_reserve_POSITIVE_CONTROL_LOOKUPS: list[tuple[str, tuple[tuple[object, ...], ...]]] = []
+
+
+def _reserve_positive_control_key(units):
+    """Canonical production units by identity; every other unit by path, source and full AST dump.
+
+    The AST dump makes an in-place mutation of a non-canonical tree miss, even
+    when its source text did not change. Canonical units are the shared
+    `_production_units()` objects, which no test may mutate (the existing
+    `@cache` already depends on that).
+    """
+    canonical = {unit.path: unit for unit in _production_units()}
+    return tuple(
+        ("canonical", unit.path, id(unit))
+        if canonical.get(unit.path) is unit
+        else ("source", unit.path, unit.source, ast.dump(unit.tree, include_attributes=True))
+        for unit in units
+    )
+
+
+def _reserve_run_positive_control(units):
+    """`_reserve_run` for a positive control whose input does not depend on the test's parameter.
+
+    Use it only for the parameter-independent positive control of a
+    parametrized test. A planted negative must always call `_reserve_run`
+    directly, so it is computed fresh.
+    """
+    units = tuple(units)
+    key = _reserve_positive_control_key(units)
+    hit = _reserve_POSITIVE_CONTROL_RUNS.get(key)
+    _reserve_POSITIVE_CONTROL_LOOKUPS.append(("miss" if hit is None else "hit", key))
+    if hit is None:
+        hit = _reserve_run(units)
+        _reserve_POSITIVE_CONTROL_RUNS[key] = hit
+    return copy.deepcopy(hit)
+
+
 def _mutation_callable_escapes(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     units = tuple(units)
     proof = _AuthorityProof(units)
@@ -39695,7 +39740,7 @@ def test_continuation_batch_data_receipt_refuses_changed_exact_role(before, afte
 )
 def test_continuation_batch_data_receipt_keeps_foreign_effects_unproved(addition):
     units = _production_units()
-    normal = _reserve_run(units)
+    normal = _reserve_run_positive_control(units)
     assert not normal["global_failures"], normal["global_failures"]
     assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
     path = "src/elspeth/web/execution/service.py"
@@ -39749,7 +39794,7 @@ def test_continuation_batch_data_receipt_keeps_foreign_effects_unproved(addition
 )
 def test_continuation_batch_data_supplier_closure_refuses_external_effect(addition):
     units = _production_units()
-    normal = _reserve_run(units)
+    normal = _reserve_run_positive_control(units)
     assert not normal["global_failures"], normal["global_failures"]
     assert not normal["unproven_web_rows"], normal["unproven_web_rows"]
     failures, receipt = _reserve_continuation_batch_state_receipt(units)

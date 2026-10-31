@@ -2948,7 +2948,7 @@ def test_callback_consumers_keep_external_transfers_and_mutations_refused(additi
         "import elspeth.web.composer.prompt_guard_rendering as renderer\n"
     )
     # The exact same imports must first be compatible with the full proof.
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, imports)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, imports)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._parse_source(path, imports + addition)
@@ -3102,7 +3102,7 @@ def test_callback_definition_roles_do_not_waive_supplier_writes(addition):
     units = fencing._production_units()
     path = "src/elspeth/callback_role_adversary.py"
     imports = "import elspeth.web.composer.prompt_guard_rendering as renderer\nimport elspeth.contracts.prompt_guard as trust\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, imports)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, imports)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     refused = fencing._reserve_ReserveProof((*units, fencing._parse_source(path, imports + addition)))
@@ -3178,7 +3178,7 @@ def test_nominal_yaml_serializer_keeps_canonical_supplier_mutation_refused(effec
     units = fencing._production_units()
     path = "src/elspeth/yaml_serializer_adversary.py"
     imports = "import elspeth.web.composer.yaml_serializer as adapter\nimport elspeth.web.composer.yaml_generator as actual\nimport yaml as serializer_library\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, imports)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, imports)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._parse_source(path, imports + effect + "\n")
@@ -3200,7 +3200,7 @@ def test_new_canonical_supplier_first_class_transfers_stay_refused(effect):
     units = fencing._production_units()
     path = "src/elspeth/new_supplier_role_adversary.py"
     imports = "import json\nfrom collections.abc import Mapping\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, imports)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, imports)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._parse_source(path, imports + effect + "\n")
@@ -3321,7 +3321,7 @@ def test_nominal_consumption_keeps_unknown_transfer_and_mutation_denials(effect)
     source = "from collections.abc import Mapping\ndef check(value):\n    return isinstance(value, Mapping)\n"
     units = fencing._production_units()
     normal = fencing._parse_source(path, source)
-    baseline = fencing._reserve_run((*units, normal))
+    baseline = fencing._reserve_run_positive_control((*units, normal))
     assert baseline["global_failures"] == []
     assert baseline["unproven_web_rows"] == []
     changed = fencing._parse_source(path, source + effect)
@@ -3360,7 +3360,7 @@ def test_wire_supplier_table_read_role_preserves_write_and_escape_refusal(effect
     )
     units = fencing._production_units()
     normal = fencing._parse_source(path, source)
-    baseline = fencing._reserve_run((*units, normal))
+    baseline = fencing._reserve_run_positive_control((*units, normal))
     assert baseline["global_failures"] == []
     assert baseline["unproven_web_rows"] == []
     changed = fencing._parse_source(path, source + effect)
@@ -3389,7 +3389,7 @@ def test_wire_supplier_table_read_role_preserves_write_and_escape_refusal(effect
 )
 def test_response_model_registration_requires_actual_constructor_and_receiver(before, after):
     units = fencing._production_units()
-    baseline = fencing._reserve_run(units)
+    baseline = fencing._reserve_run_positive_control(units)
     assert baseline["global_failures"] == []
     assert baseline["unproven_web_rows"] == []
     original = next(unit for unit in units if unit.path == "src/elspeth/web/catalog/routes.py")
@@ -3422,7 +3422,7 @@ def test_supported_type_aliases_do_not_export_supplier_metadata(effect):
         path,
         "from __future__ import annotations\nfrom elspeth.supplier_alias_holder import Held\ndef typed(value: Held) -> Held:\n    return value\n",
     )
-    baseline = fencing._reserve_run((*units, holder, clean))
+    baseline = fencing._reserve_run_positive_control((*units, holder, clean))
     assert baseline["global_failures"] == []
     assert baseline["unproven_web_rows"] == []
     changed = fencing._parse_source(path, effect)
@@ -3436,7 +3436,7 @@ def test_lazy_type_syntax_cannot_retain_an_imported_json_callable():
     path = "src/elspeth/supplier_callable_alias_probe.py"
     imports = "from collections.abc import Mapping\nfrom json import loads\n"
     normal = fencing._parse_source(path, imports + "type Held = list[Mapping]\n")
-    baseline = fencing._reserve_run((*units, normal))
+    baseline = fencing._reserve_run_positive_control((*units, normal))
     assert baseline["global_failures"] == []
     assert baseline["unproven_web_rows"] == []
     # No metadata read is needed to prove the declaration itself is refused.
@@ -3471,7 +3471,7 @@ def test_retained_canonical_enum_members_preserve_mutation_and_recovery_denials(
         "from elspeth.contracts.plugin_capabilities import PluginCapability\n"
         "def read():\n    member = PluginCapability.LLM\n    return member.name, member.value\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3504,7 +3504,7 @@ def test_registered_schema_recovery_is_not_a_mutable_class_permission(effect):
         "from elspeth.web.catalog.routes import catalog_router\n"
         "def read():\n    return catalog_router.routes[0].response_model.__args__[0].__name__\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3553,7 +3553,7 @@ def test_actual_enum_carrier_and_iteration_keep_selected_member_identity(effect)
         "def read():\n    box = CapabilityDeclaration(PluginCapability.LLM)\n    return box.capability.value\n"
         "names = [member.value for member in PluginCapability]\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3601,7 +3601,7 @@ def test_nominal_data_remains_data_but_does_not_export_its_mutable_class(effect)
         "value = PluginSummary(name='source', description='safe', plugin_type='source', config_fields=[])\n"
         "def read():\n    return value.name\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3630,7 +3630,7 @@ def test_canonical_cast_discards_only_its_complete_closed_type_operand(effect):
         "value = {}\nresult = cast(Mapping[str, object], value)\n"
         "type Held = list[Mapping]\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3654,7 +3654,7 @@ def test_recursive_lazy_type_declaration_retains_metadata_denial(effect):
         "type Tree = str | Mapping[str, Tree] | tuple[Tree, ...]\n"
         "def typed(value: Tree) -> Tree:\n    return value\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3672,7 +3672,7 @@ def test_recursive_lazy_type_declaration_retains_metadata_denial(effect):
 )
 def test_json_import_and_class_local_http_slot_are_distinct_bindings(before, after):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     source = next(unit for unit in units if unit.path == "src/elspeth/contracts/call_data.py")
@@ -3702,7 +3702,7 @@ def test_retained_enum_keys_and_known_callers_do_not_erase_capability_origin(eff
         "box = CapabilityDeclaration(PluginCapability.LLM)\n"
         "name = box.capability.value\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3739,7 +3739,7 @@ def test_actual_eager_annotation_recovery_preserves_supplier_mutation_denials(ef
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
         "name = annotation.__origin__.__name__\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3774,7 +3774,7 @@ def test_dataclass_field_iteration_does_not_erase_retained_type_identity(effect)
         "from elspeth.contracts.composer_mutation import ComposerMutationRevocation\n"
         "def read():\n    for field in fields(ComposerMutationRevocation):\n        name = field.name\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3801,7 +3801,7 @@ def test_metadata_container_keeps_complete_retained_leaf_origin(effect):
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
         "name = annotation.__origin__.__name__\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3828,7 +3828,7 @@ def test_metadata_identity_boolean_consumer_preserves_all_other_transfer_denials
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
         "result = _is_union(origin=annotation)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3850,7 +3850,7 @@ def test_redaction_iterator_and_nodes_are_retaining_not_json_consumers(effect):
     units = fencing._production_units()
     path = "src/elspeth/retained_redaction_node_probe.py"
     source = "from elspeth.web.composer.redaction import walk_model_schema, _RepairToolCallShadowModel\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3876,7 +3876,7 @@ def test_exact_sensitive_metadata_count_consumers_do_not_export_marker_callbacks
         "metadata = _RepairToolCallShadowModel.model_fields['arguments'].metadata\n"
         "present = _has_sensitive(metadata=metadata)\ncount = _count_sensitive(metadata)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3894,7 +3894,7 @@ def test_exact_sensitive_metadata_count_consumers_do_not_export_marker_callbacks
 )
 def test_metadata_scalar_receipt_checks_complete_executed_owner_and_marker_allocation(before, after):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     unit = next(unit for unit in units if unit.path == "src/elspeth/web/composer/redaction.py")
@@ -3930,7 +3930,7 @@ def test_complete_metadata_normalizers_retain_every_returned_and_destructured_id
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
         "normalized = _normalise(field_type=annotation, metadata=())\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -3949,7 +3949,7 @@ def test_complete_metadata_normalizers_retain_every_returned_and_destructured_id
 )
 def test_normalizer_receipt_refuses_new_effect_before_retained_return(effect):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     unit = next(unit for unit in units if unit.path == "src/elspeth/web/composer/redaction.py")
@@ -4012,7 +4012,7 @@ def test_metadata_query_factory_is_not_a_transferable_callback_permission(effect
         "query = attrgetter('__annotations__')\n"
         "name = query(owner)['attributes'].__origin__.__name__\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4065,7 +4065,7 @@ def test_expression_scopes_keep_enclosing_destructured_and_iteration_metadata(ef
         "    names = [inner for inner in ('ordinary',)]\n"
         "    name = inner.__origin__.__name__\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4097,7 +4097,7 @@ def test_manifest_name_projection_discards_only_complete_checked_scalar_result(e
         "special_name = _typing_special_form_name(value=annotation)\n"
         "ordinary_consumer(name, canonical_name, special_name)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4119,7 +4119,7 @@ def test_manifest_name_projection_discards_only_complete_checked_scalar_result(e
 )
 def test_manifest_scalar_receipt_requires_complete_body_and_literal_name_tables(before, after):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     unit = next(unit for unit in units if unit.path == "src/elspeth/contracts/runtime_val_manifest.py")
@@ -4152,7 +4152,7 @@ def test_actual_capability_identity_consumers_close_only_the_exact_enum_paramete
         "c = transform_plugin_has_capability(plugin, capability=PluginCapability.LLM)\n"
         "ordinary_consumer(a, b, c)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4172,7 +4172,7 @@ def test_actual_capability_identity_consumers_close_only_the_exact_enum_paramete
 )
 def test_enum_identity_consumer_receipt_refuses_complete_body_effect_or_retained_return(before, after):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     unit = next(unit for unit in units if unit.path == "src/elspeth/web/plugin_policy/coverage.py")
@@ -4284,7 +4284,7 @@ def test_plural_fields_allocation_receipt_keeps_foreign_receiver_and_class_escap
         "from elspeth.contracts.errors import DeclaredInputFieldAbsentViolation\n"
         "error = DeclaredInputFieldAbsentViolation(component='node', fields=('name',))\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4312,7 +4312,7 @@ def test_canonical_supplier_identity_operators_do_not_grant_overloaded_or_retain
         "d = isinstance(foreign, TypeAliasType)\ne = isinstance(foreign, UnionType)\nf = isinstance(foreign, ModuleType)\n"
         "ordinary_consumer(a, b, c, d, e, f)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4336,7 +4336,7 @@ def test_direct_derived_metadata_alias_cleanup_preserves_mutation_and_import_ref
         "from elspeth.contracts.events import _validate_engine_span_attributes\n"
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source + "del annotation\n")))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source + "del annotation\n")))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4439,7 +4439,7 @@ def test_retained_metadata_iteration_unpacking_refuses_ambiguous_or_effectful_ta
         "from elspeth.contracts.events import _validate_engine_span_attributes\n"
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
     )
-    normal = fencing._reserve_run(
+    normal = fencing._reserve_run_positive_control(
         (*units, fencing._parse_source(path, header + "for key, value in [(annotation, annotation)]:\n    pass\n"))
     )
     assert normal["global_failures"] == []
@@ -4466,7 +4466,7 @@ def test_retained_metadata_comprehension_unpacking_keeps_value_and_filter_refusa
         "from elspeth.contracts.events import _validate_engine_span_attributes\n"
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
     )
-    normal = fencing._reserve_run(
+    normal = fencing._reserve_run_positive_control(
         (*units, fencing._parse_source(path, header + "saved = [value for key, value in [(annotation, annotation)]]\n"))
     )
     assert normal["global_failures"] == []
@@ -4523,7 +4523,9 @@ def test_annotation_dictionary_view_grant_requires_actual_fresh_dictionary_and_d
         "from elspeth.contracts.events import _validate_engine_span_attributes as owner\n"
         "hints = get_type_hints(owner, include_extras=True)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, header + "for key, value in hints.items():\n    pass\n")))
+    normal = fencing._reserve_run_positive_control(
+        (*units, fencing._parse_source(path, header + "for key, value in hints.items():\n    pass\n"))
+    )
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, header + effect)))
@@ -4586,7 +4588,7 @@ def test_model_field_table_slot_replacement_cannot_hide_behind_unselected_model_
     source = (
         "from elspeth.core.config import ElspethSettings as owner\nfields = owner.model_fields\nannotation = fields['sources'].annotation\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect.replace("SLOT", slot))))
@@ -4614,7 +4616,7 @@ def test_unpacked_metadata_cannot_escape_through_implicit_lambda_return_or_defau
         "annotation = _validate_engine_span_attributes.__annotations__['attributes']\n"
     )
     normal_source = header + "saved = [value for key, value in [(annotation, annotation)]]\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, normal_source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, normal_source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed_source = header + "saved = [(" + capture + ") for key, value in [(annotation, annotation)]]\n"
@@ -4634,7 +4636,7 @@ def test_lambda_parameter_shadow_does_not_inherit_outer_retained_metadata_origin
         "for key, value in [(annotation, annotation)]:\n    pass\n"
         "ordinary = lambda value: value\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + "captured = lambda: value\n")))
@@ -4662,7 +4664,7 @@ def test_nested_local_lazy_type_alias_grammar_retains_recovery_and_binding_refus
         "type Outer = list[Inner]\n"
         "type Recursive = str | Mapping[str, Recursive] | Sequence[Recursive]\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4684,7 +4686,7 @@ def test_nested_lazy_alias_does_not_launder_function_or_executed_leaf_as_type(ch
     units = fencing._production_units()
     path = "src/elspeth/retained_nested_lazy_function_probe.py"
     source = "from collections.abc import Mapping\nfrom json import loads\ntype Inner = Mapping[str, object]\ntype Outer = list[Inner]\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed_source = source.replace("type Inner = Mapping[str, object]", changed_inner)
@@ -4802,7 +4804,7 @@ def test_approval_field_consumer_full_proof_preserves_class_supplier_and_method_
         "binding = ApprovalBinding('a', 'b', 'c', 'd', 'e', 'f')\n"
         "serialized = binding.as_json()\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4871,7 +4873,7 @@ def test_sensitive_factory_retains_marker_callback_and_supplier_refusals(effect)
     units = fencing._production_units()
     path = "src/elspeth/sensitive_factory_retention_probe.py"
     source = "from elspeth.web.composer.redaction import Sensitive\nmarker = Sensitive()\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -4985,7 +4987,7 @@ def test_protected_supplier_globals_preserve_unrelated_and_local_bindings_and_as
 @pytest.mark.parametrize("name", ["type", "zip"])
 def test_common_proof_refuses_implicit_global_approval_supplier_replacement(name):
     units = fencing._production_units()
-    normal = fencing._reserve_run(units)
+    normal = fencing._reserve_run_positive_control(units)
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     path = "src/elspeth/web/coordination/approval_authority.py"
@@ -5130,7 +5132,7 @@ def test_run_status_checked_projection_does_not_grant_raw_field_metadata_transfe
         "held = RunStatusResponse.model_fields['status']\n"
         "status_values = RUN_STATUS_ALL_VALUES\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5163,7 +5165,7 @@ def test_common_proof_refuses_reflected_implicit_supplier_namespace_recovery(eff
     units = fencing._production_units()
     path = "src/elspeth/implicit_supplier_reflection_probe.py"
     source = "import elspeth.web.coordination.approval_authority as owner\nname = getattr(owner, '__name__')\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5257,7 +5259,7 @@ def test_configuration_eager_annotations_retain_metadata_recovery_and_supplier_d
     source = (
         "import elspeth.contracts.config.alignment as owner\nfrom typing import get_args\nheld = owner.__annotations__['FIELD_MAPPINGS']\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5328,7 +5330,7 @@ def test_original_proof_retains_typing_supplier_namespace_mutation_denial(effect
     units = fencing._production_units()
     path = "src/elspeth/typing_supplier_complete_probe.py"
     source = "import typing\nform = typing._SpecialForm\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5589,7 +5591,7 @@ def test_plugin_lookup_exception_match_does_not_grant_mutation_or_callback_trans
         "from elspeth.plugins.infrastructure.manager import PluginNotFoundError\n"
         "try:\n    lookup()\nexcept PluginNotFoundError:\n    pass\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5696,7 +5698,7 @@ def test_environment_annotation_normalizer_does_not_launder_retained_classes(eff
     units = fencing._production_units()
     path = "src/elspeth/environment_annotation_recovery_probe.py"
     source = "from elspeth.web.config import _annotation_scalar_types\ntypes = _annotation_scalar_types(int | None)\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5813,7 +5815,7 @@ def test_run_event_checked_consumer_does_not_release_original_field_metadata(eff
     units = fencing._production_units()
     path = "src/elspeth/run_event_metadata_probe.py"
     source = "from elspeth.web.execution.schemas import RunEvent\nannotation = RunEvent.model_fields['event_type'].annotation\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5913,7 +5915,7 @@ def test_mutation_annotation_role_preserves_recovered_class_denials(effect):
     units = fencing._production_units()
     path = "src/elspeth/mutation_annotation_recovery_probe.py"
     source = "from elspeth.contracts.composer_mutation import ComposerMutationRevocation\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -5986,7 +5988,7 @@ def test_prompt_part_enum_record_retains_singleton_and_record_escape_denials(eff
         "from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardTrust\n"
         "part = PromptGuardContentPart('reference', PromptGuardTrust.REFERENCE)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6052,7 +6054,7 @@ def test_unknown_enum_producer_must_not_erase_retained_origin(producer, consumer
     units = fencing._production_units()
     path = "src/elspeth/enum_producer_escape_probe.py"
     imports = "from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardTrust\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, imports)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, imports)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, imports + producer + consumer)))
@@ -6119,7 +6121,7 @@ def test_actual_prompt_renderer_result_never_erases_its_retained_enum_records(ef
         "from elspeth.web.composer.prompt_guard_rendering import json_content_parts\n"
         "parts = json_content_parts('\"reference\"', reference_paths=frozenset({()}))\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6215,7 +6217,7 @@ def test_schema_capability_actual_result_keeps_enum_and_callable_escape_denials(
         "from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability\n"
         "capability = _capability(CapabilityDeclaration(PluginCapability.LLM))\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6291,7 +6293,7 @@ def test_actual_prompt_argument_result_keeps_nominal_class_and_escape_denials(ef
         "from elspeth.web.composer.prompt_guard_rendering import json_argument_content_parts\n"
         "parts = json_argument_content_parts('\"reference\"')\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6384,7 +6386,7 @@ def test_actual_control_disclosure_projection_does_not_release_enum_or_callable_
         "text = _disclosure_draft(capability=PluginCapability.PROMPT_SHIELD, control_plugin='control', llm_component_id='node', llm_component_kind='node', role=ControlRole.INPUT)\n"
         "opaque_callback(text)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6464,7 +6466,7 @@ def test_actual_control_options_consumes_only_its_exact_role_argument(effect):
         "from elspeth.contracts.plugin_capabilities import ControlRole\n"
         "options = _control_options(plugin_name='control', alias='operator', fields=(), summaries={}, role=ControlRole.INPUT, disclosure_draft='review')\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, source)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, source)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
@@ -6873,7 +6875,9 @@ def test_imported_callable_cannot_hide_its_actual_retained_default():
     consumer = fencing._parse_source(
         consumer_path, "from elspeth.enum_default_owner_probe import exposed as alias\nopaque_callback(alias)\n"
     )
-    normal = fencing._reserve_run((*units, fencing._parse_source(owner_path, template.replace("RETAINED", "'safe'")), consumer))
+    normal = fencing._reserve_run_positive_control(
+        (*units, fencing._parse_source(owner_path, template.replace("RETAINED", "'safe'")), consumer)
+    )
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     refused = fencing._reserve_run(
@@ -7003,7 +7007,7 @@ def test_class_check_recipient_respects_actual_builtin_shadow():
     path = "src/elspeth/retained_class_check_shadow_probe.py"
     prefix = "from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardTrust\n"
     ordinary = prefix + "def held(object):\n    part = 'safe'\n    return isinstance([part for _ in (0,)], object)\n"
-    normal = fencing._reserve_run((*units, fencing._parse_source(path, ordinary)))
+    normal = fencing._reserve_run_positive_control((*units, fencing._parse_source(path, ordinary)))
     assert normal["global_failures"] == []
     assert normal["unproven_web_rows"] == []
     assert ordinary.count("part = 'safe'") == 1
