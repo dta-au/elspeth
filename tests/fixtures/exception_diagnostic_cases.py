@@ -298,9 +298,10 @@ def _exercise_owned_settlement_failure() -> None:
     assert recognized.witnesses == (known,)
     safe = recognized.project(request_id="diagnostic-correlation", timeout_seconds=5)
     assert safe.http_status == 503
+    # 776d25bd7: executor-capacity refusals project executor_unavailable.
     assert safe.body == {
-        "detail": "Database is currently unavailable. Please retry in a moment.",
-        "error_type": "database_unavailable",
+        "detail": "Server execution capacity is currently unavailable. Review the session before retrying.",
+        "error_type": "executor_unavailable",
         "request_id": "diagnostic-correlation",
     }
     assert "private-generation-diagnostic" not in json.dumps(safe.body)
