@@ -5850,9 +5850,15 @@ async def test_structure_listener_reentry_keeps_b4_audits_and_application_lock_s
 
 @pytest.mark.asyncio
 async def test_structure_independent_worker_order_uses_owner_sequences_and_causal_edges(monkeypatch, request):
+    from tests.helpers.continuation_policy import OBSERVED_SQL_TRIAL_RETENTION_SECONDS
+
     _require_structure_api()
     engine = request.getfixturevalue("engine")
     second = _structure_secondary_engine()
+    # The waits only sequence the two workers; their timeout guards a hang. The
+    # observed SQL work took 2.76 s at load 30, beyond the former 2 s, and the
+    # whole operation already runs inside this trial's retention stage clock.
+    barrier_seconds = OBSERVED_SQL_TRIAL_RETENTION_SECONDS
 
     async def trial(reverse):
         first_done, second_done = threading.Event(), threading.Event()
@@ -5861,7 +5867,7 @@ async def test_structure_independent_worker_order_uses_owner_sequences_and_causa
 
         def first_work():
             if reverse:
-                assert second_done.wait(2)
+                assert second_done.wait(barrier_seconds)
             result = _structure_sql_work(engine)
             completions.append(1)
             first_done.set()
@@ -5869,7 +5875,7 @@ async def test_structure_independent_worker_order_uses_owner_sequences_and_causa
 
         def second_work():
             if not reverse:
-                assert first_done.wait(2)
+                assert first_done.wait(barrier_seconds)
             result = _structure_sql_work(second)
             completions.append(2)
             second_done.set()

@@ -1353,7 +1353,10 @@ def _structure_store_empty_dialect_cache(statement: object) -> None:
     if "dialect_options" not in state:
         return
     cache = state["dialect_options"]
-    if type(statement) not in (Insert, Update) or type(cache) is not _STRUCTURE_CACHE_CLASS:
+    # SQLAlchemy 2.0.45 creates this empty cache on any DialectKWArgs statement
+    # when it generates the execution cache key, so an executed snapshot_sequence
+    # Select carries one exactly as Insert/Update do (same creator and state).
+    if type(statement) not in (Insert, Update, Select) or type(cache) is not _STRUCTURE_CACHE_CLASS:
         raise _StructureShapeRefusal("source_cache_type")
     if dict.__len__(cache) != 0:
         raise _StructureShapeRefusal("source_cache_nonempty")
