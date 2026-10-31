@@ -1029,8 +1029,9 @@ def _assert_provider_settlement_rows(
     from elspeth.web.composer.provider_context import capture_provider_context
     from elspeth.web.composer.visible_tool_event import validate_visible_response_gap
 
-    assert len(rows) == 2
-    call_row, request_row = rows
+    # A failed settlement also retains the private provider_failure facts row.
+    assert len(rows) == (3 if status == "auth_error" else 2)
+    call_row, request_row = rows[:2]
     assert all(row.role == "audit" and row.session_id == harness.session_id for row in rows)
     assert all(row.composition_state_id is None and row.tool_call_id is None and row.parent_assistant_id is None for row in rows)
     assert call_row.content == "Provider call result recorded."
@@ -1093,6 +1094,25 @@ def _assert_provider_settlement_rows(
         None,
         ("not_recorded",),
     )
+    if status != "auth_error":
+        return
+    failure_row = rows[2]
+    assert failure_row.content == "Private credential-filtered diagnostic facts"
+    envelopes = json.loads(failure_row.tool_calls)
+    assert len(envelopes) == 1
+    failure = ComposerDiagnosticEvidence.from_envelope(
+        envelopes[0],
+        expected_session_id=harness.session_id,
+        expected_operation_id=harness.compose_context.fence.operation_id,
+        expected_tool_call_id=attempt.attempt_id,
+    )
+    assert failure.operation_epoch == harness.compose_context.fence.operation_epoch
+    assert failure.evidence_id == diagnostic_evidence_identity("provider-failure", attempt.attempt_id)
+    assert failure.status == "provider_failure" and failure.tool_name == "composer_failure"
+    assert (failure.arguments.disposition, failure.arguments.content, failure.arguments.reasons) == ("unavailable", None, ("not_recorded",))
+    assert failure.authority_arguments is None
+    assert failure.result.disposition == "retained" and failure.result.content is not None
+    assert [node["class"] for node in json.loads(failure.result.content)["nodes"]] == [errors[status][0]]
 
 
 def _assert_primary_settlement_rows(harness: _Harness) -> set[str]:
@@ -1160,11 +1180,23 @@ def _assert_completed_trace_ledger(
     if prior:
         assert prior[0].content == "prior"
     cohort = rows[len(prior) :]
-    assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit", "audit", "audit", "audit"]
+    assert [row.role for row in cohort] == [
+        "assistant",
+        "tool",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+        "audit",
+    ]
     _assert_guard_row(harness, cohort[3])
-    _assert_provider_settlement_rows(harness, cohort[4:6], sdk_messages)
+    _assert_provider_settlement_rows(harness, cohort[4:7], sdk_messages)
     # Remove only the validated guard and settlement rows; retain the original END oracle verbatim.
-    cohort = (*cohort[:3], *cohort[6:])
+    cohort = (*cohort[:3], *cohort[7:])
     assert [row.role for row in cohort] == ["assistant", "tool", "audit", "audit", "audit", "audit", "audit"]
     _assert_private_tool_cohort(cohort[:3], harness.compose_context.fence.operation_id, harness.compose_context.fence.operation_epoch)
     assert cohort[1].composition_state_id == cohort[2].composition_state_id
@@ -1446,9 +1478,13 @@ def test_compose_loop_audit_machine_examples(cancellation_arrival_time: Cancella
         "after_response_yielded",
     }:
         if cancellation_arrival_time == "after_response_yielded":
+            # One more audit row than before: the END advisor auth_error now
+            # retains its private provider_failure facts (validated in
+            # _assert_completed_trace_ledger).
             assert [row.role for row in outcome.turn_rows] == [
                 "assistant",
                 "tool",
+                "audit",
                 "audit",
                 "audit",
                 "audit",
