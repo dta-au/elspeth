@@ -283,10 +283,11 @@ def test_explain_state_construction_failure_emits_audit_fetch_failure_counter() 
     """
     app = _explain_app(_ExplodingOnStateFromRecordSessionService())
     # state_from_record raises AttributeError when handed a sentinel that
-    # is not a SessionRecord shape (it accesses .metadata_ on the input).
-    # This is the realistic failure mode for a corrupt record returned
-    # by get_current_state; the route's second try/except catches the
-    # AttributeError, emits the counter, and re-raises.
-    with TestClient(app) as client, pytest.raises(AttributeError, match="metadata_"):
+    # is not a SessionRecord shape (its Tier-1 metadata check reads .id
+    # first, for the refusal message). This is the realistic failure mode
+    # for a corrupt record returned by get_current_state; the route's
+    # second try/except catches the AttributeError, emits the counter, and
+    # re-raises.
+    with TestClient(app) as client, pytest.raises(AttributeError, match="no attribute 'id'"):
         client.get(f"/api/sessions/{_SESSION_ID}/audit-readiness/explain")
     assert observed_value(app.state.sessions_telemetry.audit_fetch_failure_total) == 1

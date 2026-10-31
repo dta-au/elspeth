@@ -22,14 +22,12 @@ def test_state_response_exposes_authoritative_content_checksum() -> None:
     assert payload["composition_content_hash"] == composition_content_hash(state_from_record(record))
 
 
-def test_null_metadata_remains_readable_without_a_checksum_but_not_runnable() -> None:
-    record = replace(_record(None), metadata_=None)
-    payload = _state_response(record).model_dump()
-    assert payload["metadata"] is None
-    assert payload["composition_content_hash"] is None
-    assert CompositionStateResponse.model_validate(payload).composition_content_hash is None
+def test_null_metadata_record_is_refused_before_it_can_be_read_or_checksummed() -> None:
+    # Tier 1 (41fcaafce, require_stored_state_metadata): a stored state always
+    # carries its pipeline metadata, so a None-metadata record cannot exist to be
+    # projected without a checksum; the record itself refuses construction.
     with pytest.raises(ValueError, match="None metadata_"):
-        state_from_record(record)
+        replace(_record(None), metadata_=None)
 
 
 @pytest.mark.parametrize("metadata", [{}, {"name": "Missing description"}])

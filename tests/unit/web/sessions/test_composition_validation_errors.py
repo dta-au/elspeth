@@ -45,11 +45,11 @@ def test_owned_error_collections_are_nominal_and_detached():
     assert "CompositionValidationError" in vars(protocol)
     error = protocol.CompositionValidationError(message="detail", error_code=None, component=None)
     original = [error]
-    data = protocol.CompositionStateData(validation_errors=original)
+    data = protocol.CompositionStateData(validation_errors=original, metadata_={"name": "Errors", "description": ""})
     original.clear()
     assert data.validation_errors == (error,)
     with pytest.raises(AuditIntegrityError):
-        protocol.CompositionStateData(validation_errors=["old"])
+        protocol.CompositionStateData(validation_errors=["old"], metadata_={"name": "Errors", "description": ""})
     object.__setattr__(error, "component", {})
     with pytest.raises(AuditIntegrityError):
         protocol.serialize_composition_validation_errors(data.validation_errors)
