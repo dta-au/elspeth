@@ -9517,6 +9517,22 @@ def _structure_store_visitor_predicate_mutant_code(mutation):
     return codes[0]
 
 
+def _assert_only_the_planted_slot_refused(snapshot, planter):
+    """A process-global slot is visible to every observed thread, not only the planter.
+
+    The planting thread must record exactly one untruncated refusal. The event-loop
+    thread may legitimately observe the same planted slot if the interpreter switches
+    threads inside the interval, so the aggregate is checked by cause (a set), never
+    by count or position: ``snapshot.errors`` is the first eight labels over all
+    threads and the loop thread's labels precede the worker's.
+    """
+    ((trace, thread),) = planter
+    assert thread.error_count == 1 and thread.errors == ["original_source_changed"]
+    assert not trace._structure_errors
+    assert all(set(other.errors) <= {"original_source_changed"} for other in trace._structure_threads.values())
+    assert snapshot.errors and set(snapshot.errors) == {"original_source_changed"}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [False, True])
 async def test_structure_source_predicate_late_absent_slot_interval_is_audited(monkeypatch, request, record_property, change):
@@ -9545,7 +9561,7 @@ async def test_structure_source_predicate_late_absent_slot_interval_is_audited(m
     prior, monitoring = sys.getprofile(), _native_monitor_state()
     engine = request.getfixturevalue("engine")
     repository, context, operation_id, _selected, _revision = _closed_dml_seed(engine)
-    intervals, native, public_returns = [], [], []
+    intervals, native, public_returns, planter = [], [], [], []
     payload = b"independently authored late absent compiler slot interval"
 
     def before(_conn, _cursor, statement, parameters, current, many):
@@ -9558,6 +9574,7 @@ async def test_structure_source_predicate_late_absent_slot_interval_is_audited(m
             assert type(trace) is RetentionMemoTrace
             thread = trace._structure_threads[threading.get_ident()]
             count, start = thread.error_count, len(thread.errors)
+            planter.append((trace, thread))
             assert count == start == 0, "the slot opposition requires an otherwise healthy observation"
             if change:
                 PGCompiler.visit_max_func = None
@@ -9625,7 +9642,7 @@ async def test_structure_source_predicate_late_absent_slot_interval_is_audited(m
         assert len(rows) == 1 and rows[0].sql.bind_arities == (7,) and rows[0].outcome == "returned"
         assert snapshot.closed
         if change:
-            assert snapshot.errors == ("original_source_changed",)
+            _assert_only_the_planted_slot_refused(snapshot, planter)
             assert not snapshot.complete and not snapshot.observation_verified
         else:
             assert snapshot.complete and snapshot.observation_verified and not snapshot.errors

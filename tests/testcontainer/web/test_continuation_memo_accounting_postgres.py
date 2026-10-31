@@ -214,7 +214,7 @@ async def test_pg_structure_source_slot_interval(monkeypatch, request, record_pr
     engine, context, operation_id = pg_continuation
     prior, monitoring = sys.getprofile(), accounting._native_monitor_state()
     payload = b"independently authored PG source slot interval"
-    intervals, native = [], []
+    intervals, native, planter = [], [], []
 
     def before(_conn, _cursor, statement, parameters, current, many):
         if type(current.invoked_statement) is Insert and current.invoked_statement.table is store.chunks:
@@ -226,6 +226,7 @@ async def test_pg_structure_source_slot_interval(monkeypatch, request, record_pr
             assert type(trace) is RetentionMemoTrace
             thread = trace._structure_threads[threading.get_ident()]
             count, start = thread.error_count, len(thread.errors)
+            planter.append((trace, thread))
             # Preserve the first existing refusal before this control can
             # plant a slot. A capped prefix is not a complete error inventory.
             record_property("pg_late_slot_prior_refusal", (count, start, tuple(thread.errors)))
@@ -271,7 +272,10 @@ async def test_pg_structure_source_slot_interval(monkeypatch, request, record_pr
         assert helper._STRUCTURE_STORE_VISITOR_GUARDS is guards
         (row,) = accounting._closed_dml_rows(snapshot)
         assert row.sql.bind_arities == (7,) and row.outcome == "returned"
-        assert snapshot.errors == (("original_source_changed",) if change else ())
+        if change:
+            accounting._assert_only_the_planted_slot_refused(snapshot, planter)
+        else:
+            assert snapshot.errors == ()
     finally:
         assert "visit_max_func" not in PGCompiler.__dict__
         assert sys.getprofile() is prior and accounting._native_monitor_state() == monitoring
