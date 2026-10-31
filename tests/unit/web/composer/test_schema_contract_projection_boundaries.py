@@ -166,7 +166,7 @@ def test_planner_plugin_contract_rejects_recursive_projection_overflow() -> None
         knob_schema={"fields": []},
     )
 
-    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+    with pytest.raises(_SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
 
 
@@ -179,7 +179,7 @@ def test_planner_plugin_contract_rejects_more_than_4096_input_nodes() -> None:
         knob_schema={"fields": []},
     )
 
-    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+    with pytest.raises(_SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
 
 
@@ -192,7 +192,7 @@ def test_planner_plugin_contract_rejects_noncanonical_admitted_scalar() -> None:
         knob_schema={"fields": []},
     )
 
-    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+    with pytest.raises(_SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
 
 
@@ -209,7 +209,7 @@ def test_planner_plugin_contract_rejects_every_noncanonical_scalar_domain(bad_de
         knob_schema={"fields": []},
     )
 
-    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+    with pytest.raises(_SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
 
 
@@ -233,7 +233,7 @@ def test_planner_plugin_contract_rejects_oversize_scalar_or_hint_before_contract
         composer_hints=composer_hints,
     )
 
-    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+    with pytest.raises(_SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
 
 

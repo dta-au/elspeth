@@ -212,10 +212,10 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
     """Legacy span integration with a synthetic callback, not a guarded SDK claim."""
     import threading
 
+    from elspeth.web.composer import provider_quota
     from elspeth.web.composer.provider_context import capture_provider_context
     from elspeth.web.composer.provider_quota import (
         admit_provider_attempt,
-        provider_attempt_needs_terminal_audit,
         quota_provider_calls,
     )
 
@@ -279,7 +279,12 @@ async def test_legacy_retry_settlement_failure_preserves_original_provider_evide
                 await provider()
             except APIError as original:
                 assert original is provider_error
-                assert provider_attempt_needs_terminal_audit()
+                # The failure belongs to an admitted, still-unaudited attempt. This is the
+                # predicate the removed provider_attempt_needs_terminal_audit() evaluated
+                # (dropped in 41fcaafce with its only caller); its unscoped ``span is None``
+                # arm cannot apply inside this span, so the span must exist here.
+                span = provider_quota._SPAN.get()
+                assert span is not None and span.attempt is not None and span.call is None
                 recorder.record_llm_call(
                     build_llm_call_record(
                         model_requested="test/planner",

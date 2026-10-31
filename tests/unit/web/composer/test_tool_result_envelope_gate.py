@@ -3230,6 +3230,11 @@ _ADVISOR_ENVELOPE_PAYLOADS: dict[str, tuple[str, ...]] = {
     # Adjudicated 0.8.10: CommonProviderCostRefused is a refusal, not a provider error; its
     # outbound_call_made says whether the refused call reached the provider. Exact keys.
     "cost_refusal_payload": ("success", "status", "code", "outbound_call_made"),
+    # 0.8.10 (927058668, ``_complete_service_failure``): the dispatcher-owned, value-free
+    # SERVICE_FAILURE refusal. Not a tool payload: its exact keys are independently pinned by
+    # continuation_tool_failure._require_service_failure_output, the redaction dispatcher arm
+    # and continuation_terminal_p4_data's controlled terminal row.
+    "payload": ("success", "status", "reason"),
     # Preparation refusal is a completed semantic tool outcome. No physical
     # call left the process; the reservation is released before this payload.
     "context_payload": (
