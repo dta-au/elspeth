@@ -15,9 +15,12 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 
+from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+from elspeth.web.composer._required_paths_validator import _TOOL_REQUIRED_PATHS, _find_missing_required_paths
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.tool_batch import _pre_dispatch_argument_error
 from elspeth.web.composer.tool_error_payloads import arg_error_payload
-from elspeth.web.composer.tools import require_schema_valid_arguments
+from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.sessions.models import chat_messages_table
 from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
@@ -69,7 +72,9 @@ def _repair_script(env: ParityEnv, bad: dict[str, Any], valid: dict[str, Any]) -
     return script
 
 
-async def _drive_freeform_scripted(env: ParityEnv, completion: CommonSDK, session: Any) -> tuple[Any, Any]:
+async def _drive_freeform_scripted(
+    env: ParityEnv, completion: CommonSDK, session: Any, *, expected_argument_error: ToolArgumentError | None = None
+) -> tuple[Any, Any]:
     await env.sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
     user_message = await env.sessions.add_message(session.id, "user", _LINEAR["intent"], writer_principal="route_user_message")
     result = await env.composer.compose(
@@ -79,6 +84,12 @@ async def _drive_freeform_scripted(env: ParityEnv, completion: CommonSDK, sessio
         assert result.raw_assistant_content == _REPLY
     else:
         assert result.message == _REPLY
+    if expected_argument_error is not None:
+        rejected, repaired = result.tool_invocations
+        assert rejected.status is ComposerToolStatus.ARG_ERROR
+        assert rejected.error_class == type(expected_argument_error).__name__
+        assert rejected.error_category is expected_argument_error.category
+        assert repaired.status is ComposerToolStatus.SUCCESS
     completion.assert_done()
     assert completion.phases == ["end"]
     assert_actual_audits(
@@ -112,16 +123,28 @@ async def test_freeform_one_repair_converges_to_reference_graph(parity_env: Pari
     session = await parity_env.sessions.create_session("alice", "Alice", "local")
     valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
     malformed = _malformed_missing_edges(valid)
-    # Independent controls: the omitted field trips the live S-gate, the valid
-    # neighbor passes it, and the actual feedback is produced by that same owner.
+    # The direct S-gate retains its structured repair signal, while the real
+    # compose call reaches the schema-required-path arm before that later gate.
     with pytest.raises(ToolArgumentError) as rejected:
         require_schema_valid_arguments("set_pipeline", malformed)
-    expected = arg_error_payload(rejected.value, "set_pipeline")
-    assert any(item["loc"] == ["edges"] and item["type"] == "missing" for item in expected["validation_errors"])
+    schema_expected = arg_error_payload(rejected.value, "set_pipeline")
+    assert any(item["loc"] == ["edges"] and item["type"] == "missing" for item in schema_expected["validation_errors"])
     require_schema_valid_arguments("set_pipeline", valid)
+    required_paths = _TOOL_REQUIRED_PATHS["set_pipeline"]
+    assert _find_missing_required_paths(valid, required_paths) == []
+    missing = _find_missing_required_paths(malformed, required_paths)
+    assert missing and set(missing) == {"edges"}
+    expected_error = _pre_dispatch_argument_error("set_pipeline", ToolArgumentErrorCategory.MISSING_REQUIRED_PATH)
+    assert type(expected_error) is ToolArgumentError
+    assert expected_error.category is ToolArgumentErrorCategory.MISSING_REQUIRED_PATH
+    assert expected_error.category is not rejected.value.category
+    assert expected_error.schema_violations == ()
+    # This arm owns its display text (tool_batch.py), separately from the S
+    # serializer. Preserve every compiled path, including shared ancestors.
+    expected = {"error": f"Tool 'set_pipeline' missing required argument(s): {', '.join(missing)}"}
     completion = _repair_script(parity_env, malformed, valid)
 
-    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session)
+    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session, expected_argument_error=expected_error)
 
     assert_isomorphic(committed, reference, left="freeform-one-repair:linear_transform", right="reference")
     assert _last_tool_feedback(completion.requests[1]) == expected
@@ -135,7 +158,11 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
     planner repair counter are deliberately not represented as live evidence.
     """
     bounded = parity_env.app.state.settings.model_copy(update={"composer_planner_max_provider_calls": 2})
+    # The routed turn captures its request budget from mounted settings before
+    # compose reuses that owner, so both real suppliers need the same policy.
+    parity_env.monkeypatch.setattr(parity_env.app.state, "settings", bounded)
     parity_env.monkeypatch.setattr(parity_env.composer, "_settings", bounded)
+    assert parity_env.app.state.settings is parity_env.composer._settings is bounded
     async with parity_env._client() as client:
         created = await client.post("/api/sessions", json={"title": "freeform repair exhaustion"})
         assert created.status_code == 201, created.text
