@@ -293,6 +293,24 @@ def test_iteration_publisher_unreviewed_effect_refuses_the_exact_source_contract
             "if False:",
             "selected body changed",
         ),
+        (
+            helper.LIVE_PHASES,
+            "live.advisor_calls_used = (\n            batch.state,",
+            "live.advisor_calls_used = (\n            foreign_state,",
+            "continuation live-phase state copyback changed",
+        ),
+        (
+            helper.LIVE_PHASES,
+            "        batch.next_tool_index += 1\n",
+            "        live.state = batch.state\n        batch.next_tool_index += 1\n",
+            "continuation live-phase state copyback changed",
+        ),
+        (
+            helper.LIVE_PHASES,
+            "batch, accumulator, live = data.batch, data.accumulator, runtime.live",
+            "batch, accumulator, live = data.batch, data.accumulator, foreign_live",
+            "continuation live-phase state copyback changed",
+        ),
     ],
 )
 def test_iteration_transfer_refuses_changed_owned_sources(path, before, after, detail):

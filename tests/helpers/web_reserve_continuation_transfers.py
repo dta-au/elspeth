@@ -38,6 +38,7 @@ PRETITLE = "src/elspeth/web/composer/continuation_initialization.py"
 ROUTE_HELPERS = "src/elspeth/web/sessions/routes/_helpers.py"
 SERVICE = "src/elspeth/web/composer/service.py"
 SESSIONS = "src/elspeth/web/sessions/service.py"
+LIVE_PHASES = "src/elspeth/web/composer/continuation_live_phases.py"
 BATCH = "src/elspeth/web/composer/tool_batch.py"
 MESSAGE_BUILDERS = "src/elspeth/web/composer/continuation_message_builders.py"
 FAMILY_BUILDERS = "src/elspeth/web/composer/continuation_message_family_builders.py"
@@ -1624,6 +1625,49 @@ def iteration_local_transfers(units):
     _require(failures, len(stores) == 1, "continuation iteration first-state store changed")
     if len(stores) == 1:
         receipt["state_writes"].add((INITIALIZATION, id(stores[0].targets[0])))
+    # The live dispatch phase copies the settled batch values back onto the
+    # same iteration state (live = runtime.live) after each issued call.
+    live_phase_units = [unit for unit in units if unit.path == LIVE_PHASES]
+    owned = _find(live_phase_units[0].tree, "ContinuationLivePhases._execute_one_owned") if len(live_phase_units) == 1 else None
+    copybacks = (
+        []
+        if owned is None
+        else [
+            node
+            for node in ast.walk(owned)
+            if isinstance(node, ast.Assign)
+            and _same(
+                node,
+                "live.state, live.last_validation, live.last_runtime_preflight, live.advisor_calls_used = "
+                "(batch.state, batch.last_validation, batch.last_runtime_preflight, batch.advisor_calls_used)",
+            )
+        ]
+    )
+    live_bindings = (
+        []
+        if owned is None
+        else [
+            node
+            for node in ast.walk(owned)
+            if isinstance(node, ast.Assign) and _same(node, "batch, accumulator, live = data.batch, data.accumulator, runtime.live")
+        ]
+    )
+    live_state_stores = (
+        []
+        if owned is None
+        else [
+            node
+            for node in ast.walk(owned)
+            if isinstance(node, ast.Attribute) and node.attr == "state" and isinstance(node.ctx, (ast.Store, ast.Del))
+        ]
+    )
+    _require(
+        failures,
+        len(copybacks) == 1 and len(live_bindings) == 1 and live_state_stores == [copybacks[0].targets[0].elts[0]],
+        "continuation live-phase state copyback changed",
+    )
+    if len(copybacks) == 1:
+        receipt["state_writes"].add((LIVE_PHASES, id(copybacks[0].targets[0].elts[0])))
     consume = selected[INITIALIZATION, "_consume"]
     joined = _one_call(
         failures,

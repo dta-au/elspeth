@@ -5939,6 +5939,98 @@ def _reserve_cancel_tokens_are_immutable(unit):
     )
 
 
+def _reserve_fresh_two_phase_construction(call, owner_q, resolver):
+    """``X = Owner.__new__(Owner)`` then, as the next statement, ``Owner.__init__(X, ...)``.
+
+    The receiver is the instance the previous statement allocated, so this is
+    construction (retained before ``__init__`` runs), not an unbound re-dispatch
+    on another holder's live carrier. Anything between the two statements, a
+    different target, or a different class refuses.
+    """
+    if (
+        owner_q is None
+        or not isinstance(call.func, ast.Attribute)
+        or call.func.attr != "__init__"
+        or not call.args
+        or isinstance(call.args[0], ast.Starred)
+    ):
+        return False
+    target = call.args[0]
+    if not (isinstance(target, ast.Name) or (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name))):
+        return False
+    statement = getattr(call, "_landscape_parent", None)
+    block = getattr(statement, "_landscape_parent", None)
+    if not isinstance(statement, ast.Expr) or statement.value is not call or block is None:
+        return False
+    body = next((field for field in ("body", "orelse", "finalbody") if statement in getattr(block, field, ())), None)
+    if body is None:
+        return False
+    statements = getattr(block, body)
+    index = statements.index(statement)
+    if index == 0:
+        return False
+    previous = statements[index - 1]
+    allocation = previous.value if isinstance(previous, ast.Assign) else None
+    return (
+        isinstance(previous, ast.Assign)
+        and len(previous.targets) == 1
+        and ast.unparse(previous.targets[0]) == ast.unparse(target)
+        and isinstance(allocation, ast.Call)
+        and isinstance(allocation.func, ast.Attribute)
+        and allocation.func.attr == "__new__"
+        and resolver.qualified_name(allocation.func.value, use=allocation) == owner_q
+        and len(allocation.args) == 1
+        and not allocation.keywords
+        and resolver.qualified_name(allocation.args[0], use=allocation) == owner_q
+    )
+
+
+# (path, constructor, exact statement) of each reviewed plain ``authority``
+# instance-field store; see _reserve_supported_boundary.
+_reserve_REVIEWED_AUTHORITY_FIELD_STORES = (
+    ("src/elspeth/web/execution_lease_cleanup.py", "ExecutionAcquisitionObligation.__init__", "self.authority = authority"),
+    ("src/elspeth/web/coordination/lifecycle.py", "ContinuationLeaseAdoption.__init__", "self.authority = authority"),
+    (
+        "src/elspeth/web/sessions/continuation_driver.py",
+        "_SegmentDriver.__init__",
+        "self.authority = services.composer_operation_authority",
+    ),
+)
+
+
+def _reserve_reviewed_authority_field_stores(units):
+    """Join each reviewed ``self.authority = ...`` constructor store to its AST target.
+
+    Each class is base-less (it cannot inherit a protected descriptor), and each
+    store is the one exact statement in its constructor body; anything else refuses.
+    """
+    owned_stores = []
+    for store_path, constructor, expected in _reserve_REVIEWED_AUTHORITY_FIELD_STORES:
+        store_units = [unit for unit in units if unit.path == store_path]
+        store_ctor = _reserve_node_at(store_units[0], constructor) if len(store_units) == 1 else None
+        store_class = _reserve_node_at(store_units[0], constructor.rsplit(".", 1)[0]) if len(store_units) == 1 else None
+        owner_stores = (
+            []
+            if not isinstance(store_ctor, ast.FunctionDef)
+            or not isinstance(store_class, ast.ClassDef)
+            or store_class.bases
+            or store_class.keywords
+            else [
+                statement.targets[0]
+                for statement in store_ctor.body
+                if isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Attribute)
+                and statement.targets[0].attr == "authority"
+                and ast.unparse(statement) == expected
+            ]
+        )
+        if len(owner_stores) != 1:
+            return ["owned authority field initializer is not unique " + store_path], frozenset()
+        owned_stores.append((store_path, id(owner_stores[0])))
+    return [], frozenset(owned_stores)
+
+
 def _reserve_cancel_route_failures(sources):
     route = sources.get(_reserve_CANCEL_ROUTE_PATH)
     if not isinstance(route, str):
@@ -21197,29 +21289,9 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     integrity_supplier_failures, integrity_supplier = _reserve_integrity_projection_supplier(units)
     if integrity_supplier_failures:
         return _reserve_ProtectedBoundary(integrity_supplier_failures, (), (), (), ())
-    obligation_units = [unit for unit in units if unit.path == "src/elspeth/web/execution_lease_cleanup.py"]
-    obligation_ctor = (
-        _reserve_node_at(obligation_units[0], "ExecutionAcquisitionObligation.__init__") if len(obligation_units) == 1 else None
-    )
-    owner_stores = (
-        []
-        if obligation_ctor is None
-        else [
-            node
-            for statement in obligation_ctor.body
-            if isinstance(statement, ast.Assign)
-            for node in statement.targets
-            if isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "self"
-            and node.attr == "authority"
-            and isinstance(statement.value, ast.Name)
-            and statement.value.id == "authority"
-        ]
-    )
-    if len(owner_stores) != 1:
-        return _reserve_ProtectedBoundary(("owned execution obligation authority initializer is not unique",), (), (), (), ())
-    qualified_owner_stores = frozenset({(obligation_units[0].path, id(owner_stores[0]))})
+    owner_store_failures, qualified_owner_stores = _reserve_reviewed_authority_field_stores(units)
+    if owner_store_failures:
+        return _reserve_ProtectedBoundary(tuple(owner_store_failures), (), (), (), ())
     typed_family = _reserve_dependency_roles.family_dependency_roles(units, family)
     typed_supplier = _reserve_supplier_contracts.supplier_dependency_roles(units, family, roles)
     captured_callable_origins = frozenset(edge["guarded_function_origin"] for edge in typed_supplier["captured_runtime_callable_transfers"])
@@ -23077,7 +23149,7 @@ class _reserve_ReserveProof:
                                 and isinstance(n.args[0], ast.Name)
                                 and (n.args[0].id == located[1])
                                 and derives(caller_q, carrier)
-                            ):
+                            ) and not _reserve_fresh_two_phase_construction(n, owner_q, r):
                                 failures.append("unbound carrier dispatch " + unit.path)
                     if owner_q in frozen_qualified and n.func.attr in {"__init__", "__new__", "__post_init__", "__setattr__"}:
                         failures.append("unbound frozen identity reconstruction " + unit.path)
@@ -23100,7 +23172,7 @@ class _reserve_ReserveProof:
                             and isinstance(n.args[0], ast.Name)
                             and (n.args[0].id == located[1])
                             and derives(caller_q, owner_q)
-                        ):
+                        ) and not _reserve_fresh_two_phase_construction(n, owner_q, r):
                             failures.append("unbound protected-field writer " + unit.path)
                     if (
                         (
@@ -40642,6 +40714,73 @@ def test_cancel_token_admission_requires_the_reviewed_frozen_shape(before: str |
         source = source.replace(before, after)
     assert _reserve_cancel_tokens_are_immutable(_parse_source(unit.path, source)) is admitted
     assert not _reserve_cancel_tokens_are_immutable(_parse_source("src/elspeth/web/other.py", unit.source))
+
+
+@pytest.mark.parametrize(
+    ("source", "admitted"),
+    [
+        (
+            "class A:\n    def join(self):\n        self.lease = SessionOperationLease.__new__(SessionOperationLease)\n"
+            "        SessionOperationLease.__init__(self.lease, 1)\n",
+            True,
+        ),
+        (
+            "def make():\n    lease = SessionOperationLease.__new__(SessionOperationLease)\n    SessionOperationLease.__init__(lease, 1)\n",
+            True,
+        ),
+        ("def reinit(live):\n    SessionOperationLease.__init__(live, 1)\n", False),
+        (
+            "def make(other):\n    lease = SessionOperationLease.__new__(SessionOperationLease)\n    lease = other\n"
+            "    SessionOperationLease.__init__(lease, 1)\n",
+            False,
+        ),
+        (
+            "def make(other):\n    lease = SessionOperationLease.__new__(SessionOperationLease)\n    SessionOperationLease.__init__(other, 1)\n",
+            False,
+        ),
+        ("def make():\n    lease = object.__new__(object)\n    SessionOperationLease.__init__(lease, 1)\n", False),
+    ],
+)
+def test_fresh_two_phase_construction_admits_only_the_just_allocated_receiver(source: str, admitted: bool) -> None:
+    unit = _parse_source(
+        "src/elspeth/web/two_phase_control.py", "from elspeth.web.coordination.lifecycle import SessionOperationLease\n" + source
+    )
+    resolver = _resolver_for_unit(unit)
+    [call] = [n for n in ast.walk(unit.tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "__init__"]
+    owner = resolver.qualified_name(call.func.value, use=call)
+    assert owner == "elspeth.web.coordination.lifecycle.SessionOperationLease"
+    assert _reserve_fresh_two_phase_construction(call, owner, resolver) is admitted
+
+
+@pytest.mark.parametrize(
+    ("path", "before", "after"),
+    [
+        (
+            "src/elspeth/web/coordination/lifecycle.py",
+            "        self.authority = authority\n        self.context = context\n",
+            "        self.authority = foreign\n        self.context = context\n",
+        ),
+        (
+            "src/elspeth/web/sessions/continuation_driver.py",
+            "self.authority = services.composer_operation_authority",
+            "self.authority = services.session_service",
+        ),
+        ("src/elspeth/web/sessions/continuation_driver.py", "class _SegmentDriver:", "class _SegmentDriver(ForeignCarrier):"),
+        (
+            "src/elspeth/web/execution_lease_cleanup.py",
+            "        self.authority = authority\n",
+            "        self.authority = authority\n        self.authority = authority\n",
+        ),
+    ],
+)
+def test_reviewed_authority_field_stores_refuse_a_changed_store(path: str, before: str, after: str) -> None:
+    units = _production_units()
+    failures, stores = _reserve_reviewed_authority_field_stores(units)
+    assert failures == [] and {store_path for store_path, _ in stores} == {entry[0] for entry in _reserve_REVIEWED_AUTHORITY_FIELD_STORES}
+    original = next(unit for unit in units if unit.path == path)
+    assert original.source.count(before) == 1
+    changed = tuple(_parse_source(path, original.source.replace(before, after)) if unit.path == path else unit for unit in units)
+    assert _reserve_reviewed_authority_field_stores(changed) == (["owned authority field initializer is not unique " + path], frozenset())
 
 
 def test_closure_allowlist_drops_only_exact_reviewed_counts() -> None:
