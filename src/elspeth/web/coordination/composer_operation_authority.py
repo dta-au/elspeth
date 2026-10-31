@@ -2063,8 +2063,8 @@ async def admit_composer_operation(
     deadline_seconds: float,
     max_nonterminal: int,
     auth_provider_type: str,
-    lifecycle_version: Literal[1, 2] = 1,
-    continuation_enabled: bool = False,
+    lifecycle_version: Literal[1, 2],
+    continuation_enabled: bool,
 ) -> tuple[ComposerOperationRecord, bool]:
     return await run_sync_in_worker(
         authority.admit,

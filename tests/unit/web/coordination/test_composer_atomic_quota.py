@@ -293,6 +293,8 @@ async def test_cancelled_awaiter_leaves_worker_owned_atomic_pair(operation_store
             deadline_seconds=180,
             max_nonterminal=64,
             auth_provider_type="local",
+            lifecycle_version=1,
+            continuation_enabled=False,
         )
     )
     try:
