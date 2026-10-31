@@ -61,7 +61,7 @@ from elspeth.web.sessions.models import sessions_table as sessions
 from elspeth.web.sessions.models import token_usage_ledger_table as usage
 from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.continuation_inventory import inventory_work
-from tests.helpers.continuation_memo import RetentionMemoTrace
+from tests.helpers.continuation_memo import RetentionMemoTrace, UncachedValidationBudget
 from tests.helpers.fenced_session import seed_token_policies
 from tests.unit.web.composer.test_explicit_provider_custody import _assert_required_guard_admitted, _required_guard_settings
 from tests.unit.web.coordination import test_composer_operation_authority as operations
@@ -77,6 +77,32 @@ from tests.unit.web.sessions.test_continuation_title_application import paid_tit
 from tests.unit.web.sessions.test_continuation_title_provider import actual_title_update
 
 operation_store = operations.operation_store
+
+
+def _paid_uncached_budgets(*stages):
+    """Declared upper bounds for a paid trial's measured uncached validation.
+
+    Only paid (settled TITLE) trials run these uncached validators during
+    first-Compose retention; the nonpaid arms measure zero and declare
+    nothing. Each value is the exact count measured on Python 3.13 on
+    2026-11-01 (invocations, attempts, input characters), never padded; all
+    four paid READY arms measured identical totals, as did both rollback
+    arms. Re-measure if the paid TITLE fixture or its audit changes.
+    """
+    return tuple(
+        budget
+        for stage, (metadata, context) in enumerate(stages, 1)
+        for budget in (
+            UncachedValidationBudget(stage, *metadata, validator="diagnostic_correlation_metadata"),
+            UncachedValidationBudget(stage, *context, validator="provider_context_message_text"),
+        )
+    )
+
+
+# First construction plus its read-only replay: two retention stages.
+_PAID_READY_BUDGETS = _paid_uncached_budgets(((24, 144, 5520), (8, 16, 6576)), ((15, 90, 3450), (5, 10, 4110)))
+# Rolled-back first construction plus its complete replay.
+_PAID_ROLLBACK_BUDGETS = _paid_uncached_budgets(((6, 36, 1380), (2, 4, 1644)), ((24, 144, 5520), (8, 16, 6576)))
 
 
 async def ready_case(store, tmp_path, monkeypatch, *, paid=False, bound_base=False, content="Original Café Session Title"):
@@ -209,7 +235,7 @@ async def test_real_ready_publishes_complete_first_compose_once(operation_store,
         assert replay.materialization is not runtime.materialization and replay.graph.evidence is not runtime.graph.evidence
         assert len(sdk) == int(paid)
         work.coordinator.assert_completed()
-        memo_trace.finish(stages=2)
+        memo_trace.finish(stages=2, uncached_validation_limits=_PAID_READY_BUDGETS if paid else ())
     finally:
         operation_store[1].release(running.session_operation_context)
 
@@ -333,7 +359,7 @@ async def test_initial_compose_publication_rolls_back_complete_sql_then_replays(
         assert_first_graph(result, service, running)
         assert len(sdk) == 1
         work.coordinator.assert_completed()
-        memo_trace.finish(stages=2)
+        memo_trace.finish(stages=2, uncached_validation_limits=_PAID_ROLLBACK_BUDGETS)
     finally:
         operation_store[1].release(running.session_operation_context)
 
