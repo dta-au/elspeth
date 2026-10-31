@@ -45,7 +45,7 @@
       "ComposerOperationRunning",
       "ComposerOperationFenceLost"
     ],
-    "sha256": "740ff8131d3dc956cf5e3a3b6b3a7fa74c7d3833c5c1183b6deb9f6fe1ce897b"
+    "sha256": "625d2f62fb9f3a5adcbf8952b738f82d7a1f77af91ad21ffc73b8898457949d2"
   },
   "src/elspeth/web/sessions/proposal_authority.py": {
     "protected_exports": [],

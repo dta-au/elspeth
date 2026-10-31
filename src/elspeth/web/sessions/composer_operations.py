@@ -84,7 +84,7 @@ def require_canonical_operation_id(value: object) -> str:
 
 
 class ComposerOperationError(BaseModel):
-    model_config = ConfigDict(strict=True, extra="forbid")
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
     http_status: int = Field(ge=400, le=599)
     failure_code: ComposerOperationFailureCode
     error_type: str | None
