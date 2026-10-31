@@ -805,10 +805,12 @@ async def test_measure_actual_stop_p4_application_evidence_excess(operation_stor
             "application_store.verified_chunk_load", continuation_p4_application_store._private_chunk_on_connection, output_kind="chunk"
         ),
     )
+    # The verified load reads its bounded bytes through read_private_chunk;
+    # plain read_chunk now serves only the old-snapshot predecessor path.
     monkeypatch.setattr(
         continuation_p4_application_store,
-        "read_chunk",
-        work.wrap("application_store.read_chunk", continuation_p4_application_store.read_chunk, output_kind="bytes"),
+        "read_private_chunk",
+        work.wrap("application_store.read_private_chunk", continuation_p4_application_store.read_private_chunk, output_kind="bytes"),
     )
     monkeypatch.setattr(
         continuation_p4_application_store,
@@ -895,7 +897,7 @@ async def test_measure_actual_stop_p4_application_evidence_excess(operation_stor
         measurement["production_call_observations"]["unknowns"] += ("DIRECTIONAL_WIRE_EMISSION_OUTSIDE_NAMED_ENCODE_ALIAS",)
         assert set(work.report()["fixed_aliases"]) == {
             "application_store.verified_chunk_load",
-            "application_store.read_chunk",
+            "application_store.read_private_chunk",
             "application_store.verify_private_chunk",
             "application_data.verify_private_chunk",
             "codec.parse_json_strict",
