@@ -394,7 +394,10 @@ def _namespace_effects(units, configured_function):
                     continue
                 canonical = node is configured_function
                 canonical |= (
-                    scope is unit.tree and isinstance(node, ast.ClassDef) and original in {OWNER, RECOVERY} and node in unit.tree.body
+                    scope is unit.tree
+                    and isinstance(node, ast.ClassDef)
+                    and original in {OWNER, RECOVERY, DRAIN}
+                    and node in unit.tree.body
                 )
                 if isinstance(node, (ast.Import, ast.ImportFrom)):
                     imports = {
@@ -408,6 +411,7 @@ def _namespace_effects(units, configured_function):
                     expected = {
                         APP + ".ApplicationFinalizerOwner": OWNER,
                         APP + ".ProcessRecovery": RECOVERY,
+                        APP + ".ComposerDrainSignal": DRAIN,
                         APP + ".configure_required_executor_recovery": WORKER + ".configure_required_executor_recovery",
                         APP + ".threading": "threading",
                         "elspeth.web.application_finalizers.threading": "threading",
