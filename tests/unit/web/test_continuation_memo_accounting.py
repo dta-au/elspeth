@@ -7814,7 +7814,18 @@ def _closed_dml_seed(engine):
         raise
 
 
-async def _closed_dml_trial(monkeypatch, request, engine, context, operation_id, work, *, refused=False, listeners=()):
+async def _closed_dml_trial(
+    monkeypatch,
+    request,
+    engine,
+    context,
+    operation_id,
+    work,
+    *,
+    refused=False,
+    listeners=(),
+    refusal_match="structure observation incomplete",
+):
     from sqlalchemy import event
 
     from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator, RequiredWorkSource
@@ -7859,7 +7870,7 @@ async def _closed_dml_trial(monkeypatch, request, engine, context, operation_id,
             if primary is None and cleanup is not None:
                 raise cleanup
         if refused:
-            with pytest.raises(AssertionError, match="structure observation incomplete"):
+            with pytest.raises(AssertionError, match=refusal_match):
                 trace.finish(stages=1, require_snapshot=False, require_population=False, structure_observation=True)
         else:
             # The actual original store/driver premises precede qualification.
@@ -8353,6 +8364,11 @@ async def test_structure_only_original_snapshot_sequence_aggregate_is_supported(
             work,
             refused=changed != "original",
             listeners=((physical, "before_execute", before, True),),
+            # The memo trace's own carrier check refuses first; the structure
+            # snapshot must still be incomplete with errors (asserted below).
+            refusal_match=(
+                "target work lacked its actual stage carrier" if changed == "missing-carrier" else "structure observation incomplete"
+            ),
         )
         assert result == 1
         if changed == "original":
