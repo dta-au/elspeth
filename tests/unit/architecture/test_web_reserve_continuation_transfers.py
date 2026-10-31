@@ -29,6 +29,19 @@ def _parse(path: str, source: str) -> _Source:
     return _Source(path, source, ast.parse(source, filename=path))
 
 
+def _rebind_body_pins(monkeypatch, path: str, symbol: str, declaration: ast.AST) -> None:
+    """Rebind every reviewed pin of this body, as a reviewer re-pinning it would.
+
+    A body can be pinned by its digest and, separately, by an exact-source
+    prerequisite table. Rebinding only the digest would let the exact-source
+    gate refuse first, so the structural check under test would never run.
+    """
+    monkeypatch.setitem(helper._CONTRACTS[path], symbol, helper._digest(declaration))
+    for table in (helper._ATTACHMENT_PREREQUISITE_BODIES, helper._RUNTIME_INITIALIZATION_BODIES):
+        if (path, symbol) in table:
+            monkeypatch.setitem(table, (path, symbol), ast.unparse(declaration))
+
+
 def _changed(path: str, before: str, after: str) -> tuple[_Source, ...]:
     units = _units()
     original = next(unit for unit in units if unit.path == path)
@@ -437,7 +450,9 @@ def test_continuation_receipts_refuse_duplicate_or_missing_source():
             True,
             "retained_attachment: AttachmentResultCheckpoint | None = None,",
             "retained_attachment: AttachmentResultCheckpoint | None = foreign_result,",
-            "exact optional formal/default changed",
+            # The P4 batch custody prerequisite (checked first) pins this exact
+            # formal list, defaults included, so it refuses before this check.
+            "P4 batch custody native signature changed _execute_continuation_call_live",
         ),
         (
             helper.attachment_local_transfers,
@@ -506,7 +521,7 @@ def test_continuation_structural_transfer_refuses_after_rebinding_only_changed_d
     if symbol is not None:
         declaration = helper._find(changed.tree, symbol)
         assert declaration is not None
-        monkeypatch.setitem(helper._CONTRACTS[path], symbol, helper._digest(declaration))
+        _rebind_body_pins(monkeypatch, path, symbol, declaration)
     if namespace:
         headers = helper._Namespace().visit(copy.deepcopy(changed.tree))
         monkeypatch.setitem(helper._NAMESPACES, path, helper._digest(headers))
@@ -582,8 +597,10 @@ def test_continuation_structural_transfer_refuses_after_rebinding_only_changed_d
         (
             helper.ATTACHMENT_APPLICATION,
             "require_attachment_projection",
-            "if encode_turn_evidence(after, env_ref_names=env_ref_names) != encode_turn_evidence(expected, env_ref_names=env_ref_names):",
-            "if encode_turn_evidence(before, env_ref_names=env_ref_names) != encode_turn_evidence(expected, env_ref_names=env_ref_names):",
+            # 41fcaafce compares admitted forms; comparing the expected side with
+            # itself disables the check entirely.
+            "if encode_turn_evidence(after_admitted, env_ref_names=env_ref_names) != encode_turn_evidence(",
+            "if encode_turn_evidence(expected_admitted, env_ref_names=env_ref_names) != encode_turn_evidence(",
             "complete evidence/transcript comparison changed",
         ),
         (
@@ -617,7 +634,7 @@ def test_attachment_projection_structure_survives_only_the_mutated_body_pin(monk
     changed = next(unit for unit in units if unit.path == path)
     declaration = helper._find(changed.tree, symbol)
     assert declaration is not None
-    monkeypatch.setitem(helper._CONTRACTS[path], symbol, helper._digest(declaration))
+    _rebind_body_pins(monkeypatch, path, symbol, declaration)
     failures, receipt = helper.attachment_local_transfers(units)
     assert any(detail in failure for failure in failures), failures
     assert not any("selected body changed" in failure or "namespace changed" in failure for failure in failures), failures

@@ -225,15 +225,11 @@ def test_dependency_header_rejects_supplier_or_registry_substitution(path, befor
 def test_actual_central_batch_data_prerequisite_keeps_native_three_constructor_sites():
     from tests.unit.architecture import test_web_landscape_mutation_fencing as fence
 
-    root = Path(__file__).resolve().parents[3]
-    paths = ("src/elspeth/web/composer/tool_batch.py", "src/elspeth/web/composer/bounded_json.py")
-    # The fencing receipt resolves owners through parent links that only its own
-    # parser attaches, so build every unit with it.
-    units = tuple(
-        fence._parse_source(path, text)
-        for path, text in (*((unit.path, unit.source) for unit in _units()), *((path, (root / path).read_text()) for path in paths))
-    )
-    batch = next(unit for unit in units if unit.path == paths[0])
+    # The receipt chains into further prerequisites (P4 custody, the manual
+    # Advisor allowance); the actual source is the complete production unit set,
+    # parsed with the parent links the fencing receipt resolves owners through.
+    units = fence._production_units()
+    batch = next(unit for unit in units if unit.path == "src/elspeth/web/composer/tool_batch.py")
     classes = {name: fence._reserve_node_at(batch, name) for name in ("ContinuationBatchState", "ContinuationCallState", "_CallWireFacts")}
     assert all(isinstance(declaration, ast.ClassDef) for declaration in classes.values())
     failures, receipt = fence._reserve_continuation_batch_data_receipt(units, classes)
