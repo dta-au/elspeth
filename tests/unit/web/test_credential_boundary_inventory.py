@@ -57,6 +57,9 @@ _FREE_TEXT_DISPOSITIONS = {
     # Server-computed continuation_provider_input_hash(kwargs), never caller text.
     "src/elspeth/web/composer/provider_gateway.py:PreparedContinuationPrimaryRequest.input_sha256": "structural_identifier",
     "src/elspeth/web/composer/tools/sessions.py:_AdvisorHintRequest.problem_summary": "provider_boundary_guard",
+    # The TITLE user prompt reaches the provider only through prepare_provider_input
+    # and _litellm_acompletion's request guard, after _build_auto_title_user_content redaction.
+    "src/elspeth/web/sessions/_auto_title.py:PreparedAutoTitleRequest.user_prompt": "provider_boundary_guard",
     "src/elspeth/web/execution/schemas.py:ExecuteRequest.fanout_ack_token": "execution_acknowledgement",
     "src/elspeth/web/execution/schemas.py:ExecuteRequest.secret_ack_token": "execution_acknowledgement",
     "src/elspeth/web/preferences/models.py:UpdateComposerPreferencesRequest.tutorial_run_id": "structural_identifier",
@@ -317,13 +320,13 @@ _PROVIDER_MODULES = (
     "src/elspeth/web/composer/provider_gateway.py",
     "src/elspeth/web/composer/advisor_checkpoint.py",
     "src/elspeth/web/composer/boot_probe.py",
+    # The retired empty-state planner (U-30) now holds carriers only and makes no
+    # provider call; it stays scanned so a reintroduced call must choose a disposition.
     "src/elspeth/web/composer/pipeline_planner.py",
     "src/elspeth/web/sessions/_auto_title.py",
 )
 _PROVIDER_CALL_DISPOSITIONS = {
     "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": "complete_response_guard",
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body._litellm_acompletion": "complete_response_guard",
-    "src/elspeth/web/composer/pipeline_planner.py:_complete_planner_provider._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": "complete_response_guard",
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": "request_guard",
@@ -334,16 +337,6 @@ _PROVIDER_CALL_DISPOSITIONS = {
 _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit_body._litellm_acompletion": (
         ("AdvisorCheckpointOwner._call_advisor_with_audit_body", "_require_no_credential_material_in_completion_fields"),
-    ),
-    "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model_body._litellm_acompletion": (
-        ("_parse_response_tool_calls", "require_no_credential_material"),
-        ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
-        ("_plan_pipeline_inner", "build_llm_call_record"),
-    ),
-    "src/elspeth/web/composer/pipeline_planner.py:_complete_planner_provider._litellm_acompletion": (
-        ("_parse_response_tool_calls", "require_no_credential_material"),
-        ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
-        ("_plan_pipeline_inner", "build_llm_call_record"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": (
         ("ProviderGateway._call_llm", "require_no_credential_material_in_tool_wire"),
@@ -610,7 +603,9 @@ _STATE_GUARD_DISPOSITIONS = {
     "src/elspeth/web/composer/continuation_bootstrap.py:encode_continuation_bootstrap": "continuation_payload",
     "src/elspeth/web/composer/continuation_codec.py:encode_private_chunk": "continuation_payload",
     "src/elspeth/web/composer/continuation_composition_initialization.py:_build_owners": "continuation_payload",
-    "src/elspeth/web/composer/continuation_evidence.py:encode_turn_evidence": "continuation_payload",
+    # Admission (AdmittedTurnEvidence, via _encode_turn_evidence_source) owns the guard;
+    # encode_turn_evidence accepts only admitted evidence.
+    "src/elspeth/web/composer/continuation_evidence.py:require_evidence_fields_admission": "continuation_payload",
     "src/elspeth/web/composer/continuation_initialization.py:prepare_pretitle_bootstrap.prepare": "continuation_payload",
     "src/elspeth/web/composer/continuation_p4_state_payload.py:decode_p4_state_payload": "continuation_payload",
     "src/elspeth/web/composer/continuation_runtime.py:_capture_owners": "continuation_payload",
@@ -629,7 +624,7 @@ _STATE_MATERIALIZATION_DISPOSITIONS = {
     "src/elspeth/web/sessions/service.py:SessionServiceImpl._load_graph_recovery_context_on_connection.state_from_record": "recovery_checkpoint_guard",
     # Continuation restore hydrates committed state only to compare or hash it
     # against retained evidence; none of these dispatches or publishes it.
-    "src/elspeth/web/composer/continuation_evidence_restore.py:read_selected_turn_evidence_graph_on_connection.state_from_record": "committed_checkpoint_comparison",
+    "src/elspeth/web/composer/continuation_evidence_restore.py:read_selected_turn_evidence_graph_data_on_connection.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/composer/continuation_p4_application.py:_project_effects.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/continuation.py:_authored_row_hash.state_from_record": "committed_checkpoint_comparison",
     "src/elspeth/web/sessions/continuation_bootstrap_source.py:_require_current_pretitle_value_equality.state_from_record": "committed_checkpoint_comparison",
