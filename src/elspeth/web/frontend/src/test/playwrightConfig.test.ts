@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 function backendWebServerBlock(): string {
   const source = readFileSync("playwright.config.ts", "utf8");
   const match = source.match(
-    /command:\s*\n[\s\S]*?"uv run --extra webui python -m uvicorn elspeth\.web\.app:create_app --factory "[\s\S]*?env: composerSettingsEnv,\s*}/,
+    /command:(?:\s*|\s*PRIVATE_RUN_DIR !== undefined \? PRIVATE_BACKEND_COMMAND :\s*)\n[\s\S]*?"uv run --extra webui python -m uvicorn elspeth\.web\.app:create_app --factory "[\s\S]*?env: composerSettingsEnv,\s*}/,
   );
   if (match === null) {
     throw new Error("Could not locate the Playwright backend webServer block");
