@@ -49,7 +49,7 @@ import textwrap
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, wraps
 from pathlib import Path
 
 import pytest
@@ -6807,6 +6807,36 @@ def _reserve_authority_receiver_contract(units):
     return []
 
 
+# Per-call memo for pure facts of one AST that a single whole-tree proof call
+# would otherwise recompute thousands of times (measured 2026-11-01 on 08abad7f9:
+# `_reserve_annotation_only_nonwrites` walked each module ~28,000 times and the
+# builtin-rebinding `global` scan ~750,000 times per `_reserve_run`). It exists
+# only while the outermost decorated proof call is on the stack and is dropped on
+# exit, so a test that mutates an AST between proof calls can never read a stale
+# fact. Entries hold the tree itself, so an id() cannot be reused while cached.
+_reserve_PROOF_MEMO = None
+_reserve_PROOF_MEMO_DEPTH = 0
+
+
+def _reserve_proof_memo_scope(fn):
+    """Open one memo for the outermost decorated proof call; drop it when that call returns."""
+
+    @wraps(fn)
+    def scoped(*args, **kwargs):
+        global _reserve_PROOF_MEMO, _reserve_PROOF_MEMO_DEPTH
+        if _reserve_PROOF_MEMO_DEPTH == 0:
+            _reserve_PROOF_MEMO = {}
+        _reserve_PROOF_MEMO_DEPTH += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _reserve_PROOF_MEMO_DEPTH -= 1
+            if _reserve_PROOF_MEMO_DEPTH == 0:
+                _reserve_PROOF_MEMO = None
+
+    return scoped
+
+
 def _reserve_annotation_only_nonwrites(unit, bound):
     """Same-AST simple annotation targets that assign no namespace value.
 
@@ -6815,6 +6845,25 @@ def _reserve_annotation_only_nonwrites(unit, bound):
     scanned. Keep it separate from dataclasses.field's origin-specific local
     storage receipt, whose function/comprehension cases have other premises.
     """
+    scope = _reserve_PROOF_MEMO
+    if scope is not None:
+        # One walk indexes every simple bare annotation by name, in walk order.
+        entry = scope.get(id(unit.tree))
+        if entry is None or entry[0] is not unit.tree:
+            index = {}
+            for owner in ast.walk(unit.tree):
+                if isinstance(owner, (ast.Module, ast.ClassDef)):
+                    for node in owner.body:
+                        if (
+                            isinstance(node, ast.AnnAssign)
+                            and isinstance(node.target, ast.Name)
+                            and node.simple == 1
+                            and node.value is None
+                        ):
+                            index.setdefault(node.target.id, {})[id(node.target)] = id(owner)
+            entry = (unit.tree, index)
+            scope[id(unit.tree)] = entry
+        return dict(entry[1].get(bound, {}))
     return {
         id(node.target): id(owner)
         for owner in ast.walk(unit.tree)
@@ -6828,6 +6877,7 @@ def _reserve_annotation_only_nonwrites(unit, bound):
     }
 
 
+@_reserve_proof_memo_scope
 def _reserve_owned_source_binding_failures(
     modules,
     selected,
@@ -7567,6 +7617,7 @@ def _reserve_typing_eager_query_namespace_current(unit, query):
     return True
 
 
+@_reserve_proof_memo_scope
 def _reserve_typing_annotation_source_facts(unit):
     """Positive original-source facts; none reclassify a descriptor globally."""
     resolver = _resolver_for_unit(unit)
@@ -9424,6 +9475,7 @@ def _reserve_catalog_returned_config_role_receipt(units, *, producer):
     return result
 
 
+@_reserve_proof_memo_scope
 def _reserve_typing_supplier_mutation_failures(units):
     """Denial-only typing namespace effects using the original lexical resolver.
 
@@ -9435,14 +9487,19 @@ def _reserve_typing_supplier_mutation_failures(units):
         resolver = _resolver_for_unit(unit)
         source_facts = _reserve_typing_annotation_source_facts(unit)
 
-        def canonical_builtin(node, name, use, *, resolver=resolver, unit=unit):
+        # The same module-wide `global` scan, done once per unit instead of once per query.
+        module_global_names = frozenset(
+            declared for statement in ast.walk(unit.tree) if isinstance(statement, ast.Global) for declared in statement.names
+        )
+
+        def canonical_builtin(node, name, use, *, resolver=resolver, unit=unit, module_global_names=module_global_names):
             qualified = resolver.qualified_name(node, use=use)
             return qualified == "builtins." + name or (
                 qualified == name
                 and isinstance(node, ast.Name)
                 and not resolver.is_local(node.id, use)
                 and _reserve_composer_receiver.builtin_binding(unit.tree, name)
-                and not any(isinstance(statement, ast.Global) and name in statement.names for statement in ast.walk(unit.tree))
+                and name not in module_global_names
             )
 
         def typing_namespace(
@@ -11177,6 +11234,7 @@ def _reserve_diagnostic_predicate(diagnostics, value, use, result):
     return result
 
 
+@_reserve_proof_memo_scope
 def _reserve_selected_origin_effect_failures(
     units,
     extra_roots=frozenset(),
@@ -20735,6 +20793,7 @@ def _reserve_apply_closure_allowlist(failures, unit_paths, allowlist=None):
     return [*kept, *stale]
 
 
+@_reserve_proof_memo_scope
 def _reserve_supported_boundary(units, *, origin_diagnostics=None):
     """Join finite source receipts on these AST nodes; refuse unclosed effects."""
     recovery_supplier_failures, recovery_supplier = _reserve_compose_proposal_transfers.recovery_instruction_supplier_contracts(units)
