@@ -16,7 +16,11 @@ from tests.fixtures.dag_scenario_corpus.recovery_partial_terminal import (
 from tests.fixtures.dag_scenario_corpus.schema import SinkOutputProjection
 
 
-@pytest.mark.timeout(20)
+# Hang backstop, not a speed budget. Measured 2026-11-01 on 08abad7f9 (3.13):
+# 9.6-10.6 s wall and 7.9-9.2 s CPU serial, over 3 runs on a host at load ~16.
+# The old 20 s cap tripped on contended xdist workers, which showed up as
+# "node down: Not properly terminated". 60 s is ~6x the serial time.
+@pytest.mark.timeout(60)
 def test_partial_terminal_sink_boundary_reopens_and_resumes_exact_survivor_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
