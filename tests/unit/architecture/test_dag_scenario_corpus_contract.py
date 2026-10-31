@@ -989,7 +989,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 0.8.10 carry-forward: retain b003e0cd's segmented ValueTransform assistance
 # source and its three 7d4ce6833cb24ca0 provenance tokens, together with the
 # sparse-admission JSON source provenance above. No other manifest bytes change.
-EXPECTED_CASE_REGISTRY_SHA256 = "a3334588fc67913b5539316408987f8fab02f73780db663330f821ec1e59820b"
+# 0.8.10 version cut: the same eight runtime-derived engine version fields
+# advance (engine:0.8.9 -> engine:0.8.10). Reversing those eight tokens restores
+# the prior manifest bytes and the prior pin a3334588fc67...; nothing else changes.
+EXPECTED_CASE_REGISTRY_SHA256 = "c5395cd1d1d39aef39727ffec656dd33b88f7eb0ff6e838f6494e268cf09399b"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
