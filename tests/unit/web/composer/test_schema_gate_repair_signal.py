@@ -33,6 +33,7 @@ from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardTo
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
 from elspeth.web.composer.audit import VALIDATION_ERROR_MESSAGES
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import SchemaViolation, SchemaViolationCode, ToolArgumentError
 from elspeth.web.composer.service import ComposeLoopTestResult, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -121,6 +122,7 @@ class _RecordingComposeLLM(_FakeComposeLLM):
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         for message in _messages:
             if type(message) is dict and message["role"] == "tool":

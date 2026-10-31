@@ -32,6 +32,7 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -141,6 +142,7 @@ class _Turn:
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
             prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
             prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+            prepared_input: PreparedProviderInput | None = None,
         ) -> _AdmittedLLMCompletion:
             self.sent_tool_lists.append(tools)
             return responses.pop(0) if responses else _text_response()

@@ -34,6 +34,7 @@ from elspeth.web.composer.diagnostic_evidence import (
     ComposerDiagnosticEvidence,
     diagnostic_evidence_identity,
 )
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -167,6 +168,7 @@ async def _drive_turn_then_provider_timeout(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         if responses:
             return responses.pop(0)

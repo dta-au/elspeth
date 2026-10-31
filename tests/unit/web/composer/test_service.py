@@ -53,6 +53,7 @@ from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _compose_preflight_repair_message
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompt_guard_clients import AzurePromptGuardClient
 from elspeth.web.composer.proposals import build_tool_proposal_summary
@@ -254,6 +255,7 @@ class _ReconciliationLLMScript:
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> _AdmittedLLMCompletion:
         self.prompts.append(deepcopy(messages))
         return next(self._responses)
@@ -1857,6 +1859,7 @@ class TestComposerSingleToolCall:
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
             prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
             prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+            prepared_input: PreparedProviderInput | None = None,
         ) -> Any:
             return responses.pop(0)
 
@@ -1925,6 +1928,7 @@ class TestComposerSingleToolCall:
             prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
             prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
             prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+            prepared_input: PreparedProviderInput | None = None,
         ) -> Any:
             return responses.pop(0)
 

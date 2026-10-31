@@ -45,6 +45,7 @@ from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import composer_preflight as preflight_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
@@ -248,6 +249,7 @@ class _ScriptedLLM:
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         if not self._responses:
             return _admit_composer_llm_completion(_fake_text_response("Done."))

@@ -9,6 +9,7 @@ import litellm
 import pytest
 
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.provider_context import capture_provider_context
 from tests.unit.contracts.test_composer_llm_audit import _make_call
 from tests.unit.web.composer.test_private_evidence_persistence import private_writer as _private_writer
@@ -274,7 +275,14 @@ async def test_gateway_terminal_paths_keep_the_preawait_context(tmp_path, monkey
     messages = [{"role": "user", "content": "PRIVATE REQUEST BEFORE AWAIT"}]
     expected = deepcopy(messages)
 
-    async def completion(wire_messages, wire_tools, *, provider_custody: object | None = None, credential_state: object | None = None):
+    async def completion(
+        wire_messages,
+        wire_tools,
+        *,
+        provider_custody: object | None = None,
+        credential_state: object | None = None,
+        prepared_input: PreparedProviderInput | None = None,
+    ):
         assert wire_messages == expected
         wire_messages[0]["content"] = "MUTATED AFTER SNAPSHOT"
         if mode == "timeout":

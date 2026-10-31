@@ -38,6 +38,7 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tool_batch import _replace_llm_tool_call_arguments
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
@@ -188,6 +189,7 @@ class _RecordingLLM(_FakeComposeLLM):
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         self.seen.append(copy.deepcopy(list(messages)))
         return await super().__call__(

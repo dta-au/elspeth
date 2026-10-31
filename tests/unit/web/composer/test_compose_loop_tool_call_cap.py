@@ -15,6 +15,7 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointVerdict
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -353,6 +354,7 @@ async def test_bonus_over_cap_raises_shared_cap_error_before_bonus_dispatch(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 
@@ -408,6 +410,7 @@ async def test_bonus_exactly_at_cap_keeps_generic_composition_exhaustion(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         return provider_gateway._admit_composer_llm_completion(next(responses))
 

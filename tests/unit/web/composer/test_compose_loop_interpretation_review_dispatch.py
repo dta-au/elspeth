@@ -66,6 +66,7 @@ from elspeth.web.composer.no_tool_policy import (
     is_pending_interpretation_handoff,
     visible_message_segments,
 )
+from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
@@ -249,6 +250,7 @@ class _ScriptedLLM:
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         self.messages.append(_messages)
         self.tools.append(_tools)
@@ -4637,6 +4639,7 @@ async def test_review_handoff_generates_fresh_reply_after_persisted_narration(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         if {tool["function"]["name"] for tool in tools} == {"handoff_to_user", "restore_parked_graph"}:
             snapshot = await progress_registry.get_latest("reply-progress")
@@ -5012,6 +5015,7 @@ async def test_review_reply_is_bounded_audited_and_cannot_dispatch(
         prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
         prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
         prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        prepared_input: PreparedProviderInput | None = None,
     ) -> Any:
         nonlocal reply_calls
         if {tool["function"]["name"] for tool in tools} != {"handoff_to_user", "restore_parked_graph"}:
