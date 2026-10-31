@@ -12,6 +12,7 @@ from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import _harness
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.graph_recovery import GraphRecoveryContext
@@ -63,7 +64,10 @@ async def test_adapter_forwards_exact_remaining_budget_and_owned_provider_pair(t
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ):
+        # The adapter forwards the caller's (absent) ceiling unchanged.
+        assert mutation_ceiling is None
         calls.append(
             (self, message, messages, state, session_operation_context, budget_seconds, required_work, provider_owner, advisor_history)
         )
@@ -148,7 +152,10 @@ async def test_adapter_legacy_call_preserves_budget_and_closes_actual_owned_leas
         recovery_context=None,
         retained_operation_context: RetainedOperationContext | None = None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ):
+        # The adapter forwards the caller's (absent) ceiling unchanged.
+        assert mutation_ceiling is None
         contexts.append(session_operation_context)
         budgets.append(budget_seconds)
         assert type(required_work) is RequiredWorkBinding
@@ -217,7 +224,10 @@ async def test_adapter_preserves_original_body_and_close_outcomes(tmp_path, monk
         recovery_context=None,
         retained_operation_context=None,
         advisor_history: AdvisorTranscriptHistory | None = None,
+        mutation_ceiling: ComposerMutationCeiling | None = None,
     ):
+        # The adapter forwards the caller's (absent) ceiling unchanged.
+        assert mutation_ceiling is None
         assert type(required_work) is RequiredWorkBinding
         assert advisor_history is None
         assert type(provider_owner) is ProviderInvocationOwner

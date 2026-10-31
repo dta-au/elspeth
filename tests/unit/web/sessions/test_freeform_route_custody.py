@@ -566,7 +566,7 @@ class _ActualCustodyGate:
 
             monkeypatch.setattr(composer_finalization, "_message_with_state_response", gated_projection)
         else:
-            real = composer_turn._publish_progress
+            real = composer_finalization._publish_progress
 
             async def gated_progress(*args, **kwargs):
                 value = await real(*args, **kwargs)
@@ -581,7 +581,7 @@ class _ActualCustodyGate:
                         self.finished.set()
                 return value
 
-            monkeypatch.setattr(composer_turn, "_publish_progress", gated_progress)
+            monkeypatch.setattr(composer_finalization, "_publish_progress", gated_progress)
 
 
 async def _actual_join_control(tmp_path, monkeypatch, *, site, route):
@@ -696,7 +696,7 @@ async def test_after_commit_progress_fault_retains_original_and_cannot_replace_t
     original = failure("first-party after-commit projection fault")
     owners = []
     real_started = app.state.composer_async_worker._run_started
-    real_progress = composer_turn._publish_progress
+    real_progress = composer_finalization._publish_progress
 
     async def capture_owner(services, running, lease):
         owner = asyncio.current_task()
@@ -710,7 +710,7 @@ async def test_after_commit_progress_fault_retains_original_and_cannot_replace_t
             raise original
 
     monkeypatch.setattr(app.state.composer_async_worker, "_run_started", capture_owner)
-    monkeypatch.setattr(composer_turn, "_publish_progress", fail_after_commit)
+    monkeypatch.setattr(composer_finalization, "_publish_progress", fail_after_commit)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             session_id = (await client.post("/api/sessions", json={"title": "late projection"})).json()["id"]
