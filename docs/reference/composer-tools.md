@@ -409,15 +409,51 @@ Atomically replace the entire pipeline in one call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `source` | object | **Yes** | `{plugin, options, on_success, on_validation_failure}`; full replacement requires an explicit nonempty failure choice. |
+| `source` | object | One of `source` / `sources` | Default root: `{plugin, options?, on_success, on_validation_failure, blob_id?, blob_ids?, inline_blob?}`; full replacement requires an explicit nonempty failure choice. |
+| `sources` | object | One of `source` / `sources` | Named roots keyed by stable provider-authored names. Each value has `{plugin, options?, on_success, on_validation_failure, blob_id?, blob_ids?}`; named inline creation is undeclared. |
 | `nodes` | array | **Yes** | Array of `transform`, `gate`, `aggregation`, `coalesce`, `row_union`, `queue`, or `collector` node specs: `[{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, routes?, fork_to?, branches?, policy?, merge?, timeout_seconds?, scope_name?, scope_opener?, scope_policy?}]` |
 | `edges` | array | **Yes** | Array of edge specs: `[{id, from_node, to_node, edge_type}]` |
-| `outputs` | array | **Yes** | Array of output specs with required explicit `on_write_failure`: `[{name, plugin, options, on_write_failure}]`. |
+| `outputs` | array | **Yes** | Array of output specs with required explicit `on_write_failure`: `[{sink_name, plugin, options, on_write_failure}]`. |
 | `metadata` | object | No | `{name?, description?}` |
 
 **When to use:** When the user describes a complete pipeline and you can construct the whole thing at once. More efficient than sequential `set_source` + `upsert_node` + `upsert_edge` + `set_output` calls. Also useful for major restructuring where most components change.
 
 Generated `csv` and `json` outputs must include `options.collision_policy`; the web composer and MCP composer controls reject missing policy choices before export.
+
+**Attachment selection in 0.8.10:** default and named roots accept nullable
+`blob_id` or ordered `blob_ids`; only the default root accepts `inline_blob`.
+Choose exactly one top-level `source` or `sources` object and omit the other;
+null is not a keep-existing-source instruction.
+Omitted/null selectors are absent. Competing correctly typed non-null selectors
+produce root-attributed `source_binding_ambiguous`; wrong shapes, empty/over-width
+lists and undeclared named inline fields use the argument-error channel.
+`blob_ids` contains 1–512 strings and requires the provider's explicit
+`plugin:"blob_rows"`; even one member retains document-row semantics. Duplicate
+identity/content within a list refuses it; separate roots may reuse an
+attachment. Binding uses current owned READY records and never substitutes a
+plugin, root name or route to make the request pass. The private/plugin storage
+bound of 1,000 does not increase the 512 public selector bound.
+Plural attachments retain original user-verbatim upload provenance; they do
+not admit LLM-authored document content.
+
+For a current saved draft,
+`get_pipeline_state({"component":"set_pipeline_arguments"})` returns a public
+replacement document with scalar IDs or ordered plural IDs, ordinary/review
+options and `sink_name` output names, stripping matching private custody.
+Public reapplication resolves current metadata rather than copying historical
+entry facts. Malformed, contradictory or unreconstructible custody refuses
+instead of being dropped or truncated; earlier credential admission can refuse
+before the serializer. Public projection grants no private reviewed authority.
+
+The public implementation is published at `9d7f626` after source review and unit
+receiving, with bounded authenticated SDK/dialect receiving at `776d25bd`.
+A separate nine-case public PostgreSQL slice passes against that production
+checkpoint, including persistence/private reuse, atomic refusal, ownership,
+metadata freshness and cross-connection transaction visibility. Full final-source
+PostgreSQL, live-provider delivery, the full scripted tutorial and final global
+receiving remain pending; see the
+[versioned TC-001/TC-005 contract](composer-tool-contracts-0.8.10.md#tc-001--provider-authored-scalar-and-plural-attachment-roots)
+for its exact status and boundaries.
 
 ---
 
@@ -595,7 +631,7 @@ Place a secret reference marker in the pipeline config. The secret is resolved a
 |-----------|------|----------|-------------|
 | `name` | string | **Yes** | Secret reference name |
 | `target` | string | **Yes** | `"source"`, `"node"`, or `"output"` |
-| `target_id` | string | No | Node ID or output name (required for `"node"` and `"output"` targets) |
+| `target_id` | string | Conditional | Exact raw source-map name, node ID or output name. Required for `"node"`/`"output"` and for `"source"` when multiple sources exist; an unspecified selector chooses the sole source. Use `left`, not `source:left`; follow the offered wire schema's requiredness and nullability. |
 | `option_key` | string | **Yes** | Config option key to set (e.g. `"api_key"`) |
 
 **When to use:** When a plugin needs a credential. Always use `list_secret_refs` first to check availability, then `validate_secret_ref` to confirm access, then `wire_secret_ref` to connect it.
