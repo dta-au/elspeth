@@ -5218,13 +5218,13 @@ def _structure_secondary_engine():
 
 
 async def _structure_trial(monkeypatch, request, engines, operation, *, phase="retention"):
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     with monkeypatch.context() as patch:
         trace = RetentionMemoTrace(patch, request)
         trace.observe_structure(engines=engines, entrypoint="calibration")
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         result = await timer.run(phase, operation)
         try:
@@ -5400,7 +5400,7 @@ async def test_structure_original_unwind_and_entry_failure_never_claim_returned_
     from sqlalchemy import event
 
     from elspeth.web.sessions.locking import locked_session_transaction
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -5425,7 +5425,7 @@ async def test_structure_original_unwind_and_entry_failure_never_claim_returned_
     prior = sys.getprofile()
     trace = RetentionMemoTrace(monkeypatch, request)
     trace.observe_structure(engines=(engine,), entrypoint="calibration")
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     if cut != "clock-entry":
         timer.finish_preparation()
     if cut == "window-entry":
@@ -5462,14 +5462,14 @@ async def test_structure_original_unwind_and_entry_failure_never_claim_returned_
 @pytest.mark.asyncio
 async def test_structure_nested_original_clocks_and_windows_restore_the_outer_carrier(monkeypatch, request):
     from elspeth.web.sessions.locking import locked_session_transaction
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
     second = _structure_secondary_engine()
     trace = RetentionMemoTrace(monkeypatch, request)
     trace.observe_structure(engines=(engine, second), entrypoint="calibration")
-    policy = minimal_continuation_policy().actions.session_sql
+    policy = observed_sql_trial_policy().actions.session_sql
 
     async def inner():
         return _structure_sql_work(second)
@@ -5500,7 +5500,7 @@ async def test_structure_nested_original_clocks_and_windows_restore_the_outer_ca
 @pytest.mark.asyncio
 async def test_structure_native_identity_reuse_after_retirement_does_not_drop_invocations(monkeypatch, request):
     from elspeth.web.sessions.locking import locked_session_transaction
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -5517,7 +5517,7 @@ async def test_structure_native_identity_reuse_after_retirement_does_not_drop_in
         return 0
 
     for _ in range(64):
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         invocation = timer.run("retention", operation)
         clock_ids.append(id(invocation.cr_frame))
@@ -5616,7 +5616,7 @@ async def test_structure_actual_admission_records_reads_clock_and_terminal_outco
     from elspeth.web.sessions.composer_operations import ComposerOperationFenceLost
     from elspeth.web.sessions.continuation import require_continuation_mutation
     from elspeth.web.sessions.locking import locked_session_transaction
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -5630,7 +5630,7 @@ async def test_structure_actual_admission_records_reads_clock_and_terminal_outco
             return require_continuation_mutation(conn, context)
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         if outcome == "raised":
             with pytest.raises(ComposerOperationFenceLost):
@@ -5679,14 +5679,14 @@ async def test_structure_actual_admission_omission_is_not_an_equal_structural_pa
 async def test_structure_raw_real_work_survives_source_or_carrier_refusal(monkeypatch, request, changed):
     from elspeth.web import continuation_retention_memo as memo_module
     from elspeth.web.coordination import database_clock
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
     foreign = _structure_secondary_engine()
     trace = RetentionMemoTrace(monkeypatch, request)
     trace.observe_structure(engines=(engine,), entrypoint="calibration")
-    policy = minimal_continuation_policy().actions.session_sql
+    policy = observed_sql_trial_policy().actions.session_sql
     original_clock = database_clock.database_now
 
     def alias(conn):
@@ -5761,11 +5761,11 @@ async def test_structure_never_exports_sql_literal_parameter_or_result_values(mo
         return _structure_sql_work(engine, canary=canary)
 
     if literal_sql:
-        from tests.helpers.continuation_policy import minimal_continuation_policy
+        from tests.helpers.continuation_policy import observed_sql_trial_policy
 
         trace = RetentionMemoTrace(monkeypatch, request)
         trace.observe_structure(engines=(engine,), entrypoint="calibration")
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         with pytest.raises(AssertionError, match="structure observation incomplete"):
@@ -5785,7 +5785,7 @@ async def test_structure_listener_reentry_keeps_b4_audits_and_application_lock_s
     from sqlalchemy.sql import Select
 
     from elspeth.web.dependencies import create_catalog_service
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -5825,7 +5825,7 @@ async def test_structure_listener_reentry_keeps_b4_audits_and_application_lock_s
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             monkeypatch.setattr(async_workers, "_SHARED_EXECUTOR", pool)
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             assert await timer.run("retention", operation) == 0
         assert seen == [1]
@@ -5910,7 +5910,7 @@ async def test_structure_independent_worker_order_uses_owner_sequences_and_causa
 async def test_structure_commit_callback_is_only_an_attempt_when_original_commit_raises(monkeypatch, request):
     from sqlalchemy import event
 
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -5929,7 +5929,7 @@ async def test_structure_commit_callback_is_only_an_attempt_when_original_commit
         return _structure_sql_work(engine)
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         with pytest.raises(RuntimeError) as caught:
             await timer.run("retention", operation)
@@ -5993,7 +5993,7 @@ async def test_structure_listener_install_failure_rolls_back_only_owned_callback
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["omitted", "later-original", "tamper"])
 async def test_structure_explicit_terminal_qualification_preserves_original_finish_failure(monkeypatch, request, failure):
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6003,7 +6003,7 @@ async def test_structure_explicit_terminal_qualification_preserves_original_fini
     async def operation():
         return _structure_sql_work(engine)
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     await timer.run("retention", operation)
     if failure == "omitted":
@@ -6042,7 +6042,7 @@ async def test_structure_missing_or_open_observation_cannot_be_a_passing_empty_p
 @pytest.mark.asyncio
 @pytest.mark.parametrize("marker_type", [RuntimeError, KeyboardInterrupt, SystemExit, asyncio.CancelledError])
 async def test_structure_primary_native_exception_is_identical_and_never_budget_qualified(monkeypatch, request, marker_type):
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6055,7 +6055,7 @@ async def test_structure_primary_native_exception_is_identical_and_never_budget_
         _structure_sql_work(engine)
         raise marker
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     with pytest.raises(marker_type) as caught:
         try:
@@ -6186,7 +6186,7 @@ async def test_structure_public_request_terminal_survives_a_late_after_cursor_er
 
     from elspeth.web.sessions.locking import locked_session_transaction
     from elspeth.web.sessions.models import sessions_table
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6218,7 +6218,7 @@ async def test_structure_public_request_terminal_survives_a_late_after_cursor_er
         return 0
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         assert after_driver == [1]
@@ -6247,7 +6247,7 @@ async def test_structure_real_select_driver_unwind_has_no_after_cursor_success(m
 
     from elspeth.web.sessions.locking import locked_session_transaction
     from elspeth.web.sessions.models import sessions_table
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6277,7 +6277,7 @@ async def test_structure_real_select_driver_unwind_has_no_after_cursor_success(m
         return 0
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         assert before == [1] and after == [] and len(originals) == 1
@@ -6297,7 +6297,7 @@ async def test_structure_real_select_driver_unwind_has_no_after_cursor_success(m
 async def test_structure_worker_close_restores_the_loop_and_reusable_worker(monkeypatch, request, body_error):
     from sqlalchemy import event
 
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6329,7 +6329,7 @@ async def test_structure_worker_close_restores_the_loop_and_reusable_worker(monk
             return await async_workers.run_required_sql_finish_once(ticket, work)
 
         try:
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             outcome = await timer.run("retention", operation)
             if body_error:
@@ -6372,7 +6372,7 @@ async def test_structure_worker_observation_interrupt_preserves_outcome_and_prof
 ):
     from sqlalchemy import event
 
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6415,7 +6415,7 @@ async def test_structure_worker_observation_interrupt_preserves_outcome_and_prof
 
         leaked = []
         try:
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             outcome = await timer.run("retention", operation)
             if boundary != "normal":
@@ -6520,7 +6520,7 @@ async def test_structure_fresh_select_refuses_changed_owned_metadata_or_visitor(
 
     from elspeth.web.sessions.locking import locked_session_transaction
     from elspeth.web.sessions.models import sessions_table
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6588,7 +6588,7 @@ async def test_structure_fresh_select_refuses_changed_owned_metadata_or_visitor(
             return 0
 
         try:
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             assert await timer.run("retention", operation) == 0
         finally:
@@ -6659,7 +6659,7 @@ async def test_structure_native_window_lifetime_keeps_caught_reyield_separate_fr
 @pytest.mark.parametrize("change", ["normal", "missing", "duplicate", "wrong-frame", "carrier", "generation", "pending-close"])
 async def test_structure_native_delivery_requires_the_same_actual_pending_return(monkeypatch, request, change):
     from elspeth.web import continuation_retention_memo as memo_module
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6702,7 +6702,7 @@ async def test_structure_native_delivery_requires_the_same_actual_pending_return
             trace.close()
         return value
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     assert await timer.run("retention", operation) == 0 and delivered == ["yield"]
     if change == "normal":
@@ -6728,7 +6728,7 @@ async def test_structure_native_delivery_requires_the_same_actual_pending_return
 @pytest.mark.parametrize("wrong_submission", [False, True])
 async def test_structure_native_worker_window_binds_its_real_submission_and_reuses_the_thread(monkeypatch, request, wrong_submission):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6764,7 +6764,7 @@ async def test_structure_native_worker_window_binds_its_real_submission_and_reus
         async def operation():
             return await async_workers.run_required_sql_finish_once(ticket, work)
 
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         outcome = await timer.run("retention", operation)
         assert type(outcome) is RequiredSQLReturned and outcome.value == 0
@@ -6822,7 +6822,7 @@ async def test_structure_native_lifetime_monitor_coexists_with_prior_profile_byt
     monkeypatch, request, native_bytes, prior_profile
 ):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6865,7 +6865,7 @@ async def test_structure_native_lifetime_monitor_coexists_with_prior_profile_byt
             await asyncio.sleep(0)
             return value
 
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         if prior_profile:
@@ -6947,7 +6947,7 @@ async def test_structure_native_monitor_cleanup_interruption_preserves_original_
     monkeypatch, request, boundary, native_error
 ):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -6974,7 +6974,7 @@ async def test_structure_native_monitor_cleanup_interruption_preserves_original_
             raise primary
         return value
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     if native_error:
         with pytest.raises(RuntimeError) as caught:
@@ -6999,7 +6999,7 @@ async def test_structure_native_monitor_cleanup_interruption_preserves_original_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("marker_type", [RuntimeError, KeyboardInterrupt, SystemExit])
 async def test_structure_native_unwind_callback_cannot_replace_the_real_primary(monkeypatch, request, marker_type):
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7024,7 +7024,7 @@ async def test_structure_native_unwind_callback_cannot_replace_the_real_primary(
         with locked_session_transaction(engine, "original-primary"):
             raise primary
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     with pytest.raises(RuntimeError) as caught:
         try:
@@ -7039,7 +7039,7 @@ async def test_structure_native_unwind_callback_cannot_replace_the_real_primary(
 @pytest.mark.parametrize("loss", ["callback", "name", "local-mask"])
 async def test_structure_lifetime_monitor_refuses_ownership_loss_without_erasing_foreign_state(monkeypatch, request, loss):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7069,7 +7069,7 @@ async def test_structure_lifetime_monitor_refuses_ownership_loss_without_erasing
         return value
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         with pytest.raises(RuntimeError):
@@ -7137,7 +7137,7 @@ def test_structure_lifetime_monitor_refuses_and_restores_a_retained_native_callb
 async def test_structure_audited_native_entry_failure_preserves_primary_and_clears_authority(monkeypatch, request, boundary, marker_type):
     from elspeth.web.sessions.locking import locked_session_transaction
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7168,7 +7168,7 @@ async def test_structure_audited_native_entry_failure_preserves_primary_and_clea
                 raise primary
         return 0
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     if boundary == "unwind":
         with pytest.raises(RuntimeError) as caught:
@@ -7197,7 +7197,7 @@ async def test_structure_audited_native_entry_failure_preserves_primary_and_clea
 @pytest.mark.parametrize("changed", [False, True])
 async def test_structure_restored_foreign_native_callback_cannot_relabel_original_return(monkeypatch, request, changed):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7227,7 +7227,7 @@ async def test_structure_restored_foreign_native_callback_cannot_relabel_origina
             assert helper._LIFETIME_REGISTER(owned.tool, event, foreign) is original
         return result
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     try:
         assert await timer.run("retention", operation) == 0
@@ -7257,7 +7257,7 @@ async def test_structure_cleanup_composed_owner_loss_and_interrupt_retains_forei
     monkeypatch, request, boundary, change, native_error
 ):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7312,7 +7312,7 @@ async def test_structure_cleanup_composed_owner_loss_and_interrupt_retains_forei
             raise primary
         return value
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     try:
         if native_error:
@@ -7389,7 +7389,7 @@ def test_structure_install_claim_seam_preserves_a_reclaimed_foreign_slot(monkeyp
 @pytest.mark.parametrize("name", ["get_tool", "set_events", "free_tool_id", "register_callback"])
 async def test_structure_cleanup_uses_held_monitor_apis_without_calling_replaced_public_bindings(monkeypatch, request, name):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7404,7 +7404,7 @@ async def test_structure_cleanup_uses_held_monitor_apis_without_calling_replaced
     async def operation():
         return _structure_sql_work(engine)
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     assert await timer.run("retention", operation) == 0
     with monkeypatch.context() as patch:
@@ -7420,7 +7420,7 @@ async def test_structure_cleanup_uses_held_monitor_apis_without_calling_replaced
 async def test_structure_pending_domains_refuse_foreign_protocols_without_retaining_capabilities(monkeypatch, request, domain):
     from elspeth.web.sessions.locking import locked_session_transaction
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7491,7 +7491,7 @@ async def test_structure_pending_domains_refuse_foreign_protocols_without_retain
         return 0
 
     try:
-        timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+        timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
         timer.finish_preparation()
         assert await timer.run("retention", operation) == 0
         with pytest.raises(AssertionError, match="structure observation incomplete"):
@@ -7511,7 +7511,7 @@ async def test_structure_prior_c_return_exchange_capability_refuses_before_losin
     monkeypatch, request, native_error, marker_type
 ):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7548,7 +7548,7 @@ async def test_structure_prior_c_return_exchange_capability_refuses_before_losin
             raise primary
         return value
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     try:
         if native_error:
@@ -7652,7 +7652,7 @@ async def test_structure_cleanup_saved_interruption_survives_later_prior_capabil
     monkeypatch, request, boundary, lose_capability, marker_type, native_error
 ):
     from tests.helpers import continuation_memo as helper
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     engine = request.getfixturevalue("engine")
@@ -7724,7 +7724,7 @@ async def test_structure_cleanup_saved_interruption_survives_later_prior_capabil
             raise primary
         return value
 
-    timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+    timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
     timer.finish_preparation()
     try:
         if native_error:
@@ -7812,7 +7812,7 @@ async def _closed_dml_trial(monkeypatch, request, engine, context, operation_id,
     from sqlalchemy import event
 
     from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator, RequiredWorkSource
-    from tests.helpers.continuation_policy import minimal_continuation_policy
+    from tests.helpers.continuation_policy import observed_sql_trial_policy
 
     _require_structure_api()
     initial_profile = sys.getprofile()
@@ -7836,7 +7836,7 @@ async def _closed_dml_trial(monkeypatch, request, engine, context, operation_id,
                 assert ticket.complete and not ticket.errors and async_workers.outstanding_admissions() == 0
                 return outcome.value
 
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             result = await timer.run("retention", operation)
         finally:

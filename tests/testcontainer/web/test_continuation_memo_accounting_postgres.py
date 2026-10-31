@@ -24,7 +24,7 @@ from sqlalchemy.sql.dml import Insert
 from sqlalchemy.sql.selectable import Select
 from tests.helpers import continuation_memo as helper
 from tests.helpers.continuation_memo import RetentionMemoTrace
-from tests.helpers.continuation_policy import minimal_continuation_policy
+from tests.helpers.continuation_policy import observed_sql_trial_policy
 from tests.helpers.postgres_target import postgres_test_target
 from tests.testcontainer.web import test_composer_operations_postgres as operations_pg
 from tests.unit.web import test_continuation_memo_accounting as accounting
@@ -333,7 +333,7 @@ async def test_pg_private_original_bounded_reader_structure(monkeypatch, request
                 assert ticket.complete and not ticket.errors and async_workers.outstanding_admissions() == 0
                 return outcome.value
 
-            timer = clock.ContinuationActionClock(minimal_continuation_policy().actions.session_sql)
+            timer = clock.ContinuationActionClock(observed_sql_trial_policy().actions.session_sql)
             timer.finish_preparation()
             assert await timer.run("retention", operation) == len(payload)
         finally:
