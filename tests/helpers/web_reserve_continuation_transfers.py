@@ -267,7 +267,14 @@ SOURCE_RECORD_FIELDS = {
     "producers.ContinuationToolMessagePublication": ("producers", "completion", "batch", "call", "recorder", "messages", "catalog"),
     "producers.CurrentMessageProduction": ("producers", "messages"),
 }
-REQUIRED_PATHS = tuple(dict.fromkeys((*_NAMESPACES, *RECORD_PATHS.values(), *RECORD_CALLERS)))
+# Batch, phase, failure custody and publication sources read by
+# p4_batch_custody_receipt; REQUIRED_PATHS (end of module) includes them.
+P4_BATCH_CUSTODY_PATHS = (
+    "src/elspeth/web/composer/tool_batch.py",
+    "src/elspeth/web/composer/continuation_live_phases.py",
+    "src/elspeth/web/composer/continuation_tool_failure.py",
+    "src/elspeth/web/composer/continuation_prompt_producers.py",
+)
 SITE_KEYS = (
     "selected_definitions",
     "class_uses",
@@ -1405,6 +1412,47 @@ def _capture_evidence_moved_guards(unit, failures):
     return {(unit.path, id(node)) for node in (*prefix, fields, *actual_tail)}
 
 
+# Canonical supplier imports of the runtime-initialization transfers, as
+# (importing path, bound name, module, member). Module-level so REQUIRED_PATHS
+# can include every supplier source the receipt reads.
+_RUNTIME_INITIALIZATION_IMPORTS = (
+    *((path, "capture_turn_evidence", _module(EVIDENCE_GRAPH), "capture_turn_evidence") for path in (RUNTIME, INITIAL_DATA)),
+    *(
+        (path, "encode_mandatory_private_chunk", "elspeth.web.composer.continuation_codec", "encode_mandatory_private_chunk")
+        for path in (RUNTIME, INITIAL_DATA)
+    ),
+    *(
+        (path, "encode_turn_evidence", "elspeth.web.composer.continuation_evidence", "encode_turn_evidence")
+        for path in (RUNTIME, INITIAL_DATA)
+    ),
+    *(
+        (path, "encode_message_shelf", "elspeth.web.composer.continuation_message_shelf", "encode_message_shelf")
+        for path in (RUNTIME, INITIAL_DATA)
+    ),
+    (RUNTIME, "decode_recorder_snapshot", "elspeth.web.composer.continuation_audit_buffer", "decode_recorder_snapshot"),
+    (FIRST_RUNTIME, "_finish_current_evidence", _module(EVIDENCE_GRAPH), "_finish_current_evidence"),
+    (EVIDENCE_GRAPH, "ce", "elspeth.web.composer", "continuation_evidence"),
+    (
+        EVIDENCE_GRAPH,
+        "capture_application_recorder_source",
+        "elspeth.web.composer.continuation_application_graph",
+        "capture_application_recorder_source",
+    ),
+    (EVIDENCE_GRAPH, "P4ApplicationSources", "elspeth.web.composer.continuation_evidence_application_values", "P4ApplicationSources"),
+    (EVIDENCE_GRAPH, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError"),
+)
+_RUNTIME_INITIALIZATION_EXTRA_SUPPLIERS = frozenset(
+    {
+        ("elspeth.web.composer.continuation_finish_reads", "ContinuationFinishRead"),
+        ("elspeth.web.composer.continuation_evidence_application_data", "capture_joint_evidence_graph"),
+        *(
+            ("elspeth.web.composer.continuation_evidence", name)
+            for name in ("TurnEvidenceFields", "TurnEvidenceSnapshot", "require_evidence_fields_admission", "admit_turn_evidence")
+        ),
+    }
+)
+
+
 def runtime_initialization_prerequisite_transfers(units):
     """Check retained callers and moved guards without granting effect sites."""
     index = {unit.path: unit for unit in units}
@@ -1419,32 +1467,7 @@ def runtime_initialization_prerequisite_transfers(units):
         else:
             checked.add((path, id(owner)))
     checked.update(_capture_evidence_moved_guards(index[EVIDENCE_GRAPH], failures))
-    imports = (
-        *((path, "capture_turn_evidence", _module(EVIDENCE_GRAPH), "capture_turn_evidence") for path in (RUNTIME, INITIAL_DATA)),
-        *(
-            (path, "encode_mandatory_private_chunk", "elspeth.web.composer.continuation_codec", "encode_mandatory_private_chunk")
-            for path in (RUNTIME, INITIAL_DATA)
-        ),
-        *(
-            (path, "encode_turn_evidence", "elspeth.web.composer.continuation_evidence", "encode_turn_evidence")
-            for path in (RUNTIME, INITIAL_DATA)
-        ),
-        *(
-            (path, "encode_message_shelf", "elspeth.web.composer.continuation_message_shelf", "encode_message_shelf")
-            for path in (RUNTIME, INITIAL_DATA)
-        ),
-        (RUNTIME, "decode_recorder_snapshot", "elspeth.web.composer.continuation_audit_buffer", "decode_recorder_snapshot"),
-        (FIRST_RUNTIME, "_finish_current_evidence", _module(EVIDENCE_GRAPH), "_finish_current_evidence"),
-        (EVIDENCE_GRAPH, "ce", "elspeth.web.composer", "continuation_evidence"),
-        (
-            EVIDENCE_GRAPH,
-            "capture_application_recorder_source",
-            "elspeth.web.composer.continuation_application_graph",
-            "capture_application_recorder_source",
-        ),
-        (EVIDENCE_GRAPH, "P4ApplicationSources", "elspeth.web.composer.continuation_evidence_application_values", "P4ApplicationSources"),
-        (EVIDENCE_GRAPH, "AuditIntegrityError", "elspeth.contracts.errors", "AuditIntegrityError"),
-    )
+    imports = _RUNTIME_INITIALIZATION_IMPORTS
     for path, name, module, member in imports:
         _require(
             failures,
@@ -1454,16 +1477,7 @@ def runtime_initialization_prerequisite_transfers(units):
     # Existing external primitives retain their definition/import boundary;
     # this does not recursively seal their implementation bodies.
     suppliers = {(module, member) for _path, name, module, member in imports if name != "ce"}
-    suppliers.update(
-        {
-            ("elspeth.web.composer.continuation_finish_reads", "ContinuationFinishRead"),
-            ("elspeth.web.composer.continuation_evidence_application_data", "capture_joint_evidence_graph"),
-            *(
-                ("elspeth.web.composer.continuation_evidence", name)
-                for name in ("TurnEvidenceFields", "TurnEvidenceSnapshot", "require_evidence_fields_admission", "admit_turn_evidence")
-            ),
-        }
-    )
+    suppliers.update(_RUNTIME_INITIALIZATION_EXTRA_SUPPLIERS)
     for module, member in sorted(suppliers):
         path = "src/" + module.replace(".", "/") + ".py"
         _require(
@@ -1711,10 +1725,7 @@ def _custody_node_at(unit, symbol):
 
 def p4_batch_custody_receipt(units):
     """Bind P4's concrete custody transfers; never grant an arbitrary callback."""
-    batch_path = "src/elspeth/web/composer/tool_batch.py"
-    phase_path = "src/elspeth/web/composer/continuation_live_phases.py"
-    custody_path = "src/elspeth/web/composer/continuation_tool_failure.py"
-    publication_path = "src/elspeth/web/composer/continuation_prompt_producers.py"
+    batch_path, phase_path, custody_path, publication_path = P4_BATCH_CUSTODY_PATHS
     indexed = {unit.path: unit for unit in units}
     if len(indexed) != len(units) or any(path not in indexed for path in (batch_path, phase_path, custody_path, publication_path)):
         return ["P4 batch custody source is missing or duplicated"], {}
@@ -3117,6 +3128,42 @@ _ATTACHMENT_PREREQUISITE_BODIES = {
 }
 
 
+# Names are concrete suppliers of the reviewed transfers, not a caller
+# whitelist. Local imports are checked in their actual function body. Entries are
+# (importing path, owning symbol or None, bound name, module); module-level so
+# REQUIRED_PATHS can include every supplier source the receipt reads.
+_ATTACHMENT_PREREQUISITE_IMPORTS = (
+    (PROVIDER_THINKING, None, "utf8_size", "elspeth.contracts.bounded_serialization"),
+    (PROVIDER_THINKING, None, "require_no_credential_material", "elspeth.web.credential_guard"),
+    (PROVIDER_THINKING, None, "ComposerAdmissionRefused", "elspeth.web.composer.protocol"),
+    (PROVIDER_THINKING, None, "Mapping", "collections.abc"),
+    (PROVIDER_THINKING, None, "Sequence", "collections.abc"),
+    (PROVIDER_THINKING, None, "cast", "typing"),
+    (
+        CHECKPOINT,
+        "_history_data",
+        "load_attachment_history_data_on_connection",
+        "elspeth.web.sessions.continuation_attachment_application",
+    ),
+    (CHECKPOINT, None, "read_chunk", "elspeth.web.sessions.continuation"),
+    (CHECKPOINT, None, "private_chunk_key", "elspeth.web.sessions.continuation"),
+    (CHECKPOINT, None, "decode_attachment_published_result", "elspeth.web.composer.continuation_attachment_result_data"),
+    (CHECKPOINT, None, "decode_read_owner_result", "elspeth.web.sessions.continuation_owner_results"),
+    (CHECKPOINT, None, "decode_dispatch_audit", "elspeth.web.composer.continuation_dispatch_audit"),
+    (ATTACHMENT_DRIVER, None, "_registered_read", "elspeth.web.composer.continuation_runtime"),
+    (ATTACHMENT_DRIVER, None, "ContinuationRuntimeSource", "elspeth.web.sessions.continuation_runtime"),
+    (ATTACHMENT_APPLICATION, None, "require_admitted_turn_evidence", "elspeth.web.composer.continuation_evidence"),
+    (ATTACHMENT_APPLICATION, None, "admit_turn_evidence", "elspeth.web.composer.continuation_evidence"),
+    (ATTACHMENT_APPLICATION, None, "encode_turn_evidence", "elspeth.web.composer.continuation_evidence"),
+    (ATTACHMENT_APPLICATION, "admit_attachment_application", "decode_turn_evidence", "elspeth.web.composer.continuation_evidence"),
+    (ATTACHMENT_APPLICATION, None, "encode_recorder_snapshot", "elspeth.web.composer.continuation_audit_buffer"),
+    (FINISHER, None, "require_admitted_turn_evidence", "elspeth.web.composer.continuation_evidence"),
+    (FINISHER, None, "capture_turn_evidence", "elspeth.web.composer.continuation_evidence_graph"),
+    (FINISHER, "finish_current_attachment_result", "_registered_read", "elspeth.web.composer.continuation_runtime"),
+    (FINISHER, "finish_current_attachment_result", "ContinuationRuntimeSource", "elspeth.web.sessions.continuation_runtime"),
+)
+
+
 def attachment_prerequisite_transfers(units):
     """Check reviewed moved obligations without admitting retained source seals.
 
@@ -3143,38 +3190,7 @@ def attachment_prerequisite_transfers(units):
     if failures:
         return failures, {}
 
-    # Names are concrete suppliers of the reviewed transfers, not a caller
-    # whitelist. Local imports are checked in their actual function body.
-    imports = (
-        (PROVIDER_THINKING, None, "utf8_size", "elspeth.contracts.bounded_serialization"),
-        (PROVIDER_THINKING, None, "require_no_credential_material", "elspeth.web.credential_guard"),
-        (PROVIDER_THINKING, None, "ComposerAdmissionRefused", "elspeth.web.composer.protocol"),
-        (PROVIDER_THINKING, None, "Mapping", "collections.abc"),
-        (PROVIDER_THINKING, None, "Sequence", "collections.abc"),
-        (PROVIDER_THINKING, None, "cast", "typing"),
-        (
-            CHECKPOINT,
-            "_history_data",
-            "load_attachment_history_data_on_connection",
-            "elspeth.web.sessions.continuation_attachment_application",
-        ),
-        (CHECKPOINT, None, "read_chunk", "elspeth.web.sessions.continuation"),
-        (CHECKPOINT, None, "private_chunk_key", "elspeth.web.sessions.continuation"),
-        (CHECKPOINT, None, "decode_attachment_published_result", "elspeth.web.composer.continuation_attachment_result_data"),
-        (CHECKPOINT, None, "decode_read_owner_result", "elspeth.web.sessions.continuation_owner_results"),
-        (CHECKPOINT, None, "decode_dispatch_audit", "elspeth.web.composer.continuation_dispatch_audit"),
-        (ATTACHMENT_DRIVER, None, "_registered_read", "elspeth.web.composer.continuation_runtime"),
-        (ATTACHMENT_DRIVER, None, "ContinuationRuntimeSource", "elspeth.web.sessions.continuation_runtime"),
-        (ATTACHMENT_APPLICATION, None, "require_admitted_turn_evidence", "elspeth.web.composer.continuation_evidence"),
-        (ATTACHMENT_APPLICATION, None, "admit_turn_evidence", "elspeth.web.composer.continuation_evidence"),
-        (ATTACHMENT_APPLICATION, None, "encode_turn_evidence", "elspeth.web.composer.continuation_evidence"),
-        (ATTACHMENT_APPLICATION, "admit_attachment_application", "decode_turn_evidence", "elspeth.web.composer.continuation_evidence"),
-        (ATTACHMENT_APPLICATION, None, "encode_recorder_snapshot", "elspeth.web.composer.continuation_audit_buffer"),
-        (FINISHER, None, "require_admitted_turn_evidence", "elspeth.web.composer.continuation_evidence"),
-        (FINISHER, None, "capture_turn_evidence", "elspeth.web.composer.continuation_evidence_graph"),
-        (FINISHER, "finish_current_attachment_result", "_registered_read", "elspeth.web.composer.continuation_runtime"),
-        (FINISHER, "finish_current_attachment_result", "ContinuationRuntimeSource", "elspeth.web.sessions.continuation_runtime"),
-    )
+    imports = _ATTACHMENT_PREREQUISITE_IMPORTS
     for path, symbol, name, module in imports:
         scope = index[path].tree
         if symbol is not None:
@@ -4085,3 +4101,30 @@ def continuation_local_transfers(units):
         for owner, members in receipt["receiver_members"].items():
             joined["receiver_members"].setdefault(owner, set()).update(members)
     return _finish(failures, joined)
+
+
+# Every source path any receipt in this module requires, derived from the same
+# tables the receipts read, so a gate cannot require a path the unit sets omit.
+REQUIRED_PATHS = tuple(
+    dict.fromkeys(
+        (
+            *_NAMESPACES,
+            *RECORD_PATHS.values(),
+            *RECORD_CALLERS,
+            BATCH,
+            EVIDENCE_GRAPH,
+            *P4_BATCH_CUSTODY_PATHS,
+            *(path for path, _symbol in _RUNTIME_INITIALIZATION_BODIES),
+            *(path for path, _symbol in _ATTACHMENT_PREREQUISITE_BODIES),
+            # Supplier definitions the receipts resolve inside elspeth.
+            *(
+                "src/" + module.replace(".", "/") + ".py"
+                for module in sorted(
+                    {module for _path, name, module, _member in _RUNTIME_INITIALIZATION_IMPORTS if name != "ce"}
+                    | {module for module, _member in _RUNTIME_INITIALIZATION_EXTRA_SUPPLIERS}
+                    | {module for _path, _symbol, _name, module in _ATTACHMENT_PREREQUISITE_IMPORTS if module.startswith("elspeth.")}
+                )
+            ),
+        )
+    )
+)
