@@ -231,6 +231,7 @@ class TestToolListOrderIsCacheKeyContract:
         from elspeth.contracts.composer_llm_audit import ToolContractDialect
         from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
         from elspeth.web.composer.tools import get_tool_definitions
+        from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 
         definitions = get_tool_definitions()
         tools = composer_loop_tool_definitions(ToolContractDialect.NONE)
@@ -246,9 +247,11 @@ class TestToolListOrderIsCacheKeyContract:
         for definition, tool in zip(definitions, registry_tools, strict=True):
             parameters = tool["function"]["parameters"]
             if definition["name"] == "set_pipeline":
+                # The envelope carries the canonical schema: the registered
+                # definition plus the runtime naming disclosures.
                 assert parameters == {
                     "type": "object",
-                    "properties": {"pipeline": definition["parameters"]},
+                    "properties": {"pipeline": canonical_set_pipeline_schema()},
                     "required": ["pipeline"],
                     "additionalProperties": False,
                 }
