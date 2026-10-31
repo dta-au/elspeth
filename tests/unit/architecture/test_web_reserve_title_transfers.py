@@ -402,8 +402,10 @@ def test_title_current_work_relationships_refuse_after_only_the_mutated_supplier
     (
         (title.SQL, "_current"),
         (title.SQL, "_source_chain"),
-        (title.SQL, "_require_physical"),
-        (title.SQL, "_require_audit_cohort"),
+        # 776d25bd7 moved these guards into the *_data delegates, which the
+        # wrappers call unchanged; both are under the TITLE source contract.
+        (title.SQL, "_require_physical_data"),
+        (title.SQL, "_require_audit_cohort_data"),
         (title.SQL, "AdmittedTitleAuditSource.require"),
         (title.SQL, "admit_title_audit_source_on_connection"),
         (title.SQL, "complete_title_accounting_on_connection"),

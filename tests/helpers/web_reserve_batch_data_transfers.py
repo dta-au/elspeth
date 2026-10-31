@@ -112,6 +112,14 @@ LOCAL_SUPPLIER_SPECS = (
             "elspeth.web.composer.continuation_application_graph.application_result_tools",
         ),
     ),
+    (
+        # Reviewed 2026-11-01: a read-only retained-failure integrity check that
+        # raises AuditIntegrityError and performs no I/O or mutation (41fcaafce).
+        "_joint",
+        "from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links",
+        None,
+        ("elspeth.web.composer.continuation_tool_failure.require_retained_failure_links",),
+    ),
 )
 
 # Raw source-segment bindings for the parent-owned existing receipt only.

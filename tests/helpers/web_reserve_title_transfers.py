@@ -159,7 +159,7 @@ ORIGINS = (
     (DRIVER, "run_prepared_title_provider", "elspeth.web.composer.continuation_title_provider"),
     (DRIVER, "settle_current_title_result", "elspeth.web.composer.continuation_title_provider"),
     (DRIVER, "prepare_current_title_provider", "elspeth.web.composer.continuation_title_provider"),
-    (DRIVER, "apply_current_title_success", "elspeth.web.composer.continuation_title_provider"),
+    (DRIVER, "apply_current_title_success", "elspeth.web.composer.continuation_title_application"),
     (DRIVER, "InitializeFrame", "elspeth.web.composer.continuation"),
 )
 

@@ -227,7 +227,12 @@ def test_actual_central_batch_data_prerequisite_keeps_native_three_constructor_s
 
     root = Path(__file__).resolve().parents[3]
     paths = ("src/elspeth/web/composer/tool_batch.py", "src/elspeth/web/composer/bounded_json.py")
-    units = (*_units(), *(_parse(path, (root / path).read_text()) for path in paths))
+    # The fencing receipt resolves owners through parent links that only its own
+    # parser attaches, so build every unit with it.
+    units = tuple(
+        fence._parse_source(path, text)
+        for path, text in (*((unit.path, unit.source) for unit in _units()), *((path, (root / path).read_text()) for path in paths))
+    )
     batch = next(unit for unit in units if unit.path == paths[0])
     classes = {name: fence._reserve_node_at(batch, name) for name in ("ContinuationBatchState", "ContinuationCallState", "_CallWireFacts")}
     assert all(isinstance(declaration, ast.ClassDef) for declaration in classes.values())

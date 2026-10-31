@@ -1737,13 +1737,14 @@ def p4_batch_custody_receipt(units):
 
     initialize = _custody_node_at(batch, "_initialize_continuation_batch_live")
     primary = _custody_node_at(phases, "ContinuationLivePhases._primary_for_phase")
+    initializer_owner = _custody_node_at(phases, "ContinuationLivePhases._initialize_batch")
     execute = _custody_node_at(batch, "_execute_continuation_call_live")
     finish = _custody_node_at(batch, "_finish_continuation_batch_live")
     issue = _custody_node_at(phases, "ContinuationLivePhases._execute_one_owned")
     persist = _custody_node_at(phases, "ContinuationLivePhases._persist_batch")
-    if not all(isinstance(node, ast.AsyncFunctionDef) for node in (initialize, primary, execute, issue, persist)) or not isinstance(
-        finish, ast.FunctionDef
-    ):
+    if not all(
+        isinstance(node, ast.AsyncFunctionDef) for node in (initialize, primary, initializer_owner, execute, issue, persist)
+    ) or not isinstance(finish, ast.FunctionDef):
         return ["P4 batch custody native definition changed"], {}
     phase_contract = ast.parse(OWNER_TEMPLATES["phases.ContinuationLivePhases"])
     for symbol in ("_primary_for_phase", "_capture_issued_finish", "_execute_one_owned", "_persist_batch"):
@@ -1772,7 +1773,7 @@ def p4_batch_custody_receipt(units):
         "actual initializer import changed",
     )
     initialize_call = one(
-        primary,
+        initializer_owner,
         "await _initialize_continuation_batch_live("
         "call_model=result.outcome, ctx=context, acc=accumulator, llm_messages=live.llm_messages, batch=batch)",
         "actual initializer owner arguments changed",

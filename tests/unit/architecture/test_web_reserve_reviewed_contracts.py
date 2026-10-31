@@ -10053,15 +10053,17 @@ def test_receiving_p4_initializer_keeps_original_owners_after_phase_source_rebin
     assert failures == [], failures
     path = "src/elspeth/web/composer/continuation_live_phases.py"
     original = next(unit for unit in units if unit.path == path)
-    primary = fencing._reserve_node_at(original, "ContinuationLivePhases._primary_for_phase")
+    initializer_owner = fencing._reserve_node_at(original, "ContinuationLivePhases._initialize_batch")
     (initializer,) = [
-        node for node in ast.walk(primary) if isinstance(node, ast.Call) and ast.unparse(node.func) == "_initialize_continuation_batch_live"
+        node
+        for node in ast.walk(initializer_owner)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_initialize_continuation_batch_live"
     ]
     assert (path, id(initializer)) in receipt["native_calls"]
     assert (path, id(initializer.func)) in receipt["native_uses"]
 
     def change(unit):
-        owner = fencing._reserve_node_at(unit, "ContinuationLivePhases._primary_for_phase")
+        owner = fencing._reserve_node_at(unit, "ContinuationLivePhases._initialize_batch")
         (statement,) = [
             node
             for node in owner.body

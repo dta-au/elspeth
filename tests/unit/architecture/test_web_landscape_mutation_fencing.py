@@ -19872,17 +19872,18 @@ def _reserve_continuation_batch_data_receipt(units, classes):
     actual_local_sites = {(path, id(node)) for node in local_imports}
     require(transfers["additional_local_imports"] <= actual_local_sites, "additional local supplier receipt is detached")
     local_imports = [node for node in local_imports if (path, id(node)) not in transfers["additional_local_imports"]]
-    local_suppliers = (
-        (
-            "_argument_text",
-            "from elspeth.contracts.json_parser import parse_json_strict",
-            "elspeth.contracts.json_parser.parse_json_strict",
-        ),
-        (
-            "_check_prepared",
-            "from elspeth.web.composer.continuation_dispatch_audit import _binding",
-            "elspeth.web.composer.continuation_dispatch_audit._binding",
-        ),
+    # The unconditional (phase-free) rows of the reviewed supplier specs; the
+    # phase-bound rows arrive above through additional_local_imports. One
+    # reviewed list, so a new local supplier cannot be admitted in one check
+    # and missed by this one.
+    local_suppliers = tuple(
+        (owner, source, origins[0])
+        for owner, source, phase, origins in _reserve_batch_data_transfers.LOCAL_SUPPLIER_SPECS
+        if phase is None and len(origins) == 1
+    )
+    require(
+        all(len(origins) == 1 for _owner, _source, phase, origins in _reserve_batch_data_transfers.LOCAL_SUPPLIER_SPECS if phase is None),
+        "phase-free local supplier must name exactly one origin",
     )
     require(len(local_imports) == len(local_suppliers), "local supplier cohort changed")
     for owner_name, import_source, origin in local_suppliers:

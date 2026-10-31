@@ -309,8 +309,12 @@ def _structure_instruction_sites(code: CodeType) -> dict[int, str]:
     Python 3.12 reports ``f_lasti`` at an instruction's final CACHE unit when an
     exception unwinds through it (``prev_instr`` has already passed the caches);
     3.13 reports the instruction start. A cache unit belongs to exactly one
-    instruction, and no return or yield instruction carries caches, so the extra
-    key can only resolve an unwind to the instruction that actually raised.
+    instruction, and no return or yield instruction carries caches, so an added
+    key can only ever classify an outcome as an unwind, never as a return or
+    yield. For a frame's ``f_lasti`` it names the instruction that raised. For a
+    sys.monitoring PY_UNWIND offset on 3.13 (start - 2 when an exception passes
+    up through an inlined call) it can name the preceding instruction; that
+    lookup only requires a known non-return, non-yield site.
     """
     instructions = list(dis.get_instructions(code))
     sites: dict[int, str] = {}
