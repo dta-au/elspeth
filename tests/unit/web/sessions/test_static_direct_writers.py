@@ -1407,19 +1407,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
-        path="tests/integration/web/composer/test_freeform_pipeline_planner.py",
-        enclosing_symbol="test_direct_manifest_mismatch_checkpoint_defers_original_cancellation.pause",
-        table="chat_messages",
-        operation="raw_string_in_startswith",
-        purpose=(
-            "READ-ONLY statement matcher: a before_cursor_execute listener "
-            "matches `INSERT INTO chat_messages` to pause the production native "
-            "llm_call_audit insert while the deferred cancellation is observed. "
-            "The test issues no insert; the matched statement is the production "
-            "writer's own."
-        ),
-    ),
-    ReviewedWriter(
         path="tests/testcontainer/web/test_content_publication_contention_postgres.py",
         enclosing_symbol="test_control_without_session_serialisation_two_writers_collide_on_one_version.hold_before_insert",
         table="composition_states",
@@ -2081,6 +2068,26 @@ _LOCK_DISCIPLINE_NEGATIVE_TESTS: tuple[LockDisciplineNegativeTest, ...] = (
 # ``_REVIEWED_ALLOWLIST`` above.
 
 _TEST_FIXTURE_REVIEWED_WRITERS: tuple[ReviewedWriter, ...] = (
+    ReviewedWriter(
+        path="tests/unit/web/composer/test_reviewed_plural_authority.py",
+        enclosing_symbol="_mutate_later_record",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Provenance perturbation fixture: for the llm_generated/disambiguated arms, seeds one route_user_message "
+            "user row (sequence 1) so a later blob record can name a message id; no assistant or audit row is written."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/routes/composer/test_operation_versions.py",
+        enclosing_symbol="test_lifecycle2_stop_preserves_completed_result_without_marking_or_waking",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Lifecycle-2 Stop fixture: one executemany seeds the operation's reserved user row and its completed "
+            "assistant reply at the next sequence numbers, so Stop can be shown to preserve a completed result."
+        ),
+    ),
     ReviewedWriter(
         path="tests/testcontainer/web/test_quota_authority_postgres.py",
         enclosing_symbol="test_container_storage_serializes_cross_identity_output_reservations",
