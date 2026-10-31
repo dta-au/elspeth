@@ -522,8 +522,9 @@ def _assert_batch_session_authority(sources: Mapping[str, str]) -> None:
         session_operation_context=ctx.session_operation_context, current_state_id=current_state_id,
         composer_model_version=provider_model_version, llm_messages=llm_messages,
         anti_anchor=anti_anchor, policy_catalog=ctx.policy_catalog, review_preflight=review_preflight,
+        failure_observation=observation, publication=publication,
     ),
-    audit=audit, recorder=recorder,
+    audit=audit, recorder=recorder, failure_observation=observation,
 )"""
     ).body[0]
     assert _stable_ast_bytes(tries[0].body[0]) == _stable_ast_bytes(expected_transfer)
@@ -846,13 +847,13 @@ mutation_ceiling = ComposerMutationCeiling(str(turn.session_id), str(turn_user_m
     )
     assert (
         hashlib.sha256(_stable_ast_bytes(ast.Module(body=retained_prefix, type_ignores=[]))).hexdigest()
-        == "e00d6b374471ab72519e2d17e8af9b0f7df4384e2d4d6473c35d6e3cd53ffe1b"
+        == "93c06565d7a2b2c72d2de0d0d086607bd2bcd0a0d87480d794edfc1c3d654905"
     )
     assert (
         hashlib.sha256(
             _stable_ast_bytes(ast.Module(body=invocation_try.body[: invocation_try.body.index(primary_branch)], type_ignores=[]))
         ).hexdigest()
-        == "bfe52a9bd67375dc641dd59d0fb413b7c8c7db0602d953fe3c3d754ef1e8ab70"
+        == "fc7c4b15183094f2858e8058641ee933ad90f6049fe0cda92c5d32c2788e739b"
     )
 
 
