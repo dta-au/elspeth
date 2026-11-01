@@ -255,7 +255,7 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Login to GHCR
         if: steps.registries.outputs.push_ghcr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -263,7 +263,7 @@ jobs:
 
       - name: Login to ACR
         if: steps.registries.outputs.push_acr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
@@ -500,7 +500,7 @@ jobs:
 
       - name: Upload gateway qualification evidence
         if: steps.gateway-ghcr-push.outputs.digest != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: gateway-build-qualification-${{ env.IMAGE_SHA }}
           path: |
@@ -519,7 +519,7 @@ jobs:
 
       - name: Upload main image qualification evidence
         if: always() && (steps.ghcr-push.outputs.digest != '' || steps.acr-push.outputs.digest != '')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: main-image-qualification-${{ env.IMAGE_SHA }}
           path: |
@@ -626,7 +626,7 @@ jobs:
 
       - name: Login to GHCR (to pull image)
         if: needs.build-push.outputs.push_ghcr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -634,7 +634,7 @@ jobs:
 
       - name: Login to ACR (to pull image)
         if: needs.build-push.outputs.push_acr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
@@ -914,7 +914,7 @@ jobs:
 
       - name: Login to GHCR for verified promotion
         if: needs.build-push.outputs.push_ghcr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -922,7 +922,7 @@ jobs:
 
       - name: Login to ACR for verified promotion
         if: needs.build-push.outputs.push_acr == 'true'
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6
         with:
           registry: ${{ secrets.ACR_REGISTRY }}
           username: ${{ secrets.AZURE_CLIENT_ID }}
