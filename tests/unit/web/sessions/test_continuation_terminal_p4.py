@@ -126,6 +126,21 @@ async def _close_released_lease(store, owner, running):
     assert actual.lease_token == expected.lease_token and actual.released_at is not None
 
 
+def _release_fence_externally(store, running):
+    """Release the exact fence the way another owner or a reaper would: through the authority.
+
+    Never join the live lease from inside work that lease owns. Its close would
+    wait for the very task calling it, and the two would wait for each other
+    forever. The in-memory lease is not told: it must find the loss itself.
+    """
+    expected = running.session_operation_context.fence
+    store[1].release(running.session_operation_context)
+    with store[0].connect() as conn:
+        actual = conn.execute(select(fences).where(fences.c.session_id == str(running.claim.session_id))).one()
+    assert actual.operation_id == expected.operation_id and actual.operation_epoch == expected.operation_epoch
+    assert actual.lease_token == expected.lease_token and actual.released_at is not None
+
+
 def _require_publication(
     owner,
     running,
@@ -414,7 +429,9 @@ async def test_terminal_p4_released_issued_fence_cannot_publish_with_live_origin
         released = []
 
         async def release_then_refuse(**kwargs):
-            await _close_released_lease(operation_store, owner, running)
+            # This seam runs inside the issued-tool task the lease owns, so the
+            # fence is released externally rather than by closing the lease.
+            await asyncio.to_thread(_release_fence_externally, operation_store, running)
             released.append(stored_rows(operation_store[0]))
             return await refuse(**kwargs)
 
