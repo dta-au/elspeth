@@ -103,9 +103,10 @@ function useSuccessorNotice(status: ComposerOperationStatusV2 | null | undefined
     if (operation === null || segment === null) return;
     const previous = seen.current;
     if (previous === null || previous.operation !== operation) {
-      // A segment already running at attach is history; one first seen queued
-      // (or interrupted) has not started, so its start is still announced.
-      const baseline = segment.state === "running" ? segment.sequence : segment.sequence - 1;
+      // A segment already running at attach is history; a successor first seen
+      // queued (or interrupted) has not started, so its start is still
+      // announced. Segment 1 is never a successor, so its baseline floor is 1.
+      const baseline = segment.state === "running" ? segment.sequence : Math.max(1, segment.sequence - 1);
       seen.current = { operation, baseline, announced: baseline };
       return;
     }

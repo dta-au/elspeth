@@ -60,6 +60,11 @@ describe("Continuation copy (design §4.2, F-12)", () => {
     rerender(<ComposingIndicator operationStatus={status({ status_revision: 3, segment: { sequence: 2, generation: 2, state: "running", deadline_at: new Date().toISOString() } })} />);
     expect(screen.getByText(SUCCESSOR_NOTICE)).toBeInTheDocument();
   });
+  it.each(["queued", "interrupted"] as const)("does not announce segment 1 first seen %s when it starts", (state) => {
+    const { rerender } = render(<ComposingIndicator operationStatus={status({ status: "queued", phase: "queued", segment: { sequence: 1, generation: 1, state, deadline_at: null } })} />);
+    rerender(<ComposingIndicator operationStatus={status({ status_revision: 2 })} />);
+    expect(screen.queryByText(SUCCESSOR_NOTICE)).toBeNull();
+  });
   it("does not show the notice on first attach to a request already past segment 1", () => {
     render(<ComposingIndicator operationStatus={status({ segment: { sequence: 4, generation: 4, state: "running", deadline_at: new Date().toISOString() } })} />);
     expect(screen.queryByText(SUCCESSOR_NOTICE)).toBeNull();
