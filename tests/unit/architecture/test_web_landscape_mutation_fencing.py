@@ -35835,6 +35835,9 @@ def test_landscape_subordinate_helper_edge_set_is_frozen() -> None:
     )
 
 
+# Budget: ~2x the measured 490.5 s wall (2026-11-01, ae10139b3 plus the reserve-proof
+# speedups, serial, 3.13, host load ~13). proof-23 measured 566 s without the speedups.
+@pytest.mark.timeout(1000)
 @pytest.mark.landscape_long_run
 def test_required_work_reserve_admission_on_actual_sources() -> None:
     result = _reserve_run(_production_units())
@@ -35842,6 +35845,9 @@ def test_required_work_reserve_admission_on_actual_sources() -> None:
     assert not result["unproven_web_rows"], result["unproven_web_rows"]
 
 
+# Budget: ~2x the measured 2142 s wall (2026-11-01, ae10139b3 plus the reserve-proof
+# speedups, serial, 3.13, host load ~13-21). CI's job allows 7200-14400 s.
+@pytest.mark.timeout(4300)
 @pytest.mark.landscape_long_run
 def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> None:
     """A protected constructor passed through a local formal can still mutate its class."""
@@ -35965,6 +35971,9 @@ def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> N
     )
 
 
+# Budget: ~2x the measured 782.8 s wall (2026-11-01, ae10139b3 plus the reserve-proof
+# speedups, serial, 3.13, host load ~13). Pristine ae10139b3 took 1065 s; CI took 637 s.
+@pytest.mark.timeout(1600)
 @pytest.mark.landscape_long_run
 def test_no_mutation_alias_wrapper_dynamic_or_raw_write_escape_exists() -> None:
     units = _production_units()
@@ -38484,6 +38493,10 @@ def test_compose_iteration_state_receipt_refuses_external_origin_effects(additio
     assert not boundary.disjoint_compose_state_writes
 
 
+# Budget: ~2x the measured 520.5 s wall (2026-11-01, ae10139b3 plus the reserve-proof
+# speedups, serial, 3.13, host load ~13). proof-23 measured 1137.7 s without them,
+# over the 600 s default in its ordinary CI shard.
+@pytest.mark.timeout(1100)
 @pytest.mark.landscape_fencing_regression
 def test_compose_iteration_receipt_does_not_admit_an_unrelated_state_write():
     units = _production_units()
@@ -38820,6 +38833,9 @@ def test_continuation_batch_state_receipt_belongs_to_the_actual_source_ast():
     assert not detached_receipt["state_writes"] & boundary.disjoint_compose_state_writes
 
 
+# Budget: ~2x the measured 523.4 s wall (2026-11-01, ae10139b3 plus the reserve-proof
+# speedups, serial, 3.13, host load ~13). proof-23 measured 751.6 s without them.
+@pytest.mark.timeout(1100)
 @pytest.mark.landscape_fencing_regression
 def test_continuation_batch_receipt_does_not_admit_an_unrelated_state_write():
     units = _production_units()
