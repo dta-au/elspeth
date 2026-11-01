@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from threading import Event, Lock
-from unittest.mock import patch
+from uuid import uuid4
 
-import httpx
 import pytest
 
 from elspeth.web import async_workers
@@ -14,10 +13,7 @@ from elspeth.web.async_workers import (
     run_stream_read_in_worker,
 )
 from elspeth.web.composer_stream import BoundedComposerStreamResponse, ComposerStreamCapacityError, ComposerStreamPermits
-from elspeth.web.required_work import reduce_composer_failures
-from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
-from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
-from tests.helpers.composer_operations import build_composer_operation_app, message_body, submit_and_settle
+from tests.helpers.continuation_app import ScriptedSDK, assistant_contents, continuation_app, end_admit, install_sdk, settle
 
 
 async def _wait_for(predicate) -> None:
@@ -27,9 +23,9 @@ async def _wait_for(predicate) -> None:
 
 
 @pytest.mark.asyncio
-async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_terminal_sql(tmp_path) -> None:
-    setup = await build_composer_operation_app(tmp_path, timeout_seconds=60)
-    setup.composer.release.set()
+async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_terminal_sql(tmp_path, monkeypatch) -> None:
+    sdk = ScriptedSDK([("primary", ("Completed delayed response.", None)), ("end", end_admit())])
+    install_sdk(monkeypatch, sdk)
     permits = ComposerStreamPermits()
     release = Event()
     entered = [Event() for _ in range(8)]
@@ -51,31 +47,20 @@ async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_termi
     async def send(_message):
         return None
 
-    def read(index):
-        entered[index].set()
-        release.wait()
-        try:
-            return setup.app.state.session_service.get_session_for_stream(setup.session_id)
-        finally:
-            finished[index].set()
+    async with continuation_app(tmp_path, monkeypatch) as harness:
 
-    async def frames(index):
-        await run_stream_read_in_worker(read, index)
-        yield b"data: released\n\n"
+        def read(index):
+            entered[index].set()
+            release.wait()
+            try:
+                return harness.app.state.session_service.get_session_for_stream(harness.session_id)
+            finally:
+                finished[index].set()
 
-    with (
-        patch.object(
-            ComposerAsyncWorker, "_failure_for", autospec=True, side_effect=ComposerAsyncWorker._failure_for
-        ) as failure_selections,
-        patch(
-            "elspeth.web.sessions.composer_async_worker.reduce_composer_failures", autospec=True, side_effect=reduce_composer_failures
-        ) as failure_reductions,
-        patch(
-            "elspeth.web.sessions.composer_async_worker.project_composer_operation_error",
-            autospec=True,
-            side_effect=project_composer_operation_error,
-        ) as failure_projections,
-    ):
+        async def frames(index):
+            await run_stream_read_in_worker(read, index)
+            yield b"data: released\n\n"
+
         try:
             for index in range(8):
                 permit = permits.acquire(f"op-{index}", f"principal-{index // 4}")
@@ -86,45 +71,22 @@ async def test_eight_hung_stream_reads_leave_shared_pool_for_real_auth_and_termi
             assert permits.occupied == 8
             with pytest.raises(ComposerStreamCapacityError):
                 permits.acquire("ninth", "third-principal")
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=setup.app), base_url="http://test", headers={"Authorization": f"Bearer {setup.token}"}
-            ) as client:
-                async with asyncio.timeout(5):
-                    ordinary = await client.get(f"/api/sessions/{setup.session_id}")
+            async with harness.client() as client:
+                async with asyncio.timeout(30):
+                    ordinary = await client.get(f"/api/sessions/{harness.session_id}")
                     assert ordinary.status_code == 200
-                    settled = await submit_and_settle(
-                        client, setup.app, path=f"/api/sessions/{setup.session_id}/messages", body=message_body("Ordinary request")
+                    operation_id = str(uuid4())
+                    accepted = await client.post(
+                        f"/api/sessions/{harness.session_id}/messages",
+                        json={"content": "Ordinary request", "operation_id": operation_id, "state_id": None},
                     )
-                snapshot = settled.final.json()
-                if snapshot["status"] != "completed":
-                    originals = []
-                    for selection in failure_selections.call_args_list:
-                        current = selection.args[1]
-                        if current.session_id == setup.session_id and current.operation_id == snapshot["operation_id"]:
-                            original = selection.args[3]
-                            if all(original is not retained for retained in originals):
-                                originals.append(original)
-                    for reduction in failure_reductions.call_args_list:
-                        for receipt in reduction.args[0]:
-                            authority = receipt.key.authority
-                            if (
-                                authority.context.fence.session_id == str(setup.session_id)
-                                and authority.durable_operation_id == snapshot["operation_id"]
-                                and all(receipt.original_root is not retained for retained in originals)
-                            ):
-                                originals.append(receipt.original_root)
-                    for projection in failure_projections.call_args_list:
-                        if projection.kwargs["request_id"] == settled.accepted.headers["X-Request-ID"]:
-                            original = projection.args[0]
-                            if all(original is not retained for retained in originals):
-                                originals.append(original)
-                    if originals:
-                        raise AssertionError(settled.final.text) from BaseExceptionGroup(
-                            "Actual same-operation failure selection inputs (not a claimed winner)", originals
-                        )
-                assert snapshot["status"] == "completed", settled.final.text
-                assert settled.result()["message"]["content"] == "Completed delayed response."
-            assert setup.composer.calls == 1
+                    assert accepted.status_code == 202, accepted.text
+                    snapshot = await settle(harness, operation_id=operation_id, client=client)
+                # Integration completion point (U-40): the request completes and
+                # publishes the one scripted reply through the shared pool.
+                assert snapshot.status == "completed", snapshot.model_dump_json()
+                assert assistant_contents(harness.app, harness.session_id) == ["Completed delayed response."]
+            assert sdk.roles == ["primary", "end"]
             assert not any(item.is_set() for item in finished)
             assert outstanding_admissions() == 8
             await asyncio.gather(*subscribers)

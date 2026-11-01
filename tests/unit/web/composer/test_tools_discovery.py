@@ -27,8 +27,9 @@ from elspeth.web.composer.tools._dispatch import execute_discovery_tool_with_con
 from elspeth.web.composer.tools._dispatch import execute_tool as dispatch_tool
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
-from tests.unit.web.composer._helpers import _composer_service_with_session, _persisted_tool_responses
+from tests.unit.web.composer._helpers import _composer_service_with_session
 from tests.unit.web.composer.test_compose_loop_audit_wiring import _make_llm_response, _make_settings
+from tests.unit.web.composer.test_compose_loop_persistence import _dispatch_admitted_batch
 from tests.unit.web.composer.test_output_rejection_contracts import _context, _saved_state
 from tests.unit.web.composer.test_tools import (
     _empty_state,
@@ -513,16 +514,18 @@ async def test_discovery_outer_fault_preserves_prior_success_and_completed_refus
         ]
     )
     llm = create_autospec(service._provider_gateway._call_llm, return_value=_admit_composer_llm_completion(response))
-    monkeypatch.setattr(service._provider_gateway, "_call_llm", llm)
-    monkeypatch.setattr("elspeth.web.composer.service.BufferingRecorder", lambda: recorder)
-    with pytest.raises(ComposerPluginCrashError) as caught:
-        await service._run_one_turn_for_test(session_id=session_id, initial_state=state)
+    # The batch runs in the shared dispatch owner Continuation reuses
+    # (tool_batch.run_tool_batch); it captures the crash for P4 rather than
+    # raising, so the carrier is read from the dispatch outcome.
+    outcome = await _dispatch_admitted_batch(service, llm=llm, session_id=session_id, initial_state=state, recorder=recorder)
+    crash = outcome.plugin_crash
     assert reads == [("source", "json")] and llm.await_count == 1
-    assert caught.value.original_exc is fault and caught.value.__cause__ is fault
-    assert caught.value.partial_state is not None and caught.value.partial_state.version == 18
-    assert caught.value.partial_state.metadata == prior.updated_state.metadata
-    assert caught.value.partial_state.nodes == state.nodes and state.to_dict() == before
-    assert caught.value.failed_turn is not None and caught.value.failed_turn.tool_calls_attempted == 3
+    assert type(crash) is ComposerPluginCrashError
+    assert crash.original_exc is fault and outcome.plugin_crash_cause is fault
+    assert crash.partial_state is not None and crash.partial_state.version == 18
+    assert crash.partial_state.metadata == prior.updated_state.metadata
+    assert crash.partial_state.nodes == state.nodes and state.to_dict() == before
+    assert [item.call.id for item in outcome.tool_outcomes] == ["discovery_prior", "discovery_refused", "discovery_fault"]
     assert [inv.tool_call_id for inv in recorder.invocations] == ["discovery_prior", "discovery_refused", "discovery_fault"]
     assert [inv.status for inv in recorder.invocations] == [
         ComposerToolStatus.SUCCESS,
@@ -530,11 +533,9 @@ async def test_discovery_outer_fault_preserves_prior_success_and_completed_refus
         ComposerToolStatus.PLUGIN_CRASH,
     ]
     assert [inv.version_after for inv in recorder.invocations] == [18, 18, None]
-    rows = _persisted_tool_responses(service, session_id)
-    assert [row["tool_call_id"] for row in rows] == ["discovery_prior", "discovery_refused", "discovery_fault"]
-    refused = json.loads(rows[1]["result_canonical"])
-    assert refused["success"] is False and refused["validation"]["errors"][0]["error_code"] == "plugin_not_installed"
-    assert json.loads(rows[2]["result_canonical"])["error_class"] == error_type.__name__
+    refused = outcome.tool_outcomes[1].response
+    assert refused.success is False and refused.validation.errors[0].error_code == "plugin_not_installed"
+    assert outcome.tool_outcomes[2].error_class == error_type.__name__
 
 
 class TestToolDefinitions:

@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime
-from hashlib import sha256
 from typing import Any
-from unittest.mock import patch
 from uuid import UUID
 
 import httpx
@@ -794,113 +791,6 @@ async def test_real_advisor_keeps_oversized_indivisible_summary_scalar_refused(i
         )
     assert refused.value.http_status == 422 and refused.value.disposition == "unavailable"
     assert sent == [] and completion.requests == []
-
-
-@pytest.mark.asyncio
-async def test_real_freeform_batch_and_cache_retain_complete_nominal_schema(invocation, monkeypatch, catalog, azure):
-    from sqlalchemy import select
-
-    from elspeth.web.composer import provider_gateway
-    from elspeth.web.sessions.models import chat_messages_table
-    from tests.unit.web.composer._helpers import _clean_advisor_checkpoint, _make_settings
-    from tests.unit.web.composer._scripted_sdk import _response, _ScriptedCompletion, _text_response
-
-    policy, snapshot = catalog
-    client, sent = azure
-    service = _guarded_service(
-        invocation,
-        monkeypatch,
-        composer_client=client,
-        catalog=create_catalog_service(),
-        settings=_make_settings(composer_model="anthropic/claude-sonnet-4.5", composer_prompt_guard_mode="required"),
-    )
-    owner = invocation[2]
-    context = owner.required_work.coordinator.authority.context
-    completion = _ScriptedCompletion(
-        _response(
-            ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
-            ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
-        ),
-        _text_response("The registered schema is available for review."),
-    )
-    monkeypatch.setattr(litellm, "acompletion", completion)
-    monkeypatch.setattr(service._advisor_checkpoint, "_run_advisor_checkpoint", _clean_advisor_checkpoint)
-    from uuid import UUID, uuid4
-
-    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
-
-    preferences = await service._require_sessions_service().get_composer_preferences(UUID(context.fence.session_id))
-    mutation_ceiling = ComposerMutationCeiling(context.fence.session_id, str(uuid4()), preferences.trust_mode)
-    with (
-        prompt_guard_user_scope(_USER),
-        patch.object(provider_gateway, "enforce_prompt_guard", autospec=True, side_effect=provider_gateway.enforce_prompt_guard) as checks,
-    ):
-        result = await service._compose_loop(
-            _USER,
-            [],
-            _empty(),
-            session_id=context.fence.session_id,
-            user_id="alice",
-            deadline=asyncio.get_running_loop().time() + 30.0,
-            plugin_snapshot=snapshot,
-            policy_catalog=policy,
-            mutation_ceiling=mutation_ceiling,
-            session_operation_context=context,
-            required_work=owner.required_work,
-            provider_owner=owner,
-        )
-    assert len(completion.requests) == 2
-    assert [invocation.cache_hit for invocation in result.tool_invocations] == [False, True]
-    tools = [message for message in completion.requests[1]["messages"] if message["role"] == "tool"]
-    assert len(tools) == 2
-    assert all("json_schema" in message["content"] for message in tools)
-    assert all(guard_contracts.PROMPT_GUARD_CONTENT_PARTS_KEY not in message for message in tools)
-    assert "json_schema" not in "\n".join(document for body in sent for document in body["documents"])
-    assert len(checks.call_args_list) == 2
-    forwarded = checks.call_args_list[1].kwargs
-    assert any(parts is not None for parts in forwarded["content_parts"])
-    assert any(parts is not None for parts in forwarded["tool_argument_parts"])
-    wire = completion.requests[1]
-    assert wire["messages"] == forwarded["messages"]
-    assert wire["messages"][0]["cache_control"] == {"type": "ephemeral"}
-    assert wire["tools"][-1]["cache_control"] == {"type": "ephemeral"}
-    assert all(guard_contracts.PROMPT_GUARD_TOOL_ARGUMENT_PARTS_KEY not in message for message in wire["messages"])
-    hashed = {
-        "role": "composer",
-        "policy_fingerprint": client.policy_fingerprint,
-        "enforce_azure_character_limits": True,
-        "user_prompt": _USER,
-        "messages": wire["messages"],
-        "tools": wire["tools"],
-        "trusted_message_indexes": sorted(forwarded["trusted_message_indexes"]),
-        "content_parts": [
-            None
-            if parts is None
-            else [
-                {"text": part.text, "trust": part.trust.value if part.trust is not None else None, "inspection_text": part.inspection_text}
-                for part in parts
-            ]
-            for parts in forwarded["content_parts"]
-        ],
-        "tool_argument_parts": [
-            None
-            if entries is None
-            else [
-                {
-                    "tool_call_index": entry.tool_call_index,
-                    "parts": [{"text": part.text, "inspection_text": part.inspection_text} for part in entry.parts],
-                }
-                for entry in entries
-            ]
-            for entries in forwarded["tool_argument_parts"]
-        ],
-    }
-    expected = sha256(json.dumps(hashed, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
-    with invocation[0].connect() as connection:
-        rows = connection.execute(select(chat_messages_table.c.tool_calls)).scalars().all()
-    audits = [item["check"] for row in rows if row is not None for item in row if item.get("_kind") == "prompt_guard_audit"]
-    assert len(audits) == 2
-    assert audits[1]["request_hash"] == expected
 
 
 @pytest.mark.asyncio

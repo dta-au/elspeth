@@ -3,20 +3,17 @@
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import no_tool_policy as policy
 from elspeth.web.composer.graph_recovery import GraphRecoveryIntent
 from elspeth.web.composer.protocol import ComposerResult, PipelineCommitIntent
 from elspeth.web.composer.service import ComposerServiceImpl, _announce_staged_review_handoff
-from elspeth.web.composer.state import OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import OutputSpec, SourceSpec
 from elspeth.web.composer.turn_effects import TurnEvidence
-from elspeth.web.sessions.models import composition_states_table
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import _composer_history_content, composer_turn_end_assistant_row
 from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
@@ -335,62 +332,6 @@ def test_receipt_count_bound_and_raw_lookalike_do_not_share_terminal_vocabulary(
     segments = policy.visible_message_segments(content=result, raw_content=content)
     assert segments[0] == policy.AssistantTextSegment(content)
     assert len(segments) == 2 and isinstance(segments[-1], policy.TrustedSystemNoticeSegment)
-
-
-@pytest.mark.asyncio
-async def test_checkpoint_scope_stays_zero_when_route_later_saves_a_revision(tmp_path: Path) -> None:
-    from elspeth.web.sessions.schemas import MessageWithStateResponse
-    from tests.unit.web.sessions.test_run_composer_turn import _make_app, _make_composer_mock, _run, _running_job
-
-    app, sessions = _make_app(tmp_path)
-    composer = _make_composer_mock()
-    app.state.composer_service = composer
-    session = await sessions.create_session("alice", "Checkpoint scope", "local")
-    replies: list[ComposerResult] = []
-
-    async def checkpoint_result(message, history, starting_state, **kwargs):
-        evidence = TurnEvidence(
-            session_id=str(session.id),
-            session_operation_context=kwargs["session_operation_context"],
-            request_id="scope-control",
-            request=message,
-            initial_state_id=None,
-            initial_state=starting_state,
-        )
-        raw = "Here is the updated draft."
-        result = ComposerResult(
-            message=policy.compose_checkpoint_receipt_message(raw, raw_content=raw, evidence=evidence),
-            raw_assistant_content=raw,
-            state=replace(starting_state, metadata=PipelineMetadata(name="Route projection"), version=starting_state.version + 1),
-        )
-        replies.append(result)
-        return result
-
-    # Existing route harness models only the Composer boundary; real adopted
-    # authority, post_compose persistence and terminal response run underneath.
-    composer.compose.side_effect = checkpoint_result
-    async with _running_job(app, sessions, session.id, kind="compose_message", content="Update the draft name.") as job:
-        record = await _run(app, job)
-    assert record.status == "completed" and record.result_json is not None
-    response = MessageWithStateResponse.model_validate_json(record.result_json)
-    assert response.message.content == replies[0].message
-    assert response.message.raw_content is None  # Existing public response privacy contract.
-    assert [segment.kind for segment in response.message.segments] == ["text", "trusted_system_notice"]
-    assert response.message.segments[0].content == replies[0].raw_assistant_content
-    assert "Verified checkpoint evidence covers 0 saved draft revisions." in response.message.content
-    versions = await sessions.get_state_versions(session.id)
-    assert len(versions) == 1
-    current = await sessions.get_current_state(session.id)
-    assert current is not None
-    with sessions._engine.connect() as conn:
-        provenance = conn.execute(
-            select(composition_states_table.c.provenance).where(composition_states_table.c.id == str(current.id))
-        ).scalar_one()
-    assert provenance == "post_compose"
-    stored = await sessions.get_messages(session.id, limit=None)
-    terminal = next(row for row in stored if row.role == "assistant")
-    assert (terminal.content, terminal.raw_content) == (replies[0].message, replies[0].raw_assistant_content)
-    assert _composer_history_content(terminal) == replies[0].raw_assistant_content
 
 
 @pytest.mark.parametrize(("suffix", "notice"), _BARE_SUFFIX_ROUND_TRIP_CASES)

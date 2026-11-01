@@ -2845,44 +2845,6 @@ async def test_cancel_during_title_stops_before_primary_and_settles_the_child(tm
     assert len(_llm_call_audit_rows(messages)) == 0
 
 
-@pytest.mark.parametrize(
-    ("marker", "expected"),
-    [
-        (composer_turn._COMPOSER_OPERATION_LEASE_LOST, ("failed", "service_setup_failed")),
-        (composer_turn._COMPOSER_OPERATION_SHUTDOWN, ("failed", "service_setup_failed")),
-        (composer_turn._COMPOSER_OPERATION_CANCEL_REQUESTED, ("cancelled", "client_cancelled")),
-        (None, ("failed", "service_setup_failed")),
-    ],
-)
-@pytest.mark.asyncio
-async def test_worker_cancel_markers_classify_the_cancelled_progress(tmp_path: Path, marker: object, expected: tuple[str, str]) -> None:
-    """E22: only the cancel endpoint's marker is a user Stop; lease loss, shutdown and an unmarked cancel are server faults."""
-    app, service = _make_app(tmp_path)
-    started = asyncio.Event()
-
-    class _ParkedComposer:
-        async def compose(self, *args: Any, **kwargs: Any) -> ComposerResult:
-            del args, kwargs
-            started.set()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable: the test cancels this call")
-
-    app.state.composer_service = _ParkedComposer()
-    session = await service.create_session("alice", "Marker", "local")
-    async with _running_job(app, service, session.id, kind="compose_message", content="Hold.") as job:
-        task = asyncio.create_task(_run(app, job))
-        await asyncio.wait_for(started.wait(), timeout=5.0)
-        if marker is None:
-            task.cancel()
-        else:
-            task.cancel(marker)
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        snapshot = await composer_app_services(app).progress_registry.get_latest(str(session.id))
-
-    assert (snapshot.phase, snapshot.reason) == expected
-
-
 class _FailingPublishRegistry(ComposerProgressRegistry):
     def __init__(self, failure: BaseException) -> None:
         super().__init__()

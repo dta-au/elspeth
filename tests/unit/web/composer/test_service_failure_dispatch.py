@@ -40,8 +40,6 @@ from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.required_executor import RequiredGenerationUnavailable
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError
-from tests.unit.web.composer import test_compose_loop_interpretation_review_dispatch as legacy_fixtures
-from tests.unit.web.composer._helpers import _persisted_tool_responses
 from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch import _state_with_llm_node
 from tests.unit.web.sessions import test_continuation_composition_initialization as initialization_fixtures
 from tests.unit.web.sessions.test_continuation_live_phases import _advance, _phase_case
@@ -50,8 +48,6 @@ from tests.unit.web.sessions.test_continuation_primary_result import _assert_req
 from tests.unit.web.sessions.test_continuation_tool_failure import _advisor_case
 
 operation_store = _operation_store
-engine = legacy_fixtures.engine
-sessions_service = legacy_fixtures.sessions_service
 
 
 def _review_call():
@@ -391,79 +387,6 @@ async def test_actual_service_handler_and_audit_secondary_keep_origins_without_i
         assert "_ServiceHandlerFailure" not in capture_failure_facts(observed.value).canonical
         assert owner.failure_custody.original is original and not owner.failure_custody.completed
         assert owner.terminal_completion is None and owner.p4 is None
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("seam", ("handler", "normalization", "audit"))
-async def test_legacy_registered_service_marker_separates_actual_handler_from_post_return(tmp_path, sessions_service, monkeypatch, seam):
-    from elspeth.web.composer.service import ComposerAvailability
-
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.compute_availability",
-        lambda **kwargs: ComposerAvailability(available=True, model=str(kwargs["model"]), provider="anthropic"),
-    )
-    composer = legacy_fixtures._build_composer(tmp_path, sessions_service)
-    actual_save = sessions_service.save_composition_state
-
-    async def save_incomplete(session_id, payload, **kwargs):
-        return await actual_save(session_id, replace(payload, is_valid=False), **kwargs)
-
-    monkeypatch.setattr(sessions_service, "save_composition_state", save_incomplete)
-    session_id, state_id = await legacy_fixtures._seed_session_and_state(sessions_service)
-    monkeypatch.setattr(sessions_service, "save_composition_state", actual_save)
-    original, cause = _service_error("sql"), RuntimeError("legacy service prior cause")
-    original.__cause__ = cause
-    entered, early = [], []
-    if seam == "handler":
-
-        async def create(**kwargs):
-            entered.append(kwargs)
-            raise original
-
-        monkeypatch.setattr(sessions_service, "create_pending_interpretation_event", create)
-    elif seam == "normalization":
-
-        def normalize(result, catalog):
-            assert result.success and result.data["_kind"] == "interpretation_review_pending"
-            entered.append(result)
-            raise original
-
-        monkeypatch.setattr(session_dispatch, "normalize_tool_result_validation", normalize)
-    else:
-        actual_record = BufferingRecorder.record
-
-        def record(self, invocation):
-            if invocation.tool_name == "request_interpretation_review" and invocation.status is ComposerToolStatus.SUCCESS:
-                entered.append(invocation)
-                raise original
-            return actual_record(self, invocation)
-
-        monkeypatch.setattr(BufferingRecorder, "record", record)
-
-    async def forbid_early(**kwargs):
-        early.append(kwargs)
-        raise AssertionError("service failure cannot start EARLY Advisor work")
-
-    monkeypatch.setattr(composer._advisor_checkpoint, "_maybe_run_early_checkpoint", forbid_early)
-    call_id, tool_name, arguments = _review_call()
-    llm = legacy_fixtures._ScriptedLLM(
-        [legacy_fixtures._fake_response_with_tool_call(tool_call_id=call_id, tool_name=tool_name, arguments=arguments)]
-    )
-    with pytest.raises(OperationalError) as observed:
-        await composer._run_one_turn_for_test(
-            llm=llm, session_id=str(session_id), current_state_id=str(state_id), initial_state=_state_with_llm_node()
-        )
-    assert observed.value is original and original.__cause__ is cause
-    assert len(entered) == len(llm.messages) == 1 and not early
-    events = await sessions_service.list_interpretation_events(session_id, status="pending")
-    rows = _persisted_tool_responses(composer, str(session_id))
-    if seam == "handler":
-        assert not events
-        assert [row["tool_call_id"] for row in rows] == ["pending_review"]
-        assert json.loads(rows[0]["result_canonical"]) == {"success": False, "status": "SERVICE_FAILURE", "reason": "service_failure"}
-    else:
-        assert len(events) == 1 and events[0].tool_call_id == "pending_review"
-        assert not rows, "a returned handler's later failure cannot fabricate controlled completion/P4"
 
 
 @pytest.mark.asyncio

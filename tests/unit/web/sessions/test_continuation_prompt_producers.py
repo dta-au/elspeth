@@ -9,6 +9,7 @@ import json
 from dataclasses import FrozenInstanceError
 from threading import Event
 from time import monotonic
+from typing import Any
 
 import litellm
 import pytest
@@ -36,6 +37,7 @@ from elspeth.web.composer.continuation_iteration import (
     capture_continuation_producer_inputs,
     encode_continuation_iteration,
 )
+from elspeth.web.composer.continuation_message_builders import build_service_initial_messages
 from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
 from elspeth.web.composer.continuation_prompt_recipes import PluginSchemaMessageRecipe
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -392,7 +394,8 @@ async def test_initial_and_fixed_actual_producers_restore_order_aliases_and_curr
     initial = list(produced.messages)
     current_snapshot, catalog = kwargs["service"]._policy_context.build("alice")
     warm = await asyncio.to_thread(
-        kwargs["service"]._build_messages,
+        build_service_initial_messages,
+        kwargs["service"],
         chat_history=list(owner.inputs.values.history),
         state=owner.inputs.values.initial_state,
         user_message=REQUEST,
@@ -442,6 +445,125 @@ async def test_initial_and_fixed_actual_producers_restore_order_aliases_and_curr
     assert restored.snapshot_for_continuation(current, materialization=cold.producers) == shelf
     kwargs["required_work"].coordinator.assert_completed()
     next_kwargs["required_work"].coordinator.assert_completed()
+
+
+async def dispatch_tool_batch(
+    service: ComposerServiceImpl,
+    *,
+    call_model: _CallModelOutcome,
+    mutation_ceiling: Any,
+    state: Any,
+    last_validation: Any,
+    last_runtime_preflight: Any,
+    llm_messages: list[dict[str, Any]],
+    recorder: BufferingRecorder,
+    anti_anchor: AntiAnchorTracker,
+    discovery_cache: dict[str, Any],
+    runtime_preflight_cache: Any,
+    session_id: str | None,
+    user_id: str | None,
+    user_message_id: str | None,
+    user_message_content: str | None,
+    current_state_id: str | None,
+    actor: str,
+    initial_version: int,
+    deadline: float,
+    progress: Any,
+    session_scope: str,
+    advisor_calls_used: int,
+    cancellation_requested: asyncio.Event,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: Any,
+    composition_turns_used: int,
+    discovery_turns_used: int,
+    failed_turn: Any,
+    session_operation_context: Any = None,
+    provider_owner: ProviderInvocationOwner | None = None,
+    turn_evidence: TurnEvidence | None = None,
+    message_producers: Any = None,
+) -> Any:
+    """Drive the shared dispatch owner ``tool_batch.run_tool_batch`` from a service.
+
+    Builds the batch context exactly as the service did before the V1 loop
+    adapter ``ComposerServiceImpl._dispatch_tool_batch`` was removed;
+    Continuation builds the same context from its restored runtime
+    (``continuation_runtime.build_runtime_tool_batch_context``).
+    """
+    from uuid import UUID
+
+    from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+    from elspeth.web.composer.tool_batch import BatchAccumulator, ToolBatchContext, ToolBatchCustody, ToolBatchProvenance, run_tool_batch
+
+    sessions = service._require_sessions_service() if session_id is not None else None
+    session_uuid = UUID(session_id) if session_id is not None else None
+    preferences = await sessions.get_composer_preferences(session_uuid) if sessions is not None and session_uuid is not None else None
+    review_required = False
+    if session_uuid is not None:
+        if type(mutation_ceiling) is not ComposerMutationCeiling or preferences is None:
+            raise AuditIntegrityError("Session mutation dispatch lost its request ceiling")
+        if mutation_ceiling.session_id != str(session_uuid):
+            raise AuditIntegrityError("Mutation dispatch crossed sessions")
+        if session_operation_context is not None:
+            mutation_ceiling.validate_context(session_operation_context)
+        if turn_evidence is not None and mutation_ceiling.request_id != turn_evidence.request_id:
+            raise AuditIntegrityError("Mutation dispatch crossed logical requests")
+        review_required = not mutation_ceiling.permits_auto(preferences.trust_mode)
+    elif mutation_ceiling is not None:
+        raise AuditIntegrityError("Sessionless mutation dispatch received a mutation ceiling")
+    ctx = ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
+        ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        provider_owner=provider_owner,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=recorder,
+        anti_anchor=anti_anchor,
+        discovery_cache=discovery_cache,
+        runtime_preflight_cache=runtime_preflight_cache,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        user_id=user_id,
+        user_message_id=user_message_id,
+        user_message_content=user_message_content,
+        current_state_id=current_state_id,
+        actor=actor,
+        initial_version=initial_version,
+        deadline=deadline,
+        progress=progress,
+        session_scope=session_scope,
+        turn_sessions_service=sessions,
+        turn_session_uuid=session_uuid,
+        turn_preferences=preferences,
+        mutation_ceiling=mutation_ceiling,
+        review_required=review_required,
+        cancellation_requested=cancellation_requested,
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
+        tool_contract_dialect=service._planner_dialect,
+        session_operation_authority=sessions.session_operation_authority if sessions is not None else None,
+        composition_turns_used=composition_turns_used,
+        discovery_turns_used=discovery_turns_used,
+        failed_turn=failed_turn,
+        turn_evidence=turn_evidence,
+        message_producers=message_producers,
+    )
+    acc = BatchAccumulator(
+        state=state, last_validation=last_validation, last_runtime_preflight=last_runtime_preflight, advisor_calls_used=advisor_calls_used
+    )
+    return await run_tool_batch(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages)
 
 
 async def dispatch_schema_twice(kwargs, owner, recorder, *, store, tmp_path, monkeypatch):
@@ -520,7 +642,8 @@ async def dispatch_schema_twice(kwargs, owner, recorder, *, store, tmp_path, mon
     assert ledger.completion_tokens == original_call.completion_tokens == 3
     messages = []
     cache = {}
-    result, advisor_used = await service._dispatch_tool_batch(
+    result, advisor_used = await dispatch_tool_batch(
+        service,
         call_model=outcome,
         mutation_ceiling=kwargs["selected"].stack.mutation_ceiling.materialize(),
         state=state,

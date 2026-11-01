@@ -1,16 +1,17 @@
 """Freeform proposals and lazy composition persist through ordinary session APIs."""
 
 import asyncio
+import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer.protocol import ComposerResult, ComposerService
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from tests.helpers.composer_operations import settle_sync
+from elspeth.web.composer import prompts as composer_prompts
+from tests.helpers.continuation_app import ScriptedSDK, continuation_app, end_admit, install_sdk, submit_and_settle
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+from tests.unit.web.composer.test_primary_rejection_gateway import _sdk_rejection
 from tests.unit.web.sessions.test_routes import (
     ValidationResult,
     _async_return,
@@ -140,40 +141,45 @@ def test_rootless_freeform_proposal_survives_reload(tmp_path, monkeypatch, tool_
     assert asyncio.run(service.get_state(persisted.id)) == persisted
 
 
-@pytest.mark.parametrize("endpoint", ["messages", "recompose"])
-def test_lazy_freeform_composition_passes_empty_state(tmp_path, endpoint) -> None:
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = client.post("/api/sessions", json={"title": "Freeform request"}).json()
-    session_id = uuid.UUID(session["id"])
-    composer = MagicMock(spec=ComposerService)
-    composer.compose = AsyncMock(
-        spec=ComposerService.compose,
-        return_value=ComposerResult(
-            message="Please choose your input.",
-            state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-        ),
+def _state_wire(messages) -> str:
+    return next(
+        row["content"]
+        for row in messages
+        if isinstance(row["content"], str) and row["content"].startswith(composer_prompts.STATE_CONTEXT_PREFIX)
     )
-    app.state.composer_service = composer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["messages", "recompose"])
+async def test_lazy_freeform_composition_passes_empty_state(tmp_path, monkeypatch, endpoint) -> None:
+    steps: list = [("primary", ("Please choose your input.", None)), ("end", end_admit())]
     if endpoint == "recompose":
-        user_message = asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
-        settled = settle_sync(
-            client,
-            app,
-            path=f"/api/sessions/{session_id}/recompose",
-            body={"expected_user_message_id": str(user_message.id), "operation_id": str(uuid.uuid4()), "state_id": None},
-        )
-    else:
-        settled = settle_sync(
-            client,
-            app,
-            path=f"/api/sessions/{session_id}/messages",
-            body={"content": "Summarize my CSV", "operation_id": str(uuid.uuid4()), "state_id": None},
-        )
-    assert settled.final.status_code == 200, settled.final.text
-    settled.result()
-    composer.compose.assert_awaited_once()
-    supplied_state = composer.compose.call_args.args[2]
-    assert isinstance(supplied_state, CompositionState)
-    assert supplied_state.sources == {}
-    assert supplied_state.nodes == ()
+        # The recompose precondition: the conversation ends at a failed user
+        # turn whose original ingress receipt the retry reuses.
+        steps.insert(0, ("raise", _sdk_rejection()))
+    sdk = ScriptedSDK(steps)
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sessions = harness.app.state.session_service
+        assert await sessions.get_current_state(harness.session_id) is None
+        first_primary = 0
+        if endpoint == "recompose":
+            failed = await submit_and_settle(harness, {"content": "Summarize my CSV", "operation_id": str(uuid.uuid4()), "state_id": None})
+            assert failed.status == "failed", failed.model_dump_json()
+            assert await sessions.get_current_state(harness.session_id) is None
+            users = [row for row in await sessions.get_messages(harness.session_id, limit=None) if row.role == "user"]
+            assert [row.content for row in users] == ["Summarize my CSV"]
+            body = {"expected_user_message_id": str(users[0].id), "operation_id": str(uuid.uuid4()), "state_id": None}
+            first_primary = 1
+        else:
+            body = {"content": "Summarize my CSV", "operation_id": str(uuid.uuid4()), "state_id": None}
+        snapshot = await submit_and_settle(harness, body, route=endpoint)
+        # The planner's first request for this operation carries the lazy, empty composition.
+        assert sdk.roles[first_primary : first_primary + 1] == ["primary"], snapshot.model_dump_json()
+        view = json.loads(_state_wire(sdk.requests[first_primary]["messages"]).split("\n", 1)[1])["current_state"]
+        supplied_state = view["data"]
+        assert supplied_state["sources"] == {}
+        assert supplied_state["nodes"] == []
+        # Integration completion point (U-40): the clarifying reply completes.
+        assert snapshot.status == "completed", snapshot.model_dump_json()
+        assert snapshot.result is not None and snapshot.result.message.content == "Please choose your input."

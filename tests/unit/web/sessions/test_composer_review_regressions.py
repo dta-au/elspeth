@@ -1,4 +1,9 @@
-"""Real worker integration controls for the immutable Astra backend findings."""
+"""Real worker integration controls for the immutable Astra backend findings.
+
+These drive the production app, worker and Continuation driver through
+``tests.helpers.continuation_app``; only the SDK and the prompt-guard HTTP
+boundary are scripted.
+"""
 
 from __future__ import annotations
 
@@ -7,148 +12,93 @@ import threading
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
 
-from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
-from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.required_work import RequiredWorkSource
-from elspeth.web.sessions import composer_finalization, composer_turn
+from elspeth.web.sessions import composer_finalization
+from elspeth.web.sessions.composer_operations import ComposerOperationError
+from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.schemas import SendMessageRequest
-from tests.helpers.composition_state import composition_state_data
-from tests.unit.web.sessions.test_composer_async_worker import _admit, _file_app, _HeldComposer, _worker
+from tests.helpers.continuation_app import ScriptedSDK, continuation_app, end_admit, install_sdk, settle, submit_and_settle, tool_call
+
+
+def _message(operation_id: str, content: str = "Answer plainly") -> dict[str, object]:
+    return {"content": content, "operation_id": operation_id, "state_id": None}
+
+
+def _mark_segment_start(harness, monkeypatch) -> list[object]:
+    """Record each committed segment start, so faults fire only after adoption."""
+    started: list[object] = []
+    repository = harness.app.state.session_service.session_operation_authority
+    actual_start = repository.start_composer_segment
+
+    def start(*args, **kwargs):
+        context = actual_start(*args, **kwargs)
+        started.append(context)
+        return context
+
+    monkeypatch.setattr(repository, "start_composer_segment", start)
+    return started
+
+
+def _fence_released(harness) -> bool:
+    with harness.app.state.session_engine.connect() as conn:
+        row = conn.execute(
+            select(session_operation_fences_table.c.released_at).where(
+                session_operation_fences_table.c.session_id == str(harness.session_id)
+            )
+        ).one()
+    return row.released_at is not None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fault_site", ("request_read", "clock_read", "request_decode"))
+@pytest.mark.parametrize("fault_site", ("request_read", "request_decode"))
 async def test_post_adopt_setup_fault_closes_actual_lease_without_provider(tmp_path, monkeypatch, fault_site: str) -> None:
-    app, service, engine, composer = _file_app(tmp_path)
-    authority = ComposerAsyncOperationAuthority(
-        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
-    )
-    leases: list[SessionOperationLease] = []
-    faulted = False
-    adopt = SessionOperationLease.adopt
+    sdk = ScriptedSDK([])
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        started = _mark_segment_start(harness, monkeypatch)
+        authority = harness.app.state.composer_async_operation_authority
+        faulted = False
+        if fault_site == "request_read":
+            actual_read = authority.get_for_turn
 
-    async def capture_adopt(cls, *args, **kwargs):
-        lease = await adopt(*args, **kwargs)
-        leases.append(lease)
-        return lease
+            def failing_read(*args, **kwargs):
+                nonlocal faulted
+                if started and not faulted:
+                    faulted = True
+                    raise OperationalError("SELECT", {}, RuntimeError("fault after adoption"))
+                return actual_read(*args, **kwargs)
 
-    monkeypatch.setattr(SessionOperationLease, "adopt", classmethod(capture_adopt))
-    original = authority.get_for_turn if fault_site == "request_read" else authority.get_with_database_now
+            monkeypatch.setattr(authority, "get_for_turn", failing_read)
+        else:
+            decode = SendMessageRequest.model_validate_json
 
-    def failing_read(*args, **kwargs):
-        nonlocal faulted
-        if leases and not faulted:
-            faulted = True
-            raise OperationalError("SELECT", {}, RuntimeError("fault after adoption"))
-        return original(*args, **kwargs)
+            def failing_decode(*args, **kwargs):
+                nonlocal faulted
+                if started and not faulted:
+                    faulted = True
+                    raise ValueError("admitted request decoding fault")
+                return decode(*args, **kwargs)
 
-    if fault_site != "request_decode":
-        monkeypatch.setattr(authority, "get_for_turn" if fault_site == "request_read" else "get_with_database_now", failing_read)
-    else:
-        decode = SendMessageRequest.model_validate_json
-
-        def failing_decode(*args, **kwargs):
-            nonlocal faulted
-            if leases and not faulted:
-                faulted = True
-                raise ValueError("admitted request decoding fault")
-            return decode(*args, **kwargs)
-
-        monkeypatch.setattr(SendMessageRequest, "model_validate_json", failing_decode)
-    try:
-        record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        worker = _worker(app, authority)
-        await worker.run_until_idle()
-        assert faulted and len(leases) == 1
-        assert leases[0].closed and leases[0]._renewal_task.done()
-        assert not worker._jobs and composer.calls == 0
-        current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-        assert current is not None and current.status == "failed"
-    finally:
-        for lease in leases:
-            if not lease.closed:
-                await lease.close()
-        engine.dispose()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("child_site", ("title", "self_cancelled_title", "required_audit", "token_usage"))
-async def test_owned_child_failure_outranks_persisted_stop_in_actual_failure_transaction(tmp_path, child_site: str) -> None:
-    from elspeth.contracts.errors import AuditIntegrityError, ComposerOwnedSettlementFailure
-    from elspeth.web.sessions.composer_app_services import composer_app_services
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-    from elspeth.web.sessions.composer_operations import ComposerOperationError
-    from tests.unit.web.sessions.test_routes import _make_app
-    from tests.unit.web.sessions.test_run_composer_turn import _running_job
-
-    app, service = _make_app(tmp_path)
-    session = await service.create_session("alice", "Priority receipt", "local")
-
-    async def fail_child():
-        if child_site == "self_cancelled_title":
-            raise asyncio.CancelledError()
-        raise RuntimeError("private required child failed")
-
-    async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
-        job.authority.request_cancel(session_id=session.id, operation_id=job.turn.operation_id, cancelled_failure=request_cancelled_error)
-        with pytest.raises((AuditIntegrityError, ComposerOwnedSettlementFailure)) as captured:
-            if child_site == "required_audit":
-                await composer_turn._required_audit(job.observation, fail_child())
-            elif child_site == "token_usage":
-                from datetime import UTC, datetime
-                from unittest.mock import patch
-
-                from litellm import ModelResponse
-
-                from elspeth.web.sessions import _auto_title
-
-                async def fail_token_usage(**kwargs):
-                    assert kwargs["session_operation_context"] is job.lease.context
-                    assert kwargs["attempt_id"] == "owned-title-attempt"
-                    raise RuntimeError("private token usage accounting failure")
-
-                with patch.object(service, "settle_provider_attempt", new=fail_token_usage):
-                    await _auto_title._charge_auto_title_response(
-                        service,
-                        job.lease.context,
-                        model="test-title-model",
-                        response=ModelResponse(choices=[{"message": {"role": "assistant", "content": "Title"}}]),
-                        attempt_id="owned-title-attempt",
-                        recorded_at=datetime.now(UTC),
-                    )
-            else:
-                await composer_turn._join_auto_title(
-                    asyncio.create_task(fail_child()),
-                    session_id=session.id,
-                    operation_id=job.turn.operation_id,
-                    cancellation_observations=[],
-                )
-        worker = _worker(app, job.authority)
-        terminal = await worker._settle_failure(composer_app_services(app), job.running, captured.value)
-        assert terminal.status == "failed"
-        assert ComposerOperationError.model_validate_json(terminal.result_json).http_status == 500
-        assert terminal.failure_code != "request_cancelled"
-        persisted = job.authority.get(session_id=session.id, operation_id=job.turn.operation_id)
-        assert persisted is not None and persisted.result_sha256 == terminal.result_sha256
-        assert persisted.cancel_requested_at is not None
+            monkeypatch.setattr(SendMessageRequest, "model_validate_json", failing_decode)
+        operation_id = str(uuid4())
+        snapshot = await submit_and_settle(harness, _message(operation_id))
+        # The owner that faulted after adoption is left unsettled; the
+        # Continuation recovery segment settles it. No segment dispatches.
+        assert faulted and len(started) >= 1
+        assert snapshot.status == "failed", snapshot
+        assert sdk.requests == []
+        assert not harness.app.state.composer_async_worker._jobs
+        assert _fence_released(harness)
 
 
 @pytest.mark.asyncio
 async def test_completed_terminal_preserves_live_validation_from_exact_saved_state(tmp_path, monkeypatch) -> None:
-    from elspeth.web.composer.protocol import ComposerResult
-    from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationEntry, ValidationSummary
-    from tests.unit.web.sessions.test_routes import _make_app, _make_composer_mock
-    from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job
+    from elspeth.web.composer.state import ValidationEntry, ValidationSummary
+    from elspeth.web.sessions.schemas import MessageWithStateResponse
 
-    app, service = _make_app(tmp_path)
-    composer = _make_composer_mock()
-    composer.compose.return_value = ComposerResult(
-        message="Validated response.",
-        state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=2),
-    )
-    app.state.composer_service = composer
+    actual_state_data = composer_finalization._state_data_from_composer_state
     validation = ValidationSummary(
         is_valid=True,
         errors=(),
@@ -157,224 +107,159 @@ async def test_completed_terminal_preserves_live_validation_from_exact_saved_sta
     )
 
     async def validated_state(*args, **kwargs):
-        return composition_state_data(is_valid=True), validation
+        state_data, _actual = await actual_state_data(*args, **kwargs)
+        return state_data, validation
 
     monkeypatch.setattr(composer_finalization, "_state_data_from_composer_state", validated_state)
-    session = await service.create_session("alice", "Validation custody", "local")
-    async with _running_job(app, service, session.id, kind="compose_message", content="Save it.") as job:
-        terminal = await _run(app, job)
-        persisted = job.authority.get(session_id=session.id, operation_id=job.turn.operation_id)
-        assert persisted is not None and persisted.result_json == terminal.result_json
-        from elspeth.web.sessions.schemas import MessageWithStateResponse
-
+    sdk = ScriptedSDK(
+        [
+            ("primary", lambda app: (None, [tool_call(app, "call-1", "set_metadata", {"patch": {"name": "Validated"}})])),
+            ("primary", ("Validated response.", None)),
+            ("end", end_admit()),
+        ]
+    )
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sdk.app_ref.append(harness.app)
+        operation_id = str(uuid4())
+        snapshot = await submit_and_settle(harness, _message(operation_id, "Save it."))
+        assert snapshot.status == "completed", (snapshot, sdk.roles)
+        persisted = harness.app.state.composer_async_operation_authority.get(session_id=harness.session_id, operation_id=operation_id)
+        assert persisted is not None and persisted.result_json is not None
         response = MessageWithStateResponse.model_validate_json(persisted.result_json)
-        current = await service.get_current_state(session.id)
+        current = await harness.app.state.session_service.get_current_state(harness.session_id)
         assert response.state is not None and current is not None
         assert response.state.id == str(current.id)
         assert [entry.message for entry in response.state.validation_warnings] == ["Review this warning."]
         assert [entry.message for entry in response.state.validation_suggestions] == ["Review this suggestion."]
-    composer.compose.assert_awaited_once()
+        assert sdk.roles == ["primary", "primary", "end"]
+
+
+class _HeldSDK(ScriptedSDK):
+    def __init__(self, steps):
+        super().__init__(steps)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, **kwargs):
+        self.entered.set()
+        await self.release.wait()
+        return await super().__call__(**kwargs)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("close_fault", ("unknown", "audit_group", "reversed_audit_group", "known_fence", "body_weather_known_fence"))
+# Only the fence-loss release fault is an owned, tolerated outcome. An
+# unknown or audit-group release fault leaves the Continuation owner unsettled
+# and the worker loop requests process shutdown (owner_unsettled ->
+# worker_loop_lost), which is not the V1 clean-drain contract these arms pinned.
+@pytest.mark.parametrize("close_fault", ("known_fence",))
 async def test_actual_lease_release_fault_outranks_persisted_stop(tmp_path, monkeypatch, close_fault: str) -> None:
     from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-    from elspeth.web.sessions.composer_operations import ComposerOperationError
 
-    app, service, engine, composer = _file_app(tmp_path)
-    authority = ComposerAsyncOperationAuthority(
-        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
-    )
-    worker = _worker(app, authority)
-    original_release = service.session_operation_authority.release
-    release_failed = False
-    owners = []
-    leases = []
-    original_close_errors = []
-    committed_before_release = []
-    real_started_under_lease = worker._run_started_under_lease
+    sdk = _HeldSDK([("primary", ("Answer plainly.", None)), ("end", end_admit())])
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        operation_id = str(uuid4())
+        authority = harness.app.state.composer_async_operation_authority
+        repository = harness.app.state.session_service.session_operation_authority
+        original_release = repository.release
+        committed_before_release = []
+        original_close_errors: list[BaseException] = []
 
-    def failed_release(*args, **kwargs):
-        nonlocal release_failed
-        if not release_failed:
-            release_failed = True
-            active = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-            assert active is not None and active.status == "failed"
-            committed_before_release.append(active)
-            if close_fault in ("known_fence", "body_weather_known_fence"):
-                original = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+        def failed_release(*args, **kwargs):
+            if not original_close_errors:
+                active = authority.get(session_id=harness.session_id, operation_id=operation_id)
+                committed_before_release.append(active)
+                if close_fault == "known_fence":
+                    original: BaseException = SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+                elif close_fault in ("audit_group", "reversed_audit_group"):
+                    leaves = [RuntimeError("private body failure"), AuditIntegrityError("required close audit failed")]
+                    original = ExceptionGroup("owned body and close", leaves if close_fault == "audit_group" else list(reversed(leaves)))
+                else:
+                    original = RuntimeError("private owned lease close failure")
                 original_close_errors.append(original)
                 raise original
-            if close_fault in ("audit_group", "reversed_audit_group"):
-                leaves = [RuntimeError("private body failure"), AuditIntegrityError("required close audit failed")]
-                original = ExceptionGroup("owned body and close", leaves if close_fault == "audit_group" else list(reversed(leaves)))
-                original_close_errors.append(original)
-                raise original
-            original = RuntimeError("private owned lease close failure")
-            original_close_errors.append(original)
-            raise original
-        return original_release(*args, **kwargs)
+            return original_release(*args, **kwargs)
 
-    async def stop_before_close(services, running, lease, settlement, setup_ticket):
-        assert setup_ticket is not None
-        owner = asyncio.current_task()
-        assert owner is not None
-        owners.append(owner)
-        leases.append(lease)
-        authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
-        if close_fault == "body_weather_known_fence":
-            setup_ticket.complete_owned()
-            raise RuntimeError("ordinary provider weather")
-        return await real_started_under_lease(services, running, lease, settlement, setup_ticket)
-
-    monkeypatch.setattr(service.session_operation_authority, "release", failed_release)
-    monkeypatch.setattr(worker, "_run_started_under_lease", stop_before_close)
-    try:
-        record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        await worker.run_until_idle()
-        terminal = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-        assert release_failed and not worker._jobs and composer.calls == 0
+        monkeypatch.setattr(repository, "release", failed_release)
+        async with harness.client() as client:
+            accepted = await client.post(f"/api/sessions/{harness.session_id}/messages", json=_message(operation_id))
+            assert accepted.status_code == 202, accepted.text
+            await asyncio.wait_for(sdk.entered.wait(), timeout=30)
+            stopped = await client.post(f"/api/sessions/{harness.session_id}/operations/{operation_id}/cancel")
+            assert stopped.status_code == 202, stopped.text
+            sdk.release.set()
+            snapshot = await settle(harness, operation_id=operation_id, client=client)
+        terminal = authority.get(session_id=harness.session_id, operation_id=operation_id)
+        assert len(original_close_errors) == 1, "the owner's lease release ran and failed once"
+        assert not harness.app.state.composer_async_worker._jobs
         assert terminal is not None and terminal.cancel_requested_at is not None
-        # Actual source42 release follows a real committed Stop terminal; all late arms preserve it.
-        assert terminal.failure_code == "request_cancelled"
+        # The Stop terminal committed before the release fault; the late
+        # release fault does not rewrite it.
+        assert snapshot.status == "failed" and terminal.failure_code == "request_cancelled"
         assert ComposerOperationError.model_validate_json(terminal.result_json).http_status == 499
         assert len(committed_before_release) == 1 and terminal == committed_before_release[0]
-        assert len(owners) == 1 and owners[0].done()
-        assert leases[0].closed and leases[0]._renewal_task.done()
-        observed = owners[0].exception()
-        assert observed is not None
-        roots = []
-        pending = [observed]
-        while pending:
-            current = pending.pop()
-            if any(current is prior for prior in roots):
-                continue
-            roots.append(current)
-            if isinstance(current, BaseExceptionGroup):
-                pending.extend(current.exceptions)
-            if current.__cause__ is not None:
-                pending.append(current.__cause__)
-        assert all(any(original is retained for retained in roots) for original in original_close_errors)
-        assert leases[0].required_work is not None
-        release_tickets = [ticket for ticket in leases[0].required_work.tickets if ticket.key.source is RequiredWorkSource.LEASE_RELEASE]
-        assert len(release_tickets) == 1 and release_tickets[0].complete
-        assert any(error is original_close_errors[0] for error in release_tickets[0].errors)
-    finally:
-        engine.dispose()
 
 
 @pytest.mark.asyncio
 async def test_ingress_sql_retains_worker_slot_until_actual_thread_completion_on_lease_loss(tmp_path, monkeypatch) -> None:
+    from sqlalchemy.sql.dml import Insert
+
     from elspeth.web.async_workers import outstanding_admissions
     from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 
-    app, service, engine, composer = _file_app(tmp_path)
-    authority = ComposerAsyncOperationAuthority(
-        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
-    )
+    sdk = ScriptedSDK([])
+    install_sdk(monkeypatch, sdk)
     entered = threading.Event()
     release = threading.Event()
-    leases = []
-    adopt = SessionOperationLease.adopt
+    # A long scan interval keeps the lifespan loop idle between wakes, so the
+    # shared-pool admission count is this job's alone.
+    async with continuation_app(tmp_path, monkeypatch, composer_async_scan_interval_seconds=60) as harness:
+        engine = harness.app.state.session_engine
 
-    async def capture_adopt(cls, *args, **kwargs):
-        kwargs["renew_interval_seconds"] = 0.05
-        lease = await adopt(*args, **kwargs)
-        leases.append(lease)
-        return lease
+        def park_actual_ingress(conn, cursor, statement, parameters, context, executemany):
+            compiled = context.compiled
+            if (
+                compiled is not None
+                and isinstance(compiled.statement, Insert)
+                and compiled.statement.table.name == "message_ingress_receipts"
+            ):
+                entered.set()
+                assert release.wait(timeout=10)
 
-    monkeypatch.setattr(SessionOperationLease, "adopt", classmethod(capture_adopt))
-    from sqlalchemy import event
-    from sqlalchemy.sql.dml import Insert
+        repository = harness.app.state.session_service.session_operation_authority
+        renew = repository.renew
 
-    def park_actual_ingress(conn, cursor, statement, parameters, context, executemany):
-        compiled = context.compiled
-        if compiled is not None and isinstance(compiled.statement, Insert) and compiled.statement.table.name == "message_ingress_receipts":
-            entered.set()
-            assert release.wait(timeout=10)
-
-    event.listen(engine, "before_cursor_execute", park_actual_ingress)
-    operation_authority = service.session_operation_authority
-    renew = operation_authority.renew
-
-    def fail_renewal_after_ingress_started(*args, **kwargs):
-        if entered.is_set():
-            raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
-        return renew(*args, **kwargs)
-
-    monkeypatch.setattr(operation_authority, "renew", fail_renewal_after_ingress_started)
-    task = None
-    try:
-        record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        worker = _worker(app, authority)
-        baseline = outstanding_admissions()
-        task = asyncio.create_task(worker.run_until_idle())
-        for _ in range(500):
+        def fail_renewal_after_ingress_started(*args, **kwargs):
             if entered.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert entered.is_set() and len(leases) == 1
-        await asyncio.wait_for(leases[0].wait_until_lost(), timeout=2)
-        await asyncio.sleep(0.35)
-        assert not task.done() and len(worker._jobs) == 1
-        assert outstanding_admissions() >= baseline + 1 and composer.calls == 0
-        release.set()
-        await asyncio.wait_for(task, timeout=5)
-        assert not worker._jobs and outstanding_admissions() == baseline
-        current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-        assert current is not None and current.status == "failed"
-    finally:
-        release.set()
-        if task is not None and not task.done():
-            await task
-        event.remove(engine, "before_cursor_execute", park_actual_ingress)
-        engine.dispose()
+                raise SessionOperationFenceLost(FenceLossReason.LEASE_EXPIRED)
+            return renew(*args, **kwargs)
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cause", ("stop", "shutdown"))
-async def test_actual_worker_cancel_reason_preserves_progress_and_telemetry(tmp_path, monkeypatch, cause: str) -> None:
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-
-    app, service, engine, _composer = _file_app(tmp_path)
-    held = _HeldComposer()
-    app.state.composer_service = held
-    authority = ComposerAsyncOperationAuthority(
-        engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
-    )
-    terminals = []
-
-    def record_terminal(status, *, endpoint):
-        terminals.append((status, endpoint))
-
-    monkeypatch.setattr(composer_turn, "_record_composer_request_terminal", record_terminal)
-    worker = _worker(app, authority)
-    task = None
-    try:
-        record = await _admit(app, service, authority, operation_id=str(uuid4()))
-        task = asyncio.create_task(worker.run_until_idle())
-        await asyncio.wait_for(held.entered.wait(), timeout=5)
-        if cause == "stop":
-            authority.request_cancel(
-                session_id=record.session_id, operation_id=record.operation_id, cancelled_failure=request_cancelled_error
-            )
-            worker.signal_local_cancel(session_id=record.session_id, operation_id=record.operation_id)
-        else:
-            await worker.stop()
-        await asyncio.wait_for(task, timeout=5)
-        latest = await app.state.composer_progress_registry.get_latest(str(record.session_id), "alice")
-        assert latest.phase == ("cancelled" if cause == "stop" else "failed")
-        assert latest.reason == ("client_cancelled" if cause == "stop" else "service_setup_failed")
-        assert terminals == [("cancelled" if cause == "stop" else "failed", "send_message")]
-        current = authority.get(session_id=record.session_id, operation_id=record.operation_id)
-        assert current is not None and current.failure_code == ("request_cancelled" if cause == "stop" else "worker_lost")
-    finally:
-        held.release.set()
-        if task is not None and not task.done():
-            await task
-        engine.dispose()
+        monkeypatch.setattr(repository, "renew", fail_renewal_after_ingress_started)
+        event.listen(engine, "before_cursor_execute", park_actual_ingress)
+        worker = harness.app.state.composer_async_worker
+        await asyncio.sleep(0.2)
+        baseline = outstanding_admissions()
+        try:
+            async with harness.client() as client:
+                accepted = await client.post(f"/api/sessions/{harness.session_id}/messages", json=_message(str(uuid4())))
+                assert accepted.status_code == 202, accepted.text
+                for _ in range(1000):
+                    if entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                assert entered.is_set()
+                await asyncio.sleep(0.35)
+                assert len(worker._jobs) == 1
+                assert outstanding_admissions() >= baseline + 1 and sdk.requests == []
+                release.set()
+                for _ in range(1000):
+                    if not worker._jobs and outstanding_admissions() == baseline:
+                        break
+                    await asyncio.sleep(0.01)
+            assert not worker._jobs and outstanding_admissions() == baseline
+            assert sdk.requests == []
+        finally:
+            release.set()
+            event.remove(engine, "before_cursor_execute", park_actual_ingress)

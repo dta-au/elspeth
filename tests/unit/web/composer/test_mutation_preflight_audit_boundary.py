@@ -32,6 +32,7 @@ from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
+from tests.unit.web.sessions.test_continuation_prompt_producers import dispatch_tool_batch
 
 from .conftest import _fake_llm_response
 from .test_preview_policy_snapshot import _registry, _service
@@ -142,7 +143,8 @@ async def test_applied_mutation_is_audited_before_preflight(
     mutation_ceiling = ComposerMutationCeiling(result_session_id, str(uuid4()), preferences.trust_mode)
 
     async def dispatch():
-        return await service._dispatch_tool_batch(
+        return await dispatch_tool_batch(
+            service,
             call_model=_CallModelOutcome(completion=completion),
             mutation_ceiling=mutation_ceiling,
             state=state,

@@ -1,79 +1,48 @@
-"""Envelope-assertion harness for the composer LLM tool-use loop.
+"""Production prompt-byte envelope for the composer's provider requests.
 
-This test file is the regression gate for the elspeth-4e79436719 cluster:
-unbounded prompt growth across LLM provider turns. The existing
-``test_inline_complete_pipeline_replay_uses_atomic_tool_shape`` test
-characterizes a happy fake replay; this harness characterizes the
-**failure class** the staging incident exposed:
+This file is the regression gate for the elspeth-4e79436719 cluster:
+unbounded prompt growth across LLM provider turns (a 76 KB skill prompt +
+20 KB tools spec re-sent on every turn burned 600 K+ prompt tokens for a
+trivial pipeline-creation request on 2026-05-06 staging).
 
-- The compose loop sends a 76 KB skill prompt + 20 KB tools spec on every
-  turn, so a 20-turn exchange burns 600 K+ prompt tokens for a trivial
-  pipeline-creation request (2026-05-06 staging exchanges referenced in
-  the epic).
-
-The harness runs the real ``compose()`` method against a scripted fake
-LLM and enforces, on each turn:
-
-1. **Turn ceiling** — total turns ≤ a named constant. Catches a
-   regression that lifts the budget without justification.
-2. **Per-turn payload byte envelope** — the ``messages`` list and
-   ``tools`` array passed into ``_call_llm`` are JSON-serialized and
-   their cumulative byte size is asserted against a named constant.
-   This is what bites: the bytes are the bytes the production
-   ``_build_messages`` / ``composer_loop_tool_definitions`` code actually emitted,
-   not whatever the test author scripted into the fake response. A
-   regression that re-introduces unbounded transcript accumulation
-   (or grows the system-prompt skill without compensating compaction)
-   fails this assertion.
-3. **Reported prompt-token envelope** — sum of audit-row
-   ``prompt_tokens`` ≤ a named constant. Useful as a cheap secondary
-   gate; reflects the values the script reports, not the production
-   token count, so it must always be paired with the byte-envelope
-   assertion above.
-4. **Audit completeness** — every fake LLM call appears verbatim in
-   ``result.llm_calls``; no synthetic finalize-only records leak in.
-5. **Cache-warm assertion (xfail until Phase 3)** — turns ≥ 2 have
-   non-zero ``cache_read_input_tokens`` once provider-side prompt
-   caching is wired. Marked ``xfail`` today because the
-   ``cache_control`` markers have not landed (Phase 3 of the plan).
-
-The fake LLM is patched at ``litellm.acompletion`` so the dispatch path,
-provider admission, audit recorder, and budget counters run through real code. Only
-the provider call itself is replaced — this keeps the harness faithful
-to production behaviour while staying deterministic and offline.
+The deleted V1 ``compose()`` loop is gone. The bytes are now measured on the
+shared owners that build every Continuation primary request:
+``continuation_message_builders.build_service_initial_messages`` (system
+prompt, skill and context) plus ``composer_loop_tool_definitions`` (the
+tool palette), and ``tool_batch.run_tool_batch`` for the assistant/tool
+messages a batch appends before the next request. Only the provider is
+absent: no request is sent.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from copy import deepcopy
-from dataclasses import dataclass
+import asyncio
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from uuid import UUID
 
 import pytest
 
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.continuation_message_builders import build_service_initial_messages
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, composer_loop_tool_definitions
 from elspeth.web.composer.service import ComposerAvailability
+from elspeth.web.composer.tool_batch import BatchAccumulator, ToolBatchContext, ToolBatchCustody, ToolBatchProvenance, run_tool_batch
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
-    FakeChoice,
     _composer_service_with_session,
     _empty_state,
     _make_llm_response,
     _make_settings,
     _mock_catalog,
-    _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
 
 
 @pytest.fixture(autouse=True)
 def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bypass the OPENAI_API_KEY availability check.
-
-    Mirrors the autouse fixture in ``test_service.py``: these envelope
-    tests verify compose-loop budget mechanics, not local API-key
-    presence. Skipping the check keeps the harness deterministic
-    offline.
-    """
+    """Bypass the OPENAI_API_KEY availability check (deterministic offline)."""
 
     def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
         return ComposerAvailability(available=True, model=model, provider="test")
@@ -84,19 +53,6 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # Named envelope constants — bumping these requires a paired plan-update PR.
 # ---------------------------------------------------------------------------
-
-# Total provider calls across one compose() invocation. Matches current
-# settings (composer_max_composition_turns=15 + composer_max_discovery_turns=10),
-# capped at a sane upper bound for first-turn creation prompts. A regression
-# that lifts this without justification fails the suite loudly.
-ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT = 5
-
-# Sum of per-turn prompt_tokens across one trivial-creation compose() call.
-# This figure reflects what the harness scripts into fake responses; it is
-# NOT a claim about real production prompt sizes. It serves as a cheap
-# secondary gate paired with the byte-envelope assertion below, which is
-# the one that actually measures production output.
-ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT = 50_000
 
 # Cumulative byte-size envelope on the production-emitted ``messages`` +
 # ``tools`` JSON blobs across one compose() call. This IS a real production
@@ -138,300 +94,116 @@ def _serialize_call(messages: Any, tools: Any) -> int:
     return len(json.dumps(payload, default=str).encode("utf-8"))
 
 
-@dataclass(frozen=True)
-class ScriptedTurn:
-    """One scripted assistant turn, with optional tool calls and usage payload."""
+async def _rootless_trivial_request_sizes(user_message: str = "Build a CSV pipeline.") -> tuple[int, ...]:
+    """Byte sizes of the two provider requests of the rootless trivial script.
 
-    content: str | None = None
-    tool_calls: tuple[dict[str, Any], ...] = ()
-    prompt_tokens: int = 1_000
-    completion_tokens: int = 50
-    cache_read_input_tokens: int | None = None
-    cache_creation_input_tokens: int | None = None
-    cached_prompt_tokens: int | None = None
-
-
-@dataclass
-class _ScriptedResponse:
-    """Fake LiteLLM response carrying ``choices`` and a ``usage`` object."""
-
-    choices: list[FakeChoice]
-    usage: dict[str, Any]
-    model: str = "openrouter/test/scripted-model"
-    id: str = "chatcmpl-scripted"
-
-
-def _build_scripted_response(turn: ScriptedTurn) -> _ScriptedResponse:
-    base = _make_llm_response(
-        content=turn.content,
-        tool_calls=list(turn.tool_calls) if turn.tool_calls else None,
-    )
-    usage: dict[str, Any] = {
-        "prompt_tokens": turn.prompt_tokens,
-        "completion_tokens": turn.completion_tokens,
-        "total_tokens": turn.prompt_tokens + turn.completion_tokens,
-    }
-    if turn.cached_prompt_tokens is not None:
-        usage["prompt_tokens_details"] = {"cached_tokens": turn.cached_prompt_tokens}
-    if turn.cache_creation_input_tokens is not None:
-        usage["cache_creation_input_tokens"] = turn.cache_creation_input_tokens
-    if turn.cache_read_input_tokens is not None:
-        usage["cache_read_input_tokens"] = turn.cache_read_input_tokens
-    return _ScriptedResponse(choices=base.choices, usage=usage)
-
-
-@dataclass
-class _EnvelopeRun:
-    """Captured per-turn payload sizes plus the compose() result."""
-
-    result: Any
-    per_turn_byte_sizes: tuple[int, ...]
-    per_turn_messages: tuple[list[dict[str, Any]], ...]
-
-
-async def _run_envelope(script: Sequence[ScriptedTurn], *, user_message: str = "Build a CSV pipeline.") -> _EnvelopeRun:
-    """Run ``compose()`` against the scripted turn sequence.
-
-    Returns both the ``ComposerResult`` and a tuple of per-turn JSON byte
-    sizes captured from the production-emitted messages/tools payloads.
+    Request 1 is the initial primary input. Request 2 is request 1 plus the
+    assistant/tool messages the ``list_sources`` discovery batch appends.
     """
-    catalog = _mock_catalog()
-    settings = _make_settings()
-    service, session_id = _composer_service_with_session(catalog=catalog, settings=settings)
+    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+    sessions = service._require_sessions_service()
     state = _empty_state()
-
-    responses = iter(_build_scripted_response(turn) for turn in script)
-    sizes: list[int] = []
-    dispatched_messages: list[list[dict[str, Any]]] = []
-
-    async def complete(**kwargs: Any) -> _ScriptedResponse:
-        # Capture at dispatch: the append-only loop mutates the message list
-        # after each call, so inspecting call_args_list later overcounts bytes.
-        sizes.append(_serialize_call(kwargs["messages"], kwargs["tools"]))
-        dispatched_messages.append(deepcopy(kwargs["messages"]))
-        return next(responses)
-
-    with patch("litellm.acompletion", new_callable=AsyncMock) as mock_llm:
-        mock_llm.side_effect = complete
-        result = await service.compose(user_message, [], state, session_id=session_id)
-
-    return _EnvelopeRun(result=result, per_turn_byte_sizes=tuple(sizes), per_turn_messages=tuple(dispatched_messages))
-
-
-# ---------------------------------------------------------------------------
-# Scenarios — keep small. Add scenarios here when new failure classes emerge.
-# ---------------------------------------------------------------------------
-
-
-_ROOTLESS_TRIVIAL_SCRIPT: tuple[ScriptedTurn, ...] = (
-    # Actual catalog discovery earns a second provider turn. This envelope
-    # fixture makes no semantic-publication claim about a fabricated build.
-    ScriptedTurn(
-        content=None,
-        tool_calls=({"id": "trivial_sources", "name": "list_sources", "arguments": {}},),
-        prompt_tokens=8_000,
-        completion_tokens=40,
-    ),
-    ScriptedTurn(
-        content="I still need your input file before I can build the pipeline.",
-        prompt_tokens=8_000,
-        completion_tokens=40,
-    ),
-)
-
-# Module-load coupling guard: if a future edit grows ``_ROOTLESS_TRIVIAL_SCRIPT``
-# beyond the asserted turn ceiling, the test would fail because the SCRIPT
-# is too long, not because a regression was detected — a false positive that
-# erodes trust in the gate. Fail fast at import time so the misalignment is
-# obvious. Bumping the ceiling and the script in lockstep is intentional and
-# requires touching this guard explicitly.
-assert len(_ROOTLESS_TRIVIAL_SCRIPT) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
-    f"_ROOTLESS_TRIVIAL_SCRIPT has {len(_ROOTLESS_TRIVIAL_SCRIPT)} turns but the "
-    f"asserted ceiling is {ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT}. The script "
-    "cannot exceed the ceiling — otherwise the harness fails for the wrong "
-    "reason. Either shrink the script or bump ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT "
-    "(and justify the bump in the commit message)."
-)
-
-
-# Pathological scenario: a 5-turn run where each turn burns 20K prompt tokens
-# (simulating the elspeth-4e79436719 staging case where the full skill +
-# tools spec is re-sent on every turn). The harness must reject this:
-# 5 x 20K = 100K, well above ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT.
-# The fourth turn's prose leaves an empty pipeline after discovery. The
-# fifth turn answers the neutral rootless recovery, so the loop terminates
-# cleanly instead of exhausting the finite provider script.
-_PATHOLOGICAL_PROMPT_GROWTH_SCRIPT: tuple[ScriptedTurn, ...] = (
-    ScriptedTurn(
-        content=None,
-        tool_calls=({"id": "call_1", "name": "list_sources", "arguments": {}},),
-        prompt_tokens=20_000,
-    ),
-    ScriptedTurn(
-        content=None,
-        tool_calls=({"id": "call_2", "name": "list_transforms", "arguments": {}},),
-        prompt_tokens=20_000,
-    ),
-    ScriptedTurn(
-        content=None,
-        tool_calls=({"id": "call_3", "name": "list_sinks", "arguments": {}},),
-        prompt_tokens=20_000,
-    ),
-    ScriptedTurn(
-        content="I have surveyed the catalog.",
-        prompt_tokens=20_000,
-    ),
-    ScriptedTurn(
-        content="I still need your input file before I can build the pipeline.",
-        prompt_tokens=20_000,
-    ),
-)
-
-
-class TestEnvelopeHarness:
-    """Regression gate for unbounded compose-loop growth (elspeth-4e79436719)."""
-
-    @pytest.mark.asyncio
-    async def test_rootless_trivial_prompt_under_turn_ceiling(self) -> None:
-        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
-        assert run.result.repair_turns_used == 0
-        assert not run.result.state.sources
-        assert "[ELSPETH-SYSTEM]" in run.result.message
-        assert "I still need your input file before I can build the pipeline." in run.result.message
-        assert len(run.result.llm_calls) <= ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT, (
-            f"Trivial first-turn creation exceeded the named turn ceiling "
-            f"({ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT}); a regression has lifted the "
-            "compose-loop budget without justification."
+    snapshot, policy_catalog = service._policy_context.build("test-user")
+    tools = composer_loop_tool_definitions(service._planner_dialect)
+    preferences = await sessions.get_composer_preferences(UUID(session_id))
+    ceiling = ComposerMutationCeiling(session_id, "envelope-request", preferences.trust_mode)
+    with fenced_operation_context(sessions._engine, session_id) as context:
+        messages = build_service_initial_messages(
+            service,
+            chat_history=[],
+            state=state,
+            user_message=user_message,
+            session_id=session_id,
+            user_id="test-user",
+            plugin_snapshot=snapshot,
+            policy_catalog=policy_catalog,
+            session_operation_context=context,
         )
-
-    @pytest.mark.asyncio
-    async def test_rootless_trivial_prompt_under_production_byte_envelope(self) -> None:
-        """Real production prompt-size assertion.
-
-        Captures the JSON byte size of the messages + tools that
-        ``_call_llm`` was actually invoked with — i.e., what
-        ``_build_messages`` and ``composer_loop_tool_definitions`` emitted. Asserts
-        the cumulative byte total stays under the envelope. This is the
-        gate that bites a regression which re-introduces unbounded
-        transcript growth or ships a system prompt that has become
-        dramatically larger.
-        """
-        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
-        total_bytes = sum(run.per_turn_byte_sizes)
-        assert all(size <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT for size in run.per_turn_byte_sizes)
-        assert total_bytes <= ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY, (
-            f"Trivial first-turn creation emitted {total_bytes} bytes of "
-            f"messages+tools across {len(run.per_turn_byte_sizes)} turns "
-            f"({run.per_turn_byte_sizes}); exceeded named envelope "
-            f"({ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY}). The compose loop "
-            "is re-emitting bytes it should not, or the static prefix grew "
-            "without compensating compaction."
-        )
-
-    @pytest.mark.asyncio
-    async def test_rootless_trivial_prompt_under_reported_token_envelope(self) -> None:
-        """Secondary gate: audit-row prompt_tokens stay under the named envelope.
-
-        These are the values the script reported, not production token
-        counts. Pair with ``test_rootless_trivial_prompt_under_production_byte_envelope``
-        for actual production-shape coverage.
-        """
-        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
-        total = sum((c.prompt_tokens or 0) for c in run.result.llm_calls)
-        assert total <= ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT, (
-            f"Trivial first-turn creation script reported {total} prompt tokens, "
-            f"exceeding the named envelope ({ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT}); "
-            "a regression has re-introduced unbounded transcript accumulation."
-        )
-
-    @pytest.mark.asyncio
-    async def test_audit_completeness_every_fake_call_recorded(self) -> None:
-        """Every fake LLM call must produce exactly one ComposerLLMCall record.
-
-        Synthetic finalize-only or duplicate records fail this assertion.
-        """
-        run = await _run_envelope(_ROOTLESS_TRIVIAL_SCRIPT)
-        assert len(run.result.llm_calls) == len(_ROOTLESS_TRIVIAL_SCRIPT)
-        for fake_turn, recorded in zip(_ROOTLESS_TRIVIAL_SCRIPT, run.result.llm_calls, strict=True):
-            assert recorded.prompt_tokens == fake_turn.prompt_tokens
-            assert recorded.completion_tokens == fake_turn.completion_tokens
-
-    @pytest.mark.asyncio
-    async def test_post_warm_turns_record_cache_read_input_tokens(self) -> None:
-        """Phase 3 audit-truth assertion: cache hits land on the audit row.
-
-        The harness scripts ``cache_read_input_tokens`` from turn 2 onward
-        (turn 1 is a cache miss, no caching benefit yet). The assertion
-        verifies that whatever the provider reports about cache hits
-        flows through the audit pipeline and lands on the
-        ``ComposerLLMCall`` record. Phase 1B wired the extraction;
-        Phase 3 wired the cache_control markers; this test gates the
-        end-to-end truthfulness contract: the audit row reflects what
-        the provider actually said.
-        """
-        warm_script: tuple[ScriptedTurn, ...] = (
-            ScriptedTurn(
-                content=None,
-                tool_calls=({"id": "c1", "name": "list_sources", "arguments": {}},),
-                prompt_tokens=8_000,
-                # Turn 1: cold cache. No cache_read_input_tokens.
+        sizes = [_serialize_call(messages, tools)]
+        ctx = ToolBatchContext(
+            session_tools=service._session_tools,
+            provenance=ToolBatchProvenance(
+                model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
             ),
-            ScriptedTurn(
-                content=None,
-                tool_calls=({"id": "c2", "name": "list_transforms", "arguments": {}},),
-                prompt_tokens=8_000,
-                # Turn 2: warm cache. Provider reports it served 7K tokens
-                # from cache and 1K of fresh prompt.
-                cache_read_input_tokens=7_000,
+            custody=ToolBatchCustody(
+                data_dir=service._data_dir,
+                session_engine=service._session_engine,
+                secret_service=service._secret_service,
+                secret_wiring_policy=service._secret_wiring_policy,
+                max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
             ),
-            ScriptedTurn(
-                content="I still need your input file before I can build the pipeline.",
-                prompt_tokens=8_000,
-                cache_read_input_tokens=7_000,
-            ),
+            redaction_telemetry=service._redaction_telemetry,
+            preflight=service._preflight,
+            schema_disclosure=service._schema_disclosure,
+            advisor_checkpoint=service._advisor_checkpoint,
+            advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+            advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+            recorder=BufferingRecorder(),
+            anti_anchor=AntiAnchorTracker(),
+            discovery_cache={},
+            runtime_preflight_cache=service._preflight.new_cache(),
+            session_id=session_id,
+            session_operation_context=context,
+            user_id="test-user",
+            user_message_id=None,
+            user_message_content=user_message,
+            current_state_id=None,
+            actor="composer-web:user:test-user",
+            initial_version=state.version,
+            deadline=asyncio.get_running_loop().time() + 60,
+            progress=None,
+            session_scope=f"session:{session_id}",
+            turn_sessions_service=sessions,
+            turn_session_uuid=UUID(session_id),
+            turn_preferences=preferences,
+            mutation_ceiling=ceiling,
+            review_required=not ceiling.permits_auto(preferences.trust_mode),
+            cancellation_requested=asyncio.Event(),
+            plugin_snapshot=snapshot,
+            policy_catalog=policy_catalog,
+            tool_contract_dialect=service._planner_dialect,
+            session_operation_authority=sessions.session_operation_authority,
         )
-        run = await _run_envelope(warm_script)
-        assert len(run.result.llm_calls) == 3
-        assert run.result.repair_turns_used == 0
-        assert run.result.llm_calls[0].cache_read_input_tokens is None
-        assert run.result.llm_calls[1].cache_read_input_tokens == 7_000
-        assert run.result.llm_calls[2].cache_read_input_tokens == 7_000
-        assert [invocation.tool_name for invocation in run.result.tool_invocations] == ["list_sources", "list_transforms"]
-        assert "I still need your input file before I can build the pipeline." in run.result.message
+        completion = _admit_composer_llm_completion(
+            _make_llm_response(tool_calls=[{"id": "trivial_sources", "name": "list_sources", "arguments": {}}])
+        )
+        acc = BatchAccumulator(state=state, last_validation=None, last_runtime_preflight=None, advisor_calls_used=0)
+        before = len(messages)
+        outcome, _advisor_calls = await run_tool_batch(
+            call_model=_CallModelOutcome(completion=completion), ctx=ctx, acc=acc, llm_messages=messages
+        )
+    assert outcome.plugin_crash is None and len(outcome.tool_outcomes) == 1
+    assert [message["role"] for message in messages[before:]] == ["assistant", "tool"]
+    sizes.append(_serialize_call(messages, tools))
+    return tuple(sizes)
 
 
-class TestEnvelopeHarnessSelfTests:
-    """Self-tests on the harness — confirms it actually catches regressions.
+@pytest.mark.asyncio
+async def test_rootless_trivial_prompt_under_production_byte_envelope() -> None:
+    """Real production prompt-size assertion.
 
-    A test harness that cannot fail when something is wrong is a placebo.
-    These tests verify the harness fires when given a deliberately
-    over-budget scenario.
+    The bytes are what the shared request builders emit for each of the two
+    provider requests of the rootless trivial script. A regression that
+    re-introduces unbounded transcript growth or ships a dramatically larger
+    system prompt or tool palette fails here.
     """
+    sizes = await _rootless_trivial_request_sizes()
+    total_bytes = sum(sizes)
+    assert all(size <= ENVELOPE_MAX_PRODUCTION_BYTES_TRIVIAL_PROMPT for size in sizes), sizes
+    assert total_bytes <= ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY, (
+        f"Trivial first-turn creation emitted {total_bytes} bytes of "
+        f"messages+tools across {len(sizes)} requests ({sizes}); exceeded named envelope "
+        f"({ENVELOPE_MAX_PRODUCTION_BYTES_ROOTLESS_RECOVERY}). A request is re-emitting bytes "
+        "it should not, or the static prefix grew without compensating compaction."
+    )
 
-    @pytest.mark.asyncio
-    async def test_pathological_script_triggers_envelope_failure(self) -> None:
-        """The pathological prompt-growth script either exhausts the loop
-        budget (raising ComposerConvergenceError) OR exceeds the envelope.
-        Either outcome is a *positive* signal that the harness is doing
-        its job — a regression that re-introduces unbounded transcript
-        accumulation cannot pass both the production budget AND the
-        envelope assertion silently.
-        """
-        from elspeth.web.composer.protocol import ComposerConvergenceError
 
-        try:
-            run = await _run_envelope(_PATHOLOGICAL_PROMPT_GROWTH_SCRIPT)
-        except ComposerConvergenceError:
-            # Loop budget tripped before envelope — the production guard fired.
-            return
+@pytest.mark.asyncio
+async def test_envelope_measure_grows_with_the_request() -> None:
+    """Self-test: the instrument sees request bytes, so a larger request measures larger.
 
-        # If we got here, the loop returned a result — the envelope must reject it.
-        total = sum((c.prompt_tokens or 0) for c in run.result.llm_calls)
-        envelope_breached = total > ENVELOPE_MAX_PROMPT_TOKENS_TRIVIAL_PROMPT
-        turn_ceiling_breached = len(run.result.llm_calls) > ENVELOPE_MAX_TURNS_TRIVIAL_PROMPT
-        assert envelope_breached or turn_ceiling_breached, (
-            f"Harness self-test failed: a 5-turn 20K-token-each script produced "
-            f"{len(run.result.llm_calls)} turns x {total} total prompt tokens, "
-            "but neither the envelope assertion nor the turn ceiling fired. "
-            "The harness would not catch the original elspeth-4e79436719 regression."
-        )
+    A harness that cannot fail when something is wrong is a placebo.
+    """
+    small = await _rootless_trivial_request_sizes("Build a CSV pipeline.")
+    large = await _rootless_trivial_request_sizes("Build a CSV pipeline. " + "x" * 50_000)
+    assert all(after >= before + 50_000 for before, after in zip(small, large, strict=True)), (small, large)
