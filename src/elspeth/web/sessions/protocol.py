@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.advisor_audit import AdvisorGraphReviewFact
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
     from elspeth.web.composer.continuation_handoff import ContinuationYieldReason
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
     from elspeth.web.composer.continuation_policy import ContinuationSegmentPolicy
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
@@ -3173,6 +3174,8 @@ class SessionServiceProtocol(Protocol):
         env_ref_names: frozenset[str],
         original: BaseException | None = None,
         custody: ContinuationToolFailureCustody | None = None,
+        p4_writer_observation: P4WriterObservation | None = None,
+        p4_live_owner: ContinuationLiveP4 | None = None,
     ) -> CommittedContinuationFailure: ...
 
     async def fail_composer_async_operation(

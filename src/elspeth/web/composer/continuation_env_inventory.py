@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Connection
+from sqlalchemy import Connection, select
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
@@ -15,6 +15,8 @@ from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLRetu
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 from elspeth.web.sessions.continuation import _require_current_continuation_running, require_snapshot_cas
+from elspeth.web.sessions.locking import continuation_metadata_source_scope, locked_session_transaction
+from elspeth.web.sessions.models import sessions_table
 
 if TYPE_CHECKING:
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -135,6 +137,54 @@ async def _read_current_env_names(advisor: AdvisorCheckpointOwner, session_id: s
     if type(names) is not frozenset or any(type(name) is not str for name in names):
         raise AuditIntegrityError("current Advisor environment inventory lost its actual nominal names")
     return names
+
+
+async def read_disposition_env_names(
+    *, advisor: AdvisorCheckpointOwner, authority: ComposerAsyncOperationAuthority, required_work: RequiredWorkBinding
+) -> frozenset[str]:
+    """Read current names under the exact timed owner that is disposing work."""
+    from elspeth.web.composer.continuation_initialization import _registered
+    from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
+    from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+    from elspeth.web.sessions.service import SessionServiceImpl
+
+    if (
+        type(advisor) is not AdvisorCheckpointOwner
+        or type(authority) is not ComposerAsyncOperationAuthority
+        or type(required_work) is not RequiredWorkBinding
+        or type(required_work.running) is not ComposerOperationRunning
+    ):
+        raise AuditIntegrityError("Disposition inventory requires its actual nominal owners")
+    running = required_work.running
+    required_work.validate_context(running.session_operation_context)
+    sessions = advisor._require_sessions_service()
+    owner = required_work.coordinator.sql_deadline_owner
+    if (
+        type(sessions) is not SessionServiceImpl
+        or sessions._engine is not authority._engine
+        or type(owner) is not ContinuationSQLDeadlineOwner
+        or owner.running is not running
+    ):
+        raise AuditIntegrityError("Disposition inventory changed its actual store or physical timing owner")
+    owner.validate_context(running.session_operation_context, operation_id=running.claim.operation_id, attempt=running.claim.attempt)
+    session_id = str(running.claim.session_id)
+
+    def read() -> frozenset[str]:
+        with locked_session_transaction(sessions._engine, session_id) as conn:
+            _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+            user_id = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one()
+            with continuation_metadata_source_scope(sessions._engine):
+                names = AdvisorCheckpointOwner._env_ref_names_for_session_owner(advisor, user_id)
+            if type(names) is not frozenset or any(type(name) is not str for name in names):
+                raise AuditIntegrityError("Disposition inventory lost its actual nominal names")
+            return names
+
+    return await _registered(
+        work=required_work,
+        source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+        operation=read,
+        expected=frozenset,
+    )
 
 
 async def materialize_continuation_env_inventory(

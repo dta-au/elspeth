@@ -1,0 +1,275 @@
+"""One physical capture reuses pure work while each current SQL proof remains real."""
+
+import asyncio
+from hashlib import sha256
+from threading import Event
+
+import pytest
+from sqlalchemy import update
+
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer import continuation_runtime as runtime_owner
+from elspeth.web.composer.continuation_codec import encode_continuation_snapshot
+from elspeth.web.continuation_retention_memo import (
+    RetentionStageMemo,
+    current_retention_stage_memo,
+    retention_stage_memo_scope,
+)
+from elspeth.web.sessions import continuation_runtime as sql_owner
+from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot, private_chunk_key, put_chunk
+from elspeth.web.sessions.locking import locked_session_transaction
+from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
+from elspeth.web.sessions.models import composer_operation_segments_table as segments
+from tests.unit.web.coordination.test_continuation_p4_recovery_start import recovery_rows
+from tests.unit.web.sessions import test_continuation_runtime as runtime_cases
+
+operation_store = runtime_cases.operation_store
+
+
+async def _capture(runtime, arguments):
+    return await runtime_owner.capture_continuation_runtime_owners(
+        runtime, selected=arguments["selected"], inventory=arguments["inventory"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["returned", "initial-read-error", "capture-error", "final-read-error", "started-cancellation"])
+async def test_physical_capture_shares_one_fresh_memo_across_both_sql_proofs_and_closes_it(operation_store, monkeypatch, outcome):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    sql_reads, captures, lookups, computations = [], [], [], []
+    original_lookup = RetentionStageMemo._lookup
+    entered, release = Event(), Event()
+    original_error = ValueError("original physical capture error")
+
+    def read(conn, *args, **kwargs):
+        memo = current_retention_stage_memo()
+        assert type(memo) is RetentionStageMemo and memo.active
+        sql_reads.append((memo, conn))
+        if outcome == "initial-read-error" or (outcome == "final-read-error" and len(sql_reads) == 2):
+            raise original_error
+        return original_read(conn, *args, **kwargs)
+
+    def lookup(memo, entries, key, compute):
+        lookups.append(memo)
+
+        def actual_compute():
+            computations.append(memo)
+            return compute()
+
+        return original_lookup(memo, entries, key, actual_compute)
+
+    def capture(*args, **kwargs):
+        memo = current_retention_stage_memo()
+        assert type(memo) is RetentionStageMemo and memo.active
+        captures.append(memo)
+        result = original_capture(*args, **kwargs)
+        assert memo.cached_entry_count > 0
+        if outcome == "capture-error":
+            raise original_error
+        if outcome == "started-cancellation":
+            entered.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    monkeypatch.setattr(RetentionStageMemo, "_lookup", lookup)
+    before = recovery_rows(operation_store[0])
+    try:
+        with retention_stage_memo_scope() as outer:
+            if outcome.endswith("error"):
+                with pytest.raises(ValueError) as caught:
+                    await _capture(runtime, arguments)
+                assert caught.value is original_error
+            elif outcome == "started-cancellation":
+                task = asyncio.create_task(_capture(runtime, arguments))
+                try:
+                    assert await asyncio.to_thread(entered.wait, 5)
+                    task.cancel("actual physical capture cancellation")
+                    await asyncio.sleep(0)
+                    assert not task.done() and captures[-1].active
+                finally:
+                    release.set()
+                with pytest.raises(asyncio.CancelledError, match="actual physical capture cancellation"):
+                    await task
+            else:
+                first = await _capture(runtime, arguments)
+                second = await _capture(runtime, arguments)
+                assert first.selected is second.selected is arguments["selected"]
+                assert len(captures) == 2 and captures[0] is not captures[1]
+                for memo in captures:
+                    assert sum(actual is memo for actual in lookups) > sum(actual is memo for actual in computations) > 0
+            assert current_retention_stage_memo() is outer and outer.active
+            assert all(memo is not outer and not memo.active and memo.cached_entry_count == 0 for memo, _conn in sql_reads)
+        if outcome == "initial-read-error":
+            assert captures == [] and len(sql_reads) == 1
+            expected = [sql_reads[0][0]]
+        else:
+            expected = [memo for memo in captures for _ in range(1 if outcome == "capture-error" else 2)]
+        assert len(sql_reads) == len(expected)
+        assert all(actual is wanted for (actual, _conn), wanted in zip(sql_reads, expected, strict=True))
+        assert all(conn.closed for _memo, conn in sql_reads)
+        if outcome not in ("initial-read-error", "capture-error"):
+            assert sql_reads[0][1] is not sql_reads[1][1]
+        assert current_retention_stage_memo() is None
+        assert not outer.active and outer.cached_entry_count == 0
+        assert recovery_rows(operation_store[0]) == before
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        release.set()
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+async def test_runtime_facade_defaults_to_fresh_isolation_and_borrows_only_explicit_current_memo(operation_store, monkeypatch):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    original_read = sql_owner.read_runtime_source_on_connection
+    observed = []
+
+    def read(*args, **kwargs):
+        observed.append(current_retention_stage_memo())
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    try:
+        with retention_stage_memo_scope() as outer:
+            for _ in range(2):
+                await asyncio.to_thread(
+                    arguments["authority"].read_continuation_runtime,
+                    running,
+                    selected=arguments["selected"],
+                    inventory=arguments["inventory"],
+                )
+                assert observed[-1] is not outer and not observed[-1].active
+            assert observed[0] is not observed[1]
+            await asyncio.to_thread(
+                arguments["authority"].read_continuation_runtime,
+                running,
+                selected=arguments["selected"],
+                inventory=arguments["inventory"],
+                retention_memo=outer,
+            )
+            assert observed[-1] is outer and outer.active
+        assert not outer.active and outer.cached_entry_count == 0
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["foreign", "closed", "wrong-current"])
+async def test_runtime_facade_refuses_invalid_borrow_before_sql(operation_store, monkeypatch, kind):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    original_read = sql_owner.read_runtime_source_on_connection
+    observed = []
+
+    def read(*args, **kwargs):
+        observed.append(True)
+        return original_read(*args, **kwargs)
+
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    with retention_stage_memo_scope() as closed:
+        pass
+    try:
+        with retention_stage_memo_scope() as outer, retention_stage_memo_scope() as current:
+            borrowed = object() if kind == "foreign" else closed if kind == "closed" else outer
+            before = recovery_rows(operation_store[0])
+            with pytest.raises(AuditIntegrityError, match="exact active retention memo"):
+                await asyncio.to_thread(
+                    arguments["authority"].read_continuation_runtime,
+                    running,
+                    selected=arguments["selected"],
+                    inventory=arguments["inventory"],
+                    retention_memo=borrowed,
+                )
+            assert observed == [] and recovery_rows(operation_store[0]) == before
+            assert current_retention_stage_memo() is current and current.active and outer.active
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["sql-bytes", "current-policy", "current-inventory"])
+async def test_capture_memo_does_not_replace_final_current_sql_validation(operation_store, monkeypatch, change):
+    arguments, _history, _attachments = await runtime_cases.runtime_case(operation_store)
+    running = arguments["inventory"].running
+    runtime = await runtime_owner.restore_continuation_runtime(**arguments)
+    original_read, original_capture = sql_owner.read_runtime_source_on_connection, runtime_owner._capture_owners
+    reads, capture_memos, after_mutation = [], [], []
+
+    def read(*args, **kwargs):
+        reads.append(current_retention_stage_memo())
+        return original_read(*args, **kwargs)
+
+    def capture(*args, **kwargs):
+        capture_memos.append(current_retention_stage_memo())
+        result = original_capture(*args, **kwargs)
+        with locked_session_transaction(operation_store[0], str(running.claim.session_id)) as conn:
+            if change == "sql-bytes":
+                reference = arguments["selected"].stack.frames[0].caches
+                original = next(chunk for chunk in arguments["selected"].chunks if chunk.reference == reference)
+                payload = original.canonical.encode("utf-8") + b" "
+                changed = conn.execute(
+                    update(chunks)
+                    .where(
+                        chunks.c.session_id == str(running.claim.session_id),
+                        chunks.c.operation_id == running.claim.operation_id,
+                        chunks.c.chunk_key == private_chunk_key(original),
+                    )
+                    .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+                )
+                assert changed.rowcount == 1
+            elif change == "current-policy":
+                different = "0" * 64 if arguments["selected"].stack.policy_hash != "0" * 64 else "1" * 64
+                changed = conn.execute(
+                    update(segments)
+                    .where(
+                        segments.c.session_id == str(running.claim.session_id),
+                        segments.c.operation_id == running.claim.operation_id,
+                        segments.c.sequence == running.claim.segment_sequence,
+                        segments.c.generation == running.claim.ownership_generation,
+                    )
+                    .values(policy_sha256=different)
+                )
+                assert changed.rowcount == 1
+            else:
+                for chunk in result.chunks:
+                    put_chunk(
+                        conn,
+                        session_id=str(running.claim.session_id),
+                        operation_id=running.claim.operation_id,
+                        key=private_chunk_key(chunk),
+                        payload=chunk.canonical.encode("utf-8"),
+                        codec=chunk.reference.codec,
+                    )
+                append_complete_snapshot(
+                    conn,
+                    session_id=str(running.claim.session_id),
+                    operation_id=running.claim.operation_id,
+                    expected_checkpoint_id=result.selected.checkpoint_id,
+                    expected_cursor=result.selected.stack.cursor,
+                    snapshot_json=encode_continuation_snapshot(result.stack),
+                    event_batch=(ContinuationEvent("checkpoint", '{"test_scope":"actual capture changes current selection"}'),),
+                    handoff=False,
+                )
+        after_mutation.append(recovery_rows(operation_store[0]))
+        return result
+
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", read)
+    monkeypatch.setattr(runtime_owner, "_capture_owners", capture)
+    try:
+        with pytest.raises(AuditIntegrityError):
+            await _capture(runtime, arguments)
+        assert len(reads) == 2 and len(capture_memos) == 1 and len(after_mutation) == 1
+        assert reads[0] is reads[1] is capture_memos[0]
+        assert not reads[0].active and reads[0].cached_entry_count == 0
+        assert recovery_rows(operation_store[0]) == after_mutation[0]
+        arguments["required_work"].coordinator.assert_completed()
+    finally:
+        operation_store[1].release(running.session_operation_context)

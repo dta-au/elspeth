@@ -159,12 +159,17 @@ def _submission_unavailable(
     finalizer: ApplicationFinalizerCapability | None = None,
     *,
     claim_release: QueuedClaimRelease | None = None,
+    watch_reader: ComposerOperationWatchReader | None = None,
 ) -> bool:
     _assert_recovery_registered()
     if finalizer is not None and (_APPLICATION_FINALIZER_OWNER is None or not _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)):
         raise AuditIntegrityError("Invalid application finalizer authority")
     if claim_release is not None and (type(claim_release) is not QueuedClaimRelease or ticket is not None or finalizer is not None):
         raise AuditIntegrityError("Invalid drain-time claim release authority")
+    if watch_reader is not None and (
+        type(watch_reader) is not ComposerOperationWatchReader or ticket is not None or finalizer is not None or claim_release is not None
+    ):
+        raise AuditIntegrityError("Invalid drain-time operation observation authority")
     allowed_finalizer = (
         finalizer is not None and _APPLICATION_FINALIZER_OWNER is not None and _APPLICATION_FINALIZER_OWNER.owns_claimed(finalizer)
     )
@@ -173,6 +178,7 @@ def _submission_unavailable(
         and not allowed_finalizer
         and claim_release is None
         and (ticket is None or not ticket.permits_process_drain)
+        and (watch_reader is None or not watch_reader.permits_process_drain(_INSTANCE_DRAINING))
     )
 
 
@@ -182,9 +188,10 @@ def _generation_for(
     finalizer: ApplicationFinalizerCapability | None = None,
     *,
     claim_release: QueuedClaimRelease | None = None,
+    watch_reader: ComposerOperationWatchReader | None = None,
 ) -> RequiredExecutorGenerationCustodian:
     global _GENERATION_COUNTER, _GENERATION_CUSTODIAN
-    if _submission_unavailable(ticket, finalizer, claim_release=claim_release):
+    if _submission_unavailable(ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader):
         raise RequiredGenerationUnavailable("Shared executor lifecycle unavailable")
     callback = _RECOVERY_CALLBACK
     if callback is None:
@@ -252,7 +259,7 @@ async def _submit_shared[T](
     try:
         executor = _get_shared_executor()
         generation = (
-            _generation_for(executor, ticket, finalizer)
+            _generation_for(executor, ticket, finalizer, watch_reader=watch_reader)
             if claim_release is None
             else _generation_for(executor, claim_release=claim_release)
         )
@@ -296,7 +303,9 @@ async def _submit_shared[T](
     future: ConcurrentFuture[T] | None = None
     with generation.submission_lock:
         try:
-            if generation.state != "active" or _submission_unavailable(ticket, finalizer, claim_release=claim_release):
+            if generation.state != "active" or _submission_unavailable(
+                ticket, finalizer, claim_release=claim_release, watch_reader=watch_reader
+            ):
                 raise RequiredGenerationUnavailable("Shared executor generation quarantined")
             if watch_reader is not None:
                 _assert_current_watch_generation(watch_reader, executor, generation)
@@ -476,7 +485,7 @@ async def run_required_sql_finish_once[**P, T](
     operation = functools.partial(func, *args, **kwargs)
     deadline_owner = ticket.sql_deadline_owner
     if deadline_owner is not None:
-        from elspeth.web.sessions.locking import continuation_sql_deadline_scope
+        from elspeth.web.sessions.locking import ContinuationPaidSettlementScope, continuation_sql_deadline_scope
 
         def invoke_with_deadline() -> T:
             deadline_owner.validate_context(
@@ -484,10 +493,21 @@ async def run_required_sql_finish_once[**P, T](
                 operation_id=ticket.key.authority.durable_operation_id,
                 attempt=ticket.key.authority.claim_attempt,
             )
+            paid_scope = (
+                ContinuationPaidSettlementScope(ticket, deadline_owner)
+                if ticket.key.source is RequiredWorkSource.PROVIDER_SETTLEMENT_SQL
+                else None
+            )
             with continuation_sql_deadline_scope(
                 deadline_owner,
                 lifecycle=ticket.key.source
-                in (RequiredWorkSource.LEASE_RENEWAL, RequiredWorkSource.LEASE_RELEASE, RequiredWorkSource.CONTINUATION_HANDOFF_SQL),
+                in (
+                    RequiredWorkSource.LEASE_RENEWAL,
+                    RequiredWorkSource.LEASE_RELEASE,
+                    RequiredWorkSource.CONTINUATION_HANDOFF_SQL,
+                    RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+                ),
+                paid_settlement=paid_scope,
             ):
                 return operation()
 
@@ -1056,7 +1076,7 @@ def _assert_current_watch_generation(
     with _EXECUTOR_LOCK:
         if _SHARED_EXECUTOR is not executor or _GENERATION_CUSTODIAN is not generation or _SHARED_SHUTDOWN_STARTED:
             raise RequiredGenerationUnavailable("Operation observation generation is no longer current")
-    if generation.state != "active" or _submission_unavailable(None):
+    if generation.state != "active" or _submission_unavailable(None, watch_reader=reader):
         raise RequiredGenerationUnavailable("Operation observation generation cannot submit")
     reader.check_cutoff()
 

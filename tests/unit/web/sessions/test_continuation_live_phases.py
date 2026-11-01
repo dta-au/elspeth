@@ -1,6 +1,6 @@
 """Actual V2 paid response → tool → owed Stop prefix source controls."""
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import FrozenInstanceError, replace
 from datetime import timedelta
 from typing import Any
@@ -100,7 +100,7 @@ async def _phase_case(
                         },
                     }
                 ],
-                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
             )
 
         monkeypatch.setattr(litellm, "acompletion", completion)
@@ -447,6 +447,125 @@ async def test_actual_v2_tool_phase_preserves_live_paid_objects_and_commits_the_
 
 
 @pytest.mark.asyncio
+async def test_changed_cut_uses_one_current_sql_source_for_runtime_and_producers(operation_store, tmp_path, monkeypatch):
+    from elspeth.web.composer import continuation_live_phases as phases
+    from elspeth.web.composer import continuation_prompt_producers as producers
+    from elspeth.web.sessions import continuation_runtime as source_reader
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        actual_phase = phases.ContinuationLivePhases._current_phase_read
+        actual_source_inputs = source_reader._read_current_inputs
+        actual_producer_inputs = producers._read_current_inputs
+        actual_adopt = producers.CurrentContinuationMessageProducers.advance_current_from_source
+        current_reads = []
+        adoptions = []
+        changed_cuts = []
+
+        def source_inputs(conn, *, selected, inventory):
+            current_reads.append(("source", selected))
+            return actual_source_inputs(conn, selected=selected, inventory=inventory)
+
+        def producer_inputs(conn, *, selected, inventory, finish_read=None):
+            current_reads.append(("producer", selected))
+            return actual_producer_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
+
+        def adopt(self, selected, inventory, source):
+            assert source.selected is selected
+            assert source.admitted_evidence is not None
+            adoptions.append((selected, source))
+            return actual_adopt(self, selected, inventory, source)
+
+        async def phase(self, selected):
+            prior = self.runtime.source.selected if self.runtime is not None else None
+            read_start, adopt_start = len(current_reads), len(adoptions)
+            result = await actual_phase(self, selected)
+            if prior is not None and prior != selected:
+                changed_cuts.append((selected, result, current_reads[read_start:], adoptions[adopt_start:]))
+            return result
+
+        monkeypatch.setattr(source_reader, "_read_current_inputs", source_inputs)
+        monkeypatch.setattr(producers, "_read_current_inputs", producer_inputs)
+        monkeypatch.setattr(producers.CurrentContinuationMessageProducers, "advance_current_from_source", adopt)
+        monkeypatch.setattr(phases.ContinuationLivePhases, "_current_phase_read", phase)
+        await _advance(owner)
+        assert changed_cuts
+        for selected, result, reads, adopted in changed_cuts:
+            assert result.runtime.source.selected is selected
+            assert reads == [("source", selected)]
+            assert len(adopted) == 1 and adopted[0][0] is selected
+            assert adopted[0][1] is result.runtime.source
+        assert len(sdk) == 1
+
+
+@pytest.mark.asyncio
+async def test_stop_competing_with_changed_cut_source_requires_fresh_refusal(operation_store, tmp_path, monkeypatch):
+    import asyncio
+    import threading
+
+    from elspeth.web.composer import continuation_live_phases as phases
+    from elspeth.web.sessions import continuation_runtime as source_reader
+    from elspeth.web.sessions.models import composer_async_operations_table as operations
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
+        actual_phase = phases.ContinuationLivePhases._current_phase_read
+        actual_inputs = source_reader._read_current_inputs
+        read_entered = threading.Event()
+        release_read = threading.Event()
+        stop_entered = threading.Event()
+        held = []
+        target = []
+
+        async def phase(self, selected):
+            prior = self.runtime.source.selected if self.runtime is not None else None
+            if prior is not None and prior != selected and not held:
+                target.append(selected)
+            try:
+                return await actual_phase(self, selected)
+            finally:
+                target.clear()
+
+        def inputs(conn, *, selected, inventory):
+            if target and selected is target[0] and not held:
+                held.append(selected)
+                read_entered.set()
+                assert release_read.wait(timeout=10), "changed-cut current read did not receive test release"
+            return actual_inputs(conn, selected=selected, inventory=inventory)
+
+        def cancel():
+            stop_entered.set()
+            return owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+
+        monkeypatch.setattr(phases.ContinuationLivePhases, "_current_phase_read", phase)
+        monkeypatch.setattr(source_reader, "_read_current_inputs", inputs)
+        advance = asyncio.create_task(_advance(owner))
+        stop = None
+        try:
+            assert await asyncio.to_thread(read_entered.wait, 10)
+            stop = asyncio.create_task(asyncio.to_thread(cancel))
+            assert await asyncio.to_thread(stop_entered.wait, 10)
+        finally:
+            release_read.set()
+        if stop is not None:
+            cancelled = await stop
+            assert cancelled is not None and cancelled.cancel_requested_at is not None
+        with suppress(ComposerOperationCancelledDuringTurn):
+            await advance
+        with operation_store[0].connect() as conn:
+            durable = conn.execute(
+                select(operations.c.cancel_requested_at).where(
+                    operations.c.session_id == str(running.claim.session_id), operations.c.operation_id == running.claim.operation_id
+                )
+            ).scalar_one()
+        assert durable is not None and len(sdk) == 1 and held
+        current = owner.runtime
+        assert current is not None
+        with pytest.raises(ComposerOperationCancelledDuringTurn):
+            owner.authority.read_continuation_runtime(
+                running, selected=current.source.selected, inventory=current.materialization.inventory
+            )
+
+
+@pytest.mark.asyncio
 async def test_actual_result_source_and_graph_successors_preserve_original_live_owners(operation_store, tmp_path, monkeypatch):
     from elspeth.web.composer import continuation_message_families as families
     from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidence
@@ -731,7 +850,7 @@ async def test_actual_phase_batch_context_preserves_normal_and_owed_read_owners(
         monkeypatch.setattr(type(owner.authority), "read_continuation_runtime", normal)
         monkeypatch.setattr(ContinuationFinishRead, "read_runtime", owed)
         context = await build_runtime_tool_batch_context(runtime, cancellation_requested=owner.cancellation_requested, phase_read=phase)
-        assert reads == [("owed" if stop else "normal", running, selected, phase.inventory)] * 2
+        assert reads == [("owed" if stop else "normal", running, selected, phase.inventory)] * (2 if stop else 1)
         assert all(row[1] is running and row[2] is selected and row[3] is phase.inventory for row in reads)
         assert context.recorder is runtime.live.recorder and context.message_producers is runtime.materialization
         assert context.turn_evidence is runtime.live.turn_evidence and context.provider_owner is runtime.bindings.provider_owner
@@ -844,28 +963,36 @@ async def test_actual_phase_batch_context_refuses_foreign_or_unearned_finish_rea
 
 
 @pytest.mark.asyncio
-async def test_actual_phase_batch_context_rechecks_cut_after_preferences(operation_store, tmp_path, monkeypatch):
+@pytest.mark.parametrize("stop", (False, True))
+async def test_actual_phase_batch_context_rechecks_cut_after_preferences(operation_store, tmp_path, monkeypatch, stop):
     from elspeth.web.composer.continuation_runtime import build_runtime_tool_batch_context
     from elspeth.web.sessions.continuation import ContinuationCASConflict, ContinuationEvent, append_complete_snapshot
 
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
-        owner.observe_stop()
+        if stop:
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
+            owner.observe_stop()
         phase = await owner._current_phase_read(owner.runtime.source.selected)
-        assert type(phase.finish_read) is ContinuationFinishRead
+        assert (type(phase.finish_read) is ContinuationFinishRead) is stop
         reads, advanced = [], []
-        actual_read = ContinuationFinishRead.read_runtime
+        actual_owed_read = ContinuationFinishRead.read_runtime
+        actual_normal_read = type(owner.authority).read_continuation_runtime
         sessions = owner.service._require_sessions_service()
         actual_preferences = type(sessions).get_composer_preferences
 
-        def read(self, authority):
+        def owed_read(self, authority):
             assert self is phase.finish_read
             reads.append(self)
-            return actual_read(self, authority)
+            return actual_owed_read(self, authority)
+
+        def normal_read(self, current, **kwargs):
+            assert self is owner.authority and current is running and kwargs["selected"] is phase.selected
+            reads.append(self)
+            return actual_normal_read(self, current, **kwargs)
 
         async def preferences(self, session_id):
-            assert self is sessions and len(reads) == 1
+            assert self is sessions and len(reads) == (1 if stop else 0)
             result = await actual_preferences(self, session_id)
             with operation_store[0].begin() as conn:
                 current = append_complete_snapshot(
@@ -882,11 +1009,17 @@ async def test_actual_phase_batch_context_rechecks_cut_after_preferences(operati
             advanced.append(stored_rows(operation_store[0]))
             return result
 
-        monkeypatch.setattr(ContinuationFinishRead, "read_runtime", read)
+        monkeypatch.setattr(ContinuationFinishRead, "read_runtime", owed_read)
+        monkeypatch.setattr(type(owner.authority), "read_continuation_runtime", normal_read)
         monkeypatch.setattr(type(sessions), "get_composer_preferences", preferences)
-        with pytest.raises(ContinuationCASConflict):
+        refusal = (
+            pytest.raises(ContinuationCASConflict)
+            if stop
+            else pytest.raises(AuditIntegrityError, match=r"^runtime prefix changed its actual current selected source$")
+        )
+        with refusal:
             await build_runtime_tool_batch_context(phase.runtime, cancellation_requested=owner.cancellation_requested, phase_read=phase)
-        assert len(reads) == 2 and len(advanced) == 1
+        assert len(reads) == (2 if stop else 1) and len(advanced) == 1
         assert stored_rows(operation_store[0]) == advanced[0] and len(sdk) == 1 and owner.p4 is None
 
 
@@ -1103,7 +1236,7 @@ async def test_driver_action_ready_re_read_of_the_same_cut_reaches_the_primary(o
             return ModelResponse(
                 model="test/model",
                 choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "Explained.", "tool_calls": None}}],
-                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
             )
 
         monkeypatch.setattr(litellm, "acompletion", completion)

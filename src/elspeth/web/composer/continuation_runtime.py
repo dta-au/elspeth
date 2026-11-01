@@ -50,6 +50,7 @@ from elspeth.web.composer.continuation_selection import SelectedContinuationStat
 from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.composer.provider_quota import ProviderInvocationOwner
 from elspeth.web.composer.tool_batch import ToolBatchContext, ToolBatchCustody, ToolBatchProvenance
+from elspeth.web.continuation_retention_memo import RetentionStageMemo, retention_stage_memo_scope
 from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.required_sql_outcomes import RequiredSQLRaised, RequiredSQLReturned
@@ -185,7 +186,33 @@ def _restore_live(
     progress: ComposerProgressSink | None,
     finish_read: ContinuationFinishRead | None = None,
 ) -> RestoredContinuationRuntime:
+    from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3
+    from elspeth.web.composer.provider_cost import CommonProviderCostBudget, continuation_common_cost_policy
     from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
+
+    cost_source = source.cost_snapshot
+    if cost_source is None:
+        if provider_owner.cost_budget is not None:
+            raise AuditIntegrityError("legacy runtime gained a current cost owner")
+    else:
+        if type(source.policy) is ContinuationAdmissionPolicyV2:
+            cost_policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 = source.policy
+        elif type(source.policy) is ContinuationAdmissionPolicyV3:
+            cost_policy = source.policy
+        else:
+            raise AuditIntegrityError("runtime cost source lacks admitted v2 policy")
+        cost_source_owner = CommonProviderCostBudget(cost_source)
+        cost_source_owner.validate_binding(
+            session_id=selected.stack.logical.session_id,
+            request_id=selected.stack.logical.original_user_message_id,
+            lifecycle_version=2,
+        )
+        if cost_source.applicability != "continuation_v2" or cost_source.policy != continuation_common_cost_policy(cost_policy):
+            raise AuditIntegrityError("runtime cost source changed immutable admitted limits")
+        if provider_owner.cost_budget is None:
+            provider_owner.bind_cost_budget(cost_source_owner)
+        elif provider_owner.cost_budget.snapshot() != cost_source:
+            raise AuditIntegrityError("warm Continuation cost owner differs from complete durable accounting")
 
     _index, frame = _compose(selected)
     names = inventory.names
@@ -445,7 +472,10 @@ async def build_runtime_tool_batch_context(
         return source
 
     sessions = service._require_sessions_service()
-    await _registered_read(work, ContinuationRuntimeSource, read_source)
+    if phase_read is None or finish_read is not None:
+        # A normal phase cohort has just proved this selected source. Owed
+        # finish reads retain their two explicit source checks across Stop.
+        await _registered_read(work, ContinuationRuntimeSource, read_source)
     sid = UUID(runtime.source.selected.stack.logical.session_id)
     preferences = await sessions.get_composer_preferences(sid)
     await _registered_read(work, ContinuationRuntimeSource, read_source)
@@ -790,16 +820,16 @@ async def capture_continuation_runtime_owners(
     authority = runtime.materialization.authority
     running = _work_owners(authority, inventory, work)
 
-    def capture() -> CapturedContinuationRuntime:
+    def capture_scoped(memo: RetentionStageMemo) -> CapturedContinuationRuntime:
         from elspeth.web.composer.continuation_evidence import state_from_evidence_json
         from elspeth.web.composer.protocol import ComposerContextUnsupported
 
-        source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+        source = authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
         try:
             captured = _capture_owners(runtime, source=source, inventory=inventory)
         except ComposerContextUnsupported as refused:
             try:
-                authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+                authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
             except BaseException as failure:
                 raise BaseExceptionGroup("Retention refusal and final current-source admission", [refused, failure]) from None
             # Carry only work the actual recorder has not drained. Prior
@@ -812,8 +842,14 @@ async def capture_continuation_runtime_owners(
                 llm_calls=live.recorder.llm_calls[runtime.drained.llm_calls :],
                 failed_turn=live.failed_turn,
             ) from refused
-        authority.read_continuation_runtime(running, selected=selected, inventory=inventory)
+        authority.read_continuation_runtime(running, selected=selected, inventory=inventory, retention_memo=memo)
         return captured
+
+    def capture() -> CapturedContinuationRuntime:
+        # One actual physical invocation owns this pure cache. Each facade
+        # call still opens and proves its own current SQL DATA transaction.
+        with retention_stage_memo_scope() as memo:
+            return capture_scoped(memo)
 
     result = await _registered_read(work, CapturedContinuationRuntime, capture)
     if type(result) is not CapturedContinuationRuntime:

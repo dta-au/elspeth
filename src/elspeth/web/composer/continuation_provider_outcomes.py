@@ -18,6 +18,8 @@ def encode_physical_audit_call(call: ComposerLLMCall) -> str:
     if type(call) is not ComposerLLMCall:
         raise TypeError("physical audit retention requires its complete actual nominal record")
     projected = _PHYSICAL_AUDIT.dump_python(call, mode="json", warnings="error", fallback=owned_json)
+    if projected["cost_response_accountable"] is None:
+        del projected["cost_response_accountable"]
     return canonical_json(owned_json(projected))
 
 

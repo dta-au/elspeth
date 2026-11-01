@@ -12,8 +12,10 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, final
 
 from sqlalchemy import Engine, event
 from sqlalchemy.engine import Connection
@@ -24,23 +26,118 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
 from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
 
-_CONTINUATION_SQL_DEADLINE: ContextVar[tuple[ContinuationSQLDeadlineOwner, bool] | None] = ContextVar(
+if TYPE_CHECKING:
+    from elspeth.web.required_work import RequiredWorkTicket
+
+
+class _ContinuationSQLDeadlineMode(Enum):
+    PAID_SETTLEMENT = "paid_settlement"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class ContinuationPaidSettlementScope:
+    """One actual paid SQL ticket selects only its original retained reserve."""
+
+    ticket: RequiredWorkTicket
+    owner: ContinuationSQLDeadlineOwner
+
+    def __post_init__(self) -> None:
+        from elspeth.web.required_work import RequiredWorkSource, RequiredWorkTicket
+
+        if (
+            type(self.ticket) is not RequiredWorkTicket
+            or type(self.owner) is not ContinuationSQLDeadlineOwner
+            or self.ticket.sql_deadline_owner is not self.owner
+            or self.ticket.key.source is not RequiredWorkSource.PROVIDER_SETTLEMENT_SQL
+        ):
+            raise AuditIntegrityError("paid SQL reserve requires the actual provider settlement ticket")
+        self.owner.validate_context(
+            self.ticket.key.authority.context,
+            operation_id=self.ticket.key.authority.durable_operation_id,
+            attempt=self.ticket.key.authority.claim_attempt,
+        )
+
+
+_CONTINUATION_SQL_DEADLINE: ContextVar[tuple[ContinuationSQLDeadlineOwner, bool | _ContinuationSQLDeadlineMode] | None] = ContextVar(
     "continuation_sql_deadline", default=None
 )
+_CONTINUATION_METADATA_ENGINE: ContextVar[Engine | None] = ContextVar("continuation_metadata_engine", default=None)
 
 
 @contextlib.contextmanager
-def continuation_sql_deadline_scope(owner: ContinuationSQLDeadlineOwner, *, lifecycle: bool = False) -> Iterator[None]:
+def continuation_sql_deadline_scope(
+    owner: ContinuationSQLDeadlineOwner,
+    *,
+    lifecycle: bool = False,
+    paid_settlement: ContinuationPaidSettlementScope | None = None,
+) -> Iterator[None]:
     if type(owner) is not ContinuationSQLDeadlineOwner:
         raise AuditIntegrityError("physical SQL deadline scope requires its actual V2 owner")
+    if type(lifecycle) is not bool or (
+        paid_settlement is not None
+        and (
+            lifecycle
+            or type(paid_settlement) is not ContinuationPaidSettlementScope
+            or paid_settlement.owner is not owner
+            or paid_settlement.ticket.complete
+        )
+    ):
+        raise AuditIntegrityError("physical SQL deadline scope changed its exact timing mode")
+    mode = _ContinuationSQLDeadlineMode.PAID_SETTLEMENT if paid_settlement is not None else lifecycle
     previous = _CONTINUATION_SQL_DEADLINE.get()
-    if previous is not None and previous != (owner, lifecycle):
+    if previous is not None and previous != (owner, mode):
         raise AuditIntegrityError("physical SQL cannot replace another operation's deadline")
-    token = _CONTINUATION_SQL_DEADLINE.set((owner, lifecycle))
+    token = _CONTINUATION_SQL_DEADLINE.set((owner, mode))
     try:
         yield
     finally:
         _CONTINUATION_SQL_DEADLINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_metadata_source_scope(engine: Engine) -> Iterator[None]:
+    """Bind related metadata to this physical callback's actual session store."""
+    if _CONTINUATION_SQL_DEADLINE.get() is None:
+        raise AuditIntegrityError("Continuation metadata requires its actual physical SQL timing owner")
+    previous = _CONTINUATION_METADATA_ENGINE.get()
+    if previous is not None and previous is not engine:
+        raise AuditIntegrityError("Continuation metadata cannot replace its actual session store")
+    token = _CONTINUATION_METADATA_ENGINE.set(engine)
+    try:
+        yield
+    finally:
+        _CONTINUATION_METADATA_ENGINE.reset(token)
+
+
+@contextlib.contextmanager
+def continuation_metadata_connection_deadline_scope(conn: Connection) -> Iterator[None]:
+    """Install the existing clock on a metadata connection before its SELECT.
+
+    This does not bound engine checkout or transport setup. It grants no
+    authority and does not change the original action/settlement/drain clock.
+    """
+    current = _CONTINUATION_SQL_DEADLINE.get()
+    if current is None:
+        yield
+        return
+    expected_engine = _CONTINUATION_METADATA_ENGINE.get()
+    if expected_engine is not None and conn.engine is not expected_engine:
+        raise AuditIntegrityError("Continuation metadata connection belongs to another session store")
+    owner, mode = current
+    session_id = owner.running.session_operation_context.fence.session_id
+    owner.remaining_statement(
+        session_id=session_id,
+        lifecycle=mode is True,
+        paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+    )
+    with continuation_connection_deadline_scope(conn, session_id):
+        yield
+    owner.remaining_statement(
+        session_id=session_id,
+        lifecycle=mode is True,
+        paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+    )
 
 
 _fcntl: Any
@@ -325,7 +422,7 @@ def continuation_connection_deadline_scope(
 ) -> Iterator[None]:
     """Install one canonical PG bound before the caller's first SQL/lock."""
     current = _CONTINUATION_SQL_DEADLINE.get()
-    owner, lifecycle = current if current is not None else (None, False)
+    owner, mode = current if current is not None else (None, False)
     if conn.dialect.name != "postgresql" or (deadline is None and owner is None):
         yield
         return
@@ -339,7 +436,12 @@ def continuation_connection_deadline_scope(
         executemany: bool,
     ) -> None:
         if owner is not None:
-            remaining = owner.remaining_statement(session_id=session_id, deadline=deadline, lifecycle=lifecycle)
+            remaining = owner.remaining_statement(
+                session_id=session_id,
+                deadline=deadline,
+                lifecycle=mode is True,
+                paid_settlement=mode is _ContinuationSQLDeadlineMode.PAID_SETTLEMENT,
+            )
         elif deadline is not None:
             remaining = deadline.remaining_seconds(now=time.monotonic())
         else:

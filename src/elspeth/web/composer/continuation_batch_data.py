@@ -86,7 +86,12 @@ from elspeth.web.execution.schemas import (
 )
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.continuation_application_graph import ApplicationGraph, ApplicationRecorderSource
+    from elspeth.web.composer.continuation_application_graph import (
+        ApplicationGraph,
+        ApplicationRecorderSource,
+        _ValidatedRecorderSource,
+        _ValidatedSelectedRecorder,
+    )
 
 _MAX_NODES = 100_000
 _MAX_DEPTH = 128
@@ -946,13 +951,18 @@ def _encode(
     memory_completion: bool = False,
     application: ApplicationGraph | None = None,
     recorder_source: ApplicationRecorderSource | None = None,
+    checked_source: _ValidatedRecorderSource | None = None,
 ) -> str:
+    selected_recorder = None
     if application is not None:
-        from elspeth.web.composer.continuation_application_graph import application_result_tools
+        from elspeth.web.composer.continuation_application_graph import _ValidatedSelectedRecorder, application_result_tools
 
         if prepared is not None or memory_completion or application.selected is not data:
             _fail("application graph mixed another cut or selected root")
-        result_tools = application_result_tools(application, env_ref_names, recorder_source=recorder_source)
+        selected_recorder = _ValidatedSelectedRecorder.capture(application, recorder_source)
+        result_tools = application_result_tools(
+            application, env_ref_names, recorder_source=recorder_source, selected_recorder=selected_recorder
+        )
         if application.selected_audit is not None and application.selected_dialect is not None:
             prepared = (application.selected_audit, application.selected_dialect)
     else:
@@ -965,6 +975,8 @@ def _encode(
         memory_completion=memory_completion,
         application=application,
         recorder_source=recorder_source,
+        checked_source=checked_source,
+        selected_recorder=selected_recorder,
     )
 
 
@@ -977,6 +989,8 @@ def _encode_values(
     memory_completion: bool = False,
     application: ApplicationGraph | None = None,
     recorder_source: ApplicationRecorderSource | None = None,
+    checked_source: _ValidatedRecorderSource | None = None,
+    selected_recorder: _ValidatedSelectedRecorder | None = None,
 ) -> str:
     """Directional wire emission inside an already checked constructor call.
 
@@ -990,16 +1004,24 @@ def _encode_values(
     if application is not None:
         from elspeth.web.composer.continuation_application_graph import (
             ProspectiveApplicationRecorderSource,
+            _ValidatedSelectedRecorder,
             application_recorder_slots,
             require_application_recorder_source,
         )
 
         if recorder_source is None:
             _fail("application graph lost its explicit original recorder source")
-        require_application_recorder_source(recorder_source, env_ref_names)
+        if checked_source is None:
+            require_application_recorder_source(recorder_source, env_ref_names)
+        else:
+            checked_source.require_bound(recorder_source, env_ref_names)
+        if selected_recorder is None:
+            selected_recorder = _ValidatedSelectedRecorder.capture(application, recorder_source)
+        else:
+            selected_recorder.require_bound(application, recorder_source)
         prospective = type(recorder_source) is ProspectiveApplicationRecorderSource
-        recorder_slots = application_recorder_slots(application, recorder_source)
-    elif recorder_source is not None:
+        recorder_slots = application_recorder_slots(application, recorder_source, selected_recorder=selected_recorder)
+    elif recorder_source is not None or checked_source is not None or selected_recorder is not None:
         _fail("standalone batch cannot acquire an application recorder source")
     identities: dict[int, int] = {}
     active: set[int] = set()
@@ -1028,7 +1050,9 @@ def _encode_values(
         if application is not None:
             from elspeth.web.composer.continuation_application_graph import application_members
 
-            extra_members = application_members(value, recorder_slots=recorder_slots, recorder_source=recorder_source)
+            extra_members = application_members(
+                value, recorder_slots=recorder_slots, recorder_source=recorder_source, selected_recorder=selected_recorder
+            )
         elif type(value) is ComposerToolInvocation:
             # Only the new closed refusal edge reaches an invocation in a
             # standalone batch. Reuse its exact codec/private-authoring links;
@@ -1155,8 +1179,12 @@ def _decode_graph_values(
     memory_completion: bool = False,
     application: bool = False,
     recorder_source: ApplicationRecorderSource | None = None,
+    checked_source: _ValidatedRecorderSource | None = None,
+    selected_recorder_out: list[_ValidatedSelectedRecorder] | None = None,
 ) -> tuple[RestoredBatchData | RestoredPreparedBatchData | RestoredMemoryCompletionBatchData | ApplicationGraph, dict[int, str]]:
     prospective = False
+    if not application and (checked_source is not None or selected_recorder_out is not None):
+        _fail("standalone batch cannot acquire an application recorder check")
     if application:
         from elspeth.web.composer.continuation_application_graph import (
             ProspectiveApplicationRecorderSource,
@@ -1165,7 +1193,10 @@ def _decode_graph_values(
 
         if recorder_source is None:
             _fail("application graph lost its explicit original recorder source")
-        require_application_recorder_source(recorder_source, env_ref_names)
+        if checked_source is None:
+            require_application_recorder_source(recorder_source, env_ref_names)
+        else:
+            checked_source.require_bound(recorder_source, env_ref_names)
         prospective = type(recorder_source) is ProspectiveApplicationRecorderSource
     if type(encoded) is not str or (not prospective and len(encoded.encode("utf-8")) > JSON_MAX_TOTAL_UTF8_BYTES):
         _fail("coupled batch data exceeds its complete byte bound")
@@ -1331,6 +1362,7 @@ def _decode_graph_values(
         if application:
             from elspeth.web.composer.continuation_application_graph import (
                 ApplicationGraph,
+                _ValidatedSelectedRecorder,
                 application_recorder_slots,
                 application_result_tools,
             )
@@ -1342,12 +1374,17 @@ def _decode_graph_values(
                 application_value = ApplicationGraph(data, effects, recorder, cuts, audit_values[0], dialect)
             else:
                 application_value = ApplicationGraph(data, effects, recorder, cuts)
-            result_tools = application_result_tools(application_value, env_ref_names, recorder_source=recorder_source)
+            selected_recorder = _ValidatedSelectedRecorder.capture(application_value, recorder_source)
+            result_tools = application_result_tools(
+                application_value, env_ref_names, recorder_source=recorder_source, selected_recorder=selected_recorder
+            )
             if recorder_source is None:
                 _fail("application graph lost its original recorder source")
-            actual_slots = application_recorder_slots(application_value, recorder_source)
+            actual_slots = application_recorder_slots(application_value, recorder_source, selected_recorder=selected_recorder)
             if any(actual_slots.get(id(restored[index])) != slot for slot, index in claimed_llm_slots.items()):
                 _fail("application LLM changed its canonical first recorder identity slot")
+            if selected_recorder_out is not None:
+                selected_recorder_out.append(selected_recorder)
         elif prepared:
             if len(audit_values) != 1 or dialect is None:
                 _fail("prepared batch lost its one exact audit/dialect owner")

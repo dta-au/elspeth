@@ -64,6 +64,7 @@ from elspeth.web.composer.continuation_message_family_builders import (
 )
 from elspeth.web.composer.continuation_message_family_recipes import (
     AttachmentResultMessageRecipe,
+    ControlResultMessageRecipe,
     FailureSchemaMessageRecipe,
     NativeThinkingMessageRecipe,
     ToolCallArgumentsMessageRecipe,
@@ -97,6 +98,7 @@ from elspeth.web.sessions.transcript_reads import non_private_message_predicate,
 if TYPE_CHECKING:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
+    from elspeth.web.composer.continuation_control_transitions import ControlResultToolMessage
     from elspeth.web.composer.continuation_evidence import TurnEvidenceSnapshot
     from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
     from elspeth.web.composer.continuation_message_shelf import MessageShelfSnapshot
@@ -105,6 +107,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.tool_batch import ContinuationBatchState, ContinuationCallState
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.sessions.continuation_composition_initialization import CurrentCompositionInitializationSource
+    from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
 
 _NATIVE_KEYS = frozenset({"thinking_blocks", "reasoning_content", "reasoning_details"})
 
@@ -468,13 +471,7 @@ class CurrentContinuationMessageProducers:
                 )
             )
 
-    def advance_current(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
-        """Rebind one live producer after its real same-owner SQL transition.
-
-        Fresh source admission precedes installation. Existing SDK message and
-        schema objects stay owned here; this read never dispatches or restores
-        replacements for those objects, and cannot cross a physical adoption.
-        """
+    def _require_advance_selection(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
         if (
             type(selected) is not SelectedContinuationState
             or type(self.selected) is not SelectedContinuationState
@@ -495,6 +492,57 @@ class CurrentContinuationMessageProducers:
             or after.provider_cost_policy != before.provider_cost_policy
         ):
             raise AuditIntegrityError("live message advance changed its request, retained policy or predecessor order")
+
+    def _install_advanced_inputs(
+        self,
+        selected: SelectedContinuationState,
+        inventory: CurrentContinuationEnvInventory,
+        actual: _CurrentProducerInputs,
+        finish_read: ContinuationFinishRead | None,
+    ) -> None:
+        if (
+            actual.bootstrap != self.inputs.bootstrap
+            or actual.bootstrap.actor_user_id != self.inputs.bootstrap.actor_user_id
+            or actual.producer_inputs != capture_continuation_producer_inputs(tuple(self._schema_inputs), env_ref_names=inventory.names)
+        ):
+            raise AuditIntegrityError("live message advance changed its original actor or actual schema history")
+        # No callbacks, allocation of SDK objects or await between these writes.
+        # A failed SQL read/transaction leaves every old binding intact.
+        self.selected, self.inventory, self.inputs, self.finish_read = selected, inventory, actual, finish_read
+
+    def advance_current_from_source(
+        self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory, source: ContinuationRuntimeSource
+    ) -> None:
+        """Adopt the producer inputs from this cut's complete locked SQL source."""
+        from elspeth.web.composer.continuation_message_shelf import encode_message_shelf
+        from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
+
+        self._require_advance_selection(selected, inventory)
+        if (
+            type(source) is not ContinuationRuntimeSource
+            or source.selected is not selected
+            or self.finish_read is not None
+            or source.evidence_env_ref_names != inventory.names
+            or source.original != bootstrap_values(source.bootstrap)
+        ):
+            raise AuditIntegrityError("live message advance lost its exact current SQL source")
+        actual = _CurrentProducerInputs(
+            source.bootstrap,
+            source.original,
+            source.iteration.producer_inputs,
+            encode_message_shelf(source.evidence.transcript).canonical,
+            source.admitted_evidence,
+        )
+        self._install_advanced_inputs(selected, inventory, actual, None)
+
+    def advance_current(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
+        """Rebind one live producer after its real same-owner SQL transition.
+
+        Fresh source admission precedes installation. Existing SDK message and
+        schema objects stay owned here; this read never dispatches or restores
+        replacements for those objects, and cannot cross a physical adoption.
+        """
+        self._require_advance_selection(selected, inventory)
         from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
 
         finish_read = None if self.finish_read is None else ContinuationFinishRead(inventory.running, selected, inventory)
@@ -510,15 +558,7 @@ class CurrentContinuationMessageProducers:
                     raise
                 finish_read = ContinuationFinishRead(inventory.running, selected, inventory)
                 actual = _read_current_inputs(conn, selected=selected, inventory=inventory, finish_read=finish_read)
-            if (
-                actual.bootstrap != self.inputs.bootstrap
-                or actual.bootstrap.actor_user_id != self.inputs.bootstrap.actor_user_id
-                or actual.producer_inputs != capture_continuation_producer_inputs(tuple(self._schema_inputs), env_ref_names=inventory.names)
-            ):
-                raise AuditIntegrityError("live message advance changed its original actor or actual schema history")
-        # No callbacks, allocation of SDK objects or await between these writes.
-        # A failed SQL read/transaction leaves every old binding intact.
-        self.selected, self.inventory, self.inputs, self.finish_read = selected, inventory, actual, finish_read
+        self._install_advanced_inputs(selected, inventory, actual, finish_read)
 
     def adopt_equal_cut(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
         """Rebind the same SQL cut re-read as fresh, value-equal objects.
@@ -547,20 +587,26 @@ class CurrentContinuationMessageProducers:
     def _require_current(self) -> _CurrentProducerInputs:
         if type(self.inputs) is not _CurrentProducerInputs:
             raise AuditIntegrityError("ready message producer has no existing Compose/family source")
+        with locked_session_transaction(self.authority._engine, str(self.inventory.running.claim.session_id)) as conn:
+            return self._require_current_on_connection(conn)
+
+    def _require_current_on_connection(self, conn: Connection) -> _CurrentProducerInputs:
+        """Reprove the existing selected producer inside the caller's session lock."""
+        if type(self.inputs) is not _CurrentProducerInputs:
+            raise AuditIntegrityError("ready message producer has no existing Compose/family source")
         from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
         from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn
 
         finish_read = self.finish_read
-        with locked_session_transaction(self.authority._engine, str(self.inventory.running.claim.session_id)) as conn:
-            try:
-                actual = _read_current_inputs(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
-            except ComposerOperationCancelledDuringTurn:
-                if type(self.selected.stack.frames[-1]) is not ToolBatchFrame:
-                    # No issued/completed tool work is owed at this cut; the
-                    # durable Stop itself is the outcome, not an owed read.
-                    raise
-                finish_read = ContinuationFinishRead(self.inventory.running, self.selected, self.inventory)
-                actual = _read_current_inputs(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
+        try:
+            actual = _read_current_inputs(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
+        except ComposerOperationCancelledDuringTurn:
+            if type(self.selected.stack.frames[-1]) is not ToolBatchFrame:
+                # No issued/completed tool work is owed at this cut; the
+                # durable Stop itself is the outcome, not an owed read.
+                raise
+            finish_read = ContinuationFinishRead(self.inventory.running, self.selected, self.inventory)
+            actual = _read_current_inputs(conn, selected=self.selected, inventory=self.inventory, finish_read=finish_read)
         if (
             actual.bootstrap != self.inputs.bootstrap
             or actual.producer_inputs != self.inputs.producer_inputs
@@ -687,6 +733,19 @@ class CurrentContinuationMessageProducers:
         index = len(self._schema_inputs)
         self._schema_inputs.append((call, admitted.result.updated_state))
         return self._register(message, PluginSchemaMessageRecipe(input_index=index))
+
+    def control_result_message(self, *, recipe: ControlResultMessageRecipe) -> ControlResultToolMessage:
+        """Register only the actual paid control's independently re-proved result."""
+        from elspeth.web.composer.continuation_control_transitions import control_result_message_on_connection
+
+        self._require_compose_family()
+        if type(recipe) is not ControlResultMessageRecipe:
+            raise TypeError("control producer requires its closed original source recipe")
+        with locked_session_transaction(self.authority._engine, str(self.inventory.running.claim.session_id)) as conn:
+            _read_current_inputs(conn, selected=self.selected, inventory=self.inventory)
+            message = control_result_message_on_connection(conn, self.inventory.running, selected=self.selected, recipe=recipe)
+        self._register(message, recipe)
+        return message
 
     def snapshot_inputs(self) -> ContinuationProducerInputs:
         return capture_continuation_producer_inputs(tuple(self._schema_inputs), env_ref_names=self.inventory.names)
@@ -1178,7 +1237,8 @@ class CurrentContinuationMessageProducers:
                 | FailureSchemaMessageRecipe
                 | AttachmentResultMessageRecipe
                 | ToolResultMessageRecipe
-                | ToolFeedbackMessageRecipe,
+                | ToolFeedbackMessageRecipe
+                | ControlResultMessageRecipe,
                 str,
             ]
         ] = []
@@ -1190,6 +1250,7 @@ class CurrentContinuationMessageProducers:
                 or type(recipe) is AttachmentResultMessageRecipe
                 or type(recipe) is ToolResultMessageRecipe
                 or type(recipe) is ToolFeedbackMessageRecipe
+                or type(recipe) is ControlResultMessageRecipe
             ):
                 family_positions.append(index)
                 family_requests.append((recipe, text))
@@ -1229,6 +1290,7 @@ class CurrentContinuationMessageProducers:
                 or type(recipe) is FailureSchemaMessageRecipe
                 or type(recipe) is ToolResultMessageRecipe
                 or type(recipe) is ToolFeedbackMessageRecipe
+                or type(recipe) is ControlResultMessageRecipe
             ):
                 current = by_position[index]
             else:

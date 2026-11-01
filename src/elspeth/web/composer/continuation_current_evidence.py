@@ -16,6 +16,7 @@ from elspeth.web.composer.continuation_evidence_graph import RestoredTurnEvidenc
 from elspeth.web.composer.continuation_evidence_restore import _require_current_reader_service
 from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce, RequiredSQLRaised, RequiredSQLReturned
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkBinding, RequiredWorkSource, RequiredWorkTicket
 from elspeth.web.sessions.composer_operations import ComposerOperationRunning
@@ -55,24 +56,25 @@ def _restore_current_message_evidence(
     )
     # Use this actual just-validated complete read, not the owner's older input
     # DATA. Reconstruction remains bracketed by an independent fresh final read.
-    admitted = materialization._require_current().admitted_evidence
-    snapshot = admitted.snapshot
-    reader = None
-    if snapshot.requires_blob_reader:
-        from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
+    with retention_stage_memo_scope():
+        admitted = materialization._require_current().admitted_evidence
+        snapshot = admitted.snapshot
+        reader = None
+        if snapshot.requires_blob_reader:
+            from elspeth.web.composer.transcript_blob_reader import CurrentTranscriptBlobReader
 
-        reader = CurrentTranscriptBlobReader.from_service(
-            service, session_id=str(running.claim.session_id), context=running.session_operation_context
+            reader = CurrentTranscriptBlobReader.from_service(
+                service, session_id=str(running.claim.session_id), context=running.session_operation_context
+            )
+        restored = _restore_current_evidence(
+            admitted,
+            context=running.session_operation_context,
+            reader=reader,
+            env_ref_names=inventory.names,
+            materialization=materialization,
         )
-    restored = _restore_current_evidence(
-        admitted,
-        context=running.session_operation_context,
-        reader=reader,
-        env_ref_names=inventory.names,
-        materialization=materialization,
-    )
-    materialization._require_current()
-    return restored
+        materialization._require_current()
+        return restored
 
 
 async def restore_current_turn_evidence(

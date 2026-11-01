@@ -65,10 +65,16 @@ def owned(tmp_path):
         engine.dispose()
 
 
-def _budget(owned, *, calls=75, request_bytes=2097152, completion=16384, cost="5.00", applicable=True):
+def _budget(owned, *, calls=75, request_bytes=2097152, completion=16384, cost="5.00", applicable=True, lifecycle=1):
     policy = CommonProviderCostPolicy(calls, request_bytes, completion, Decimal(cost), 2) if applicable else None
     return CommonProviderCostBudget(
-        CommonProviderCostSnapshot(owned[2].fence.session_id, "request", 1, "legacy_empty_v1" if applicable else "not_applicable", policy)
+        CommonProviderCostSnapshot(
+            owned[2].fence.session_id,
+            "request",
+            lifecycle,
+            ("legacy_empty_v1" if lifecycle == 1 else "continuation_v2") if applicable else "not_applicable",
+            policy,
+        )
     )
 
 
@@ -549,7 +555,10 @@ async def test_protocol_deferred_cancellation_charges_only_after_real_sql_then_p
 
 
 @pytest.mark.asyncio
-async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_metadata_accountability(owned, tmp_path, monkeypatch):
+@pytest.mark.parametrize("lifecycle", (1, 2))
+async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_metadata_accountability(
+    owned, tmp_path, monkeypatch, lifecycle
+):
     from litellm import ModelResponse
 
     from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
@@ -557,7 +566,7 @@ async def test_actual_gateway_caller_has_shared_physical_limit_and_admitted_meta
     from tests.unit.web.composer.test_llm_sampling_config import _settings
 
     engine, _, _, coordinator, owner = owned
-    budget = _budget(owned, calls=1, completion=31)
+    budget = _budget(owned, calls=1, completion=31, lifecycle=lifecycle)
     owner.bind_cost_budget(budget)
     settings = _settings(tmp_path, composer_prompt_guard_mode="debug-when-unconfigured")
     gateway = ProviderGateway(model=MODEL, settings=settings, endpoint_base_url=None, endpoint_api_key=None)

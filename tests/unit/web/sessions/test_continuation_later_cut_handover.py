@@ -10,6 +10,7 @@ import asyncio
 from uuid import uuid4
 
 import pytest
+from litellm import ModelResponse
 from sqlalchemy import select
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -45,12 +46,23 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
         ),
     )
     sdk = ScriptedSDK([*(() if cut == "end-review" else repair_prefix), ("primary", (words, None)), ("end", end_admit())])
-    install_sdk(monkeypatch, sdk)
+
+    async def priced_sdk(**kwargs):
+        reply = await sdk(**kwargs)
+        assert isinstance(reply, ModelResponse) and reply.usage is not None
+        # Both synthetic roles report finite SDK cost; they have no public
+        # price catalogue. Keep real cost admission and accounting intact.
+        reply.usage = reply.usage.model_copy(update={"cost": 0.01})
+        return reply
+
+    install_sdk(monkeypatch, priced_sdk)
     operation_id = str(uuid4())
     selected_before: list[SelectedContinuationState] = []
     selected_after: list[SelectedContinuationState] = []
     resumed_cold: list[bool] = []
     old_claims = []
+    old_phases = []
+    old_runtimes = []
     old_effects = []
     outcomes = []
     phase_trace = []
@@ -61,6 +73,18 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
     actual_dispose = driver_module._SegmentDriver.dispose
     actual_settle = driver_module._SegmentDriver.settle
     actual_fit = driver_module.admit_action
+    actual_init = driver_module._SegmentDriver.__init__
+
+    def observe_init(driver, *args, **kwargs):
+        actual_init(driver, *args, **kwargs)
+        if (
+            driver.running.claim.operation_id == operation_id
+            and old_claims
+            and driver.running.claim.ownership_generation == old_claims[0].ownership_generation + 1
+        ):
+            resumed_cold.append(driver.phases.runtime is None)
+            assert driver.phases is not old_phases[0]
+            assert driver.work.coordinator is not old_phases[0].work.coordinator
 
     def matches(selected):
         top = selected.stack.frames[-1]
@@ -90,9 +114,11 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
         nonlocal force_handover
         if selected.stack.logical.operation_id != operation_id:
             return await actual_advance(driver, stored, selected)
-        if old_claims and driver.running.claim.ownership_generation == old_claims[0].ownership_generation + 1 and not selected_after:
+        first_resumed_phase = (
+            old_claims and driver.running.claim.ownership_generation == old_claims[0].ownership_generation + 1 and not selected_after
+        )
+        if first_resumed_phase:
             selected_after.append(selected)
-            resumed_cold.append(driver.phases.runtime is None)
         generation = driver.running.claim.ownership_generation
         phase_trace.append(("entered", generation, selected.stack.frames[-1].frame_kind, selected.stack.cursor))
         try:
@@ -101,6 +127,17 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
             phase_trace.append(("raised", generation, failure_trace(original)))
             raise
         phase_trace.append(("returned", generation, selected.stack.frames[-1].frame_kind, selected.stack.cursor))
+        if first_resumed_phase:
+            # Control preflight may restore before advance; current ownership
+            # and object identity must still be fresh for the claimed segment.
+            runtime = driver.phases.runtime
+            previous = old_runtimes[0]
+            assert runtime is not None and previous is not None and runtime is not previous
+            assert runtime.bindings is not previous.bindings
+            assert runtime.materialization is not previous.materialization
+            assert runtime.bindings.required_work is driver.work
+            assert runtime.bindings.session_operation_context is driver.running.session_operation_context
+            assert runtime.bindings.provider_owner is driver.provider
         # Observe later Compose only after the actual END repair owner has
         # returned; the selected root is then re-read from its committed SQL.
         probe_produced_cut = cut != "later-compose" or type(selected.stack.frames[-1]) is EndFrame
@@ -112,6 +149,8 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
                 assert (following.checkpoint_id, following.cursor) == (current.checkpoint_id, current.stack.cursor)
                 selected_before.append(current)
                 old_claims.append(driver.running.claim)
+                old_phases.append(driver.phases)
+                old_runtimes.append(driver.phases.runtime)
                 old_effects.extend(effects(harness.app, operation_id))
                 force_handover = True
         return result
@@ -144,6 +183,7 @@ async def test_live_later_cut_hands_over_and_cold_resumes_without_repeating_work
         return await actual_settle(driver, record, original)
 
     monkeypatch.setattr(driver_module._SegmentDriver, "advance", observe_advance)
+    monkeypatch.setattr(driver_module._SegmentDriver, "__init__", observe_init)
     monkeypatch.setattr(driver_module._SegmentDriver, "dispose", observe_dispose)
     monkeypatch.setattr(driver_module._SegmentDriver, "settle", observe_settle)
     monkeypatch.setattr(driver_module, "admit_action", refuse_one_fit)

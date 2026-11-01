@@ -99,6 +99,60 @@ class ProspectiveApplicationRecorderSource(ApplicationRecorderSource):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedRecorderSource:
+    """One synchronous graph call's checked source, rechecked at its exit."""
+
+    source: ApplicationRecorderSource
+    env_ref_names: frozenset[str]
+    snapshot: RecorderSnapshot
+    original_chunk: tuple[str, str, int, str]
+
+    @classmethod
+    def capture(cls, source: ApplicationRecorderSource, env_ref_names: frozenset[str]) -> _ValidatedRecorderSource:
+        require_application_recorder_source(source, env_ref_names)
+        reference = source.chunk.reference
+        return cls(
+            source, env_ref_names, source.snapshot, (reference.codec, reference.digest, reference.byte_length, source.chunk.canonical)
+        )
+
+    def require_bound(self, source: ApplicationRecorderSource, env_ref_names: frozenset[str]) -> None:
+        reference = source.chunk.reference
+        if (
+            type(self) is not _ValidatedRecorderSource
+            or self.source is not source
+            or self.env_ref_names != env_ref_names
+            or source.env_ref_names != env_ref_names
+            or self.snapshot is not source.snapshot
+            or self.original_chunk != (reference.codec, reference.digest, reference.byte_length, source.chunk.canonical)
+        ):
+            raise AuditIntegrityError("application graph lost its call-local checked recorder source")
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedSelectedRecorder:
+    """A selected graph root checked once within one synchronous projection."""
+
+    graph: ApplicationGraph
+    source: ApplicationRecorderSource | None
+    chunk: PrivateChunk
+
+    @classmethod
+    def capture(cls, graph: ApplicationGraph, source: ApplicationRecorderSource | None) -> _ValidatedSelectedRecorder:
+        if type(graph) is not ApplicationGraph or type(graph.cuts) is not tuple:
+            raise TypeError("application graph requires its actual owned roots")
+        return cls(graph, source, application_recorder_chunk(graph.recorder, recorder_source=source))
+
+    def require_bound(self, graph: ApplicationGraph, source: ApplicationRecorderSource | None) -> None:
+        if (
+            type(self) is not _ValidatedSelectedRecorder
+            or self.graph is not graph
+            or self.source is not source
+            or (source is not None and self.chunk.reference != source.chunk.reference)
+        ):
+            raise AuditIntegrityError("application graph lost its call-local selected recorder check")
+
+
 def _prospective_recorder_values(snapshot: RecorderSnapshot, env_ref_names: frozenset[str]) -> tuple[PrivateChunk, RecorderSnapshot]:
     canonical, restored = validate_recorder_projection(snapshot)
     encoded = canonical.encode("utf-8")
@@ -217,8 +271,13 @@ def application_recorder_chunk(snapshot: RecorderSnapshot, *, recorder_source: A
     return encode_recorder_snapshot(snapshot)
 
 
-def application_recorder_slots(graph: ApplicationGraph, source: ApplicationRecorderSource) -> dict[int, int]:
-    if application_recorder_chunk(graph.recorder, recorder_source=source) != source.chunk:
+def application_recorder_slots(
+    graph: ApplicationGraph, source: ApplicationRecorderSource, *, selected_recorder: _ValidatedSelectedRecorder | None = None
+) -> dict[int, int]:
+    chunk = application_recorder_chunk(graph.recorder, recorder_source=source) if selected_recorder is None else selected_recorder.chunk
+    if selected_recorder is not None:
+        selected_recorder.require_bound(graph, source)
+    if chunk != source.chunk:
         raise AuditIntegrityError("application graph differs from its complete original recorder source")
     slots: dict[int, int] = {}
     for index, call in enumerate(graph.recorder.llm_calls):
@@ -261,7 +320,11 @@ def _atom_json(value: Any, owner: type[Any]) -> str:
 
 
 def application_members(
-    value: Any, *, recorder_slots: dict[int, int] | None = None, recorder_source: ApplicationRecorderSource | None = None
+    value: Any,
+    *,
+    recorder_slots: dict[int, int] | None = None,
+    recorder_source: ApplicationRecorderSource | None = None,
+    selected_recorder: _ValidatedSelectedRecorder | None = None,
 ) -> tuple[str, dict[str, Any]] | None:
     if type(value) is ComposerLLMCall:
         if recorder_slots is None or id(value) not in recorder_slots:
@@ -301,7 +364,10 @@ def application_members(
             "authored_state_hash": value.authored_state_hash,
         }
     if type(value) is RecorderSnapshot:
-        application_recorder_chunk(value, recorder_source=recorder_source)
+        if selected_recorder is None or value is not selected_recorder.graph.recorder:
+            application_recorder_chunk(value, recorder_source=recorder_source)
+        else:
+            selected_recorder.require_bound(selected_recorder.graph, recorder_source)
         return "application_recorder", {
             "invocations": value.invocations,
             "llm_calls": value.llm_calls,
@@ -404,7 +470,11 @@ def construct_application_member(kind: str, members: dict[str, Any]) -> Any:
 
 
 def application_result_tools(
-    graph: ApplicationGraph, env_ref_names: frozenset[str], *, recorder_source: ApplicationRecorderSource | None = None
+    graph: ApplicationGraph,
+    env_ref_names: frozenset[str],
+    *,
+    recorder_source: ApplicationRecorderSource | None = None,
+    selected_recorder: _ValidatedSelectedRecorder | None = None,
 ) -> dict[int, str]:
     from elspeth.web.composer.continuation_batch_data import _joint
     from elspeth.web.composer.continuation_p4_batch import _joined
@@ -449,7 +519,10 @@ def application_result_tools(
         raise TypeError("application graph lost actual evidence/recorder owners")
     for effects in (graph.effects, *(item for cut in graph.cuts for item in (cut.effects_before, cut.effects_after))):
         _admit_effects(effects, env_ref_names)
-    application_recorder_chunk(graph.recorder, recorder_source=recorder_source)
+    if selected_recorder is None:
+        application_recorder_chunk(graph.recorder, recorder_source=recorder_source)
+    else:
+        selected_recorder.require_bound(graph, recorder_source)
     from elspeth.web.composer.continuation_tool_failure import require_retained_failure_links
 
     for data in (graph.selected, *(cut.data for cut in graph.cuts)):
@@ -477,13 +550,39 @@ def application_result_tools(
 def encode_application_graph(graph: ApplicationGraph, *, env_ref_names: frozenset[str], recorder_source: ApplicationRecorderSource) -> str:
     from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode, _encode_values
 
-    encoded = _encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source)
-    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True, recorder_source=recorder_source)
+    checked_source = _ValidatedRecorderSource.capture(recorder_source, env_ref_names)
+    decoded_selected: list[_ValidatedSelectedRecorder] = []
+    encoded = _encode(graph.selected, env_ref_names, application=graph, recorder_source=recorder_source, checked_source=checked_source)
+    restored, result_tools = _decode_graph_values(
+        encoded,
+        env_ref_names,
+        application=True,
+        recorder_source=recorder_source,
+        checked_source=checked_source,
+        selected_recorder_out=decoded_selected,
+    )
     if (
         type(restored) is not ApplicationGraph
-        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored, recorder_source=recorder_source) != encoded
+        or len(decoded_selected) != 1
+        or _encode_values(
+            restored.selected,
+            env_ref_names,
+            result_tools,
+            application=restored,
+            recorder_source=recorder_source,
+            checked_source=checked_source,
+            selected_recorder=decoded_selected[0],
+        )
+        != encoded
     ):
         raise AuditIntegrityError("application constructors changed the actual alias partition")
+    # Both originals can contain nested mutable values. Reprove them after
+    # every constructor and alias check, before returning this wire source.
+    if application_recorder_chunk(graph.recorder, recorder_source=recorder_source) != recorder_source.chunk:
+        raise AuditIntegrityError("application graph changed its complete selected recorder")
+    if application_recorder_chunk(restored.recorder, recorder_source=recorder_source) != recorder_source.chunk:
+        raise AuditIntegrityError("application constructors changed their complete selected recorder")
+    require_application_recorder_source(recorder_source, env_ref_names)
     return encoded
 
 
@@ -492,12 +591,34 @@ def decode_application_graph(
 ) -> ApplicationGraph:
     from elspeth.web.composer.continuation_batch_data import _decode_graph_values, _encode_values
 
-    restored, result_tools = _decode_graph_values(encoded, env_ref_names, application=True, recorder_source=recorder_source)
+    checked_source = _ValidatedRecorderSource.capture(recorder_source, env_ref_names)
+    decoded_selected: list[_ValidatedSelectedRecorder] = []
+    restored, result_tools = _decode_graph_values(
+        encoded,
+        env_ref_names,
+        application=True,
+        recorder_source=recorder_source,
+        checked_source=checked_source,
+        selected_recorder_out=decoded_selected,
+    )
     if (
         type(restored) is not ApplicationGraph
-        or _encode_values(restored.selected, env_ref_names, result_tools, application=restored, recorder_source=recorder_source) != encoded
+        or len(decoded_selected) != 1
+        or _encode_values(
+            restored.selected,
+            env_ref_names,
+            result_tools,
+            application=restored,
+            recorder_source=recorder_source,
+            checked_source=checked_source,
+            selected_recorder=decoded_selected[0],
+        )
+        != encoded
     ):
         raise AuditIntegrityError("application graph lost complete values or aliases")
+    if application_recorder_chunk(restored.recorder, recorder_source=recorder_source) != recorder_source.chunk:
+        raise AuditIntegrityError("application graph changed its complete selected recorder")
+    require_application_recorder_source(recorder_source, env_ref_names)
     return restored
 
 

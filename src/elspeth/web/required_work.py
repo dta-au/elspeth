@@ -133,6 +133,10 @@ class RequiredWorkSource(IntEnum):
     CONTINUATION_READ_SQL = 57
     CONTINUATION_READ_PROJECTION = 58
     CONTINUATION_HANDOFF_SQL = 59
+    CONTINUATION_DISPOSITION_READ_SQL = 60
+    CONTINUATION_DISPOSITION_READ_PROJECTION = 61
+    CONTINUATION_HANDOFF_READBACK_SQL = 62
+    CONTINUATION_HANDOFF_READBACK_PROJECTION = 63
 
 
 SOURCE_MAPPING = MappingProxyType(
@@ -205,6 +209,8 @@ SOURCE_MAPPING = MappingProxyType(
         RequiredWorkSource.LEASE_CLOSE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.PRODUCER),
         RequiredWorkSource.LEASE_RELEASE: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.CONTINUATION_HANDOFF_SQL: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_INITIAL),
+        RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.SQL_READBACK),
+        RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_PROJECTION: (ComposerRequiredStage.LEASE_CLOSE, RequiredWorkSubphase.PROJECTION),
         RequiredWorkSource.CREATION_PURE_PREPARATION: (ComposerRequiredStage.CREATION_BINDING, RequiredWorkSubphase.PURE_PREPARATION),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_SQL: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.SQL_INITIAL),
         RequiredWorkSource.TITLE_PROVIDER_ADMISSION_PROJECTION: (ComposerRequiredStage.TITLE_ACCOUNTING, RequiredWorkSubphase.PROJECTION),
@@ -233,6 +239,14 @@ SOURCE_MAPPING = MappingProxyType(
         ),
         RequiredWorkSource.CONTINUATION_READ_SQL: (ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD, RequiredWorkSubphase.SQL_READBACK),
         RequiredWorkSource.CONTINUATION_READ_PROJECTION: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.PROJECTION,
+        ),
+        RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL: (
+            ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
+            RequiredWorkSubphase.SQL_READBACK,
+        ),
+        RequiredWorkSource.CONTINUATION_DISPOSITION_READ_PROJECTION: (
             ComposerRequiredStage.REQUIRED_CONTINUATION_CHILD,
             RequiredWorkSubphase.PROJECTION,
         ),
@@ -563,6 +577,20 @@ class RequiredWorkTicket:
 
     @property
     def permits_process_drain(self) -> bool:
+        if self.key.source in (
+            RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+        ):
+            owner = self._sql_deadline_owner
+            if owner is None:
+                return False
+            owner.validate_context(
+                self.key.authority.context,
+                operation_id=self.key.authority.durable_operation_id,
+                attempt=self.key.authority.claim_attempt,
+            )
+            owner.remaining_statement(session_id=owner.running.session_operation_context.fence.session_id, lifecycle=True)
+            return True
         return self.key.source in (
             RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
             RequiredWorkSource.PROVIDER_SETTLEMENT_SQL,
@@ -1123,6 +1151,8 @@ class RequiredWorkCoordinator:
         if type(expected_source) is not RequiredWorkSource or expected_source not in (
             RequiredWorkSource.CONTINUATION_STATE_SQL,
             RequiredWorkSource.CONTINUATION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
+            RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
         ):
             raise AuditIntegrityError("Continuation SQL outcome has an unsupported source")
         with self._lock:

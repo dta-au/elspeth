@@ -13,7 +13,12 @@ import time
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
-from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationActionPolicy,
+    ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
+)
 from elspeth.web.sessions.composer_drain import (
     COMPOSER_DRAIN_DISPOSITION_SECONDS,
     COMPOSER_DRAIN_FINISH_RESERVE_SECONDS,
@@ -25,7 +30,7 @@ from elspeth.web.sessions.composer_operations import ComposerOperationRunning
 
 class ContinuationSQLDeadlineOwner:
     running: ComposerOperationRunning
-    policy: ContinuationAdmissionPolicy
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
     drain_signal: ComposerDrainSignal
     drain_seconds: float
     hard_expires_at: float
@@ -40,14 +45,14 @@ class ContinuationSQLDeadlineOwner:
         self,
         running: ComposerOperationRunning,
         *,
-        policy: ContinuationAdmissionPolicy,
+        policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
         drain_signal: ComposerDrainSignal,
         drain_seconds: float,
         hard_expires_at: float,
     ) -> None:
         if (
             type(running) is not ComposerOperationRunning
-            or type(policy) is not ContinuationAdmissionPolicy
+            or type(policy) not in (ContinuationAdmissionPolicy, ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)
             or not math.isfinite(drain_seconds)
@@ -125,13 +130,23 @@ class ContinuationSQLDeadlineOwner:
             remaining = min(remaining, signal_start + self.drain_seconds - self.drain_finish_reserve_seconds - monotonic_now)
         return remaining
 
-    def remaining_statement(self, *, session_id: str, deadline: ComposerDrainDeadline | None = None, lifecycle: bool = False) -> float:
+    def remaining_statement(
+        self,
+        *,
+        session_id: str,
+        deadline: ComposerDrainDeadline | None = None,
+        lifecycle: bool = False,
+        paid_settlement: bool = False,
+    ) -> float:
         if session_id != str(self.running.claim.session_id):
             raise AuditIntegrityError("SQL timing cannot cover another session")
+        if type(paid_settlement) is not bool or (paid_settlement and lifecycle):
+            raise AuditIntegrityError("SQL timing cannot combine paid settlement with lifecycle scope")
         now = time.monotonic()
         with self._lock:
-            disposition = lifecycle or self._settling
-            expires_at = self.hard_expires_at if lifecycle else self._settlement_expires_at if self._settling else self._action_expires_at
+            settlement = paid_settlement or self._settling
+            disposition = lifecycle or settlement
+            expires_at = self.hard_expires_at if lifecycle else self._settlement_expires_at if settlement else self._action_expires_at
         signal_start = self.drain_signal.started_at
         statement_cap = self.statement_cap
         if signal_start is not None:

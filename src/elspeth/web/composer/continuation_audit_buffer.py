@@ -178,6 +178,8 @@ def recorder_snapshot_json(snapshot: RecorderSnapshot) -> str:
     )
     blocks = _RecorderBlocks()
     for call in projected["llm_calls"]:
+        if call["cost_response_accountable"] is None:
+            del call["cost_response_accountable"]
         call["private_request"] = _deduplicate_request(call["private_request"], blocks)
     return canonical_json({"blocks": blocks.document(), "snapshot": projected})
 

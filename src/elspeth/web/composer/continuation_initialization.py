@@ -116,12 +116,15 @@ async def adopt_recompose_original(
 
 
 async def _registered[T](*, work: RequiredWorkBinding, source: RequiredWorkSource, operation: Callable[[], T], expected: type[T]) -> T:
-    projection_source = (
-        RequiredWorkSource.CONTINUATION_READ_PROJECTION
-        if source is RequiredWorkSource.CONTINUATION_READ_SQL
-        else RequiredWorkSource.CONTINUATION_STATE_PROJECTION
-    )
-    if source not in (RequiredWorkSource.CONTINUATION_READ_SQL, RequiredWorkSource.CONTINUATION_STATE_SQL):
+    if source is RequiredWorkSource.CONTINUATION_READ_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_READ_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_DISPOSITION_READ_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_PROJECTION
+    elif source is RequiredWorkSource.CONTINUATION_STATE_SQL:
+        projection_source = RequiredWorkSource.CONTINUATION_STATE_PROJECTION
+    else:
         raise AuditIntegrityError("pre-title bootstrap has no registered SQL source")
     sql, projection = work.reserve_pair(source, projection_source)
     try:

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
+from elspeth.web.composer.continuation_policy import ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3
 
 if TYPE_CHECKING:
     from elspeth.web.composer.protocol import ComposerSettings
@@ -76,7 +77,7 @@ class CommonProviderCostSnapshot:
     session_id: str
     request_id: str
     lifecycle_version: Literal[1, 2]
-    applicability: Literal["legacy_empty_v1", "not_applicable"]
+    applicability: Literal["legacy_empty_v1", "continuation_v2", "not_applicable"]
     policy: CommonProviderCostPolicy | None
     physical_calls: int = 0
     charges: tuple[CommonProviderCostCharge, ...] = ()
@@ -87,16 +88,18 @@ class CommonProviderCostSnapshot:
             raise ValueError("cost snapshot requires original logical identity")
         if not _is_supported_lifecycle(self.lifecycle_version):
             raise ValueError("unsupported immutable lifecycle")
-        if self.applicability not in ("legacy_empty_v1", "not_applicable"):
+        if self.applicability not in ("legacy_empty_v1", "continuation_v2", "not_applicable"):
             raise ValueError("unsupported policy applicability")
-        eligible = self.applicability == "legacy_empty_v1"
+        eligible = self.applicability != "not_applicable"
         if eligible:
             if type(self.policy) is not CommonProviderCostPolicy:
                 raise ValueError("policy applicability lost its exact policy")
         elif self.policy is not None:
             raise ValueError("not-applicable policy cannot carry foreign limits")
-        if eligible and self.lifecycle_version != 1:
+        if eligible and self.lifecycle_version != 1 and self.applicability == "legacy_empty_v1":
             raise ValueError("legacy planner policy cannot activate on v2")
+        if self.applicability == "continuation_v2" and self.lifecycle_version != 2:
+            raise ValueError("Continuation policy requires lifecycle v2")
         if type(self.physical_calls) is not int or self.physical_calls < 0:
             raise ValueError("physical call count is invalid")
         if type(self.charges) is not tuple or any(type(c) is not CommonProviderCostCharge for c in self.charges):
@@ -215,6 +218,20 @@ class CommonProviderCostBudget:
             elif s.policy is not None and call.finish_reason == "length":
                 code = "RESPONSE_TRUNCATED"
         self._snapshot = replace(s, charges=charges, refusal_code=code)
+
+
+def continuation_common_cost_policy(policy: ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3) -> CommonProviderCostPolicy:
+    """Materialize the existing ledger policy from one hashed admission."""
+    if type(policy) not in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3):
+        raise AuditIntegrityError("Continuation cost limits require their exact admitted costed policy")
+    admitted = policy.provider_cost
+    return CommonProviderCostPolicy(
+        admitted.max_provider_calls,
+        admitted.max_request_bytes,
+        admitted.max_completion_tokens,
+        admitted.max_cumulative_provider_cost,
+        admitted.repair_budget,
+    )
 
 
 def capture_common_provider_cost(

@@ -28,6 +28,7 @@ from elspeth.contracts.secrets import (
 )
 from elspeth.contracts.security import secret_fingerprint
 from elspeth.core.security.secret_loader import SecretNotFoundError, SecretRef
+from elspeth.web.sessions.locking import continuation_metadata_connection_deadline_scope
 from elspeth.web.sessions.models import user_secrets_table
 
 _PBKDF2_ITERATIONS = 480_000
@@ -377,7 +378,7 @@ class UserSecretStore:
             .order_by(t.c.name)
         )
 
-        with self._engine.connect() as conn:
+        with self._engine.connect() as conn, continuation_metadata_connection_deadline_scope(conn):
             rows = conn.execute(stmt).fetchall()
 
         can_resolve = _fingerprint_key_available()

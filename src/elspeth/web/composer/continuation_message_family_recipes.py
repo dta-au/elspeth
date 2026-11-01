@@ -94,3 +94,18 @@ class ToolFeedbackMessageRecipe(ContinuationValue):
         if self.response.codec != "composer.response.v1":
             raise ValueError("issued feedback requires its original complete paid response")
         return self
+
+
+class ControlResultMessageRecipe(ContinuationValue):
+    """The original paid control's constant or whole-batch refusal, never P4."""
+
+    kind: Literal["control_result"] = "control_result"
+    response: PrivateChunkRef
+    tool_index: int = Field(ge=0)
+    intent_checkpoint_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def require_complete_source(self) -> ControlResultMessageRecipe:
+        if self.response.codec != "composer.response.v1":
+            raise ValueError("control result requires its original complete paid response")
+        return self

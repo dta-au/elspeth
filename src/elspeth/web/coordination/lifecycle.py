@@ -1769,7 +1769,12 @@ class SessionOperationLease:
                 obligation.registry.record_failure(retained_failure)
         _raise_lifecycle_originals(cancellations, failures)
 
-    async def _consume_continuation_handoff[T](self, action: Callable[[], T], outcome: list[T]) -> None:
+    async def _consume_continuation_handoff[T](
+        self,
+        action: Callable[[], T],
+        outcome: list[T],
+        verify_outcome: Callable[[T | None, BaseException | None], Awaitable[T]] | None = None,
+    ) -> None:
         """Run one handoff transaction that releases this lease's own fence.
 
         The yield and the live-owner handover write the successor state and
@@ -1778,6 +1783,10 @@ class SessionOperationLease:
         required-work barrier is sealed only after it commits (design §2.5).
         A known refusal writes nothing: the owner keeps its fence, renewal
         resumes and the lease may settle or retry (design §2.6).
+
+        Optional immutable verification belongs to this same finish task,
+        after the handoff SQL completes and before the no-new-work seal. An
+        ambiguous write may be resolved there without another mutation.
         """
         from elspeth.web.composer.continuation_next_action import ContinuationCutNotResumable
         from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
@@ -1818,9 +1827,29 @@ class SessionOperationLease:
                 self._resume_after_refused_handoff()
                 resumed = True
                 raise
-            except BaseException:
-                self._disposition = SessionOperationLeaseDisposition.UNKNOWN
-                raise
+            except BaseException as original:
+                if verify_outcome is None:
+                    self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                    raise
+                try:
+                    value = await verify_outcome(None, original)
+                except BaseException as readback_failure:
+                    self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                    if readback_failure is original:
+                        raise
+                    raise _preserve_failures(
+                        original,
+                        (readback_failure,),
+                        note_prefix="Session-operation handoff readback",
+                        group_message="Session operation handoff and immutable readback failed",
+                    ) from None
+            else:
+                if verify_outcome is not None:
+                    try:
+                        value = await verify_outcome(value, None)
+                    except BaseException:
+                        self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                        raise
             if self._required_work is not None:
                 self._required_work.seal_after_continuation_handoff()
             self._disposition = SessionOperationLeaseDisposition.CONSUMED
@@ -1836,13 +1865,21 @@ class SessionOperationLease:
         self._stop_renewal.clear()
         self._renewal_task = asyncio.create_task(self._renew_forever(), name="session-operation-renewal")
 
-    async def consume_continuation_handoff[T](self, action: Callable[[], T], *, deadline: ComposerDrainDeadline | None = None) -> T:
+    async def consume_continuation_handoff[T](
+        self,
+        action: Callable[[], T],
+        *,
+        deadline: ComposerDrainDeadline | None = None,
+        verify_outcome: Callable[[T | None, BaseException | None], Awaitable[T]] | None = None,
+    ) -> T:
         """Consume a COMPOSE lease through a handoff that releases its fence itself.
 
         It runs as the lease's one retained finish task, so a later ``close()``
         only joins it and can never start a second release (design §2.5,
         review F9). ``action`` is the bound ``commit_checkpoint_and_successor``
         or ``suspend_composer_segment`` call; its receipt is returned.
+        ``verify_outcome`` may join registered immutable readback before the
+        barrier seals, retaining an ambiguous original without repeating SQL.
         """
         if self._context.operation_kind is not SessionOperationKind.COMPOSE or self._execution_obligation is not None:
             raise RuntimeError("continuation handoff consumes only a COMPOSE lease")
@@ -1851,7 +1888,7 @@ class SessionOperationLease:
         outcome: list[T] = []
         self._finish_mode = "consume"
         self._close_task = asyncio.create_task(
-            self._consume_continuation_handoff(action, outcome), name="session-operation-continuation-handoff"
+            self._consume_continuation_handoff(action, outcome, verify_outcome), name="session-operation-continuation-handoff"
         )
         if deadline is None:
             await self._join_finish_task(self._close_task)

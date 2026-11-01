@@ -308,7 +308,7 @@ async def test_actual_advisor_feedback_uses_successful_audit_projection_and_cold
                 return litellm.ModelResponse(
                     model="test/model",
                     choices=[{"message": {"role": "assistant", "content": 'Actual café guidance: "inspect"\nThen continue.'}}],
-                    usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                    usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
                 )
 
             monkeypatch.setattr(litellm, "acompletion", complete)
@@ -2233,7 +2233,7 @@ async def _advisor_case(
             return ModelResponse(
                 model="test/model",
                 choices=[{"message": {"role": "assistant", "content": "Actual Advisor guidance."}}],
-                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
             )
         _assert_required_guard_admitted(
             store[0], running.session_operation_context, guard_requests, role="composer", user_prompt=runtime.bindings.message
@@ -2283,7 +2283,7 @@ async def _advisor_case(
                     },
                 }
             ],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)

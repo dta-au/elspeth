@@ -26,6 +26,7 @@ from elspeth.web.composer.continuation_message_family_builders import (
 )
 from elspeth.web.composer.continuation_message_family_recipes import (
     AttachmentResultMessageRecipe,
+    ControlResultMessageRecipe,
     FailureSchemaMessageRecipe,
     NativeThinkingMessageRecipe,
     ToolCallArgumentsMessageRecipe,
@@ -64,6 +65,7 @@ class _MessageFamilySources:
     batches: tuple[_BatchFamilySource, ...]
     tool_results: tuple[_ToolResultFamilySource, ...] = ()
     tool_feedback: tuple[_ToolFeedbackFamilySource, ...] = ()
+    control_results: tuple[tuple[ControlResultMessageRecipe, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,6 +406,7 @@ def _read_current_sources(
             or type(recipe) is ToolCallArgumentsMessageRecipe
             or type(recipe) is ToolResultMessageRecipe
             or type(recipe) is ToolFeedbackMessageRecipe
+            or type(recipe) is ControlResultMessageRecipe
         ) and recipe.response not in checked_native:
             read_response = (
                 read_committed_primary_response_on_connection
@@ -420,7 +423,14 @@ def _read_current_sources(
     feedback_sources = _admit_selected_tool_feedback_recipes_on_connection(
         conn, running, selected=selected, admitted=admitted, names=inventory.names
     )
-    return _MessageFamilySources(evidence, recorder, tuple(responses), tuple(batches), result_sources, feedback_sources)
+    from elspeth.web.composer.continuation_control_transitions import control_result_message_on_connection
+
+    control_results = tuple(
+        (recipe, family_message_wire(control_result_message_on_connection(conn, running, selected=selected, recipe=recipe)))
+        for recipe in evidence.transcript.producer_recipes or ()
+        if type(recipe) is ControlResultMessageRecipe
+    )
+    return _MessageFamilySources(evidence, recorder, tuple(responses), tuple(batches), result_sources, feedback_sources, control_results)
 
 
 def _require_completed_tool_source_on_connection(
@@ -938,7 +948,8 @@ class CurrentContinuationMessageFamilies:
                 | FailureSchemaMessageRecipe
                 | AttachmentResultMessageRecipe
                 | ToolResultMessageRecipe
-                | ToolFeedbackMessageRecipe,
+                | ToolFeedbackMessageRecipe
+                | ControlResultMessageRecipe,
                 str,
             ],
             ...,
@@ -955,7 +966,8 @@ class CurrentContinuationMessageFamilies:
                 | FailureSchemaMessageRecipe
                 | AttachmentResultMessageRecipe
                 | ToolResultMessageRecipe
-                | ToolFeedbackMessageRecipe,
+                | ToolFeedbackMessageRecipe
+                | ControlResultMessageRecipe,
                 str,
             ],
             ...,
@@ -992,6 +1004,7 @@ class CurrentContinuationMessageFamilies:
                 and type(recipe) is not AttachmentResultMessageRecipe
                 and type(recipe) is not ToolResultMessageRecipe
                 and type(recipe) is not ToolFeedbackMessageRecipe
+                and type(recipe) is not ControlResultMessageRecipe
             ):
                 raise AuditIntegrityError("family cohort contains an unsupported source recipe")
         if not requests:
@@ -1031,6 +1044,13 @@ class CurrentContinuationMessageFamilies:
                         raise AuditIntegrityError("feedback lost its freshly admitted committed producer")
                     message = admitted_feedback[0].message
                     feedback.append((recipe, admitted_feedback[0]))
+                elif type(recipe) is ControlResultMessageRecipe:
+                    matches = tuple(wire for original, wire in before.control_results if original == recipe)
+                    if not matches or any(wire != text for wire in matches):
+                        raise AuditIntegrityError("control result lost its original paid/checkpoint producer")
+                    from elspeth.web.composer.continuation_message_family_builders import retained_family_wire
+
+                    message = retained_family_wire(matches[0])
                 else:
                     raise AuditIntegrityError("family cohort lost its admitted recipe")
                 if family_message_wire(message) != text:
@@ -1063,6 +1083,11 @@ class CurrentContinuationMessageFamilies:
                     if _tool_result_source(after, recipe) != _tool_result_source(before, recipe):
                         raise AuditIntegrityError("tool result source changed during current reconstruction")
                     _require_response_audit_source(after, _response(after, recipe.response))
+                elif type(recipe) is ControlResultMessageRecipe:
+                    if tuple(item for item in before.control_results if item[0] == recipe) != tuple(
+                        item for item in after.control_results if item[0] == recipe
+                    ):
+                        raise AuditIntegrityError("control result changed its complete immutable source during reconstruction")
                 elif type(recipe) is ToolFeedbackMessageRecipe:
                     prior = tuple(item for item in before.tool_feedback if item.recipe == recipe)
                     current = tuple(item for item in after.tool_feedback if item.recipe == recipe)

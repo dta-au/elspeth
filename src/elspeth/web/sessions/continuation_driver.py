@@ -14,14 +14,18 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.continuation import ComposeFrame, EndFrame, InitializeFrame
 from elspeth.web.composer.continuation_clock import ContinuationTimingObservation, SegmentFit, admit_action
 from elspeth.web.composer.continuation_composition_initialization import initialize_continuation_composition
-from elspeth.web.composer.continuation_env_inventory import _read_current_env_names
+from elspeth.web.composer.continuation_control_transitions import StoredContinuationControlIntent, read_pending_control_on_connection
+from elspeth.web.composer.continuation_env_inventory import read_disposition_env_names
 from elspeth.web.composer.continuation_initialization import _registered, adopt_recompose_original, prepare_pretitle_bootstrap
 from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
-from elspeth.web.composer.continuation_next_action import _is_first_compose_iteration, next_continuation_action_policy
+from elspeth.web.composer.continuation_next_action import (
+    _has_committed_primary,
+    _is_first_compose_iteration,
+    next_continuation_action_policy,
+)
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_primary import run_continuation_primary
 from elspeth.web.composer.continuation_selection import SelectedContinuationState, load_selected_continuation
@@ -52,7 +56,9 @@ from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, Co
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, review_continuation_end
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
+from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.schemas import SendMessageRequest
 
 if TYPE_CHECKING:
@@ -138,7 +144,7 @@ class _SegmentDriver:
 
         record = await _registered(
             work=self.work,
-            source=RequiredWorkSource.CONTINUATION_READ_SQL,
+            source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
             operation=read_record,
             expected=ComposerOperationRecord,
         )
@@ -181,7 +187,9 @@ class _SegmentDriver:
             self._consumed_native.append(original)
         self.sql_deadline.begin_settlement()
         try:
-            names = await _read_current_env_names(self.service._advisor_checkpoint, str(self.running.claim.session_id))
+            names = await read_disposition_env_names(
+                advisor=self.service._advisor_checkpoint, authority=self.authority, required_work=self.work
+            )
             failure_read = await self.read_failure(names)
         except BaseException as error:
             combined = self.join_failure(error)
@@ -189,6 +197,8 @@ class _SegmentDriver:
                 raise
             raise combined from combined.__cause__
         source, custody = failure_read.source, self.phases.failure_custody
+        p4 = self.phases.p4
+        p4_writer_observation = None if p4 is None else p4.writer_observation
         from elspeth.web.sessions.continuation_p4 import terminal_service_failure
         from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application, StoredTerminalP4Preparation
         from elspeth.web.sessions.service import ComposerTerminalSQLCompletionUnknown
@@ -246,6 +256,8 @@ class _SegmentDriver:
                     env_ref_names=names,
                     original=original,
                     custody=custody,
+                    p4_writer_observation=p4_writer_observation,
+                    p4_live_owner=p4,
                 )
             except BaseException as error:
                 combined = self.join_failure(error)
@@ -291,7 +303,7 @@ class _SegmentDriver:
         try:
             return await _registered(
                 work=self.work,
-                source=RequiredWorkSource.CONTINUATION_READ_SQL,
+                source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
                 operation=lambda: ContinuationToolFailureRead(
                     self.authority.read_continuation_tool_failure(self.running, env_ref_names=names)
                 ),
@@ -307,20 +319,20 @@ class _SegmentDriver:
             raise
 
     async def dispose(self, original: BaseException | None = None) -> ContinuationSegmentOutcome:
-        from elspeth.web.sessions.composer_async_worker import _owned
-
         if original is not None and not any(original is item for item in self._consumed_native):
             self._consumed_native.append(original)
         self.sql_deadline.begin_settlement()
         record = await self.record()
         if record.cancel_requested_at is not None:
             return await self.settle(record, original)
-        names = await _read_current_env_names(self.service._advisor_checkpoint, str(self.running.claim.session_id))
+        names = await read_disposition_env_names(
+            advisor=self.service._advisor_checkpoint, authority=self.authority, required_work=self.work
+        )
         if (await self.read_failure(names)).source is not None:
             return await self.settle(record, original)
         disposition = await _registered(
             work=self.work,
-            source=RequiredWorkSource.CONTINUATION_READ_SQL,
+            source=RequiredWorkSource.CONTINUATION_DISPOSITION_READ_SQL,
             operation=partial(
                 self.authority.classify_continuation_owner, self.running, env_ref_names=names, deadline=self.worker.drain_deadline
             ),
@@ -330,6 +342,32 @@ class _SegmentDriver:
             return await self.settle(record, original)
         if disposition != "handover":
             raise AuditIntegrityError("V2 driver has no landed cross-sequence lineage owner")
+
+        async def verify_handover(
+            committed: ComposerSegmentRecoveryReceipt | None, original_failure: BaseException | None
+        ) -> ComposerSegmentRecoveryReceipt:
+            if original_failure is not None:
+                raise original_failure
+            if (
+                type(committed) is not ComposerSegmentRecoveryReceipt
+                or committed.released_context is not self.running.session_operation_context
+            ):
+                raise AuditIntegrityError("V2 handover lost its actual committing release receipt")
+
+            def verify_receipt() -> ComposerSegmentRecoveryReceipt:
+                self.services.session_service.session_operation_authority.verify_recovery(committed, deadline=self.worker.drain_deadline)
+                return committed
+
+            verified = await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+                operation=verify_receipt,
+                expected=ComposerSegmentRecoveryReceipt,
+            )
+            if verified is not committed:
+                raise AuditIntegrityError("V2 handover verification replaced its actual committing receipt")
+            return committed
+
         try:
             receipt = await self.lease.consume_continuation_handoff(
                 partial(
@@ -338,21 +376,15 @@ class _SegmentDriver:
                     deadline=self.worker.drain_deadline,
                 ),
                 deadline=self.worker.drain_deadline,
+                verify_outcome=verify_handover,
             )
         except ComposerOperationCancelledDuringTurn:
             return await self.settle(await self.record(), original)
-        if type(receipt) is not ComposerSegmentRecoveryReceipt or receipt.released_context is not self.running.session_operation_context:
-            raise AuditIntegrityError("V2 handover lost its actual committing release receipt")
-        # Consume already released atomically. Read back immutable history; a
-        # peer may be running now. Never try another release after a read error.
-        await _owned(
-            run_sync_in_worker(
-                self.services.session_service.session_operation_authority.verify_recovery, receipt, deadline=self.worker.drain_deadline
-            )
-        )
         return ContinuationSegmentHandedOver(receipt)
 
-    async def advance(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ComposerOperationRecord | None:
+    async def advance(
+        self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState
+    ) -> ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None:
         root, top = selected.stack, selected.stack.frames[-1]
         if type(top) is InitializeFrame:
             if top.ingress_phase == "reserved":
@@ -401,7 +433,7 @@ class _SegmentDriver:
             self.phases.bind_initial(runtime)
             return None
         if type(top) is ComposeFrame and top.phase == "action_ready":
-            if self.phases.runtime is None and _is_first_compose_iteration(top):
+            if self.phases.runtime is None and _is_first_compose_iteration(top) and not _has_committed_primary(root):
                 runtime = await initialize_continuation_composition(
                     service=self.service, authority=self.authority, selected=stored, required_work=self.work, provider_owner=self.provider
                 )
@@ -434,6 +466,8 @@ class _SegmentDriver:
                 provider_owner=self.provider,
                 timeout=policy.actions.primary.total,
             )
+            if isinstance(primary_result, PrimaryNoSdkRefusalReceipt):
+                return primary_result
             if delivery is not None:
                 runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
             self.phases.accept_primary(primary_result)
@@ -454,7 +488,93 @@ class _SegmentDriver:
         )
         return None
 
-    async def watch_stage(self, stage: asyncio.Task[ComposerOperationRecord | None], reader: ComposerOperationWatchReader) -> None:
+    async def pending_control(self, selected: SelectedContinuationState) -> StoredContinuationControlIntent | None:
+        top = selected.stack.frames[-1]
+        if type(top) is not ComposeFrame or top.phase != "action_ready" or not _has_committed_primary(selected.stack):
+            return None
+        _runtime, inventory = await self.phases.current(selected)
+
+        def read() -> tuple[StoredContinuationControlIntent | None]:
+            with locked_session_transaction(self.authority._engine, str(self.running.claim.session_id)) as conn:
+                return (read_pending_control_on_connection(conn, self.running, selected=selected, inventory=inventory),)
+
+        (intent,) = await _registered(work=self.work, source=RequiredWorkSource.CONTINUATION_READ_SQL, operation=read, expected=tuple)
+        if intent is not None and type(intent) is not StoredContinuationControlIntent:
+            raise AuditIntegrityError("model yield lost its actual durable intent DATA")
+        return intent
+
+    async def yield_control(self, stored: StoredContinuationSnapshot, selected: SelectedContinuationState) -> ContinuationSegmentOutcome:
+        """Yield only after the actual phase and watcher cohorts have joined."""
+        self.sql_deadline.begin_settlement()
+        top = selected.stack.frames[-1]
+        if type(top) is not ComposeFrame or top.phase != "action_ready" or not selected.stack.is_handoff_safe:
+            raise AuditIntegrityError("model yield lost its actual quiescent control cut")
+        repository = self.services.session_service.session_operation_authority
+
+        def readback() -> tuple[ComposerSegmentYieldReceipt | None]:
+            value = repository.read_yield_outcome(self.running)
+            if value is not None:
+                repository.verify_yield(value)
+            return (value,)
+
+        async def readback_owned() -> ComposerSegmentYieldReceipt | None:
+            # The registered immutable readback retains the same original
+            # hard/drain lifecycle clock after the committing owner releases.
+            values = await _registered(
+                work=self.work,
+                source=RequiredWorkSource.CONTINUATION_HANDOFF_READBACK_SQL,
+                operation=readback,
+                expected=tuple,
+            )
+            if len(values) != 1 or (values[0] is not None and type(values[0]) is not ComposerSegmentYieldReceipt):
+                raise AuditIntegrityError("model yield lost its actual immutable readback outcome")
+            return values[0]
+
+        async def verify_yield(
+            committed: ComposerSegmentYieldReceipt | None, original: BaseException | None
+        ) -> ComposerSegmentYieldReceipt:
+            if original is not None and not any(original is item for item in self._consumed_native):
+                self._consumed_native.append(original)
+            observed = await readback_owned()
+            if observed is None:
+                if original is not None:
+                    raise original
+                raise AuditIntegrityError("model yield has no actual immutable committed outcome")
+            if (
+                (observed.session_id, observed.operation_id) != (self.running.claim.session_id, self.running.claim.operation_id)
+                or (observed.predecessor_sequence, observed.predecessor_generation)
+                != (self.running.claim.segment_sequence, self.running.claim.ownership_generation)
+                or (observed.successor_sequence, observed.successor_generation)
+                != (self.running.claim.segment_sequence + 1, self.running.claim.ownership_generation + 1)
+                or observed.released_epoch != self.running.session_operation_context.fence.operation_epoch
+                or observed.cursor != stored.cursor + 1
+            ):
+                raise AuditIntegrityError("model yield lost its actual atomic successor/release receipt")
+            if committed is not None and observed != committed:
+                raise AuditIntegrityError("model yield readback differs from its actual committing receipt")
+            return observed if committed is None else committed
+
+        try:
+            receipt = await self.lease.consume_continuation_handoff(
+                partial(
+                    repository.commit_checkpoint_and_successor,
+                    self.running,
+                    expected_head=None if top.current_state_id is None else UUID(top.current_state_id),
+                    expected_checkpoint_id=stored.checkpoint_id,
+                    expected_cursor=stored.cursor,
+                    snapshot_json=stored.payload_json,
+                    reason="model_request",
+                ),
+                deadline=self.worker.drain_deadline,
+                verify_outcome=verify_yield,
+            )
+        except ComposerOperationCancelledDuringTurn:
+            return await self.settle(await self.record())
+        return ContinuationSegmentYielded(receipt)
+
+    async def watch_stage(
+        self, stage: asyncio.Task[ComposerOperationRecord | PrimaryNoSdkRefusalReceipt | None], reader: ComposerOperationWatchReader
+    ) -> None:
         key = (self.running.claim.session_id, self.running.claim.operation_id)
         stop_delivered = False
         try:
@@ -494,6 +614,10 @@ class _SegmentDriver:
             stage.cancel(COMPOSER_LEASE_LOST)
             raise
 
+    def _worker_is_draining(self) -> bool:
+        """Read live drain state afresh across asynchronous phase boundaries."""
+        return self.worker.drain_deadline is not None
+
     async def run(self, adoption_failure: BaseException | None) -> ContinuationSegmentOutcome:
         from elspeth.web.sessions.composer_async_worker import _finish_operation_watcher, _OperationWatchObservation, _StartedSettlement
 
@@ -502,15 +626,21 @@ class _SegmentDriver:
         while True:
             self.sql_deadline.begin_settlement()
             self.lease.raise_if_lost()
+            if self._worker_is_draining():
+                return await self.dispose()
             record = await self.record()
             if record.cancel_requested_at is not None:
                 return await self.settle(record)
-            names = await _read_current_env_names(self.service._advisor_checkpoint, str(self.running.claim.session_id))
+            names = await read_disposition_env_names(
+                advisor=self.service._advisor_checkpoint, authority=self.authority, required_work=self.work
+            )
             if (await self.read_failure(names)).source is not None:
                 return await self.settle(record)
-            if self.worker.drain_deadline is not None:
+            if self._worker_is_draining():
                 return await self.dispose()
             stored, selected = await self.selected()
+            if await self.pending_control(selected) is not None:
+                return await self.yield_control(stored, selected)
             policy = decode_continuation_policy(selected.stack.admission_policy_json, selected.stack.policy_hash)
             started_read = time.monotonic()
             timing = await _registered(
@@ -565,6 +695,18 @@ class _SegmentDriver:
                     return await self.dispose(original)
                 return await self.settle(await self.record(), original)
             if result is not None:
+                if type(result) is PrimaryNoSdkRefusalReceipt:
+                    from elspeth.web.sessions.composer_async_worker import _StartedSettlement
+
+                    if result.terminal.status != "failed":
+                        raise AuditIntegrityError("PRIMARY no-SDK refusal lost its failed terminal")
+                    await self.worker._verify_terminal_before_release(
+                        self.running,
+                        self.lease,
+                        result.terminal,
+                        _StartedSettlement(deferred_cancellations=list(result.deferred_cancellations), terminal_receipt=result.terminal),
+                    )
+                    return ContinuationSegmentSettled(result.terminal)
                 # The END owner already committed this terminal together with
                 # its assistant row and audit cohort (the shared R2 composite).
                 if type(result) is not ComposerOperationRecord or result.status != "completed":

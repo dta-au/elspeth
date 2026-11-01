@@ -67,6 +67,13 @@ class ContinuationProviderCostPolicy(ContinuationValue):
     accounting_owner: Literal["physical_audit_and_token_ledger"]
 
 
+class ContinuationProviderCostPolicyV2(ContinuationValue):
+    applicability: Literal["continuation_v2"]
+    lifecycle_version: Literal[2]
+    accounting_owner: Literal["physical_audit_and_token_ledger"]
+    admission_policy_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class PrivateChunkRef(ContinuationValue):
     codec: Literal[
         "composer.messages.v1",
@@ -85,6 +92,7 @@ class PrivateChunkRef(ContinuationValue):
         "composer.caches.v1",
         "composer.attachment-admissions.v1",
         "composer.response.v1",
+        "composer.primary-no-sdk-refusal.v1",
         "composer.title-input.v1",
         "composer.title-provider-result.v1",
         "composer.semantic-frontier.v1",
@@ -227,7 +235,7 @@ class ContinuationFrameStack(ContinuationValue):
     schema_version: Literal["composer.continuation.snapshot.v1"] = "composer.continuation.snapshot.v1"
     logical: LogicalRequestBinding
     mutation_ceiling: MutationCeilingSnapshot
-    provider_cost_policy: ContinuationProviderCostPolicy
+    provider_cost_policy: ContinuationProviderCostPolicy | ContinuationProviderCostPolicyV2
     policy_hash: str
     admission_policy_json: str
     cursor: int = Field(ge=0)
@@ -257,6 +265,11 @@ class ContinuationFrameStack(ContinuationValue):
     @model_validator(mode="after")
     def require_unique_effects(self) -> ContinuationFrameStack:
         self.mutation_ceiling.require_logical(self.logical)
+        if (
+            type(self.provider_cost_policy) is ContinuationProviderCostPolicyV2
+            and self.provider_cost_policy.admission_policy_hash != self.policy_hash
+        ):
+            raise ValueError("Continuation cost policy lost its admitted policy binding")
         if (self.active_action_json is None) != (self.active_action_source is None):
             raise ValueError("prescribed action lost its exact actual Advisor source")
         keys = tuple(effect.effect_id for effect in self.effect_frontier)
@@ -349,6 +362,11 @@ def prepare_composer_continuation_admission(
     original_user_message_id: str | None = None,
 ) -> ContinuationAdmissionSeed:
     from elspeth.web.composer.continuation_codec import encode_continuation_snapshot, require_continuation_request_admission
+    from elspeth.web.composer.continuation_policy import (
+        ContinuationAdmissionPolicyV2,
+        ContinuationAdmissionPolicyV3,
+        decode_continuation_policy,
+    )
 
     if kind == "compose_recompose":
         if original_user_message_id is None:
@@ -359,6 +377,7 @@ def prepare_composer_continuation_admission(
             raise AuditIntegrityError("compose cannot choose another original message")
         message_id = reserved_user_message_id(session_id, operation_id)
     require_continuation_request_admission(request_json)
+    admitted_policy = decode_continuation_policy(admission_policy_json, policy_hash)
     stack = ContinuationFrameStack(
         logical=LogicalRequestBinding(
             session_id=str(session_id),
@@ -373,10 +392,19 @@ def prepare_composer_continuation_admission(
             request_id=message_id,
             initial_trust_mode=initial_trust_mode,
         ),
-        provider_cost_policy=ContinuationProviderCostPolicy(
-            applicability="not_applicable",
-            lifecycle_version=2,
-            accounting_owner="physical_audit_and_token_ledger",
+        provider_cost_policy=(
+            ContinuationProviderCostPolicyV2(
+                applicability="continuation_v2",
+                lifecycle_version=2,
+                accounting_owner="physical_audit_and_token_ledger",
+                admission_policy_hash=policy_hash,
+            )
+            if type(admitted_policy) in (ContinuationAdmissionPolicyV2, ContinuationAdmissionPolicyV3)
+            else ContinuationProviderCostPolicy(
+                applicability="not_applicable",
+                lifecycle_version=2,
+                accounting_owner="physical_audit_and_token_ledger",
+            )
         ),
         policy_hash=policy_hash,
         admission_policy_json=admission_policy_json,

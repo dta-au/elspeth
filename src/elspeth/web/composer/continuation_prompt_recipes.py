@@ -7,6 +7,7 @@ from pydantic import Field
 from elspeth.web.composer.continuation import ContinuationValue
 from elspeth.web.composer.continuation_message_family_recipes import (
     AttachmentResultMessageRecipe,
+    ControlResultMessageRecipe,
     FailureSchemaMessageRecipe,
     NativeThinkingMessageRecipe,
     ToolCallArgumentsMessageRecipe,
@@ -48,6 +49,7 @@ ContinuationMessageRecipe = Annotated[
     | FailureSchemaMessageRecipe
     | AttachmentResultMessageRecipe
     | ToolResultMessageRecipe
-    | ToolFeedbackMessageRecipe,
+    | ToolFeedbackMessageRecipe
+    | ControlResultMessageRecipe,
     Field(discriminator="kind"),
 ]

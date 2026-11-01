@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -104,6 +105,40 @@ class ComposerOperationWatchReader:
         # Segment and action clocks own the cutoff. A process drain is observed
         # by the stage owner, which keeps watching durable Stop until its own
         # cutoff.
+
+    def permits_process_drain(self, instance_draining: threading.Event) -> bool:
+        """Keep this live segment's bounded Stop read inside its original drain.
+
+        A process latch alone grants nothing. The actual signal, worker,
+        registered coordinator and physical SQL clock must still be the same
+        owners, and ordinary or unavailable generations remain refused by the
+        submission owner.
+        """
+        from elspeth.web.sessions.continuation_sql_deadline import ContinuationSQLDeadlineOwner
+
+        deadline = self.worker.drain_deadline
+        signal = self.worker._drain_signal
+        if deadline is None or signal is None or signal.started_at is None:
+            return False
+        self.check_cutoff()
+        work = self.lease.required_work
+        key = (self.running.claim.session_id, self.running.claim.operation_id)
+        if (
+            self.worker._instance_draining is not instance_draining
+            or signal.draining is not instance_draining
+            or work is None
+            or self.worker._required_coordinators.get(key) is not work
+            or type(work.sql_deadline_owner) is not ContinuationSQLDeadlineOwner
+        ):
+            raise AuditIntegrityError("Drain observation lost its actual registered process/segment owner")
+        owner = work.sql_deadline_owner
+        if owner.running is not self.running or owner.drain_signal is not signal:
+            raise AuditIntegrityError("Drain observation changed its original physical SQL owner")
+        owner.validate_context(self.lease.context, operation_id=self.running.claim.operation_id, attempt=self.running.claim.attempt)
+        if deadline.expires_at != signal.started_at + owner.drain_seconds:
+            raise AuditIntegrityError("Drain observation changed its original signal deadline")
+        owner.remaining_statement(session_id=str(self.running.claim.session_id), deadline=deadline, lifecycle=True)
+        return True
 
     def issue_refusal(
         self,

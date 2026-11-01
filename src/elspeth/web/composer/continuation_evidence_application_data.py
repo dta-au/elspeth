@@ -412,6 +412,7 @@ def build_portable_p4_application(
     after = admit_turn_evidence(
         after_snapshot,
         env_ref_names=env_ref_names,
+        mandatory_retention=True,
         source_chunks=(audit, *admitted.sources.chunks, response_chunk, pending_batch_chunk, prepared_chunk, result_chunk),
     )
     require_admitted_p4_application(after, result_chunk=result_chunk, result=result, producer=producer, env_ref_names=env_ref_names)

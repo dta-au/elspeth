@@ -29,6 +29,7 @@ from pydantic import (
 )
 
 from elspeth.contracts.auth import AuthProviderType
+from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.prompt_guard import PromptGuardMode
 from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
@@ -388,11 +389,11 @@ class WebSettings(BaseModel):
         ),
     )
     composer_timeout_seconds: float = Field(..., gt=0)
-    # Direct planner policy and legacy eligible Web v1 compatibility bounds.
-    # Common v1 preserves physical calls, exact request bytes, completion and
-    # post-call cost; v2 has no legacy planner policy. The repair value is
-    # facade compatibility only: default 2 does not control common repair;
-    # a nondefault value refuses eligible v1 admission before provider work.
+    # Existing direct-planner and legacy v1 limits also bind newly admitted
+    # Continuation v2 PRIMARY/Advisor calls for one logical Compose request.
+    # TITLE has independent accounting and does not consume this budget.
+    # The repair value remains a supported-configuration sentinel: only 2 is
+    # admitted, and it does not reset or size the common repair counter.
     composer_planner_max_provider_calls: int = Field(default=75, strict=True, ge=1)
     composer_planner_max_request_bytes: int = Field(default=2 * 1024 * 1024, strict=True, ge=1)
     composer_planner_max_completion_tokens: int = Field(default=16_384, strict=True, ge=1)
@@ -446,6 +447,19 @@ class WebSettings(BaseModel):
     composer_continuation_quantum_seconds: float = Field(default=180.0, gt=0, le=86_400, allow_inf_nan=False)
     composer_continuation_settlement_reserve_seconds: float = Field(default=25.0, gt=0, le=86_400, allow_inf_nan=False)
     composer_continuation_action_bounds: ContinuationActionBoundsSettings = Field(default_factory=ContinuationActionBoundsSettings)
+    # No production value is inferred. A fresh V3 operation requires an
+    # explicit operator-selected allowance; stored V1/V2 policy is unchanged.
+    composer_continuation_max_retained_payload_bytes: int | None = Field(
+        default=None,
+        strict=True,
+        ge=1,
+        le=_CANONICAL_SAFE_INTEGER_MAX,
+        description=(
+            "Maximum actual retained chunk payload bytes for one new Composer logical operation, "
+            "including historical and off-head keys. Omission disables fresh V3 admission; "
+            "it does not mean unlimited storage."
+        ),
+    )
 
     @property
     def composer_sync_timeout_seconds(self) -> float:

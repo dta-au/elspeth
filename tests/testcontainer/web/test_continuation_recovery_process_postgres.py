@@ -12,6 +12,7 @@ import socket
 import threading
 import time
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -227,14 +228,15 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     from litellm.types.utils import ModelResponse
     from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
     from tests.helpers.composer_pg_http import pg_http_settings
+    from tests.helpers.continuation_app import end_admit
     from tests.helpers.fenced_session import seed_token_policies
 
     import elspeth.web.app as application
     from elspeth.web.auth.local import LocalAuthProvider
-    from elspeth.web.composer import prompt_guard_clients, provider_quota
+    from elspeth.web.composer import prompt_guard_clients, provider_gateway, provider_quota
     from elspeth.web.composer_server import run_composer_server
     from elspeth.web.process_watchdog import ProcessWatchdog
-    from elspeth.web.sessions import continuation_driver
+    from elspeth.web.sessions import composer_async_worker, continuation_driver
     from elspeth.web.sessions.composer_app_services import composer_app_services
     from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
     from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt
@@ -267,6 +269,8 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     os.environ["OPENAI_API_KEY"] = "offline-pg-http-test-only-not-a-provider-credential"
     os.environ["LITELLM_MODE"] = "PRODUCTION"
     apps, calls, claims = [], [], []
+    call_families, issued_families = [], {}
+    active_custody = ContextVar("sigterm_actual_provider_custody", default=None)
     sql_observations = []
     allowances, last_setup = {}, {}
     observation_lock = threading.Lock()
@@ -276,8 +280,10 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     timing_sql = "SELECT pg_catalog.set_config('lock_timeout', %s, true), pg_catalog.set_config('statement_timeout', %s, true)"
     advisory_sql = "SELECT pg_catalog.pg_advisory_xact_lock(%s, pg_catalog.hashtext(%s))"
 
-    def observed_remaining(owner, *, session_id, deadline=None, lifecycle=False):
-        remaining = original_remaining(owner, session_id=session_id, deadline=deadline, lifecycle=lifecycle)
+    def observed_remaining(owner, *, session_id, deadline=None, lifecycle=False, paid_settlement=False):
+        remaining = original_remaining(
+            owner, session_id=session_id, deadline=deadline, lifecycle=lifecycle, paid_settlement=paid_settlement
+        )
         allowances[threading.get_ident()] = remaining
         return remaining
 
@@ -319,16 +325,17 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
                 sql_observations.append(record)
                 _process_receipt(directory, "sql", sql_observations)
             return result
-        if query == advisory_sql and deadline is not None:
+        metadata_select = type(query) is str and query.startswith("SELECT user_secrets.name")
+        if (query == advisory_sql or metadata_select) and deadline is not None:
             pid = cursor.connection.info.backend_pid
             actual = actual_timeouts(cursor)
             with observation_lock:
                 setup = last_setup.get(pid)
                 sql_observations.append(
                     {
-                        "kind": "lock",
+                        "kind": "metadata-select" if metadata_select else "lock",
                         "pid": pid,
-                        "session_id": params[1],
+                        "session_id": str(session_id) if metadata_select else params[1],
                         "at": started,
                         "setup_index": None if setup is None else setup["index"],
                         "requested_ms": None if setup is None else setup["requested_ms"],
@@ -340,7 +347,9 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
                 return original_cursor_execute(cursor, query, params, prepare=prepare, binary=binary)
             except psycopg.Error as error:
                 with observation_lock:
-                    sql_observations.append({"kind": "lock-error", "pid": pid, "sqlstate": error.sqlstate})
+                    sql_observations.append(
+                        {"kind": "metadata-error" if metadata_select else "lock-error", "pid": pid, "sqlstate": error.sqlstate}
+                    )
                     _process_receipt(directory, "sql", sql_observations)
                 raise
         return original_cursor_execute(cursor, query, params, prepare=prepare, binary=binary)
@@ -361,16 +370,41 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     def guard_client(configuration):
         return prompt_guard_clients.AzurePromptGuardClient(configuration, http_transport=httpx.MockTransport(guard_response))
 
+    original_mint = provider_quota.ProviderInvocationOwner.mint
+    original_physical = provider_gateway._litellm_acompletion
+
+    def observed_mint(owner, family):
+        custody = original_mint(owner, family)
+        assert custody not in issued_families
+        issued_families[custody] = family
+        return custody
+
+    async def observed_physical(*args, **kwargs):
+        custody = kwargs["provider_custody"]
+        assert type(custody) is provider_quota.ProviderCallCustody and custody in issued_families
+        token = active_custody.set(custody)
+        try:
+            return await original_physical(*args, **kwargs)
+        finally:
+            active_custody.reset(token)
+
     async def offline_sdk(**kwargs):
-        span = provider_quota._SPAN.get()
-        assert span is not None and span.attempt is not None
-        sid = span.scope.context.fence.session_id
-        attempt_id = span.attempt.attempt_id
+        custody = active_custody.get()
+        assert type(custody) is provider_quota.ProviderCallCustody and custody.attempt is not None
+        family = issued_families[custody]
+        sid = custody.context.fence.session_id
+        attempt_id = custody.attempt.attempt_id
         calls.append(attempt_id)
+        call_families.append(family.name)
         assert len(calls) <= 2, "unexpected physical provider replay"
-        _process_receipt(directory, "sdk", {"attempt_id": attempt_id, "session_id": sid, "at": time.monotonic()})
+        _process_receipt(directory, "sdk", {"attempt_id": attempt_id, "session_id": sid, "family": family.name, "at": time.monotonic()})
         if mode == "peer":
-            raise AssertionError("peer redispatched the retained original provider action")
+            assert family is provider_quota.ProviderInvocationFamily.ADVISOR, "peer redispatched the paid PRIMARY"
+            assert len(calls) == 1, "peer repeated its fresh END review"
+            content = json.dumps(end_admit())
+        else:
+            assert family is provider_quota.ProviderInvocationFamily.PRIMARY
+            content = "The request was explained."
         if mode == "uncertain":
             try:
                 await _hold_physical_cut()
@@ -379,9 +413,7 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
                 raise
         return ModelResponse(
             model=kwargs["model"],
-            choices=[
-                {"finish_reason": "stop", "message": {"role": "assistant", "content": "The request was explained.", "tool_calls": None}}
-            ],
+            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": content, "tool_calls": None}}],
             usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
         )
 
@@ -397,6 +429,51 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     original_factory = application.create_app
     original_claim = ComposerAsyncOperationAuthority.claim_segment
     original_suspend = PostgresSessionOperationRepository.suspend_composer_segment
+    original_segment = composer_async_worker.run_continuation_segment
+    original_dispose = continuation_driver._SegmentDriver.dispose
+
+    def safe_failure(error, seen=None):
+        seen = {} if seen is None else seen
+        if id(error) in seen:
+            return {"original_ref": seen[id(error)]}
+        index = len(seen)
+        seen[id(error)] = index
+        frames = []
+        traceback = error.__traceback__
+        while traceback is not None:
+            frames.append({"function": traceback.tb_frame.f_code.co_name, "line": traceback.tb_lineno})
+            traceback = traceback.tb_next
+        result = {"original": index, "type": type(error).__name__, "frames": frames}
+        if isinstance(error, asyncio.CancelledError):
+            result["markers"] = [value if type(value) is str else type(value).__name__ for value in error.args]
+        if isinstance(error, BaseExceptionGroup):
+            result["children"] = [safe_failure(child, seen) for child in error.exceptions]
+        if error.__cause__ is not None:
+            result["cause"] = safe_failure(error.__cause__, seen)
+        elif error.__context__ is not None:
+            result["context"] = safe_failure(error.__context__, seen)
+        return result
+
+    async def observed_segment(worker, services, running, lease, **kwargs):
+        try:
+            outcome = await original_segment(worker, services, running, lease, **kwargs)
+        except BaseException as original:
+            _process_receipt(directory, "segment-failed", safe_failure(original))
+            raise
+        _process_receipt(directory, "segment-returned", {"type": type(outcome).__name__})
+        return outcome
+
+    async def observed_dispose(driver, original=None):
+        _process_receipt(
+            directory,
+            "disposition-entered",
+            {
+                "sequence": driver.running.claim.segment_sequence,
+                "generation": driver.running.claim.ownership_generation,
+                "original": None if original is None else safe_failure(original),
+            },
+        )
+        return await original_dispose(driver, original)
 
     def observed_suspend(repository, running, *, retry_delay_seconds=0.0, deadline=None):
         receipt = original_suspend(repository, running, retry_delay_seconds=retry_delay_seconds, deadline=deadline)
@@ -423,9 +500,10 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
         )
         return receipt
 
-    def observed_claim(authority, *, limit):
+    def observed_claim(authority, *, limit, excluded_operations=frozenset()):
         started = time.monotonic()
-        result = original_claim(authority, limit=limit)
+        result = original_claim(authority, limit=limit, excluded_operations=excluded_operations)
+        assert all((item.session_id, item.operation_id) not in excluded_operations for item in result)
         claims.append({"at": started, "claimed": [item.operation_id for item in result]})
         return result
 
@@ -501,6 +579,7 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
                         "worker_completed": True,
                         "claims": claims,
                         "sdk_calls": calls,
+                        "sdk_families": call_families,
                     },
                 )
             except BaseException as error:
@@ -515,6 +594,10 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(litellm, "acompletion", offline_sdk)
+        patch.setattr(provider_quota.ProviderInvocationOwner, "mint", observed_mint)
+        patch.setattr(provider_gateway, "_litellm_acompletion", observed_physical)
+        patch.setattr(composer_async_worker, "run_continuation_segment", observed_segment)
+        patch.setattr(continuation_driver._SegmentDriver, "dispose", observed_dispose)
         patch.setattr(prompt_guard_clients, "build_prompt_guard_client", guard_client)
         patch.setattr(continuation_driver, "run_continuation_primary", retained_primary)
         patch.setattr(ComposerAsyncOperationAuthority, "claim_segment", observed_claim)
@@ -673,7 +756,50 @@ def _actual_operation_rows(engine, sid, operation):
                 for envelope in message.tool_calls
                 if envelope.get("_kind") == "llm_call_audit"
             },
+            "provider_audit_rows": {
+                message.id: message
+                for message in messages
+                if message.role == "audit"
+                and message.tool_calls
+                and any(envelope.get("_kind") in {"llm_call_audit", "composer_diagnostic_evidence"} for envelope in message.tool_calls)
+            },
         }
+
+
+def _assert_retained_primary_and_one_fresh_end(peer, before, after):
+    """Preserve every original paid row while admitting only the new END call."""
+    original_ids = {row.attempt_id for row in before["physical"]}
+    physical_after = {row.attempt_id: row for row in after["physical"]}
+    assert {key: physical_after[key] for key in original_ids} == {row.attempt_id: row for row in before["physical"]}
+    fresh_ids = set(physical_after) - original_ids
+    assert len(fresh_ids) == 1
+    (fresh_id,) = fresh_ids
+    fresh = physical_after[fresh_id]
+    successor = after["attempts"][-1]
+    assert successor.owner_instance_id == peer["instance_id"]
+    assert (fresh.operation_id, fresh.operation_epoch, fresh.lease_token) == (
+        successor.session_operation_id,
+        successor.session_operation_epoch,
+        successor.session_operation_lease_token,
+    )
+    assert fresh.settled_at is not None
+    ledger_after = {row.entry_id: row for row in after["ledger"]}
+    original_ledger = {row.entry_id: row for row in before["ledger"]}
+    assert {key: ledger_after[key] for key in original_ledger} == original_ledger
+    assert set(ledger_after) - set(original_ledger) == {fresh.ledger_entry_id}
+    assert {key: after["audit"][key] for key in before["audit"]} == before["audit"]
+    assert set(after["audit"]) - set(before["audit"]) == {fresh_id}
+    # Full rows include the original public companion and private request,
+    # response and failure receipts, not just public token-call metadata.
+    assert {key: after["provider_audit_rows"][key] for key in before["provider_audit_rows"]} == before["provider_audit_rows"]
+    effects_after = {effect.effect_key: effect for effect in after["effects"]}
+    assert {effect.effect_key: effects_after[effect.effect_key] for effect in before["effects"]} == {
+        effect.effect_key: effect for effect in before["effects"]
+    }
+    actual = json.loads((peer["directory"] / "sdk.json").read_text())
+    assert actual["attempt_id"] == fresh_id and actual["session_id"] == peer["session_id"]
+    assert actual["family"] == "ADVISOR"
+    return fresh_id
 
 
 @contextmanager
@@ -683,7 +809,7 @@ def _authenticated_process_client(host):
     with httpx.Client(base_url=host["url"], timeout=5, trust_env=False) as client:
         login = client.post("/api/auth/login", json={"username": "sigterm-user", "password": "test sigterm password"})
         assert login.status_code == 200
-        client.headers.update({"Authorization": f"Bearer {login.json()['access_token']}", "Composer-Operation-Version": "2"})
+        client.headers.update({"Authorization": f"Bearer {login.json()['access_token']}"})
         yield client
 
 
@@ -691,15 +817,21 @@ def _submit_process_operation(client, host, engine, *, mode):
     from tests.helpers.composer_operations import message_body
 
     from elspeth.web.composer.continuation import ComposeFrame
+    from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
     operation = str(uuid4())
+    body = message_body("Explain this request without changing the pipeline.", operation_id=operation)
     response = client.post(
         f"/api/sessions/{host['session_id']}/messages",
-        json=message_body("Explain this request without changing the pipeline.", operation_id=operation),
+        json=body,
     )
     assert response.status_code == 202, response.text
-    assert response.headers["Composer-Operation-Version"] == "2"
-    assert response.request.headers["Composer-Operation-Version"] == "2" and response.json()["operation_id"] == operation
+    acknowledgement = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
+    assert json.loads(response.request.content) == body
+    assert acknowledgement.operation_id == body["operation_id"] == operation
+    assert acknowledgement.kind == "compose_message" and acknowledgement.status in ("queued", "running")
+    assert acknowledgement.segment is not None
+    assert (acknowledgement.segment.sequence, acknowledgement.segment.generation) == (1, 1)
 
     def cut():
         if mode != "prestart":
@@ -717,9 +849,26 @@ def _submit_process_operation(client, host, engine, *, mode):
         assert frame.phase == ("awaiting_response" if mode == "uncertain" else "response_retained")
         assert len(rows["physical"]) == 1 and len(rows["attempts"]) == 1
         (physical,) = rows["physical"]
-        (effect,) = [effect for effect in rows["effects"] if effect.provider_attempt_id == physical.attempt_id]
+        (attempt,) = rows["attempts"]
+        sdk_receipt = json.loads((host["directory"] / "sdk.json").read_text())
+        assert sdk_receipt["attempt_id"] == physical.attempt_id and sdk_receipt["session_id"] == host["session_id"]
+        assert sdk_receipt["family"] == "PRIMARY"
+        assert (physical.operation_id, physical.operation_epoch, physical.lease_token) == (
+            attempt.session_operation_id,
+            attempt.session_operation_epoch,
+            attempt.session_operation_lease_token,
+        )
+        (effect,) = [effect for effect in rows["effects"] if effect.effect_key == frame.provider_effect_key]
+        assert effect.input_sha256 == frame.provider_input_sha256
+        assert (effect.creator_sequence, effect.creator_generation) == (attempt.sequence, attempt.generation)
         assert effect.disposition == ("dispatched" if mode == "uncertain" else "committed")
-        if mode != "uncertain":
+        if mode == "uncertain":
+            # The response-retention transaction binds provider_attempt_id;
+            # the actual pre-return cut owns the dispatched logical effect.
+            assert effect.provider_attempt_id is None and effect.result_chunk_key is None and effect.receipt_key is None
+            assert frame.pending_response is None and physical.settled_at is None and physical.ledger_entry_id is None
+        else:
+            assert effect.provider_attempt_id == physical.attempt_id
             assert frame.pending_response is not None and effect.result_chunk_key is not None
             assert physical.settled_at is not None and len(rows["ledger"]) == 1
             assert physical.ledger_entry_id == rows["ledger"][0].entry_id and physical.attempt_id in rows["audit"]
@@ -768,7 +917,23 @@ def _assert_actual_handover(host, engine, operation, before, original_fence):
     from elspeth.web.sessions.continuation import read_chunk
     from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 
-    receipt = json.loads((host["directory"] / "handover.json").read_text())
+    path = host["directory"] / "handover.json"
+    if not path.exists():
+        rows = _actual_operation_rows(engine, host["session_id"], operation)
+        diagnostics = {
+            "status": rows["parent"].status,
+            "failure_code": rows["parent"].failure_code,
+            "generation": rows["parent"].ownership_generation,
+            "attempts": [[row.generation, row.outcome] for row in rows["attempts"]],
+            "effects": [[row.effect_key, row.disposition] for row in rows["effects"]],
+            "receipts": {
+                name: json.loads((host["directory"] / f"{name}.json").read_text())
+                for name in ("disposition-entered", "segment-failed", "segment-returned")
+                if (host["directory"] / f"{name}.json").exists()
+            },
+        }
+        pytest.fail(f"actual paid cut did not commit its handover: {json.dumps(diagnostics)}", pytrace=False)
+    receipt = json.loads(path.read_text())
     assert receipt["session_id"] == host["session_id"] and receipt["operation_id"] == operation
     assert receipt["sequence"] == before["segments"][0].sequence
     assert receipt["previous_generation"] == before["parent"].ownership_generation
@@ -838,6 +1003,7 @@ def test_actual_sigterm_stream_full_lifespan_and_paid_cut_postgres(sigterm_hosts
                 latest = min(latest, held_at + 2)
             owner_receipt = _signal_and_require_normal_exit(host, engine, earliest=held_at + 1 if grace == 30 else None, latest=latest)
         assert len(owner_receipt["sdk_calls"]) == 1
+        assert owner_receipt["sdk_families"] == ["PRIMARY"]
         if mode == "retained":
             handover = _assert_actual_handover(host, engine, operation, before, original_fence)
         if peer is None:
@@ -855,11 +1021,9 @@ def test_actual_sigterm_stream_full_lifespan_and_paid_cut_postgres(sigterm_hosts
                 lambda: response if (response := peer_client.get(path)).json()["status"] in ("completed", "failed") else None
             )
             after = _actual_operation_rows(engine, host["session_id"], operation)
-            assert after["physical"] == before["physical"] if mode == "retained" else len(after["physical"]) == 1
-            assert [row.attempt_id for row in after["physical"]] == [row.attempt_id for row in before["physical"]]
             if mode == "retained":
-                assert final.json()["status"] == "completed" and after["ledger"] == before["ledger"]
-                assert after["audit"] == before["audit"]
+                assert final.json()["status"] == "completed"
+                fresh_end = _assert_retained_primary_and_one_fresh_end(peer, before, after)
                 assert len(after["segments"]) == 1 and after["segments"][0].sequence == before["segments"][0].sequence
                 assert after["parent"].ownership_generation == before["parent"].ownership_generation + 1
                 original, successor = after["attempts"]
@@ -869,6 +1033,8 @@ def test_actual_sigterm_stream_full_lifespan_and_paid_cut_postgres(sigterm_hosts
                 assert successor.generation == handover["generation"]
                 assert [event.tag for event in after["events"]].count("recovered") == 1
             else:
+                assert len(after["physical"]) == 1
+                assert [row.attempt_id for row in after["physical"]] == [row.attempt_id for row in before["physical"]]
                 assert final.json()["status"] == "failed" and after["parent"].failure_code == "worker_lost"
                 assert (host["directory"] / "sdk-cancelled.json").exists()
                 (physical,) = after["physical"]
@@ -876,13 +1042,17 @@ def test_actual_sigterm_stream_full_lifespan_and_paid_cut_postgres(sigterm_hosts
                 assert physical.settled_at is not None and physical.ledger_entry_id == after["ledger"][0].entry_id
                 assert after["ledger"][0].prompt_tokens is None and after["ledger"][0].completion_tokens is None
                 assert physical.attempt_id in after["audit"]
-                assert [effect.disposition for effect in after["effects"] if effect.provider_attempt_id == physical.attempt_id] == [
-                    "unknown"
-                ]
+                unknown_key = before["snapshot"].frames[-1].provider_effect_key
+                (unknown_effect,) = [effect for effect in after["effects"] if effect.effect_key == unknown_key]
+                assert unknown_effect.disposition == "unknown" and unknown_effect.result_chunk_key is None
                 assert [event.tag for event in after["events"]].count("effect_unknown") == 1
                 assert len(after["attempts"]) == 1
-            assert not (peer["directory"] / "sdk.json").exists(), "reconnect/resume re-entered the paid action"
-            assert _signal_and_require_normal_exit(peer, engine)["sdk_calls"] == []
+            peer_receipt = _signal_and_require_normal_exit(peer, engine)
+            if mode == "retained":
+                assert peer_receipt["sdk_calls"] == [fresh_end] and peer_receipt["sdk_families"] == ["ADVISOR"]
+            else:
+                assert not (peer["directory"] / "sdk.json").exists(), "unknown recovery re-entered the paid action"
+                assert peer_receipt["sdk_calls"] == peer_receipt["sdk_families"] == []
 
 
 @pytest.mark.parametrize("grace", (30, 60), ids=("ecs30", "aca60"))
@@ -978,7 +1148,18 @@ def test_actual_sigterm_physical_lock_deadline_opposition_postgres(sigterm_hosts
                         for item in finished_sql
                     )
                 unchanged = _actual_operation_rows(engine, host["session_id"], operation)
-                for key in ("parent", "segments", "attempts", "effects", "events", "physical", "ledger", "audit", "snapshot"):
+                for key in (
+                    "parent",
+                    "segments",
+                    "attempts",
+                    "effects",
+                    "events",
+                    "physical",
+                    "ledger",
+                    "audit",
+                    "provider_audit_rows",
+                    "snapshot",
+                ):
                     assert unchanged[key] == before[key], f"deadline left a partial {key} cut"
         # Both branches leave the genuine complete retained result for ordinary
         # peer recovery. No lease is forged/expired or timeout/grace enlarged.
@@ -987,6 +1168,92 @@ def test_actual_sigterm_physical_lock_deadline_opposition_postgres(sigterm_hosts
             path = f"/api/sessions/{host['session_id']}/operations/{operation}"
             _await_process_fact(lambda: peer_client.get(path).json()["status"] == "completed", timeout=40)
             after = _actual_operation_rows(engine, host["session_id"], operation)
-            assert after["physical"] == before["physical"] and after["ledger"] == before["ledger"] and after["audit"] == before["audit"]
+            fresh_end = _assert_retained_primary_and_one_fresh_end(peer, before, after)
             assert len(after["segments"]) == 1 and [event.tag for event in after["events"]].count("recovered") == 1
-            assert _signal_and_require_normal_exit(peer, engine)["sdk_calls"] == []
+            receipt = _signal_and_require_normal_exit(peer, engine)
+            assert receipt["sdk_calls"] == [fresh_end] and receipt["sdk_families"] == ["ADVISOR"]
+
+
+@pytest.mark.parametrize("unbounded", (False, True), ids=("bounded", "omitted-opponent"))
+def test_actual_sigterm_user_metadata_statement_deadline_postgres(sigterm_hosts, unbounded):
+    """Block the real independent user metadata SELECT, preserving paid work."""
+    start, engine = sigterm_hosts
+    host = start("locked-unbounded" if unbounded else "locked", 30)
+    with _authenticated_process_client(host) as client:
+        operation, before = _submit_process_operation(client, host, engine, mode="retained")
+        path = f"/api/sessions/{host['session_id']}/operations/{operation}"
+        with client.stream("GET", f"{path}/stream") as stream:
+            assert stream.status_code == 200
+            first = next(line for line in stream.iter_lines() if line.startswith("data:"))
+            assert json.loads(first.removeprefix("data:").strip())["operation_id"] == operation
+            with engine.begin() as holder:
+                holder.execute(text("LOCK TABLE user_secrets IN ACCESS EXCLUSIVE MODE"))
+                holder_pid = holder.execute(text("SELECT pg_backend_pid()")).scalar_one()
+
+                def waiting_metadata():
+                    path = host["directory"] / "sql.json"
+                    if not path.exists():
+                        return None
+                    observations = json.loads(path.read_text())
+                    with engine.connect() as connection:
+                        for candidate in reversed(observations):
+                            if candidate["kind"] != "metadata-select":
+                                continue
+                            blocked = connection.execute(
+                                text(
+                                    "SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid "
+                                    "WHERE a.pid=:pid AND a.wait_event_type='Lock' AND l.locktype='relation' "
+                                    "AND l.relation='user_secrets'::regclass AND NOT l.granted "
+                                    "AND :holder=ANY(pg_blocking_pids(a.pid))"
+                                ),
+                                {"pid": candidate["pid"], "holder": holder_pid},
+                            ).first()
+                            if blocked is not None:
+                                assert candidate["setup_index"] is not None and candidate["requested_ms"] is not None
+                                setup = observations[candidate["setup_index"]]
+                                assert setup["kind"] == "timeouts" and setup["pid"] == candidate["pid"]
+                                assert setup["requested_ms"] == candidate["requested_ms"] > 0
+                                expected = [0, 0] if unbounded else [candidate["requested_ms"]] * 2
+                                assert setup["effective_ms"] == candidate["effective_ms"] == expected
+                                return candidate
+                    return None
+
+                origin = time.monotonic()
+                os.kill(host["process"].pid, signal.SIGTERM)
+                blocked = _await_process_fact(waiting_metadata, timeout=10)
+                if unbounded:
+                    with pytest.raises(AssertionError, match="host did not exit within the original signal grace"):
+                        _require_normal_exit(host, engine, origin)
+                    assert host["process"].is_alive() and not (host["directory"] / "completed.json").exists()
+                    host["process"].kill()
+                    host["process"].join(timeout=10)
+                    assert host["process"].exitcode == -signal.SIGKILL
+                else:
+                    _require_normal_exit(host, engine, origin)
+                    receipts = json.loads((host["directory"] / "sql.json").read_text())
+                    assert any(
+                        item["kind"] == "metadata-error" and item["pid"] == blocked["pid"] and item["sqlstate"] in ("55P03", "57014")
+                        for item in receipts
+                    )
+                unchanged = _actual_operation_rows(engine, host["session_id"], operation)
+                for key in (
+                    "parent",
+                    "segments",
+                    "attempts",
+                    "effects",
+                    "events",
+                    "physical",
+                    "ledger",
+                    "audit",
+                    "provider_audit_rows",
+                    "snapshot",
+                ):
+                    assert unchanged[key] == before[key], f"metadata timeout left a partial {key} cut"
+        peer = start("peer", 30, host["session_id"])
+        with _authenticated_process_client(peer) as peer_client:
+            _await_process_fact(lambda: peer_client.get(path).json()["status"] == "completed", timeout=40)
+            after = _actual_operation_rows(engine, host["session_id"], operation)
+            fresh_end = _assert_retained_primary_and_one_fresh_end(peer, before, after)
+            assert len(after["segments"]) == 1 and [event.tag for event in after["events"]].count("recovered") == 1
+            receipt = _signal_and_require_normal_exit(peer, engine)
+            assert receipt["sdk_calls"] == [fresh_end] and receipt["sdk_families"] == ["ADVISOR"]

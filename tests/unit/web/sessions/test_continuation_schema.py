@@ -141,6 +141,7 @@ def continuation_parent(tmp_path):
                 ingress_phase="pending",
                 reserved_user_message_id="original",
                 request_hash="a" * 64,
+                continuation_policy_version="composer.continuation.policy.v1",
                 actor_user_id="alice",
                 request_json="{}",
                 created_at=now,
@@ -298,6 +299,11 @@ def snapshot_store(continuation_parent):
     )
     encoded = encode_continuation_snapshot(stack)
     with engine.begin() as connection:
+        connection.execute(
+            update(jobs)
+            .where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)
+            .values(continuation_policy_version="composer.continuation.policy.v2")
+        )
         put_chunk(
             connection,
             session_id=sid,

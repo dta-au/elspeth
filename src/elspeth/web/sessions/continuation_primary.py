@@ -6,10 +6,13 @@ did not happen. Only an actual committed, settled response can be reused.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, replace
-from typing import Any
+from hashlib import sha256
+from typing import Any, Literal
 from uuid import UUID
 
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import Connection, Row, insert, select, update
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
@@ -29,18 +32,24 @@ from elspeth.web.composer.continuation_codec import (
     decode_retained_physical_audit_call,
     encode_continuation_response,
     encode_continuation_snapshot,
+    encode_private_chunk,
     verify_private_chunk,
 )
 from elspeth.web.composer.continuation_evidence import decode_turn_evidence, encode_turn_evidence
 from elspeth.web.composer.continuation_evidence_application_data import append_primary_call_to_evidence
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
+from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit, PrimaryNoSdkRefusalReason
 from elspeth.web.composer.continuation_provider_outcomes import require_successful_response_audit
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers, supports_anthropic_prompt_cache_markers
 from elspeth.web.composer.provider_context import capture_provider_context
-from elspeth.web.coordination.quota_authority import _usage_entry_id, token_usage_entry_from_llm_call_envelope
+from elspeth.web.coordination.quota_authority import (
+    _undispatched_cancellation_event_id,
+    _usage_entry_id,
+    token_usage_entry_from_llm_call_envelope,
+)
 from elspeth.web.credential_guard import require_no_credential_material
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning
+from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationRecord, ComposerOperationRunning
 from elspeth.web.sessions.continuation import (
     ContinuationCASConflict,
     ContinuationEvent,
@@ -58,8 +67,11 @@ from elspeth.web.sessions.continuation import (
 )
 from elspeth.web.sessions.continuation_selection import load_selected_private_chunks_on_connection
 from elspeth.web.sessions.models import chat_messages_table as messages
+from elspeth.web.sessions.models import composer_async_operations_table as jobs
+from elspeth.web.sessions.models import composer_continuation_checkpoints_table as checkpoints
 from elspeth.web.sessions.models import composer_continuation_chunks_table as chunks
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from elspeth.web.sessions.models import composer_continuation_events_table as events
 from elspeth.web.sessions.models import composer_continuation_provider_ordinals_table as ordinals
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
@@ -506,15 +518,36 @@ def selected_primary_effect_data_on_connection(
             or effect.response_finished_at is None
         ):
             raise AuditIntegrityError("committed primary lost its complete selected response/physical settlement shape")
+    elif effect.disposition == "refused":
+        if (
+            frame.phase != "awaiting_response"
+            or frame.pending_response is not None
+            or type(effect.receipt_key) is not str
+            or not effect.receipt_key
+            or type(effect.result_chunk_key) is not str
+            or not effect.result_chunk_key.startswith("value:composer.primary-no-sdk-refusal.v1:")
+            or effect.provider_attempt_id is not None
+            or effect.physical_sequence is not None
+            or effect.physical_generation is not None
+            or effect.requested_model is not None
+            or effect.response_finished_at is not None
+        ):
+            raise AuditIntegrityError("refused primary lost its terminal no-SDK receipt shape")
     else:
         raise AuditIntegrityError("primary effect has an unknown durable disposition")
     return selected, stack, frame, effect
 
 
-def begin_primary_provider_on_connection(conn: Connection, prepared: PreparedContinuationProvider) -> StoredContinuationSnapshot:
+def begin_primary_provider_on_connection(
+    conn: Connection, prepared: PreparedContinuationProvider, *, no_sdk_issuer: PrimaryNoSdkIssuer | None = None
+) -> StoredContinuationSnapshot:
     if type(prepared) is not PreparedContinuationProvider or type(prepared.binding) is not ContinuationProviderBinding:
         raise AuditIntegrityError("primary dispatch requires the actual prepared owner result")
     binding, current = prepared.binding, prepared.snapshot
+    if no_sdk_issuer is not None:
+        if type(no_sdk_issuer) is not PrimaryNoSdkIssuer or no_sdk_issuer.prepared_candidate is not prepared:
+            raise AuditIntegrityError("primary dispatch changed its original live no-SDK issuer")
+        no_sdk_issuer.clock.require_preparation_time()
     running = binding.running
     _require_current_continuation_running(conn, running)
     selected, root, frame, effect = _selected_effect(
@@ -554,7 +587,7 @@ def begin_primary_provider_on_connection(conn: Connection, prepared: PreparedCon
         .values(disposition="dispatched")
     )
     encoded = _effect_snapshot(encode_continuation_snapshot(root), effect_key=binding.effect_key, disposition="dispatched", receipt_id=None)
-    return append_complete_snapshot(
+    result = append_complete_snapshot(
         conn,
         session_id=str(running.claim.session_id),
         operation_id=running.claim.operation_id,
@@ -563,6 +596,375 @@ def begin_primary_provider_on_connection(conn: Connection, prepared: PreparedCon
         snapshot_json=encoded,
         event_batch=(ContinuationEvent("may_dispatch", canonical_json({"effect_key": binding.effect_key})),),
         handoff=False,
+    )
+    if no_sdk_issuer is not None:
+        no_sdk_issuer.clock.require_preparation_time()
+    return result
+
+
+class _PrimaryNoSdkRefusalData(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    version: Literal[1]
+    session_id: str
+    operation_id: str
+    effect_key: str
+    input_sha256: str
+    creator_sequence: int
+    creator_generation: int
+    claim_attempt: int
+    operation_epoch: int
+    source_checkpoint_id: str
+    source_cursor: int
+    source_disposition: Literal["prepared", "dispatched"]
+    receipt_key: str
+    reason: Literal[
+        "preparation_expired",
+        "pre_sdk_deadline",
+        "chargeable_refused",
+        "cost_refused",
+        "storage_failure",
+        "integrity_refused",
+        "cancelled_before_sdk",
+    ]
+    public_error_json: str
+    undispatched_attempt_id: str | None
+    undispatched_model: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PrimaryNoSdkRefusalReceipt:
+    terminal: ComposerOperationRecord
+    refused: StoredContinuationSnapshot
+    effect_key: str
+    receipt_key: str
+    result_chunk_key: str
+    deferred_cancellations: tuple[asyncio.CancelledError, ...] = field(default=(), compare=False)
+
+
+def _primary_no_sdk_event(data: _PrimaryNoSdkRefusalData, result_chunk_key: str) -> str:
+    return canonical_json(
+        {
+            "version": 1,
+            "effect_key": data.effect_key,
+            "input_sha256": data.input_sha256,
+            "receipt_key": data.receipt_key,
+            "result_chunk_key": result_chunk_key,
+            "source_disposition": data.source_disposition,
+        }
+    )
+
+
+def refuse_primary_no_sdk_on_connection(conn: Connection, permit: PrimaryNoSdkRefusalPermit) -> PrimaryNoSdkRefusalReceipt:
+    """One fenced transaction for the proved unentered effect and failed terminal."""
+    from elspeth.web.coordination.composer_operation_authority import (
+        _read,
+        _select_failure_on_connection,
+        settle_composer_operation_on_connection,
+    )
+    from elspeth.web.sessions.composer_operation_errors import deadline_expired_error, project_composer_operation_error
+
+    if type(permit) is not PrimaryNoSdkRefusalPermit:
+        raise AuditIntegrityError("PRIMARY no-SDK writer requires its actual live permit")
+    issuer = permit.issuer
+    issuer.require_refusal_permit(permit)
+    running = issuer.running
+    _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
+    source = permit.dispatched if permit.dispatched is not None else permit.prepared.snapshot
+    disposition: Literal["prepared", "dispatched"] = "dispatched" if permit.dispatched is not None else "prepared"
+    selected, root, frame, effect = _selected_effect(
+        conn,
+        running,
+        checkpoint_id=source.checkpoint_id,
+        cursor=source.cursor,
+        effect_key=permit.prepared.binding.effect_key,
+        input_sha256=permit.prepared.binding.input_sha256,
+    )
+    if (
+        selected != source
+        or effect.disposition != disposition
+        or (effect.creator_sequence, effect.creator_generation) != (running.claim.segment_sequence, running.claim.ownership_generation)
+    ):
+        raise AuditIntegrityError("PRIMARY no-SDK writer lost its exact prepared or dispatched source")
+    stored_primary_input_data_on_connection(
+        conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
+    )
+    parent = _read(conn, running.claim.session_id, running.claim.operation_id)
+    if parent is None or parent.status != "running":
+        raise AuditIntegrityError("PRIMARY no-SDK writer lost its current terminal owner")
+    if permit.reason in (PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED, PrimaryNoSdkRefusalReason.PRE_SDK_DEADLINE):
+        observed_allowance = (
+            issuer.clock.policy.preparation if permit.reason is PrimaryNoSdkRefusalReason.PREPARATION_EXPIRED else issuer.clock.policy.total
+        )
+        original_error = deadline_expired_error(request_id=parent.request_id, timeout_seconds=observed_allowance)
+    else:
+        original_error = project_composer_operation_error(permit.original_failure, request_id=parent.request_id)
+    selected_error = _select_failure_on_connection(parent, original_error, authoritative_failure=False)
+    data = _PrimaryNoSdkRefusalData(
+        version=1,
+        session_id=str(running.claim.session_id),
+        operation_id=running.claim.operation_id,
+        effect_key=effect.effect_key,
+        input_sha256=effect.input_sha256,
+        creator_sequence=effect.creator_sequence,
+        creator_generation=effect.creator_generation,
+        claim_attempt=running.claim.attempt,
+        operation_epoch=running.session_operation_context.fence.operation_epoch,
+        source_checkpoint_id=source.checkpoint_id,
+        source_cursor=source.cursor,
+        source_disposition=disposition,
+        receipt_key=permit.receipt_key,
+        reason=permit.reason.value,
+        public_error_json=canonical_json(selected_error.model_dump(mode="json")),
+        undispatched_attempt_id=permit.undispatched_attempt_id,
+        undispatched_model=permit.undispatched_model,
+    )
+    chunk = encode_private_chunk(codec="composer.primary-no-sdk-refusal.v1", canonical=canonical_json(data.model_dump(mode="json")))
+    result_chunk_key = private_chunk_key(chunk)
+    put_chunk(
+        conn,
+        session_id=data.session_id,
+        operation_id=data.operation_id,
+        key=result_chunk_key,
+        payload=chunk.canonical.encode("utf-8"),
+        codec=chunk.reference.codec,
+    )
+    changed = conn.execute(
+        update(effects)
+        .where(
+            effects.c.session_id == data.session_id,
+            effects.c.operation_id == data.operation_id,
+            effects.c.effect_key == data.effect_key,
+            effects.c.disposition == disposition,
+            effects.c.receipt_key.is_(None),
+            effects.c.result_chunk_key.is_(None),
+            effects.c.provider_attempt_id.is_(None),
+        )
+        .values(disposition="refused", receipt_key=data.receipt_key, result_chunk_key=result_chunk_key)
+    )
+    if changed.rowcount != 1:
+        raise ContinuationCASConflict("PRIMARY no-SDK refusal lost its exact unresolved effect")
+    encoded = _effect_snapshot(
+        encode_continuation_snapshot(root), effect_key=data.effect_key, disposition="refused", receipt_id=data.receipt_key
+    )
+    refused = append_complete_snapshot(
+        conn,
+        session_id=data.session_id,
+        operation_id=data.operation_id,
+        expected_checkpoint_id=source.checkpoint_id,
+        expected_cursor=source.cursor,
+        snapshot_json=encoded,
+        event_batch=(ContinuationEvent("effect_refused", _primary_no_sdk_event(data, result_chunk_key)),),
+        handoff=False,
+    )
+    terminal = settle_composer_operation_on_connection(conn, running, outcome=selected_error, authoritative_failure=True)
+    if terminal.status != "failed" or terminal.journal_cursor != refused.cursor + 1:
+        raise AuditIntegrityError("PRIMARY no-SDK terminal did not atomically follow its refused effect")
+    return PrimaryNoSdkRefusalReceipt(terminal, refused, data.effect_key, data.receipt_key, result_chunk_key)
+
+
+def read_primary_no_sdk_refusal_on_connection(
+    conn: Connection, *, session_id: UUID, operation_id: str, effect_key: str
+) -> PrimaryNoSdkRefusalReceipt | None:
+    """Cold terminal proof; a missing receipt never implies an unentered SDK."""
+    from elspeth.web.coordination.composer_operation_authority import _record_from_row
+
+    sid = str(session_id)
+    parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one_or_none()
+    if parent is None or parent.status != "failed":
+        return None
+    terminal = _record_from_row(parent)
+    stored = require_snapshot_cas(
+        conn,
+        session_id=sid,
+        operation_id=operation_id,
+        expected_checkpoint_id=terminal.checkpoint_id,
+        expected_cursor=terminal.journal_cursor,
+    )
+    root = decode_continuation_snapshot(stored.payload_json)
+    frame = _primary_frame(root)
+    if frame.provider_effect_key != effect_key or frame.provider_input_sha256 is None:
+        return None
+    _selected, _root, _frame, effect = selected_primary_effect_data_on_connection(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        checkpoint_id=stored.checkpoint_id,
+        cursor=stored.cursor,
+        effect_key=effect_key,
+        input_sha256=frame.provider_input_sha256,
+    )
+    if effect.disposition != "refused":
+        return None
+    chunk_row = conn.execute(
+        select(chunks).where(
+            chunks.c.session_id == sid,
+            chunks.c.operation_id == operation_id,
+            chunks.c.chunk_key == effect.result_chunk_key,
+        )
+    ).one_or_none()
+    if chunk_row is None or chunk_row.codec != "composer.primary-no-sdk-refusal.v1":
+        raise AuditIntegrityError("PRIMARY no-SDK receipt has no exact closed result chunk")
+    try:
+        canonical = read_chunk(conn, session_id=sid, operation_id=operation_id, key=effect.result_chunk_key).decode(
+            "utf-8", errors="strict"
+        )
+        chunk = encode_private_chunk(codec=chunk_row.codec, canonical=canonical)
+        data = _PrimaryNoSdkRefusalData.model_validate_json(canonical, strict=True)
+        failure = ComposerOperationError.model_validate_json(data.public_error_json, strict=True)
+    except (ValueError, ValidationError) as error:
+        raise AuditIntegrityError("PRIMARY no-SDK receipt violates its closed result codec") from error
+    if (
+        private_chunk_key(chunk) != effect.result_chunk_key
+        or canonical_json(data.model_dump(mode="json")) != canonical
+        or canonical_json(failure.model_dump(mode="json")) != data.public_error_json
+        or terminal.result_json != data.public_error_json
+        or terminal.failure_code != failure.failure_code
+        or terminal.status != "failed"
+        or terminal.settled_by != "owner_terminal"
+        or (data.session_id, data.operation_id, data.effect_key, data.input_sha256) != (sid, operation_id, effect_key, effect.input_sha256)
+        or (data.creator_sequence, data.creator_generation) != (effect.creator_sequence, effect.creator_generation)
+        or (data.claim_attempt, data.operation_epoch) != (terminal.attempt, terminal.session_operation_epoch)
+        or data.receipt_key != effect.receipt_key
+        or (data.undispatched_attempt_id is None) != (data.undispatched_model is None)
+        or terminal.journal_cursor != data.source_cursor + 2
+    ):
+        raise AuditIntegrityError("PRIMARY no-SDK receipt contradicts its terminal/effect identity")
+    source_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.checkpoint_id == data.source_checkpoint_id,
+            checkpoints.c.cursor == data.source_cursor,
+        )
+    ).one_or_none()
+    refusal_row = conn.execute(
+        select(checkpoints).where(
+            checkpoints.c.session_id == sid,
+            checkpoints.c.operation_id == operation_id,
+            checkpoints.c.cursor == data.source_cursor + 1,
+        )
+    ).one_or_none()
+    refusal_event = conn.execute(
+        select(events).where(
+            events.c.session_id == sid,
+            events.c.operation_id == operation_id,
+            events.c.sequence == data.source_cursor + 1,
+        )
+    ).one_or_none()
+    settled_event = conn.execute(
+        select(events).where(
+            events.c.session_id == sid,
+            events.c.operation_id == operation_id,
+            events.c.sequence == terminal.journal_cursor,
+        )
+    ).one_or_none()
+    if source_row is None or refusal_row is None or refusal_event is None or settled_event is None:
+        raise AuditIntegrityError("PRIMARY no-SDK receipt lost its exact source/refusal/terminal journal")
+    try:
+        source_stack = decode_continuation_snapshot(
+            read_chunk(conn, session_id=sid, operation_id=operation_id, key=source_row.snapshot_chunk_key).decode("utf-8", errors="strict")
+        )
+        refused_stack = decode_continuation_snapshot(
+            read_chunk(conn, session_id=sid, operation_id=operation_id, key=refusal_row.snapshot_chunk_key).decode("utf-8", errors="strict")
+        )
+    except UnicodeDecodeError as error:
+        raise AuditIntegrityError("PRIMARY no-SDK journal lost strict snapshot bytes") from error
+    source_frontier = tuple(item for item in source_stack.effect_frontier if item.effect_id == effect_key)
+    if (
+        source_row.kind != "transition"
+        or refusal_row.kind != "transition"
+        or source_stack.cursor != data.source_cursor
+        or len(source_frontier) != 1
+        or (source_frontier[0].disposition, source_frontier[0].receipt_id) != (data.source_disposition, None)
+        or type(source_stack.frames[-1]) is not ComposeFrame
+        or source_stack.frames[-1].provider_effect_key != effect_key
+        or source_stack.frames[-1].provider_input_sha256 != effect.input_sha256
+        or refused_stack.cursor != data.source_cursor + 1
+        or refused_stack.effect_frontier != root.effect_frontier
+        or source_stack.model_copy(update={"effect_frontier": root.effect_frontier, "cursor": root.cursor}) != root
+        or refusal_event.tag != "effect_refused"
+        or read_chunk(conn, session_id=sid, operation_id=operation_id, key=refusal_event.payload_chunk_key)
+        != _primary_no_sdk_event(data, effect.result_chunk_key).encode("utf-8")
+        or settled_event.tag != "settled"
+        or read_chunk(conn, session_id=sid, operation_id=operation_id, key=settled_event.payload_chunk_key)
+        != canonical_json(
+            {
+                "version": 1,
+                "sequence": data.creator_sequence,
+                "generation": data.creator_generation,
+                "status": terminal.status,
+                "failure_code": terminal.failure_code,
+            }
+        ).encode("utf-8")
+    ):
+        raise AuditIntegrityError("PRIMARY no-SDK journal does not prove one refused source")
+    stored_primary_input_data_on_connection(conn, session_id=session_id, operation_id=operation_id, effect=effect, frame=frame)
+    if data.undispatched_attempt_id is not None:
+        attempt = conn.execute(select(physical).where(physical.c.attempt_id == data.undispatched_attempt_id)).one_or_none()
+        owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == sid)).scalar_one_or_none()
+        entry_id = _usage_entry_id(session_id=sid, source="composer", run_id=None, call_id=data.undispatched_attempt_id)
+        ledger = conn.execute(select(usage).where(usage.c.entry_id == entry_id)).one_or_none()
+        audit = conn.execute(
+            select(messages).where(messages.c.id == _undispatched_cancellation_event_id(data.undispatched_attempt_id))
+        ).one_or_none()
+        if (
+            attempt is None
+            or attempt.session_id != sid
+            or attempt.source != "composer"
+            or attempt.run_id is not None
+            or attempt.operation_id != terminal.session_operation_id
+            or attempt.operation_epoch != terminal.session_operation_epoch
+            or attempt.identity_id != owner
+            or attempt.settled_at is None
+            or attempt.ledger_entry_id != entry_id
+            or ledger is None
+            or ledger.identity_id != attempt.identity_id
+            or ledger.session_id != sid
+            or ledger.source != "composer"
+            or ledger.run_id is not None
+            or ledger.model != data.undispatched_model
+            or any(
+                value != 0
+                for value in (
+                    ledger.prompt_tokens,
+                    ledger.completion_tokens,
+                    ledger.cached_prompt_tokens,
+                    ledger.reasoning_tokens,
+                )
+            )
+            or audit is None
+            or audit.session_id != sid
+            or audit.role != "audit"
+            or audit.writer_principal != "compose_loop"
+            or audit.raw_content is not None
+            or audit.tool_calls is not None
+            or audit.composition_state_id is not None
+            or audit.tool_call_id is not None
+            or audit.parent_assistant_id is not None
+            or restore_utc(audit.created_at) != restore_utc(ledger.recorded_at)
+            or restore_utc(audit.created_at) != restore_utc(attempt.settled_at)
+        ):
+            raise AuditIntegrityError("PRIMARY no-SDK admitted attempt lacks its exact zero-use cancellation cohort")
+        if audit.content != canonical_json(
+            {
+                "kind": "provider_attempt.cancelled_before_dispatch",
+                "attempt_id": data.undispatched_attempt_id,
+                "source": "composer",
+                "run_id": None,
+                "requested_model": data.undispatched_model,
+                "operation_id": terminal.session_operation_id,
+                "operation_epoch": terminal.session_operation_epoch,
+                "lease_token_sha256": sha256(attempt.lease_token.encode("utf-8")).hexdigest(),
+            }
+        ):
+            raise AuditIntegrityError("PRIMARY no-SDK admitted attempt changed its cancellation audit")
+    return PrimaryNoSdkRefusalReceipt(
+        terminal,
+        StoredContinuationSnapshot(encode_continuation_snapshot(refused_stack), refusal_row.cursor, refusal_row.checkpoint_id),
+        effect_key,
+        effect.receipt_key,
+        effect.result_chunk_key,
     )
 
 

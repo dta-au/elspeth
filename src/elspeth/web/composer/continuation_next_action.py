@@ -23,7 +23,13 @@ from elspeth.web.composer.continuation import (
     ToolBatchFrame,
 )
 from elspeth.web.composer.continuation_bootstrap import bootstrap_values, decode_continuation_bootstrap
-from elspeth.web.composer.continuation_policy import ContinuationActionPolicy, ContinuationAdmissionPolicy, decode_continuation_policy
+from elspeth.web.composer.continuation_policy import (
+    ContinuationActionPolicy,
+    ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
+    decode_continuation_policy,
+)
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
 
 if TYPE_CHECKING:
@@ -374,6 +380,19 @@ def _is_first_compose_iteration(frame: ComposeFrame) -> bool:
     )
 
 
+def _has_committed_primary(root: ContinuationFrameStack) -> bool:
+    """Structural sizing only; the current SQL owner must prove paid sources.
+
+    A control can finish without spending a discovery/composition turn or
+    writing an assistant chat row. Its retained PRIMARY still makes this a
+    later cut; zero counters cannot turn it back into virgin initialization.
+    """
+    return any(
+        item.effect_id.startswith("provider:0:") and item.disposition == "committed" and item.receipt_id is not None
+        for item in root.effect_frontier
+    )
+
+
 def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
     """A cut sized only for a handoff: no pending settlement, owner result or open effect."""
     if root.pending_settlement_ids or root.pending_owner_results or not root.is_handoff_safe:
@@ -382,7 +401,9 @@ def _require_quiescent_handoff_cut(root: ContinuationFrameStack) -> None:
         raise AuditIntegrityError("next allowance cut still holds an open effect")
 
 
-def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy) -> ContinuationActionPolicy | None:
+def handoff_cut_allowance(
+    root: ContinuationFrameStack, policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
+) -> ContinuationActionPolicy | None:
     """Size the handoff-safe cuts no recovery owner produces; None for every other cut.
 
     These cuts exist only after a yield (design §2.4): a later Compose
@@ -391,7 +412,7 @@ def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmi
     re-proves it after the new claim and fence.
     """
     top = root.frames[-1]
-    if type(top) is ComposeFrame and top.phase == "action_ready" and not _is_first_compose_iteration(top):
+    if type(top) is ComposeFrame and top.phase == "action_ready" and (not _is_first_compose_iteration(top) or _has_committed_primary(root)):
         _require_quiescent_handoff_cut(root)
         if len(root.frames) != 1 or top.provider_effect_key is not None or top.pending_response is not None or top.tools is None:
             raise AuditIntegrityError("next allowance lost its closed later Compose iteration cut")
@@ -430,9 +451,15 @@ def handoff_cut_allowance(root: ContinuationFrameStack, policy: ContinuationAdmi
 
 
 def next_continuation_action_policy(
-    *, selected: SelectedContinuationState, policy: ContinuationAdmissionPolicy
+    *,
+    selected: SelectedContinuationState,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
 ) -> ContinuationActionPolicy:
-    if type(selected) is not SelectedContinuationState or type(policy) is not ContinuationAdmissionPolicy:
+    if type(selected) is not SelectedContinuationState or type(policy) not in (
+        ContinuationAdmissionPolicy,
+        ContinuationAdmissionPolicyV2,
+        ContinuationAdmissionPolicyV3,
+    ):
         raise TypeError("next allowance requires its actual selected DATA and retained policy")
     selected.__post_init__()
     root = selected.stack

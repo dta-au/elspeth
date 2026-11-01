@@ -34,6 +34,8 @@ from elspeth.web.composer.continuation_limits import CONTINUATION_PRIVATE_DOCUME
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
     ContinuationSegmentPolicy,
     decode_continuation_policy,
 )
@@ -47,6 +49,12 @@ from elspeth.web.sessions.composer_operations import (
     composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.continuation_events import CONTINUATION_EVENT_TAGS, ContinuationEventTag
+from elspeth.web.sessions.continuation_retained_capacity import (
+    ProspectiveContinuationChunk,
+    admit_retained_payload_chunks,
+    load_continuation_read_contract,
+    read_bounded_retained_chunk,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
     composer_async_operations_table as jobs,
@@ -221,12 +229,36 @@ def initialize_continuation(
     snapshot_json: str,
     action_json: str,
     policy_sha256: str,
+    retained_payload_limit_bytes: int | None = None,
 ) -> None:
+    initial = decode_continuation_snapshot(snapshot_json)
+    policy = decode_continuation_policy(initial.admission_policy_json, initial.policy_hash)
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    if contract.version != policy.schema_version or (
+        type(policy) is ContinuationAdmissionPolicyV3
+        and (contract.policy_hash != policy.policy_hash or contract.allowance != policy.max_retained_payload_bytes)
+    ):
+        raise AuditIntegrityError("initial root differs from its original persisted admission contract")
+    if type(policy) is ContinuationAdmissionPolicyV3 and (
+        initial.logical.session_id != session_id
+        or initial.logical.operation_id != operation_id
+        or initial.cursor != 0
+        or initial.policy_hash != policy_sha256
+    ):
+        raise AuditIntegrityError("V3 initial root differs from its original operation or policy")
+    limit = _retained_payload_limit(policy, retained_payload_limit_bytes)
     now = database_now(conn)
     snapshot_key = f"snapshot:{checkpoint_id}"
-    put_chunk(
-        conn, session_id=session_id, operation_id=operation_id, key=snapshot_key, payload=snapshot_json.encode("utf-8"), codec="snapshot.v2"
-    )
+    initial_chunk = ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2")
+    if limit is not None:
+        admit_retained_payload_chunks(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            prospective=(initial_chunk,),
+            retained_payload_limit_bytes=limit,
+        )
+    _insert_chunk_after_admission(conn, session_id=session_id, operation_id=operation_id, chunk=initial_chunk)
     conn.execute(
         insert(checkpoints).values(
             session_id=session_id,
@@ -273,6 +305,18 @@ class ContinuationCASConflict(AuditIntegrityError):
     """The complete selected snapshot is no longer the expected head."""
 
 
+def _retained_payload_limit(
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
+    supplied: int | None,
+) -> int | None:
+    if type(policy) is not ContinuationAdmissionPolicyV3:
+        return supplied
+    admitted = policy.max_retained_payload_bytes
+    if supplied is not None and (type(supplied) is not int or supplied != admitted):
+        raise AuditIntegrityError("V3 retained payload allowance differs from its immutable admission policy")
+    return admitted
+
+
 def put_chunk(
     conn: Connection,
     *,
@@ -281,35 +325,91 @@ def put_chunk(
     key: str,
     payload: bytes,
     codec: str,
+    retained_payload_limit_bytes: int | None = None,
 ) -> None:
     if type(payload) is not bytes or not key or not codec:
         raise ValueError("chunk requires exact bytes and owned codec/key")
-    digest = sha256(payload).hexdigest()
-    old = conn.execute(
-        select(chunks).where(
-            chunks.c.session_id == session_id,
-            chunks.c.operation_id == operation_id,
-            chunks.c.chunk_key == key,
-        )
+    # The first root has no selected checkpoint. Its original seed is admitted
+    # by initialize_continuation before this generic writer can resolve policy.
+    existing = conn.execute(
+        select(checkpoints.c.checkpoint_id)
+        .where(checkpoints.c.session_id == session_id, checkpoints.c.operation_id == operation_id)
+        .limit(1)
     ).one_or_none()
-    if old is not None:
-        if old.payload != payload or old.sha256 != digest or old.byte_length != len(payload) or old.codec != codec:
-            raise AuditIntegrityError("immutable chunk collision")
-        return
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    if existing is None and contract.version == "composer.continuation.policy.v3":
+        raise AuditIntegrityError("V3 chunk write requires its admitted initial checkpoint")
+    limit = retained_payload_limit_bytes
+    if existing is not None:
+        selected = load_snapshot(conn, session_id=session_id, operation_id=operation_id)
+        root = decode_continuation_snapshot(selected.payload_json)
+        if root.policy_hash != contract.policy_hash and contract.version == "composer.continuation.policy.v3":
+            raise AuditIntegrityError("V3 chunk writer lost its original policy hash")
+        limit = _retained_payload_limit(decode_continuation_policy(root.admission_policy_json, root.policy_hash), limit)
+    candidate = ProspectiveContinuationChunk(key, payload, codec)
+    if limit is not None:
+        admit_retained_payload_chunks(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            prospective=(candidate,),
+            retained_payload_limit_bytes=limit,
+        )
+    _insert_chunk_after_admission(conn, session_id=session_id, operation_id=operation_id, chunk=candidate)
+
+
+def _insert_chunk_after_admission(conn: Connection, *, session_id: str, operation_id: str, chunk: ProspectiveContinuationChunk) -> None:
+    digest = sha256(chunk.payload).hexdigest()
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    if contract.version == "composer.continuation.policy.v3":
+        if contract.allowance is None:
+            raise AuditIntegrityError("V3 chunk write lost its original allowance")
+        bounded_old = read_bounded_retained_chunk(
+            conn, session_id=session_id, operation_id=operation_id, key=chunk.key, allowance=contract.allowance
+        )
+        if bounded_old is not None:
+            if bounded_old != chunk:
+                raise AuditIntegrityError("immutable chunk collision")
+            return
+    else:
+        legacy_old = conn.execute(
+            select(chunks).where(
+                chunks.c.session_id == session_id,
+                chunks.c.operation_id == operation_id,
+                chunks.c.chunk_key == chunk.key,
+            )
+        ).one_or_none()
+        if legacy_old is not None:
+            if (
+                legacy_old.payload != chunk.payload
+                or legacy_old.sha256 != digest
+                or legacy_old.byte_length != len(chunk.payload)
+                or legacy_old.codec != chunk.codec
+            ):
+                raise AuditIntegrityError("immutable chunk collision")
+            return
     conn.execute(
         insert(chunks).values(
             session_id=session_id,
             operation_id=operation_id,
-            chunk_key=key,
-            payload=payload,
+            chunk_key=chunk.key,
+            payload=chunk.payload,
             sha256=digest,
-            byte_length=len(payload),
-            codec=codec,
+            byte_length=len(chunk.payload),
+            codec=chunk.codec,
         )
     )
 
 
 def read_chunk(conn: Connection, *, session_id: str, operation_id: str, key: str) -> bytes:
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    if contract.version == "composer.continuation.policy.v3":
+        if contract.allowance is None:
+            raise AuditIntegrityError("V3 chunk read lost its original allowance")
+        bounded = read_bounded_retained_chunk(conn, session_id=session_id, operation_id=operation_id, key=key, allowance=contract.allowance)
+        if bounded is None:
+            raise AuditIntegrityError("continuation chunk digest or binding mismatch")
+        return bounded.payload
     row = conn.execute(
         select(chunks).where(
             chunks.c.session_id == session_id,
@@ -405,6 +505,13 @@ def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> St
     payload = read_chunk(conn, session_id=session_id, operation_id=operation_id, key=snapshot.snapshot_chunk_key)
     encoded = payload.decode("utf-8", errors="strict")
     stack = decode_continuation_snapshot(encoded)
+    contract = load_continuation_read_contract(conn, session_id=session_id, operation_id=operation_id)
+    policy = decode_continuation_policy(stack.admission_policy_json, stack.policy_hash)
+    if contract.version != policy.schema_version or (
+        type(policy) is ContinuationAdmissionPolicyV3
+        and (contract.policy_hash != policy.policy_hash or contract.allowance != policy.max_retained_payload_bytes)
+    ):
+        raise AuditIntegrityError("selected root differs from its original persisted admission contract")
     if (stack.logical.session_id, stack.logical.operation_id, stack.cursor) != (session_id, operation_id, snapshot.cursor):
         raise AuditIntegrityError("complete continuation snapshot differs from its SQL identity/cursor")
     return StoredContinuationSnapshot(encoded, snapshot.cursor, snapshot.checkpoint_id)
@@ -665,6 +772,7 @@ def append_complete_snapshot(
     event_batch: tuple[ContinuationEvent, ...],
     handoff: bool,
     prepared_append: PreparedContinuationAppend | None = None,
+    retained_payload_limit_bytes: int | None = None,
 ) -> StoredContinuationSnapshot:
     from elspeth.contracts.hashing import _CANONICAL_SAFE_INTEGER_MAX
     from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
@@ -678,10 +786,13 @@ def append_complete_snapshot(
         raise ValueError("a durable transition requires its attribution event")
     next_cursor = expected_cursor + len(event_batch)
     previous_stack = decode_continuation_snapshot(current.payload_json)
+    policy = decode_continuation_policy(previous_stack.admission_policy_json, previous_stack.policy_hash)
+    limit = _retained_payload_limit(policy, retained_payload_limit_bytes)
     frame_stack = decode_continuation_snapshot(snapshot_json)
     if (
         frame_stack.logical != previous_stack.logical
         or frame_stack.mutation_ceiling != previous_stack.mutation_ceiling
+        or frame_stack.provider_cost_policy != previous_stack.provider_cost_policy
         or frame_stack.policy_hash != previous_stack.policy_hash
         or frame_stack.admission_policy_json != previous_stack.admission_policy_json
         or frame_stack.cursor not in (expected_cursor, next_cursor)
@@ -708,17 +819,36 @@ def append_complete_snapshot(
         ):
             raise AuditIntegrityError("prepared append differs from its actual current transition")
         now, checkpoint_id = prepared_append.published_at, prepared_append.checkpoint_id
+    snapshot_json = (
+        encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": next_cursor}))
+        if prepared_append is None
+        else prepared_append.snapshot_json
+    )
+    snapshot_key = f"snapshot:{checkpoint_id}"
+    prospective = (
+        *(
+            ProspectiveContinuationChunk(f"event:{expected_cursor + index}", item.payload_json.encode("utf-8"), "event.v2")
+            for index, item in enumerate(event_batch, start=1)
+        ),
+        ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2"),
+    )
+    if limit is not None:
+        admit_retained_payload_chunks(
+            conn,
+            session_id=session_id,
+            operation_id=operation_id,
+            prospective=prospective,
+            retained_payload_limit_bytes=limit,
+        )
     cursor = expected_cursor
     for item in event_batch:
         cursor += 1
         event_key = f"event:{cursor}"
-        put_chunk(
+        _insert_chunk_after_admission(
             conn,
             session_id=session_id,
             operation_id=operation_id,
-            key=event_key,
-            payload=item.payload_json.encode("utf-8"),
-            codec="event.v2",
+            chunk=ProspectiveContinuationChunk(event_key, item.payload_json.encode("utf-8"), "event.v2"),
         )
         conn.execute(
             insert(events).values(
@@ -730,14 +860,11 @@ def append_complete_snapshot(
                 created_at=now,
             )
         )
-    snapshot_json = (
-        encode_continuation_snapshot(frame_stack.model_copy(update={"cursor": cursor}))
-        if prepared_append is None
-        else prepared_append.snapshot_json
-    )
-    snapshot_key = f"snapshot:{checkpoint_id}"
-    put_chunk(
-        conn, session_id=session_id, operation_id=operation_id, key=snapshot_key, payload=snapshot_json.encode("utf-8"), codec="snapshot.v2"
+    _insert_chunk_after_admission(
+        conn,
+        session_id=session_id,
+        operation_id=operation_id,
+        chunk=ProspectiveContinuationChunk(snapshot_key, snapshot_json.encode("utf-8"), "snapshot.v2"),
     )
     conn.execute(
         insert(checkpoints).values(
@@ -769,7 +896,7 @@ def append_complete_snapshot(
 @dataclass(frozen=True, slots=True)
 class _SegmentStartSelection:
     snapshot: StoredContinuationSnapshot
-    policy: ContinuationAdmissionPolicy
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3
     action: ContinuationActionPolicy
     action_json: str
 
@@ -781,7 +908,7 @@ def _initial_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
 ) -> ContinuationActionPolicy:
     del conn
     if (
@@ -818,7 +945,7 @@ def _selected_segment_action(
     segment: Row[Any],
     snapshot: StoredContinuationSnapshot,
     stack: ContinuationFrameStack,
-    policy: ContinuationAdmissionPolicy,
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3,
 ) -> ContinuationActionPolicy:
     if segment.sequence == 1 and segment.generation == 1:
         return _initial_segment_action(conn, parent=parent, segment=segment, snapshot=snapshot, stack=stack, policy=policy)
@@ -903,7 +1030,7 @@ class ComposerSegmentStartObservation:
     context: SessionOperationContext | None = None
     committed: bool = False
     reconciled: bool = False
-    policy: ContinuationAdmissionPolicy | None = None
+    policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | None = None
     hard_expires_at: float | None = None
 
 

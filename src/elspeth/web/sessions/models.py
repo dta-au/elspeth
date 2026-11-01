@@ -76,7 +76,7 @@ from elspeth.web.sessions.composer_operations import COMPOSER_OPERATION_REQUEST_
 # lifecycle. It also adds the terminal-run and run-counter CHECKs and closed
 # Continuation value CHECKs, and drops the unused sessions_cleanup_claims table.
 # Every epoch-79 store is refused; 0.8.10 starts from a fresh store.
-SESSION_SCHEMA_EPOCH = 80
+SESSION_SCHEMA_EPOCH = 81
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -3646,6 +3646,9 @@ composer_async_operations_table = Table(
     Column("ingress_phase", String(16), nullable=False),
     Column("reserved_user_message_id", String(128), nullable=False),
     Column("request_hash", String(64), nullable=False),
+    Column("continuation_policy_version", String(64), nullable=False),
+    Column("continuation_policy_sha256", String(64)),
+    Column("continuation_retained_payload_limit_bytes", BigInteger),
     Column("actor_user_id", String(128), ForeignKey("identities.identity_id", ondelete="RESTRICT"), nullable=False),
     Column("request_id", String(128)),
     Column("base_state_id", String(128)),
@@ -3691,6 +3694,17 @@ composer_async_operations_table = Table(
     ),
     CheckConstraint("length(operation_id) = 36 AND attempt >= 0", name="ck_composer_operations_identity"),
     *_lower_sha256_constraints("request_hash", name="ck_composer_operations_request_hash"),
+    *_lower_sha256_constraints("continuation_policy_sha256", name="ck_composer_operations_continuation_policy_hash", nullable=True),
+    CheckConstraint(
+        "continuation_policy_version IS NOT NULL AND "
+        "((continuation_policy_version IN ('composer.continuation.policy.v1', 'composer.continuation.policy.v2') "
+        "AND continuation_policy_sha256 IS NULL AND continuation_retained_payload_limit_bytes IS NULL) OR "
+        "(continuation_policy_version = 'composer.continuation.policy.v3' "
+        "AND continuation_policy_sha256 IS NOT NULL "
+        "AND continuation_retained_payload_limit_bytes IS NOT NULL "
+        "AND continuation_retained_payload_limit_bytes > 0))",
+        name="ck_composer_operations_continuation_policy_contract",
+    ),
     *_lower_sha256_constraints("result_sha256", name="ck_composer_operations_result_hash", nullable=True),
     CheckConstraint("session_operation_epoch IS NULL OR session_operation_epoch > 0", name="ck_composer_operations_epoch"),
     CheckConstraint(

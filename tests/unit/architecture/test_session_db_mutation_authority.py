@@ -22353,6 +22353,34 @@ def test_reviewed_data_binding_cannot_hide_an_off_scope_connection_consumer(tmp_
     assert len(rows) == 1 and rows[0].connection_escape and rows[0].authority is None
 
 
+def test_same_authority_data_consumer_requires_explicit_review_after_digest_repin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sources = _reviewed_data_source_fixture(tmp_path)
+    module = sys.modules[__name__]
+    candidate = "ComposerAsyncOperationAuthority.read_continuation_control_intent"
+    reviewed = _CONTINUATION_DATA_READERS - {candidate}
+    monkeypatch.setattr(module, "_CONTINUATION_DATA_READERS", reviewed)
+
+    def scan_with_current_pin() -> list[WriterIdentity]:
+        expected = production_source_ast_digest({path: ast.parse(source) for path, source in sources.items()})
+        monkeypatch.setattr(module, "_CONTINUATION_DATA_READ_SOURCE_SHA256", expected)
+        return scan_production_source_map(sources, collected_paths=["src/elspeth/web/sessions/engine.py"])
+
+    baseline = scan_with_current_pin()
+    assert len(baseline) == 1 and baseline[0].authority is None and not baseline[0].connection_escape
+    caller = "src/elspeth/web/coordination/composer_operation_authority.py"
+    assert sources[caller].count("def read_continuation_runtime(") == 1
+    sources[caller] = sources[caller].replace("def read_continuation_runtime(", "def read_continuation_control_intent(")
+    # The same DATA-returning body and authority class cannot acquire review
+    # through a new matching digest alone; this is not a raw-connection leak.
+    unreviewed = scan_with_current_pin()
+    assert len(unreviewed) == 1 and unreviewed[0].connection_escape and unreviewed[0].authority is None
+    # Calibrate the exact review gate on this synthetic source universe. This
+    # does not admit the real production consumer without its separate review.
+    monkeypatch.setattr(module, "_CONTINUATION_DATA_READERS", reviewed | {candidate})
+    admitted = scan_with_current_pin()
+    assert len(admitted) == 1 and not admitted[0].connection_escape and admitted[0].authority is None
+
+
 def test_reviewed_data_binding_covers_a_separate_descendant_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sources = _reviewed_data_source_fixture(tmp_path)
     caller_path = "src/elspeth/web/coordination/composer_operation_authority.py"

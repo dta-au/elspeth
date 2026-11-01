@@ -28,6 +28,8 @@ from elspeth.web.required_work import RequiredWorkBinding, RequiredWorkRole, Req
 
 if TYPE_CHECKING:
     from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+    from elspeth.web.composer.continuation_clock import ContinuationActionClock
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
     from elspeth.web.sessions.continuation import StoredContinuationSnapshot
     from elspeth.web.sessions.continuation_title_provider import PreparedTitleProvider, TitleAuditSettlementRequest
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -127,6 +129,7 @@ class ProviderCallCustody:
         "_context",
         "_cost_budget",
         "_cost_response_accountable",
+        "_primary_no_sdk_issuer",
         "_required_work",
         "_sdk_entered",
         "_service",
@@ -134,6 +137,7 @@ class ProviderCallCustody:
         "_undispatched_recurrence",
         "attempt",
         "call",
+        "continuation_primary_clock",
         "continuation_title",
         "continuation_title_result",
         "continuation_title_selected",
@@ -159,6 +163,7 @@ class ProviderCallCustody:
         self._service = service
         self._context = context
         self._required_work = required_work
+        self._primary_no_sdk_issuer: PrimaryNoSdkIssuer | None = None
         self.attempt: ProviderAttempt | None = None
         self.call: ComposerLLMCall | None = None
         self._sdk_entered = False
@@ -167,6 +172,7 @@ class ProviderCallCustody:
         self._undispatched_recurrence = 0
         self._settlements = 0
         self.continuation_title: PreparedTitleProvider | None = None
+        self.continuation_primary_clock: ContinuationActionClock | None = None
         self.continuation_title_selected: StoredContinuationSnapshot | None = None
         self.continuation_title_result: TitleAuditSettlementRequest | None = None
 
@@ -191,6 +197,32 @@ class ProviderCallCustody:
         self.continuation_title = prepared
         self.continuation_title_selected = prepared.selected
 
+    def bind_continuation_primary_clock(self, clock: ContinuationActionClock) -> None:
+        from elspeth.web.composer.continuation_clock import ContinuationActionClock
+
+        if (
+            type(clock) is not ContinuationActionClock
+            or self.continuation_title is not None
+            or self.continuation_primary_clock is not None
+            or self.attempt is not None
+            or self.required_work.role is not RequiredWorkRole.TURN
+        ):
+            raise AuditIntegrityError("PRIMARY timing requires its original pre-dispatch action owner")
+        self.continuation_primary_clock = clock
+
+    def bind_primary_no_sdk_issuer(self, issuer: PrimaryNoSdkIssuer) -> None:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+
+        if (
+            type(issuer) is not PrimaryNoSdkIssuer
+            or self._primary_no_sdk_issuer is not None
+            or self.continuation_primary_clock is not issuer.clock
+            or self.attempt is not None
+        ):
+            raise AuditIntegrityError("PRIMARY no-SDK issuer requires original unentered physical custody")
+        issuer.bind_custody(self)
+        self._primary_no_sdk_issuer = issuer
+
     async def retain_continuation_title(self, completion: _AdmittedLLMCompletion) -> None:
         from elspeth.web.composer.continuation_title_provider import retain_current_title_success
 
@@ -208,6 +240,10 @@ class ProviderCallCustody:
             return None
         policy = self._cost_budget.snapshot().policy
         return policy.max_completion_tokens if policy is not None else None
+
+    @property
+    def has_cost_budget(self) -> bool:
+        return self._cost_budget is not None
 
     def require_cost_dispatch(self) -> None:
         if self._cost_budget is not None:
@@ -292,6 +328,7 @@ class ProviderCallCustody:
     async def _cancel_undispatched(self, *, model: str) -> tuple[asyncio.CancelledError, ...]:
         if self.attempt is None or self._sdk_entered:
             raise AuditIntegrityError("Undispatched disposition lacks exact no-SDK attempt evidence")
+        admitted = self.attempt
         binding = self.required_work
         ticket = binding.coordinator.reserve(
             RequiredWorkSource.UNDISPATCHED_ATTEMPT_CANCELLATION_SQL,
@@ -308,6 +345,8 @@ class ProviderCallCustody:
                 required_work=ticket,
             )
         )
+        if self._primary_no_sdk_issuer is not None:
+            self._primary_no_sdk_issuer.note_undispatched_cancel(self, admitted, model=model)
         self.attempt = None
         self.call = None
         return cancellations
@@ -362,6 +401,8 @@ class ProviderCallCustody:
                 if type(attempt) is not ProviderAttempt:
                     raise AuditIntegrityError("Provider admission returned a foreign attempt")
                 self.attempt = attempt
+                if self._primary_no_sdk_issuer is not None:
+                    self._primary_no_sdk_issuer.note_admitted_attempt(self, attempt, model=model)
                 self._admitted_ns = time.monotonic_ns()
                 self.call = None
                 self._sdk_entered = False
@@ -378,6 +419,8 @@ class ProviderCallCustody:
     def mark_sdk_entered(self) -> None:
         if self.attempt is None or self._sdk_entered or self.call is not None:
             raise AuditIntegrityError("Physical provider dispatch lacks exact admitted custody")
+        if self._primary_no_sdk_issuer is not None:
+            self._primary_no_sdk_issuer.mark_sdk_entered(self)
         if self._cost_budget is not None:
             self._cost_budget.dispatched()
         self._sdk_entered = True
@@ -404,6 +447,12 @@ class ProviderCallCustody:
             return False
         if not self._sdk_entered or call.call_id != self.attempt.attempt_id or call.started_at != self.attempt.started_at:
             raise AuditIntegrityError("Provider audit replaced actual admitted identity")
+        if (
+            self._cost_budget is not None
+            and self._cost_budget.snapshot().applicability == "continuation_v2"
+            and (call.cost_response_accountable is None or call.cost_response_accountable is not self._cost_response_accountable)
+        ):
+            raise AuditIntegrityError("Continuation audit changed its actual response accountability")
         self.call = call
         return True
 
@@ -466,6 +515,10 @@ class ProviderCallCustody:
             projection.begin_projection()
             projection.complete_owned()
         if self._cost_budget is not None:
+            if self._cost_budget.snapshot().applicability == "continuation_v2" and (
+                self.call.cost_response_accountable is None or self.call.cost_response_accountable is not self._cost_response_accountable
+            ):
+                raise AuditIntegrityError("Continuation settlement lost its observed response accountability")
             self._cost_budget.consume_settled(self.call, response_accountable=self._cost_response_accountable)
         self.attempt = None
         self.call = None

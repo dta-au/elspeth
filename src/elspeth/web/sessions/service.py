@@ -426,6 +426,7 @@ from elspeth.web.validation import _validate_accepted_value_content
 if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.audit_storage import ComposerOperationFailureFacts
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.composer.diagnostic_evidence import ComposerDiagnosticEvidence
@@ -9887,6 +9888,8 @@ class SessionServiceImpl:
         env_ref_names: frozenset[str],
         original: BaseException | None = None,
         custody: ContinuationToolFailureCustody | None = None,
+        p4_writer_observation: P4WriterObservation | None = None,
+        p4_live_owner: ContinuationLiveP4 | None = None,
     ) -> CommittedContinuationFailure:
         from elspeth.web.sessions.continuation_tool_failure import fail_continuation_tool_operation
 
@@ -9898,6 +9901,8 @@ class SessionServiceImpl:
             env_ref_names=env_ref_names,
             original=original,
             custody=custody,
+            p4_writer_observation=p4_writer_observation,
+            p4_live_owner=p4_live_owner,
         )
 
     async def fail_composer_async_operation(

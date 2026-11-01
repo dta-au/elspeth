@@ -108,7 +108,7 @@ def _reply(content: str, tool_calls=None) -> ModelResponse:
                 "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
             }
         ],
-        usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
     )
 
 
@@ -160,6 +160,7 @@ class ScriptedSDK:
 
     ``primary`` replies serve the composer model with the full palette;
     ``end`` replies serve the END Advisor review with its structured verdict.
+    Every response supplies deterministic finite cost for admitted v2 policy.
     """
 
     def __init__(self, settings_model: str, advisor_model: str, steps):
@@ -180,7 +181,7 @@ class ScriptedSDK:
         return ModelResponse(
             model=self.advisor_model,
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(payload), "tool_calls": None}}],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
 

@@ -132,7 +132,7 @@ async def _issued_review_case(store, tmp_path, monkeypatch, *, calls=None):
                     },
                 }
             ],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)

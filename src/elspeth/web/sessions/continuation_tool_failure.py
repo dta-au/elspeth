@@ -50,9 +50,11 @@ from elspeth.web.sessions.models import composer_segment_attempts_table as attem
 from elspeth.web.sessions.time_normalization import restore_utc
 
 if TYPE_CHECKING:
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
     from elspeth.web.composer.continuation_tool_failure import ContinuationToolFailureCustody
     from elspeth.web.required_sql_outcomes import RequiredSQLFinishOnce
     from elspeth.web.required_work import RequiredWorkCoordinator, RequiredWorkTicket
+    from elspeth.web.sessions.continuation_p4 import P4WriterObservation
     from elspeth.web.sessions.continuation_p4_application_store import StoredTerminalP4Application, StoredTerminalP4Preparation
     from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -97,6 +99,119 @@ class _CurrentFailureSourceSelection:
     source: RetainedToolFailureSource | None
     selected: SelectedContinuationState
     unresolved: tuple[str, ...]
+
+
+def _rolled_back_p4_capacity_refusal_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    selection: _CurrentFailureSourceSelection,
+    *,
+    env_ref_names: frozenset[str],
+    errors: tuple[BaseException, ...],
+    p4_writer_observation: P4WriterObservation | None,
+    stop_requested: bool,
+    deferred_cancellation: bool,
+) -> BaseException | None:
+    """Admit one fresh capacity refusal only after the actual P4 SQL readback proved rollback."""
+    from elspeth.web.composer.protocol import ComposerContextUnsupported
+    from elspeth.web.sessions.continuation_p4 import P4WriterObservation, read_p4_transaction_outcome_on_connection
+
+    observed = p4_writer_observation
+    if type(observed) is not P4WriterObservation or len(errors) != 1 or stop_requested or deferred_cancellation:
+        return None
+    original = observed.original_error
+    if (
+        type(original) is not ComposerContextUnsupported
+        or original.reason != "retained_chunk_bytes"
+        or errors[0] is not original
+        or observed.commit.running is not running
+        or not observed.known_not_committed
+        or observed.committed
+        or observed.candidate is None
+        or observed.application_candidate is not None
+        or observed.readback is not None
+        or selection.source is not None
+        or selection.unresolved != (observed.commit.effect_key,)
+    ):
+        return None
+    top = selection.selected.stack.frames[-1]
+    if type(top) is not ToolBatchFrame or top.phase != "effect_reconciling":
+        return None
+    # The prior readback is a process-local witness. Re-enter the exact SQL
+    # checkpoint/effect and candidate-row proof under this terminal lock;
+    # a later committed or uncertain result must retain worker_lost.
+    actual = read_p4_transaction_outcome_on_connection(conn, observed, env_ref_names=env_ref_names)
+    if actual is not None or not observed.known_not_committed or observed.committed:
+        return None
+    return original
+
+
+def _physical_p4_integrity_failure_on_connection(
+    conn: Connection,
+    running: ComposerOperationRunning,
+    selection: _CurrentFailureSourceSelection,
+    *,
+    required_work: RequiredWorkCoordinator,
+    env_ref_names: frozenset[str],
+    errors: tuple[BaseException, ...],
+    p4_writer_observation: P4WriterObservation | None,
+    p4_live_owner: ContinuationLiveP4 | None,
+) -> AuditIntegrityError | None:
+    """Admit only the original failed physical P4 SQL after a fresh rollback proof."""
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.composer.continuation_live_p4 import ContinuationLiveP4
+    from elspeth.web.required_sql_outcomes import RequiredSQLRaised
+    from elspeth.web.sessions.continuation_p4 import P4WriterObservation, read_p4_transaction_outcome_on_connection
+
+    owner, observed = p4_live_owner, p4_writer_observation
+    if type(owner) is not ContinuationLiveP4 or type(observed) is not P4WriterObservation:
+        return None
+    physical, ticket = owner.physical, owner._checkpoint_ticket
+    if type(physical) is not RequiredSQLRaised or ticket is None:
+        return None
+    original = physical.error
+    if (
+        type(original) is not AuditIntegrityError
+        or type(observed.original_error) is not OperationalError
+        or original.__cause__ is not observed.original_error
+        or owner.inventory.running is not running
+        or owner.work.running is not running
+        or owner.work.coordinator is not required_work
+        or owner.writer_observation is not observed
+        or owner.commit is not observed.commit
+        or owner.prepared is not observed.prepared
+        or observed.commit.running is not running
+        or not observed.known_not_committed
+        or observed.committed
+        or observed.application_candidate is not None
+        or observed.readback is not None
+        or owner.committed_outcome is not None
+        or owner.publication is not None
+        or owner.terminal_completion is not None
+        or selection.source is not None
+        or selection.unresolved != (observed.commit.effect_key,)
+    ):
+        return None
+    top = selection.selected.stack.frames[-1]
+    if type(top) is not ToolBatchFrame or top.phase != "effect_reconciling":
+        return None
+    pending: list[BaseException] = list(errors)
+    seen = False
+    while pending:
+        error = pending.pop()
+        if error is original:
+            seen = True
+            break
+        if isinstance(error, BaseExceptionGroup):
+            pending.extend(error.exceptions)
+    if not seen:
+        return None
+    required_work.validate_compose_checkpoint_sql_outcome(ticket=ticket, actual_outcome=physical)
+    actual = read_p4_transaction_outcome_on_connection(conn, observed, env_ref_names=env_ref_names)
+    if actual is not None or not observed.known_not_committed or observed.committed:
+        return None
+    return original
 
 
 def _read_tool_failure_selection_on_connection(
@@ -638,6 +753,8 @@ async def fail_continuation_tool_operation(
     env_ref_names: frozenset[str],
     original: BaseException | None = None,
     custody: ContinuationToolFailureCustody | None = None,
+    p4_writer_observation: P4WriterObservation | None = None,
+    p4_live_owner: ContinuationLiveP4 | None = None,
 ) -> CommittedContinuationFailure:
     """At most two physically joined terminal invocations; no tool/P4 replay."""
     from uuid import uuid4
@@ -736,12 +853,41 @@ async def fail_continuation_tool_operation(
                 raise AuditIntegrityError("V2 failed terminal lost its actual parent")
             current = _record_from_row(row)
             diagnostic = operation_failure_diagnostic_id(session_id=sid, operation_id=oid)
+            physical_integrity = _physical_p4_integrity_failure_on_connection(
+                conn,
+                running,
+                selection,
+                required_work=required_work,
+                env_ref_names=env_ref_names,
+                errors=tuple(errors),
+                p4_writer_observation=p4_writer_observation,
+                p4_live_owner=p4_live_owner,
+            )
+            authoritative_failure = physical_integrity is not None
             if observation is not None:
                 selected_failure = observation.prepared.outcome
                 if not isinstance(selected_failure, ComposerOperationError):
                     raise AuditIntegrityError("failed terminal candidate changed its actual failed result type")
+            elif physical_integrity is not None:
+                selected_failure = project_composer_operation_error(
+                    physical_integrity, request_id=current.request_id, diagnostic_id=diagnostic
+                )
             elif selection.unresolved:
-                selected_failure = worker_lost_error(request_id=current.request_id)
+                capacity = _rolled_back_p4_capacity_refusal_on_connection(
+                    conn,
+                    running,
+                    selection,
+                    env_ref_names=env_ref_names,
+                    errors=tuple(errors),
+                    p4_writer_observation=p4_writer_observation,
+                    stop_requested=current.cancel_requested_at is not None,
+                    deferred_cancellation=bool(cancellations),
+                )
+                selected_failure = (
+                    worker_lost_error(request_id=current.request_id)
+                    if capacity is None
+                    else project_composer_operation_error(capacity, request_id=current.request_id, diagnostic_id=diagnostic)
+                )
             elif errors:
                 selected_failure = project_composer_operation_error(
                     combine_failure_objects(errors[0], *errors[1:]), request_id=current.request_id, diagnostic_id=diagnostic
@@ -750,7 +896,7 @@ async def fail_continuation_tool_operation(
                 selected_failure = project_retained_tool_failure(source, request_id=current.request_id, diagnostic_id=diagnostic)
             else:
                 raise AuditIntegrityError("V2 failed terminal has neither actual native nor retained failure source")
-            selected_failure = _select_failure_on_connection(row, selected_failure, authoritative_failure=False)
+            selected_failure = _select_failure_on_connection(row, selected_failure, authoritative_failure=authoritative_failure)
             segment = conn.execute(
                 select(segments).where(
                     segments.c.session_id == sid, segments.c.operation_id == oid, segments.c.sequence == running.claim.segment_sequence
@@ -861,7 +1007,11 @@ async def fail_continuation_tool_operation(
                 select(messages.c.sequence_no).where(messages.c.session_id == sid, messages.c.id == candidate.message_id)
             ).scalar_one()
             result = settle_composer_operation_on_connection(
-                conn, running, outcome=candidate.prepared.outcome, prepared_settlement=candidate.prepared
+                conn,
+                running,
+                outcome=candidate.prepared.outcome,
+                authoritative_failure=authoritative_failure,
+                prepared_settlement=candidate.prepared,
             )
             selected_outcome = candidate.prepared.outcome
             if not isinstance(selected_outcome, ComposerOperationError):

@@ -281,7 +281,13 @@ class AdvisorCheckpointOwner:
         if self._secret_service is None:
             return frozenset()
         session = await self._require_sessions_service().get_session(UUID(session_id))
-        return frozenset(item.name for item in self._secret_service.list_refs(session.user_id))
+        return AdvisorCheckpointOwner._env_ref_names_for_session_owner(self, session.user_id)
+
+    def _env_ref_names_for_session_owner(self, user_id: str) -> frozenset[str]:
+        """Share the actual scoped metadata producer with registered reads."""
+        if self._secret_service is None:
+            return frozenset()
+        return frozenset(item.name for item in self._secret_service.list_refs(user_id))
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> RequestAdvisorHintArgumentsModel | AdvisorArgumentRejection:
         """Admit complete public input before advisor budget or provider effects.
@@ -748,6 +754,9 @@ class AdvisorCheckpointOwner:
                             response=response,
                             response_metadata=response_metadata,
                             max_completion_tokens_requested=max_completion,
+                            cost_response_accountable=(
+                                response_metadata is not None if provider_custody is not None and provider_custody.has_cost_budget else None
+                            ),
                             error_class=error_class,
                             error_message=error_message,
                             credential_surface="composer_advisor_response",

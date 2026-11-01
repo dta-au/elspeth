@@ -764,7 +764,8 @@ def test_v2_admission_fresh_bundle_uses_actual_sql_mode_and_reserved_ingress(ope
         stack = decode_continuation_snapshot(snapshot.payload_json)
         assert stack.mutation_ceiling.initial_trust_mode == mode
         assert stack.logical.original_user_message_id == str(record.reserved_user_message_id)
-        assert stack.provider_cost_policy.applicability == "not_applicable"
+        assert stack.provider_cost_policy.applicability == "continuation_v2"
+        assert stack.provider_cost_policy.admission_policy_hash == stack.policy_hash
         (segment,) = conn.execute(select(segments)).all()
         assert segment.state == "queued" and segment.sequence == segment.generation == 1
         assert segment.deadline_at is segment.claim_token is segment.started_at is None

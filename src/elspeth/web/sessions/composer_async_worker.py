@@ -239,7 +239,8 @@ class ComposerAsyncWorker:
         capacity = self._concurrency - len(self._jobs)
         if capacity <= 0 or self._stopping or self._instance_draining.is_set():
             return 0
-        claims = await _owned(run_sync_in_worker(self._authority.claim_segment, limit=capacity))
+        excluded_operations = frozenset(self._jobs)
+        claims = await _owned(run_sync_in_worker(self._authority.claim_segment, limit=capacity, excluded_operations=excluded_operations))
         if self._stopping or self._instance_draining.is_set():
             for claim in claims:
                 await self._release_unstarted_claim(claim)
@@ -247,8 +248,12 @@ class ComposerAsyncWorker:
         admitted = 0
         for claim in claims:
             key = (claim.session_id, claim.operation_id)
-            if key in self._jobs:
-                raise AuditIntegrityError("Composer claim duplicates locally owned work")
+            if key in self._jobs or len(self._jobs) >= self._concurrency:
+                # Another local caller can install work while SQL selection
+                # awaits. Hand back only this exact new unstarted claim;
+                # never replace the predecessor's Task/Stop/coordinator.
+                await self._release_unstarted_claim(claim)
+                continue
             self._local_cancels[key] = asyncio.Event()
             task = asyncio.create_task(self._job(claim), name="composer-operation")
             self._jobs[key] = task

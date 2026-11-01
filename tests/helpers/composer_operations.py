@@ -100,14 +100,13 @@ class SettledComposerOperation:
 def install_composer_async_worker(
     app: FastAPI, *, concurrency: int = 4, scan_interval_seconds: float = 1.0, claim_lease_seconds: int = 30, drain_seconds: float = 10.0
 ):
-    from threading import Event
-
     from elspeth.web.composer.continuation_policy_settings import continuation_policy_from_settings
     from elspeth.web.composer.progress import ComposerProgressRegistry
     from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
     from elspeth.web.middleware.request_id import RequestIdMiddleware
     from elspeth.web.process_recovery import ProcessRecovery
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker
+    from elspeth.web.sessions.composer_drain import ComposerDrainSignal
     from tests.fixtures.process_watchdog import OwnedTestProcessWatchdog
 
     service = app.state.session_service
@@ -124,8 +123,12 @@ def install_composer_async_worker(
         claim_lease_seconds=claim_lease_seconds,
         continuation_policy=continuation_policy_from_settings(app.state.settings),
     )
+    signal = ComposerDrainSignal()
     if "instance_draining" not in app.state._state:
-        app.state.instance_draining = Event()
+        app.state.instance_draining = signal.draining
+    else:
+        signal.draining = app.state.instance_draining
+    app.state.composer_drain_signal = signal
     if "process_recovery" not in app.state._state:
         app.state.process_recovery = ProcessRecovery(
             watchdog=OwnedTestProcessWatchdog(app.state.instance_draining), instance_draining=app.state.instance_draining
@@ -144,6 +147,7 @@ def install_composer_async_worker(
         owner_instance_id=service.session_operation_owner_instance_id,
         process_recovery=app.state.process_recovery,
         instance_draining=app.state.instance_draining,
+        drain_signal=signal,
     )
     app.state.composer_async_operation_authority = authority
     app.state.composer_async_worker = worker

@@ -8,7 +8,9 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
 
+import litellm
 import pytest
+from litellm import ModelResponse
 from sqlalchemy import Text, select, text, update
 from sqlalchemy.engine import Dialect
 from sqlalchemy.types import TypeDecorator
@@ -148,7 +150,19 @@ def _install_schema1_writer(monkeypatch):
 
 @asynccontextmanager
 async def _failed_guard_case(store, tmp_path, monkeypatch, *, legacy):
+    class _CostedModelResponse(ModelResponse):
+        """Report cost from the shared Advisor fixture's actual SDK response."""
+
+        def __init__(self, **kwargs):
+            usage = kwargs["usage"]
+            assert type(usage) is dict and "cost" not in usage
+            super().__init__(**dict(kwargs, usage={**usage, "cost": 0.01}))
+
     with monkeypatch.context() as guard_patch:
+        # _advisor_case imports ModelResponse before constructing its SDK stub.
+        # Keep the current provider-cost admission live while exercising the
+        # original blocked Advisor guard and versioned cold-reader oracles.
+        guard_patch.setattr(litellm, "ModelResponse", _CostedModelResponse)
         legacy_hashes = _install_schema1_writer(guard_patch) if legacy else None
         async with _advisor_case(store, tmp_path, monkeypatch, block=True) as (owner, running, sdk):
             await _advance(owner)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -135,13 +136,23 @@ class ContinuationActionClock:
         self.policy = policy
         self.started = asyncio.get_running_loop().time()
         self.deadline = self.started + policy.total
+        # Synchronous SQL owners cannot use an event loop clock. Keep a
+        # separate, explicitly monotonic preparation deadline for that seam.
+        self.started_monotonic = time.monotonic()
+        self.preparation_deadline_monotonic = self.started_monotonic + policy.preparation
         self._seen: set[str] = set()
+
+    def require_preparation_time(self, *, monotonic_now: float | None = None) -> None:
+        now = time.monotonic() if monotonic_now is None else monotonic_now
+        if type(now) is not float or not math.isfinite(now):
+            raise ValueError("preparation observation must be finite monotonic time")
+        if now > self.preparation_deadline_monotonic:
+            raise TimeoutError("continuation preparation allowance expired")
 
     def finish_preparation(self) -> None:
         if self._seen:
             raise ValueError("action preparation cannot renew or follow another stage")
-        if asyncio.get_running_loop().time() > self.started + self.policy.preparation:
-            raise TimeoutError("continuation preparation allowance expired")
+        self.require_preparation_time()
         self._seen.add("preparation")
 
     async def run[T](self, stage: ContinuationTimedStage, operation: Callable[[], Awaitable[T]]) -> T:

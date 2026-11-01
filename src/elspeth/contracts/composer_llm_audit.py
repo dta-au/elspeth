@@ -225,6 +225,8 @@ class ComposerLLMCall:
     # Catalog identity configured for fallback pricing, independent of routing.
     pricing_model: str | None = None
     provider_cost_source: ComposerLLMProviderCostSource = PROVIDER_COST_SOURCE_NOT_AVAILABLE
+    # None is retained only for historical calls without an admitted cost owner.
+    cost_response_accountable: bool | None = None
     max_completion_tokens_requested: int | None = None
     planner_policy_hash: str | None = None
     planner_call_ordinal: int | None = None
@@ -237,6 +239,8 @@ class ComposerLLMCall:
     private_request: PrivateProviderContext | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.cost_response_accountable is not None and type(self.cost_response_accountable) is not bool:
+            raise TypeError("cost_response_accountable must be exact bool or historical absence")
         if self.private_request is not None and type(self.private_request) is not PrivateProviderContext:
             raise TypeError("LLM private request context must be owned")
         if self.private_failure is not None and type(self.private_failure) is not PrivateFailureFacts:

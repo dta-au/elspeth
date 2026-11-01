@@ -76,7 +76,7 @@ async def test_finish_once_uses_actual_bootstrap_prompt_despite_lost_async_conte
         return ModelResponse(
             model="test/model",
             choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "Actual reply", "tool_calls": None}}],
-            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10, "cost": 0.01},
         )
 
     monkeypatch.setattr(litellm, "acompletion", completion)

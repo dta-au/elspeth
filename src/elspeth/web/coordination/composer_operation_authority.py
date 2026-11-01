@@ -7,6 +7,7 @@ reads omit request bodies and every cross-session discovery has a hard limit.
 from __future__ import annotations
 
 import secrets
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast, final
 from uuid import UUID, uuid4
@@ -28,9 +29,15 @@ from elspeth.web.composer.continuation_codec import PrivateChunk, decode_continu
 from elspeth.web.composer.continuation_policy import (
     ContinuationActionPolicy,
     ContinuationAdmissionPolicy,
+    ContinuationAdmissionPolicyV2,
+    ContinuationAdmissionPolicyV3,
     decode_continuation_policy,
 )
-from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
+from elspeth.web.continuation_retention_memo import (
+    RetentionStageMemo,
+    current_retention_stage_memo,
+    retention_stage_memo_scope,
+)
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
@@ -114,6 +121,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_evidence import AdmittedTurnEvidence
     from elspeth.web.composer.continuation_owed_evidence import OwedP4EvidenceData
     from elspeth.web.composer.continuation_prepared_p4 import PreparedP4Value
+    from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer, PrimaryNoSdkRefusalPermit
     from elspeth.web.composer.continuation_runtime import CapturedContinuationRuntime
     from elspeth.web.composer.continuation_selection import SelectedContinuationState
     from elspeth.web.composer.continuation_tool_failure import TerminalServiceCompletion
@@ -129,7 +137,7 @@ if TYPE_CHECKING:
         StoredTerminalP4Application,
         StoredTerminalP4Preparation,
     )
-    from elspeth.web.sessions.continuation_primary import PrimaryProviderResult, RetainedPrimaryPhaseData
+    from elspeth.web.sessions.continuation_primary import PrimaryNoSdkRefusalReceipt, PrimaryProviderResult, RetainedPrimaryPhaseData
     from elspeth.web.sessions.continuation_recovery_candidates import ContinuationInactiveCandidate, ContinuationRecoveryCandidate
     from elspeth.web.sessions.continuation_runtime import ContinuationRuntimeSource
     from elspeth.web.sessions.continuation_tool_failure import RetainedToolFailureSource
@@ -476,12 +484,16 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy | None = None,
+        continuation_policy: ContinuationAdmissionPolicy | ContinuationAdmissionPolicyV2 | ContinuationAdmissionPolicyV3 | None = None,
     ) -> None:
         """``continuation_policy`` is required to admit; read-only owners may omit it."""
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
             raise ValueError("invalid composer operation authority configuration")
-        if continuation_policy is not None and type(continuation_policy) is not ContinuationAdmissionPolicy:
+        if continuation_policy is not None and type(continuation_policy) not in (
+            ContinuationAdmissionPolicy,
+            ContinuationAdmissionPolicyV2,
+            ContinuationAdmissionPolicyV3,
+        ):
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
         self._owner_instance_id = owner_instance_id
@@ -629,6 +641,15 @@ class ComposerAsyncOperationAuthority:
                             kind=kind,
                             status="queued",
                             request_hash=request_hash,
+                            continuation_policy_version=retained_policy.schema_version,
+                            continuation_policy_sha256=(
+                                retained_policy.policy_hash if type(retained_policy) is ContinuationAdmissionPolicyV3 else None
+                            ),
+                            continuation_retained_payload_limit_bytes=(
+                                retained_policy.max_retained_payload_bytes
+                                if type(retained_policy) is ContinuationAdmissionPolicyV3
+                                else None
+                            ),
                             actor_user_id=actor_user_id,
                             request_id=request_id,
                             base_state_id=str(base_state_id) if base_state_id else None,
@@ -895,9 +916,15 @@ class ComposerAsyncOperationAuthority:
         expected_checkpoint_id: str,
         expected_cursor: int,
         primary_input_json: str | None = None,
+        no_sdk_issuer: PrimaryNoSdkIssuer | None = None,
     ) -> PreparedContinuationProvider:
         if type(running) is not ComposerOperationRunning:
             raise TypeError("continuation boundary requires nominal running custody")
+        if no_sdk_issuer is not None:
+            from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+
+            if type(no_sdk_issuer) is not PrimaryNoSdkIssuer or no_sdk_issuer.running is not running or family != 0:
+                raise AuditIntegrityError("PRIMARY preparation changed its original no-SDK issuer")
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
             binding = prepare_provider_effect_on_connection(
                 conn,
@@ -910,7 +937,10 @@ class ComposerAsyncOperationAuthority:
                 primary_input_json=primary_input_json,
             )
             snapshot = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
-            return PreparedContinuationProvider(binding, snapshot)
+            prepared = PreparedContinuationProvider(binding, snapshot)
+            if no_sdk_issuer is not None:
+                no_sdk_issuer.note_prepared_candidate(prepared)
+            return prepared
 
     def observe_provider_action(self, binding: ContinuationProviderBinding) -> ProviderActionObservation:
         if type(binding) is not ContinuationProviderBinding:
@@ -991,12 +1021,20 @@ class ComposerAsyncOperationAuthority:
         *,
         selected: SelectedContinuationState,
         inventory: CurrentContinuationEnvInventory,
+        retention_memo: RetentionStageMemo | None = None,
     ) -> ContinuationRuntimeSource:
         from elspeth.web.sessions.continuation_runtime import read_runtime_source_on_connection
 
         if type(running) is not ComposerOperationRunning:
             raise AuditIntegrityError("runtime read requires its actual running owner")
-        with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
+        if retention_memo is not None and (
+            type(retention_memo) is not RetentionStageMemo
+            or not retention_memo.active
+            or current_retention_stage_memo() is not retention_memo
+        ):
+            raise AuditIntegrityError("runtime read requires its exact active retention memo")
+        memo_scope = retention_stage_memo_scope() if retention_memo is None else nullcontext(retention_memo)
+        with session_data_read_transaction(self._engine, str(running.claim.session_id)) as conn, memo_scope:
             return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
     def read_continuation_tool_failure(
@@ -1145,13 +1183,150 @@ class ComposerAsyncOperationAuthority:
         with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
             return apply_attachment_history_on_connection(conn, running, selected=selected, inventory=inventory)
 
-    def begin_continuation_primary(self, prepared: PreparedContinuationProvider) -> StoredContinuationSnapshot:
+    def begin_continuation_primary(
+        self, prepared: PreparedContinuationProvider, *, no_sdk_issuer: PrimaryNoSdkIssuer | None = None
+    ) -> StoredContinuationSnapshot:
         from elspeth.web.sessions.continuation_primary import begin_primary_provider_on_connection
 
         if type(prepared) is not PreparedContinuationProvider:
             raise AuditIntegrityError("primary dispatch requires its actual prepared owner result")
         with locked_session_transaction(self._engine, str(prepared.binding.running.claim.session_id)) as conn:
-            return begin_primary_provider_on_connection(conn, prepared)
+            dispatched = begin_primary_provider_on_connection(conn, prepared, no_sdk_issuer=no_sdk_issuer)
+            if no_sdk_issuer is not None:
+                no_sdk_issuer.note_dispatched_candidate(dispatched)
+            return dispatched
+
+    def read_continuation_primary_prepare_outcome(self, issuer: PrimaryNoSdkIssuer) -> PreparedContinuationProvider | None:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+        from elspeth.web.sessions.continuation_primary import (
+            selected_primary_effect_data_on_connection,
+            stored_primary_input_data_on_connection,
+        )
+
+        if type(issuer) is not PrimaryNoSdkIssuer:
+            raise AuditIntegrityError("PRIMARY preparation readback requires its actual issuer")
+        running = issuer.running
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            candidate = issuer.prepared_candidate
+            if candidate is not None and current == candidate.snapshot:
+                _selected, _root, frame, effect = selected_primary_effect_data_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    checkpoint_id=current.checkpoint_id,
+                    cursor=current.cursor,
+                    effect_key=candidate.binding.effect_key,
+                    input_sha256=candidate.binding.input_sha256,
+                )
+                if effect.disposition != "prepared":
+                    raise AuditIntegrityError("PRIMARY preparation readback found an advanced effect")
+                stored_primary_input_data_on_connection(
+                    conn, session_id=running.claim.session_id, operation_id=running.claim.operation_id, effect=effect, frame=frame
+                )
+            elif (current.checkpoint_id, current.cursor) == (issuer.original_checkpoint_id, issuer.original_cursor):
+                return None
+            else:
+                raise AuditIntegrityError("PRIMARY preparation commit outcome is not its original selected source")
+        if candidate is None:
+            raise AuditIntegrityError("PRIMARY committed preparation lost its actual candidate")
+        issuer.bind_prepared(candidate)
+        return candidate
+
+    def read_continuation_primary_begin_outcome(self, issuer: PrimaryNoSdkIssuer) -> StoredContinuationSnapshot | None:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkIssuer
+        from elspeth.web.sessions.continuation_primary import selected_primary_effect_data_on_connection
+
+        if type(issuer) is not PrimaryNoSdkIssuer or issuer.prepared_candidate is None:
+            raise AuditIntegrityError("PRIMARY begin readback requires its exact prepared issuer")
+        running = issuer.running
+        prepared = issuer.prepared_candidate
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            current = load_snapshot(conn, session_id=str(running.claim.session_id), operation_id=running.claim.operation_id)
+            candidate = issuer.dispatched_candidate
+            if candidate is not None and current == candidate:
+                _selected, _root, _frame, effect = selected_primary_effect_data_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    checkpoint_id=current.checkpoint_id,
+                    cursor=current.cursor,
+                    effect_key=prepared.binding.effect_key,
+                    input_sha256=prepared.binding.input_sha256,
+                )
+                if effect.disposition != "dispatched":
+                    raise AuditIntegrityError("PRIMARY begin readback found another disposition")
+            elif current == prepared.snapshot:
+                return None
+            else:
+                raise AuditIntegrityError("PRIMARY begin commit outcome is not its original selected source")
+        if candidate is None:
+            raise AuditIntegrityError("PRIMARY committed begin lost its actual candidate")
+        issuer.bind_dispatched(candidate)
+        return candidate
+
+    def refuse_continuation_primary(self, permit: PrimaryNoSdkRefusalPermit) -> PrimaryNoSdkRefusalReceipt:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation_primary import (
+            read_primary_no_sdk_refusal_on_connection,
+            refuse_primary_no_sdk_on_connection,
+        )
+
+        if type(permit) is not PrimaryNoSdkRefusalPermit:
+            raise AuditIntegrityError("PRIMARY refusal requires its actual live no-SDK permit")
+        permit.issuer.require_refusal_permit(permit)
+        running = permit.issuer.running
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            prior = read_primary_no_sdk_refusal_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=running.claim.operation_id,
+                effect_key=permit.prepared.binding.effect_key,
+            )
+            if prior is not None:
+                if prior.receipt_key != permit.receipt_key:
+                    raise AuditIntegrityError("PRIMARY no-SDK refusal readback selected another live receipt")
+                result = prior
+            else:
+                result = refuse_primary_no_sdk_on_connection(conn, permit)
+        permit.issuer.mark_refusal_committed(permit)
+        return result
+
+    def read_continuation_primary_no_sdk_refusal(self, permit: PrimaryNoSdkRefusalPermit) -> PrimaryNoSdkRefusalReceipt | None:
+        from elspeth.web.composer.continuation_primary_no_sdk import PrimaryNoSdkRefusalPermit
+        from elspeth.web.sessions.continuation_primary import (
+            read_primary_no_sdk_refusal_on_connection,
+            selected_primary_effect_data_on_connection,
+        )
+
+        if type(permit) is not PrimaryNoSdkRefusalPermit:
+            raise AuditIntegrityError("PRIMARY readback requires its actual live no-SDK permit")
+        permit.issuer.require_refusal_permit(permit)
+        running = permit.issuer.running
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+            receipt = read_primary_no_sdk_refusal_on_connection(
+                conn,
+                session_id=running.claim.session_id,
+                operation_id=running.claim.operation_id,
+                effect_key=permit.prepared.binding.effect_key,
+            )
+            if receipt is not None:
+                if receipt.receipt_key != permit.receipt_key:
+                    raise AuditIntegrityError("PRIMARY no-SDK readback selected another refusal")
+            else:
+                source = permit.dispatched if permit.dispatched is not None else permit.prepared.snapshot
+                selected_primary_effect_data_on_connection(
+                    conn,
+                    session_id=running.claim.session_id,
+                    operation_id=running.claim.operation_id,
+                    checkpoint_id=source.checkpoint_id,
+                    cursor=source.cursor,
+                    effect_key=permit.prepared.binding.effect_key,
+                    input_sha256=permit.prepared.binding.input_sha256,
+                )
+        if receipt is not None:
+            permit.issuer.mark_refusal_committed(permit)
+        return receipt
 
     def publish_continuation_primary(
         self,
@@ -1450,8 +1625,26 @@ class ComposerAsyncOperationAuthority:
                 next_cursor = ComposerOperationFailureCursor(settled_at=last.settled_at, operation_id=last.operation_id)
             return tuple(outcomes), next_cursor
 
-    def claim_segment(self, *, limit: int) -> tuple[ComposerOperationClaim, ...]:
+    def claim_segment(
+        self, *, limit: int, excluded_operations: frozenset[tuple[UUID, str]] = frozenset()
+    ) -> tuple[ComposerOperationClaim, ...]:
         _bounded(limit)
+        if type(excluded_operations) is not frozenset:
+            raise TypeError("local claim exclusions must be an immutable operation-key snapshot")
+        for key in excluded_operations:
+            if type(key) is not tuple or len(key) != 2:
+                raise TypeError("local claim exclusion requires a complete operation key")
+            _identity(*key)
+        blocked = (
+            or_(
+                *(
+                    and_(segments.c.session_id == str(session_id), segments.c.operation_id == operation_id)
+                    for session_id, operation_id in sorted(excluded_operations)
+                )
+            )
+            if excluded_operations
+            else false()
+        )
         with self._engine.connect() as conn:
             now = database_now(conn)
             candidates = conn.execute(
@@ -1460,7 +1653,10 @@ class ComposerAsyncOperationAuthority:
                     segments.c.operation_id,
                     segments.c.sequence,
                 )
-                .where(_continuation_claim_predicate(conn, now))
+                # A locally finishing predecessor must not consume LIMIT and
+                # starve unrelated work. This is only this caller's scheduling
+                # hint; peer/global SQL eligibility and claim CAS stay intact.
+                .where(_continuation_claim_predicate(conn, now), ~blocked)
                 .order_by(
                     segments.c.next_eligible_at,
                     segments.c.enqueued_at,
