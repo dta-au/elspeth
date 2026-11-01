@@ -95,8 +95,10 @@ GRAMMARS = {
     "_handle_plugin_crash": "c0345259ed743d014249dfc660177a0f614e7d48572bd85107b2dbf1cc33aa25",
     "_handle_runtime_preflight_failure": "fd3578fce1748f626a5c0e09fab7f7f60f15c1e8ee0e8c950f580c378f553865",
     "_run_composer_turn": "7e4bc316e58c1c2c8abfef2c7a0038fa364313d7c9eeb4e040418547292b422c",
-    # Reviewed 2026-11-01: the moved runtime-preflight caller (41fcaafce).
-    "settle_composer_result": "fe3ee099677b49c914de06bb58c43fbfbcb7c5b7793a0f62964c757a7c39c1b6",
+    # Reviewed 2026-11-01: the moved runtime-preflight caller (41fcaafce),
+    # then the verified-checkpoint refusal before the strict-lane save
+    # (the head verification read, fix-autocommit).
+    "settle_composer_result": "743ca996546636bf24704d96b43c9181831aa652935ba448da58bfdc970e9eee",
 }
 IMPORT_GRAMMARS = {
     "src/elspeth/web/sessions/routes/_helpers.py|elspeth.web.required_work": "24c410aedf7d87072b30e0483a70191b9729d6d67166d1ef15b55ff0013b5199",

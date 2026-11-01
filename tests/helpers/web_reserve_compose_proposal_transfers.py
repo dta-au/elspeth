@@ -471,7 +471,9 @@ _REVIEWED_METHOD_SHAPES = {
     SETTLEMENT: "7c7465be32aeab7821c08a1a511541f23bb394aa39cd756b2f2215cda3cde599",
     # Root derives this from the actual selected body after the finite join is
     # reviewed. None refuses; it is never a waiver for an unreceived body.
-    FINALIZATION: "fe3ee099677b49c914de06bb58c43fbfbcb7c5b7793a0f62964c757a7c39c1b6",
+    # Reviewed 2026-11-01: the verified-checkpoint refusal before the
+    # strict-lane save (the head verification read, fix-autocommit).
+    FINALIZATION: "743ca996546636bf24704d96b43c9181831aa652935ba448da58bfdc970e9eee",
 }
 _REVIEWED_RECOVERY_METHOD_SHAPE = "cb8dea7814eb14cbe8601c402db19eb544781954c26679a6780e378b3d6d35c0"
 _REVIEWED_ANNOTATIONS = {TURN: frozenset({"assistant_write", "parent_assistant_id"})}
@@ -483,7 +485,9 @@ _METHOD_PATHS = {
     FINALIZATION: "settle_composer_result",
 }
 
-_FINALIZATION_NAMESPACE_SHAPE = "68064590d888ca71f9363c76fa2bbb1139dc9299cfd41376cced883bed92895b"
+# Reviewed 2026-11-01: adds the state_from_record import used by the head
+# verification read (fix-autocommit).
+_FINALIZATION_NAMESPACE_SHAPE = "a0b4c30c6dacaf268964af90f7c197e27ba9c2971efd71d574d2cd0f0ba2e2fa"
 _FINALIZATION_FIELDS = (
     "service",
     "session",

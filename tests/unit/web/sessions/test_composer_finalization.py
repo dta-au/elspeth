@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.compartments import chat_ingress_input
-from elspeth.web.composer.protocol import ComposerRuntimePreflightError
+from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.composer.protocol import ComposerResult, ComposerRuntimePreflightError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions import composer_finalization, composer_turn
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composition_states_table
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schemas import MessageWithStateResponse
 from elspeth.web.sessions.state_envelope import unwrap_state_column
 from tests.unit.web.sessions.test_routes import _make_app, _make_composer_mock
@@ -149,3 +154,75 @@ async def test_finalization_snapshots_nested_provenance_and_thaws_only_at_real_w
             persisted = job.authority.get(session_id=session.id, operation_id=job.turn.operation_id)
             assert persisted.result_json == terminal.result_json and job.observation.audit_cohort_durable
         assert len(captured) == 1
+
+
+def _checkpoint_data(state: CompositionState) -> CompositionStateData:
+    wire = state.to_dict()
+    return CompositionStateData(
+        sources=wire["sources"],
+        nodes=wire["nodes"],
+        edges=wire["edges"],
+        outputs=wire["outputs"],
+        metadata_=wire["metadata"],
+        is_valid=False,
+        composer_meta={"validation_lane": "authoring_only"},
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned", ("verified", "diverged", "unanchored", "stale_anchor"))
+async def test_post_compose_save_reprojects_only_the_verified_checkpoint(tmp_path, returned):
+    """An auto-commit turn's head is the advisor-verified graph, or the turn refuses.
+
+    The compose double stands in for the loop: it commits one in-turn
+    ``tool_call`` checkpoint under the actual COMPOSE fence (as P4 does) and
+    returns a result anchored to it via ``final_persisted_state_id``.
+    """
+    app, service = _make_app(tmp_path)
+    composer = _make_composer_mock()
+    app.state.composer_service = composer
+    session = await service.create_session("alice", "Verified head", "local")
+    verified = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(name="Verified draft"), version=2)
+    checkpoints = []
+
+    async def compose_with_checkpoint(message, history, starting_state, **kwargs):
+        checkpoint = await service.save_composition_state(
+            session.id,
+            _checkpoint_data(verified),
+            provenance="tool_call",
+            session_operation_context=kwargs["session_operation_context"],
+        )
+        checkpoints.append(checkpoint)
+        state = verified if returned != "diverged" else replace(verified, metadata=PipelineMetadata(name="Never verified"))
+        anchor = {"verified": checkpoint.id, "diverged": checkpoint.id, "unanchored": None, "stale_anchor": uuid4()}[returned]
+        return ComposerResult(message="The draft was saved.", state=state, final_persisted_state_id=anchor)
+
+    composer.compose.side_effect = compose_with_checkpoint
+    async with _running_job(app, service, session.id, kind="compose_message", content="Save the draft.") as job:
+        if returned == "verified":
+            terminal = await _run(app, job)
+            assert terminal.status == "completed"
+        else:
+            with pytest.raises(AuditIntegrityError):
+                await _run(app, job)
+    (checkpoint,) = checkpoints
+    with app.state.session_engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.session_id == str(session.id))
+                .order_by(composition_states_table.c.version)
+            )
+            .mappings()
+            .all()
+        )
+    current = await service.get_current_state(session.id)
+    assert current is not None
+    if returned == "verified":
+        assert [row["provenance"] for row in rows] == ["tool_call", "post_compose"]
+        assert rows[0]["id"] == str(checkpoint.id) and rows[1]["id"] == str(current.id)
+        assert composition_content_hash(state_from_record(current)) == composition_content_hash(verified)
+    else:
+        # Refused before the strict-lane save: the head stays the checkpoint.
+        assert [row["provenance"] for row in rows] == ["tool_call"]
+        assert current.id == checkpoint.id

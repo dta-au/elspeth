@@ -46,6 +46,7 @@ from elspeth.web.execution.completion_gates import (
 from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.composer_operations import ComposerOperationAssistantWrite
+from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.routes._helpers import (
     _composition_proposal_response,
     _handle_runtime_preflight_failure,
@@ -379,6 +380,21 @@ async def settle_composer_result(
         post_compose_state_id = route_settlement.settlement.state.id
         assistant_record = route_settlement.settlement.transition_message
     elif result.state.version != state.version:
+        # Verification read. A turn that committed in-turn checkpoints leaves
+        # the head on the tool_call row the END advisor verified; this save
+        # re-projects that graph in the strict lane (models.py composer_meta:
+        # two writers, one column). It must name that exact head
+        # (final_persisted_state_id) and carry the identical graph, or the
+        # session's head would become a graph the advisor never verified.
+        verified_head = await service.get_current_state(session.id)
+        verified_head_id = verified_head.id if verified_head is not None else None
+        if result.final_persisted_state_id is not None and result.final_persisted_state_id != verified_head_id:
+            raise AuditIntegrityError("Composer settlement head moved off its final persisted checkpoint")
+        if verified_head_id != compose_base_state_id:
+            if verified_head is None or result.final_persisted_state_id is None:
+                raise AuditIntegrityError("Post-compose save lacks the verified checkpoint it re-projects")
+            if composition_content_hash(state_from_record(verified_head)) != composition_content_hash(result.state):
+                raise AuditIntegrityError("Post-compose save differs from its advisor-verified checkpoint")
         await _publish_progress(
             progress_sink,
             event=ComposerProgressEvent(

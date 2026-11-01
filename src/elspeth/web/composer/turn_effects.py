@@ -994,6 +994,29 @@ class TurnEvidence:
             batches=(*self.effects.batches, batch),
         )
 
+    def final_persisted_head(self) -> UUID | None:
+        """The durable head after the final persisted tool turn, as evidence.
+
+        This is ``ComposerResult.final_persisted_state_id``: the state that
+        route settlement re-projects in the strict lane. When this request did
+        not move the head it is the request's own initial state. When it did,
+        the head is returned only if it is the checkpoint the END advisor was
+        shown as verified. ``None`` then means the verification evidence is
+        missing, and finalization refuses to save over that head.
+        """
+        head_state_id = self.effects.latest_committed_state_id
+        if head_state_id is None:
+            return None
+        if head_state_id == self.effects.initial_state_id:
+            return UUID(head_state_id)
+        if (
+            self.effects.verification != "verified"
+            or self.effects.latest_verified_state_id != head_state_id
+            or self.effects.latest_committed_state_id != head_state_id
+        ):
+            return None
+        return UUID(head_state_id)
+
     def render_saved_scope(self) -> str:
         """Describe owned checkpoint evidence, not subsequent route settlement.
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from uuid import UUID
 
 import httpx
 import litellm
@@ -271,8 +272,12 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             assert deep_thaw(saved.nodes[0].routes) == authored["nodes"][0]["routes"]
             end = parse_advisor_publication_review(script.requests[-1]["messages"][1]["content"])
             assert end["saved_effects"]["verification"] == "verified"
-            assert end["saved_effects"]["latest_committed_state_id"] == str(current.id)
-            assert end["saved_effects"]["latest_verified_state_id"] == str(current.id)
+            # The END advisor verified the in-turn tool_call checkpoint; the
+            # current head is its strict-lane post_compose re-projection,
+            # bound to that checkpoint below (models.py composer_meta).
+            verified_id = end["saved_effects"]["latest_verified_state_id"]
+            assert end["saved_effects"]["latest_committed_state_id"] == verified_id
+            assert observed_result.final_persisted_state_id == UUID(verified_id)
         else:
             (proposal,) = proposals
             assert proposal.tool_name == "set_pipeline" and proposal.status == "pending" and current is None
@@ -300,9 +305,19 @@ async def test_referential_planner_threshold_retirement_preserves_first_candidat
             states = connection.execute(
                 select(composition_states_table).where(composition_states_table.c.session_id == str(session.id))
             ).all()
-        assert len(states) == int(auto)
+        assert len(states) == 2 * int(auto)
         if auto:
-            assert states[0].id == str(current.id) and states[0].provenance == "tool_call"
+            checkpoint, final = sorted(states, key=lambda row: row.version)
+            assert (checkpoint.provenance, final.provenance) == ("tool_call", "post_compose")
+            assert checkpoint.id == verified_id and final.id == str(current.id)
+            assert final.version == checkpoint.version + 1
+            assert (final.sources, final.nodes, final.edges, final.outputs, final.metadata_) == (
+                checkpoint.sources,
+                checkpoint.nodes,
+                checkpoint.edges,
+                checkpoint.outputs,
+                checkpoint.metadata_,
+            )
         assert len(jobs) == 1 and jobs[0].status == "completed"
         assert jobs[0].operation_id == body["operation_id"] and jobs[0].actor_user_id == "alice"
         assert {row.operation_id for row in attempts} == {jobs[0].session_operation_id}

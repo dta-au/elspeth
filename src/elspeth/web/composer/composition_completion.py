@@ -2750,4 +2750,11 @@ class CompositionCompletion:
         raw = result.message if result.raw_assistant_content is None else result.raw_assistant_content
         message = compose_checkpoint_receipt_message(result.message, raw_content=raw, evidence=turn_evidence)
         _enforce_augmentation_prefix_invariant(branch="checkpoint_receipt_augmentation", content=result.message, augmented=message)
-        return replace(result, message=message, raw_assistant_content=raw)
+        # The receipt and the settlement anchor describe the same evidence:
+        # route finalization re-projects only this verified head.
+        return replace(
+            result,
+            message=message,
+            raw_assistant_content=raw,
+            final_persisted_state_id=turn_evidence.final_persisted_head(),
+        )
