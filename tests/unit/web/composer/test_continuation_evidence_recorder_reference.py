@@ -108,6 +108,44 @@ def test_late_transcript_credentials_win_over_actual_pair_excess(mode):
             admit_turn_evidence(value, env_ref_names=frozenset(), source_chunks=(audit,), mandatory_retention=mode == "mandatory")
 
 
+def test_planted_credentials_refuse_on_every_read_after_the_clean_source_was_read():
+    """Repeated reads of the clean pair first; near-copies with one planted
+    credential (deep in the transcript, at the tail of the large recorder)
+    must refuse identically on every read, not only the first."""
+    _value, audit, source = _pair_candidate()
+    for _ in range(3):
+        positive = decode_turn_evidence(source, env_ref_names=frozenset(), source_chunks=(audit,))
+        assert positive.recorder_chunk is audit and encode_turn_evidence(positive) == source
+
+    _value, planted_audit, planted_source = _pair_candidate(credential=True)
+    assert "postgresql://" in planted_source.canonical
+    transcript_refusals = []
+    for _ in range(3):
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            decode_turn_evidence(planted_source, env_ref_names=frozenset(), source_chunks=(planted_audit,))
+        transcript_refusals.append((caught.value.surface, caught.value.finding))
+    assert len(set(transcript_refusals)) == 1
+
+    secret = "postgresql://user:secret@host/db"  # secret-scan: allow-this-line
+    payload = json.loads(audit.canonical)
+    body = payload["withheld_replies"][-1]["content"]
+    assert len(body) > 100_000
+    payload["withheld_replies"][-1]["content"] = body[: -len(secret)] + secret
+    canonical = canonical_json(payload)
+    encoded = canonical.encode()
+    corrupt = PrivateChunk(
+        PrivateChunkRef(codec=audit.reference.codec, digest=sha256(encoded).hexdigest(), byte_length=len(encoded)), canonical
+    )
+    assert corrupt.reference.byte_length == audit.reference.byte_length
+    recorder_refusals = []
+    for _ in range(3):
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            decode_recorder_snapshot(corrupt)
+        recorder_refusals.append((caught.value.surface, caught.value.finding))
+    assert len(set(recorder_refusals)) == 1
+    assert recorder_refusals[0][1].category == "credential_url"
+
+
 def test_actual_recorder_reference_preserves_graphless_source_and_cold_channels():
     owner, messages, recorder, logical, _ = rich_evidence()
     admitted = snapshot(owner, messages, recorder, logical)

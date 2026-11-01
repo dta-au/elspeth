@@ -10,8 +10,11 @@ general-purpose DLP system.
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from collections.abc import Collection, Iterable, Mapping, Set
 from dataclasses import dataclass
+from hashlib import sha256
+from threading import Lock
 from types import MappingProxyType
 from typing import Any, Final, Literal, cast
 from urllib.parse import ParseResult, parse_qs, urlparse
@@ -341,7 +344,72 @@ def _allowed_reference_finding(
     return None
 
 
+type _CleanTextKey = tuple[int, bytes]
+
+# Distinct clean texts per process, not characters: a key is a length and a
+# 32-byte digest, so 65,536 entries stay near 10 MB however long the texts are.
+_CLEAN_TEXT_MEMO_MAX_ENTRIES: Final[int] = 65_536
+
+
+class _CleanTextMemo:
+    """Bounded process-local record of exact texts classified clean.
+
+    Classification reads only its argument and this module's immutable
+    patterns and vocabularies, so an identical text always classifies
+    identically. A key is the text's length and the SHA-256 of its
+    surrogate-preserving UTF-8 bytes (an injective encoding of every ``str``),
+    so no scanned text is retained. Only a clean result is recorded: a text
+    with any finding takes the complete classification path every time.
+    Lookups, records and eviction share one lock; detector worker threads
+    classify concurrently.
+    """
+
+    __slots__ = ("_entries", "_lock", "_max_entries")
+
+    def __init__(self, max_entries: int) -> None:
+        self._entries: OrderedDict[_CleanTextKey, None] = OrderedDict()
+        self._lock = Lock()
+        self._max_entries = max_entries
+
+    def contains(self, key: _CleanTextKey) -> bool:
+        with self._lock:
+            if key not in self._entries:
+                return False
+            self._entries.move_to_end(key)
+            return True
+
+    def record(self, key: _CleanTextKey) -> None:
+        with self._lock:
+            self._entries[key] = None
+            self._entries.move_to_end(key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+_CLEAN_TEXT_MEMO: Final[_CleanTextMemo] = _CleanTextMemo(_CLEAN_TEXT_MEMO_MAX_ENTRIES)
+
+
+def _clean_text_key(value: str) -> _CleanTextKey:
+    return len(value), sha256(value.encode("utf-8", errors="surrogatepass")).digest()
+
+
 def _classify_string(value: str) -> CredentialCategory | None:
+    # Continuation reads re-admit the same immutable documents many times
+    # under one session lock; each whole-document text would otherwise be
+    # re-scanned by every pattern on every read. A string subclass can
+    # override equality and encoding, so only an exact ``str`` is keyed.
+    if type(value) is not str:
+        return _classify_string_uncached(value)
+    key = _clean_text_key(value)
+    if _CLEAN_TEXT_MEMO.contains(key):
+        return None
+    category = _classify_string_uncached(value)
+    if category is None:
+        _CLEAN_TEXT_MEMO.record(key)
+    return category
+
+
+def _classify_string_uncached(value: str) -> CredentialCategory | None:
     if _PRIVATE_KEY_PATTERN.search(value):
         return "private_key"
     if any(pattern.search(value) for pattern in _CREDENTIAL_URL_PATTERNS):

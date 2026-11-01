@@ -7,6 +7,7 @@ import json
 
 import pytest
 
+from elspeth.contracts import credential_material
 from elspeth.contracts.credential_material import (
     CREDENTIAL_PATTERN_SPECS,
     REDACTED_CREDENTIAL_TEXT,
@@ -293,3 +294,90 @@ def test_audit_scrub_uses_fixed_whole_value_sentinel_and_handles_cycles() -> Non
     assert scrubbed["password"] == REDACTED_CREDENTIAL_TEXT
     assert scrubbed["cycle"] == [REDACTED_CREDENTIAL_TEXT, REDACTED_CREDENTIAL_TEXT]
     assert secret not in repr(scrubbed)
+
+
+def _recorded_clean(value: str) -> bool:
+    return credential_material._CLEAN_TEXT_MEMO.contains(credential_material._clean_text_key(value))
+
+
+def test_a_credential_added_to_a_text_first_classified_clean_is_still_found() -> None:
+    clean = "ordinary retained recorder body " * 4096
+    document = {"ordinary": [{"nested": [{"deeper": clean}]}]}
+
+    assert find_credential_material(document) is None
+    assert find_credential_material(document) is None
+    # Known positive for the instrument: the clean text really was recorded.
+    assert _recorded_clean(clean)
+    for planted in (
+        clean + "sk-ant-" + "a" * 40,
+        clean[:-1] + "postgresql://user:secret@host/db",  # secret-scan: allow-this-line
+        "-----BEGIN PRIVATE KEY-----" + clean[27:],
+    ):
+        assert len(planted) >= len(clean) - 1
+        nested = {"ordinary": [{"nested": [{"deeper": planted}]}]}
+        findings = [find_credential_material(nested) for _ in range(3)]
+        assert findings[0] is not None
+        assert findings == [findings[0]] * 3
+        assert findings[0].location == "mapping_value"
+        assert not _recorded_clean(planted)
+
+
+def test_a_one_character_change_that_completes_a_credential_is_found() -> None:
+    short = "AKIAABCDEFGHIJKLMNO"  # secret-scan: allow-this-line
+    assert find_credential_material({"ordinary": short}) is None
+    assert _recorded_clean(short)
+
+    finding = find_credential_material({"ordinary": short + "P"})
+
+    assert finding is not None
+    assert finding.category == "token_shape"
+
+
+def test_the_same_credential_text_is_found_on_every_scan_and_never_recorded() -> None:
+    secret = "https://user:pass@example.test/path"
+    findings = [find_credential_material({"ordinary": [{"nested": secret}]}) for _ in range(3)]
+
+    assert all(finding is not None and finding.category == "credential_url" for finding in findings)
+    assert len(set(findings)) == 1
+    assert not _recorded_clean(secret)
+    assert scrub_credential_material({"ordinary": secret}) == {"ordinary": REDACTED_CREDENTIAL_TEXT}
+    assert scrub_credential_material({"ordinary": secret}) == {"ordinary": REDACTED_CREDENTIAL_TEXT}
+
+
+def test_a_string_subclass_cannot_present_the_key_of_a_recorded_clean_text() -> None:
+    clean = "ordinary clean scrub text"
+    assert scrub_credential_material({"ordinary": clean}) == {"ordinary": clean}
+    assert _recorded_clean(clean)
+
+    class Impostor(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            return clean.encode(encoding, errors)
+
+        def __len__(self) -> int:
+            return len(clean)
+
+    secret = Impostor("sk-ant-" + "a" * 40)
+
+    assert scrub_credential_material({"ordinary": secret}) == {"ordinary": REDACTED_CREDENTIAL_TEXT}
+
+
+def test_clean_text_memo_evicts_least_recent_keys_beyond_its_bound() -> None:
+    memo = credential_material._CleanTextMemo(2)
+    first, second, third = (credential_material._clean_text_key(text) for text in ("first", "second", "third"))
+    memo.record(first)
+    memo.record(second)
+    assert memo.contains(first)
+    memo.record(third)
+
+    assert memo.contains(first) and memo.contains(third)
+    assert not memo.contains(second)
+
+
+def test_clean_text_keys_distinguish_surrogate_pairs_from_astral_characters() -> None:
+    astral = chr(0x1F600)
+    pair = chr(0xD83D) + chr(0xDE00)
+    assert len(astral) == 1 and len(pair) == 2
+
+    assert credential_material._clean_text_key(astral) != credential_material._clean_text_key(pair)
+    assert credential_material._clean_text_key(chr(0xD800)) != credential_material._clean_text_key(chr(0xFFFD))
+    assert credential_material._clean_text_key(chr(0xD83D) + "a") != credential_material._clean_text_key(chr(0xFFFD) + "a")
