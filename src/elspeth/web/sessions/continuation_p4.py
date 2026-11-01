@@ -229,7 +229,6 @@ def read_p4_transaction_outcome_on_connection(
         or creator.session_operation_id != running.session_operation_context.fence.operation_id
         or creator.session_operation_epoch != running.session_operation_context.fence.operation_epoch
         or creator.claim_attempt != running.claim.attempt
-        or parent.lifecycle_version != 2
         or parent.actor_user_id != source.actor_user_id
         or principal.user_id != source.actor_user_id
         or source.physical_operation_id != creator.session_operation_id
@@ -1295,7 +1294,6 @@ def _require_terminal_source_on_connection(conn: Connection, value: TerminalP4In
         or principal is None
         or creator is None
         or checkpoint is None
-        or parent.lifecycle_version != 2
         or parent.actor_user_id != value.actor_user_id
         or principal.user_id != value.actor_user_id
         or creator.claim_attempt != value.claim_attempt

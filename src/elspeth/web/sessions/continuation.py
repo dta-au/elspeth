@@ -171,7 +171,6 @@ def require_continuation_mutation(
         parent is not None
         and segment is not None
         and live_fence is not None
-        and parent.lifecycle_version == 2
         and parent.status == "running"
         and principal is not None
         and principal.archived_at is None
@@ -384,7 +383,6 @@ def load_snapshot(conn: Connection, *, session_id: str, operation_id: str) -> St
         select(jobs.c.checkpoint_id, jobs.c.journal_cursor).where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
         )
     ).one_or_none()
     if parent is None:
@@ -704,7 +702,6 @@ def append_complete_snapshot(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.checkpoint_id == expected_checkpoint_id,
             jobs.c.journal_cursor == expected_cursor,
         )
@@ -970,7 +967,6 @@ def recover_segment_on_connection(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == "running",
             jobs.c.current_segment_sequence == segment.sequence,
             jobs.c.ownership_generation == expected_generation,
@@ -1283,7 +1279,6 @@ def settle_segment_on_connection(
         .where(
             jobs.c.session_id == session_id,
             jobs.c.operation_id == operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == parent.status,
             jobs.c.current_segment_sequence == segment.sequence,
             jobs.c.ownership_generation == segment.generation,
@@ -1305,12 +1300,10 @@ def settle_continuation_on_connection(
     """The live owner's V2 terminal under its exact current fence and attempt.
 
     A ``request_cancelled`` outcome is the one terminal a pending Stop allows.
-    The fence is left for the lease close, as for V1, so the worker verifies
+    The fence is left for the lease close, so the worker verifies
     the terminal before it releases (design §2.7).
     """
     claim, context = running.claim, running.session_operation_context
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("continuation settlement requires its segment claim")
     cancelling = isinstance(outcome, ComposerOperationError) and outcome.failure_code == "request_cancelled"
     # False means no live continuation attempt holds this fence: not this owner.
     if not require_continuation_mutation(conn, context, allow_cancel=cancelling, allow_expired_segment=True):
@@ -1389,8 +1382,6 @@ def yield_segment_on_connection(
     from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent, roll_slice_for_successor
 
     claim, context = running.claim, running.session_operation_context
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("yield requires a continuation segment claim")
     fence = context.fence
     # False means no live continuation attempt holds this fence: not this owner.
     if not require_continuation_mutation(conn, context, allow_cancel=False, allow_expired_segment=True):
@@ -1497,7 +1488,6 @@ def yield_segment_on_connection(
         .where(
             jobs.c.session_id == sid,
             jobs.c.operation_id == operation,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status == "running",
             jobs.c.current_segment_sequence == sequence,
             jobs.c.ownership_generation == generation,
@@ -1629,8 +1619,6 @@ def read_yield_outcome_on_connection(conn: Connection, running: ComposerOperatio
     from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent
 
     claim, fence = running.claim, running.session_operation_context.fence
-    if claim.segment_sequence is None or claim.ownership_generation is None:
-        raise TypeError("yield outcome requires a continuation segment claim")
     sid, operation = str(claim.session_id), claim.operation_id
     history = conn.execute(
         select(attempts).where(
@@ -1695,7 +1683,7 @@ def _select_segment_start_on_connection(
     owner_instance_id: str,
     segment_policy: ContinuationSegmentPolicy | None = None,
 ) -> _SegmentStartSelection:
-    if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
+    if type(claim) is not ComposerOperationClaim:
         raise TypeError("continuation start requires its nominal segment claim")
     if segment_policy is not None and type(segment_policy) is not ContinuationSegmentPolicy:
         raise TypeError("segment policy must be its actual owned type")
@@ -1716,7 +1704,6 @@ def _select_segment_start_on_connection(
     if (
         parent is None
         or segment is None
-        or parent.lifecycle_version != 2
         or parent.status not in ("queued", "running")
         or parent.attempt != claim.attempt
         or parent.current_segment_sequence != claim.segment_sequence
@@ -1878,7 +1865,6 @@ def start_segment_on_connection(
         .where(
             jobs.c.session_id == str(claim.session_id),
             jobs.c.operation_id == claim.operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status.in_(("queued", "running")),
             jobs.c.attempt == claim.attempt,
             jobs.c.current_segment_sequence == claim.segment_sequence,

@@ -6,7 +6,6 @@ reads omit request bodies and every cross-session discovery has a hard limit.
 
 from __future__ import annotations
 
-import math
 import secrets
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast, final
@@ -45,9 +44,6 @@ from elspeth.web.sessions.composer_operations import (
     COMPOSER_OPERATION_RESULT_SCHEMA_ERROR,
     COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS,
     ComposerOperationActiveError,
-    ComposerOperationCancelledBeforeStart,
-    ComposerOperationCancelledDuringTurn,
-    ComposerOperationCancelledFailure,
     ComposerOperationCapacityError,
     ComposerOperationClaim,
     ComposerOperationConflictError,
@@ -62,8 +58,6 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRunning,
     ComposerOperationSavedRevisions,
     ComposerOperationSettledBy,
-    ComposerTurnDeadlineExpired,
-    composer_operation_request_hash,
     composer_operation_result_hash,
     composer_operation_v2_request_hash,
 )
@@ -174,7 +168,6 @@ def _continuation_claim_predicate(conn: Connection, now: datetime) -> ColumnElem
         .where(
             jobs.c.session_id == segments.c.session_id,
             jobs.c.operation_id == segments.c.operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.status.in_(("queued", "running")),
             jobs.c.current_segment_sequence == segments.c.sequence,
             jobs.c.ownership_generation == segments.c.generation,
@@ -225,15 +218,12 @@ def _record_from_row(row: Row[Any], *, request_json: str | None = None) -> Compo
             actor_user_id=row.actor_user_id,
             request_id=row.request_id,
             base_state_id=UUID(row.base_state_id) if row.base_state_id is not None else None,
-            deadline_at=restore_utc(row.deadline_at) if row.deadline_at is not None else None,
             created_at=restore_utc(row.created_at),
             updated_at=restore_utc(row.updated_at),
             started_at=restore_utc(row.started_at) if row.started_at is not None else None,
             settled_at=restore_utc(row.settled_at) if row.settled_at is not None else None,
             cancel_requested_at=restore_utc(row.cancel_requested_at) if row.cancel_requested_at is not None else None,
-            claim_token_present=row.claim_token is not None,
             claim_owner_instance_id=row.claim_owner_instance_id,
-            claim_expires_at=restore_utc(row.claim_expires_at) if row.claim_expires_at is not None else None,
             attempt=row.attempt,
             session_operation_id=row.session_operation_id,
             session_operation_epoch=row.session_operation_epoch,
@@ -244,7 +234,6 @@ def _record_from_row(row: Row[Any], *, request_json: str | None = None) -> Compo
             result_json=row.result_json,
             result_sha256=row.result_sha256,
             request_json=request_json,
-            lifecycle_version=row.lifecycle_version,
             phase=row.phase,
             status_revision=row.status_revision,
             current_segment_sequence=row.current_segment_sequence,
@@ -273,7 +262,7 @@ def _saved_failure_revisions(
 ) -> dict[str, ComposerOperationSavedRevisions]:
     """Aggregate only the returned operations' own fences, never later session edits.
 
-    A V2 operation writes under one fence per segment attempt, so its saves are
+    An operation writes under one fence per segment attempt, so its saves are
     folded across every attempt fence and keyed under its last fence, which is
     the key the caller looks up (design §2.7, protocol R8).
     """
@@ -281,14 +270,13 @@ def _saved_failure_revisions(
     for record in records:
         if record.session_operation_id is None:
             continue
-        if record.lifecycle_version == 2:
-            for fence_id in conn.execute(
-                select(segment_attempts.c.session_operation_id).where(
-                    segment_attempts.c.session_id == str(session_id),
-                    segment_attempts.c.operation_id == record.operation_id,
-                )
-            ).scalars():
-                owner_of[fence_id] = record.session_operation_id
+        for fence_id in conn.execute(
+            select(segment_attempts.c.session_operation_id).where(
+                segment_attempts.c.session_id == str(session_id),
+                segment_attempts.c.operation_id == record.operation_id,
+            )
+        ).scalars():
+            owner_of[fence_id] = record.session_operation_id
         owner_of[record.session_operation_id] = record.session_operation_id
     operation_fences = tuple(owner_of)
     if not operation_fences:
@@ -353,30 +341,8 @@ def _failure_outcome(record: ComposerOperationRecord, saved: ComposerOperationSa
     )
 
 
-def get_composer_operation_for_start_on_connection(conn: Connection, claim: ComposerOperationClaim) -> ComposerOperationRecord:
-    if type(claim) is not ComposerOperationClaim:
-        raise TypeError("claim must be ComposerOperationClaim")
-    row = _read(conn, claim.session_id, claim.operation_id, body=True)
-    if (
-        row is None
-        or row.lifecycle_version != 1
-        or claim.segment_sequence is not None
-        or not _claim_matches(row, claim)
-        or row.claim_expires_at is None
-        or restore_utc(row.claim_expires_at) <= database_now(conn)
-    ):
-        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-    if row.cancel_requested_at is not None:
-        raise ComposerOperationCancelledBeforeStart(claim)
-    return _record_from_row(row, request_json=row.request_json)
-
-
-def _claim_matches(row: Row[Any], claim: ComposerOperationClaim) -> bool:
-    return bool(row.status == "queued" and row.claim_token == claim.claim_token and row.attempt == claim.attempt)
-
-
 def _segment_claim_predicates(claim: ComposerOperationClaim, owner_instance_id: str) -> tuple[ColumnElement[bool], ...]:
-    """The exact pre-start V2 claim: its segment row, generation, token and owner."""
+    """The exact pre-start claim: its segment row, generation, token and owner."""
     return (
         segments.c.session_id == str(claim.session_id),
         segments.c.operation_id == claim.operation_id,
@@ -389,7 +355,7 @@ def _segment_claim_predicates(claim: ComposerOperationClaim, owner_instance_id: 
 
 
 def _request_continuation_cancel_on_connection(conn: Connection, row: Row[Any], *, now: datetime) -> ComposerOperationRecord:
-    """Mark Stop on a nonterminal V2 parent; never settle it here.
+    """Mark Stop on a nonterminal parent; never settle it here.
 
     The owning worker settles ``request_cancelled`` at its next boundary, or
     the recovery sweep does when no owner remains (design §2.7). The marker
@@ -402,7 +368,6 @@ def _request_continuation_cancel_on_connection(conn: Connection, row: Row[Any], 
             update(jobs)
             .where(
                 *_key(UUID(row.session_id), row.operation_id),
-                jobs.c.lifecycle_version == 2,
                 jobs.c.status == row.status,
                 jobs.c.cancel_requested_at.is_(None),
             )
@@ -427,25 +392,11 @@ def _request_continuation_cancel_on_connection(conn: Connection, row: Row[Any], 
     return _record_from_row(updated)
 
 
-def _request_cancel_on_connection(
-    conn: Connection, row: Row[Any], *, cancelled_failure: ComposerOperationCancelledFailure
-) -> ComposerOperationRecord:
+def _request_cancel_on_connection(conn: Connection, row: Row[Any]) -> ComposerOperationRecord:
     """Mutate only under the caller's session lock, after its authorization."""
     if row.status in ("completed", "failed"):
         return _record_from_row(row)
-    session_id = UUID(row.session_id)
-    operation_id = row.operation_id
-    now = database_now(conn)
-    if row.lifecycle_version == 2:
-        return _request_continuation_cancel_on_connection(conn, row, now=now)
-    values: _ComposerTerminalValues = {"cancel_requested_at": row.cancel_requested_at or now, "updated_at": now}
-    if row.status == "queued" and row.claim_token is None:
-        values.update(_terminal_values(cancelled_failure(request_id=row.request_id), now=now, settled_by="request_cancel"))
-    conn.execute(update(jobs).where(*_key(session_id, operation_id), jobs.c.status == row.status).values(**values))
-    updated = _read(conn, session_id, operation_id)
-    if updated is None:
-        raise AuditIntegrityError("cancelled operation missing")
-    return _record_from_row(updated)
+    return _request_continuation_cancel_on_connection(conn, row, now=database_now(conn))
 
 
 def _binding(row: Row[Any], *, kind: ComposerOperationKind, request_hash: str, actor_user_id: str, base_state_id: UUID | None) -> None:
@@ -456,22 +407,6 @@ def _binding(row: Row[Any], *, kind: ComposerOperationKind, request_hash: str, a
         or row.base_state_id != (str(base_state_id) if base_state_id else None)
     ):
         raise ComposerOperationConflictError(session_id=UUID(row.session_id), operation_id=row.operation_id)
-
-
-def _replay_request_hash(
-    old: Row[Any], *, session_id: UUID, kind: ComposerOperationKind, request: SendMessageRequest | RecomposeRequest
-) -> str:
-    """The hash a replay must match: the existing row's own lifecycle hash.
-
-    A retried POST can negotiate another lifecycle than the one that admitted
-    the operation. It is the same request when its bytes hash to the stored
-    value under the stored lifecycle's function; ``_binding`` refuses otherwise.
-    """
-    if old.lifecycle_version == 1:
-        return composer_operation_request_hash(session_id=session_id, kind=kind, request=request)
-    if old.lifecycle_version == 2:
-        return composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request)
-    raise AuditIntegrityError("stored composer operation has an unknown lifecycle version")
 
 
 def _require_owner(conn: Connection, *, session_id: UUID, actor_user_id: str, auth_provider_type: str) -> None:
@@ -491,8 +426,6 @@ def _require_owner(conn: Connection, *, session_id: UUID, actor_user_id: str, au
 class _ComposerTerminalValues(TypedDict, total=False):
     status: Literal["failed", "completed"]
     request_json: None
-    claim_token: None
-    claim_expires_at: None
     failure_code: str | None
     settled_by: ComposerOperationSettledBy
     result_schema: str
@@ -511,8 +444,6 @@ def _terminal_values(
     return {
         "status": "failed" if failed else "completed",
         "request_json": None,
-        "claim_token": None,
-        "claim_expires_at": None,
         "failure_code": outcome.failure_code if isinstance(outcome, ComposerOperationError) else None,
         "settled_by": settled_by,
         "result_schema": COMPOSER_OPERATION_RESULT_SCHEMA_ERROR if failed else COMPOSER_OPERATION_RESULT_SCHEMA_SUCCESS,
@@ -523,9 +454,7 @@ def _terminal_values(
     }
 
 
-def _select_failure_on_connection(
-    row: Row[Any], failure: ComposerOperationError, *, now: datetime, authoritative_failure: bool
-) -> ComposerOperationError:
+def _select_failure_on_connection(row: Row[Any], failure: ComposerOperationError, *, authoritative_failure: bool) -> ComposerOperationError:
     if authoritative_failure:
         return failure
     if row.cancel_requested_at is not None:
@@ -533,20 +462,6 @@ def _select_failure_on_connection(
         body["request_id"] = row.request_id
         return ComposerOperationError(
             http_status=499, failure_code="request_cancelled", error_type="request_cancelled", body=body, diagnostic_id=None
-        )
-    if row.lifecycle_version == 1 and restore_utc(row.deadline_at) <= now:
-        body = {
-            "error_type": "composer_operation_deadline_expired",
-            "detail": "The composer request timed out. Reload to review the current session state before resubmitting.",
-            "timeout_seconds": (restore_utc(row.deadline_at) - restore_utc(row.created_at)).total_seconds(),
-        }
-        body["request_id"] = row.request_id
-        return ComposerOperationError(
-            http_status=504,
-            failure_code="deadline_expired",
-            error_type="composer_operation_deadline_expired",
-            body=body,
-            diagnostic_id=None,
         )
     return failure
 
@@ -559,11 +474,11 @@ class ComposerAsyncOperationAuthority:
         *,
         owner_instance_id: str,
         claim_lease_seconds: int,
-        continuation_policy: ContinuationAdmissionPolicy | None = None,
+        continuation_policy: ContinuationAdmissionPolicy,
     ) -> None:
         if engine.dialect.name not in ("sqlite", "postgresql") or not owner_instance_id.strip() or not 5 <= claim_lease_seconds <= 600:
             raise ValueError("invalid composer operation authority configuration")
-        if continuation_policy is not None and type(continuation_policy) is not ContinuationAdmissionPolicy:
+        if type(continuation_policy) is not ContinuationAdmissionPolicy:
             raise TypeError("continuation policy must be its owned complete admission policy")
         self._engine = engine
         self._owner_instance_id = owner_instance_id
@@ -582,27 +497,14 @@ class ComposerAsyncOperationAuthority:
         request_id: str | None,
         base_state_id: UUID | None,
         request_json: str,
-        deadline_seconds: float,
         max_nonterminal: int,
         auth_provider_type: str,
-        lifecycle_version: Literal[1, 2] = 1,
-        continuation_enabled: bool = False,
         seed: ContinuationAdmissionSeed | None = None,
     ) -> tuple[ComposerOperationRecord, bool]:
         _identity(session_id, operation_id)
         _bounded(max_nonterminal)
-        selected_lifecycle: object = lifecycle_version
-        selected_enabled: object = continuation_enabled
-        if type(selected_lifecycle) is not int or selected_lifecycle not in (1, 2):
-            raise ValueError("unknown composer lifecycle version")
-        if type(selected_enabled) is not bool or (selected_lifecycle == 1 and seed is not None):
-            raise ValueError("invalid continuation admission configuration")
-        if (
-            not math.isfinite(deadline_seconds)
-            or deadline_seconds <= 0
-            or len(request_json.encode("utf-8")) > COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH
-        ):
-            raise ValueError("invalid composer request budget or encoded size")
+        if len(request_json.encode("utf-8")) > COMPOSER_OPERATION_REQUEST_JSON_MAX_LENGTH:
+            raise ValueError("invalid composer request encoded size")
         request: SendMessageRequest | RecomposeRequest
         if kind == "compose_message":
             request = SendMessageRequest.model_validate_json(request_json)
@@ -613,12 +515,7 @@ class ComposerAsyncOperationAuthority:
         if (
             request.operation_id != operation_id
             or request.state_id != base_state_id
-            or (
-                composer_operation_request_hash(session_id=session_id, kind=kind, request=request)
-                if lifecycle_version == 1
-                else composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request)
-            )
-            != request_hash
+            or composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request) != request_hash
         ):
             raise ValueError("composer request does not match its immutable admission binding")
         if type(quota) is not ComposerQuotaAdmission:
@@ -630,66 +527,45 @@ class ComposerAsyncOperationAuthority:
             _require_owner(conn, session_id=session_id, actor_user_id=actor_user_id, auth_provider_type=auth_provider_type)
             old = _read(conn, session_id, operation_id)
             if old is not None:
-                _binding(
-                    old,
-                    kind=kind,
-                    request_hash=_replay_request_hash(old, session_id=session_id, kind=kind, request=request),
-                    actor_user_id=actor_user_id,
-                    base_state_id=base_state_id,
-                )
+                _binding(old, kind=kind, request_hash=request_hash, actor_user_id=actor_user_id, base_state_id=base_state_id)
                 return _record_from_row(old), False
-            if lifecycle_version == 2 and not continuation_enabled:
-                raise ComposerOperationPreconditionRefused(
-                    error=ComposerOperationError(
-                        http_status=409,
-                        failure_code="http_error",
-                        error_type="composer_continuation_disabled",
-                        body={
-                            "detail": {"error_type": "composer_continuation_disabled", "detail": "New continuation requests are disabled."}
-                        },
-                        diagnostic_id=None,
+            original_message_id = check_composer_request_preconditions_on_connection(
+                conn,
+                ComposerOperationPreconditions(session_id, actor_user_id, request_id, base_state_id, kind, request_json),
+                auth_provider_type=auth_provider_type,
+            )
+            if base_state_id is not None:
+                base_row = conn.execute(
+                    select(composition_states_table).where(
+                        composition_states_table.c.id == str(base_state_id),
+                        composition_states_table.c.session_id == str(session_id),
                     )
+                ).one()
+                try:
+                    state_from_record(state_record_from_row(base_row))
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise AuditIntegrityError("continuation base state cannot be hydrated") from exc
+            initial_trust_mode = conn.execute(
+                select(sessions_table.c.trust_mode).where(sessions_table.c.id == str(session_id))
+            ).scalar_one()
+            if type(initial_trust_mode) is not str or initial_trust_mode not in ("auto_commit", "explicit_approve"):
+                raise AuditIntegrityError("continuation admission requires the current owned session trust mode")
+            if seed is None:
+                seed = prepare_composer_continuation_admission(
+                    session_id=session_id,
+                    operation_id=operation_id,
+                    kind=kind,
+                    request_json=request_json,
+                    request_hash=request_hash,
+                    base_state_id=base_state_id,
+                    policy_hash=self._continuation_policy.policy_hash,
+                    admission_policy_json=self._continuation_policy.model_dump_json(),
+                    initial_trust_mode=cast(Literal["auto_commit", "explicit_approve"], initial_trust_mode),
+                    initial_action_json=self._continuation_policy.actions.session_sql.model_dump_json(),
+                    original_user_message_id=str(original_message_id) if original_message_id is not None else None,
                 )
-            if lifecycle_version == 2:
-                original_message_id = check_composer_request_preconditions_on_connection(
-                    conn,
-                    ComposerOperationPreconditions(session_id, actor_user_id, request_id, base_state_id, kind, request_json),
-                    auth_provider_type=auth_provider_type,
-                )
-                if base_state_id is not None:
-                    base_row = conn.execute(
-                        select(composition_states_table).where(
-                            composition_states_table.c.id == str(base_state_id),
-                            composition_states_table.c.session_id == str(session_id),
-                        )
-                    ).one()
-                    try:
-                        state_from_record(state_record_from_row(base_row))
-                    except (TypeError, ValueError, KeyError) as exc:
-                        raise AuditIntegrityError("continuation base state cannot be hydrated") from exc
-                initial_trust_mode = conn.execute(
-                    select(sessions_table.c.trust_mode).where(sessions_table.c.id == str(session_id))
-                ).scalar_one()
-                if type(initial_trust_mode) is not str or initial_trust_mode not in ("auto_commit", "explicit_approve"):
-                    raise AuditIntegrityError("continuation admission requires the current owned session trust mode")
-                if seed is None:
-                    if self._continuation_policy is None:
-                        raise ValueError("new continuation admission has no validated server policy")
-                    seed = prepare_composer_continuation_admission(
-                        session_id=session_id,
-                        operation_id=operation_id,
-                        kind=kind,
-                        request_json=request_json,
-                        request_hash=request_hash,
-                        base_state_id=base_state_id,
-                        policy_hash=self._continuation_policy.policy_hash,
-                        admission_policy_json=self._continuation_policy.model_dump_json(),
-                        initial_trust_mode=cast(Literal["auto_commit", "explicit_approve"], initial_trust_mode),
-                        initial_action_json=self._continuation_policy.actions.session_sql.model_dump_json(),
-                        original_user_message_id=str(original_message_id) if original_message_id is not None else None,
-                    )
-                if type(seed) is not ContinuationAdmissionSeed:
-                    raise ValueError("fresh continuation admission requires its owned server seed")
+            if type(seed) is not ContinuationAdmissionSeed:
+                raise ValueError("fresh continuation admission requires its owned server seed")
             count = conn.execute(
                 select(func.count()).select_from(
                     select(jobs.c.operation_id).where(jobs.c.status.in_(("queued", "running"))).limit(max_nonterminal).subquery()
@@ -712,35 +588,30 @@ class ComposerAsyncOperationAuthority:
                     )
                 )
             now = database_now(conn)
-            initial_checkpoint_id: str | None = None
-            reserved_message_id: str | None = None
-            if lifecycle_version == 2:
-                if seed is None:
-                    raise AuditIntegrityError("continuation seed disappeared")
-                reserved_message_id = (
-                    str(request.expected_user_message_id)
-                    if isinstance(request, RecomposeRequest)
-                    else reserved_user_message_id(session_id=session_id, operation_id=operation_id)
-                )
-                seed.validate_binding(
-                    session_id=session_id,
-                    operation_id=operation_id,
-                    kind=kind,
-                    request_json=request_json,
-                    request_hash=request_hash,
-                    base_state_id=base_state_id,
-                    reserved_user_message_id=reserved_message_id,
-                )
-                initial_stack = decode_continuation_snapshot(seed.snapshot_json)
-                if initial_stack.mutation_ceiling.initial_trust_mode != initial_trust_mode:
-                    raise AuditIntegrityError("fresh continuation seed substituted another initial session trust mode")
-                retained_policy = decode_continuation_policy(initial_stack.admission_policy_json, initial_stack.policy_hash)
-                initial_action = ContinuationActionPolicy.model_validate_json(seed.action_json, strict=True)
-                if initial_action != retained_policy.actions.session_sql:
-                    raise AuditIntegrityError("initial action differs from the retained complete admission policy")
-                if self._continuation_policy is not None and retained_policy != self._continuation_policy:
-                    raise AuditIntegrityError("fresh server seed substituted another admission policy")
-                initial_checkpoint_id = str(uuid4())
+            reserved_message_id = (
+                str(request.expected_user_message_id)
+                if isinstance(request, RecomposeRequest)
+                else reserved_user_message_id(session_id=session_id, operation_id=operation_id)
+            )
+            seed.validate_binding(
+                session_id=session_id,
+                operation_id=operation_id,
+                kind=kind,
+                request_json=request_json,
+                request_hash=request_hash,
+                base_state_id=base_state_id,
+                reserved_user_message_id=reserved_message_id,
+            )
+            initial_stack = decode_continuation_snapshot(seed.snapshot_json)
+            if initial_stack.mutation_ceiling.initial_trust_mode != initial_trust_mode:
+                raise AuditIntegrityError("fresh continuation seed substituted another initial session trust mode")
+            retained_policy = decode_continuation_policy(initial_stack.admission_policy_json, initial_stack.policy_hash)
+            initial_action = ContinuationActionPolicy.model_validate_json(seed.action_json, strict=True)
+            if initial_action != retained_policy.actions.session_sql:
+                raise AuditIntegrityError("initial action differs from the retained complete admission policy")
+            if retained_policy != self._continuation_policy:
+                raise AuditIntegrityError("fresh server seed substituted another admission policy")
+            initial_checkpoint_id = str(uuid4())
             try:
                 with conn.begin_nested():
                     conn.execute(
@@ -754,44 +625,33 @@ class ComposerAsyncOperationAuthority:
                             request_id=request_id,
                             base_state_id=str(base_state_id) if base_state_id else None,
                             request_json=request_json,
-                            deadline_at=now + timedelta(seconds=deadline_seconds) if lifecycle_version == 1 else None,
-                            lifecycle_version=lifecycle_version,
-                            phase="queued" if lifecycle_version == 2 else None,
+                            phase="queued",
                             status_revision=0,
-                            current_segment_sequence=1 if lifecycle_version == 2 else None,
-                            ownership_generation=1 if lifecycle_version == 2 else None,
+                            current_segment_sequence=1,
+                            ownership_generation=1,
                             checkpoint_id=initial_checkpoint_id,
                             journal_cursor=0,
-                            ingress_phase=("pending" if kind == "compose_message" else "committed") if lifecycle_version == 2 else None,
+                            ingress_phase="pending" if kind == "compose_message" else "committed",
                             reserved_user_message_id=reserved_message_id,
-                            user_message_id=reserved_message_id if lifecycle_version == 2 and kind == "compose_recompose" else None,
+                            user_message_id=reserved_message_id if kind == "compose_recompose" else None,
                             attempt=0,
                             created_at=now,
                             updated_at=now,
                         )
                     )
-                    if lifecycle_version == 2:
-                        if seed is None or initial_checkpoint_id is None:
-                            raise AuditIntegrityError("initial continuation binding disappeared")
-                        initialize_continuation(
-                            conn,
-                            session_id=str(session_id),
-                            operation_id=operation_id,
-                            checkpoint_id=initial_checkpoint_id,
-                            snapshot_json=seed.snapshot_json,
-                            action_json=seed.action_json,
-                            policy_sha256=seed.policy_hash,
-                        )
+                    initialize_continuation(
+                        conn,
+                        session_id=str(session_id),
+                        operation_id=operation_id,
+                        checkpoint_id=initial_checkpoint_id,
+                        snapshot_json=seed.snapshot_json,
+                        action_json=seed.action_json,
+                        policy_sha256=seed.policy_hash,
+                    )
             except IntegrityError:
                 old = _read(conn, session_id, operation_id)
                 if old is not None:
-                    _binding(
-                        old,
-                        kind=kind,
-                        request_hash=_replay_request_hash(old, session_id=session_id, kind=kind, request=request),
-                        actor_user_id=actor_user_id,
-                        base_state_id=base_state_id,
-                    )
+                    _binding(old, kind=kind, request_hash=request_hash, actor_user_id=actor_user_id, base_state_id=base_state_id)
                     return _record_from_row(old), False
                 active = conn.execute(
                     select(jobs.c.operation_id, jobs.c.kind)
@@ -828,11 +688,10 @@ class ComposerAsyncOperationAuthority:
     def read_segment_claim(self, claim: ComposerOperationClaim) -> ComposerOperationRecord | None:
         """Read only the exact still-live pre-start segment claim.
 
-        A successor's parent is running. There is no V1 queued-parent or
-        legacy-deadline condition; start rechecks this read under its lock.
+        A successor's parent is running; start rechecks this read under its lock.
         """
-        if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
-            raise TypeError("segment claim observation requires its exact V2 claim")
+        if type(claim) is not ComposerOperationClaim:
+            raise TypeError("segment claim observation requires its exact claim")
         with self._engine.connect() as conn:
             now = database_now(conn)
             row = conn.execute(
@@ -841,7 +700,6 @@ class ComposerAsyncOperationAuthority:
                 .where(
                     *_segment_claim_predicates(claim, self._owner_instance_id),
                     segments.c.claim_expires_at > now,
-                    jobs.c.lifecycle_version == 2,
                     jobs.c.status.in_(("queued", "running")),
                     jobs.c.current_segment_sequence == claim.segment_sequence,
                     jobs.c.ownership_generation == claim.ownership_generation,
@@ -858,9 +716,9 @@ class ComposerAsyncOperationAuthority:
         env_ref_names: frozenset[str] = frozenset(),
         deadline: ComposerDrainDeadline | None = None,
     ) -> ComposerOperationRecord:
-        """Use the existing current-fence V2 terminal body, never a V1 deadline."""
-        if type(running) is not ComposerOperationRunning or running.claim.segment_sequence is None:
-            raise TypeError("continuation terminal requires its actual V2 running owner")
+        """Use the existing current-fence terminal body."""
+        if type(running) is not ComposerOperationRunning:
+            raise TypeError("continuation terminal requires its actual running owner")
         with locked_session_transaction(self._engine, str(running.claim.session_id), deadline=deadline) as conn:
             from elspeth.web.composer.continuation_next_action import validate_continuation_structure_on_connection
             from elspeth.web.composer.continuation_selection import SelectedContinuationState
@@ -1621,7 +1479,6 @@ class ComposerAsyncOperationAuthority:
                     .where(
                         jobs.c.session_id == hint.session_id,
                         jobs.c.operation_id == hint.operation_id,
-                        jobs.c.lifecycle_version == 2,
                         jobs.c.status.in_(("queued", "running")),
                         jobs.c.current_segment_sequence == hint.sequence,
                         jobs.c.ownership_generation == row.generation,
@@ -1646,102 +1503,16 @@ class ComposerAsyncOperationAuthority:
                 )
         return tuple(claimed)
 
-    def claim_next(self, *, limit: int) -> tuple[ComposerOperationClaim, ...]:
-        _bounded(limit)
-        with self._engine.connect() as conn:
-            now = database_now(conn)
-            candidates = conn.execute(
-                select(jobs.c.session_id, jobs.c.operation_id)
-                .where(
-                    jobs.c.lifecycle_version == 1,
-                    jobs.c.status == "queued",
-                    jobs.c.cancel_requested_at.is_(None),
-                    jobs.c.deadline_at > now,
-                    or_(jobs.c.claim_token.is_(None), jobs.c.claim_expires_at <= now),
-                    ~select(fences.c.session_id)
-                    .where(fences.c.session_id == jobs.c.session_id, fences.c.released_at.is_(None), fences.c.lease_expires_at > now)
-                    .exists(),
-                    select(sessions_table.c.id)
-                    .where(sessions_table.c.id == jobs.c.session_id, sessions_table.c.archived_at.is_(None))
-                    .exists(),
-                )
-                .order_by(jobs.c.created_at, jobs.c.operation_id)
-                .limit(limit)
-            ).all()
-        claims: list[ComposerOperationClaim] = []
-        for candidate in candidates:
-            sid = UUID(candidate.session_id)
-            with locked_session_transaction(self._engine, candidate.session_id) as conn:
-                now = database_now(conn)
-                query = (
-                    select(jobs)
-                    .where(*_key(sid, candidate.operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "queued")
-                    .limit(1)
-                )
-                if conn.dialect.name == "postgresql":
-                    query = query.with_for_update(skip_locked=True)
-                row = conn.execute(query).one_or_none()
-                if row is None:
-                    continue
-                token = secrets.token_urlsafe(32)
-                result = conn.execute(
-                    update(jobs)
-                    .where(
-                        *_key(sid, candidate.operation_id),
-                        jobs.c.lifecycle_version == 1,
-                        jobs.c.status == "queued",
-                        jobs.c.attempt == row.attempt,
-                        jobs.c.cancel_requested_at.is_(None),
-                        jobs.c.deadline_at > now,
-                        or_(jobs.c.claim_token.is_(None), jobs.c.claim_expires_at <= now),
-                        ~select(fences.c.session_id)
-                        .where(fences.c.session_id == str(sid), fences.c.released_at.is_(None), fences.c.lease_expires_at > now)
-                        .exists(),
-                        select(sessions_table.c.id).where(sessions_table.c.id == str(sid), sessions_table.c.archived_at.is_(None)).exists(),
-                    )
-                    .values(
-                        claim_token=token,
-                        claim_owner_instance_id=self._owner_instance_id,
-                        claim_expires_at=now + timedelta(seconds=self._claim_lease_seconds),
-                        attempt=row.attempt + 1,
-                        updated_at=now,
-                    )
-                )
-                if result.rowcount == 1:
-                    claims.append(
-                        ComposerOperationClaim(session_id=sid, operation_id=row.operation_id, claim_token=token, attempt=row.attempt + 1)
-                    )
-        return tuple(claims)
-
     def renew_claim(self, claim: ComposerOperationClaim) -> ComposerOperationRecord:
         with locked_session_transaction(self._engine, str(claim.session_id)) as conn:
             now = database_now(conn)
-            if claim.segment_sequence is not None:
-                # A V2 claim lives on its segment row; the parent never holds one.
-                renewed = conn.execute(
-                    update(segments)
-                    .where(*_segment_claim_predicates(claim, self._owner_instance_id), segments.c.claim_expires_at > now)
-                    .values(claim_expires_at=now + timedelta(seconds=self._claim_lease_seconds))
-                )
-                if renewed.rowcount != 1:
-                    raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-                row = _read(conn, claim.session_id, claim.operation_id)
-                if row is None:
-                    raise AuditIntegrityError("renewed operation missing")
-                return _record_from_row(row)
-            result = conn.execute(
-                update(jobs)
-                .where(
-                    *_key(claim.session_id, claim.operation_id),
-                    jobs.c.status == "queued",
-                    jobs.c.claim_token == claim.claim_token,
-                    jobs.c.attempt == claim.attempt,
-                    jobs.c.claim_owner_instance_id == self._owner_instance_id,
-                    jobs.c.claim_expires_at > now,
-                )
-                .values(claim_expires_at=now + timedelta(seconds=self._claim_lease_seconds), updated_at=now)
+            # A claim lives on its segment row; the parent never holds one.
+            renewed = conn.execute(
+                update(segments)
+                .where(*_segment_claim_predicates(claim, self._owner_instance_id), segments.c.claim_expires_at > now)
+                .values(claim_expires_at=now + timedelta(seconds=self._claim_lease_seconds))
             )
-            if result.rowcount != 1:
+            if renewed.rowcount != 1:
                 raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
             row = _read(conn, claim.session_id, claim.operation_id)
             if row is None:
@@ -1750,38 +1521,21 @@ class ComposerAsyncOperationAuthority:
 
     def release_claim(self, claim: ComposerOperationClaim) -> None:
         with locked_session_transaction(self._engine, str(claim.session_id)) as conn:
-            if claim.segment_sequence is not None:
-                released = conn.execute(
-                    update(segments)
-                    .where(*_segment_claim_predicates(claim, self._owner_instance_id))
-                    .values(claim_token=None, claim_owner_instance_id=None, claim_expires_at=None)
-                )
-                if released.rowcount != 1:
-                    raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-                return
-            result = conn.execute(
-                update(jobs)
-                .where(
-                    *_key(claim.session_id, claim.operation_id),
-                    jobs.c.status == "queued",
-                    jobs.c.claim_token == claim.claim_token,
-                    jobs.c.attempt == claim.attempt,
-                    jobs.c.claim_owner_instance_id == self._owner_instance_id,
-                )
-                .values(claim_token=None, claim_owner_instance_id=None, claim_expires_at=None, updated_at=database_now(conn))
+            released = conn.execute(
+                update(segments)
+                .where(*_segment_claim_predicates(claim, self._owner_instance_id))
+                .values(claim_token=None, claim_owner_instance_id=None, claim_expires_at=None)
             )
-            if result.rowcount != 1:
+            if released.rowcount != 1:
                 raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
 
-    def request_cancel(
-        self, *, session_id: UUID, operation_id: str, cancelled_failure: ComposerOperationCancelledFailure
-    ) -> ComposerOperationRecord | None:
+    def request_cancel(self, *, session_id: UUID, operation_id: str) -> ComposerOperationRecord | None:
         """Trusted internal cancellation; HTTP callers must use request_owner_cancel."""
         with locked_session_transaction(self._engine, str(session_id)) as conn:
             row = _read(conn, session_id, operation_id)
             if row is None:
                 return None
-            return _request_cancel_on_connection(conn, row, cancelled_failure=cancelled_failure)
+            return _request_cancel_on_connection(conn, row)
 
     def request_owner_cancel(
         self,
@@ -1790,7 +1544,6 @@ class ComposerAsyncOperationAuthority:
         operation_id: str,
         actor_user_id: str,
         auth_provider_type: str,
-        cancelled_failure: ComposerOperationCancelledFailure,
     ) -> ComposerOperationRecord | None:
         """Authenticate the Stop actor again inside the mutation's session lock."""
         with locked_session_transaction(self._engine, str(session_id)) as conn:
@@ -1798,66 +1551,7 @@ class ComposerAsyncOperationAuthority:
             row = _read(conn, session_id, operation_id)
             if row is None or row.actor_user_id != actor_user_id:
                 return None
-            return _request_cancel_on_connection(conn, row, cancelled_failure=cancelled_failure)
-
-    def settle_unstarted(
-        self,
-        claim_or_none: ComposerOperationClaim | None,
-        *,
-        session_id: UUID,
-        operation_id: str,
-        failure: ComposerOperationError,
-        authoritative_failure: bool = False,
-    ) -> ComposerOperationRecord:
-        _identity(session_id, operation_id)
-        if type(failure) is not ComposerOperationError or type(authoritative_failure) is not bool:
-            raise TypeError("queued settlement requires owned failure and nominal evidence classification")
-        if claim_or_none is not None and (
-            type(claim_or_none) is not ComposerOperationClaim
-            or claim_or_none.session_id != session_id
-            or claim_or_none.operation_id != operation_id
-        ):
-            raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-        with locked_session_transaction(self._engine, str(session_id)) as conn:
-            row = _read(conn, session_id, operation_id)
-            if row is not None and row.lifecycle_version != 1:
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-            if row is not None and row.status in ("completed", "failed"):
-                return _record_from_row(row)
-            now = database_now(conn)
-            if row is None or row.status != "queued":
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-            predicates = [*_key(session_id, operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "queued"]
-            if claim_or_none is None:
-                if row.claim_token is not None and row.claim_expires_at is not None and restore_utc(row.claim_expires_at) > now:
-                    raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-                predicates.append(or_(jobs.c.claim_token.is_(None), jobs.c.claim_expires_at <= now))
-            else:
-                if (
-                    not _claim_matches(row, claim_or_none)
-                    or row.claim_owner_instance_id != self._owner_instance_id
-                    or row.claim_expires_at is None
-                    or restore_utc(row.claim_expires_at) <= now
-                ):
-                    raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id, attempt=claim_or_none.attempt)
-                predicates.extend(
-                    (
-                        jobs.c.claim_token == claim_or_none.claim_token,
-                        jobs.c.attempt == claim_or_none.attempt,
-                        jobs.c.claim_owner_instance_id == self._owner_instance_id,
-                        jobs.c.claim_expires_at > now,
-                    )
-                )
-            selected = _select_failure_on_connection(row, failure, now=now, authoritative_failure=authoritative_failure)
-            result = conn.execute(
-                update(jobs).where(*predicates).values(**_terminal_values(selected, now=now, settled_by="settle_unstarted"))
-            )
-            if result.rowcount != 1:
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-            settled = _read(conn, session_id, operation_id)
-            if settled is None:
-                raise AuditIntegrityError("settled operation missing")
-            return _record_from_row(settled)
+            return _request_cancel_on_connection(conn, row)
 
     def list_recoverable_segments(self, *, limit: int) -> tuple[ContinuationRecoveryCandidate, ...]:
         from elspeth.web.sessions.continuation_recovery_candidates import list_recoverable_segments
@@ -1869,48 +1563,6 @@ class ComposerAsyncOperationAuthority:
 
         return list_inactive_continuations(self._engine, limit=limit)
 
-    def list_expired_queued(self, *, limit: int) -> tuple[ComposerOperationRecord, ...]:
-        _bounded(limit)
-        with self._engine.connect() as conn:
-            now = database_now(conn)
-            rows = conn.execute(
-                select(*(c for c in jobs.c if c.name != "request_json"))
-                .where(
-                    jobs.c.lifecycle_version == 1,
-                    jobs.c.status == "queued",
-                    or_(jobs.c.deadline_at <= now, jobs.c.cancel_requested_at.is_not(None)),
-                    or_(jobs.c.claim_token.is_(None), jobs.c.claim_expires_at <= now),
-                )
-                .order_by(jobs.c.created_at)
-                .limit(limit)
-            ).all()
-            return tuple(_record_from_row(row) for row in rows)
-
-    def list_expired_running(self, *, limit: int) -> tuple[ComposerOperationRecord, ...]:
-        _bounded(limit)
-        with self._engine.connect() as conn:
-            now = database_now(conn)
-            rows = conn.execute(
-                select(*(c for c in jobs.c if c.name != "request_json"))
-                .where(
-                    jobs.c.lifecycle_version == 1,
-                    jobs.c.status == "running",
-                    ~select(fences.c.session_id)
-                    .where(
-                        fences.c.session_id == jobs.c.session_id,
-                        fences.c.operation_id == jobs.c.session_operation_id,
-                        fences.c.lease_token == jobs.c.session_operation_lease_token,
-                        fences.c.operation_epoch == jobs.c.session_operation_epoch,
-                        fences.c.released_at.is_(None),
-                        fences.c.lease_expires_at > now,
-                    )
-                    .exists(),
-                )
-                .order_by(jobs.c.created_at)
-                .limit(limit)
-            ).all()
-            return tuple(_record_from_row(row) for row in rows)
-
     def count_nonterminal(self, *, limit: int) -> int:
         _bounded(limit)
         with self._engine.connect() as conn:
@@ -1921,131 +1573,6 @@ class ComposerAsyncOperationAuthority:
                     )
                 ).scalar_one()
             )
-
-    def settle_lost(
-        self,
-        *,
-        session_operation_context: SessionOperationContext,
-        session_id: UUID,
-        operation_id: str,
-        failure: ComposerOperationError,
-        authoritative_failure: bool = False,
-    ) -> ComposerOperationRecord:
-        return self._settle_recovery(
-            session_id=session_id,
-            operation_id=operation_id,
-            failure=failure,
-            settled_by="settle_lost",
-            authoritative_failure=authoritative_failure,
-            recovery_context=session_operation_context,
-        )
-
-    def settle_own_lapsed(
-        self,
-        *,
-        session_id: UUID,
-        operation_id: str,
-        owner_instance_id: str,
-        failure: ComposerOperationError,
-        authoritative_failure: bool = False,
-    ) -> ComposerOperationRecord:
-        if owner_instance_id != self._owner_instance_id:
-            raise ValueError("lapsed settlement must belong to this worker instance")
-        return self._settle_recovery(
-            session_id=session_id,
-            operation_id=operation_id,
-            failure=failure,
-            settled_by="settle_own_lapsed",
-            authoritative_failure=authoritative_failure,
-            recovery_context=None,
-        )
-
-    def settle_lost_inactive_session(
-        self,
-        *,
-        session_id: UUID,
-        operation_id: str,
-        failure: ComposerOperationError,
-        authoritative_failure: bool = False,
-    ) -> ComposerOperationRecord:
-        return self._settle_recovery(
-            session_id=session_id,
-            operation_id=operation_id,
-            failure=failure,
-            settled_by="settle_lost_inactive_session",
-            authoritative_failure=authoritative_failure,
-            recovery_context=None,
-        )
-
-    def _settle_recovery(
-        self,
-        *,
-        session_id: UUID,
-        operation_id: str,
-        failure: ComposerOperationError,
-        settled_by: ComposerOperationSettledBy,
-        recovery_context: SessionOperationContext | None,
-        authoritative_failure: bool,
-    ) -> ComposerOperationRecord:
-        _identity(session_id, operation_id)
-        if type(failure) is not ComposerOperationError or type(authoritative_failure) is not bool:
-            raise TypeError("recovery settlement requires owned failure and nominal evidence classification")
-        if recovery_context is not None and type(recovery_context) is not SessionOperationContext:
-            raise TypeError("recovery settlement requires an exact SessionOperationContext")
-        with locked_session_transaction(self._engine, str(session_id)) as conn:
-            row = _read(conn, session_id, operation_id)
-            if row is not None and row.lifecycle_version != 1:
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-            if row is not None and row.status in ("completed", "failed"):
-                return _record_from_row(row)
-            now = database_now(conn)
-            if row is None or row.status != "running":
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)
-            fence = conn.execute(select(fences).where(fences.c.session_id == str(session_id)).with_for_update()).one_or_none()
-            session = conn.execute(select(sessions_table.c.archived_at).where(sessions_table.c.id == str(session_id))).one_or_none()
-            exact_old = (
-                fence is not None
-                and fence.operation_id == row.session_operation_id
-                and fence.lease_token == row.session_operation_lease_token
-                and fence.operation_epoch == row.session_operation_epoch
-            )
-            valid = False
-            if settled_by == "settle_lost_inactive_session":
-                valid = session is not None and session.archived_at is not None
-            elif settled_by == "settle_own_lapsed":
-                valid = (
-                    exact_old
-                    and fence is not None
-                    and fence.released_at is None
-                    and restore_utc(fence.lease_expires_at) <= now
-                    and row.claim_owner_instance_id == self._owner_instance_id
-                )
-            elif recovery_context is not None and fence is not None:
-                f = recovery_context.fence
-                valid = (
-                    recovery_context.operation_kind is SessionOperationKind.COMPOSE
-                    and fence.operation_kind == SessionOperationKind.COMPOSE.value
-                    and fence.owner_instance_id == self._owner_instance_id
-                    and f.session_id == str(session_id)
-                    and f.operation_id == fence.operation_id
-                    and f.lease_token == fence.lease_token
-                    and f.operation_epoch == fence.operation_epoch
-                    and fence.operation_epoch > row.session_operation_epoch
-                    and fence.released_at is None
-                    and restore_utc(fence.lease_expires_at) > now
-                )
-            if not valid:
-                raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id, attempt=row.attempt)
-            failure = _select_failure_on_connection(row, failure, now=now, authoritative_failure=authoritative_failure)
-            conn.execute(
-                update(jobs)
-                .where(*_key(session_id, operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "running")
-                .values(**_terminal_values(failure, now=now, settled_by=settled_by))
-            )
-            settled = _read(conn, session_id, operation_id)
-            if settled is None:
-                raise AuditIntegrityError("recovery settlement missing")
-            return _record_from_row(settled)
 
 
 async def admit_composer_operation(
@@ -2060,11 +1587,8 @@ async def admit_composer_operation(
     request_id: str | None,
     base_state_id: UUID | None,
     request_json: str,
-    deadline_seconds: float,
     max_nonterminal: int,
     auth_provider_type: str,
-    lifecycle_version: Literal[1, 2],
-    continuation_enabled: bool,
 ) -> tuple[ComposerOperationRecord, bool]:
     return await run_sync_in_worker(
         authority.admit,
@@ -2077,64 +1601,9 @@ async def admit_composer_operation(
         request_id=request_id,
         base_state_id=base_state_id,
         request_json=request_json,
-        deadline_seconds=deadline_seconds,
         max_nonterminal=max_nonterminal,
         auth_provider_type=auth_provider_type,
-        lifecycle_version=lifecycle_version,
-        continuation_enabled=continuation_enabled,
     )
-
-
-def start_composer_operation_on_connection(
-    conn: Connection, claim: ComposerOperationClaim, *, context: SessionOperationContext, user_message_id: UUID | None
-) -> None:
-    if context.operation_kind is not SessionOperationKind.COMPOSE or context.fence.session_id != str(claim.session_id):
-        raise AuditIntegrityError("composer start context is foreign")
-    job = get_composer_operation_for_start_on_connection(conn, claim)
-    if (job.kind == "compose_recompose") != (user_message_id is not None):
-        raise ValueError("composer start user binding must match the operation kind")
-    owner = conn.execute(
-        select(fences.c.owner_instance_id)
-        .where(
-            fences.c.session_id == context.fence.session_id,
-            fences.c.operation_id == context.fence.operation_id,
-            fences.c.lease_token == context.fence.lease_token,
-            fences.c.operation_epoch == context.fence.operation_epoch,
-        )
-        .limit(1)
-    ).scalar_one_or_none()
-    if owner is None or job.claim_owner_instance_id != owner:
-        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-    now = database_now(conn)
-    result = conn.execute(
-        update(jobs)
-        .where(
-            *_key(claim.session_id, claim.operation_id),
-            jobs.c.lifecycle_version == 1,
-            jobs.c.status == "queued",
-            jobs.c.claim_token == claim.claim_token,
-            jobs.c.attempt == claim.attempt,
-            jobs.c.claim_owner_instance_id == owner,
-            jobs.c.claim_expires_at > now,
-            jobs.c.cancel_requested_at.is_(None),
-            jobs.c.deadline_at > now,
-        )
-        .values(
-            status="running",
-            session_operation_id=context.fence.operation_id,
-            session_operation_lease_token=context.fence.lease_token,
-            session_operation_epoch=context.fence.operation_epoch,
-            started_at=now,
-            claim_expires_at=None,
-            user_message_id=str(user_message_id) if user_message_id else None,
-            updated_at=now,
-        )
-    )
-    if result.rowcount != 1:
-        row = _read(conn, claim.session_id, claim.operation_id)
-        if row is not None and _claim_matches(row, claim) and row.cancel_requested_at is not None:
-            raise ComposerOperationCancelledBeforeStart(claim)
-        raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
 
 
 def _running_predicates(running: ComposerOperationRunning) -> tuple[Any, ...]:
@@ -2144,7 +1613,6 @@ def _running_predicates(running: ComposerOperationRunning) -> tuple[Any, ...]:
     return (
         *_key(claim.session_id, claim.operation_id),
         jobs.c.status == "running",
-        jobs.c.claim_token == claim.claim_token,
         jobs.c.attempt == claim.attempt,
         jobs.c.session_operation_id == fence.operation_id,
         jobs.c.session_operation_lease_token == fence.lease_token,
@@ -2165,39 +1633,14 @@ def require_composer_operation_mutation_on_connection(conn: Connection, context:
     if require_continuation_mutation(conn, context):
         return
     f = context.fence
-    row = conn.execute(
-        select(
-            jobs.c.status,
-            jobs.c.cancel_requested_at,
-            jobs.c.deadline_at,
-            jobs.c.created_at,
-            jobs.c.operation_id,
-            jobs.c.attempt,
-            jobs.c.claim_token,
-            jobs.c.session_operation_id,
-            jobs.c.session_operation_lease_token,
-        )
+    bound = conn.execute(
+        select(jobs.c.operation_id, jobs.c.attempt)
         .where(jobs.c.session_id == f.session_id, jobs.c.session_operation_epoch == f.operation_epoch)
         .limit(1)
     ).one_or_none()
-    if row is None:
-        return
-    if row.session_operation_id != f.operation_id or row.session_operation_lease_token != f.lease_token or row.status != "running":
-        raise ComposerOperationFenceLost(session_id=UUID(f.session_id), operation_id=row.operation_id, attempt=row.attempt)
-    if row.cancel_requested_at is not None:
-        raise ComposerOperationCancelledDuringTurn(
-            ComposerOperationClaim(
-                session_id=UUID(f.session_id), operation_id=row.operation_id, claim_token=row.claim_token, attempt=row.attempt
-            )
-        )
-    now = database_now(conn)
-    if restore_utc(row.deadline_at) <= now:
-        raise ComposerTurnDeadlineExpired(
-            session_id=UUID(f.session_id),
-            operation_id=row.operation_id,
-            remaining_seconds=(restore_utc(row.deadline_at) - now).total_seconds(),
-            budget_seconds_at_running=(restore_utc(row.deadline_at) - restore_utc(row.created_at)).total_seconds(),
-        )
+    if bound is not None:
+        # A durable job carries this epoch but no segment attempt grants it.
+        raise ComposerOperationFenceLost(session_id=UUID(f.session_id), operation_id=bound.operation_id, attempt=bound.attempt)
 
 
 def _proposal_composer_binding(
@@ -2239,7 +1682,6 @@ def _proposal_composer_binding(
         or lease.released_at is not None
         or restore_utc(lease.lease_expires_at) <= now
         or row.claim_owner_instance_id != lease.owner_instance_id
-        or row.claim_token is None
         or row.attempt < 1
     ):
         raise AuditIntegrityError("proposal composer job/fence authority mismatch")
@@ -2247,7 +1689,6 @@ def _proposal_composer_binding(
         running.session_operation_context != context
         or running.claim.session_id != UUID(fence.session_id)
         or running.claim.operation_id != row.operation_id
-        or running.claim.claim_token != row.claim_token
         or running.claim.attempt != row.attempt
     ):
         raise AuditIntegrityError("proposal composer claim authority mismatch")
@@ -2332,83 +1773,24 @@ def require_composer_settlement_actor_on_connection(
         raise AuditIntegrityError("composer settlement actor does not match running user")
 
 
-def bind_composer_operation_user_message_on_connection(
-    conn: Connection, running: ComposerOperationRunning, *, user_message_id: UUID
-) -> None:
-    require_composer_operation_mutation_on_connection(conn, running.session_operation_context)
-    row = conn.execute(select(jobs.c.kind, jobs.c.user_message_id).where(*_running_predicates(running)).limit(1)).one_or_none()
-    if row is None:
-        raise ComposerOperationFenceLost(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, attempt=running.claim.attempt
-        )
-    if row.kind != "compose_message":
-        raise ValueError("only a compose_message operation admits a new user row")
-    if row.user_message_id is not None:
-        raise AuditIntegrityError("composer user message binding was not fresh")
-    result = conn.execute(
-        update(jobs)
-        .where(
-            *_running_predicates(running),
-            jobs.c.user_message_id.is_(None),
-            jobs.c.kind == "compose_message",
-            jobs.c.cancel_requested_at.is_(None),
-        )
-        .values(user_message_id=str(user_message_id), updated_at=database_now(conn))
-    )
-    if result.rowcount != 1:
-        raise AuditIntegrityError("composer user message binding was not fresh")
-
-
 def settle_composer_operation_on_connection(
     conn: Connection,
     running: ComposerOperationRunning,
     *,
     outcome: MessageWithStateResponse | ComposerOperationError,
     authoritative_failure: bool = False,
-    settled_at: datetime | None = None,
     prepared_settlement: PreparedSegmentSettlement | None = None,
 ) -> ComposerOperationRecord:
     """Sealed terminal CAS. Failed results cannot authorize business mutations."""
-    if running.claim.segment_sequence is not None:
-        from elspeth.web.sessions.continuation import settle_continuation_on_connection
+    from elspeth.web.sessions.continuation import settle_continuation_on_connection
 
-        current = _read(conn, running.claim.session_id, running.claim.operation_id)
-        if current is not None and current.status in ("completed", "failed"):
-            return _record_from_row(current)
-        if current is not None and isinstance(outcome, ComposerOperationError):
-            outcome = _select_failure_on_connection(current, outcome, now=database_now(conn), authoritative_failure=authoritative_failure)
-        settle_continuation_on_connection(conn, running, outcome=outcome, prepared_settlement=prepared_settlement)
-        settled_v2 = _read(conn, running.claim.session_id, running.claim.operation_id)
-        if settled_v2 is None:
-            raise AuditIntegrityError("continuation terminal missing")
-        return _record_from_row(settled_v2)
-    row = _read(conn, running.claim.session_id, running.claim.operation_id)
-    if row is not None and row.status in ("completed", "failed"):
-        return _record_from_row(row)
-    now = database_now(conn)
-    if isinstance(outcome, MessageWithStateResponse):
-        require_composer_operation_mutation_on_connection(conn, running.session_operation_context)
-        if row is not None and restore_utc(row.deadline_at) <= now:
-            raise ComposerOperationFenceLost(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
-    elif row is not None:
-        outcome = _select_failure_on_connection(row, outcome, now=now, authoritative_failure=authoritative_failure)
-    if (
-        isinstance(outcome, ComposerOperationError)
-        and outcome.failure_code == "request_cancelled"
-        and row is not None
-        and row.cancel_requested_at is None
-    ):
-        raise AuditIntegrityError("cancel outcome requires a durable Stop marker")
-    result = conn.execute(
-        update(jobs)
-        .where(*_running_predicates(running))
-        .values(**_terminal_values(outcome, now=settled_at if settled_at is not None else now, settled_by="owner_terminal"))
-    )
-    if result.rowcount != 1:
-        raise ComposerOperationFenceLost(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, attempt=running.claim.attempt
-        )
+    current = _read(conn, running.claim.session_id, running.claim.operation_id)
+    if current is not None and current.status in ("completed", "failed"):
+        return _record_from_row(current)
+    if current is not None and isinstance(outcome, ComposerOperationError):
+        outcome = _select_failure_on_connection(current, outcome, authoritative_failure=authoritative_failure)
+    settle_continuation_on_connection(conn, running, outcome=outcome, prepared_settlement=prepared_settlement)
     settled = _read(conn, running.claim.session_id, running.claim.operation_id)
     if settled is None:
-        raise AuditIntegrityError("owner terminal missing")
+        raise AuditIntegrityError("continuation terminal missing")
     return _record_from_row(settled)

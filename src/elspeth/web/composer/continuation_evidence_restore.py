@@ -137,8 +137,7 @@ def read_selected_turn_evidence_graph_data_on_connection(
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation_id)).one()
     principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at).where(sessions.c.id == sid)).one()
     if (
-        parent.lifecycle_version != 2
-        or parent.actor_user_id != snapshot.actor_user_id
+        parent.actor_user_id != snapshot.actor_user_id
         or principal.user_id != snapshot.actor_user_id
         or parent.request_hash != root.logical.request_hash
         or parent.kind != root.logical.kind

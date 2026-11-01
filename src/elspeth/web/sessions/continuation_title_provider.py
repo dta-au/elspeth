@@ -833,7 +833,6 @@ def validate_unclaimed_title_recovery_data_on_connection(
     if (
         generation <= 1
         or selected.cursor <= 0
-        or parent.lifecycle_version != 2
         or parent.status not in ("queued", "running")
         or session.archived_at is None
         or parent.actor_user_id != session.user_id

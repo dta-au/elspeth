@@ -53,12 +53,10 @@ def _local_action(stages: ContinuationLocalStageSettings) -> ContinuationActionP
     )
 
 
-def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicy | None:
-    """None when V2 admission is disabled; otherwise the complete validated policy."""
+def continuation_policy_from_settings(settings: WebSettings) -> ContinuationAdmissionPolicy:
+    """The complete validated Continuation admission policy."""
     if type(settings) is not WebSettings:
         raise TypeError("continuation policy requires the owned WebSettings")
-    if not settings.composer_continuation_enabled:
-        return None
     bounds = settings.composer_continuation_action_bounds
     primary_guard = _guard_seconds(settings.composer_prompt_guard)
     advisor_guard_settings = settings.composer_advisor_prompt_guard

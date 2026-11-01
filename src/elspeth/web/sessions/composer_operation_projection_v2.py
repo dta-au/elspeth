@@ -1,4 +1,4 @@
-"""Read-only Composer-Operation-Version 2 projections of a lifecycle-2 operation.
+"""Read-only public projections of a durable Composer operation.
 
 The parent is read through ``ComposerAsyncOperationAuthority`` (which validates
 the record as Tier 1). The current segment is read here by its exact
@@ -104,19 +104,17 @@ def read_v2_projection_inputs(
     The segment is read between two parent reads. Every segment state or
     deadline change commits together with a parent ``status_revision`` bump,
     so equal revisions and pointers on both sides prove the segment belongs to
-    that revision. Otherwise the triple is re-read. A missing, v1 or terminal
+    that revision. Otherwise the triple is re-read. A missing or terminal
     parent is returned with no segment.
     """
     for _ in range(_CONSISTENT_READ_ATTEMPTS):
         before, _now = authority.get_with_database_now(session_id=session_id, operation_id=operation_id)
-        if before is None or before.lifecycle_version != 2 or before.status in ("completed", "failed"):
+        if before is None or before.status in ("completed", "failed"):
             return ComposerOperationProjectionInputs(before, None, _now)
         sequence, generation = before.current_segment_sequence, before.ownership_generation
-        if sequence is None or generation is None:
-            raise AuditIntegrityError("Live v2 operation has no segment pointer")
         row = _read_segment_row(engine, session_id=session_id, operation_id=operation_id, sequence=sequence, generation=generation)
         after, now = authority.get_with_database_now(session_id=session_id, operation_id=operation_id)
-        if after is None or after.lifecycle_version != 2 or after.status in ("completed", "failed"):
+        if after is None or after.status in ("completed", "failed"):
             return ComposerOperationProjectionInputs(after, None, now)
         if _identity(after) != _identity(before):
             continue
@@ -126,8 +124,8 @@ def read_v2_projection_inputs(
 
 def _status_fields(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: int) -> _StatusFields:
     record = inputs.record
-    if record is None or record.lifecycle_version != 2 or record.phase is None:
-        raise AuditIntegrityError("v2 projection requested for a non-v2 operation")
+    if record is None:
+        raise AuditIntegrityError("operation projection requested without its parent")
     return _StatusFields(
         operation_id=record.operation_id,
         kind=record.kind,
@@ -164,14 +162,14 @@ def project_v2_snapshot(inputs: ComposerOperationProjectionInputs, *, poll_after
 
 
 def read_active_operation(engine: Engine, *, session_id: UUID, actor_user_id: str) -> ComposerActiveOperationResponse | None:
-    """The actor's live operation in the session, in any lifecycle and phase, or None.
+    """The actor's live operation in the session, in any phase, or None.
 
-    The parent row answers in every phase, including between v2 segments when
+    The parent row answers in every phase, including between segments when
     no worker publishes progress.
     """
     with engine.connect() as conn:
         row = conn.execute(
-            select(jobs.c.operation_id, jobs.c.kind, jobs.c.lifecycle_version, jobs.c.status)
+            select(jobs.c.operation_id, jobs.c.kind, jobs.c.status)
             .where(
                 jobs.c.session_id == str(session_id),
                 jobs.c.actor_user_id == actor_user_id,
@@ -182,6 +180,4 @@ def read_active_operation(engine: Engine, *, session_id: UUID, actor_user_id: st
         ).one_or_none()
     if row is None:
         return None
-    return ComposerActiveOperationResponse(
-        operation_id=row.operation_id, kind=row.kind, lifecycle_version=row.lifecycle_version, status=row.status
-    )
+    return ComposerActiveOperationResponse(operation_id=row.operation_id, kind=row.kind, status=row.status)

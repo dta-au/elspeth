@@ -1163,12 +1163,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.application_finalizer_owner.seal()
 
         def begin_composer_signal_drain(started: float) -> None:
-            if settings.composer_continuation_enabled:
-                app.state.composer_async_worker.begin_drain(started_at=started)
-            else:
-                # V1 keeps its original relative stop budget. Its separate
-                # global process-grace obligation is not a V2 D-clock claim.
-                app.state.composer_async_worker.stop_claiming()
+            app.state.composer_async_worker.begin_drain(started_at=started)
 
         app.state.composer_drain_signal.bind(asyncio.get_running_loop(), begin_composer_signal_drain)
         app.state.composer_async_worker.start()
@@ -2321,8 +2316,7 @@ def _create_app(
         session_engine,
         owner_instance_id=session_service.session_operation_owner_instance_id,
         claim_lease_seconds=settings.composer_async_claim_lease_seconds,
-        # None while V2 admission is disabled (the default): the authority then
-        # refuses every V2 admission. Each admitted operation retains its copy.
+        # Each admitted operation retains its own copy of the policy.
         continuation_policy=continuation_policy_from_settings(settings),
     )
     app.state.composer_async_operation_authority = composer_async_authority
@@ -2832,10 +2826,6 @@ def _create_app(
         tutorial_profile_row = next(row for row in plugin_policy_readiness.rows if row.id == "tutorial_profile")
         return {
             "composer_available": composer.available,
-            # Composer-Operation-Version a new submission should request: 2 only
-            # when lifecycle-2 admission is enabled (the continuation policy
-            # exists exactly when the gate is on, so the setting decides here).
-            "composer_operation_admission_version": 2 if settings.composer_continuation_enabled else 1,
             "composer_model": composer.model,
             # The advisor model that gates completion, beside the planner
             # model above and with the same (unauthenticated) disclosure

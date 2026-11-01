@@ -101,7 +101,6 @@ class ComposerOperationWatchReader:
         if (
             type(worker) is not ComposerAsyncWorker
             or type(running) is not ComposerOperationRunning
-            or running.claim.segment_sequence is None
             or type(lease) is not SessionOperationLease
             or lease.context != running.session_operation_context
         ):

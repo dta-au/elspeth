@@ -101,7 +101,6 @@ from elspeth.web.coordination.composer_operation_authority import (
     _read,
     _record_from_row,
     _select_failure_on_connection,
-    bind_composer_operation_user_message_on_connection,
     derive_proposal_composer_binding_on_connection,
     prove_revocation_composer_binding_on_connection,
     require_composer_operation_mutation_on_connection,
@@ -359,7 +358,6 @@ from elspeth.web.sessions.protocol import (
     InterpretationPlaceholderConsumedError,
     InterpretationSourceDataContractDriftError,
     InterpretationUnsupportedChoiceError,
-    MessageIngressFresh,
     OperationReceiptActive,
     OperationReceiptCompleted,
     OperationReceiptFailed,
@@ -405,7 +403,6 @@ from elspeth.web.sessions.protocol import (
     StaleComposeStateError,
     StateRevertReceiptResult,
     TransitionAssistantDraft,
-    TransitionResponseSettlement,
     TrustModeAutoCommitRevokedError,
     decode_stored_composition_validation_errors,
     require_stored_state_metadata,
@@ -6446,9 +6443,9 @@ class SessionServiceImpl:
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         running: ComposerOperationRunning,
-        required_work: RequiredWorkTicket | None = None,
-        continuation: StoredContinuationSnapshot | None = None,
-    ) -> MessageIngressFresh | ContinuationIngressCheckpoint:
+        required_work: RequiredWorkTicket,
+        continuation: StoredContinuationSnapshot,
+    ) -> ContinuationIngressCheckpoint:
         """Accept one freeform user message and read its transcript in one transaction.
 
         Write-then-read split across two pooled connections is how the
@@ -6498,7 +6495,7 @@ class SessionServiceImpl:
             retain_ingress_on_connection,
         )
 
-        def _sync() -> Sequence[Any] | ContinuationIngressCheckpoint:
+        def _sync() -> ContinuationIngressCheckpoint:
             with (
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
@@ -6509,29 +6506,25 @@ class SessionServiceImpl:
                     expected_kind=SessionOperationKind.COMPOSE,
                 ),
             ):
-                prepared_ingress: ContinuationIngressPrepared | None = None
-                if continuation is not None:
-                    if (
-                        running.claim.session_id != session_id
-                        or running.claim.operation_id != request_id
-                        or running.session_operation_context is not session_operation_context
-                    ):
-                        raise AuditIntegrityError("initializer ingress crossed its actual session/operation/context")
-                    if required_work is None:
-                        raise AuditIntegrityError("initializer ingress requires its actual required SQL ticket")
-                    preparation = prepare_ingress_on_connection(
-                        conn,
-                        running,
-                        selected=continuation,
-                        content=content,
-                        requested_state_id=requested_state_id,
-                        composition_state_id=composition_state_id,
-                    )
-                    if type(preparation) is ContinuationIngressCheckpoint:
-                        return preparation
-                    if type(preparation) is not ContinuationIngressPrepared:
-                        raise AuditIntegrityError("initializer ingress replaced its actual SQL preparation")
-                    prepared_ingress = preparation
+                if (
+                    running.claim.session_id != session_id
+                    or running.claim.operation_id != request_id
+                    or running.session_operation_context is not session_operation_context
+                ):
+                    raise AuditIntegrityError("initializer ingress crossed its actual session/operation/context")
+                preparation = prepare_ingress_on_connection(
+                    conn,
+                    running,
+                    selected=continuation,
+                    content=content,
+                    requested_state_id=requested_state_id,
+                    composition_state_id=composition_state_id,
+                )
+                if type(preparation) is ContinuationIngressCheckpoint:
+                    return preparation
+                if type(preparation) is not ContinuationIngressPrepared:
+                    raise AuditIntegrityError("initializer ingress replaced its actual SQL preparation")
+                prepared_ingress = preparation
                 if requested_sid is not None:
                     _assert_state_in_session(
                         conn,
@@ -6547,52 +6540,25 @@ class SessionServiceImpl:
                         caller="add_message_with_transcript",
                     )
                 seq = self._reserve_sequence_range(conn, sid, count=1)
-                if prepared_ingress is not None:
-                    msg_id_holder["id"] = self._insert_chat_message(
-                        conn,
-                        session_id=sid,
-                        role=role,
-                        content=content,
-                        raw_content=raw_content,
-                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                        sequence_no=seq,
-                        writer_principal=writer_principal,
-                        composition_state_id=csid,
-                        tool_call_id=tool_call_id,
-                        parent_assistant_id=pid,
-                        created_at=now,
-                        session_operation_context=session_operation_context,
-                        message_id=prepared_ingress.reserved_id,
-                    )
-                else:
-                    msg_id_holder["id"] = self._insert_chat_message(
-                        conn,
-                        session_id=sid,
-                        role=role,
-                        content=content,
-                        raw_content=raw_content,
-                        # Same deep_thaw rationale as ``add_message``:
-                        # tool_calls may be a frozen mapping/tuple shape the
-                        # JSON encoder rejects.
-                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                        sequence_no=seq,
-                        writer_principal=writer_principal,
-                        composition_state_id=csid,
-                        tool_call_id=tool_call_id,
-                        parent_assistant_id=pid,
-                        created_at=now,
-                        session_operation_context=session_operation_context,
-                    )
-                if (
-                    running.claim.session_id != session_id
-                    or running.claim.operation_id != request_id
-                    or running.session_operation_context != session_operation_context
-                ):
-                    raise AuditIntegrityError("composer ingress running authority mismatch")
-                if prepared_ingress is None:
-                    bind_composer_operation_user_message_on_connection(conn, running, user_message_id=UUID(msg_id_holder["id"]))
-                else:
-                    bind_ingress_on_connection(conn, running, prepared=prepared_ingress, message_id=msg_id_holder["id"])
+                msg_id_holder["id"] = self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role=role,
+                    content=content,
+                    raw_content=raw_content,
+                    # Same deep_thaw rationale as ``add_message``: tool_calls
+                    # may be a frozen mapping/tuple shape the JSON encoder rejects.
+                    tool_calls=deep_thaw(tool_calls) if tool_calls else None,
+                    sequence_no=seq,
+                    writer_principal=writer_principal,
+                    composition_state_id=csid,
+                    tool_call_id=tool_call_id,
+                    parent_assistant_id=pid,
+                    created_at=now,
+                    session_operation_context=session_operation_context,
+                    message_id=prepared_ingress.reserved_id,
+                )
+                bind_ingress_on_connection(conn, running, prepared=prepared_ingress, message_id=msg_id_holder["id"])
                 self._insert_message_ingress_receipt(
                     conn,
                     session_id=sid,
@@ -6615,36 +6581,18 @@ class SessionServiceImpl:
                     .where(chat_messages_table.c.session_id == sid, non_private_message_predicate(conn.dialect.name))
                     .order_by(chat_messages_table.c.sequence_no)
                 ).fetchall()
-                if prepared_ingress is not None:
-                    actual_transcript = tuple(self._row_to_chat_message_record(row) for row in message_rows)
-                    if not actual_transcript or str(actual_transcript[-1].id) != msg_id_holder["id"]:
-                        raise AuditIntegrityError("initializer ingress lost its actual same-transaction maximum user row")
-                    actual_message = replace(actual_transcript[-1], operation_id=operation_id)
-                    return retain_ingress_on_connection(
-                        conn, running, prepared=prepared_ingress, transcript=(*actual_transcript[:-1], actual_message)
-                    )
-                return message_rows
+                actual_transcript = tuple(self._row_to_chat_message_record(row) for row in message_rows)
+                # By construction (single transaction, session write lock held
+                # for the sequence allocation) the inserted row IS the maximum
+                # sequence_no in the snapshot just read.
+                if not actual_transcript or str(actual_transcript[-1].id) != msg_id_holder["id"]:
+                    raise AuditIntegrityError("initializer ingress lost its actual same-transaction maximum user row")
+                actual_message = replace(actual_transcript[-1], operation_id=operation_id)
+                return retain_ingress_on_connection(
+                    conn, running, prepared=prepared_ingress, transcript=(*actual_transcript[:-1], actual_message)
+                )
 
-        sync_result = (
-            await run_required_sql_in_worker(required_work, _sync) if required_work is not None else await self._run_composer_sql(_sync)
-        )
-        if isinstance(sync_result, ContinuationIngressCheckpoint):
-            return sync_result
-        transcript = [self._row_to_chat_message_record(row) for row in sync_result]
-        if not transcript or str(transcript[-1].id) != msg_id_holder["id"]:
-            # By construction (single transaction, session write lock held
-            # for the sequence allocation) the inserted row IS the maximum
-            # sequence_no in the snapshot just read. If this fires, the
-            # store violated read-your-own-write inside one transaction —
-            # genuine engine/store corruption, not a timing artifact.
-            raise AuditIntegrityError(
-                "Tier 1 audit anomaly: add_message_with_transcript same-"
-                f"transaction snapshot for session {sid} does not end at "
-                f"inserted message {msg_id_holder['id']}."
-            )
-        message = replace(transcript[-1], operation_id=operation_id)
-        transcript[-1] = message
-        return MessageIngressFresh(operation_id=operation_id, message=message, transcript=tuple(transcript))
+        return await run_required_sql_in_worker(required_work, _sync)
 
     def _row_to_chat_message_record(self, row: Any, *, operation_id: str | None = None) -> ChatMessageRecord:
         return chat_message_record_from_row(row, operation_id=operation_id)
@@ -7030,76 +6978,6 @@ class SessionServiceImpl:
                 return self._row_to_state_record(result_row)
 
         return cast(CompositionStateRecord, await self._run_sync(_sync))
-
-    async def commit_composition_response(
-        self,
-        *,
-        session_id: UUID,
-        expected_current_state_id: UUID | None,
-        state: CompositionStateData,
-        assistant_content: str,
-        raw_content: str | None,
-        session_operation_context: SessionOperationContext,
-    ) -> TransitionResponseSettlement:
-        """Persist a post-compose state and assistant under exact authority."""
-
-        sid = str(session_id)
-        expected_state_id = str(expected_current_state_id) if expected_current_state_id is not None else None
-        now = self._now()
-
-        def _sync() -> tuple[CompositionStateRecord, ChatMessageRecord]:
-            with (
-                self._session_process_locked_begin(sid) as conn,
-                self._session_write_lock(conn, sid),
-                self._session_composer_mutation_transaction(
-                    conn,
-                    session_id=sid,
-                    session_operation_context=session_operation_context,
-                    expected_kind=SessionOperationKind.COMPOSE,
-                ),
-            ):
-                current_state_id = conn.execute(
-                    select(composition_states_table.c.id)
-                    .where(composition_states_table.c.session_id == sid)
-                    .order_by(desc(composition_states_table.c.version))
-                    .limit(1)
-                ).scalar_one_or_none()
-                if current_state_id != expected_state_id:
-                    raise StaleComposeStateError(
-                        "commit_composition_response: current composition state changed "
-                        f"for session_id={sid!r}; expected={expected_state_id!r}, "
-                        f"actual={current_state_id!r}"
-                    )
-
-                state_id = self._insert_composition_checkpoint(
-                    conn,
-                    session_id=sid,
-                    state=state,
-                    provenance="post_compose",
-                    created_at=now,
-                    session_operation_context=session_operation_context,
-                )
-                message_record = self._insert_transition_assistant(
-                    conn,
-                    session_id=sid,
-                    state_id=state_id,
-                    content=assistant_content,
-                    raw_content=raw_content,
-                    created_at=now,
-                    session_operation_context=session_operation_context,
-                )
-                state_row = conn.execute(
-                    select(composition_states_table)
-                    .where(composition_states_table.c.session_id == sid)
-                    .where(composition_states_table.c.id == state_id)
-                ).one()
-                return self._row_to_state_record(state_row), message_record
-
-        state_record, message_record = cast(
-            tuple[CompositionStateRecord, ChatMessageRecord],
-            await self._run_sync(_sync),
-        )
-        return TransitionResponseSettlement(state=state_record, message=message_record)
 
     async def get_composition_head(self, session_id: UUID) -> CompositionStateHead:
         """Return trusted scalar graph identity without decoding graph JSON."""
@@ -9682,10 +9560,10 @@ class SessionServiceImpl:
                     raise cancelled from original_failure
                 if attempt > 0 and (
                     isinstance(original_failure, _ComposerTerminalRetryStateChanged)
-                    or (current is not None and (current.cancel_requested_at is not None or current.legacy_deadline_at <= now))
+                    or (current is not None and current.cancel_requested_at is not None)
                 ):
                     # The original immutable bundle remains the failure
-                    # evidence; ordinary Stop/deadline changes cannot invent
+                    # evidence; an ordinary Stop change cannot invent
                     # an integrity fault or erase an original accounting fault.
                     raise first_failure from original_failure
                 if attempt > 0 and original_failure is not first_failure:
@@ -9898,20 +9776,17 @@ class SessionServiceImpl:
         attempted_audit_rows: tuple[ChatMessageRecord, ...] | None = None
         attempted_proposals: tuple[CompositionProposalRecord, ...] | None = None
         attempted_state: CompositionStateRecord | None = None
-        attempted_deadline_expired: bool | None = None
 
         def _can_retry(current: ComposerOperationRecord, now: datetime) -> bool:
             return (
                 attempted_response is not None
                 and current.cancel_requested_at is None
-                and attempted_deadline_expired is False
-                and current.legacy_deadline_at > now
                 and current.session_operation_id == context.fence.operation_id
                 and current.session_operation_epoch == context.fence.operation_epoch
             )
 
         def _sync() -> ComposerOperationRecord:
-            nonlocal attempted_response, attempted_deadline_expired, frozen_created_at
+            nonlocal attempted_response, frozen_created_at
             nonlocal attempted_message, attempted_audit_rows, attempted_proposals, attempted_state
             with (
                 self._session_process_locked_begin(sid) as conn,
@@ -9931,7 +9806,6 @@ class SessionServiceImpl:
                 current_job = _record_from_row(job_row)
                 if attempted_response is not None and not _can_retry(current_job, now):
                     raise _ComposerTerminalRetryStateChanged("immutable terminal retry driving state changed")
-                attempted_deadline_expired = current_job.legacy_deadline_at <= now
                 terminal_review = self._validate_terminal_graph_review(
                     conn, running=running, drafts=audit_cohort, audit_state_id=audit_composition_state_id
                 )
@@ -10072,7 +9946,7 @@ class SessionServiceImpl:
                     )
                 response = MessageWithStateResponse.model_validate(response.model_dump(mode="python"), strict=True)
                 attempted_response = response
-                result = settle_composer_operation_on_connection(conn, running, outcome=response, settled_at=frozen_created_at)
+                result = settle_composer_operation_on_connection(conn, running, outcome=response)
             # Telemetry is after commit and cannot change the stored terminal.
             for draft in active_drafts:
                 record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
@@ -10135,7 +10009,6 @@ class SessionServiceImpl:
         sid = str(running.claim.session_id)
         attempted_failure: ComposerOperationError | None = None
         attempted_cancel: datetime | None = None
-        attempted_deadline_expired: bool | None = None
         frozen_settled_at: datetime | None = None
         frozen_failure_draft: AuditMessageDraft | None = None
         frozen_failure_message_id: str | None = None
@@ -10144,13 +10017,12 @@ class SessionServiceImpl:
             return (
                 attempted_failure is not None
                 and current.cancel_requested_at == attempted_cancel
-                and (current.legacy_deadline_at <= now) == attempted_deadline_expired
                 and current.session_operation_id == running.session_operation_context.fence.operation_id
                 and current.session_operation_epoch == running.session_operation_context.fence.operation_epoch
             )
 
         def _sync() -> ComposerOperationRecord:
-            nonlocal attempted_failure, attempted_cancel, attempted_deadline_expired, frozen_settled_at
+            nonlocal attempted_failure, attempted_cancel, frozen_settled_at
             nonlocal frozen_failure_draft, frozen_failure_message_id
             active_drafts: tuple[AuditMessageDraft, ...] = ()
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
@@ -10175,12 +10047,11 @@ class SessionServiceImpl:
                     )
                 if attempted_failure is not None and not _can_retry(current, now):
                     raise _ComposerTerminalRetryStateChanged("immutable failed terminal driving state changed")
-                selected = _select_failure_on_connection(row, failure, now=now, authoritative_failure=authoritative_failure)
+                selected = _select_failure_on_connection(row, failure, authoritative_failure=authoritative_failure)
                 if attempted_failure is not None and selected != attempted_failure:
                     raise _ComposerTerminalRetryStateChanged("immutable failed terminal bundle changed")
                 attempted_failure = selected
                 attempted_cancel = current.cancel_requested_at
-                attempted_deadline_expired = current.legacy_deadline_at <= now
                 if frozen_settled_at is None:
                     frozen_settled_at = now
                 if operation_failure_facts is not None:
@@ -10201,9 +10072,7 @@ class SessionServiceImpl:
                         created_at=frozen_settled_at,
                         recorded_at=frozen_settled_at,
                     )
-                result = settle_composer_operation_on_connection(
-                    conn, running, outcome=attempted_failure, authoritative_failure=True, settled_at=frozen_settled_at
-                )
+                result = settle_composer_operation_on_connection(conn, running, outcome=attempted_failure, authoritative_failure=True)
             for draft in active_drafts:
                 record_settled_composer_audit_message(role=draft.role, writer_principal="compose_loop", tool_calls=draft.tool_calls)
             return result

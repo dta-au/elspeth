@@ -739,7 +739,7 @@ async def fail_continuation_tool_operation(
                 selected_failure = project_retained_tool_failure(source, request_id=current.request_id, diagnostic_id=diagnostic)
             else:
                 raise AuditIntegrityError("V2 failed terminal has neither actual native nor retained failure source")
-            selected_failure = _select_failure_on_connection(row, selected_failure, now=now, authoritative_failure=False)
+            selected_failure = _select_failure_on_connection(row, selected_failure, authoritative_failure=False)
             segment = conn.execute(
                 select(segments).where(
                     segments.c.session_id == sid, segments.c.operation_id == oid, segments.c.sequence == running.claim.segment_sequence

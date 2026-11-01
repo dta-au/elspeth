@@ -47,8 +47,6 @@ class ContinuationSQLDeadlineOwner:
     ) -> None:
         if (
             type(running) is not ComposerOperationRunning
-            or running.claim.segment_sequence is None
-            or running.claim.ownership_generation is None
             or type(policy) is not ContinuationAdmissionPolicy
             or type(drain_signal) is not ComposerDrainSignal
             or type(drain_seconds) not in (float, int)

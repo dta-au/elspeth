@@ -19,7 +19,6 @@ from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final, get_args
 from uuid import UUID, uuid4
 
-from pydantic import JsonValue
 from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError
@@ -77,9 +76,7 @@ from elspeth.web.coordination.chargeable_admission_authority import RepositoryCh
 from elspeth.web.coordination.composer_mutation_guard import require_auto_mutation_on_connection
 from elspeth.web.coordination.composer_operation_authority import (
     _require_owner,
-    get_composer_operation_for_start_on_connection,
     require_composer_operation_mutation_on_connection,
-    start_composer_operation_on_connection,
 )
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -105,12 +102,9 @@ from elspeth.web.coordination.quota_authority import (
 )
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
 from elspeth.web.sessions.composer_drain import ComposerDrainDeadline
-from elspeth.web.sessions.composer_operation_preconditions import check_composer_operation_preconditions_on_connection
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationClaim,
-    ComposerOperationError,
     ComposerOperationFenceLost,
-    ComposerOperationPreconditionRefused,
     ComposerOperationRunning,
 )
 from elspeth.web.sessions.content_publication import prepare_content_publication, read_content_publication
@@ -4976,7 +4970,6 @@ class _SessionOperationAuthorityRepository:
             select(composer_async_operations_table.c.operation_id)
             .where(
                 composer_async_operations_table.c.session_id == session_id_text,
-                composer_async_operations_table.c.lifecycle_version == 2,
                 composer_async_operations_table.c.status.in_(("queued", "running")),
             )
             .limit(1)
@@ -5104,7 +5097,6 @@ class _SessionOperationAuthorityRepository:
             select(composer_async_operations_table).where(
                 composer_async_operations_table.c.session_id == str(session_id),
                 composer_async_operations_table.c.operation_id == operation_id,
-                composer_async_operations_table.c.lifecycle_version == 2,
             )
         ).one_or_none()
         if (
@@ -5361,7 +5353,6 @@ class _SessionOperationAuthorityRepository:
             if (
                 parent is None
                 or segment is None
-                or parent.lifecycle_version != 2
                 or parent.status not in ("queued", "running")
                 or parent.actor_user_id != candidate.actor_user_id
                 or parent.current_segment_sequence != candidate.segment_sequence
@@ -5437,8 +5428,6 @@ class _SessionOperationAuthorityRepository:
         if type(running) is not ComposerOperationRunning:
             raise TypeError("handover requires the owned running custody")
         claim, context = running.claim, running.session_operation_context
-        if claim.segment_sequence is None or claim.ownership_generation is None:
-            raise TypeError("handover requires a continuation segment claim")
         if type(retry_delay_seconds) not in (int, float) or not math.isfinite(retry_delay_seconds) or not 0 <= retry_delay_seconds <= 60:
             raise ValueError("handover retry delay must be finite between zero and sixty seconds")
         session_id_text = str(claim.session_id)
@@ -5556,7 +5545,7 @@ class _SessionOperationAuthorityRepository:
         observation: ComposerSegmentStartObservation | None = None,
         deadline: ComposerDrainDeadline | None = None,
     ) -> SessionOperationContext:
-        if type(claim) is not ComposerOperationClaim or claim.segment_sequence is None or claim.ownership_generation is None:
+        if type(claim) is not ComposerOperationClaim:
             raise TypeError("continuation start requires its nominal segment claim")
         if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
             raise ValueError("auth_provider_type must name a browser authentication provider")
@@ -5577,7 +5566,6 @@ class _SessionOperationAuthorityRepository:
                 select(composer_async_operations_table.c.actor_user_id).where(
                     composer_async_operations_table.c.session_id == str(claim.session_id),
                     composer_async_operations_table.c.operation_id == claim.operation_id,
-                    composer_async_operations_table.c.lifecycle_version == 2,
                     composer_async_operations_table.c.status.in_(("queued", "running")),
                 )
             ).one_or_none()
@@ -5649,51 +5637,6 @@ class _SessionOperationAuthorityRepository:
                 observation.reconciled = True
                 return None
             raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-
-    def start_composer_async_operation(
-        self,
-        claim: ComposerOperationClaim,
-        *,
-        owner_instance_id: str,
-        lease_seconds: int,
-        auth_provider_type: str,
-    ) -> SessionOperationContext:
-        if type(claim) is not ComposerOperationClaim:
-            raise TypeError("claim must be ComposerOperationClaim")
-        if type(auth_provider_type) is not str or auth_provider_type not in get_args(AuthProviderType):
-            raise ValueError("auth_provider_type must name a browser authentication provider")
-        _validate_owner(owner_instance_id)
-        _validate_lease_seconds(lease_seconds)
-        with self._locked_transaction(str(claim.session_id)) as conn:
-            job = get_composer_operation_for_start_on_connection(conn, claim)
-            if job.claim_owner_instance_id != owner_instance_id:
-                raise ComposerOperationFenceLost(session_id=claim.session_id, operation_id=claim.operation_id, attempt=claim.attempt)
-            if job.legacy_deadline_at <= self._database_now(conn):
-                body: dict[str, JsonValue] = {
-                    "error_type": "composer_operation_deadline_expired",
-                    "detail": "The composer request waited too long to start. Please resubmit.",
-                    "timeout_seconds": (job.legacy_deadline_at - job.created_at).total_seconds(),
-                }
-                body["request_id"] = job.request_id
-                raise ComposerOperationPreconditionRefused(
-                    error=ComposerOperationError(
-                        http_status=504,
-                        failure_code="deadline_expired",
-                        error_type="composer_operation_deadline_expired",
-                        body=body,
-                        diagnostic_id=None,
-                    )
-                )
-            context = self._advance_exclusive_fence_on_connection(
-                conn,
-                session_id_text=str(claim.session_id),
-                operation_kind=SessionOperationKind.COMPOSE,
-                owner_instance_id=owner_instance_id,
-                lease_seconds=lease_seconds,
-            )
-            user_message_id = check_composer_operation_preconditions_on_connection(conn, job, auth_provider_type=auth_provider_type)
-            start_composer_operation_on_connection(conn, claim, context=context, user_message_id=user_message_id)
-            return context
 
     def _admit_blob_read(
         self,

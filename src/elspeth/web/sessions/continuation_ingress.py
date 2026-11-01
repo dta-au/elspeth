@@ -217,8 +217,8 @@ def _read_ingress_values_with_source_on_connection(
         raise AuditIntegrityError("initializer source lost its exact Initialize frame")
     parent = conn.execute(select(jobs).where(jobs.c.session_id == sid, jobs.c.operation_id == operation)).one()
     principal = conn.execute(select(sessions.c.user_id, sessions.c.archived_at, sessions.c.title).where(sessions.c.id == sid)).one()
-    if parent.lifecycle_version != 2 or parent.kind != "compose_message":
-        raise AuditIntegrityError("initializer ingress cannot insert for another lifecycle/request kind")
+    if parent.kind != "compose_message":
+        raise AuditIntegrityError("initializer ingress cannot insert for another request kind")
     try:
         request = SendMessageRequest.model_validate_json(parent.request_json, strict=True)
     except ValidationError as error:
@@ -227,8 +227,7 @@ def _read_ingress_values_with_source_on_connection(
     requested = str(requested_state_id) if requested_state_id is not None else None
     state = str(composition_state_id) if composition_state_id is not None else None
     if (
-        parent.lifecycle_version != 2
-        or parent.kind != "compose_message"
+        parent.kind != "compose_message"
         or principal.archived_at is not None
         or principal.user_id != parent.actor_user_id
         or request.operation_id != operation
@@ -474,7 +473,6 @@ def bind_ingress_on_connection(
         .where(
             jobs.c.session_id == str(running.claim.session_id),
             jobs.c.operation_id == running.claim.operation_id,
-            jobs.c.lifecycle_version == 2,
             jobs.c.ingress_phase == "pending",
             jobs.c.user_message_id.is_(None),
             jobs.c.reserved_user_message_id == message_id,

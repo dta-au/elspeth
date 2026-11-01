@@ -15,7 +15,6 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError,
     ComposerOperationKind,
     ComposerOperationPreconditionRefused,
-    ComposerOperationRecord,
 )
 from elspeth.web.sessions.models import (
     chat_messages_table,
@@ -55,19 +54,6 @@ def _refuse(job: ComposerOperationPreconditions, *, status: int, detail: str, er
             body=body if flat or error_type is None else {"detail": body},
             diagnostic_id=None,
         )
-    )
-
-
-def check_composer_operation_preconditions_on_connection(
-    conn: Connection, job: ComposerOperationRecord, *, auth_provider_type: str
-) -> UUID | None:
-
-    if type(job) is not ComposerOperationRecord:
-        raise TypeError("job must be ComposerOperationRecord")
-    return check_composer_request_preconditions_on_connection(
-        conn,
-        ComposerOperationPreconditions(job.session_id, job.actor_user_id, job.request_id, job.base_state_id, job.kind, job.request_json),
-        auth_provider_type=auth_provider_type,
     )
 
 

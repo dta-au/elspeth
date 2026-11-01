@@ -951,15 +951,6 @@ class ChatMessageRecord:
             freeze_fields(self, "tool_calls")
 
 
-@dataclass(frozen=True, slots=True)
-class MessageIngressFresh:
-    """A newly accepted user row with its same-transaction transcript."""
-
-    operation_id: UUID
-    message: ChatMessageRecord
-    transcript: tuple[ChatMessageRecord, ...]
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CompositionRejectionEventRecord:
     """One ``composition_rejection_events`` row, projected for the audit-grade view.
@@ -2550,17 +2541,6 @@ class SessionOperationAuthority(Protocol):
         """Prove this actual producer's committed context or known unstarted claim."""
         ...
 
-    def start_composer_async_operation(
-        self,
-        claim: ComposerOperationClaim,
-        *,
-        owner_instance_id: str,
-        lease_seconds: int,
-        auth_provider_type: str,
-    ) -> SessionOperationContext:
-        """Atomically bind one queued claim to a new COMPOSE fence."""
-        ...
-
     def create_session_with_initial_fence(
         self,
         *,
@@ -3295,9 +3275,9 @@ class SessionServiceProtocol(Protocol):
         parent_assistant_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
         running: ComposerOperationRunning,
-        required_work: RequiredWorkTicket | None = None,
-        continuation: StoredContinuationSnapshot | None = None,
-    ) -> MessageIngressFresh | ContinuationIngressCheckpoint:
+        required_work: RequiredWorkTicket,
+        continuation: StoredContinuationSnapshot,
+    ) -> ContinuationIngressCheckpoint:
         """Accept a user message once and return a nominal admission result.
 
         The insert and the transcript read MUST happen inside one
@@ -3373,23 +3353,6 @@ class SessionServiceProtocol(Protocol):
         Implementations must return the final session head because an opted-
         out session may auto-resolve a prepared event and derive a newer state
         inside the settlement transaction.
-        """
-        ...
-
-    async def commit_composition_response(
-        self,
-        *,
-        session_id: UUID,
-        expected_current_state_id: UUID | None,
-        state: CompositionStateData,
-        assistant_content: str,
-        raw_content: str | None,
-        session_operation_context: SessionOperationContext,
-    ) -> TransitionResponseSettlement:
-        """Atomically persist one post-compose state and its response.
-
-        The exact live COMPOSE authority is validated in the same database
-        transaction as both rows, so takeover commits neither half.
         """
         ...
 
