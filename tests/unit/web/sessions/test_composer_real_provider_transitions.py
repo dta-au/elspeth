@@ -6,6 +6,7 @@ import json
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import litellm
@@ -15,7 +16,6 @@ from jsonschema import Draft202012Validator
 from sqlalchemy import select
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
@@ -469,31 +469,24 @@ async def test_each_real_composer_transition_has_its_own_settled_provider_eviden
 async def test_transition_instrument_rejects_primary_provider_bypass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     physical_call = ProviderGateway._call_llm
     calls = 0
+    counterfeited = False
 
+    # The stand-in forwards every keyword it does not inspect. An explicit
+    # keyword list went stale when production began passing prepared_input:
+    # the first call then raised TypeError, the operation settled failed,
+    # and this control failed before the census could judge the bypass.
     async def bypass(
         self: ProviderGateway,
         messages: object,
         tools: object,
         *,
         provider_custody: ProviderCallCustody | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
+        **forwarded: Any,
     ) -> _AdmittedLLMCompletion:
-        nonlocal calls
+        nonlocal calls, counterfeited
         calls += 1
         if calls == 1:
-            return await physical_call(
-                self,
-                messages,
-                tools,
-                provider_custody=provider_custody,
-                credential_state=credential_state,
-                prompt_guard_trusted_message_indexes=prompt_guard_trusted_message_indexes,
-                prompt_guard_content_parts=prompt_guard_content_parts,
-                prompt_guard_tool_argument_parts=prompt_guard_tool_argument_parts,
-            )
+            return await physical_call(self, messages, tools, provider_custody=provider_custody, **forwarded)
         # First transition dispatches normally. Counterfeit the second path
         # while leaving accounting real: a positive per-walk total misses it.
         assert type(provider_custody) is ProviderCallCustody
@@ -518,9 +511,14 @@ async def test_transition_instrument_rejects_primary_provider_bypass(tmp_path: P
             ],
             usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         )
+        counterfeited = True
         return _admit_composer_llm_completion(response)
 
     monkeypatch.setattr(ProviderGateway, "_call_llm", bypass)
-    with pytest.raises(AssertionError, match="transition bypassed the primary provider"):
+    with pytest.raises(AssertionError) as caught:
         await test_each_real_composer_transition_has_its_own_settled_provider_evidence(tmp_path, monkeypatch, "followup")
+    # The rejection proves nothing unless the counterfeit actually ran: check
+    # that first, so a census failure for another reason is named as such.
+    assert counterfeited, f"the counterfeit dispatch never ran; the census failed for another reason: {caught.value}"
     assert calls == 2
+    assert "transition bypassed the primary provider" in str(caught.value)
