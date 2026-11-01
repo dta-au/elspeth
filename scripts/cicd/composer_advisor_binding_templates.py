@@ -6573,8 +6573,11 @@ class FirstRuntimeGraph:
     else:
         # Same SQL cut can arrive as a fresh selected object, including a
         # warm owner which has just observed durable Stop. Carry that
-        # exact read choice without replacing live owners or their clocks.
+        # exact read choice without replacing live owners or their clocks;
+        # the message producers adopt the same equal cut so PRIMARY input
+        # admission sees the selection this read now holds.
         _require_runtime_source_refresh(self.runtime.source, source)
+        self.runtime.materialization.adopt_equal_cut(selected, inventory)
         self.runtime = replace(self.runtime, source=source)
     if self.runtime is None:
         raise AuditIntegrityError("live phase source lost its actual runtime")
@@ -8121,8 +8124,11 @@ class ContinuationLivePhases:
         else:
             # Same SQL cut can arrive as a fresh selected object, including a
             # warm owner which has just observed durable Stop. Carry that
-            # exact read choice without replacing live owners or their clocks.
+            # exact read choice without replacing live owners or their clocks;
+            # the message producers adopt the same equal cut so PRIMARY input
+            # admission sees the selection this read now holds.
             _require_runtime_source_refresh(self.runtime.source, source)
+            self.runtime.materialization.adopt_equal_cut(selected, inventory)
             self.runtime = replace(self.runtime, source=source)
         if self.runtime is None:
             raise AuditIntegrityError("live phase source lost its actual runtime")
@@ -10689,6 +10695,9 @@ class CurrentContinuationMessageProducers:
             self._schema_inputs.append((_AdmittedToolCall(entry.tool_call_id, _AdmittedToolFunction('get_plugin_schema', entry.raw_arguments)), states[entry.state_index]))
 
     def advance_current(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
+        pass
+
+    def adopt_equal_cut(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
         pass
 
     def _require_current(self) -> _CurrentProducerInputs:

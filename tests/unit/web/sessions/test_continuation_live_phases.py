@@ -1074,3 +1074,91 @@ async def test_owed_stop_read_refuses_contradictory_tool_result_after_actual_pos
         with pytest.raises(AuditIntegrityError, match="coupled source codec"):
             facet.read_runtime(owner.authority)
         assert stored_rows(operation_store[0]) == malformed and len(sdk) == 1
+
+
+@pytest.mark.asyncio
+async def test_driver_action_ready_re_read_of_the_same_cut_reaches_the_primary(operation_store, tmp_path, monkeypatch):
+    """The driver's action_ready arm, with the runtime already bound, re-reads
+    the SAME SQL cut as a fresh selected object and hands
+    ``runtime.source.selected`` with ``runtime.materialization`` to PRIMARY
+    (continuation_driver.py:409-426). The producers must adopt that equal cut,
+    or PRIMARY input admission refuses the pair before any SDK entry.
+    """
+    runtime, work, requests = await initialized_primary_input(operation_store, tmp_path, monkeypatch)
+    service, authority = runtime.materialization.service, operation_store[2]
+    running = work.running
+    assert running is not None
+    provider = runtime.bindings.provider_owner
+    adoption = ContinuationLeaseAdoption(
+        operation_store[1], running.session_operation_context, lease_seconds=30, required_work=work.coordinator
+    )
+    lease = await adoption.join()
+    sdk_calls = []
+    try:
+        owner = ContinuationLivePhases(service, authority, work, provider, lease)
+        owner.bind_initial(runtime)
+        bound = runtime.source.selected
+        fresh = await load_selected_continuation(
+            authority=authority, running=running, selected=authority.load_continuation_snapshot(running), required_work=work
+        )
+        # Premise: the same cut, as a different object.
+        assert fresh == bound and fresh is not bound
+        current, _inventory = await owner.current(fresh)
+        assert current.source.selected is fresh
+        assert current.materialization is runtime.materialization
+        assert current.materialization.selected is fresh
+
+        async def completion(**sdk_kwargs):
+            _assert_required_guard_admitted(
+                operation_store[0], running.session_operation_context, requests, role="composer", user_prompt=runtime.bindings.message
+            )
+            sdk_calls.append(sdk_kwargs)
+            return ModelResponse(
+                model="test/model",
+                choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": "Explained.", "tool_calls": None}}],
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            )
+
+        monkeypatch.setattr(litellm, "acompletion", completion)
+        _messages, _tools, delivery, _delivery_input = service._prepare_primary_delivery(
+            messages=current.live.llm_messages,
+            tools=current.live.tools,
+            recorder=current.live.recorder,
+            turn_evidence=current.live.turn_evidence,
+            state=current.live.state,
+            failed_turn=current.live.failed_turn,
+        )
+        with prompt_guard_user_scope(current.bindings.message):
+            primary = await run_continuation_primary(
+                service=service,
+                authority=authority,
+                selected=current.source.selected,
+                producers=current.materialization,
+                messages=current.live.llm_messages,
+                tools=current.live.tools,
+                recorder=current.live.recorder,
+                drained=current.drained,
+                required_work=work,
+                provider_owner=provider,
+                timeout=5,
+            )
+        assert len(sdk_calls) == 1
+        assert primary.outcome.completion.message.content == "Explained."
+        if delivery is not None:
+            current.live.turn_evidence.confirm_delivery(delivery, current.live.recorder.llm_calls)
+    finally:
+        await lease.close()
+
+
+@pytest.mark.asyncio
+async def test_same_cut_adoption_refuses_a_different_cut(operation_store, tmp_path, monkeypatch):
+    """Equal-cut adoption rebinds references only; any value difference is a
+    different cut and leaves every producer binding intact."""
+    runtime, work, _requests = await initialized_primary_input(operation_store, tmp_path, monkeypatch)
+    producers = runtime.materialization
+    before = (producers.selected, producers.inventory, producers.finish_read)
+    changed = replace(producers.selected, checkpoint_id=producers.selected.checkpoint_id + "-other")
+    with pytest.raises(AuditIntegrityError, match="same-cut adoption"):
+        producers.adopt_equal_cut(changed, producers.inventory)
+    assert producers.selected is before[0] and producers.inventory is before[1] and producers.finish_read is before[2]
+    assert work.running is not None

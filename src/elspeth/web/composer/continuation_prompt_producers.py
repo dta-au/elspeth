@@ -520,6 +520,30 @@ class CurrentContinuationMessageProducers:
         # A failed SQL read/transaction leaves every old binding intact.
         self.selected, self.inventory, self.inputs, self.finish_read = selected, inventory, actual, finish_read
 
+    def adopt_equal_cut(self, selected: SelectedContinuationState, inventory: CurrentContinuationEnvInventory) -> None:
+        """Rebind the same SQL cut re-read as fresh, value-equal objects.
+
+        advance_current owns a real transition and refuses an equal cursor.
+        A same-cut re-read changes nothing durable, so no SQL is read and no
+        producer input is replaced: only the selection/inventory references
+        move, so identity checks downstream see the read the caller now holds.
+        Any value difference is a different cut and is refused.
+        """
+        if (
+            type(selected) is not SelectedContinuationState
+            or type(inventory) is not CurrentContinuationEnvInventory
+            or inventory.running is not self.inventory.running
+            or inventory.running.session_operation_context is not self.inventory.running.session_operation_context
+            or inventory.names != self.inventory.names
+            or inventory.selection != self.inventory.selection
+            or selected != self.selected
+        ):
+            raise AuditIntegrityError("live message same-cut adoption changed its actual selection, inventory or owners")
+        from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
+
+        finish_read = None if self.finish_read is None else ContinuationFinishRead(inventory.running, selected, inventory)
+        self.selected, self.inventory, self.finish_read = selected, inventory, finish_read
+
     def _require_current(self) -> _CurrentProducerInputs:
         if type(self.inputs) is not _CurrentProducerInputs:
             raise AuditIntegrityError("ready message producer has no existing Compose/family source")
