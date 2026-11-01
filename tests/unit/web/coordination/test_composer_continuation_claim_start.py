@@ -10,7 +10,6 @@ from tests.unit.web.coordination.test_composer_operation_authority import (
     _admission_rows,
     _admission_v2_authority,
     admit,
-    failed,
 )
 from tests.unit.web.coordination.test_composer_operation_authority import (
     operation_store as _operation_store,
@@ -23,7 +22,6 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationCancelledDuringTurn,
-    ComposerOperationError,
     ComposerOperationFenceLost,
     ComposerOperationPreconditionRefused,
 )
@@ -41,7 +39,7 @@ operation_store = _operation_store
 
 def queued(store, *, policy=None):
     authority = _admission_v2_authority(store, policy=policy)
-    record, fresh = admit(authority, store[4], lifecycle_version=2, continuation_enabled=True)
+    record, fresh = admit(authority, store[4])
     assert fresh
     return authority, record
 
@@ -72,7 +70,7 @@ def test_fresh_start_has_exact_history_snapshot_and_independent_clocks(operation
         history = conn.execute(select(attempts)).one()
         assert load_snapshot(conn, session_id=str(sid), operation_id=record.operation_id) == snapshot
         assert require_continuation_mutation(conn, context) is True
-    assert parent.deadline_at is None and parent.attempt == history.claim_attempt == claim.attempt
+    assert parent.attempt == history.claim_attempt == claim.attempt
     assert parent.current_segment_sequence == segment.sequence == history.sequence == 1
     assert parent.ownership_generation == segment.generation == history.generation == 1
     assert parent.session_operation_id == segment.session_operation_id == history.session_operation_id == context.fence.operation_id
@@ -205,19 +203,11 @@ def test_valid_shaped_snapshot_and_segment_substitutions_are_refused(operation_s
     assert _admission_rows(engine) == before
 
 
-def test_cancelled_v2_can_start_cleanup_but_business_guard_still_refuses(operation_store):
-    engine, repository, _, _, sid = operation_store
-    authority, record = queued(operation_store)
+def test_cancelled_request_can_start_cleanup_but_business_guard_still_refuses(operation_store):
+    engine, repository, _, _, _sid = operation_store
+    authority, _record = queued(operation_store)
     with engine.begin() as conn:
         conn.execute(update(jobs).values(cancel_requested_at=database_now(conn)))
-    assert authority.claim_next(limit=1) == () and authority.list_expired_queued(limit=1) == ()
-    failure = ComposerOperationError(
-        http_status=500, failure_code="worker_lost", error_type=None, body={"detail": "controlled legacy settlement"}, diagnostic_id=None
-    )
-    before = _admission_rows(engine)
-    with pytest.raises(ComposerOperationFenceLost):
-        authority.settle_unstarted(None, session_id=sid, operation_id=record.operation_id, failure=failure)
-    assert _admission_rows(engine) == before
     (claim,) = authority.claim_segment(limit=1)
     context = start_segment(repository, claim)
     with engine.begin() as conn:
@@ -226,26 +216,9 @@ def test_cancelled_v2_can_start_cleanup_but_business_guard_still_refuses(operati
         assert require_continuation_mutation(conn, context, allow_cancel=True) is True
     before = _admission_rows(engine)
     with pytest.raises(ComposerOperationFenceLost):
-        authority.settle_unstarted(None, session_id=sid, operation_id=record.operation_id, failure=failure)
-    with pytest.raises(ComposerOperationFenceLost):
-        repository.start_composer_async_operation(claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local")
-    assert authority.list_expired_running(limit=1) == ()
+        start_segment(repository, claim)
     assert _admission_rows(engine) == before
     repository.release(context)
-    assert authority.list_expired_running(limit=1) == ()
-    with engine.begin() as conn:
-        conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(archived_at=database_now(conn)))
-    before = _admission_rows(engine)
-    with pytest.raises(ComposerOperationFenceLost):
-        authority._settle_recovery(
-            session_id=sid,
-            operation_id=record.operation_id,
-            failure=failure,
-            settled_by="settle_lost_inactive_session",
-            recovery_context=None,
-            authoritative_failure=False,
-        )
-    assert _admission_rows(engine) == before
 
 
 def test_history_insert_failure_rolls_back_actual_fence_and_segment_start(operation_store):
@@ -364,7 +337,7 @@ def test_unexpired_oldest_claim_does_not_consume_limit_one(operation_store):
     other = repository.create_session_with_initial_fence(
         user_id="alice", title="Younger", auth_provider_type="local", owner_instance_id="test-owner", lease_seconds=30
     )
-    second, fresh = admit(authority, other.id, lifecycle_version=2, continuation_enabled=True)
+    second, fresh = admit(authority, other.id)
     assert fresh
     (new_claim,) = authority.claim_segment(limit=1)
     assert old_claim.operation_id == first.operation_id and new_claim.operation_id == second.operation_id
@@ -448,7 +421,7 @@ async def test_recompose_start_retains_actual_original_ingress_without_inserting
     repository.release(context)
     authority = _admission_v2_authority(operation_store)
     request = RecomposeRequest(operation_id=str(uuid4()), expected_user_message_id=original.id)
-    record, fresh = admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+    record, fresh = admit(authority, sid, request)
     assert fresh and record.reserved_user_message_id == record.user_message_id == original.id
     with engine.connect() as conn:
         before = conn.execute(select(chat_messages_table).order_by(chat_messages_table.c.sequence_no)).all()
@@ -501,87 +474,6 @@ def test_first_start_requires_exact_complete_admitted_initializer(operation_stor
     with pytest.raises(AuditIntegrityError, match="exact admitted complete initializer"):
         start_segment(repository, claim)
     assert _admission_rows(engine) == before
-
-
-@pytest.mark.parametrize("lifecycle", [1, 2])
-@pytest.mark.parametrize("owner", ["claim_next", "get_start", "start", "expired_queued", "expired_running", "unstarted", "recovery"])
-def test_each_legacy_owner_preserves_v1_and_refuses_actual_v2(operation_store, lifecycle, owner):
-    from elspeth.web.coordination.composer_operation_authority import get_composer_operation_for_start_on_connection
-
-    engine, repository, legacy_authority, _, sid = operation_store
-    if lifecycle == 2:
-        authority, record = queued(operation_store)
-    else:
-        authority = legacy_authority
-        record, fresh = admit(authority, sid)
-        assert fresh
-    claim = None
-    if owner in ("get_start", "start", "expired_running", "recovery"):
-        (claim,) = authority.claim_segment(limit=1) if lifecycle == 2 else authority.claim_next(limit=1)
-    if owner in ("expired_running", "recovery"):
-        context = (
-            start_segment(repository, claim)
-            if lifecycle == 2
-            else repository.start_composer_async_operation(
-                claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local"
-            )
-        )
-        repository.release(context)
-    if owner == "expired_queued":
-        with engine.begin() as conn:
-            conn.execute(update(jobs).where(jobs.c.operation_id == record.operation_id).values(cancel_requested_at=database_now(conn)))
-    if owner == "recovery":
-        with engine.begin() as conn:
-            conn.execute(update(sessions_table).where(sessions_table.c.id == str(sid)).values(archived_at=database_now(conn)))
-    before = _admission_rows(engine)
-    if owner in ("claim_next", "expired_queued", "expired_running"):
-        if owner == "claim_next":
-            selected = authority.claim_next(limit=1)
-        elif owner == "expired_queued":
-            selected = authority.list_expired_queued(limit=1)
-        else:
-            selected = authority.list_expired_running(limit=1)
-        if lifecycle == 2:
-            assert selected == (), "legacy discovery selected V2"
-        else:
-            assert len(selected) == 1
-            assert selected[0].operation_id == record.operation_id
-    else:
-
-        def call_owner():
-            if owner == "get_start":
-                with engine.connect() as conn:
-                    return get_composer_operation_for_start_on_connection(conn, claim)
-            if owner == "start":
-                return repository.start_composer_async_operation(
-                    claim, owner_instance_id="test-owner", lease_seconds=30, auth_provider_type="local"
-                )
-            if owner == "unstarted":
-                return authority.settle_unstarted(
-                    None, session_id=sid, operation_id=record.operation_id, failure=failed(), authoritative_failure=True
-                )
-            return authority._settle_recovery(
-                session_id=sid,
-                operation_id=record.operation_id,
-                failure=failed(),
-                settled_by="settle_lost_inactive_session",
-                recovery_context=None,
-                authoritative_failure=True,
-            )
-
-        if lifecycle == 2:
-            with pytest.raises(ComposerOperationFenceLost):
-                call_owner()
-        else:
-            result = call_owner()
-            if owner == "start":
-                assert result.fence.session_id == str(sid)
-                assert authority.get(session_id=sid, operation_id=record.operation_id).status == "running"
-            else:
-                assert result.operation_id == record.operation_id
-                assert result.status == ("queued" if owner == "get_start" else "failed")
-    if lifecycle == 2:
-        assert _admission_rows(engine) == before
 
 
 @pytest.mark.parametrize("guard", ["action", "initializer"])
@@ -701,83 +593,6 @@ def test_registered_old_owner_omission_has_actual_postgres_eligibility_witness(o
     else:
         with pytest.raises(AssertionError, match="live registered old owner was incorrectly eligible"):
             test_expired_physical_lease_preserves_distributed_old_owner_liveness(operation_store)
-
-
-@pytest.mark.parametrize("lifecycle", [1, 2])
-@pytest.mark.parametrize("owner", ["claim_next", "get_start", "start", "expired_queued", "expired_running", "unstarted", "recovery"])
-def test_each_legacy_isolation_omission_retains_its_actual_independent_backstops(operation_store, monkeypatch, lifecycle, owner):
-    import inspect
-    from textwrap import dedent
-
-    from sqlalchemy.exc import IntegrityError
-
-    from elspeth.web.coordination import composer_operation_authority as module
-    from elspeth.web.coordination import repository as repository_module
-
-    originals = {
-        "claim_next": module.ComposerAsyncOperationAuthority.claim_next,
-        "get_start": module.get_composer_operation_for_start_on_connection,
-        "start": module.start_composer_operation_on_connection,
-        "expired_queued": module.ComposerAsyncOperationAuthority.list_expired_queued,
-        "expired_running": module.ComposerAsyncOperationAuthority.list_expired_running,
-        "unstarted": module.ComposerAsyncOperationAuthority.settle_unstarted,
-        "recovery": module.ComposerAsyncOperationAuthority._settle_recovery,
-    }
-    original = originals[owner]
-    source = dedent(inspect.getsource(original))
-    if owner == "claim_next":
-        edits = (
-            ("\n                jobs.c.lifecycle_version == 1,\n", "\n"),
-            (
-                '                .where(*_key(sid, candidate.operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "queued")\n',
-                '                .where(*_key(sid, candidate.operation_id), jobs.c.status == "queued")\n',
-            ),
-            ("\n                    jobs.c.lifecycle_version == 1,\n", "\n"),
-        )
-    elif owner == "get_start":
-        edits = (("        or row.lifecycle_version != 1\n        or claim.segment_sequence is not None\n", ""),)
-    elif owner == "start":
-        edits = (("            jobs.c.lifecycle_version == 1,\n", ""),)
-    elif owner in ("expired_queued", "expired_running"):
-        edits = (("                jobs.c.lifecycle_version == 1,\n", ""),)
-    else:
-        early_guard = (
-            "        if row is not None and row.lifecycle_version != 1:\n"
-            "            raise ComposerOperationFenceLost(session_id=session_id, operation_id=operation_id)\n"
-        )
-        if owner == "unstarted":
-            sql_guard = '        predicates = [*_key(session_id, operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "queued"]\n'
-            unguarded_sql = '        predicates = [*_key(session_id, operation_id), jobs.c.status == "queued"]\n'
-        else:
-            sql_guard = '            .where(*_key(session_id, operation_id), jobs.c.lifecycle_version == 1, jobs.c.status == "running")\n'
-            unguarded_sql = '            .where(*_key(session_id, operation_id), jobs.c.status == "running")\n'
-        edits = ((early_guard, ""), (sql_guard, unguarded_sql))
-    for fragment, replacement in edits:
-        assert source.count(fragment) == 1
-        source = source.replace(fragment, replacement)
-    namespace = vars(module).copy()
-    exec(compile("from __future__ import annotations\n" + source, "<one-complete-legacy-isolation-omission>", "exec"), namespace)
-    if owner == "get_start":
-        monkeypatch.setattr(module, "get_composer_operation_for_start_on_connection", namespace[original.__name__])
-        monkeypatch.setattr(repository_module, "get_composer_operation_for_start_on_connection", namespace[original.__name__])
-    elif owner == "start":
-        monkeypatch.setattr(module, "start_composer_operation_on_connection", namespace[original.__name__])
-        monkeypatch.setattr(repository_module, "start_composer_operation_on_connection", namespace[original.__name__])
-    else:
-        monkeypatch.setattr(module.ComposerAsyncOperationAuthority, original.__name__, namespace[original.__name__])
-    if lifecycle == 1 or owner in ("claim_next", "get_start", "start"):
-        # These omissions survive on valid V2 rows: NULL deadline, parent claim
-        # identity, and the earlier old-start guard remain authoritative.
-        test_each_legacy_owner_preserves_v1_and_refuses_actual_v2(operation_store, lifecycle, owner)
-    elif owner in ("expired_queued", "expired_running"):
-        with pytest.raises(AssertionError, match="legacy discovery selected V2"):
-            test_each_legacy_owner_preserves_v1_and_refuses_actual_v2(operation_store, lifecycle, owner)
-    else:
-        # Removing the complete application isolation does not bypass the
-        # existing SQL terminal bundle CHECK. This is a DDL backstop, not an
-        # application refusal or a claim that an unsafe settlement committed.
-        with pytest.raises(IntegrityError, match="ck_composer_operations_status_bundle"):
-            test_each_legacy_owner_preserves_v1_and_refuses_actual_v2(operation_store, lifecycle, owner)
 
 
 @pytest.mark.asyncio
