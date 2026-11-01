@@ -52,6 +52,16 @@ package version do not establish combined-release qualification or publication.
   is still 90 days. The flag still overrides `settings.yaml`, which overrides
   the default.
 
+- **Frozen records detach read-only proxy inputs.** `LLMResponse.raw_response`,
+  `ReplayedCall.response_data` and `error_data`, and `ValidationSuccess.data`
+  skipped the deep freeze when given a `MappingProxyType`. A proxy is a view
+  over the caller's dict, so the record stayed aliased to mutable data. These
+  inputs are now always deep-frozen.
+- **A session lease refuses a finish awaited from its own task.** Awaiting
+  `close`, a continuation handoff or an archive finish from inside a task the
+  lease owns used to deadlock forever with no deadline. It now raises
+  `AuditIntegrityError`. The polling EXECUTE close path is not covered.
+
 ### Composer
 
 - **Composer Continuation is retained durably and ships default-off.** A long
@@ -151,6 +161,27 @@ package version do not establish combined-release qualification or publication.
     record `PLUGIN_CRASH`. Later tool faults retain the admitted canonical
     evidence. See
     [MCP call outcome contracts](docs/reference/composer-tool-contracts-0.8.10.md#tc-020--local-mcp-call-outcomes-preserve-safe-evidence).
+- **A crash capture no longer replaces the verified session head.** After a
+  plugin crash or a runtime preflight failure, the route saves the captured
+  graph only if its content hash equals the durable head. Two paths are
+  affected. In one, the per-turn checkpoint transaction rolled back; in the
+  other, a preflight crash escaped before any checkpoint. Both used to make an
+  uncommitted, unverified graph the session head. When the capture differs from
+  the head, the route writes no state row and the verified head stays current.
+  The plugin-crash path now also records the rolled-back turn's tool calls, so
+  the unwind keeps its evidence.
+- **Continuation PRIMARY calls are no longer refused after a same-cut
+  re-read.** With Continuation enabled, a re-read of an unchanged cut replaced
+  the phase source but left the message producers bound to the previous read.
+  As a result, every PRIMARY call after initialization was refused before it
+  reached the provider. The producers now adopt a value-equal re-read and
+  refuse one that differs.
+- **Credential classification of repeated evidence is memoized.** Continuation
+  evidence reads under the session lock re-scanned the same immutable documents
+  many times. In one measured run, 164 s of 310 s of session-lock holds went to
+  this rescanning, and the lease expired. A string the scanner found clean is now
+  remembered by its exact length and SHA-256 digest. The memo is bounded and
+  thread-safe, and it records no findings.
 
 ### Security and signing
 
