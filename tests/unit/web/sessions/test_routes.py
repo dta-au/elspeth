@@ -5990,6 +5990,8 @@ class TestMessageRoutes:
     ) -> None:
         from elspeth.web.composer.advisor_audit import ADVISOR_CHECKPOINT_PASS_AUDIT_KIND
         from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+        from elspeth.web.composer.visible_tool_event import VISIBLE_TOOL_EVENT_KIND
+        from elspeth.web.composer.withheld_replies import COMPOSER_WITHHELD_REPLY_KIND
         from tests.helpers.advisor_review import parse_advisor_publication_review
         from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 
@@ -6077,11 +6079,19 @@ class TestMessageRoutes:
         composer = app.state.composer_service
         checkpoint = composer._advisor_checkpoint._run_advisor_checkpoint
         assert checkpoint.__func__ is AdvisorCheckpointOwner._run_advisor_checkpoint
+        # The compose loop's set_pipeline saves an invalid graph with its
+        # validation findings rather than refusing it. The first save is the
+        # empty->non-empty transition, so EARLY runs; the runtime preflight then
+        # owes one more planner turn before END.
         script = CommonSDK(
             request=request,
             candidate=candidate,
+            saved=1,
             steps=(
                 Step("primary", tool_name="set_pipeline", arguments={"pipeline": rejected_pipeline}),
+                Step("early"),
+                Step("primary", content=candidate),
+                Step("primary", content=candidate),
                 Step("primary", content=candidate),
                 Step("end"),
             ),
@@ -6102,29 +6112,33 @@ class TestMessageRoutes:
 
         assert sent.status_code == 200, sent.json()
         script.assert_done()
-        assert script.phases == ["end"]
-        assert len(provider_requests) == 3
-        assert_actual_audits(app.state.session_engine, provider_requests, ("success", "success", "success"), session_id=session_id)
-        end_messages = provider_requests[2]["messages"]
+        assert script.phases == ["early", "end"]
+        assert len(provider_requests) == 6
+        assert_actual_audits(app.state.session_engine, provider_requests, ("success",) * 6, session_id=session_id)
+        end_messages = provider_requests[5]["messages"]
         assert [message["role"] for message in end_messages] == ["system", "user"]
         review = parse_advisor_publication_review(end_messages[1]["content"])
         assert review["current_request"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
         assert review["candidate_reply"] == "I cannot safely complete that pipeline."
-        assert review["saved_effects"]["saved_revision_count"] == 0
-        assert review["saved_effects"]["net_changed"] is False
-        correction_context = json.dumps(provider_requests[1]["messages"])
+        assert review["saved_effects"]["saved_revision_count"] == 1
+        assert review["saved_effects"]["net_changed"] is True
+        correction_context = json.dumps(provider_requests[2]["messages"])
         assert all(canary in correction_context for canary in canaries.values())
         feedback_events = [
             message
-            for message in provider_requests[1]["messages"]
+            for message in provider_requests[2]["messages"]
             if message["role"] == "tool" and message["tool_call_id"] == "common-tool-1"
         ]
         assert len(feedback_events) == 1
         assert validator_message_canary in json.dumps(feedback_events[0])
 
         persisted_messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
+        # The saved authoring turn now persists the assistant's own tool-call
+        # row, whose entries are provider tool calls rather than audit envelopes.
         private_audit = [
-            message for message in persisted_messages if message.tool_calls and message.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
+            message
+            for message in persisted_messages
+            if message.tool_calls and "_kind" in message.tool_calls[0] and message.tool_calls[0]["_kind"] == DIAGNOSTIC_EVIDENCE_KIND
         ]
         private_evidence = [
             ComposerDiagnosticEvidence.from_envelope(message.tool_calls[0], expected_session_id=session_id) for message in private_audit
@@ -6136,9 +6150,10 @@ class TestMessageRoutes:
         assert authoring.wire_arguments.content is not None
         assert json.loads(authoring.wire_arguments.content) == {"pipeline": rejected_pipeline}
         assert authoring.result.content is not None
-        assert json.loads(authoring.result.content)["success"] is False
+        authoring_result = json.loads(authoring.result.content)
+        assert authoring_result["success"] is True and authoring_result["validation"]["is_valid"] is False
         private_requests = [evidence for evidence in private_evidence if evidence.status == "provider_request"]
-        assert len(private_requests) == 3
+        assert len(private_requests) == 6
         assert len({evidence.evidence_id for evidence in private_evidence}) == len(private_evidence)
         for evidence in private_requests:
             assert evidence.tool_name == "composer_provider_context"
@@ -6154,6 +6169,21 @@ class TestMessageRoutes:
         for canary_name in ("option", "path", "validator_message"):
             assert canaries[canary_name] in private_payload
         persisted_audit = [message for message in persisted_messages if message.role in {"audit", "tool"} and message not in private_audit]
+        # A saved tool turn also persists its visible-tool-event companion,
+        # which by design retains the received/effective argument strings
+        # (secret-redacted only) for later Advisor review — the authored
+        # option, path and route values, never the user's prompt. It is
+        # storage-only: neither GET surface below may expose it.
+        visible_events = [
+            deep_thaw(message.tool_calls[0])
+            for message in persisted_audit
+            if message.tool_calls and "_kind" in message.tool_calls[0] and message.tool_calls[0]["_kind"] == VISIBLE_TOOL_EVENT_KIND
+        ]
+        assert [event["tool_call_id"] for event in visible_events] == ["common-tool-1"]
+        visible_payload = json.dumps(visible_events)
+        for canary_name in ("option", "path", "validator_message"):
+            assert canaries[canary_name] in visible_payload
+        assert prompt_canary not in visible_payload
         included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true")
         assert included.status_code == 200, included.json()
         private_message_ids = {str(message.id) for message in private_audit}
@@ -6164,8 +6194,21 @@ class TestMessageRoutes:
         returned_audit = [message for message in included.json() if message["role"] in {"audit", "tool"}]
         audit_surfaces = {
             "GET with raw content": json.dumps([message for message in raw_included.json() if message["role"] in {"audit", "tool"}]),
+            # Every persisted audit/tool row, including the visible event row's
+            # own redacted display content; only that row's retained
+            # Advisor-review companion (checked above) is set aside.
             "persisted": json.dumps(
-                [{"content": message.content, "tool_calls": deep_thaw(message.tool_calls)} for message in persisted_audit],
+                [
+                    {
+                        "content": message.content,
+                        "tool_calls": [
+                            entry
+                            for entry in deep_thaw(message.tool_calls or [])
+                            if not ("_kind" in entry and entry["_kind"] == VISIBLE_TOOL_EVENT_KIND)
+                        ],
+                    }
+                    for message in persisted_audit
+                ],
                 sort_keys=True,
             ),
             "GET": json.dumps(returned_audit, sort_keys=True),
@@ -6176,26 +6219,39 @@ class TestMessageRoutes:
         physical = [envelope for envelope in envelopes if envelope["_kind"] == "llm_call_audit"]
         attempts = [envelope for envelope in envelopes if envelope["_kind"] == "planner_attempt_audit"]
         passes = [envelope for envelope in envelopes if envelope["_kind"] == ADVISOR_CHECKPOINT_PASS_AUDIT_KIND]
+        # PRIMARY (save), EARLY + its pass, two PRIMARY replies the runtime
+        # preflight superseded (each withheld), the final PRIMARY reply, END + pass.
         assert [envelope["_kind"] for envelope in envelopes] == [
             "prompt_guard_audit",
             "llm_call_audit",
+            "prompt_guard_audit",
+            "llm_call_audit",
+            ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
+            "prompt_guard_audit",
+            "llm_call_audit",
+            COMPOSER_WITHHELD_REPLY_KIND,
+            "prompt_guard_audit",
+            "llm_call_audit",
+            COMPOSER_WITHHELD_REPLY_KIND,
             "prompt_guard_audit",
             "llm_call_audit",
             "prompt_guard_audit",
             "llm_call_audit",
             ADVISOR_CHECKPOINT_PASS_AUDIT_KIND,
         ]
-        _assert_required_route_guard_checks(envelopes, guard_mount, roles=["composer", "composer", "advisor"])
+        _assert_required_route_guard_checks(
+            envelopes, guard_mount, roles=["composer", "advisor", "composer", "composer", "composer", "advisor"]
+        )
         assert guard_requests
         assert all(
             request["userPrompt"] == f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."
             for request in guard_requests
         )
-        assert len(physical) == 3 and attempts == [] and len(passes) == 1
+        assert len(physical) == 6 and attempts == [] and len(passes) == 2
         assert all(envelope["call"]["planner_call_ordinal"] is None for envelope in physical)
-        assert passes[0]["pass"]["phase"] == "end"
-        assert passes[0]["pass"]["publication_verdict"] == "ADMIT"
-        assert passes[0]["pass"]["provider_attempts"] == 1
+        assert [item["pass"]["phase"] for item in passes] == ["early", "end"]
+        assert passes[-1]["pass"]["publication_verdict"] == "ADMIT"
+        assert all(item["pass"]["provider_attempts"] == 1 for item in passes)
         assert {evidence.tool_call_id for evidence in private_requests} == {envelope["call"]["call_id"] for envelope in physical}
         for surface_name, surface_payload in audit_surfaces.items():
             for canary_name, canary in canaries.items():
