@@ -125,8 +125,15 @@ async def test_live_common_context_reads_complete_value_exactly(tmp_path, invoca
     scope = ComposerContentScope(UUID(session_id), composition_content_hash(state))
     service = _guarded_service(invocation, monkeypatch, composer_client=_azure_client(inspected), catalog=create_catalog_service())
 
+    # Shield inspections recorded before each completion. The client splits one
+    # request's guard input across calls at PROMPT_GUARD_MAX_TEXT_CHARACTERS /
+    # PROMPT_GUARD_MAX_DOCUMENTS_PER_CALL, so a request owns a slice of
+    # ``inspected``, not exactly one entry.
+    inspections_before: list[int] = []
+
     class ReadCompleteValueCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs):
+            inspections_before.append(len(inspected))
             if not self.requests:
                 view = json.loads(_state_wire(kwargs["messages"]).split("\n", 1)[1])["current_state"]
                 manifest = CompleteValueManifest.from_payload(view["content_manifest"])
@@ -149,7 +156,11 @@ async def test_live_common_context_reads_complete_value_exactly(tmp_path, invoca
         provider_owner=owner,
     )
     assert result.state is state
-    assert len(completion.requests) == len(inspected) == 2
+    assert len(completion.requests) == 2
+    # Every request was inspected before it was sent, and nothing after the last.
+    assert len(inspections_before) == 2 and 0 < inspections_before[0] < inspections_before[1] == len(inspected)
+    initial_inspections = inspected[: inspections_before[0]]
+    selected_inspections = inspected[inspections_before[0] : inspections_before[1]]
     first_wire = _state_wire(completion.requests[0]["messages"])
     view = json.loads(first_wire.split("\n", 1)[1])["current_state"]
     manifest = CompleteValueManifest.from_payload(view["content_manifest"])
@@ -184,8 +195,8 @@ async def test_live_common_context_reads_complete_value_exactly(tmp_path, invoca
         "utf8_bytes": reference.utf8_bytes,
         "value": payload["\ue000"]["text"],
     }
-    initial_projection = "\n".join(inspected[0]["documents"])
-    selected_projection = "\n".join(inspected[1]["documents"])
+    initial_projection = "\n".join(document for request in initial_inspections for document in request["documents"])
+    selected_projection = "\n".join(document for request in selected_inspections for document in request["documents"])
     assert payload["\ue000"]["text"] not in initial_projection
     assert payload["\ue000"]["text"] in selected_projection
     projection = "\n".join(document for request in inspected for document in request["documents"])
