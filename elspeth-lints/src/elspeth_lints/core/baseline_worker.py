@@ -188,6 +188,13 @@ def _confirm_child() -> int:
             [
                 "-p",
                 "no:dotenv",
+                # PYTEST_DISABLE_PLUGIN_AUTOLOAD leaves the ini keys owned by
+                # unloaded plugins (env_files, timeout*) unregistered, and the
+                # snapshot's strict_config would reject them before the one
+                # fixed node runs. The ordinary suite validates that ini with
+                # its plugins loaded; this child loads none.
+                "-o",
+                "strict_config=false",
                 "--runxfail",
                 "-o",
                 "addopts=",

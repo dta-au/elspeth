@@ -41,6 +41,12 @@ def _fixture(root: Path, *, drift: bool = False) -> None:
         (root / path).mkdir(parents=True, exist_ok=True)
         if not path.endswith("fixtures"):
             (root / path / "__init__.py").write_text("")
+    # The snapshot's own pytest ini shape: strict config plus keys owned by
+    # plugins the confirmation child does not load.
+    (root / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\nstrict_config = true\ntimeout = 600\n"
+        'timeout_method = "thread"\ntimeout_func_only = false\nenv_files = [".env"]\n'
+    )
     (root / rpc.BASELINE_PATH).write_text(json.dumps({"demo.rule": []} if drift else EXPECTED))
     source = """import json
 from pathlib import Path
