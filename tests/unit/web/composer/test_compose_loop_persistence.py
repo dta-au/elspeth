@@ -24,7 +24,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
 from elspeth.core.canonical import canonical_json
-from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer import turn_audit as turn_audit_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
@@ -3238,16 +3237,36 @@ async def test_step2_dispatches_one_persist_compose_turn_async_per_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [0, 2], ids=["completed-neighbor", "repeated-cancellation"])
 async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
     monkeypatch: pytest.MonkeyPatch,
+    cancel_count: int,
 ) -> None:
     """A cancelled awaiter must not split a sync side effect from P4 persist."""
 
+    from elspeth.web.composer import service as service_module
+
     service = composer_service_with_real_sessions
-    sessions_service = service._sessions_service  # type: ignore[attr-defined]
+    sessions_service = service._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
     _patch_auto_commit_preferences(monkeypatch, sessions_service)
+
+    cancellation_flags: list[asyncio.Event] = []
+    joined_cancellations: list[asyncio.CancelledError | None] = []
+    owned_tasks: list[asyncio.Future[Any]] = []
+    original_join = service_module._await_tool_turn_with_deferred_cancellation
+
+    async def _observe_join(awaitable: Any, *, cancellation_requested: asyncio.Event) -> Any:
+        cancellation_flags.append(cancellation_requested)
+        child = asyncio.ensure_future(awaitable)
+        owned_tasks.append(child)
+        result, cancellation = await original_join(child, cancellation_requested=cancellation_requested)
+        joined_cancellations.append(cancellation)
+        return result, cancellation
+
+    monkeypatch.setattr(service_module, "_await_tool_turn_with_deferred_cancellation", _observe_join)
 
     loop = asyncio.get_running_loop()
     worker_started = asyncio.Event()
@@ -3260,7 +3279,7 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
         worker_invocations += 1
         state = cast(Any, args[2])
         loop.call_soon_threadsafe(worker_started.set)
-        if not release_worker.wait(timeout=5.0):
+        if not release_worker.wait(timeout=30.0):
             raise TimeoutError("test worker was never released")
         worker_finished.set()
         return ToolResult(
@@ -3323,29 +3342,62 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
             )
         return _text_response("must not be reached after cancellation")
 
-    compose_task = asyncio.create_task(
-        _run_one_turn(
-            service,
-            llm=_llm,
-            session_id=result_session_id,
-        )
-    )
-    await asyncio.wait_for(worker_started.wait(), timeout=2.0)
-    compose_task.cancel()
-    await asyncio.sleep(0)
+    propagated_cancellations: list[asyncio.CancelledError] = []
 
+    async def _compose() -> Any:
+        try:
+            return await _run_one_turn(service, llm=_llm, session_id=result_session_id)
+        except asyncio.CancelledError as cancelled:
+            propagated_cancellations.append(cancelled)
+            raise
+
+    compose_task = asyncio.create_task(_compose())
+    markers = [object() for _ in range(cancel_count)]
+    premature_completion = False
     try:
-        assert not compose_task.done(), "cancellation escaped while the synchronous tool still owned an in-flight side effect"
+        await asyncio.wait_for(worker_started.wait(), timeout=15.0)
+        assert len(cancellation_flags) == 1
+        for marker in markers:
+            cancellation_flags[0].clear()
+            compose_task.cancel(marker)
+            flag_waiter = asyncio.create_task(cancellation_flags[0].wait())
+            try:
+                done, _ = await asyncio.wait((flag_waiter, compose_task), return_when=asyncio.FIRST_COMPLETED, timeout=15.0)
+                assert done, "neither the cancellation rendezvous nor the compose task completed"
+                premature_completion = compose_task in done
+            finally:
+                flag_waiter.cancel()
+                await asyncio.gather(flag_waiter, return_exceptions=True)
+            if premature_completion:
+                break
     finally:
         release_worker.set()
-        await run_sync_in_worker(worker_finished.wait, 5.0)
+        outcomes = await asyncio.wait_for(asyncio.gather(compose_task, *owned_tasks, return_exceptions=True), timeout=30.0)
 
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(compose_task, timeout=5.0)
+    assert not premature_completion, "cancellation escaped while the synchronous tool still owned an in-flight side effect"
+    assert worker_finished.is_set()
+    assert len(joined_cancellations) == 1
+    if cancel_count:
+        assert isinstance(outcomes[0], asyncio.CancelledError)
+        assert compose_task.cancelled()
+        cancellation = joined_cancellations[0]
+        assert isinstance(cancellation, asyncio.CancelledError)
+        assert propagated_cancellations == [cancellation]
+        assert propagated_cancellations[0] is cancellation
+        assert cancellation.args[0] is markers[0]
+        cause = cancellation.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert len(cause.exceptions) == 1
+        assert isinstance(cause.exceptions[0], asyncio.CancelledError)
+        assert cause.exceptions[0].args[0] is markers[1]
+    else:
+        assert not isinstance(outcomes[0], BaseException)
+        assert joined_cancellations == [None]
 
-    assert worker_invocations == 1, "deferred cancellation must not start another tool"
-    assert llm_calls == 1, "deferred cancellation must stop before another model turn"
-    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+    expected_calls = 1 if cancel_count else 2
+    assert worker_invocations == expected_calls, "deferred cancellation must not start another tool"
+    assert llm_calls == expected_calls, "deferred cancellation must stop before another model turn"
+    with sessions_service._engine.connect() as conn:
         persisted_rows = list(
             conn.execute(
                 select(
@@ -3360,8 +3412,8 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
             ).mappings()
         )
 
-    assert [row["role"] for row in persisted_rows] == ["assistant", "tool"]
-    assert len(persisted_rows[0]["tool_calls"]) == 1
+    assert [row["role"] for row in persisted_rows] == ["assistant", *["tool"] * expected_calls]
+    assert len(persisted_rows[0]["tool_calls"]) == expected_calls
     assert persisted_rows[0]["tool_calls"][0]["id"] == "call_cancel_during_worker"
     assert persisted_rows[1]["tool_call_id"] == "call_cancel_during_worker"
     assert json.loads(persisted_rows[1]["content"])["success"] is True
@@ -3658,19 +3710,24 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
     """Earlier committed invocations are not duplicated on unwind recovery."""
 
     from elspeth.web.composer import tool_batch
+    from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
 
-    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert isinstance(sessions_service, SessionServiceImpl)
     _patch_auto_commit_preferences(monkeypatch, sessions_service)
-    composer_service_with_real_sessions._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
+    composer_service_with_real_sessions._skill_markdown_history_upserted = True
 
     original_execute = tool_batch.execute_tool
     execute_calls = 0
+    original_crash = RuntimeError("second-turn plugin crash")
+    original_cause = ValueError("original plugin cause")
+    original_crash.__cause__ = original_cause
 
     def _execute(tool_name: str, *args: Any, **kwargs: Any) -> Any:
         nonlocal execute_calls
         execute_calls += 1
         if execute_calls == 2:
-            raise RuntimeError("second-turn plugin crash")
+            raise original_crash
         return original_execute(tool_name, *args, **kwargs)
 
     monkeypatch.setattr(tool_batch, "execute_tool", _execute)
@@ -3682,7 +3739,7 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
         nonlocal persist_calls
         persist_calls += 1
         if persist_calls == 2:
-            inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
+            inject_commit_OperationalError(sessions_service._engine)
         return await original_persist(**kwargs)
 
     monkeypatch.setattr(sessions_service, "persist_compose_turn_async", _fail_second_persist)
@@ -3705,16 +3762,21 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
     ) -> Any:
         return responses.pop(0)
 
+    compose_context = seed_live_compose_context(sessions_service._engine, result_session_id)
     with pytest.raises(ComposerPluginCrashError) as excinfo:
         await _run_one_turn(
             composer_service_with_real_sessions,
             llm=_llm,
             session_id=result_session_id,
+            session_operation_context=compose_context,
         )
 
+    assert execute_calls == 2
     assert persist_calls == 2
+    assert excinfo.value.original_exc is original_crash
+    assert original_crash.__cause__ is original_cause
     assert [invocation.tool_call_id for invocation in excinfo.value.tool_invocations] == ["call_unpersisted_crash"]
-    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+    with sessions_service._engine.connect() as conn:
         rows = conn.execute(
             text(
                 "SELECT role, tool_call_id FROM chat_messages WHERE session_id = :session_id AND role IN ('assistant', 'tool') ORDER BY sequence_no"
@@ -3722,3 +3784,32 @@ async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
             {"session_id": result_session_id},
         ).fetchall()
     assert rows == [("assistant", None), ("tool", "call_committed")]
+
+    # The recovery owner drains exactly the carried suffix through real SQL.
+    with sessions_service._engine.connect() as conn:
+        committed = conn.execute(
+            select(chat_messages_table)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .order_by(chat_messages_table.c.sequence_no)
+        ).all()
+    await _persist_turn_audit_cohort(
+        sessions_service,
+        UUID(result_session_id),
+        excinfo.value.tool_invocations,
+        excinfo.value.llm_calls,
+        tool_composition_state_id=None,
+        llm_composition_state_id=None,
+        plugin_crash_pending=True,
+        session_operation_context=compose_context,
+    )
+    with sessions_service._engine.connect() as conn:
+        recovered = conn.execute(
+            select(chat_messages_table)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .order_by(chat_messages_table.c.sequence_no)
+        ).all()
+    assert recovered[: len(committed)] == committed
+    tool_audits = [row for row in recovered if row.role == "audit" and row.tool_calls is not None and row.tool_calls[0]["_kind"] == "audit"]
+    expected_content, expected_envelope = redacted_tool_invocation_content_and_envelope(excinfo.value.tool_invocations[0])
+    assert [(row.content, row.tool_calls) for row in tool_audits] == [(expected_content, [expected_envelope])]
+    assert [(row.role, row.tool_call_id) for row in recovered if row.role in ("assistant", "tool")] == rows

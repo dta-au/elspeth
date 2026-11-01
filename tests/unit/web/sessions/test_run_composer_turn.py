@@ -2211,8 +2211,9 @@ async def test_recompose_turn_refuses_a_transcript_that_moved_under_its_own_leas
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [0, 2], ids=["completed-neighbor", "repeated-cancellation"])
 async def test_marker_delivered_while_the_settlement_child_runs_is_deferred_and_completed_wins(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int
 ) -> None:
     """Owned-child custody (`_join_freeform_owned_task`): the marker is deferred past the composite, then re-raised.
 
@@ -2220,35 +2221,102 @@ async def test_marker_delivered_while_the_settlement_child_runs_is_deferred_and_
     after provider return still settles). N12 reads ``durable_completed`` and
     writes no terminal after a completed one.
     """
+    from tests.unit.web.sessions.test_composer_async_worker import _worker
+
     app, service = _make_app(tmp_path)
-    app.state.composer_service = _make_composer_mock("Settled despite the marker.")
+    composer = _make_composer_mock("Settled despite the marker.")
+    llm_call = _llm_call()
+    composer.compose.return_value = ComposerResult(message="Settled despite the marker.", state=_EMPTY_STATE, llm_calls=(llm_call,))
+    app.state.composer_service = composer
     session = await service.create_session("alice", "Deferred", "local")
     composite_entered = asyncio.Event()
     release = asyncio.Event()
     real_complete = service.complete_composer_async_operation
+    real_fail = service.fail_composer_async_operation
+    complete_receipts: list[ComposerOperationRecord] = []
+    failed_terminal_attempts: list[ComposerOperationRunning] = []
+    cancellation_seen: asyncio.Queue[asyncio.CancelledError] = asyncio.Queue()
+    original_join = composer_turn._join_freeform_owned_task
+
+    class _ObservedCancellations(list[asyncio.CancelledError]):
+        def __init__(self, originals: list[asyncio.CancelledError]) -> None:
+            super().__init__(originals)
+            self.originals = originals
+
+        def append(self, cancelled: asyncio.CancelledError) -> None:
+            super().append(cancelled)
+            self.originals.append(cancelled)
+            cancellation_seen.put_nowait(cancelled)
+
+    async def _observe_join(task: asyncio.Task[Any], *, cancellation_observations: list[asyncio.CancelledError] | None = None) -> Any:
+        observations = _ObservedCancellations(cancellation_observations) if cancellation_observations is not None else None
+        return await original_join(task, cancellation_observations=observations)
 
     async def _gated_complete(*args: Any, **kwargs: Any) -> ComposerOperationRecord:
         composite_entered.set()
         await release.wait()
-        return await real_complete(*args, **kwargs)
+        receipt = await real_complete(*args, **kwargs)
+        complete_receipts.append(receipt)
+        return receipt
+
+    async def _observe_fail(running: ComposerOperationRunning, **kwargs: Any) -> ComposerOperationRecord:
+        failed_terminal_attempts.append(running)
+        return await real_fail(running, **kwargs)
 
     monkeypatch.setattr(service, "complete_composer_async_operation", _gated_complete)
+    monkeypatch.setattr(service, "fail_composer_async_operation", _observe_fail)
+    monkeypatch.setattr(composer_turn, "_join_freeform_owned_task", _observe_join)
     async with _running_job(app, service, session.id, kind="compose_message", content="Go.") as job:
-        task = asyncio.create_task(_run(app, job))
-        await asyncio.wait_for(composite_entered.wait(), timeout=5.0)
-        task.cancel(composer_turn._COMPOSER_OPERATION_SHUTDOWN)
-        await asyncio.sleep(0.05)
-        assert not task.done()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        propagated: list[asyncio.CancelledError] = []
+
+        async def _run_and_observe() -> ComposerOperationRecord:
+            try:
+                return await _run(app, job)
+            except asyncio.CancelledError as cancelled:
+                propagated.append(cancelled)
+                raise
+
+        task = asyncio.create_task(_run_and_observe())
+        originals: list[asyncio.CancelledError] = []
+        try:
+            await asyncio.wait_for(composite_entered.wait(), timeout=15.0)
+            for _ in range(cancel_count):
+                task.cancel(composer_turn._COMPOSER_OPERATION_SHUTDOWN)
+                originals.append(await asyncio.wait_for(cancellation_seen.get(), timeout=15.0))
+                assert not task.done()
+        finally:
+            release.set()
+            outcomes = await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=30.0)
+        assert len(complete_receipts) == 1
+        if cancel_count:
+            assert isinstance(outcomes[0], asyncio.CancelledError)
+            assert propagated[0] is originals[0]
+            assert len(originals) == cancel_count
+        else:
+            assert outcomes[0] is complete_receipts[0]
+            assert propagated == []
         assert job.lifecycle.durable_completed is True
         assert job.observation.audit_cohort_durable is True
         record = await _row(job)
+        assert record == complete_receipts[0]
+
+        services = composer_app_services(app)
+        await composer_turn.persist_cancelled_turn_audit(services, job.running, job.observation)
+        await composer_turn.persist_cancelled_turn_audit(services, job.running, job.observation)
+        worker = _worker(app, job.authority)
+        for failure in originals or [RuntimeError("independent late failure")]:
+            retained = await worker._settle_failure(services, job.running, failure)
+            assert retained == record
+        assert failed_terminal_attempts == []
+        assert await _row(job) == record
 
     assert record.status == "completed"
     assert record.settled_by == "owner_terminal"
     assert _user_and_assistant_roles(await service.get_messages(session.id, limit=None)) == ["user", "assistant"]
+    rows = _llm_call_audit_rows(await service.get_messages(session.id, limit=None))
+    assert len(rows) == 1
+    assert rows[0][1]["call"]["call_id"] == llm_call.call_id
+    composer.compose.assert_awaited_once()
 
 
 @pytest.mark.parametrize("kind", ["compose_message", "compose_recompose"])

@@ -29,7 +29,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from elspeth.contracts.composer_audit import ComposerToolInvocation
+from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.catalog.protocol import CatalogService
@@ -1917,7 +1917,8 @@ async def test_advisor_cancelled_error_carries_buffered_llm_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_provider_outage() -> None:
+@pytest.mark.parametrize("failure_kind", ["first_party", "cost", "guard", "provider"])
+async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_provider_outage(failure_kind: str) -> None:
     """A defect raised inside the advisor call keeps unwinding.
 
     The interception's handler is scoped to ``advisor_provider_failure_types``
@@ -1927,11 +1928,28 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
     LLM the provider was unavailable, record ``finish_success`` over a Tier-1
     corruption signal, and let the turn continue on a broken audit trail.
     """
+    from litellm.exceptions import APIError
+    from sqlalchemy import select
+
     from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.contracts.prompt_guard import PromptGuardDecision
+    from elspeth.web.composer.prompt_guard import PromptGuardRefused
+    from elspeth.web.composer.provider_cost import CommonProviderCostRefused
+    from elspeth.web.sessions.models import quota_provider_attempts_table
 
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
-    original = AuditIntegrityError("recorder could not seal the advisor call")
+    cause = ValueError("original advisor cause")
+    original = (
+        AuditIntegrityError("recorder could not seal the advisor call")
+        if failure_kind == "first_party"
+        else CommonProviderCostRefused("PROVIDER_CALLS_EXHAUSTED")
+        if failure_kind == "cost"
+        else PromptGuardRefused(decision=PromptGuardDecision("blocked", "policy_blocked"), audit_id=str(uuid4()))
+        if failure_kind == "guard"
+        else APIError(status_code=500, message="upstream server error", llm_provider="anthropic", model="claude-sonnet-4-6")
+    )
+    original.__cause__ = cause
 
     script = ComposerSDKScript(
         primary_model=service._provider_gateway._model,
@@ -1939,22 +1957,86 @@ async def test_first_party_failure_in_the_advisor_path_is_not_reported_as_a_prov
             _make_raw_advisor_tool_call("call_first_party_bug"),
             _make_raw_text_only_response("would incorrectly continue"),
         ],
+        advisor_model=service._settings.composer_advisor_model,
+        advisor=[original] if failure_kind == "provider" else [],
     )
     with (
         patch("litellm.acompletion", new=script),
-        patch.object(service._advisor_checkpoint, "_call_advisor_with_audit", new_callable=AsyncMock) as mock_advisor,
+        patch.object(
+            service._advisor_checkpoint,
+            "_call_advisor_with_audit",
+            new_callable=AsyncMock,
+            wraps=service._advisor_checkpoint._call_advisor_with_audit,
+        ) as mock_advisor,
         patch.object(service, "_persist_turn_audit", wraps=service._persist_turn_audit) as mock_persist,
-        pytest.raises(AuditIntegrityError, match="recorder could not seal") as exc_info,
     ):
-        mock_advisor.side_effect = original
-        await service.compose("help me", [], _empty_state(), session_id=session_id)
+        if failure_kind == "provider":
+            result = await service.compose("help me", [], _empty_state(), session_id=session_id)
+        else:
+            mock_advisor.side_effect = original
+            with pytest.raises(type(original)) as exc_info:
+                await service.compose("help me", [], _empty_state(), session_id=session_id)
 
-    assert exc_info.value is original
+    mock_advisor.assert_awaited_once()
     assert mock_persist.await_count == 1
+    assert original.__cause__ is cause
+    assert script.primary.await_count == (2 if failure_kind == "provider" else 1)
+    assert script.advisor.await_count == (1 if failure_kind == "provider" else 0)
     persist_kwargs = mock_persist.await_args.kwargs
-    assert persist_kwargs["crash_pending"] is True
+    assert persist_kwargs["crash_pending"] is (failure_kind != "provider")
+    assert len(persist_kwargs["tool_outcomes"]) == 1
     failed_outcome = persist_kwargs["tool_outcomes"][-1]
     assert failed_outcome.call.function.name == "request_advisor_hint"
-    assert failed_outcome.error_class == "AuditIntegrityError"
-    persisted_failure = json.loads(_persisted_tool_responses(service, session_id)[-1]["result_canonical"])
-    assert persisted_failure["_redaction_status"] == "plugin_crash"
+    assert len(persist_kwargs["private_invocations"]) == 1
+    assert persist_kwargs["private_invocations"][0].status is (
+        ComposerToolStatus.PLUGIN_CRASH if failure_kind == "first_party" else ComposerToolStatus.SUCCESS
+    )
+    with service._require_sessions_service()._engine.connect() as connection:
+        attempts = connection.execute(
+            select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.session_id == session_id)
+        ).all()
+    assert len(attempts) == script.primary.await_count + script.advisor.await_count
+    assert all(attempt.settled_at is not None and attempt.ledger_entry_id is not None for attempt in attempts)
+    persisted = _persisted_tool_responses(service, session_id)
+    assert len(persisted) == 1
+    assert persisted[0]["tool_call_id"] == "call_first_party_bug"
+    persisted_failure = json.loads(persisted[0]["result_canonical"])
+    if failure_kind == "first_party":
+        assert exc_info.value is original
+        assert failed_outcome.error_class == "AuditIntegrityError"
+        assert persisted_failure["_redaction_status"] == "plugin_crash"
+    elif isinstance(original, CommonProviderCostRefused):
+        assert exc_info.value is original
+        assert failed_outcome.error_class is None
+        assert persisted_failure == {
+            "success": False,
+            "status": "PROVIDER_POLICY_REFUSED",
+            "code": original.code,
+            "outbound_call_made": False,
+        }
+    elif isinstance(original, PromptGuardRefused):
+        assert isinstance(exc_info.value, PromptGuardRefused)
+        assert exc_info.value.__cause__ is original
+        assert exc_info.value.audit_id == original.audit_id
+        assert failed_outcome.error_class is None
+        assert failed_outcome.response == {"success": False, "outbound_call_made": False, **original.to_payload()}
+        # request_advisor_hint's redaction policy lists error_type and detail
+        # as known response-text keys, so they persist as redacted text; any
+        # other refusal key stays collapsed into the unknown-key sentinel.
+        assert persisted_failure == {
+            "success": False,
+            "outbound_call_made": False,
+            "error_type": "<redacted-response-text>",
+            "detail": "<redacted-response-text>",
+            "_unknown_response": "<redacted-unknown-response-key>",
+        }
+        assert exc_info.value.tool_invocations == ()
+    else:
+        # A recognized provider failure remains recoverable feedback and the
+        # planner may perform the independently correct next model turn.
+        assert failed_outcome.error_class is None
+        assert persisted_failure["status"] == "ADVISOR_ERROR"
+        assert failed_outcome.response["error_class"] == "APIError"
+        assert persisted_failure["error_class"] == "<redacted-response-text>"
+        assert len(result.tool_invocations) == 1
+        assert result.state == _empty_state()
