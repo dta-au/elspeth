@@ -3,20 +3,6 @@
  "description": "Reviewed allowlist for the Common supported-boundary whole-tree closure layer. Each entry is matched by (category, path, symbol) with an exact row count; a changed count surfaces every row of that key, and a dropped count is reported stale.",
  "entries": [
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/composer_mcp/server.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/composer_mcp/server.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "retained supplier callable recovered",
    "path": "src/elspeth/config_loading.py",
    "symbol": null,
@@ -213,13 +199,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/infrastructure/base.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/plugins/infrastructure/clients/deadline.py",
    "symbol": null,
@@ -255,31 +234,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/sources/aws_s3_source.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "canonical supplier lazy alias escaped",
    "path": "src/elspeth/plugins/sources/csv_source.py",
    "symbol": null,
    "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/sources/csv_source.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/sources/llm/source.py",
-   "symbol": null,
-   "count": 2,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -290,80 +248,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/sources/power_automate.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/aws/bedrock_content_safety.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/aws/bedrock_prompt_shield.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/aws/textract_document_analysis.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/azure/ai_search.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/azure/content_safety.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/azure/document_intelligence.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/azure/prompt_shield.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/plugins/transforms/field_mapper.py",
    "symbol": null,
    "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/plugins/transforms/llm/transform.py",
-   "symbol": null,
-   "count": 2,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -416,32 +304,11 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/app.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/web/application_finalizers.py",
    "symbol": null,
    "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/audit_readiness/service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/audit_readiness/service.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "unknown protected attribute receiver",
@@ -458,13 +325,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier stored in class namespace",
-   "path": "src/elspeth/web/catalog/schemas.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "retained enum callable capture is unclosed",
    "path": "src/elspeth/web/catalog/service.py",
    "symbol": null,
@@ -472,73 +332,10 @@
    "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/catalog/service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/catalog/service.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/_attachment_response.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/_attachment_response.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/advisor_abandonment.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/advisor_abandonment.py",
-   "symbol": null,
-   "count": 13,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier callable recovered",
-   "path": "src/elspeth/web/composer/advisor_abandonment.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/advisor_checkpoint.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/advisor_checkpoint.py",
-   "symbol": null,
-   "count": 22,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "retained supplier callable recovered",
    "path": "src/elspeth/web/composer/advisor_checkpoint.py",
    "symbol": null,
-   "count": 2,
+   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -549,59 +346,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/advisor_checkpoint.py",
-   "symbol": null,
-   "count": 7,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 4,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 67,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier augmentation is unclosed",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "retained supplier callable recovered",
    "path": "src/elspeth/web/composer/advisor_context.py",
    "symbol": null,
-   "count": 7,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier iteration binding is unclosed",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored as unclosed carrier key",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/advisor_context.py",
-   "symbol": null,
-   "count": 12,
+   "count": 6,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -612,80 +360,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/advisor_transcript.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/advisor_transcript.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/advisor_transcript.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/web/composer/advisor_transcript.py",
    "symbol": null,
    "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/anti_anchor.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/audit.py",
-   "symbol": null,
-   "count": 4,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/audit.py",
-   "symbol": null,
-   "count": 5,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/audit_storage.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/audit_storage.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/audit_storage.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/audit_storage.py",
-   "symbol": null,
-   "count": 4,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -707,55 +385,6 @@
    "path": "src/elspeth/web/composer/continuation_application_graph.py",
    "symbol": null,
    "count": 6,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_attachment_application.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_attachment_finisher.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_batch_data.py",
-   "symbol": null,
-   "count": 10,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/continuation_batch_data.py",
-   "symbol": null,
-   "count": 6,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_batch_data.py",
-   "symbol": null,
-   "count": 7,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier callable recovered",
-   "path": "src/elspeth/web/composer/continuation_batch_data.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/continuation_batch_data.py",
-   "symbol": null,
-   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -836,34 +465,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_evidence_application_data.py",
-   "symbol": null,
-   "count": 8,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_evidence_graph.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_evidence_graph.py",
-   "symbol": null,
-   "count": 4,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/continuation_evidence_graph.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/web/composer/continuation_evidence_graph.py",
    "symbol": null,
@@ -910,41 +511,6 @@
    "path": "src/elspeth/web/composer/continuation_live_phases.py",
    "symbol": null,
    "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/continuation_message_builders.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_message_family_builders.py",
-   "symbol": null,
-   "count": 4,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/continuation_message_family_builders.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_message_family_builders.py",
-   "symbol": null,
-   "count": 5,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/continuation_message_family_builders.py",
-   "symbol": null,
-   "count": 2,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -1011,13 +577,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_policy_settings.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "canonical supplier first-class role is unproved",
    "path": "src/elspeth/web/composer/continuation_prepared_p4.py",
    "symbol": "elspeth.web.sessions._persist_payload.RejectionRecord",
@@ -1028,15 +587,8 @@
    "category": "guarded constructed instance transferred to unreviewed caller",
    "path": "src/elspeth/web/composer/continuation_prompt_producers.py",
    "symbol": null,
-   "count": 4,
+   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_prompt_producers.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "retained supplier metadata escaped",
@@ -1110,13 +662,6 @@
   },
   {
    "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_title_input.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
    "path": "src/elspeth/web/composer/continuation_title_provider.py",
    "symbol": null,
    "count": 2,
@@ -1133,29 +678,8 @@
    "category": "guarded constructed instance transferred to unreviewed caller",
    "path": "src/elspeth/web/composer/continuation_title_values.py",
    "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_tool_argument_messages.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/continuation_tool_argument_messages.py",
-   "symbol": null,
    "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/continuation_tool_failure.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "batch callback consumer unproved supplier role",
@@ -1169,13 +693,6 @@
    "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
    "symbol": "elspeth.web.composer.continuation_tool_batch._dump_owned",
    "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/continuation_tool_receipts.py",
-   "symbol": null,
-   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -1193,87 +710,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/discovery_cache.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/inventory_response_contracts.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/inventory_response_contracts.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/llm_response_parsing.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/llm_response_parsing.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/no_tool_finalize.py",
-   "symbol": null,
-   "count": 4,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/no_tool_finalize.py",
-   "symbol": null,
-   "count": 13,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/pipeline_commit.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/pipeline_commit.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "guarded constructed instance transferred to unreviewed caller",
    "path": "src/elspeth/web/composer/pipeline_proposal.py",
    "symbol": null,
    "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/planner_authoring_aids.py",
-   "symbol": null,
-   "count": 17,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/planner_authoring_aids.py",
-   "symbol": null,
-   "count": 6,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -1291,20 +731,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/prompt_guard_rendering.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/prompts.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "retained supplier metadata escaped",
    "path": "src/elspeth/web/composer/prompts.py",
    "symbol": null,
@@ -1319,36 +745,8 @@
    "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/protocol.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/protocol.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier callable recovered",
-   "path": "src/elspeth/web/composer/protocol.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "typing supplier namespace transfer is unclosed",
    "path": "src/elspeth/web/composer/protocol.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/provider_audit_source.py",
    "symbol": null,
    "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
@@ -1358,27 +756,6 @@
    "path": "src/elspeth/web/composer/provider_cost.py",
    "symbol": null,
    "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/provider_thinking.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/provider_thinking.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/provider_thinking.py",
-   "symbol": null,
-   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -1438,76 +815,6 @@
    "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 16,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier augmentation is unclosed",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier iteration binding is unclosed",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored as unclosed carrier key",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/required_controls.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
-   "path": "src/elspeth/web/composer/service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/session_tool.py",
-   "symbol": null,
-   "count": 6,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "canonical supplier first-class role is unproved",
    "path": "src/elspeth/web/composer/state.py",
    "symbol": "elspeth.plugins.infrastructure.manager.PluginNotFoundError",
@@ -1536,28 +843,7 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/strict_transport.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/tool_batch.py",
-   "symbol": null,
-   "count": 5,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tool_batch.py",
-   "symbol": null,
-   "count": 34,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier stored in unclosed carrier",
    "path": "src/elspeth/web/composer/tool_batch.py",
    "symbol": null,
    "count": 1,
@@ -1578,67 +864,11 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/_common.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/tools/_dispatch.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/tools/_generation_schema_response.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/tools/_generation_schema_response.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/_generation_schema_response.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "selected owner capability passed to unreviewed caller",
    "path": "src/elspeth/web/composer/tools/_generation_schema_response.py",
    "symbol": null,
    "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/blobs.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/outputs.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/secrets.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "canonical supplier first-class role is unproved",
@@ -1648,81 +878,11 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/sessions.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/sources.py",
-   "symbol": null,
-   "count": 5,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/transforms.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/tools/wire_projection.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tools/wire_projection.py",
-   "symbol": null,
-   "count": 34,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier callable recovered",
-   "path": "src/elspeth/web/composer/tools/wire_projection.py",
-   "symbol": null,
-   "count": 7,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier iteration binding is unclosed",
-   "path": "src/elspeth/web/composer/tools/wire_projection.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "retained supplier mutated through unclosed receiver",
    "path": "src/elspeth/web/composer/tools/wire_projection.py",
    "symbol": null,
    "count": 2,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/turn_audit.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/turn_audit.py",
-   "symbol": null,
-   "count": 6,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/turn_effects.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "unknown protected attribute receiver",
@@ -1739,27 +899,6 @@
    "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/composer/tutorial_service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/composer/tutorial_service.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/composer/visible_tool_event.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "retained supplier metadata transferred",
    "path": "src/elspeth/web/composer/yaml_importer.py",
    "symbol": null,
@@ -1774,13 +913,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/config.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "retained supplier class-check recipient is unclosed",
    "path": "src/elspeth/web/config.py",
    "symbol": null,
@@ -1788,21 +920,7 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained supplier lambda metadata capture is unclosed",
-   "path": "src/elspeth/web/config.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "retained supplier metadata transferred",
-   "path": "src/elspeth/web/config.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained supplier stored in class namespace",
    "path": "src/elspeth/web/config.py",
    "symbol": null,
    "count": 1,
@@ -1823,52 +941,10 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/coordination/repository.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/web/coordination/repository.py",
    "symbol": null,
    "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/doctor.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/doctor.py",
-   "symbol": null,
-   "count": 3,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/execution/_validation_materialization.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/execution/_validation_materialization.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained supplier callable recovered",
-   "path": "src/elspeth/web/execution/_validation_materialization.py",
-   "symbol": null,
-   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -1879,46 +955,11 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/execution/service.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "unknown protected attribute receiver",
    "path": "src/elspeth/web/execution_lease_cleanup.py",
    "symbol": null,
    "count": 2,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/interpretation_state.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/interpretation_state.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/plugin_policy/availability.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/plugin_policy/coverage.py",
-   "symbol": null,
-   "count": 9,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
   },
   {
    "category": "canonical supplier first-class role is unproved",
@@ -1935,20 +976,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "retained enum producer return is unclosed",
-   "path": "src/elspeth/web/sessions/_auto_title.py",
-   "symbol": null,
-   "count": 1,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/sessions/_auto_title.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
    "category": "retained supplier mutated through unclosed receiver",
    "path": "src/elspeth/web/sessions/_auto_title.py",
    "symbol": null,
@@ -1960,13 +987,6 @@
    "path": "src/elspeth/web/sessions/_auto_title.py",
    "symbol": null,
    "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/sessions/composer_async_worker.py",
-   "symbol": null,
-   "count": 3,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
@@ -2082,13 +1102,6 @@
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {
-   "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/sessions/continuation_driver.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "D1: ComposerOperationError is made frozen at its producer (0.8.10-STATUS, defects); the transfer itself is ordinary."
-  },
-  {
    "category": "selected constructed instance stored outside local binding",
    "path": "src/elspeth/web/sessions/continuation_driver.py",
    "symbol": null,
@@ -2118,30 +1131,9 @@
   },
   {
    "category": "guarded constructed instance transferred to unreviewed caller",
-   "path": "src/elspeth/web/sessions/continuation_p4_application_store.py",
-   "symbol": null,
-   "count": 2,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "guarded constructed instance transferred to unreviewed caller",
    "path": "src/elspeth/web/sessions/continuation_title_provider.py",
    "symbol": null,
-   "count": 6,
-   "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
-  },
-  {
-   "category": "retained enum value passed to unclosed caller",
-   "path": "src/elspeth/web/sessions/proposal_authority.py",
-   "symbol": null,
-   "count": 7,
-   "reason": "Retained enum value or record holding one: immutable at the language level (maintainer ruling 2026-11-01, 0.8.10-STATUS decision 3)."
-  },
-  {
-   "category": "typing supplier namespace transfer is unclosed",
-   "path": "src/elspeth/web/sessions/protocol.py",
-   "symbol": null,
-   "count": 11,
+   "count": 1,
    "reason": "Reviewed 2026-11-01: ordinary code, no product defect (lane closure-classify supplier/capability reports); analysis-closure limit allowlisted per maintainer ruling 'fix what we can, allowlist the rest'."
   },
   {

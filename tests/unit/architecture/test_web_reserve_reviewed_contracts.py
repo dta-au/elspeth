@@ -3459,7 +3459,6 @@ def test_lazy_type_syntax_cannot_retain_an_imported_json_callable():
         "PluginCapability.LLM.__class__.__new__ = replacement\n",
         "cls = type(PluginCapability.LLM)\ncls.__new__ = replacement\n",
         "opaque_callback(type(PluginCapability.LLM))\n",
-        "opaque_callback(PluginCapability.LLM)\n",
         "vars(PluginCapability.LLM)['_value_'] = 'changed'\n",
         "members = tuple(PluginCapability)\nmembers[0]._value_ = 'changed'\n",
     ],
@@ -3479,6 +3478,33 @@ def test_retained_canonical_enum_members_preserve_mutation_and_recovery_denials(
         ("retained supplier " in failure or "retained enum " in failure or "selected origin " in failure) and path in failure
         for failure in changed["global_failures"]
     ), changed["global_failures"]
+
+
+@pytest.mark.landscape_fencing_regression
+@pytest.mark.parametrize(
+    "effect",
+    [
+        "opaque_callback(PluginCapability.LLM)\n",
+        "opaque_callback((PluginCapability.LLM,))\n",
+        "def produce():\n    return PluginCapability.LLM\n",
+    ],
+)
+def test_retained_canonical_enum_member_transfer_is_admitted_at_the_language_level(effect):
+    """Passing or returning an enum member needs no consumer closure.
+
+    Enum members count as immutable at the language level (maintainer ruling
+    2026-11-01, 0.8.10-STATUS decision 3); only a deliberate private write can
+    change one, and the mutation denials above still refuse every such write.
+    """
+    units = fencing._production_units()
+    path = "src/elspeth/retained_enum_member_probe.py"
+    source = (
+        "from elspeth.contracts.plugin_capabilities import PluginCapability\n"
+        "def read():\n    member = PluginCapability.LLM\n    return member.name, member.value\n"
+    )
+    changed = fencing._reserve_run((*units, fencing._parse_source(path, source + effect)))
+    assert changed["global_failures"] == []
+    assert changed["unproven_web_rows"] == []
 
 
 @pytest.mark.landscape_fencing_regression

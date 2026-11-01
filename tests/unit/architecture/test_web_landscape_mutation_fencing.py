@@ -5908,6 +5908,47 @@ _reserve_CANCEL_CONSUMERS = {
 _reserve_CANCEL_TOKEN_OWNER_PATH = "src/elspeth/web/sessions/composer_operations.py"
 
 
+def _reserve_language_immutable_class(modules, qualified):
+    """True for an owned ``@dataclass(frozen=True)`` or ``ConfigDict(frozen=True)`` pydantic class.
+
+    Immutability is judged at the language level (maintainer ruling
+    2026-11-01, 0.8.10-STATUS decision 3): an instance of such a class refuses
+    every plain attribute write at the slip site, so transferring it to an
+    unreviewed callee needs no consumer closure. A frozen configuration
+    inherited from a base class is not followed; the class stays guarded.
+    """
+    owner_module, _, name = qualified.rpartition(".")
+    source = modules.get(owner_module)
+    cls = _reserve_node_at(source, name) if source is not None else None
+    if not isinstance(cls, ast.ClassDef):
+        return False
+
+    def frozen_keyword(call):
+        return any(
+            keyword.arg == "frozen" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True for keyword in call.keywords
+        )
+
+    for decorator in cls.decorator_list:
+        if (
+            isinstance(decorator, ast.Call)
+            and ast.unparse(decorator.func) in {"dataclass", "dataclasses.dataclass"}
+            and frozen_keyword(decorator)
+        ):
+            return True
+    for statement in cls.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == "model_config"
+            and isinstance(statement.value, ast.Call)
+            and ast.unparse(statement.value.func) in {"ConfigDict", "pydantic.ConfigDict"}
+            and frozen_keyword(statement.value)
+        ):
+            return True
+    return False
+
+
 def _reserve_cancel_tokens_are_immutable(unit):
     """True only while ComposerOperationCancel keeps its reviewed frozen shape.
 
@@ -7833,7 +7874,7 @@ def _reserve_typing_annotation_source_facts(unit):
             if (
                 scalar_imports["typing.get_args"][id(query.func)] < index
                 and producer < index
-                and all(id(intervening) in safe_statements for intervening in unit.tree.body[producer + 1 : index])
+                and (all(id(intervening) in safe_statements for intervening in unit.tree.body[producer + 1 : index]) or current(alias_name))
                 and _reserve_typing_eager_query_namespace_current(unit, query)
             ):
                 scalar_query_results.add(id(query))
@@ -11588,6 +11629,14 @@ def _reserve_selected_origin_effect_failures(
         if module in modules:
             return ["selected origin module identity is duplicated " + module]
         modules[module] = unit
+    # Language-level immutability (maintainer ruling 2026-11-01, decision 3):
+    # a frozen dataclass or frozen pydantic instance refuses every plain write
+    # at the slip site, so its transfer needs no consumer closure. Rebinding
+    # its class through the instance is a deliberate act (threat-model ruling
+    # 2026-11-01) and is not chased through callee formals.
+    protected_constructed_classes = frozenset(
+        qualified for qualified in protected_constructed_classes if not _reserve_language_immutable_class(modules, qualified)
+    )
     source_bindings = [
         *recovery_failures,
         *field_receiver_failures,
@@ -16042,7 +16091,21 @@ def _reserve_selected_origin_effect_failures(
                     raise _RetentionConsumerBudgetExceeded
 
             def consumer(selected, node=node):
-                return retained_supplier_effect(node, retained_expression=selected)
+                effect = retained_supplier_effect(node, retained_expression=selected)
+                if effect in _reserve_ENUM_TRANSFER_EFFECTS:
+                    # PROTOTYPE (immutability lane): enum members and the frozen
+                    # records that hold them are immutable at the language level
+                    # (maintainer ruling 2026-11-01, decision 3). A transfer of
+                    # such a value needs no consumer closure; re-evaluate with
+                    # enum-kind origins hidden so only a non-enum origin can
+                    # sustain a transfer row. Mutation rules (stores, reflected
+                    # writes, descriptor recovery) still see the enum receiver.
+                    def hidden(value, use, *, selected=selected, **kw):
+                        origin = selected(value, use, **kw)
+                        return None if origin is not None and origin[0] in _reserve_ENUM_TRANSFER_HIDDEN_KINDS else origin
+
+                    effect = retained_supplier_effect(node, retained_expression=hidden)
+                return effect
 
             if origin_diagnostics is not None:
                 consumer = origin_diagnostics.observe_consumer(consumer)
@@ -20773,6 +20836,28 @@ _reserve_IMMUTABLE_STDLIB_SUPPLIER_ORIGINS = frozenset({"datetime.datetime"})
 # Typing special forms admitted only in load-context subscription (see
 # supplier_structural_role). They are mutable, so they are not immutable origins.
 _reserve_TYPING_SUBSCRIPT_FORMS = frozenset({"typing.Required", "typing.NotRequired", "typing.Annotated"})
+
+# PROTOTYPE (immutability lane): transfer-category effects that an enum-rooted
+# origin alone must not sustain, and the enum-kind origins hidden from them.
+# "enum-compound" is deliberately NOT hidden: it tags any retained non-supplier
+# direct origin, not only enum nesting.
+_reserve_ENUM_TRANSFER_HIDDEN_KINDS = frozenset({"enum-value", "enum-record", "enum-sequence", "enum-record-sequence", "enum-compound"})
+_reserve_ENUM_TRANSFER_EFFECTS = frozenset(
+    {
+        "retained enum value passed to unclosed caller ",
+        "retained enum producer return is unclosed ",
+        "retained enum callable capture is unclosed ",
+        "retained enum declaration transfer is unclosed ",
+        "retained supplier stored in unclosed carrier ",
+        "retained supplier stored in class namespace ",
+        "retained supplier stored as unclosed carrier key ",
+        "retained supplier iteration binding is unclosed ",
+        "retained supplier augmentation is unclosed ",
+        "retained supplier lambda metadata capture is unclosed ",
+        "retained supplier class-check recipient is unclosed ",
+        "retained supplier callable recovered ",
+    }
+)
 
 # Reviewed allowlist for the whole-tree closure layer (maintainer ruling
 # 2026-11-01: "we fix what we can and whitelist/ignore what we can't"). A row is
@@ -35845,130 +35930,142 @@ def test_required_work_reserve_admission_on_actual_sources() -> None:
     assert not result["unproven_web_rows"], result["unproven_web_rows"]
 
 
+_reserve_GUARDED_PLANT_IMPORT = "\nfrom elspeth.web.composer.continuation_caches import ColdComposerCaches\n"
+_reserve_GUARDED_PLANT_CONSTRUCTOR = "ColdComposerCaches(history=None)"
+_reserve_GUARDED_PLANT_CALLEE = "def _review_touch_caches(caches):\n    caches.last_preflight = None\n"
+_reserve_GUARDED_TRANSFER = "guarded constructed instance transferred to unreviewed caller"
+
+
 # Budget: ~2x the measured 2142 s wall (2026-11-01, ae10139b3 plus the reserve-proof
-# speedups, serial, 3.13, host load ~13-21). CI's job allows 7200-14400 s.
+# speedups, serial, 3.13, host load ~13-21). CI's job allows 7200-14400 s. The
+# plant now carries ColdComposerCaches through the same seven binder shapes
+# (seven boundary runs), so the budget is unchanged.
 @pytest.mark.timeout(4300)
 @pytest.mark.landscape_long_run
 def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> None:
-    """A protected constructor passed through a local formal can still mutate its class."""
+    """A live mutable guarded instance passed through a local formal reaches an unreviewed callee.
+
+    ``ColdComposerCaches`` is a plain ``@dataclass(slots=True)``: a callee can
+    change it with an ordinary attribute write, so every binder shape that
+    carries it to an unreviewed callee stays refused. The frozen case is
+    ``test_required_work_reserve_admits_frozen_instance_transfer`` below.
+    """
     path = "src/elspeth/web/execution/service.py"
     units = _production_units()
     service = next(unit for unit in units if unit.path == path)
-    for import_statement, producer, argument in (
-        (
-            "from elspeth.web.sessions.composer_operations import ComposerOperationError",
-            "",
-            "ComposerOperationError(http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None)",
-        ),
-        (
-            "from elspeth.web.sessions.composer_operation_errors import request_cancelled_error",
-            "",
-            "request_cancelled_error(request_id=None)",
-        ),
-        (
-            "from elspeth.web.sessions.composer_operations import ComposerOperationError",
-            "review_stored_error = ComposerOperationError(http_status=499, failure_code='request_cancelled', "
-            "error_type=None, body={}, diagnostic_id=None)\n",
-            "review_stored_error",
-        ),
+    for producer, argument in (
+        ("", _reserve_GUARDED_PLANT_CONSTRUCTOR),
+        (f"review_stored_caches = {_reserve_GUARDED_PLANT_CONSTRUCTOR}\n", "review_stored_caches"),
     ):
         changed = _parse_source(
             path,
             service.source
-            + f"\n{import_statement}\n"
+            + _reserve_GUARDED_PLANT_IMPORT
             + producer
-            + "def _review_replace_error_validator(error):\n"
-            + "    type(error).model_validate_json = str\n"
-            + f"_review_replace_error_validator({argument})\n",
+            + _reserve_GUARDED_PLANT_CALLEE
+            + f"_review_touch_caches({argument})\n",
         )
         changed_units = tuple(changed if unit.path == path else unit for unit in units)
         boundary = _reserve_supported_boundary(changed_units)
-        assert any("guarded constructed instance transferred to unreviewed caller" in failure for failure in boundary.failures), (
-            import_statement,
-            boundary.failures,
-        )
+        assert any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in boundary.failures), (argument, boundary.failures)
     closure = _parse_source(
         path,
         service.source
-        + "\nfrom elspeth.web.sessions.composer_operations import ComposerOperationError\n"
-        + "def _review_replace_error_validator(error):\n"
-        + "    type(error).model_validate_json = str\n"
+        + _reserve_GUARDED_PLANT_IMPORT
+        + _reserve_GUARDED_PLANT_CALLEE
         + "def _review_outer():\n"
         + "    def _review_inner():\n"
-        + "        _review_replace_error_validator(review_stored_error)\n"
-        + "    review_stored_error = ComposerOperationError("
-        + "http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None)\n"
+        + "        _review_touch_caches(review_stored_caches)\n"
+        + f"    review_stored_caches = {_reserve_GUARDED_PLANT_CONSTRUCTOR}\n"
         + "    _review_inner()\n"
         + "_review_outer()\n",
     )
     closure_units = tuple(closure if unit.path == path else unit for unit in units)
     closure_boundary = _reserve_supported_boundary(closure_units)
-    assert any("guarded constructed instance transferred to unreviewed caller" in failure for failure in closure_boundary.failures), (
-        closure_boundary.failures
-    )
+    assert any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in closure_boundary.failures), closure_boundary.failures
     class_body = _parse_source(
         path,
         service.source
-        + "\nfrom elspeth.web.sessions.composer_operations import ComposerOperationError\n"
-        + "def _review_replace_error_validator(error):\n"
-        + "    type(error).model_validate_json = str\n"
+        + _reserve_GUARDED_PLANT_IMPORT
+        + _reserve_GUARDED_PLANT_CALLEE
         + "class _ReviewClass:\n"
-        + "    review_stored_error = ComposerOperationError("
-        + "http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None)\n"
-        + "    _review_replace_error_validator(review_stored_error)\n",
+        + f"    review_stored_caches = {_reserve_GUARDED_PLANT_CONSTRUCTOR}\n"
+        + "    _review_touch_caches(review_stored_caches)\n",
     )
     class_units = tuple(class_body if unit.path == path else unit for unit in units)
     class_boundary = _reserve_supported_boundary(class_units)
-    assert any("guarded constructed instance transferred to unreviewed caller" in failure for failure in class_boundary.failures), (
-        class_boundary.failures
-    )
+    assert any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in class_boundary.failures), class_boundary.failures
     for nested_body in (
         "    def _review_inner():\n"
-        "        global review_stored_error\n"
-        "        _review_replace_error_validator(review_stored_error)\n"
+        "        global review_stored_caches\n"
+        "        _review_touch_caches(review_stored_caches)\n"
         "    _review_inner()\n",
-        "    class _ReviewInner:\n        global review_stored_error\n        _review_replace_error_validator(review_stored_error)\n",
+        "    class _ReviewInner:\n        global review_stored_caches\n        _review_touch_caches(review_stored_caches)\n",
     ):
         directed_global = _parse_source(
             path,
             service.source
-            + "\nfrom elspeth.web.sessions.composer_operations import ComposerOperationError\n"
-            + "review_stored_error = ComposerOperationError("
-            + "http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None)\n"
-            + "def _review_replace_error_validator(error):\n"
-            + "    type(error).model_validate_json = str\n"
+            + _reserve_GUARDED_PLANT_IMPORT
+            + f"review_stored_caches = {_reserve_GUARDED_PLANT_CONSTRUCTOR}\n"
+            + _reserve_GUARDED_PLANT_CALLEE
             + "def _review_outer():\n"
-            + "    review_stored_error = None\n"
+            + "    review_stored_caches = None\n"
             + nested_body
             + "_review_outer()\n",
         )
         global_units = tuple(directed_global if unit.path == path else unit for unit in units)
         global_boundary = _reserve_supported_boundary(global_units)
-        assert any("guarded constructed instance transferred to unreviewed caller" in failure for failure in global_boundary.failures), (
+        assert any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in global_boundary.failures), (
             global_boundary.failures
         )
     method_scope = _parse_source(
         path,
         service.source
-        + "\nfrom elspeth.web.sessions.composer_operations import ComposerOperationError\n"
-        + "review_stored_error = None\n"
-        + "def _review_replace_error_validator(error):\n"
-        + "    type(error).model_validate_json = str\n"
+        + _reserve_GUARDED_PLANT_IMPORT
+        + "review_stored_caches = None\n"
+        + _reserve_GUARDED_PLANT_CALLEE
         + "def _review_outer():\n"
-        + "    review_stored_error = ComposerOperationError("
-        + "http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None)\n"
+        + f"    review_stored_caches = {_reserve_GUARDED_PLANT_CONSTRUCTOR}\n"
         + "    class _ReviewClass:\n"
-        + "        global review_stored_error\n"
+        + "        global review_stored_caches\n"
         + "        def review(self):\n"
-        + "            _review_replace_error_validator(review_stored_error)\n"
+        + "            _review_touch_caches(review_stored_caches)\n"
         + "    _ReviewClass().review()\n"
         + "_review_outer()\n",
     )
     method_units = tuple(method_scope if unit.path == path else unit for unit in units)
     method_boundary = _reserve_supported_boundary(method_units)
-    assert any("guarded constructed instance transferred to unreviewed caller" in failure for failure in method_boundary.failures), (
-        method_boundary.failures
+    assert any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in method_boundary.failures), method_boundary.failures
+
+
+# Budget: one boundary run, measured 354-495 s serial on 3.13 (2026-11-01, host
+# load 5-18); ~2x that so a loaded host does not hit the 600 s default.
+@pytest.mark.timeout(1000)
+@pytest.mark.landscape_long_run
+def test_required_work_reserve_admits_frozen_instance_transfer() -> None:
+    """A frozen pydantic instance passed to an unreviewed callee needs no closure.
+
+    Language-level immutability (maintainer ruling 2026-11-01, decision 3):
+    ``ComposerOperationError`` is ``ConfigDict(frozen=True)``, so the callee
+    cannot change it by a plain write. Rebinding its class through the formal
+    is a deliberate act (threat-model ruling 2026-11-01), not a slip the gate
+    chases.
+    """
+    path = "src/elspeth/web/execution/service.py"
+    units = _production_units()
+    service = next(unit for unit in units if unit.path == path)
+    changed = _parse_source(
+        path,
+        service.source
+        + "\nfrom elspeth.web.sessions.composer_operations import ComposerOperationError\n"
+        + "def _review_replace_error_validator(error):\n"
+        + "    type(error).model_validate_json = str\n"
+        + "_review_replace_error_validator(ComposerOperationError("
+        + "http_status=499, failure_code='request_cancelled', error_type=None, body={}, diagnostic_id=None))\n",
     )
+    changed_units = tuple(changed if unit.path == path else unit for unit in units)
+    boundary = _reserve_supported_boundary(changed_units)
+    assert not any(_reserve_GUARDED_TRANSFER in failure and path in failure for failure in boundary.failures), boundary.failures
 
 
 # Budget: ~2x the measured 782.8 s wall (2026-11-01, ae10139b3 plus the reserve-proof
