@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import sys
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -244,6 +245,26 @@ def test_actual_central_batch_data_prerequisite_keeps_native_three_constructor_s
     transfers = receipt["additional_transfers"]
     for key in helper.SITE_KEYS:
         assert transfers[key] <= actual.keys(), key
+
+
+def test_namespace_copy_ignores_parent_links_leaked_onto_shared_context_singletons(monkeypatch):
+    """Another gate's parent links on shared context singletons must not reach the namespace copy.
+
+    ``ast.Load``/``Store``/``Del`` are one interpreter-wide instance each, so a
+    parent link a different gate attached while walking ITS trees hangs off every
+    tree parsed here.  ``copy.deepcopy`` followed that link through the whole
+    graph and raised ``RecursionError`` (31 order-dependent failures in a
+    mixed -n 6 run); the namespace copy takes declared fields only.
+    """
+    units = _units()
+    context = next(node.ctx for unit in units for node in ast.walk(unit.tree) if isinstance(node, ast.Name))
+    leaked = ast.Constant(value=0)
+    for _ in range(sys.getrecursionlimit() + 500):
+        leaked = ast.UnaryOp(op=ast.USub(), operand=leaked)
+    monkeypatch.setattr(context, "_leaked_parent", leaked, raising=False)
+    failures, receipt = helper.batch_data_local_contracts(units)
+    assert not failures, failures
+    assert receipt
 
 
 def test_data_receipt_refuses_missing_or_duplicate_source():

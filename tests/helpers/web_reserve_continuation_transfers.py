@@ -19,6 +19,7 @@ from scripts.cicd.composer_advisor_binding_templates import CLOSED_SOURCE_RECORD
 
 from elspeth_lints.core.ast_dump import stable_ast_dump
 from tests.helpers import web_reserve_composer_receiver as receiver
+from tests.helpers.web_reserve_proposal_child_transfers import copy_ast_fields
 
 CARRIERS = "src/elspeth/web/composer/_compose_loop_carriers.py"
 RUNTIME = "src/elspeth/web/composer/continuation_runtime.py"
@@ -373,7 +374,10 @@ def _select(units, paths, phase):
         unit = index[path]
         # Work on a detached AST; namespace calculation must never mutate the
         # caller's source identities while deciding a same-AST receipt.
-        namespace = _Namespace().visit(copy.deepcopy(unit.tree))
+        # Declared fields only: copy.deepcopy would follow parent links another
+        # gate attached to the shared ast.Load/Store singletons (see the batch
+        # DATA helper) and recurse across every tree that gate parsed.
+        namespace = _Namespace().visit(copy_ast_fields(unit.tree))
         _require(failures, _digest(namespace) == _NAMESPACES[path], phase + " declaration namespace changed " + path)
         receipt["import_nodes"].update((path, id(node)) for node in ast.walk(unit.tree) if isinstance(node, (ast.Import, ast.ImportFrom)))
         for name, digest in _CONTRACTS[path].items():

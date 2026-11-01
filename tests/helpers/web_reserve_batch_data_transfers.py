@@ -15,6 +15,7 @@ import textwrap
 
 from elspeth_lints.core.ast_dump import stable_ast_dump
 from tests.helpers import web_reserve_composer_receiver as receiver
+from tests.helpers.web_reserve_proposal_child_transfers import copy_ast_fields
 
 DATA = "src/elspeth/web/composer/continuation_batch_data.py"
 SCHEMA = "src/elspeth/web/composer/_schema_response_grammar.py"
@@ -276,7 +277,10 @@ class _Namespace(ast.NodeTransformer):
 
 def _namespaces(index, failures, receipt):
     for path, digest in NAMESPACE_BINDINGS.items():
-        namespace = _Namespace().visit(copy.deepcopy(index[path].tree))
+        # copy.deepcopy would follow any parent link another gate attached to a
+        # node: ast.Load/Store/Del are interpreter singletons shared by every
+        # tree, so one tree's link makes every deepcopy walk that whole graph.
+        namespace = _Namespace().visit(copy_ast_fields(index[path].tree))
         _require(failures, _digest(namespace) == digest, "dependency namespace changed " + path)
         for statement in namespace.body:
             targets = (

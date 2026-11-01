@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import sys
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -72,6 +73,26 @@ def test_actual_continuation_transfer_receipts_belong_to_supplied_source(check):
     assert not detached_failures, detached_failures
     for key in helper.SITE_KEYS:
         assert not receipt[key] & detached_receipt[key], key
+
+
+def test_namespace_copy_ignores_parent_links_leaked_onto_shared_context_singletons(monkeypatch):
+    """Another gate's parent links on shared context singletons must not reach the namespace copy.
+
+    ``ast.Load``/``Store``/``Del`` are one interpreter-wide instance each, so a
+    parent link a different gate attached while walking ITS trees hangs off every
+    tree parsed here.  ``copy.deepcopy`` followed that link through the whole
+    graph and raised ``RecursionError`` (31 order-dependent failures in a
+    mixed -n 6 run); the namespace copy takes declared fields only.
+    """
+    units = _units()
+    context = next(node.ctx for unit in units for node in ast.walk(unit.tree) if isinstance(node, ast.Name))
+    leaked = ast.Constant(value=0)
+    for _ in range(sys.getrecursionlimit() + 500):
+        leaked = ast.UnaryOp(op=ast.USub(), operand=leaked)
+    monkeypatch.setattr(context, "_leaked_parent", leaked, raising=False)
+    failures, receipt = helper.attachment_local_transfers(units)
+    assert not failures, failures
+    assert receipt
 
 
 def test_closed_source_record_receipt_keeps_generic_reflector_and_plain_class_refusals():
