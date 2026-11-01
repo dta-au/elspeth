@@ -29,7 +29,6 @@ from tests.testcontainer.web.test_external_deployment_postgres import _DatabaseP
 from elspeth.web.app import create_app
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.schema_probe import init_landscape_schema, init_session_schema
-from elspeth.web.sessions.composer_operation_versions import COMPOSER_OPERATION_VERSION_HEADER
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 
@@ -106,7 +105,7 @@ def test_stream_resumes_on_another_replica_from_sql(
         engine = replica_a.state.session_engine
         seeded = insert_v2_operation(engine, session_id=session.id, actor_user_id=principal.user_id, state="running", status_revision=5)
         path = f"/api/sessions/{session.id}/operations/{seeded.operation_id}/stream"
-        headers = {"Authorization": f"Bearer {token}", COMPOSER_OPERATION_VERSION_HEADER: "2"}
+        headers = {"Authorization": f"Bearer {token}"}
 
         def client(app) -> httpx.AsyncClient:
             return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers, timeout=60)
@@ -131,4 +130,4 @@ def test_stream_resumes_on_another_replica_from_sql(
     assert [(f["event"], f.get("id")) for f in frames_a] == [("status", "5"), ("status", "6"), ("status", "7"), ("terminal", "7")]
     # B has no memory of A: its first frame is the current revision, read from SQL.
     assert [(f["event"], f.get("id")) for f in frames_b] == [("status", "6"), ("status", "7"), ("terminal", "7")]
-    assert opened == [{"event": "composer_stream.opened", "protocol_version": 2, "resumed_from_revision": 6, "log_level": "info"}]
+    assert opened == [{"event": "composer_stream.opened", "resumed_from_revision": 6, "log_level": "info"}]

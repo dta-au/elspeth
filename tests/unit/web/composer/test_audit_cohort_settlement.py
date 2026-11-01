@@ -16,7 +16,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
 
@@ -26,15 +26,7 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import FailedTurnMetadata
-from elspeth.contracts.prompt_guard import PromptGuardContentPart, PromptGuardToolArgumentParts
-from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.audit import llm_call_audit_envelope
-from elspeth.web.composer.diagnostic_evidence import (
-    DIAGNOSTIC_EVIDENCE_KIND,
-    ComposerDiagnosticEvidence,
-    diagnostic_evidence_identity,
-)
-from elspeth.web.composer.prepared_provider_input import PreparedProviderInput
+from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -152,34 +144,6 @@ def _llm_audit_rows(rows: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-async def _drive_turn_then_provider_timeout(
-    service: ComposerServiceImpl,
-    session_id: str,
-) -> ComposerConvergenceError:
-    """Turn 1 commits a tool turn inline; turn 2's provider call times out."""
-    responses = [_metadata_tool_response("call_turn1_metadata", "Committed inline")]
-
-    async def _fake_llm(
-        _messages: Any,
-        _tools: Any,
-        *,
-        provider_custody: object | None = None,
-        credential_state: object | None = None,
-        prompt_guard_trusted_message_indexes: frozenset[int] = frozenset(),
-        prompt_guard_content_parts: tuple[tuple[PromptGuardContentPart, ...] | None, ...] | None = None,
-        prompt_guard_tool_argument_parts: tuple[tuple[PromptGuardToolArgumentParts, ...] | None, ...] | None = None,
-        prepared_input: PreparedProviderInput | None = None,
-    ) -> Any:
-        if responses:
-            return responses.pop(0)
-        raise TimeoutError
-
-    driver = cast(Any, service)
-    with pytest.raises(ComposerConvergenceError) as exc_info:
-        await driver._run_one_turn_for_test(llm=_fake_llm, session_id=session_id)
-    return exc_info.value
-
-
 async def _run_convergence_handler(service: ComposerServiceImpl, session_id: str, exc: ComposerConvergenceError) -> dict[str, object]:
     sessions_service = service._sessions_service  # type: ignore[attr-defined]
     async with acquire_compose_context(sessions_service, session_id) as compose_context:
@@ -197,100 +161,6 @@ async def _run_convergence_handler(service: ComposerServiceImpl, session_id: str
             catalog=_CATALOG,
             session_operation_context=compose_context,
         )
-
-
-@pytest.mark.asyncio
-async def test_provider_timeout_after_inline_tool_turn_persists_each_record_exactly_once(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    result_session_id: str,
-) -> None:
-    """Loop → carrier → route handler → DB: one tool row per invocation, one sidecar per LLM call.
-
-    ``_call_llm_before_deadline`` captures ``recorder.invocations`` on the
-    timeout carrier WITHOUT the loop's ``persisted_tool_call_turn`` filter, so
-    the invocation that turn 1 already committed inline arrives at the handler
-    a second time. The handler's ``failed_turn`` suppression is therefore the
-    only thing between the audit trail and a duplicated breadcrumb.
-    """
-    service = composer_service_with_real_sessions
-    sessions_service = service._sessions_service  # type: ignore[attr-defined]
-
-    exc = await _drive_turn_then_provider_timeout(service, result_session_id)
-
-    # The carrier's own shape — the premise the handler guard rests on.
-    assert exc.budget_exhausted == "timeout"
-    assert exc.failed_turn is not None
-    assert exc.failed_turn.tool_responses_persisted == 1
-    assert [inv.tool_call_id for inv in exc.tool_invocations] == ["call_turn1_metadata"], (
-        "the timeout carrier still carries the inline-persisted invocation; the handler must not drain it again"
-    )
-    assert [call.status.name for call in exc.llm_calls] == ["SUCCESS", "TIMEOUT"]
-
-    before = _chat_rows(sessions_service, result_session_id)
-    assert _invocation_occurrences(before) == {"call_turn1_metadata": 1}
-    assert _llm_audit_rows(before) == [], "LLM sidecars are buffered until the handler drains them"
-
-    body = await _run_convergence_handler(service, result_session_id, exc)
-
-    assert body["failed_turn"] == {
-        "assistant_message_id": exc.failed_turn.assistant_message_id,
-        "tool_calls_attempted": 1,
-        "tool_responses_persisted": 1,
-        "transcript_url": None,
-    }
-    after = _chat_rows(sessions_service, result_session_id)
-    assert _invocation_occurrences(after) == {"call_turn1_metadata": 1}, "the inline-persisted tool turn was drained a second time"
-    llm_rows = _llm_audit_rows(after)
-    assert len(llm_rows) == 2, "each buffered LLM call must be durable exactly once"
-    assert [row["tool_calls"][0] for row in llm_rows] == [llm_call_audit_envelope(call) for call in exc.llm_calls]
-    assert after[: len(before)] == before, "the already committed tool/private cohort must remain unchanged"
-    appended = after[len(before) :]
-    assert [_envelope_kind(row) for row in appended] == [
-        DIAGNOSTIC_EVIDENCE_KIND,
-        "llm_call_audit",
-        DIAGNOSTIC_EVIDENCE_KIND,
-        DIAGNOSTIC_EVIDENCE_KIND,
-        "llm_call_audit",
-    ]
-    requests = []
-    for row, call in zip((appended[0], appended[2]), exc.llm_calls, strict=True):
-        call_identity = call.call_id or f"legacy:{call.started_at.isoformat()}:{call.planner_call_ordinal}"
-        assert len(row["tool_calls"]) == 1
-        request = ComposerDiagnosticEvidence.from_envelope(
-            row["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=call_identity
-        )
-        assert request.evidence_id == diagnostic_evidence_identity("provider-request", call_identity)
-        assert request.status == "provider_request" and request.tool_name == "composer_provider_context"
-        assert call.private_request is not None
-        assert request.arguments.disposition == call.private_request.disposition == "retained"
-        assert request.arguments.content == call.private_request.canonical
-        assert request.arguments.content is not None
-        context = json.loads(request.arguments.content)
-        assert stable_hash(context["messages"]) == call.messages_hash
-        assert stable_hash(context["tools"]) == call.tools_spec_hash
-        assert request.authority_arguments is None
-        assert request.result.disposition == "not_returned"
-        assert request.result.content is None
-        assert request.wire_arguments.disposition == "unavailable"
-        assert request.wire_arguments.content is None
-        requests.append(request)
-    timeout_call = exc.llm_calls[1]
-    timeout_identity = timeout_call.call_id or f"legacy:{timeout_call.started_at.isoformat()}:{timeout_call.planner_call_ordinal}"
-    failure = ComposerDiagnosticEvidence.from_envelope(
-        appended[3]["tool_calls"][0], expected_session_id=result_session_id, expected_tool_call_id=timeout_identity
-    )
-    assert len(appended[3]["tool_calls"]) == 1
-    assert failure.evidence_id == diagnostic_evidence_identity("provider-failure", timeout_identity)
-    assert failure.status == "provider_failure" and failure.tool_name == "composer_failure"
-    assert len({request.evidence_id for request in requests} | {failure.evidence_id}) == 3
-    assert all(request.operation_id == failure.operation_id for request in requests)
-    assert all(request.operation_epoch == failure.operation_epoch for request in requests)
-    assert failure.result.content is not None and "TimeoutError" in failure.result.content
-    sequence_numbers = [row["sequence_no"] for row in appended]
-    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + len(appended))), (
-        "the complete public/private sidecar cohort settles as one contiguous block"
-    )
-    assert len({row["created_at"] for row in appended}) == 1, "one transaction stamps one created_at across the cohort"
 
 
 @pytest.mark.asyncio

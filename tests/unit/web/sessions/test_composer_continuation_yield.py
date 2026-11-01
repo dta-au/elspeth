@@ -15,7 +15,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.continuation_attachment_application_driver import apply_current_attachment_runtime
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_handoff import ContinuationYieldEvent
-from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
 from elspeth.web.sessions.continuation import load_snapshot, read_chunk
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -180,9 +179,7 @@ async def test_duplicate_yield_body_refuses_at_the_revoked_attempt(operation_sto
 async def test_stop_wins_over_a_yield(operation_store, tmp_path, monkeypatch):
     engine, repository, authority, *_ = operation_store
     running, yield_args = await _handoff_safe(operation_store, tmp_path, monkeypatch)
-    authority.request_cancel(
-        session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-    )
+    authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
     before = _admission_rows(engine)
     with pytest.raises(ComposerOperationCancelledDuringTurn):
         repository.commit_checkpoint_and_successor(running, **yield_args)

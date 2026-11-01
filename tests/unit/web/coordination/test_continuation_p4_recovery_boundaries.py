@@ -164,7 +164,7 @@ async def test_restart_stop_allows_only_exact_committed_pending_application(oper
         work = inventory_work(first)
         await apply_selected_p4_to_cold_evidence(authority=authority, selected=selected, inventory=inventory, required_work=work)
         work.coordinator.assert_completed()
-    stopped = authority.request_cancel(session_id=sid, operation_id=first.claim.operation_id, cancelled_failure=operations.cancelled)
+    stopped = authority.request_cancel(session_id=sid, operation_id=first.claim.operation_id)
     assert stopped is not None and stopped.cancel_requested_at is not None and stopped.status == "running"
     repository.release(first.session_operation_context)
     peer = peer_owners(operation_store)

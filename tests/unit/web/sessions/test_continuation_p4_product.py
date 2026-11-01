@@ -112,9 +112,7 @@ def _contains_identity(error, expected):
 async def test_actual_completed_application_requires_closed_original_dependencies(operation_store, tmp_path, monkeypatch, change):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         await owner.finish_owed_prefix(owner.runtime.source.selected)
         phase = owner.p4
@@ -273,9 +271,7 @@ async def test_actual_p4_one_physical_outcome_keeps_atomic_and_uncertain_boundar
         monkeypatch.setattr(continuation_live_p4_application, "retain_portable_application_on_live_evidence", project)
         if fault == "unknown_readback":
             monkeypatch.setattr(type(service), "_readback_continuation_p4_transaction", unknown)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         if fault == "none":
             await owner.finish_owed_prefix(owner.runtime.source.selected)
@@ -377,9 +373,7 @@ async def test_actual_unavailable_unwind_keeps_original_failure_and_one_physical
         service = owner.service._require_sessions_service()
         monkeypatch.setattr(service, "_insert_chat_message", insert)
         monkeypatch.setattr(continuation_p4_application_store, "apply_committing_p4_application_on_connection", apply)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         with pytest.raises(BaseException) as caught:
             await owner.finish_owed_prefix(owner.runtime.source.selected)
@@ -418,9 +412,7 @@ async def test_actual_committed_p4_readback_survives_terminal_progress_without_r
 ):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         await owner.finish_owed_prefix(owner.runtime.source.selected)
         phase = owner.p4

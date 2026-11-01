@@ -36,7 +36,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stamped_state_values, stored_default_pipeline_metadata
 
 
 @pytest.fixture
@@ -64,13 +64,15 @@ def _insert_session(conn, session_id: str) -> None:
 def _seed_composition_state(conn, *, state_id: str, session_id: str) -> None:
     conn.execute(
         insert(composition_states_table).values(
-            metadata_=stored_default_pipeline_metadata(),
-            id=state_id,
-            session_id=session_id,
-            version=1,
-            is_valid=False,
-            provenance="session_seed",
-            created_at=datetime.now(UTC),
+            **stamped_state_values(
+                metadata_=stored_default_pipeline_metadata(),
+                id=state_id,
+                session_id=session_id,
+                version=1,
+                is_valid=False,
+                provenance="session_seed",
+                created_at=datetime.now(UTC),
+            )
         )
     )
 
@@ -250,7 +252,7 @@ def test_current_session_schema_epoch() -> None:
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
     # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
     # Epoch 76 makes atomic terminal graph-review facts part of read semantics.
-    assert SESSION_SCHEMA_EPOCH == 79
+    assert SESSION_SCHEMA_EPOCH == 80
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -944,13 +946,15 @@ class TestCompositionStatesProvenanceEnum:
             with pytest.raises(IntegrityError):
                 conn.execute(
                     insert(composition_states_table).values(
-                        metadata_=stored_default_pipeline_metadata(),
-                        id=str(uuid.uuid4()),
-                        session_id=session_id,
-                        version=1,
-                        is_valid=False,
-                        provenance="not_a_real_value",
-                        created_at=datetime.now(UTC),
+                        **stamped_state_values(
+                            metadata_=stored_default_pipeline_metadata(),
+                            id=str(uuid.uuid4()),
+                            session_id=session_id,
+                            version=1,
+                            is_valid=False,
+                            provenance="not_a_real_value",
+                            created_at=datetime.now(UTC),
+                        )
                     )
                 )
 
@@ -960,13 +964,15 @@ class TestCompositionStatesProvenanceEnum:
             _insert_session(conn, session_id)
             conn.execute(
                 insert(composition_states_table).values(
-                    metadata_=stored_default_pipeline_metadata(),
-                    id=str(uuid.uuid4()),
-                    session_id=session_id,
-                    version=1,
-                    is_valid=False,
-                    provenance="interpretation_resolve",
-                    created_at=datetime.now(UTC),
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=str(uuid.uuid4()),
+                        session_id=session_id,
+                        version=1,
+                        is_valid=False,
+                        provenance="interpretation_resolve",
+                        created_at=datetime.now(UTC),
+                    )
                 )
             )
 

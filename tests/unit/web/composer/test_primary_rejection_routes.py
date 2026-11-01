@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from uuid import UUID
+from uuid import uuid4
 
 import httpx
 import litellm
@@ -21,7 +21,6 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.middleware.request_id import REQUEST_ID_HEADER
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
-from elspeth.web.sessions import composer_turn
 from elspeth.web.sessions.composer_operations import ComposerOperationError
 from elspeth.web.sessions.protocol import RunDiagnosticsAuditAuthority, RunDiagnosticsAuthorityLostError
 from elspeth.web.sessions.routes._helpers import (
@@ -29,8 +28,8 @@ from elspeth.web.sessions.routes._helpers import (
     _PROVIDER_DETAIL_REDACTED,
     composer_session_lock_registry,
 )
-from tests.helpers.composer_operations import current_head_state_id, message_body, submit_and_settle
 from tests.helpers.composition_state import composition_state_data
+from tests.helpers.continuation_app import ScriptedSDK, continuation_app, install_sdk, settle
 from tests.unit.web.composer.test_explicit_provider_custody import _required_guard_settings
 from tests.unit.web.composer.test_primary_rejection_gateway import _PRIVATE, _sdk_rejection, _settled_failure
 from tests.unit.web.sessions.test_routes import (
@@ -38,7 +37,6 @@ from tests.unit.web.sessions.test_routes import (
     _make_app,
     _save_test_composition_state,
 )
-from tests.unit.web.sessions.test_run_composer_turn import _seed_output_only_draft
 
 pytest_plugins = ("tests.helpers.execution_custody",)
 
@@ -151,73 +149,60 @@ def _observe_settlement(monkeypatch, app, service, events, settled):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("debug", [False, True], ids=["debug-off", "debug-on"])
 @pytest.mark.parametrize("credential", [False, True], ids=["bounded-prose", "credential-redacted"])
-async def test_tool_primary_durable_route_retains_rejection_after_required_audit(primary_route_case, monkeypatch, debug, credential):
-    app, service, guard_requests = primary_route_case
-    _install_real_composer(app, service, debug=debug)
+async def test_tool_primary_durable_route_retains_rejection_after_required_audit(tmp_path, monkeypatch, debug, credential):
+    """A rejected tool-loop primary fails the Continuation request with the safe projection.
+
+    Drives the production message route, worker and Continuation driver; only
+    the SDK and the prompt-guard HTTP boundary are scripted. The provider
+    attempt is settled before the terminal is published, and the durable
+    ComposerOperationError carries the retained rejection descriptor.
+    """
     original = _original(credential=credential)
-    events, settled, physical, projected = [], [], [], []
-    _observe_settlement(monkeypatch, app, service, events, settled)
-    actual_persist = composer_turn._persist_llm_calls
-    actual_project = composer_turn._litellm_error_detail
+    events, settled, physical = [], [], []
+    sdk = ScriptedSDK([("raise", original)])
 
     async def completion(**kwargs):
-        assert guard_requests
         physical.append(kwargs)
         events.append("physical")
-        raise original
+        return await sdk(**kwargs)
 
-    async def persist(*args, **kwargs):
-        assert kwargs["required_audit"] is True and kwargs["required_work"] is not None
+    install_sdk(monkeypatch, completion)
+    async with continuation_app(tmp_path, monkeypatch, composer_expose_provider_errors=debug) as harness:
+        app = harness.app
+        service = app.state.session_service
+        _observe_settlement(monkeypatch, app, service, events, settled)
+        sid = harness.session_id
+        operation_id = str(uuid4())
+        body = {"content": "Inspect this ordinary primary draft.", "operation_id": operation_id, "state_id": None}
+        async with harness.client() as client:
+            accepted = await client.post(f"/api/sessions/{sid}/messages", json=body)
+            assert accepted.status_code == 202, accepted.text
+            request_id = accepted.headers[REQUEST_ID_HEADER]
+            assert request_id
+            snapshot = await settle(harness, operation_id=operation_id, client=client)
+            visible = await client.get(f"/api/sessions/{sid}/messages")
+            assert visible.status_code == 200
+        assert snapshot.status == "failed" and snapshot.result is None
+        assert snapshot.error is not None
+        assert sdk.roles == ["raise"]
+        assert len(physical) == len(settled) == 1
         assert events == ["physical", "settled"]
-        result = await actual_persist(*args, **kwargs)
-        events.append("required-audit")
-        return result
-
-    def project(category, wrapper, **kwargs):
-        assert wrapper.__cause__ is original
-        assert events == ["physical", "settled", "required-audit"]
-        events.append("projection")
-        detail = actual_project(category, wrapper, **kwargs)
-        projected.append(detail)
-        return detail
-
-    monkeypatch.setattr(litellm, "acompletion", completion)
-    monkeypatch.setattr(composer_turn, "_persist_llm_calls", persist)
-    monkeypatch.setattr(composer_turn, "_litellm_error_detail", project)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        created = await client.post("/api/sessions", json={"title": "Primary rejection"})
-        assert created.status_code == 201, created.text
-        sid = UUID(created.json()["id"])
-        await _seed_output_only_draft(app, service, sid)
-        body = message_body("Inspect this ordinary primary draft.", state_id=await current_head_state_id(client, sid))
-        result = await submit_and_settle(client, app, path=f"/api/sessions/{sid}/messages", body=body)
-        assert result.accepted.status_code == 202
-        request_id = result.accepted.headers[REQUEST_ID_HEADER]
-        assert request_id
-        assert result.accepted.request.method == "POST"
-        assert result.accepted.request.url.path == f"/api/sessions/{sid}/messages"
-        assert json.loads(result.accepted.request.content) == body
-        snapshot = result.final.json()
-        assert snapshot["status"] == "failed" and snapshot["result"] is None
-        status, error_body = result.error()
-        assert status == 502
-        visible = await client.get(f"/api/sessions/{sid}/messages")
-        assert visible.status_code == 200
-    assert len(physical) == len(settled) == len(projected) == 1
-    assert events == ["physical", "settled", "required-audit", "projection"]
-    call, context, evidence = settled[0]
-    assert context.fence.session_id == str(sid)
-    assert call.call_id == evidence.tool_call_id
-    stored = app.state.composer_async_operation_authority.get(session_id=sid, operation_id=body["operation_id"])
-    assert stored is not None and stored.result_json is not None
-    reloaded = ComposerOperationError.model_validate_json(stored.result_json, strict=True)
-    assert reloaded.http_status == 502 and reloaded.failure_code == "http_error"
-    assert reloaded.body == error_body
-    assert snapshot["error"]["body"] == error_body
-    assert stored.request_id == request_id
-    assert error_body["detail"] == {**projected[0], "request_id": request_id}
-    assert evidence.evidence_id not in visible.text
-    _assert_public_projection(error_body["detail"], category="llm_unavailable", evidence=evidence, debug=debug, credential=credential)
+        call, context, evidence = settled[0]
+        assert context.fence.session_id == str(sid)
+        assert call.call_id == evidence.tool_call_id
+        assert evidence.evidence_id not in visible.text
+        # Completion point (U-40): the per-class primary provider-failure
+        # terminal. Until it lands Continuation settles this as worker_lost 503.
+        error_body = snapshot.error.body
+        assert snapshot.error.http_status == 502
+        stored = app.state.composer_async_operation_authority.get(session_id=sid, operation_id=operation_id)
+        assert stored is not None and stored.result_json is not None
+        reloaded = ComposerOperationError.model_validate_json(stored.result_json, strict=True)
+        assert reloaded.http_status == 502 and reloaded.failure_code == "http_error"
+        assert reloaded.body == error_body
+        assert stored.request_id == request_id
+        assert error_body["detail"]["request_id"] == request_id
+        _assert_public_projection(error_body["detail"], category="llm_unavailable", evidence=evidence, debug=debug, credential=credential)
 
 
 @pytest.mark.asyncio

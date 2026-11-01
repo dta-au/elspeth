@@ -37,7 +37,6 @@ from elspeth.web.sessions.models import (
 )
 from tests.unit.web.coordination import test_composer_operation_authority as operation_fixtures
 from tests.unit.web.coordination.test_composer_operation_authority import (
-    cancelled,
     start,
 )
 
@@ -221,7 +220,7 @@ async def test_existing_durable_stop_is_checked_before_mutation_mode(operation_s
     _engine, repository, authority, _service, sid = operation_store
     record, running = start(operation_store)
     context = running.session_operation_context
-    authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
+    authority.request_cancel(session_id=sid, operation_id=record.operation_id)
     ceiling = ComposerMutationCeiling(str(sid), "synthetic-stopped-request", "explicit_approve")
     entered = []
     try:

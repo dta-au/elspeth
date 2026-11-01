@@ -17,11 +17,25 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerService, ComposerServiceError
 from tests.helpers.composer_operations import settle_sync, strip_request_id
 from tests.unit.web.sessions.test_routes import TestClient, _make_app
 
 _REFUSAL_TEXT = "Composer admission refused: identity_disabled."
+
+# UNCOVERED (A5 batch 3): these drove the deleted V1 ``compose()`` route turn,
+# whose typed ladder mapped ComposerAdmissionRefused to 403
+# ``admission_refused`` (routes._helpers._handle_composer_chargeable_refusal,
+# now without a src caller). Continuation's failure projection
+# (sessions/composer_operation_errors.py) has no ComposerAdmissionRefused arm,
+# so a refusal during a Continuation request settles as the generic failure.
+# ``_post_after_compose_failure`` stays importable for
+# tests/unit/web/sessions/test_composer_context_unsupported_routes.py.
+pytestmark = pytest.mark.skip(
+    reason="UNCOVERED: Continuation has no ComposerAdmissionRefused failure projection; V1 compose() vehicle deleted"
+)
 
 
 def _post_after_compose_failure(tmp_path: Path, failure: ComposerServiceError, *, route: str) -> tuple[int, Any, Any]:

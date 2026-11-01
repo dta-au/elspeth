@@ -103,7 +103,7 @@ async def test_fresh_runtime_shelf_excess_keeps_last_checkpoint_and_paid_evidenc
             expected=ComposerOperationRecord,
         )
         assert terminal.status == "failed" and terminal.result_json is not None
-        assert terminal.lifecycle_version == 2 and terminal.phase == "settled"
+        assert terminal.phase == "settled"
         assert (terminal.attempt, terminal.session_operation_id, terminal.session_operation_epoch) == (
             running.claim.attempt,
             running.session_operation_context.fence.operation_id,

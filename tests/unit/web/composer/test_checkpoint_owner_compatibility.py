@@ -118,54 +118,6 @@ async def test_null_binding_never_bypasses_exact_checkpoint_context(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing", ["binding", "provider_owner"])
-async def test_direct_compose_rejects_half_required_pair_before_provider_or_sql(tmp_path, monkeypatch, missing):
-    from elspeth.web.composer.provider_quota import ProviderInvocationOwner
-    from elspeth.web.composer.service import ComposerServiceImpl
-    from tests.unit.web.composer.test_service import _empty_state, _make_settings, _mock_catalog
-
-    engine, authority, sessions = _quota_service(tmp_path)
-    session = authority.create_session_with_initial_fence(
-        user_id="alice", title="Mixed owner", auth_provider_type="local", owner_instance_id="owner", lease_seconds=60
-    )
-    context = authority.acquire(
-        session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="owner", lease_seconds=60
-    )
-    coordinator = RequiredWorkCoordinator(
-        RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, context, invocation_id=str(uuid4()))
-    )
-    binding = RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN)
-    owner = ProviderInvocationOwner(service=sessions, required_work=binding)
-    composer = ComposerServiceImpl.for_trained_operator(
-        catalog=_mock_catalog(), settings=_make_settings(), sessions_service=sessions, session_engine=engine
-    )
-    called = []
-
-    async def forbidden_dispatch(*args, **kwargs):
-        called.append(True)
-        raise AssertionError("mixed owner reached physical dispatch")
-
-    monkeypatch.setattr("litellm.acompletion", forbidden_dispatch)
-    try:
-        with pytest.raises(AuditIntegrityError, match="supplied with its turn binding"):
-            await composer.compose(
-                "Hello",
-                [],
-                _empty_state(),
-                session_id=str(session.id),
-                session_operation_context=context,
-                required_work=None if missing == "binding" else binding,
-                provider_owner=None if missing == "provider_owner" else owner,
-            )
-        assert called == []
-        assert coordinator.tickets == ()
-        with engine.connect() as conn:
-            assert conn.execute(select(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))).all() == []
-    finally:
-        authority.release(context)
-
-
-@pytest.mark.asyncio
 async def test_actual_pending_checkpoint_keeps_projection_and_release_unresolved(tmp_path, monkeypatch):
     import asyncio
     import threading

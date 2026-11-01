@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from threading import Event
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 from uuid import UUID, uuid4
 
@@ -36,11 +37,17 @@ from elspeth.web.sessions.composer_operations import ComposerOperationAssistantW
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.graph_recovery import empty_recovery_state
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    OperationReceiptClaimed,
+    OperationReceiptTakenOver,
+    SessionForkParentAuthority,
+    SessionForkSettlementCommand,
+)
 from elspeth.web.sessions.routes._helpers import _composer_conversation_tool_or_llm_audit_messages
 from elspeth.web.sessions.schemas import SendMessageRequest
 from tests.helpers.content_publication import split_content_publication
-from tests.unit.web.coordination.test_composer_operation_authority import response, start
+from tests.unit.web.coordination.test_composer_operation_authority import _ingress, response, start
 
 pytest_plugins = ("tests.unit.web.coordination.test_composer_operation_authority",)
 
@@ -72,20 +79,10 @@ async def seed(store):
 
 
 async def begin(store, base):
-    _engine, _repository, _authority, service, sid = store
+    _engine, _repository, _authority, _service, _sid = store
     request = SendMessageRequest(operation_id=str(uuid4()), content="Explain", state_id=base.id if base is not None else None)
     record, running = start(store, request)
-    await service.add_message_with_transcript(
-        sid,
-        "user",
-        request.content,
-        operation_id=UUID(record.operation_id),
-        requested_state_id=request.state_id,
-        composition_state_id=request.state_id,
-        writer_principal="route_user_message",
-        session_operation_context=running.session_operation_context,
-        running=running,
-    )
+    await _ingress(store, running)
     return record, running
 
 
@@ -385,7 +382,13 @@ async def test_terminal_fact_atomicity_and_frozen_retry(operation_store, monkeyp
         assert sum(row["id"] == str(message_id) for row in rows(store)) == 1
         assert parse_completion_gates((await store[3].get_current_state(store[4])).composer_meta) == second.gates
         if seam == "retry":
-            assert calls[0] == calls[1], "retry must preserve exact terminal identity/bytes"
+            # The first attempt rolled back, so its terminal Continuation
+            # checkpoint id (minted per attempt by
+            # settle_continuation_on_connection) was never durable; every other
+            # terminal field and byte must be the same on the retry.
+            durable = store[2].get(session_id=store[4], operation_id=running.claim.operation_id)
+            assert durable.checkpoint_id == calls[1].checkpoint_id
+            assert replace(calls[0], checkpoint_id=calls[1].checkpoint_id) == calls[1], "retry must preserve exact terminal identity/bytes"
 
 
 @pytest.mark.asyncio
@@ -521,11 +524,75 @@ async def test_authored_writer_and_review_terminal_serialize_without_stale_fact(
         assert (await store[3].get_current_state(store[4])).id == succeeded.id
 
 
+async def _fork_session(
+    service: Any,
+    *,
+    source_session_id: UUID,
+    fork_message_id: UUID,
+    new_message_content: str,
+    user_id: str,
+    auth_provider_type: str,
+):
+    """Exercise the hard-cut staged service through atomic settlement (inlined from test_fork.py)."""
+    parent = await service.get_session(source_session_id)
+    assert parent.user_id == user_id
+    assert parent.auth_provider_type == auth_provider_type
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=source_session_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    staged = None
+    try:
+        reserved = await service.reserve_operation_receipt(
+            session_id=source_session_id,
+            operation_id=str(uuid4()),
+            kind="session_fork",
+            request_hash="a" * 64,
+            actor="composer_route",
+            lease_seconds=300,
+            session_operation_context=parent_context,
+        )
+        assert type(reserved) in {OperationReceiptClaimed, OperationReceiptTakenOver}
+        parent_authority = SessionForkParentAuthority(
+            parent_context=parent_context,
+            receipt_fence=reserved.fence,
+        )
+        staged = await service.fork_session(
+            parent_authority,
+            fork_message_id=fork_message_id,
+            new_message_content=new_message_content,
+        )
+        active = await service.settle_fork_operation_receipt(
+            SessionForkSettlementCommand(
+                authority=staged.authority,
+                expected_current_state_id=staged.state.id if staged.state is not None else None,
+                edited_message_id=staged.messages[-1].id,
+                rewritten_state_id=None,
+                rewritten_state=None,
+                response_hash="b" * 64,
+                actor="composer_route",
+            )
+        )
+        return active, list(staged.messages), staged.state
+    finally:
+        if staged is not None:
+            await service._run_sync(
+                service.session_operation_authority.release,
+                staged.authority.child_context,
+            )
+        await service._run_sync(
+            service.session_operation_authority.release,
+            parent_context,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("copy_kind", ["fork", "revert"])
 async def test_snapshot_copy_carries_effective_blocker_without_copying_authoritative_audit(operation_store, copy_kind):
-    from tests.unit.web.sessions.test_fork import _fork_session
-
     store = operation_store
     base = await seed(store)
     _record, running = await begin(store, base)
@@ -582,8 +649,6 @@ async def test_snapshot_copy_carries_effective_blocker_without_copying_authorita
 @pytest.mark.asyncio
 @pytest.mark.parametrize("present", [False, True])
 async def test_later_user_fork_excludes_parent_review_authority(operation_store, present):
-    from tests.unit.web.sessions.test_fork import _fork_session
-
     store = operation_store
     base = await seed(store) if present else None
     _record, running = await begin(store, base)
@@ -633,48 +698,6 @@ async def test_later_user_fork_excludes_parent_review_authority(operation_store,
         assert admission.effective_completion_gates is None
     child_state = state_from_record(admission.record) if admission.record is not None else empty_recovery_state()
     assert not child_state.sources and not child_state.nodes and not child_state.outputs
-
-
-@pytest.mark.asyncio
-async def test_rootless_prior_blocker_survives_version_changed_turn_without_decision(tmp_path):
-    from tests.unit.web.sessions.test_routes import _make_app, _make_composer_mock
-    from tests.unit.web.sessions.test_run_composer_turn import _run, _running_job
-
-    app, service = _make_app(tmp_path)
-    snapshot_factory = app.state.plugin_snapshot_factory
-    session = await service.create_session("alice", "Rootless prior review", "local")
-    async with _running_job(app, service, session.id, kind="compose_message", content="Review") as job:
-        store = (app.state.session_engine, service.session_operation_authority, job.authority, service, session.id)
-        await service.add_message_with_transcript(
-            session.id,
-            "user",
-            job.turn.request.content,
-            operation_id=UUID(job.turn.operation_id),
-            requested_state_id=None,
-            composition_state_id=None,
-            writer_principal="route_user_message",
-            session_operation_context=job.lease.context,
-            running=job.running,
-        )
-        prior = blocked(store, job.running, None, cause=AdvisorBlockCause.GRAPH_REJECTED)
-        await finish(store, job.running, prior)
-    app.state.plugin_snapshot_factory = snapshot_factory
-    from elspeth.web.sessions.routes._helpers import _durable_completion_gates
-
-    assert parse_completion_gates({"completion_gates": await _durable_completion_gates(service, session.id)}) == prior.gates
-    changed = empty_recovery_state().with_metadata({"name": "An authored revision"})
-    composer = _make_composer_mock("The draft changed; review is still pending.", state=changed)
-    assert composer.compose.return_value.advisor_gate_decision is None
-    app.state.composer_service = composer
-    async with _running_job(app, service, session.id, kind="compose_message", content="Rename the draft") as job:
-        terminal = await _run(app, job)
-    assert terminal.status == "completed"
-    composer.compose.assert_awaited_once()
-    current = await service.get_current_state(session.id)
-    assert current.version == 1 and current.review_projection is None
-    assert state_from_record(current).metadata == changed.metadata
-    assert parse_completion_gates(current.composer_meta) == prior.gates
-    assert not current.is_valid
 
 
 @pytest.mark.asyncio
@@ -797,6 +820,26 @@ async def test_selected_recovery_retains_only_negative_effective_review(operatio
     if review_kind == "damaged_legacy":
         assert admission.context.malformed_head and admission.record is None
     intent = GraphRecoveryIntent("reset_to_turn_start", "I restored the draft; review is still needed.", None, "recovery-control")
+    if review_kind == "damaged_legacy":
+        # Ruling E (fcbb0be73): every stored gate envelope comes from a current
+        # writer, so a damaged one is Tier-1 corruption and refuses recovery
+        # before any state row is written; it is no longer read as no review.
+        with store[0].connect() as conn:
+            before = conn.execute(select(composition_states_table.c.id).order_by(composition_states_table.c.version)).scalars().all()
+        assert before[-1] == str(base.id)
+        with pytest.raises(AuditIntegrityError, match="malformed completion-gate metadata"):
+            await store[3].prepare_graph_recovery(
+                store[4],
+                context=admission.context,
+                intent=intent,
+                session_operation_context=running.session_operation_context,
+            )
+        with store[0].connect() as conn:
+            assert (
+                conn.execute(select(composition_states_table.c.id).order_by(composition_states_table.c.version)).scalars().all() == before
+            )
+        assert store[2].get(session_id=store[4], operation_id=running.claim.operation_id).status == "running"
+        return
     if review_kind == "malformed_fact":
         malformed = {"_kind": ADVISOR_GRAPH_REVIEW_AUDIT_KIND, "review": {"schema_version": 999}}
         await store[3].add_message(
@@ -832,7 +875,7 @@ async def test_selected_recovery_retains_only_negative_effective_review(operatio
     if review_kind in {"negative", "negative_absent"}:
         assert parse_completion_gates(recovery.data.composer_meta) == prior.gates
     else:
-        assert recovery.data.composer_meta is None, "positive review and damaged legacy gates grant no restored permission"
+        assert recovery.data.composer_meta is None, "a positive review grants no restored permission"
     terminal = await store[3].complete_composer_async_operation(
         running,
         assistant=ComposerOperationAssistantWrite(

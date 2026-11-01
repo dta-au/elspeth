@@ -261,7 +261,6 @@ def test_historical_checkpoint_keeps_credential_admission(surface):
 @asynccontextmanager
 async def _actual_p4(store, tmp_path, monkeypatch, mode):
     from elspeth.web.composer import tool_batch, turn_audit
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 
     descriptor = ("historical-metadata", "set_metadata", {"patch": {"name": "after"}}) if mode == "checkpoint" else None
     if mode == "checkpoint":
@@ -307,9 +306,7 @@ async def _actual_p4(store, tmp_path, monkeypatch, mode):
             assert data.batch.tool_outcomes[0].call is data.calls[0] and data.batch.tool_outcomes[0].response is None
             assert custody.call.index == 0 and custody.call.tool_call is data.calls[0] and owner.p4 is None
             monkeypatch.setattr(owner.service._require_sessions_service(), "_insert_chat_message", insert)
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             owner.observe_stop()
             with pytest.raises(BaseException) as caught:
                 await owner.finish_owed_prefix(owner.runtime.source.selected)

@@ -7,25 +7,40 @@ The historical native test names are retained across the planner retirement.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
-from sqlalchemy import select
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
+from elspeth.contracts.composer_mutation import ComposerMutationCeiling
+from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.web.auth.models import UserIdentity
+from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
 from elspeth.web.composer._required_paths_validator import _TOOL_REQUIRED_PATHS, _find_missing_required_paths
+from elspeth.web.composer.anti_anchor import AntiAnchorTracker
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.tool_batch import _pre_dispatch_argument_error
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.tool_batch import (
+    BatchAccumulator,
+    ToolBatchContext,
+    ToolBatchCustody,
+    ToolBatchProvenance,
+    _pre_dispatch_argument_error,
+    run_tool_batch,
+)
 from elspeth.web.composer.tool_error_payloads import arg_error_payload
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.generation import explain_validation_code
-from elspeth.web.sessions.models import chat_messages_table
-from tests.helpers.composer_common_sdk import CommonSDK, Step, assert_actual_audits
 from tests.helpers.composer_graphs import assert_isomorphic
-from tests.helpers.composer_operations import submit_and_settle
+from tests.helpers.session_fences import fenced_operation_context
+from tests.unit.web.composer._helpers import FakeChoice, FakeFunction, FakeLLMResponse, FakeMessage, FakeToolCall
 
 from .conftest import PARITY_FIXTURES, ParityEnv, _empty_state, rewrite_source_paths
 
@@ -56,45 +71,131 @@ def _last_tool_feedback(request: dict[str, Any]) -> dict[str, Any]:
     return json.loads(tool_messages[-1]["content"])
 
 
-def _repair_script(env: ParityEnv, bad: dict[str, Any], valid: dict[str, Any]) -> CommonSDK:
-    script = CommonSDK(
-        request=_LINEAR["intent"],
-        candidate=_REPLY,
-        steps=(
-            Step("primary", tool_name="set_pipeline", arguments={"pipeline": bad}),
-            Step("primary", tool_name="set_pipeline", arguments={"pipeline": valid}),
-            Step("primary", content=_REPLY),
-            Step("end"),
+def _set_pipeline_completion(call_id: str, pipeline: dict[str, Any]) -> _CallModelOutcome:
+    """One admitted primary completion carrying a set_pipeline call, as the parity CommonSDK scripted it."""
+    arguments = json.dumps({"pipeline": pipeline})
+    response = FakeLLMResponse(
+        choices=[
+            FakeChoice(
+                message=FakeMessage(content=None, tool_calls=[FakeToolCall(id=call_id, function=FakeFunction("set_pipeline", arguments))])
+            )
+        ]
+    )
+    return _CallModelOutcome(completion=_admit_composer_llm_completion(response))
+
+
+async def _dispatch_batch(
+    env: ParityEnv,
+    *,
+    call_model: _CallModelOutcome,
+    state: CompositionState,
+    llm_messages: list[dict[str, Any]],
+    recorder: BufferingRecorder,
+    session_id: UUID,
+    context: SessionOperationContext,
+) -> Any:
+    """Drive the shared dispatch owner ``tool_batch.run_tool_batch``.
+
+    Continuation runs the same ``_initialize/_prepare/_execute/_finish``
+    batch arms from its restored runtime
+    (``continuation_runtime.build_runtime_tool_batch_context``); the deleted V1
+    ``compose()`` reached them through ``_dispatch_tool_batch``.
+    """
+    service = env.composer
+    preferences = await env.sessions.get_composer_preferences(session_id)
+    ceiling = ComposerMutationCeiling(str(session_id), context.fence.operation_id, preferences.trust_mode)
+    ceiling.validate_context(context)
+    user = UserIdentity(user_id="alice", username="alice")
+    snapshot = env.app.state.plugin_snapshot_factory(user)
+    ctx = ToolBatchContext(
+        session_tools=service._session_tools,
+        provenance=ToolBatchProvenance(
+            model_identifier=service._model, provider=service._availability.provider, skill_hash=service._composer_skill_hash
         ),
+        custody=ToolBatchCustody(
+            data_dir=service._data_dir,
+            session_engine=service._session_engine,
+            secret_service=service._secret_service,
+            secret_wiring_policy=service._secret_wiring_policy,
+            max_blob_storage_per_session_bytes=service._settings.max_blob_storage_per_session_bytes,
+        ),
+        redaction_telemetry=service._redaction_telemetry,
+        preflight=service._preflight,
+        schema_disclosure=service._schema_disclosure,
+        advisor_checkpoint=service._advisor_checkpoint,
+        advisor_max_calls_per_compose=service._settings.composer_advisor_max_calls_per_compose,
+        advisor_timeout_seconds=service._settings.composer_advisor_timeout_seconds,
+        recorder=recorder,
+        anti_anchor=AntiAnchorTracker(),
+        discovery_cache={},
+        runtime_preflight_cache={},
+        session_id=str(session_id),
+        session_operation_context=context,
+        user_id="alice",
+        user_message_id=None,
+        user_message_content=_LINEAR["intent"],
+        current_state_id=None,
+        actor="alice",
+        initial_version=state.version,
+        deadline=asyncio.get_running_loop().time() + 60,
+        progress=None,
+        session_scope="parity-repair",
+        turn_sessions_service=env.sessions,
+        turn_session_uuid=session_id,
+        turn_preferences=preferences,
+        mutation_ceiling=ceiling,
+        review_required=not ceiling.permits_auto(preferences.trust_mode),
+        cancellation_requested=asyncio.Event(),
+        plugin_snapshot=snapshot,
+        policy_catalog=PolicyCatalogView(env.app.state.catalog_service, snapshot, env.app.state.operator_profile_registry),
+        tool_contract_dialect=service._planner_dialect,
+        session_operation_authority=env.sessions.session_operation_authority,
     )
-    script.bind(env.composer, env.monkeypatch)
-    env.monkeypatch.setattr("litellm.acompletion", script)
-    return script
+    acc = BatchAccumulator(state=state, last_validation=None, last_runtime_preflight=None, advisor_calls_used=0)
+    dispatch, _advisor_calls = await run_tool_batch(call_model=call_model, ctx=ctx, acc=acc, llm_messages=llm_messages)
+    return dispatch
 
 
-async def _drive_freeform_scripted(
-    env: ParityEnv, completion: CommonSDK, session: Any, *, expected_argument_error: ToolArgumentError | None = None
-) -> tuple[Any, Any]:
+async def _drive_freeform_batches(
+    env: ParityEnv, session: Any, bad: dict[str, Any], valid: dict[str, Any], *, expected_argument_error: ToolArgumentError | None = None
+) -> tuple[CompositionState, dict[str, Any]]:
+    """Reject ``bad`` then stage ``valid`` through the shared dispatch owner, then accept it.
+
+    Returns the committed state and the tool feedback the model would read
+    for the rejected candidate. The provider reply and END review that
+    follow a staged proposal are the Continuation completion owners (U-40).
+    """
     await env.sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
-    user_message = await env.sessions.add_message(session.id, "user", _LINEAR["intent"], writer_principal="route_user_message")
-    result = await env.composer.compose(
-        _LINEAR["intent"], [], _empty_state(), session_id=str(session.id), user_id="alice", user_message_id=str(user_message.id)
-    )
-    if result.raw_assistant_content is not None:
-        assert result.raw_assistant_content == _REPLY
-    else:
-        assert result.message == _REPLY
+    recorder = BufferingRecorder()
+    rejected_messages: list[dict[str, Any]] = []
+    state = _empty_state()
+    with fenced_operation_context(env.app.state.session_engine, str(session.id)) as context:
+        rejected_dispatch = await _dispatch_batch(
+            env,
+            call_model=_set_pipeline_completion("candidate-1", bad),
+            state=state,
+            llm_messages=rejected_messages,
+            recorder=recorder,
+            session_id=session.id,
+            context=context,
+        )
+        assert rejected_dispatch.plugin_crash is None
+        repaired_dispatch = await _dispatch_batch(
+            env,
+            call_model=_set_pipeline_completion("candidate-2", valid),
+            state=rejected_dispatch.state,
+            llm_messages=[],
+            recorder=recorder,
+            session_id=session.id,
+            context=context,
+        )
+        assert repaired_dispatch.plugin_crash is None
+    rejected, repaired = recorder.invocations
     if expected_argument_error is not None:
-        rejected, repaired = result.tool_invocations
         assert rejected.status is ComposerToolStatus.ARG_ERROR
         assert rejected.error_class == type(expected_argument_error).__name__
         assert rejected.error_category is expected_argument_error.category
-        assert repaired.status is ComposerToolStatus.SUCCESS
-    completion.assert_done()
-    assert completion.phases == ["end"]
-    assert_actual_audits(
-        env.app.state.session_engine, completion.requests, ("success", "success", "success", "success"), session_id=str(session.id)
-    )
+    assert repaired.status is ComposerToolStatus.SUCCESS
     # The rejected and pending candidates have not changed the authoritative graph.
     assert await env.sessions.get_current_state(session.id) is None
     proposals = await env.sessions.list_composition_proposals(session.id, status="pending")
@@ -106,15 +207,7 @@ async def _drive_freeform_scripted(
             f"/api/sessions/{session.id}/proposals/{proposal.id}/accept", json={"draft_hash": proposal.pipeline_metadata.draft_hash}
         )
     assert response.status_code == 200, response.text
-    return await env._committed_state(session.id), proposal
-
-
-def _disposition_rows(engine: Any) -> list[Any]:
-    with engine.connect() as conn:
-        rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    return [
-        row for row in rows if row.role == "audit" and row.tool_calls and row.tool_calls[0].get("_kind") == "planner_failure_disposition"
-    ]
+    return await env._committed_state(session.id), _last_tool_feedback({"messages": rejected_messages})
 
 
 @pytest.mark.asyncio
@@ -142,66 +235,10 @@ async def test_freeform_one_repair_converges_to_reference_graph(parity_env: Pari
     # This arm owns its display text (tool_batch.py), separately from the S
     # serializer. Preserve every compiled path, including shared ancestors.
     expected = {"error": f"Tool 'set_pipeline' missing required argument(s): {', '.join(missing)}"}
-    completion = _repair_script(parity_env, malformed, valid)
-
-    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session, expected_argument_error=expected_error)
+    committed, feedback = await _drive_freeform_batches(parity_env, session, malformed, valid, expected_argument_error=expected_error)
 
     assert_isomorphic(committed, reference, left="freeform-one-repair:linear_transform", right="reference")
-    assert _last_tool_feedback(completion.requests[1]) == expected
-
-
-@pytest.mark.asyncio
-async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(parity_env: ParityEnv) -> None:
-    """The existing common call allowance bounds repeated failed tool attempts.
-
-    This ports the public bounded-failure control; the retired hatch and its
-    planner repair counter are deliberately not represented as live evidence.
-    """
-    bounded = parity_env.app.state.settings.model_copy(update={"composer_planner_max_provider_calls": 2})
-    # The routed turn captures its request budget from mounted settings before
-    # compose reuses that owner, so both real suppliers need the same policy.
-    parity_env.monkeypatch.setattr(parity_env.app.state, "settings", bounded)
-    parity_env.monkeypatch.setattr(parity_env.composer, "_settings", bounded)
-    assert parity_env.app.state.settings is parity_env.composer._settings is bounded
-    async with parity_env._client() as client:
-        created = await client.post("/api/sessions", json={"title": "freeform repair exhaustion"})
-        assert created.status_code == 201, created.text
-        session_id = created.json()["id"]
-        valid = _valid_pipeline(parity_env, _LINEAR, session_id)
-        malformed = _malformed_missing_edges(valid)
-        completion = CommonSDK(
-            request=_LINEAR["intent"],
-            candidate=_REPLY,
-            steps=(
-                Step("primary", tool_name="set_pipeline", arguments={"pipeline": malformed}),
-                Step("primary", tool_name="set_pipeline", arguments={"pipeline": malformed}),
-            ),
-        )
-        completion.bind(parity_env.composer, parity_env.monkeypatch)
-        parity_env.monkeypatch.setattr("litellm.acompletion", completion)
-        settled = await submit_and_settle(
-            client,
-            parity_env.app,
-            path=f"/api/sessions/{session_id}/messages",
-            body={"content": _LINEAR["intent"], "operation_id": str(uuid4()), "state_id": None},
-        )
-
-    status, body = settled.error()
-    assert status == 502, settled.final.text
-    assert body["detail"]["error_type"] == "composer_planner_failure"
-    assert body["detail"]["failure_code"] == "invalid_provider_response"
-    assert body["detail"]["planner_code"] == "PROVIDER_CALLS_EXHAUSTED"
-    completion.assert_done()
-    assert completion.phases == []
-    assert_actual_audits(parity_env.app.state.session_engine, completion.requests, ("success", "success"), session_id=session_id)
-    rows = _disposition_rows(parity_env.app.state.session_engine)
-    assert len(rows) == 1
-    envelope = rows[0].tool_calls[0]
-    assert envelope["failure_code"] == "invalid_provider_response"
-    assert envelope["planner_code"] == "PROVIDER_CALLS_EXHAUSTED"
-    assert envelope["surface"] == "freeform"
-    assert await parity_env.sessions.get_current_state(UUID(session_id)) is None
-    assert await parity_env.sessions.list_composition_proposals(UUID(session_id)) == []
+    assert feedback == expected
 
 
 @pytest.mark.asyncio
@@ -211,12 +248,9 @@ async def test_freeform_policy_denied_candidate_is_rejected_with_allowlisted_sha
     valid = _valid_pipeline(parity_env, _LINEAR, str(session.id))
     denied = _policy_denied_variant(valid)
     require_schema_valid_arguments("set_pipeline", denied)
-    completion = _repair_script(parity_env, denied, valid)
-
-    committed, _proposal = await _drive_freeform_scripted(parity_env, completion, session)
+    committed, feedback = await _drive_freeform_batches(parity_env, session, denied, valid)
 
     assert_isomorphic(committed, reference, left="freeform-policy-rejection:linear_transform", right="reference")
-    feedback = _last_tool_feedback(completion.requests[1])
     assert feedback["success"] is False
     assert feedback["validation"]["is_valid"] is False
     (rejection,) = [entry for entry in feedback["validation"]["errors"] if entry["error_code"] == "plugin_not_enabled"]

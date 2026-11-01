@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import Engine, func, insert, select, text
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import composition_state_data, stored_default_pipeline_metadata
+from tests.helpers.composition_state import composition_state_data, stamped_state_values, stored_default_pipeline_metadata
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
@@ -63,21 +63,23 @@ def _seed_run_and_blob(
     with engine.begin() as conn:
         conn.execute(
             insert(composition_states_table).values(
-                id=str(state_id),
-                session_id=str(session_id),
-                version=1,
-                source=None,
-                sources=None,
-                nodes=None,
-                edges=None,
-                outputs=None,
-                metadata_=stored_default_pipeline_metadata(),
-                is_valid=True,
-                validation_errors=None,
-                composer_meta=None,
-                created_at=now,
-                derived_from_state_id=None,
-                provenance="session_seed",
+                **stamped_state_values(
+                    id=str(state_id),
+                    session_id=str(session_id),
+                    version=1,
+                    source=None,
+                    sources=None,
+                    nodes=None,
+                    edges=None,
+                    outputs=None,
+                    metadata_=stored_default_pipeline_metadata(),
+                    is_valid=True,
+                    validation_errors=None,
+                    composer_meta=None,
+                    created_at=now,
+                    derived_from_state_id=None,
+                    provenance="session_seed",
+                )
             )
         )
         conn.execute(

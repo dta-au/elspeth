@@ -41,7 +41,7 @@ from elspeth.web.required_work import RequiredWorkSource
 from elspeth.web.secrets.server_store import ServerSecretStore
 from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
-from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error, request_cancelled_error
+from elspeth.web.sessions.composer_operation_errors import project_composer_operation_error
 from elspeth.web.sessions.composer_operations import ComposerOperationError, ComposerOperationFenceLost
 from elspeth.web.sessions.continuation import ContinuationEvent, append_complete_snapshot
 from elspeth.web.sessions.continuation_p4 import (
@@ -419,9 +419,7 @@ async def test_terminal_p4_stop_after_real_issue_finishes_original_service_prefi
         refuse = operation_store[3].create_pending_interpretation_event
 
         async def stop_then_refuse(**kwargs):
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             owner.observe_stop()
             return await refuse(**kwargs)
 

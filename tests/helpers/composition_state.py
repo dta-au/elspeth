@@ -66,3 +66,29 @@ def stored_composer_meta(
     )
     stamped = prepare_content_publication(data, session_id=UUID(str(session_id)), state_id=UUID(str(state_id)), state_version=version)
     return envelope_state_column(deep_thaw(stamped.composer_meta))
+
+
+def stamped_state_values(**values: Any) -> dict[str, Any]:
+    """The values of one raw ``composition_states`` insert with its content publication stamped.
+
+    Pass exactly the column values the fixture inserts, in their stored
+    (enveloped) form. The content columns are unwrapped to compute the
+    version-bound publication the real writer stamps into ``composer_meta``;
+    any ``composer_meta`` the fixture supplies is kept as the authored part.
+    """
+    from elspeth.web.sessions.state_envelope import unwrap_state_column
+
+    return {
+        **values,
+        "composer_meta": stored_composer_meta(
+            session_id=values["session_id"],
+            state_id=values["id"],
+            version=values["version"],
+            sources=unwrap_state_column(values.get("sources")),
+            nodes=unwrap_state_column(values.get("nodes")),
+            edges=unwrap_state_column(values.get("edges")),
+            outputs=unwrap_state_column(values.get("outputs")),
+            metadata=unwrap_state_column(values["metadata_"]),
+            extra=unwrap_state_column(values.get("composer_meta")),
+        ),
+    }

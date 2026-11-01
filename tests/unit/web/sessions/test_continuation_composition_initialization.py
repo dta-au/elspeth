@@ -706,9 +706,7 @@ async def test_cancelled_ready_cannot_publish_compose_under_owed_relief(operatio
     running, service, work, ready, sdk = await ready_case(operation_store, tmp_path, monkeypatch, paid=True)
     try:
         assert not (await initialization._read_source(service=service, authority=operation_store[2], selected=ready, work=work)).initialized
-        operation_store[2].request_cancel(
-            session_id=operation_store[4], operation_id=running.claim.operation_id, cancelled_failure=operations.cancelled
-        )
+        operation_store[2].request_cancel(session_id=operation_store[4], operation_id=running.claim.operation_id)
         before = recovery_rows(operation_store[0])
         with pytest.raises(ComposerOperationCancelledDuringTurn):
             await construct(operation_store, running, service, work, ready)

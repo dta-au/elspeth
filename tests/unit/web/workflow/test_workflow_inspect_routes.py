@@ -23,6 +23,7 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.routes.workflow.inspect import create_workflow_inspect_router
 from elspeth.web.sessions.state_envelope import envelope_state_column
 from tests.fixtures.identities import ensure_test_identity
+from tests.helpers.composition_state import stamped_state_values
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 STATE = "22222222-2222-4222-8222-222222222222"
@@ -58,16 +59,18 @@ def app(closed_local_app: Any) -> Any:
         )
         conn.execute(
             insert(composition_states_table).values(
-                id=STATE,
-                session_id=SESSION,
-                version=1,
-                provenance="session_seed",
-                created_at=now,
-                sources=envelope_state_column({}),
-                nodes=envelope_state_column([]),
-                edges=envelope_state_column([]),
-                outputs=envelope_state_column([]),
-                metadata_=envelope_state_column({"name": "demo", "description": ""}),
+                **stamped_state_values(
+                    id=STATE,
+                    session_id=SESSION,
+                    version=1,
+                    provenance="session_seed",
+                    created_at=now,
+                    sources=envelope_state_column({}),
+                    nodes=envelope_state_column([]),
+                    edges=envelope_state_column([]),
+                    outputs=envelope_state_column([]),
+                    metadata_=envelope_state_column({"name": "demo", "description": ""}),
+                )
             )
         )
         conn.execute(

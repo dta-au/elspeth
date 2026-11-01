@@ -14,6 +14,7 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer._compose_loop_carriers import _AdvisorCallSuccess, _AdvisorFirstPartyFailure
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.continuation_message_builders import build_service_initial_messages
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.prompt_guard import PromptGuardMount, PromptGuardRefused, prompt_guard_user_scope
 from elspeth.web.composer.prompts import STATE_CONTEXT_PREFIX
@@ -221,12 +222,16 @@ def test_primary_view_uses_real_session_and_current_graph(invocation, monkeypatc
     operation = owner.required_work.coordinator.authority.context
     service = _guarded_service(invocation, monkeypatch)
     state = replace(_empty_state(), metadata=PipelineMetadata(description="x" * 3_000))
-    messages = service._build_messages(
-        [],
-        state,
-        "Inspect the current graph.",
+    plugin_snapshot, policy_catalog = service._policy_context.build("alice")
+    messages = build_service_initial_messages(
+        service,
+        chat_history=[],
+        state=state,
+        user_message="Inspect the current graph.",
         session_id=operation.fence.session_id,
         user_id="alice",
+        plugin_snapshot=plugin_snapshot,
+        policy_catalog=policy_catalog,
         session_operation_context=operation,
     )
     context = next(message["content"] for message in messages if message["content"].startswith(STATE_CONTEXT_PREFIX))
@@ -308,13 +313,17 @@ def test_primary_view_refuses_a_different_session_before_rendering(invocation, m
     _engine, _sessions, owner, coordinator = invocation
     operation = owner.required_work.coordinator.authority.context
     service = _guarded_service(invocation, monkeypatch)
+    plugin_snapshot, policy_catalog = service._policy_context.build("alice")
     with pytest.raises(AuditIntegrityError, match="session"):
-        service._build_messages(
-            [],
-            _empty_state(),
-            "Inspect the graph.",
+        build_service_initial_messages(
+            service,
+            chat_history=[],
+            state=_empty_state(),
+            user_message="Inspect the graph.",
             session_id="00000000-0000-0000-0000-000000000001",
             user_id="alice",
+            plugin_snapshot=plugin_snapshot,
+            policy_catalog=policy_catalog,
             session_operation_context=operation,
         )
     coordinator.assert_completed()

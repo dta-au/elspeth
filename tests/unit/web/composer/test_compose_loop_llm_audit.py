@@ -7,12 +7,13 @@ import json
 import time
 from collections.abc import Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -21,15 +22,15 @@ from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import llm_response_parsing as llm_response_parsing_module
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record, token_usage_from_response
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerServiceError
-from elspeth.web.composer.service import ComposerAvailability
-from elspeth.web.composer.state import CompositionState, PipelineMetadata, ValidationSummary
-from elspeth.web.composer.tools import ToolResult
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from tests.unit.web.composer._helpers import (
-    _composer_service_with_session,
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
 
@@ -443,12 +444,121 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
-@pytest.mark.asyncio
-async def test_text_only_success_records_llm_call_metadata() -> None:
-    service, session_id = _composer_service_with_session(
-        catalog=_mock_catalog(), settings=_make_settings(composer_pricing_model="openai/gpt-4o-2024-08-06")
-    )
+def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
+    """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
+    partially constructed provider object can legitimately carry: the boundary
+    answers None ("no extras"), it never propagates the AttributeError."""
+    from elspeth.core.llm_pricing import _pydantic_extra_fields
+
+    class _UnsetSlot:
+        __slots__ = ("__pydantic_extra__",)
+
+    assert _pydantic_extra_fields(_UnsetSlot()) is None
+
+
+# ---------------------------------------------------------------------------
+# Per-call audit records at the shared PRIMARY owner.
+#
+# Continuation's PRIMARY call and the turn-classification repair calls both go
+# through ProviderGateway's audited call body; ComposerServiceImpl.
+# _call_llm_before_deadline is the deadline/retry wrapper that attaches the
+# buffered records to a raised exception. These tests call that owner directly.
+# ---------------------------------------------------------------------------
+
+
+class _PrimaryOwner:
+    """A real fenced COMPOSE context, required-work turn binding and provider owner."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        import structlog
+
+        from elspeth.web.coordination.contracts import SessionOperationKind
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.schema import initialize_session_schema
+        from elspeth.web.sessions.service import SessionServiceImpl
+        from elspeth.web.sessions.telemetry import build_sessions_telemetry
+        from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
+
+        self.engine = create_session_engine(f"sqlite:///{tmp_path / 'llm-audit-sessions.db'}")
+        initialize_session_schema(self.engine)
+        with self.engine.begin() as connection:
+            ensure_test_identity(connection, identity_id="alice")
+            grant_test_pipeline_user(connection, identity_id="alice")
+        self.authority = SQLiteLocalSessionOperationAuthority(self.engine)
+        self.sessions = SessionServiceImpl(
+            self.engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.llm-audit"),
+            session_operation_authority=self.authority,
+        )
+        session = self.authority.create_session_with_initial_fence(
+            user_id="alice", title="LLM audit", auth_provider_type="local", owner_instance_id="llm-audit-owner", lease_seconds=300
+        )
+        self.context = self.authority.acquire(
+            session_id=session.id, operation_kind=SessionOperationKind.COMPOSE, owner_instance_id="llm-audit-owner", lease_seconds=300
+        )
+
+    def service(self, **settings_overrides: Any) -> ComposerServiceImpl:
+        return ComposerServiceImpl.for_trained_operator(
+            catalog=_mock_catalog(),
+            settings=_make_settings(**settings_overrides),
+            sessions_service=self.sessions,
+            session_engine=self.engine,
+        )
+
+    def provider_owner(self) -> Any:
+        from elspeth.web.composer.provider_quota import ProviderInvocationOwner
+        from elspeth.web.required_work import (
+            RequiredAuthorityKind,
+            RequiredWorkAuthority,
+            RequiredWorkBinding,
+            RequiredWorkCoordinator,
+            RequiredWorkRole,
+        )
+
+        coordinator = RequiredWorkCoordinator(
+            RequiredWorkAuthority(RequiredAuthorityKind.SYNCHRONOUS_COMPOSE, self.context, invocation_id=str(uuid4()))
+        )
+        return ProviderInvocationOwner(service=self.sessions, required_work=RequiredWorkBinding(coordinator, 0, 0, RequiredWorkRole.TURN))
+
+    def close(self) -> None:
+        self.authority.release(self.context)
+        self.engine.dispose()
+
+
+@pytest.fixture
+def primary(tmp_path: Path):
+    owner = _PrimaryOwner(tmp_path)
+    try:
+        yield owner
+    finally:
+        owner.close()
+
+
+async def _primary_call(
+    primary: _PrimaryOwner, *, user: str = "Build a CSV pipeline", **settings_overrides: Any
+) -> tuple[Any, BufferingRecorder]:
+    service = primary.service(**settings_overrides)
+    recorder = BufferingRecorder()
     state = _empty_state()
+    completion = await service._call_llm_before_deadline(
+        [{"role": "user", "content": user}],
+        composer_loop_tool_definitions(service._planner_dialect),
+        state,
+        state.version,
+        asyncio.get_running_loop().time() + 30,
+        recorder,
+        composition_turns_used=0,
+        discovery_turns_used=0,
+        failed_turn=None,
+        provider_owner=primary.provider_owner(),
+    )
+    return completion, recorder
+
+
+@pytest.mark.asyncio
+async def test_text_only_success_records_llm_call_metadata(primary: _PrimaryOwner) -> None:
     llm_response = _make_llm_response(content="Done.")
     requests: list[dict[str, Any]] = []
 
@@ -457,19 +567,11 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
         return llm_response
 
     with patch("litellm.acompletion", new_callable=AsyncMock, side_effect=complete) as mock_acomp:
-        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
+        _completion, recorder = await _primary_call(primary, composer_pricing_model="openai/gpt-4o-2024-08-06")
 
-    # New contract (post elspeth-861b0c58f5): model prose preserved verbatim,
-    # system suffix appended; the synthetic [ELSPETH-SYSTEM] marker is the
-    # operator-facing signal, not a wholesale replacement of the model's text.
-    assert result.message.startswith("Done.")
-    assert "[ELSPETH-SYSTEM]" in result.message
-    assert result.raw_assistant_content == "Done."
-    # A no-tool reply without an interpretation-review failure needs no repair.
-    # Every physical call still retains its exact request and provider metadata.
-    assert mock_acomp.call_count == len(result.llm_calls) == 1
-    assert result.repair_turns_used == 0
-    for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
+    # Every physical call retains its exact request and provider metadata.
+    assert mock_acomp.call_count == len(recorder.llm_calls) == 1
+    for call, request_kwargs in zip(recorder.llm_calls, requests, strict=True):
         assert call.status is ComposerLLMCallStatus.SUCCESS
         assert call.model_requested == "openrouter/openai/gpt-5.5"
         assert call.model_returned == "provider/model-returned"
@@ -485,23 +587,19 @@ async def test_text_only_success_records_llm_call_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_success_records_provider_cost_from_usage_metadata() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    state = _empty_state()
+async def test_success_records_provider_cost_from_usage_metadata(primary: _PrimaryOwner) -> None:
     llm_response = _make_llm_response(content="Done.", cost=0.0037)
 
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
+        _completion, recorder = await _primary_call(primary)
 
-    call = result.llm_calls[0]
+    call = recorder.llm_calls[0]
     assert call.provider_cost == 0.0037
     assert call.provider_cost_source == "response_usage.cost"
 
 
 @pytest.mark.asyncio
-async def test_success_records_provider_reasoning_metadata() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    state = _empty_state()
+async def test_success_records_provider_reasoning_metadata(primary: _PrimaryOwner) -> None:
     reasoning_details = [{"type": "reasoning.text", "text": "selected set_pipeline"}]
     thinking_blocks = [{"type": "thinking", "thinking": "checked required output options", "signature": "synthetic-native-signature"}]
     llm_response = _make_llm_response(
@@ -514,9 +612,9 @@ async def test_success_records_provider_reasoning_metadata() -> None:
     )
 
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
+        _completion, recorder = await _primary_call(primary)
 
-    call = result.llm_calls[0]
+    call = recorder.llm_calls[0]
     payload = call.to_dict()
     assert call.reasoning_tokens == 12
     assert call.reasoning_content == "openrouter native reasoning"
@@ -525,102 +623,33 @@ async def test_success_records_provider_reasoning_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_malformed_provider_cost_is_recorded_as_unavailable() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    state = _empty_state()
+async def test_malformed_provider_cost_is_recorded_as_unavailable(primary: _PrimaryOwner) -> None:
     llm_response = _make_llm_response(content="Done.", cost="not-a-number")
 
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response):
-        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
+        _completion, recorder = await _primary_call(primary)
 
-    call = result.llm_calls[0]
+    call = recorder.llm_calls[0]
     assert call.provider_cost is None
     assert call.provider_cost_source == "not_available"
 
 
 @pytest.mark.asyncio
-async def test_unset_sampling_is_omitted_and_reflected_in_audit() -> None:
-    service, session_id = _composer_service_with_session(
-        catalog=_mock_catalog(),
-        settings=_make_settings(composer_model="anthropic/claude-3-5-sonnet-20241022"),
-    )
-    state = _empty_state()
+async def test_unset_sampling_is_omitted_and_reflected_in_audit(primary: _PrimaryOwner) -> None:
     llm_response = _make_llm_response(content="Done.")
 
     with patch("litellm.acompletion", new_callable=AsyncMock, return_value=llm_response) as mock_acomp:
-        result = await service.compose("Build a CSV pipeline", [], state, session_id=session_id)
+        _completion, recorder = await _primary_call(primary, composer_model="anthropic/claude-3-5-sonnet-20241022")
 
     request_kwargs = mock_acomp.call_args.kwargs
     assert "temperature" not in request_kwargs
     assert "seed" not in request_kwargs
-    assert result.llm_calls[0].temperature is None
-    assert result.llm_calls[0].seed is None
+    assert recorder.llm_calls[0].temperature is None
+    assert recorder.llm_calls[0].seed is None
 
 
 @pytest.mark.asyncio
-async def test_tool_call_then_final_response_records_both_llm_calls() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    state = _empty_state()
-    tool_turn = _make_llm_response(
-        tool_calls=[
-            {
-                "id": "call-1",
-                "name": "set_metadata",
-                "arguments": {"patch": {"name": "After tool"}},
-            }
-        ],
-        request_id="chatcmpl-tool",
-    )
-    final_turn = _make_llm_response(content="Pipeline updated.", request_id="chatcmpl-final")
-    mutated_state = replace(state, metadata=PipelineMetadata(name="After tool"), version=2)
-    tool_result = ToolResult(
-        success=True,
-        updated_state=mutated_state,
-        validation=ValidationSummary(is_valid=True, errors=(), warnings=(), suggestions=(), semantic_contracts=()),
-        affected_nodes=(),
-    )
-    responses = iter((tool_turn, final_turn))
-    requests: list[dict[str, Any]] = []
-
-    async def complete(**kwargs: Any) -> _FakeLLMResponse:
-        requests.append(deepcopy(kwargs))
-        return next(responses)
-
-    with (
-        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=complete) as mock_acomp,
-        patch("elspeth.web.composer.tool_batch.execute_tool", return_value=tool_result),
-        patch.object(service._preflight, "cached_runtime_preflight", new_callable=AsyncMock, return_value=_passing_preflight()),
-    ):
-        result = await service.compose("Set a name", [], state, session_id=session_id)
-
-    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
-
-    raw = "Pipeline updated."
-    notice = (
-        "Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions. "
-        "There are net authored changes from the starting draft. Checkpoint evidence does not establish task completion."
-    )
-    assert result.raw_assistant_content == raw
-    assert result.message == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
-    assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
-        AssistantTextSegment(raw),
-        TrustedSystemNoticeSegment(notice),
-    )
-    assert [call.provider_request_id for call in result.llm_calls] == ["chatcmpl-tool", "chatcmpl-final"]
-    assert [call.status for call in result.llm_calls] == [ComposerLLMCallStatus.SUCCESS, ComposerLLMCallStatus.SUCCESS]
-    assert len(result.tool_invocations) == 1
-    assert mock_acomp.call_count == len(result.llm_calls) == len(requests) == 2
-    assert result.llm_calls[0].messages_hash != result.llm_calls[1].messages_hash
-    for call, request_kwargs in zip(result.llm_calls, requests, strict=True):
-        assert call.messages_hash == stable_hash(request_kwargs["messages"])
-        assert call.tools_spec_hash == stable_hash(request_kwargs["tools"])
-
-
-@pytest.mark.asyncio
-async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    state = _empty_state()
-
+async def test_deadline_timeout_records_llm_call_on_convergence_error(primary: _PrimaryOwner) -> None:
     async def timeout_llm(*_args: Any, **_kwargs: Any) -> _FakeLLMResponse:
         raise TimeoutError
 
@@ -628,7 +657,7 @@ async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
         patch("litellm.acompletion", side_effect=timeout_llm),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        await service.compose("Hello", [], state, session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     assert exc_info.value.budget_exhausted == "timeout"
     assert len(exc_info.value.llm_calls) == 1
@@ -636,17 +665,16 @@ async def test_deadline_timeout_records_llm_call_on_convergence_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bad_request_records_redacted_llm_call_on_service_error() -> None:
+async def test_bad_request_records_redacted_llm_call_on_service_error(primary: _PrimaryOwner) -> None:
     from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
     bad_request = LiteLLMBadRequestError(message="bad request leaked detail", model="bad", llm_provider="test")
 
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, side_effect=bad_request),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     assert str(exc_info.value) == "LLM request rejected (BadRequestError)"
     llm_calls = _captured_llm_calls(exc_info.value)
@@ -658,18 +686,12 @@ async def test_bad_request_records_redacted_llm_call_on_service_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unclassified_provider_exception_records_api_error_call() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-
+async def test_unclassified_provider_exception_records_api_error_call(primary: _PrimaryOwner) -> None:
     with (
-        patch(
-            "litellm.acompletion",
-            new_callable=AsyncMock,
-            side_effect=ValueError("unexpected codec failure"),
-        ),
+        patch("litellm.acompletion", new_callable=AsyncMock, side_effect=ValueError("unexpected codec failure")),
         pytest.raises(ValueError, match="unexpected codec failure") as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -680,15 +702,14 @@ async def test_unclassified_provider_exception_records_api_error_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_choices_records_malformed_response() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+async def test_empty_choices_records_malformed_response(primary: _PrimaryOwner) -> None:
     empty_response = _FakeLLMResponse(choices=[], usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3))
 
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, return_value=empty_response),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -730,24 +751,18 @@ async def test_empty_choices_records_malformed_response() -> None:
         ),
     ],
 )
-async def test_malformed_nonempty_response_records_malformed_not_success(case: str, choice: Any) -> None:
+async def test_malformed_nonempty_response_records_malformed_not_success(primary: _PrimaryOwner, case: str, choice: Any) -> None:
     """Regression for elspeth-b6be9e991f: a nonempty-but-malformed provider
     response must classify as MALFORMED_RESPONSE before the audit wrapper
-    records SUCCESS — previously only choices cardinality was validated, so
-    the caller crashed dereferencing message/content/tool_calls after durable
-    audit evidence had already recorded the call as successful.
+    records SUCCESS.
     """
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    malformed = _FakeLLMResponse(
-        choices=[choice],
-        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3),
-    )
+    malformed = _FakeLLMResponse(choices=[choice], usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3))
 
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, return_value=malformed),
         pytest.raises(ComposerServiceError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
@@ -757,28 +772,61 @@ async def test_malformed_nonempty_response_records_malformed_not_success(case: s
 
 
 @pytest.mark.asyncio
-async def test_cancelled_model_call_records_cancelled_status() -> None:
-    service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
+async def test_cancelled_model_call_records_cancelled_status(primary: _PrimaryOwner) -> None:
     cancelled = asyncio.CancelledError()
 
     with (
         patch("litellm.acompletion", new_callable=AsyncMock, side_effect=cancelled),
         pytest.raises(asyncio.CancelledError) as exc_info,
     ):
-        await service.compose("Hello", [], _empty_state(), session_id=session_id)
+        await _primary_call(primary, user="Hello")
 
     llm_calls = _captured_llm_calls(exc_info.value)
     assert len(llm_calls) == 1
     assert llm_calls[0].status is ComposerLLMCallStatus.CANCELLED
 
 
-def test_pydantic_extra_unset_slot_reads_as_no_extras_without_raising() -> None:
-    """A declared-but-unset ``__pydantic_extra__`` slot is third-party state a
-    partially constructed provider object can legitimately carry: the boundary
-    answers None ("no extras"), it never propagates the AttributeError."""
-    from elspeth.core.llm_pricing import _pydantic_extra_fields
+@pytest.mark.asyncio
+async def test_tool_call_then_final_response_records_both_llm_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.web.composer.no_tool_policy import AssistantTextSegment, TrustedSystemNoticeSegment, visible_message_segments
+    from tests.helpers.continuation_app import ScriptedSDK, continuation_app, end_admit, install_sdk, submit_and_settle, tool_call
 
-    class _UnsetSlot:
-        __slots__ = ("__pydantic_extra__",)
-
-    assert _pydantic_extra_fields(_UnsetSlot()) is None
+    sdk = ScriptedSDK(
+        [
+            ("primary", lambda app: (None, [tool_call(app, "call-1", "set_metadata", {"patch": {"name": "After tool"}})])),
+            ("primary", ("Pipeline updated.", None)),
+            ("end", end_admit()),
+        ]
+    )
+    install_sdk(monkeypatch, sdk)
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sdk.app_ref.append(harness.app)
+        snapshot = await submit_and_settle(harness, {"content": "Set a name", "operation_id": str(uuid4()), "state_id": None})
+        assert snapshot.status == "completed", (snapshot, sdk.roles)
+        assert snapshot.result is not None
+        raw = "Pipeline updated."
+        notice = (
+            "Checkpoint save status: Verified checkpoint evidence covers 1 saved draft revisions. "
+            "There are net authored changes from the starting draft. Checkpoint evidence does not establish task completion."
+        )
+        message = snapshot.result.message
+        assert message.raw_content == raw
+        assert message.content == raw + "\n\n---\n\n[ELSPETH-SYSTEM] " + notice
+        assert visible_message_segments(content=message.content, raw_content=message.raw_content) == (
+            AssistantTextSegment(raw),
+            TrustedSystemNoticeSegment(notice),
+        )
+        rows = await harness.app.state.session_service.get_messages(harness.session_id, limit=None)
+        calls = [
+            envelope["call"]
+            for row in rows
+            for envelope in (row.tool_calls or ())
+            if envelope["_kind"] == "llm_call_audit" and envelope["call"]["model_requested"] == "test/model"
+        ]
+        primary_requests = [request for request in sdk.requests if request["role"] == "primary"]
+        assert len(calls) == len(primary_requests) == 2
+        assert [call["status"] for call in calls] == ["success", "success"]
+        assert calls[0]["messages_hash"] != calls[1]["messages_hash"]
+        for call, request_kwargs in zip(calls, primary_requests, strict=True):
+            assert call["messages_hash"] == stable_hash(request_kwargs["messages"])
+            assert call["tools_spec_hash"] == stable_hash(request_kwargs["tools"])

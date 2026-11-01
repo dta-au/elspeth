@@ -12,6 +12,7 @@ import copy
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -22,7 +23,8 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.capability_skill import CAPABILITY_CORE_NODE_GUIDANCE
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
-from tests.integration.web.composer.parity.conftest import PARITY_FIXTURES, ParityEnv, _empty_state
+from tests.helpers.continuation_app import continuation_app, install_sdk, submit_and_settle
+from tests.integration.web.composer.parity.conftest import PARITY_FIXTURES
 
 _SCHEMA_IDENTITY_GATE_MESSAGE = "Compose loop advertised pipeline schema differs from canonical"
 
@@ -123,37 +125,39 @@ class TestManifestSchemaIdentityGate:
 
 
 @pytest.mark.asyncio
-async def test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_graph(parity_env: ParityEnv, monkeypatch):
-    original = provider_gateway.wire_tool_definitions
+async def test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_graph(tmp_path, monkeypatch):
+    """A narrowed advertised schema refuses the Continuation request before SDK entry.
 
-    def narrowed(dialect):
-        tools = original(dialect)
-        _remove_fork_to(_advertised_pipeline(tools))
-        return tools
-
-    monkeypatch.setattr(provider_gateway, "wire_tool_definitions", narrowed)
-    fixture = _fixture("fork_coalesce")
-    session = await parity_env.sessions.create_session("alice", "Alice", "local")
-    parity_env._script(fixture, str(session.id))
-    await parity_env.sessions.update_composer_preferences(session.id, trust_mode="explicit_approve", density_default="high", actor="test")
-    user = await parity_env.sessions.add_message(session.id, "user", fixture["intent"], writer_principal="route_user_message")
+    Drives the production message route, worker and Continuation driver
+    (tests/helpers/continuation_app.py). Continuation builds the loop palette
+    per request (continuation_composition_initialization), so the identity
+    gate fires there, upstream of any provider call, graph or proposal.
+    """
     sdk_calls = []
 
     async def forbidden_sdk(**kwargs):
         sdk_calls.append(kwargs)
         raise AssertionError("Narrowed advertised schema must refuse before SDK entry")
 
-    monkeypatch.setattr("litellm.acompletion", forbidden_sdk)
-    with pytest.raises(AuditIntegrityError) as caught:
-        await parity_env.composer.compose(
-            fixture["intent"],
-            [],
-            _empty_state(),
-            session_id=str(session.id),
-            user_id="alice",
-            user_message_id=str(user.id),
-        )
-    assert str(caught.value) == _SCHEMA_IDENTITY_GATE_MESSAGE
-    assert sdk_calls == []
-    assert await parity_env.sessions.get_current_state(session.id) is None
-    assert await parity_env.sessions.list_composition_proposals(session.id, status="pending") == []
+    install_sdk(monkeypatch, forbidden_sdk)
+    fixture = _fixture("fork_coalesce")
+    async with continuation_app(tmp_path, monkeypatch) as harness:
+        sessions = harness.app.state.session_service
+        await sessions.update_composer_preferences(harness.session_id, trust_mode="explicit_approve", density_default="high", actor="test")
+        original = provider_gateway.wire_tool_definitions
+
+        def narrowed(dialect):
+            tools = original(dialect)
+            _remove_fork_to(_advertised_pipeline(tools))
+            return tools
+
+        monkeypatch.setattr(provider_gateway, "wire_tool_definitions", narrowed)
+        with pytest.raises(AuditIntegrityError) as caught:
+            provider_gateway.composer_loop_tool_definitions(harness.app.state.composer_service._planner_dialect)
+        assert str(caught.value) == _SCHEMA_IDENTITY_GATE_MESSAGE
+        snapshot = await submit_and_settle(harness, {"content": fixture["intent"], "operation_id": str(uuid4()), "state_id": None})
+        assert snapshot.status == "failed" and snapshot.error is not None, snapshot
+        assert snapshot.error.body["error_type"] == "audit_integrity_error"
+        assert sdk_calls == []
+        assert await sessions.get_current_state(harness.session_id) is None
+        assert await sessions.list_composition_proposals(harness.session_id, status="pending") == []

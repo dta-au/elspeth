@@ -55,11 +55,8 @@ def admit_continuation(store):
         request_id="continuation",
         base_state_id=None,
         request_json=request.model_dump_json(),
-        deadline_seconds=180,
         max_nonterminal=64,
         auth_provider_type="local",
-        lifecycle_version=2,
-        continuation_enabled=True,
         seed=seed,
     )
     assert fresh

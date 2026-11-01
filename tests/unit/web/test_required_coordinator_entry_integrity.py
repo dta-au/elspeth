@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -13,11 +13,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.required_work import RequiredAuthorityKind, RequiredWorkAuthority, RequiredWorkCoordinator
-from elspeth.web.sessions import composer_turn
-from elspeth.web.sessions.composer_operations import ComposerOperationClaim, ComposerOperationRunning
-from elspeth.web.sessions.composer_turn import ComposerBudgetAnchor, ComposerTurnInput, ComposerTurnObservation
 from elspeth.web.sessions.routes.composer import pipeline_settlement
-from elspeth.web.sessions.schemas import SendMessageRequest
 
 
 class _CoercingImpostor:
@@ -211,78 +207,6 @@ async def test_binding_refuses_coercive_corrupted_retained_owner() -> None:
     finally:
         lease._required_work = None
         await lease.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("public", [False, True])
-async def test_turn_foreign_owner_refused_before_binding_or_provider(monkeypatch: pytest.MonkeyPatch, public: bool) -> None:
-    context = _context()
-    lease = SessionOperationLease(_Authority(), context, lease_seconds=30, renew_interval_seconds=10)
-    impostor = _CoercingImpostor()
-    operation_id = str(uuid4())
-    running = ComposerOperationRunning(ComposerOperationClaim(UUID(context.fence.session_id), operation_id, "claim", 1), context)
-    turn = ComposerTurnInput(
-        UUID(context.fence.session_id),
-        operation_id,
-        "compose_message",
-        "actor",
-        SendMessageRequest(content="request", operation_id=operation_id, state_id=None),
-        None,
-        30.0,
-    )
-    observation = ComposerTurnObservation(required_work=impostor)
-    try:
-        with monkeypatch.context() as patch:
-            allocations = _no_task_allocations(patch)
-            entry = composer_turn.run_composer_turn if public else composer_turn._run_composer_turn
-            with pytest.raises(AuditIntegrityError, match="owned required-work coordinator"):
-                await entry(
-                    object(),
-                    turn,
-                    lease=lease,
-                    running=running,
-                    request_lifecycle=object(),
-                    observation=observation,
-                    budget_anchor=ComposerBudgetAnchor(30.0, 0.0),
-                )
-            assert allocations == []
-            _assert_untouched(impostor)
-    finally:
-        await lease.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("grouped", [False, True])
-async def test_public_turn_keeps_actual_owner_and_original_body_failure(monkeypatch: pytest.MonkeyPatch, grouped: bool) -> None:
-    context = _context()
-    coordinator = _coordinator(context)
-    lease = SessionOperationLease(_Authority(), context, lease_seconds=30, renew_interval_seconds=10)
-    body_error = RuntimeError("controlled body failure")
-    cancellation = asyncio.CancelledError("controlled original cancellation")
-    original = BaseExceptionGroup("controlled originals", [body_error, cancellation]) if grouped else body_error
-    observation = ComposerTurnObservation(required_work=coordinator)
-
-    async def body(*args: object, **kwargs: object) -> None:
-        assert lease.required_work is coordinator
-        assert observation.required_work is coordinator
-        raise original
-
-    monkeypatch.setattr(composer_turn, "_run_composer_turn", body)
-    try:
-        with pytest.raises(BaseException) as caught:
-            await composer_turn.run_composer_turn(
-                object(),
-                object(),
-                lease=lease,
-                running=object(),
-                request_lifecycle=object(),
-                observation=observation,
-                budget_anchor=ComposerBudgetAnchor(30.0, 0.0),
-            )
-        assert caught.value is original
-    finally:
-        await lease.close()
-    coordinator.assert_completed()
 
 
 @pytest.mark.asyncio

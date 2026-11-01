@@ -62,7 +62,7 @@ async def test_reap_once_recovers_released_v2_owner_before_claim(operation_store
 
 
 @pytest.mark.asyncio
-async def test_reaper_excludes_locally_owned_and_adoption_pending_jobs(operation_store, tmp_path, monkeypatch):
+async def test_reaper_excludes_locally_owned_jobs(operation_store, tmp_path, monkeypatch):
     worker, _, record, _, context, auxiliary, composer = reaper(operation_store, tmp_path)
     operation_store[1].release(context)
     key = record.session_id, record.operation_id
@@ -74,13 +74,10 @@ async def test_reaper_excludes_locally_owned_and_adoption_pending_jobs(operation
     try:
         assert await worker.reap_once() == 0
         del worker._jobs[key]
-        worker._adoption_recovery_pending.add(key)
-        assert await worker.reap_once() == 0 and restarts == ["required"]
-        worker._adoption_recovery_pending.remove(key)
         assert await worker.reap_once() == 1 and composer.calls == 0
+        assert restarts == []
     finally:
         worker._jobs.pop(key, None)
-        worker._adoption_recovery_pending.discard(key)
         auxiliary.dispose()
 
 

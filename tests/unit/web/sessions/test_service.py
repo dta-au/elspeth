@@ -38,8 +38,9 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationConflictError,
     ComposerOperationPreconditionRefused,
     ComposerOperationRunning,
-    composer_operation_request_hash,
+    composer_operation_admission_request_hash,
 )
+from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
@@ -59,7 +60,6 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
     CompositionValidationError,
-    MessageIngressFresh,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuditDraft,
@@ -72,7 +72,7 @@ from elspeth.web.sessions.schemas import SendMessageRequest
 from elspeth.web.sessions.service import QuarantineCleanupError
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import composition_state_data, stored_default_pipeline_metadata
+from tests.helpers.composition_state import composition_state_data, stamped_state_values, stored_default_pipeline_metadata
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -401,13 +401,15 @@ class TestRunEvents:
             seed_session_operation_fence(conn, session_id, owner_instance_id=service.session_operation_owner_instance_id)
             conn.execute(
                 insert(composition_states_table).values(
-                    metadata_=stored_default_pipeline_metadata(),
-                    id=str(state_id),
-                    session_id=str(session_id),
-                    version=1,
-                    is_valid=True,
-                    provenance="session_seed",
-                    created_at=created_at,
+                    **stamped_state_values(
+                        metadata_=stored_default_pipeline_metadata(),
+                        id=str(state_id),
+                        session_id=str(session_id),
+                        version=1,
+                        is_valid=True,
+                        provenance="session_seed",
+                        created_at=created_at,
+                    )
                 )
             )
             conn.execute(
@@ -1861,9 +1863,13 @@ class TestPagination:
 
 def _admit_durable_ingress(service, session_id, *, operation_id, content, requested_state_id):
     from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission, RepositoryRateLimitAuthority
+    from tests.helpers.continuation_policy import minimal_continuation_policy
 
     authority = ComposerAsyncOperationAuthority(
-        service._engine, owner_instance_id=service.session_operation_owner_instance_id, claim_lease_seconds=30
+        service._engine,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        claim_lease_seconds=30,
+        continuation_policy=minimal_continuation_policy(),
     )
     request = SendMessageRequest(operation_id=str(operation_id), content=content, state_id=requested_state_id)
     record, fresh = authority.admit(
@@ -1873,68 +1879,64 @@ def _admit_durable_ingress(service, session_id, *, operation_id, content, reques
         session_id=session_id,
         operation_id=request.operation_id,
         kind="compose_message",
-        request_hash=composer_operation_request_hash(session_id=session_id, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=session_id, kind="compose_message", request=request),
         actor_user_id="alice",
         request_id=None,
         base_state_id=requested_state_id,
         request_json=request.model_dump_json(),
-        deadline_seconds=180,
         max_nonterminal=64,
         auth_provider_type="local",
     )
     return authority, record, fresh
 
 
+_RUNNING: dict[tuple[str, str], tuple[ComposerAsyncOperationAuthority, ComposerOperationRunning]] = {}
+
+
 async def _durable_ingress(
     service, session_id, role, content, *, operation_id, requested_state_id, writer_principal, composition_state_id=None
 ):
-    authority, _record, fresh = _admit_durable_ingress(
+    """Admit, claim and start one segment, then write its reserved user row through Continuation ingress.
+
+    A failed ingress transaction leaves the same running segment with no bound
+    user row, so a same-key retry reuses that segment instead of starting another.
+    A replayed admission that nobody started yet claims and starts it here.
+    """
+    from elspeth.web.required_work import RequiredWorkSource
+    from tests.helpers.continuation_inventory import inventory_work
+
+    key = (str(session_id), str(operation_id))
+    authority, _record, _fresh = _admit_durable_ingress(
         service, session_id, operation_id=operation_id, content=content, requested_state_id=requested_state_id
     )
-    if fresh:
-        (claim,) = authority.claim_next(limit=1)
-        context = service.session_operation_authority.start_composer_async_operation(
+    if key not in _RUNNING:
+        (claim,) = authority.claim_segment(limit=1)
+        context = service.session_operation_authority.start_composer_segment(
             claim, owner_instance_id=service.session_operation_owner_instance_id, lease_seconds=30, auth_provider_type="local"
         )
-        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
-    else:
-        # A failed ingress transaction leaves the same running identity with
-        # no bound user, so its owner can retry this write without starting a job.
-        from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence
-        from elspeth.web.sessions.composer_operations import ComposerOperationClaim
-        from elspeth.web.sessions.models import composer_async_operations_table
-
-        with service._engine.connect() as conn:
-            row = conn.execute(
-                select(composer_async_operations_table).where(
-                    composer_async_operations_table.c.session_id == str(session_id),
-                    composer_async_operations_table.c.operation_id == str(operation_id),
-                )
-            ).one()
-        claim = ComposerOperationClaim(
-            session_id=session_id, operation_id=str(operation_id), claim_token=row.claim_token, attempt=row.attempt
+        _RUNNING[key] = (authority, ComposerOperationRunning(claim=claim, session_operation_context=context))
+    authority, running = _RUNNING[key]
+    selected = authority.load_continuation_snapshot(running)
+    sql, projection = inventory_work(running).reserve_pair(RequiredWorkSource.INGRESS_SQL, RequiredWorkSource.INGRESS_PROJECTION)
+    try:
+        result = await service.add_message_with_transcript(
+            session_id,
+            role,
+            content,
+            operation_id=operation_id,
+            requested_state_id=requested_state_id,
+            writer_principal=writer_principal,
+            composition_state_id=composition_state_id,
+            session_operation_context=running.session_operation_context,
+            running=running,
+            required_work=sql,
+            continuation=selected,
         )
-        context = SessionOperationContext(
-            fence=SessionOperationFence(
-                session_id=str(session_id),
-                operation_id=row.session_operation_id,
-                lease_token=row.session_operation_lease_token,
-                operation_epoch=row.session_operation_epoch,
-            ),
-            operation_kind=SessionOperationKind.COMPOSE,
-        )
-        running = ComposerOperationRunning(claim=claim, session_operation_context=context)
-    return await service.add_message_with_transcript(
-        session_id,
-        role,
-        content,
-        operation_id=operation_id,
-        requested_state_id=requested_state_id,
-        writer_principal=writer_principal,
-        composition_state_id=composition_state_id,
-        session_operation_context=context,
-        running=running,
-    )
+    except BaseException as error:
+        projection.complete_owned(error)
+        raise
+    projection.complete_owned()
+    return result
 
 
 class TestAddMessageWithTranscript:
@@ -2057,7 +2059,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(result, MessageIngressFresh)
+        assert isinstance(result, ContinuationIngressCheckpoint)
         record, transcript = result.message, result.transcript
         assert isinstance(transcript, tuple)
 
@@ -2104,7 +2106,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(retry, MessageIngressFresh)
+        assert isinstance(retry, ContinuationIngressCheckpoint)
         assert retry.message.sequence_no == 1
 
     @pytest.mark.asyncio
@@ -2121,7 +2123,7 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(fresh, MessageIngressFresh)
+        assert isinstance(fresh, ContinuationIngressCheckpoint)
         with engine.begin() as conn:
             with pytest.raises(IntegrityError), conn.begin_nested():
                 conn.execute(
@@ -2176,8 +2178,8 @@ class TestAddMessageWithTranscript:
             requested_state_id=None,
             writer_principal="route_user_message",
         )
-        assert isinstance(first_result, MessageIngressFresh)
-        assert isinstance(second_result, MessageIngressFresh)
+        assert isinstance(first_result, ContinuationIngressCheckpoint)
+        assert isinstance(second_result, ContinuationIngressCheckpoint)
         assert first_result.message.id != second_result.message.id
 
     @pytest.mark.asyncio
@@ -2195,7 +2197,7 @@ class TestAddMessageWithTranscript:
             composition_state_id=state.id,
             writer_principal="route_user_message",
         )
-        assert isinstance(result, MessageIngressFresh)
+        assert isinstance(result, ContinuationIngressCheckpoint)
         record, transcript = result.message, result.transcript
 
         assert record.composition_state_id == state.id
@@ -2284,7 +2286,7 @@ class TestAddMessageWithTranscript:
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
-                assert isinstance(result, MessageIngressFresh)
+                assert isinstance(result, ContinuationIngressCheckpoint)
                 record, transcript = result.message, result.transcript
 
                 # The pinned snapshot still cannot see the committed
@@ -2347,7 +2349,7 @@ class TestAddMessageWithTranscript:
                     requested_state_id=None,
                     writer_principal="route_user_message",
                 )
-                assert isinstance(result, MessageIngressFresh)
+                assert isinstance(result, ContinuationIngressCheckpoint)
                 record, transcript = result.message, result.transcript
             finally:
                 event.remove(engine, "before_cursor_execute", record_statement)

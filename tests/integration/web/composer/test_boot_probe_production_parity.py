@@ -15,26 +15,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
-import structlog
-from sqlalchemy.pool import StaticPool
 
 import elspeth.web.composer.provider_gateway as gateway_module
 from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_APP_REFERER, OPENROUTER_APP_TITLE
-from elspeth.web.composer.advisor_transcript import AdvisorTranscriptHistory
 from elspeth.web.composer.boot_probe import build_composer_probe_requests, probe_composer_config
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
-from elspeth.web.dependencies import create_catalog_service
-from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.advisor_review import parse_advisor_publication_review
-from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+from tests.helpers.continuation_app import continuation_app, install_sdk, submit_and_settle
+from tests.helpers.session_fences import fenced_operation_context
 
 _MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
 
@@ -111,10 +105,8 @@ async def _capture_production_requests(
     message: str,
     existing_graph: bool = False,
 ) -> list[dict[str, Any]]:
-    """Run one real ``compose()`` turn and return every LiteLLM request it made."""
-    requests, _composer, _result = await _run_production_turn(
-        tmp_path, monkeypatch, settings, message=message, existing_graph=existing_graph
-    )
+    """Run one real Continuation request and return every LiteLLM request it made."""
+    requests, _composer = await _run_production_turn(tmp_path, monkeypatch, settings, message=message, existing_graph=existing_graph)
     return requests
 
 
@@ -125,62 +117,19 @@ async def _run_production_turn(
     *,
     message: str,
     existing_graph: bool = False,
-) -> tuple[list[dict[str, Any]], ComposerServiceImpl, Any]:
-    """Run one real ``compose()`` turn; return its LiteLLM requests, the service and the result.
+) -> tuple[list[dict[str, Any]], ComposerServiceImpl]:
+    """Run one real Continuation request; return its LiteLLM requests and the service.
 
-    The common primary returns prose and the real END advisor reviews it.
+    Drives the production message route, worker and Continuation driver with
+    exactly ``settings`` (tests/helpers/continuation_app.py); only the physical
+    SDK is scripted. The common primary returns prose and the real END advisor
+    reviews it. Until U-40 lands Continuation has no END arm after a no-tool
+    reply, so the request fails after the primary and no advisor request is
+    made; callers needing the advisor request fail at that completion point.
     """
-    engine = create_session_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="parity-user")
-        grant_test_pipeline_user(conn, identity_id="parity-user")
-    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("parity-user", "Parity", "local")
-    state = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    current_state_id = None
-    if existing_graph:
-        source_path = tmp_path / "existing.csv"
-        source_path.write_text("name\nAda\n", encoding="utf-8")
-        state = CompositionState(
-            source=SourceSpec(
-                plugin="csv",
-                on_success="rows",
-                options={"path": str(source_path), "schema": {"mode": "observed"}},
-                on_validation_failure="discard",
-            ),
-            nodes=(),
-            edges=(),
-            outputs=(),
-            metadata=PipelineMetadata(),
-            version=1,
-        )
-        serialized = state.to_dict()
-        saved = await sessions.save_composition_state(
-            session.id,
-            CompositionStateData(
-                nodes=serialized["nodes"], sources=serialized["sources"], metadata_=serialized["metadata"], is_valid=False
-            ),
-            provenance="session_seed",
-        )
-        current_state_id = str(saved.id)
-    user_message = await sessions.add_message(session.id, "user", message, writer_principal="route_user_message")
-    advisor_history = AdvisorTranscriptHistory.from_records(
-        session_id=str(session.id),
-        actor_user_id="parity-user",
-        current_request_id=str(user_message.id),
-        request=message,
-        records=await sessions.get_messages(session.id),
-    )
     monkeypatch.setattr(
         "elspeth.web.composer.service.compute_availability",
         lambda **_kwargs: ComposerAvailability(available=True, provider="test", model=_MODEL, reason=None),
-    )
-    composer = ComposerServiceImpl.for_trained_operator(
-        create_catalog_service(),
-        settings,
-        sessions_service=sessions,
-        session_engine=engine,
     )
     requests: list[dict[str, Any]] = []
 
@@ -198,24 +147,43 @@ async def _run_production_turn(
             return _Response(choices=[_Choice(message=_Message(content=content, tool_calls=[]))], usage=_usage())
         return _Response(choices=[_Choice(message=_Message(content="I can help you build a pipeline.", tool_calls=[]))], usage=_usage())
 
-    monkeypatch.setattr("litellm.acompletion", completion)
-    # The integration conftest's real lease adapter binds this exact persisted
-    # session/service to required work and provider custody, then joins before
-    # closing the COMPOSE lease. Only the physical SDK is replaced above.
-    try:
-        result = await composer.compose(
-            message,
-            [],
-            state,
-            session_id=str(session.id),
-            current_state_id=current_state_id,
-            user_id="parity-user",
-            user_message_id=str(user_message.id),
-            advisor_history=advisor_history,
-        )
-    finally:
-        engine.dispose()
-    return requests, composer, result
+    install_sdk(monkeypatch, completion)
+    async with continuation_app(tmp_path, monkeypatch, **dict(settings)) as harness:
+        app = harness.app
+        assert app.state.settings == settings, "the production app must run exactly the compared settings"
+        sessions = app.state.session_service
+        state_id = None
+        if existing_graph:
+            source_path = tmp_path / "existing.csv"
+            source_path.write_text("name\nAda\n", encoding="utf-8")
+            state = CompositionState(
+                source=SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": str(source_path), "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                ),
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            )
+            serialized = state.to_dict()
+            with fenced_operation_context(app.state.session_engine, str(harness.session_id)) as context:
+                saved = await sessions.save_composition_state(
+                    harness.session_id,
+                    CompositionStateData(
+                        nodes=serialized["nodes"], sources=serialized["sources"], metadata_=serialized["metadata"], is_valid=False
+                    ),
+                    provenance="session_seed",
+                    session_operation_context=context,
+                )
+            state_id = str(saved.id)
+        await submit_and_settle(harness, {"content": message, "operation_id": str(uuid4()), "state_id": state_id})
+        composer = app.state.composer_service
+        assert type(composer) is ComposerServiceImpl
+    return requests, composer
 
 
 def _expected_planner_wire_requests(settings: WebSettings) -> dict[str, dict[str, Any]]:
@@ -422,7 +390,7 @@ async def test_loop_and_advisor_keep_independent_effective_endpoints(tmp_path, m
         composer_advisor_endpoint_base_url=None if primary_proxy else _PROXY,
         composer_advisor_endpoint_api_key=None if primary_proxy else _PROXY_KEY,
     )
-    requests, composer, _result = await _run_production_turn(tmp_path, monkeypatch, settings, message="Describe the current capability.")
+    requests, composer = await _run_production_turn(tmp_path, monkeypatch, settings, message="Describe the current capability.")
     assert len(requests) == 2
     loop, advisor = _loop_request(requests), _advisor_request(requests)
     descriptions = _expected_planner_wire_requests(settings)

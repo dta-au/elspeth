@@ -125,7 +125,6 @@ async def test_actual_issued_feedback_preserves_rich_ordered_wire_through_cold_r
     from elspeth.web.composer.continuation_message_family_recipes import ToolFeedbackMessageRecipe
     from elspeth.web.composer.continuation_runtime import restore_continuation_runtime
     from elspeth.web.composer.tool_error_payloads import arg_error_payload
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
     from tests.unit.web.sessions.test_continuation_live_phases import _finish_inventory, stored_rows
 
     async with _issued_argument_feedback_case(operation_store, tmp_path, monkeypatch) as values:
@@ -143,9 +142,7 @@ async def test_actual_issued_feedback_preserves_rich_ordered_wire_through_cold_r
         assert owner.failure_custody.original is None and not owner.failure_custody.completed
         selected, inventory, facet = runtime.source.selected, runtime.materialization.inventory, None
         if stop:
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             selected, inventory = await _finish_inventory(owner, running)
             facet = ContinuationFinishRead(running, selected, inventory)
         before = stored_rows(operation_store[0])
@@ -1626,7 +1623,6 @@ async def _later_feedback_source_case(store, tmp_path, monkeypatch, *, timing, c
     )
     from elspeth.web.composer.continuation_runtime import _registered_read
     from elspeth.web.composer.prompt_guard_rendering import json_content_parts
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
     from elspeth.web.sessions.locking import locked_session_transaction
 
     async with _issued_argument_feedback_case(store, tmp_path, monkeypatch) as values:
@@ -1681,9 +1677,7 @@ async def _later_feedback_source_case(store, tmp_path, monkeypatch, *, timing, c
             assert selected.stack.model_copy(update={"cursor": completed.stack.cursor, "frames": completed.stack.frames}) == completed.stack
         facet = None
         if stop:
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             # Inventory is actual SQL/name DATA from immediately before Stop,
             # with the same head. The nominal facet now re-proves the current
             # physical owner, durable Stop, CAS and actual completed prefix.
@@ -2447,7 +2441,6 @@ async def test_actual_failed_prefix_terminal_uses_two_slots_and_exact_bundle(ope
     from elspeth.web.required_work import RequiredWorkSource
     from elspeth.web.sessions import continuation_tool_failure
     from elspeth.web.sessions.composer_async_worker import ComposerAsyncWorker, _StartedSettlement
-    from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 
     _install_original_deadline(operation_store, monkeypatch)
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
@@ -2499,7 +2492,6 @@ async def test_actual_failed_prefix_terminal_uses_two_slots_and_exact_bundle(ope
                     owner.authority.request_cancel(
                         session_id=running.claim.session_id,
                         operation_id=running.claim.operation_id,
-                        cancelled_failure=request_cancelled_error,
                     )
                 raise
             if terminal and fault == "after_commit" and len(exits) == 1:

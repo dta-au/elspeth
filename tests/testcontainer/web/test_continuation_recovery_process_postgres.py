@@ -254,7 +254,6 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
     values.update(
         composer_prompt_guard=encoded_guard,
         composer_advisor_prompt_guard=encoded_guard,
-        composer_continuation_enabled=True,
         composer_async_worker_concurrency=1,
         composer_shutdown_grace_seconds=grace,
         host="0.0.0.0",
@@ -434,7 +433,6 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
         app = original_factory(drain_signal=drain_signal)
         apps.append(app)
         assert app.state.composer_drain_signal is drain_signal
-        assert app.state.settings.composer_continuation_enabled
         watchdog = app.state.process_watchdog
         assert type(watchdog) is ProcessWatchdog and watchdog._helper is not None
         original_lifespan = app.router.lifespan_context
@@ -709,7 +707,6 @@ def _submit_process_operation(client, host, engine, *, mode):
             if not (host["directory"] / f"{marker}.json").exists():
                 return None
         rows = _actual_operation_rows(engine, host["session_id"], operation)
-        assert rows["parent"].lifecycle_version == 2
         if mode == "prestart":
             if rows["segments"][0].claim_token is not None:
                 assert rows["attempts"] == [] and rows["physical"] == [] and rows["effects"] == []

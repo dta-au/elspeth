@@ -692,9 +692,7 @@ async def test_actual_phase_batch_context_preserves_normal_and_owed_read_owners(
         )
         assert selected == original.source.selected and selected is not original.source.selected
         if stop:
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             owner.observe_stop()
         phase = await owner._current_phase_read(selected)
         runtime = phase.runtime
@@ -764,9 +762,7 @@ async def test_actual_phase_batch_context_refuses_foreign_or_unearned_finish_rea
         phase = await owner._current_phase_read(selected)
         await build_runtime_tool_batch_context(phase.runtime, cancellation_requested=owner.cancellation_requested, phase_read=phase)
         if change != "no_stop":
-            owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-            )
+            owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
             owner.observe_stop()
         if change in ("no_stop", "no_owed"):
             phase = replace(phase, finish_read=ContinuationFinishRead(running, selected, phase.inventory))
@@ -847,9 +843,7 @@ async def test_actual_phase_batch_context_rechecks_cut_after_preferences(operati
 
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         phase = await owner._current_phase_read(owner.runtime.source.selected)
         assert type(phase.finish_read) is ContinuationFinishRead
@@ -896,9 +890,7 @@ async def test_default_context_and_next_tool_keep_stop_dispatch_refusal(operatio
 
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         phase = await owner._current_phase_read(owner.runtime.source.selected)
         await build_runtime_tool_batch_context(phase.runtime, cancellation_requested=owner.cancellation_requested, phase_read=phase)
@@ -919,9 +911,7 @@ async def test_default_context_and_next_tool_keep_stop_dispatch_refusal(operatio
 async def test_real_stop_reads_and_publishes_only_the_actual_completed_prefix(operation_store, tmp_path, monkeypatch):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         owner.observe_stop()
         selected, inventory = await _finish_inventory(owner, running)
         facet = ContinuationFinishRead(running, selected, inventory)
@@ -953,9 +943,7 @@ async def test_durable_stop_before_refresh_onto_a_compose_cut_surfaces_as_cancel
     from elspeth.web.composer import continuation_live_phases as phases
 
     def stop(owner, running):
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
 
     def before_batch_initialization(owner, running):
         if when == "before_inventory":
@@ -980,9 +968,7 @@ async def test_durable_stop_before_refresh_onto_a_compose_cut_surfaces_as_cancel
 @pytest.mark.asyncio
 async def test_stop_without_issued_or_completed_work_cannot_use_the_finish_facet(operation_store, tmp_path, monkeypatch):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         selected, inventory = await _finish_inventory(owner, running)
         before = stored_rows(operation_store[0])
         with pytest.raises(AuditIntegrityError, match="completed issued-tool prefix"):
@@ -995,9 +981,7 @@ async def test_stop_without_issued_or_completed_work_cannot_use_the_finish_facet
 async def test_owed_stop_restore_refuses_a_stale_owner_or_sequence_after_actual_positive(operation_store, tmp_path, monkeypatch, foreign):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         selected, inventory = await _finish_inventory(owner, running)
         assert ContinuationFinishRead(running, selected, inventory).read_runtime(owner.authority).selected is selected
         if foreign == "physical_fence":
@@ -1028,9 +1012,7 @@ async def test_owed_stop_restore_refuses_a_stale_owner_or_sequence_after_actual_
 async def test_cold_stop_restores_the_actual_prefix_without_repeat_paid_work(operation_store, tmp_path, monkeypatch):
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         selected, inventory = await _finish_inventory(owner, running)
         facet = ContinuationFinishRead(running, selected, inventory)
         before = stored_rows(operation_store[0])
@@ -1060,9 +1042,7 @@ async def test_owed_stop_read_refuses_contradictory_tool_result_after_actual_pos
 
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, primary, sdk):
         await _advance(owner)
-        owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
-        )
+        owner.authority.request_cancel(session_id=running.claim.session_id, operation_id=running.claim.operation_id)
         selected, inventory = await _finish_inventory(owner, running)
         facet = ContinuationFinishRead(running, selected, inventory)
         assert facet.read_runtime(owner.authority).selected is selected

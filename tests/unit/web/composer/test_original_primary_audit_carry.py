@@ -18,9 +18,6 @@ from elspeth.web.composer.prompt_guard import prompt_guard_user_scope
 from elspeth.web.composer.provider_gateway import ProviderGateway
 from elspeth.web.composer.provider_quota import ProviderInvocationFamily, ProviderInvocationOwner
 from elspeth.web.composer.recovery_controls import recovery_tool_definitions
-from elspeth.web.composer.service import ComposerServiceImpl
-from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.required_work import (
     RequiredAuthorityKind,
     RequiredWorkAuthority,
@@ -68,7 +65,7 @@ def _reply():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ("gateway", "gateway_recovery", "model_turn"))
+@pytest.mark.parametrize("entry", ("gateway", "gateway_recovery"))
 async def test_original_primary_call_reaches_outcome_after_one_actual_settlement(primary_case, monkeypatch, entry):
     settings, requests, engine, context, service, coordinator, owner = primary_case
     user_prompt = "Retain the ordinary primary reply."
@@ -119,31 +116,13 @@ async def test_original_primary_call_reaches_outcome_after_one_actual_settlement
     recorder = BufferingRecorder()
     messages = [{"role": "user", "content": user_prompt}]
     with prompt_guard_user_scope(user_prompt):
-        if entry in {"gateway", "gateway_recovery"}:
-            custody = owner.mint(ProviderInvocationFamily.PRIMARY)
-            gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
-            tools = recovery_tool_definitions(ToolContractDialect.NONE) if entry == "gateway_recovery" else []
-            outcome = await gateway._call_llm_outcome_with_audit(messages, tools, timeout=5, recorder=recorder, provider_custody=custody)
-            assert custody.attempt is None and custody.call is None
-        else:
-            composer = ComposerServiceImpl.for_trained_operator(
-                catalog=create_catalog_service(), settings=settings, sessions_service=service
-            )
-            state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-            outcome = await composer._call_model_turn(
-                llm_messages=messages,
-                tools=[],
-                state=state,
-                initial_version=state.version,
-                deadline=asyncio.get_event_loop().time() + 10,
-                recorder=recorder,
-                progress=None,
-                message=user_prompt,
-                composition_turns_used=0,
-                discovery_turns_used=0,
-                failed_turn=None,
-                provider_owner=owner,
-            )
+        # Continuation's primary owner (continuation_primary) enters this
+        # same gateway outcome path.
+        custody = owner.mint(ProviderInvocationFamily.PRIMARY)
+        gateway = ProviderGateway(model="test/model", settings=settings, endpoint_base_url=None, endpoint_api_key=None)
+        tools = recovery_tool_definitions(ToolContractDialect.NONE) if entry == "gateway_recovery" else []
+        outcome = await gateway._call_llm_outcome_with_audit(messages, tools, timeout=5, recorder=recorder, provider_custody=custody)
+        assert custody.attempt is None and custody.call is None
     assert type(outcome) is _CallModelOutcome and type(outcome.completion) is _AdmittedLLMCompletion
     assert len(physical) == len(created) == len(settled) == len(recorder.llm_calls) == len(_ledger(engine)) == 1
     assert outcome.audit_call is not None
@@ -248,32 +227,3 @@ async def test_legacy_primary_body_and_gateway_keep_the_completion_return_shape(
     assert type(first) is type(second) is _AdmittedLLMCompletion
     assert first is second is legacy_completion
     assert len(gateway_calls) == 2 and all(call[0] == messages for call in gateway_calls)
-
-    old_hook_calls = []
-
-    async def old_completion_hook(self, *args, **kwargs):
-        old_hook_calls.append((args, kwargs))
-        return first
-
-    async def unexpected_outcome_hook(self, *args, **kwargs):
-        raise AssertionError("Legacy model turn bypassed its existing completion hook")
-
-    monkeypatch.setattr(ComposerServiceImpl, "_call_llm_before_deadline", old_completion_hook)
-    monkeypatch.setattr(ComposerServiceImpl, "_call_llm_outcome_before_deadline", unexpected_outcome_hook)
-    composer = ComposerServiceImpl.for_trained_operator(catalog=create_catalog_service(), settings=_settings(tmp_path))
-    state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-    outcome = await composer._call_model_turn(
-        llm_messages=messages,
-        tools=[],
-        state=state,
-        initial_version=state.version,
-        deadline=asyncio.get_event_loop().time() + 10,
-        recorder=BufferingRecorder(),
-        progress=None,
-        message="Ordinary legacy completion.",
-        composition_turns_used=0,
-        discovery_turns_used=0,
-        failed_turn=None,
-    )
-    assert len(old_hook_calls) == 1 and len(gateway_calls) == 2
-    assert outcome.completion is first and outcome.audit_call is None
