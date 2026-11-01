@@ -477,6 +477,7 @@ class CurrentContinuationMessageProducers:
         """
         if (
             type(selected) is not SelectedContinuationState
+            or type(self.selected) is not SelectedContinuationState
             or type(inventory) is not CurrentContinuationEnvInventory
             or type(self.inputs) is not _CurrentProducerInputs
             or inventory.running is not self.inventory.running
@@ -494,7 +495,6 @@ class CurrentContinuationMessageProducers:
             or after.provider_cost_policy != before.provider_cost_policy
         ):
             raise AuditIntegrityError("live message advance changed its request, retained policy or predecessor order")
-        selected.__post_init__()
         from elspeth.web.composer.continuation_finish_reads import ContinuationFinishRead
 
         finish_read = None if self.finish_read is None else ContinuationFinishRead(inventory.running, selected, inventory)
@@ -754,7 +754,8 @@ class CurrentContinuationMessageProducers:
         """
         self._require_compose_family()
         selected = self.selected
-        selected.__post_init__()
+        if type(selected) is not SelectedContinuationState:
+            raise AuditIntegrityError("tool result producer requires its actual selected DATA")
         compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
         top = selected.stack.frames[-1]
         if (
@@ -826,7 +827,8 @@ class CurrentContinuationMessageProducers:
         )
         self._require_compose_family()
         selected = self.selected
-        selected.__post_init__()
+        if type(selected) is not SelectedContinuationState:
+            raise AuditIntegrityError("feedback producer requires its actual selected DATA")
         compose = tuple(frame for frame in selected.stack.frames if type(frame) is ComposeFrame)
         top = selected.stack.frames[-1]
         call, batch = publication.call, publication.batch

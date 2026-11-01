@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_required_sql_finish_once
+from elspeth.web.composer.continuation import PrivateChunkRef
 from elspeth.web.composer.continuation_codec import (
     decode_continuation_snapshot,
     decode_frontier_chunk,
@@ -435,12 +436,28 @@ async def test_coherent_invalid_utf8_is_owned_integrity_failure_with_original_ca
     running, stored, chunk = selected_case(operation_store)
     assert authority.load_continuation_chunks(running, stored) == (chunk,)
     payload = bytes((255,))
+    reference = PrivateChunkRef(codec=chunk.reference.codec, digest=sha256(payload).hexdigest(), byte_length=len(payload))
+    root = decode_continuation_snapshot(stored.payload_json)
     with engine.begin() as conn:
-        conn.execute(
-            update(chunks)
-            .where(chunks.c.chunk_key == private_chunk_key(chunk))
-            .values(payload=payload, sha256=sha256(payload).hexdigest(), byte_length=len(payload))
+        put_chunk(
+            conn,
+            session_id=str(running.claim.session_id),
+            operation_id=running.claim.operation_id,
+            key=f"value:{reference.codec}:{reference.digest}",
+            payload=payload,
+            codec=reference.codec,
         )
+        stored = append_complete_snapshot(
+            conn,
+            session_id=str(running.claim.session_id),
+            operation_id=running.claim.operation_id,
+            expected_checkpoint_id=stored.checkpoint_id,
+            expected_cursor=stored.cursor,
+            snapshot_json=encode_continuation_snapshot(root.model_copy(update={"semantic_frontier": reference})),
+            event_batch=(ContinuationEvent("checkpoint", '{"invalid_utf8_fixture":true}'),),
+            handoff=False,
+        )
+    assert authority.load_continuation_snapshot(running) == stored
     before = rows(operation_store)
     work = inventory_work(running)
     with pytest.raises(AuditIntegrityError, match="strict UTF-8") as caught:

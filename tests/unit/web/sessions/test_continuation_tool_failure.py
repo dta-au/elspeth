@@ -712,6 +712,46 @@ async def test_private_feedback_registration_does_not_admit_rolled_back_completi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ("result", "feedback"))
+async def test_live_publication_refuses_a_replaced_selected_owner(operation_store, tmp_path, monkeypatch, seam):
+    from elspeth.web.composer import tool_batch
+    from elspeth.web.composer.continuation_prompt_producers import CurrentContinuationMessageProducers
+    from elspeth.web.composer.continuation_selection import SelectedContinuationState
+    from elspeth.web.composer.protocol import ToolArgumentError
+
+    async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
+        original_register = (
+            CurrentContinuationMessageProducers.register_tool_result_message
+            if seam == "result"
+            else CurrentContinuationMessageProducers.register_tool_feedback_message
+        )
+        refusals = []
+
+        def register(self, **kwargs):
+            assert type(self.selected) is SelectedContinuationState
+            with monkeypatch.context() as patch:
+                patch.setattr(self, "selected", object())
+                with pytest.raises(AuditIntegrityError, match="actual selected DATA") as caught:
+                    original_register(self, **kwargs)
+            refusals.append(caught.value)
+            raise caught.value
+
+        if seam == "result":
+            monkeypatch.setattr(CurrentContinuationMessageProducers, "register_tool_result_message", register)
+        else:
+
+            def execute(*args, **kwargs):
+                raise ToolArgumentError(argument="arguments", expected="an object", actual_type="missing")
+
+            monkeypatch.setattr(tool_batch, "execute_tool", execute)
+            monkeypatch.setattr(CurrentContinuationMessageProducers, "register_tool_feedback_message", register)
+        with pytest.raises(BaseException) as caught:
+            await _advance(owner)
+        assert len(refusals) == 1 and _contains_identity(caught.value, refusals[0])
+        assert len(sdk) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("corruption", ("none", "body", "keys", "parts", "unicode"))
 async def test_actual_lazy_feedback_registration_defers_size_to_real_capture_owner(operation_store, tmp_path, monkeypatch, corruption):
     from elspeth.web.composer import continuation_prompt_producers, tool_batch
@@ -2085,7 +2125,6 @@ async def _advisor_case(
     monkeypatch.setattr(prompt_guard_clients, "build_prompt_guard_client", client)
     monkeypatch.setattr(test_continuation_prompt_producers, "WebSettings", lambda **kwargs: settings.model_copy(update=kwargs))
     if required_controls:
-        from elspeth.web.composer.application_policy import PluginPolicyContextFactory
         from elspeth.web.plugin_policy.availability import build_plugin_snapshot
         from tests.unit.web.composer.test_planner_authoring_aids import _guardrail_profile_view
         from tests.unit.web.composer.test_required_control_autowire import _INLINE_CONTENT
@@ -2129,14 +2168,41 @@ async def _advisor_case(
                 generation_key=b"authoring-aids-key",
             )
 
-        actual_current = test_continuation_prompt_producers.current_service
+        def current(store, *, secret_service=None):
+            from elspeth.web.composer.service import ComposerServiceImpl
 
-        def current(*args, **kwargs):
-            service, actors = actual_current(*args, **kwargs)
-            service._policy_context = PluginPolicyContextFactory(view._full, snapshot, profiles, trained_operator_mode=False)
+            engine, _repository, _authority, sessions, _sid = store
+            configured = settings.model_copy(
+                update={
+                    "composer_max_composition_turns": 15,
+                    "composer_max_discovery_turns": 10,
+                    "composer_timeout_seconds": 85.0,
+                    "composer_rate_limit_per_minute": 100,
+                    "shareable_link_signing_key": b"\x00" * 32,
+                    "data_dir": sessions._data_dir,
+                }
+            )
+            actors = []
+
+            def current_snapshot(actor):
+                actors.append(actor)
+                return snapshot(actor)
+
+            service = ComposerServiceImpl(
+                view._full,
+                configured,
+                sessions_service=sessions,
+                session_engine=engine,
+                plugin_snapshot_factory=current_snapshot,
+                operator_profile_registry=profiles,
+                secret_service=secret_service,
+            )
+            assert service._preflight._policy_context is service._policy_context
+            assert service._preflight._operator_profile_registry is profiles and service._preflight._catalog is view._full
+            assert service._preflight._settings is service._settings
             return service, actors
 
-        monkeypatch.setattr(test_continuation_prompt_producers, "current_service", current)
+        monkeypatch.setattr(test_continuation_initialization, "current_service", current)
     if bound_base:
         actual_ready = test_continuation_composition_initialization.ready_case
 
@@ -3587,7 +3653,7 @@ async def test_real_prepared_terminal_append_reproves_exact_candidate(operation_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ("none", "facts", "record"))
 async def test_actual_session_handler_crash_uses_native_custody_and_owed_p4(operation_store, tmp_path, monkeypatch, fault):
-    from elspeth.web.composer import audit, tools
+    from elspeth.web.composer import private_diagnostic_facts, tools
     from elspeth.web.composer.audit import BufferingRecorder
 
     arguments = {"affected_node_id": "rate_node", "kind": "vague_term", "user_term": "cool", "llm_draft": "Use concise wording."}
@@ -3613,7 +3679,7 @@ async def test_actual_session_handler_crash_uses_native_custody_and_owed_p4(oper
 
         monkeypatch.setitem(tools._SESSION_AWARE_TOOL_HANDLERS, "request_interpretation_review", handler)
         if fault == "facts":
-            monkeypatch.setattr(audit, "capture_failure_facts", facts)
+            monkeypatch.setattr(private_diagnostic_facts, "capture_failure_facts", facts)
         monkeypatch.setattr(BufferingRecorder, "record_with_failure_observation", record)
         if fault == "none":
             await _advance(owner)
@@ -3640,19 +3706,30 @@ async def test_actual_session_handler_crash_uses_native_custody_and_owed_p4(oper
 async def test_actual_success_return_then_audit_failure_is_not_a_thrown_handler(operation_store, tmp_path, monkeypatch, fault):
     from elspeth.web.composer import audit, tool_batch
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.discovery_response import AdmittedDiscoveryResult
+    from elspeth.web.composer.tools._registry import response_contract_for
 
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, _running, _primary, sdk):
         actual_execute = tool_batch.execute_tool
+        actual_admit = tool_batch.admit_discovery_result
         error, cause = RuntimeError("actual success finalization failure"), RuntimeError("actual finalization cause")
-        returned, attempts = [], []
+        returned, admitted, attempts = [], [], []
 
         def execute(*args, **kwargs):
             result = actual_execute(*args, **kwargs)
             returned.append(result)
             return result
 
-        def payload(result):
+        def admit(tool_name, result):
             assert returned and result is returned[0]
+            value = actual_admit(tool_name, result)
+            assert type(value) is AdmittedDiscoveryResult and value.result is result
+            assert value.contract is response_contract_for("get_pipeline_state")
+            admitted.append(value)
+            return value
+
+        def payload(result):
+            assert admitted and result is admitted[0]
             raise error from cause
 
         def record(self, value, observation):
@@ -3660,6 +3737,7 @@ async def test_actual_success_return_then_audit_failure_is_not_a_thrown_handler(
             raise error from cause
 
         monkeypatch.setattr(tool_batch, "execute_tool", execute)
+        monkeypatch.setattr(tool_batch, "admit_discovery_result", admit)
         if fault == "payload":
             monkeypatch.setattr(audit, "_result_to_audit_payload", payload)
         else:
@@ -3667,7 +3745,8 @@ async def test_actual_success_return_then_audit_failure_is_not_a_thrown_handler(
         with pytest.raises(BaseException) as caught:
             await _advance(owner)
         observation = owner.failure_custody.observation
-        assert len(returned) == len(sdk) == 1 and observation.returned_output is returned[0]
+        assert len(returned) == len(admitted) == len(sdk) == 1 and observation.returned_output is admitted[0]
+        assert admitted[0].result is returned[0]
         assert observation.returned and not observation.execution_failed
         assert _contains_identity(caught.value, error) and error.__cause__ is cause
         assert not owner.failure_custody.completed and owner.runtime.graph.batch.batch.retained_failure is None
@@ -3679,7 +3758,7 @@ async def test_actual_success_return_then_audit_failure_is_not_a_thrown_handler(
 async def test_actual_set_pipeline_required_control_rebind_has_exact_owner(operation_store, tmp_path, monkeypatch, change):
     from elspeth.web.composer import tool_batch
     from elspeth.web.composer.audit import begin_dispatch
-    from tests.unit.web.composer.test_required_control_autowire import _bare_llm_candidate
+    from tests.unit.web.composer.test_required_control_autowire import _bare_llm_candidate, _nodes_by_id
 
     (tmp_path / "outputs").mkdir(exist_ok=True)
     arguments = _bare_llm_candidate()
@@ -3687,9 +3766,22 @@ async def test_actual_set_pipeline_required_control_rebind_has_exact_owner(opera
         operation_store, tmp_path, monkeypatch, tool_name="set_pipeline", tool_arguments=arguments, required_controls=True
     ) as (owner, _running, sdk):
         actual_rebind, actual_execute = tool_batch.rebind_dispatch_arguments, tool_batch.execute_tool
-        rebound, dispatches = [], []
+        actual_finalize = tool_batch._finalize_complete_set_pipeline_candidate
+        finalized, rebind_attempts, rebound, dispatches = [], [], [], []
+
+        async def finalize(*args, **kwargs):
+            result = await actual_finalize(*args, **kwargs)
+            assert result.candidate.acceptable and result.changed
+            nodes = _nodes_by_id(result.arguments)
+            assert nodes["prompt_shield_auto_1"]["plugin"] == "aws_bedrock_prompt_shield"
+            assert nodes["prompt_shield_auto_1"]["options"]["profile"] == "prompt-approved"
+            assert nodes["content_safety_auto_1"]["plugin"] == "aws_bedrock_content_safety"
+            assert nodes["content_safety_auto_1"]["options"]["profile"] == "content-approved"
+            finalized.append(result)
+            return result
 
         def rebind(old, values, *, failure_observation=None):
+            rebind_attempts.append(old)
             assert failure_observation is owner.failure_custody.observation
             if change == "foreign":
                 old = begin_dispatch("foreign", old.tool_name, values, version_before=old.version_before, actor=old.actor)
@@ -3704,6 +3796,7 @@ async def test_actual_set_pipeline_required_control_rebind_has_exact_owner(opera
             return actual_execute(*args, **kwargs)
 
         monkeypatch.setattr(tool_batch, "rebind_dispatch_arguments", rebind)
+        monkeypatch.setattr(tool_batch, "_finalize_complete_set_pipeline_candidate", finalize)
         monkeypatch.setattr(tool_batch, "execute_tool", execute)
         if change in ("foreign", "equal_copy"):
             with pytest.raises(AuditIntegrityError) as caught:
@@ -3716,6 +3809,7 @@ async def test_actual_set_pipeline_required_control_rebind_has_exact_owner(opera
             old, current = rebound[-1]
             observation = owner.failure_custody.observation
             assert current is observation.audit and old is not current
+            assert owner.failure_custody.call.audit is current
             assert (old.started_at, old.started_ns, old.actor, old.tool_call_id) == (
                 current.started_at,
                 current.started_ns,
@@ -3728,4 +3822,4 @@ async def test_actual_set_pipeline_required_control_rebind_has_exact_owner(opera
             if change == "late":
                 with pytest.raises(AuditIntegrityError, match="open owner"):
                     actual_rebind(current, arguments, failure_observation=observation)
-        assert len(sdk) == 1
+        assert len(finalized) == len(rebind_attempts) == len(sdk) == 1

@@ -113,7 +113,7 @@ async def publish(store, arguments, runtime):
             drained=runtime.drained,
             required_work=arguments["required_work"],
             provider_owner=arguments["provider_owner"],
-            timeout=5,
+            timeout=runtime.source.policy.actions.primary.total,
         )
 
 

@@ -709,6 +709,19 @@ async def test_real_fresh_and_cache_schema_paths_register_full_current_rebuild(o
 
 
 @pytest.mark.asyncio
+async def test_live_advance_refuses_a_replaced_previous_selected_owner(operation_store):
+    kwargs, _evidence, _recorder, _snapshot, _iteration, _actors = await producer_case(operation_store)
+    actual = await producers.load_current_message_producers(**kwargs, initial=True)
+    assert actual.messages and actual.producers.selected is kwargs["selected"]
+    foreign = object()
+    actual.producers.selected = foreign
+    with pytest.raises(AuditIntegrityError, match="actual running/context/inventory owners"):
+        actual.producers.advance_current(kwargs["selected"], kwargs["inventory"])
+    assert actual.producers.selected is foreign
+    kwargs["required_work"].coordinator.assert_completed()
+
+
+@pytest.mark.asyncio
 async def test_changed_root_and_unregistered_guarded_wire_refuse_after_normal_factory(operation_store):
     kwargs, _evidence, _recorder, _snapshot, _iteration, _actors = await producer_case(operation_store)
     actual = await producers.load_current_message_producers(**kwargs, initial=True)

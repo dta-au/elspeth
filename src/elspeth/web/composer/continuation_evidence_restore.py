@@ -58,7 +58,6 @@ def read_turn_evidence_on_connection(
 ) -> AdmittedTurnEvidence:
     if type(selected) is not SelectedContinuationState or type(running) is not ComposerOperationRunning:
         raise AuditIntegrityError("cold evidence requires its actual selected/current owners")
-    selected.__post_init__()
     names = require_current_env_inventory_on_connection(
         conn, running, inventory=inventory, expected_checkpoint_id=selected.checkpoint_id, expected_cursor=selected.stack.cursor
     )

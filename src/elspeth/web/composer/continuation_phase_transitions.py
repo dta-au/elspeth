@@ -405,7 +405,6 @@ def require_completed_tool_prefix_on_connection(
     """
     if type(selected) is not SelectedContinuationState or type(env_ref_names) is not frozenset:
         raise AuditIntegrityError("owed batch requires its complete actual selected DATA")
-    selected.__post_init__()
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
     root = selected.stack
     stored = load_snapshot(conn, session_id=root.logical.session_id, operation_id=root.logical.operation_id)
@@ -466,7 +465,6 @@ def require_completed_runtime_prefix_on_connection(
 
     if type(selected) is not SelectedContinuationState or type(env_ref_names) is not frozenset:
         raise AuditIntegrityError("runtime prefix requires its complete selected source")
-    selected.__post_init__()
     _require_current_continuation_running(conn, running)
     root = selected.stack
     stored = load_snapshot(conn, session_id=root.logical.session_id, operation_id=root.logical.operation_id)
@@ -536,7 +534,6 @@ def require_issued_tool_runtime_on_connection(
     """Prove the actual current issued call before retaining its paid outcome."""
     if type(selected) is not SelectedContinuationState or type(env_ref_names) is not frozenset:
         raise AuditIntegrityError("issued runtime requires its complete current selected DATA")
-    selected.__post_init__()
     _require_current_continuation_running(conn, running, allow_cancel=True, allow_expired_segment=True)
     stored = load_snapshot(conn, session_id=selected.stack.logical.session_id, operation_id=selected.stack.logical.operation_id)
     if stored.checkpoint_id != selected.checkpoint_id or stored.payload_json != encode_continuation_snapshot(selected.stack):

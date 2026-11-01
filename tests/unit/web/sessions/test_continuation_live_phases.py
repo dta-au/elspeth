@@ -33,6 +33,7 @@ from elspeth.web.coordination.lifecycle import ContinuationLeaseAdoption
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
 from elspeth.web.sessions.composer_operations import ComposerOperationCancelledDuringTurn, ComposerOperationFenceLost
 from elspeth.web.sessions.models import composer_continuation_effects_table as effects
+from tests.helpers.continuation_budgets import OWNER_LEASE_SECONDS
 from tests.unit.web.coordination.test_composer_operation_authority import operation_store as _operation_store
 from tests.unit.web.sessions.test_continuation_primary_result import _assert_required_guard_admitted, initialized_primary_input, stored_rows
 
@@ -49,7 +50,9 @@ async def _phase_case(
     assert running is not None
     provider = runtime.bindings.provider_owner
     assert type(provider) is ProviderInvocationOwner
-    adoption = ContinuationLeaseAdoption(store[1], running.session_operation_context, lease_seconds=30, required_work=work.coordinator)
+    adoption = ContinuationLeaseAdoption(
+        store[1], running.session_operation_context, lease_seconds=OWNER_LEASE_SECONDS, required_work=work.coordinator
+    )
     lease = await adoption.join()
     sdk_calls = []
     try:
@@ -121,7 +124,7 @@ async def _phase_case(
                 drained=runtime.drained,
                 required_work=work,
                 provider_owner=provider,
-                timeout=5,
+                timeout=runtime.source.policy.actions.primary.total,
             )
         if delivery is not None:
             runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
@@ -686,6 +689,8 @@ async def test_actual_phase_batch_context_preserves_normal_and_owed_read_owners(
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, primary, sdk):
         await _advance(owner)
         original = owner.runtime
+        old_inventory = original.materialization.inventory
+        old_inputs = original.materialization.inputs
         assert owner.latest_snapshot is not None
         selected = await load_selected_continuation(
             authority=owner.authority, running=running, selected=owner.latest_snapshot, required_work=owner.work
@@ -701,10 +706,12 @@ async def test_actual_phase_batch_context_preserves_normal_and_owed_read_owners(
         assert runtime.materialization is original.materialization and runtime.live.recorder is original.live.recorder
         assert runtime.graph.batch.calls is primary.outcome.completion.tool_batch.calls
         assert runtime.materialization.finish_read is None  # Actual warm owner, including after Stop.
+        assert phase.inventory is not old_inventory and phase.inventory == old_inventory
+        assert runtime.materialization.selected is selected and runtime.materialization.inventory is phase.inventory
+        assert runtime.materialization.inputs is old_inputs
         if stop:
             assert type(phase.finish_read) is ContinuationFinishRead
             assert phase.finish_read.selected is selected and phase.finish_read.inventory is phase.inventory
-            assert phase.inventory is not runtime.materialization.inventory
         else:
             assert phase.finish_read is None
         before = stored_rows(operation_store[0])
