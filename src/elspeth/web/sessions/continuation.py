@@ -523,6 +523,32 @@ def _settlement_driving(parent: Row[Any], segment: Row[Any], history: Row[Any] |
     )
 
 
+def _published_end_review(
+    stack: ContinuationFrameStack, outcome: MessageWithStateResponse | ComposerOperationError
+) -> tuple[str, str, str] | None:
+    """The END review effect a successful publication commits, if any.
+
+    Only a ``MessageWithStateResponse`` publishes. Its END review effect is the
+    one ``dispatched`` ``end:<response>`` entry of the top ``EndFrame``; the
+    published assistant row is its receipt and the retained candidate is its
+    result. Every other dispatched effect still becomes ``unknown``.
+    """
+    from elspeth.web.composer.continuation import ComposeFrame, EndFrame
+    from elspeth.web.composer.continuation_end_transitions import end_effect_key
+
+    top = stack.frames[-1]
+    if type(outcome) is not MessageWithStateResponse or type(top) is not EndFrame:
+        return None
+    compose = stack.frames[0]
+    if type(compose) is not ComposeFrame or compose.pending_response is None:
+        raise AuditIntegrityError("END publication lost its actual paid PRIMARY response")
+    key = end_effect_key(compose.pending_response)
+    matching = tuple(item for item in stack.effect_frontier if item.effect_id == key)
+    if len(matching) != 1 or matching[0].disposition != "dispatched":
+        raise AuditIntegrityError("END publication lost its single dispatched review effect")
+    return key, outcome.message.id, f"value:{top.candidate.codec}:{top.candidate.digest}"
+
+
 def _settlement_transition(
     stored: StoredContinuationSnapshot,
     *,
@@ -534,9 +560,19 @@ def _settlement_transition(
     from elspeth.web.coordination.composer_operation_authority import _terminal_values
 
     stack = decode_continuation_snapshot(stored.payload_json)
-    unresolved = tuple(item.effect_id for item in stack.effect_frontier if item.disposition == "dispatched")
+    published = _published_end_review(stack, outcome)
+    unresolved = tuple(
+        item.effect_id
+        for item in stack.effect_frontier
+        if item.disposition == "dispatched" and (published is None or item.effect_id != published[0])
+    )
     frontier = tuple(
-        item.model_copy(update={"disposition": "unknown"}) if item.effect_id in unresolved else item for item in stack.effect_frontier
+        item.model_copy(update={"disposition": "unknown"})
+        if item.effect_id in unresolved
+        else item.model_copy(update={"disposition": "committed", "receipt_id": published[1]})
+        if published is not None and item.effect_id == published[0]
+        else item
+        for item in stack.effect_frontier
     )
     terminal = _terminal_values(outcome, now=published_at, settled_by=settled_by)
     attribution = (
@@ -1245,6 +1281,21 @@ def settle_segment_on_connection(
         )
         if marked.rowcount != len(unresolved):
             raise AuditIntegrityError("continuation settlement lost an unresolved effect row")
+    published = _published_end_review(decode_continuation_snapshot(stored.payload_json), outcome)
+    if published is not None:
+        committed = conn.execute(
+            update(effects)
+            .where(
+                effects.c.session_id == session_id,
+                effects.c.operation_id == operation_id,
+                effects.c.effect_key == published[0],
+                effects.c.disposition == "dispatched",
+                effects.c.receipt_key.is_(None),
+            )
+            .values(disposition="committed", receipt_key=published[1], result_chunk_key=published[2])
+        )
+        if committed.rowcount != 1:
+            raise AuditIntegrityError("END publication lost its single dispatched review effect row")
     if history is not None:
         revoked = conn.execute(
             update(attempts)

@@ -125,38 +125,85 @@ async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 1500
             assert response.status_code == 200, response.text
             snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
             if snapshot.status in ("completed", "failed"):
+                # Join the owner's verified release before the lifespan ends.
+                await app.state.composer_async_worker.run_until_idle()
                 return snapshot
             await asyncio.sleep(0.02)
     raise AssertionError("Continuation request did not settle")
 
 
-def _primary_effects(app, operation_id: str):
+def _effects(app, operation_id: str):
     with app.state.session_engine.connect() as conn:
         return tuple(
             conn.execute(
                 select(composer_continuation_effects_table)
-                .where(
-                    composer_continuation_effects_table.c.operation_id == operation_id,
-                    composer_continuation_effects_table.c.owner == "provider",
-                )
+                .where(composer_continuation_effects_table.c.operation_id == operation_id)
                 .order_by(composer_continuation_effects_table.c.effect_key)
             )
         )
 
 
+def _assistant_contents(app, session_id) -> list[str]:
+    with app.state.session_engine.connect() as conn:
+        rows = conn.execute(
+            select(chat_messages_table.c.content)
+            .where(chat_messages_table.c.session_id == str(session_id), chat_messages_table.c.role == "assistant")
+            .order_by(chat_messages_table.c.sequence_no)
+        )
+        return [row.content for row in rows]
+
+
+class ScriptedSDK:
+    """Physical SDK replies in order; each names the role it must serve.
+
+    ``primary`` replies serve the composer model with the full palette;
+    ``end`` replies serve the END Advisor review with its structured verdict.
+    """
+
+    def __init__(self, settings_model: str, advisor_model: str, steps):
+        self.primary_model, self.advisor_model = settings_model, advisor_model
+        self.steps = list(steps)
+        self.requests: list[dict] = []
+
+    async def __call__(self, **kwargs):
+        assert self.steps, "unscripted physical SDK call"
+        role, payload = self.steps.pop(0)
+        self.requests.append({"role": role, **kwargs})
+        if role == "primary":
+            assert kwargs["model"] == self.primary_model
+            assert kwargs["tools"], "every PRIMARY call carries the provider palette"
+            content, tool_calls = payload
+            return _reply(content, tool_calls)
+        assert role == "end" and kwargs["model"] == self.advisor_model and "response_format" in kwargs
+        return ModelResponse(
+            model=self.advisor_model,
+            choices=[{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps(payload), "tool_calls": None}}],
+            usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
+
+
+def _end_admit() -> dict:
+    return {
+        "verdict": "CLEAN",
+        "category": "other",
+        "steps": [],
+        "findings": "The reply answers the request and changes nothing.",
+        "note": None,
+        "publication_verdict": "ADMIT",
+    }
+
+
 @pytest.mark.asyncio
 async def test_text_only_reply_completes_and_publishes_the_provider_words(tmp_path, monkeypatch):
-    """A reply without tool calls reaches End and publishes the model's own words.
+    """A reply without tool calls reaches END, is reviewed, and publishes the model's own words.
 
-    One authoring transition, one recorded PRIMARY provider call (K-7 a).
+    K-7 (a): the one authoring transition has exactly one PRIMARY provider
+    call, and the END review is its own provider call (no server-authored
+    reply). The END review effect is committed by the publication.
     """
-    calls: list[dict] = []
-
-    async def completion(**kwargs):
-        calls.append(kwargs)
-        return _reply("The request was explained without a pipeline change.")
-
-    monkeypatch.setattr(litellm, "acompletion", completion)
+    words = "The request was explained without a pipeline change."
+    sdk = ScriptedSDK("test/model", "test/advisor", [("primary", (words, None)), ("end", _end_admit())])
+    monkeypatch.setattr(litellm, "acompletion", sdk)
 
     operation_id = str(uuid4())
     async with _continuation_app(tmp_path, monkeypatch) as (app, token, session_id):
@@ -165,16 +212,16 @@ async def test_text_only_reply_completes_and_publishes_the_provider_words(tmp_pa
         )
         assert snapshot.status == "completed", snapshot.error
         assert snapshot.error is None and snapshot.result is not None
-        assert snapshot.result.message.content == "The request was explained without a pipeline change."
-        assert len(calls) == 1
-        (effect,) = _primary_effects(app, operation_id)
-        assert effect.effect_key == "provider:0:0" and effect.disposition == "committed"
-        with app.state.session_engine.connect() as conn:
-            assistants = tuple(
-                conn.execute(
-                    select(chat_messages_table.c.content).where(
-                        chat_messages_table.c.session_id == str(session_id), chat_messages_table.c.role == "assistant"
-                    )
-                )
-            )
-        assert [row.content for row in assistants] == ["The request was explained without a pipeline change."]
+        # The shared finalizer appends the backend checkpoint receipt; the
+        # reply above it is exactly the provider's words.
+        published = snapshot.result.message.content
+        assert published.split("\n\n---\n\n")[0] == words
+        assert "[ELSPETH-SYSTEM] Checkpoint save status:" in published
+        assert [request["role"] for request in sdk.requests] == ["primary", "end"] and not sdk.steps
+        effects = {row.effect_key: row for row in _effects(app, operation_id)}
+        primary = effects.pop("provider:0:0")
+        assert primary.owner == "provider" and primary.disposition == "committed"
+        ((end_key, end),) = effects.items()
+        assert end_key.startswith("end:") and end.owner == "composer_end"
+        assert end.disposition == "committed" and end.receipt_key == snapshot.result.message.id
+        assert _assistant_contents(app, session_id) == [published]
