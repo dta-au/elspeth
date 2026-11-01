@@ -117,7 +117,6 @@ def stack_for(top):
         ),
         provider_cost_policy=ContinuationProviderCostPolicy(
             applicability="not_applicable",
-            lifecycle_version=2,
             accounting_owner="physical_audit_and_token_ledger",
         ),
         policy_hash=policy.policy_hash,

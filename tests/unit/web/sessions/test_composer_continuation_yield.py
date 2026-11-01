@@ -181,7 +181,7 @@ async def test_stop_wins_over_a_yield(operation_store, tmp_path, monkeypatch):
     engine, repository, authority, *_ = operation_store
     running, yield_args = await _handoff_safe(operation_store, tmp_path, monkeypatch)
     authority.request_cancel(
-        session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+        session_id=running.claim.session_id, operation_id=running.claim.operation_id
     )
     before = _admission_rows(engine)
     with pytest.raises(ComposerOperationCancelledDuringTurn):

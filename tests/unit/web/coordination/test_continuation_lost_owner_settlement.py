@@ -445,7 +445,7 @@ async def test_coherent_paid_p4_corruption_refuses_in_live_reader_and_lost_stop(
         with pytest.raises(AuditIntegrityError):
             owner.authority.classify_continuation_owner(running, env_ref_names=phase.inventory.names)
         assert _admission_rows(engine) == before
-        owner.authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error)
+        owner.authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id)
     (candidate,) = list_recoverable_segments(engine, limit=1)
     assert_progressed_candidate(engine, candidate)
     before = _admission_rows(engine)
@@ -521,7 +521,7 @@ async def test_coherent_title_source_corruption_refuses_in_live_reader_and_lost_
             else:
                 await title_driver.read_current_title_result(service=service, running=running, required_work=work)
         assert _admission_rows(engine) == before
-        authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error)
+        authority.request_cancel(session_id=sid, operation_id=running.claim.operation_id)
     finally:
         repository.release(running.session_operation_context)
     (candidate,) = list_recoverable_segments(engine, limit=1)
@@ -612,7 +612,7 @@ async def test_lost_stop_preserves_actual_committed_p4_and_saved_revisions(opera
             quota_before = conn.execute(select(physical)).all(), conn.execute(select(token_usage_ledger_table)).all()
             retained = {row.chunk_key: row.payload for row in conn.execute(select(chunks)).all()}
         record = owner.authority.request_cancel(
-            session_id=sid, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+            session_id=sid, operation_id=running.claim.operation_id
         )
         assert record is not None and phase.application is not None
         authority = owner.authority

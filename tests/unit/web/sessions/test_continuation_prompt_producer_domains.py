@@ -104,7 +104,7 @@ async def recompose_case(store):
     assert tuple(row.id for row in all_records) == (prior.id, assistant.id, tool.id, private_row.id, ingress.message.id)
     authority = operations._admission_v2_authority(store)
     request = RecomposeRequest(operation_id=str(uuid4()), expected_user_message_id=ingress.message.id)
-    record, fresh = operations.admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True)
+    record, fresh = operations.admit(authority, sid, request)
     assert fresh and record.operation_id != old_record.operation_id
     assert record.user_message_id == ingress.message.id
     running = start_continuation(repository, authority)

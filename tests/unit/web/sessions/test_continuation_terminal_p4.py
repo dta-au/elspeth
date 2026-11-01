@@ -420,7 +420,7 @@ async def test_terminal_p4_stop_after_real_issue_finishes_original_service_prefi
 
         async def stop_then_refuse(**kwargs):
             owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+                session_id=running.claim.session_id, operation_id=running.claim.operation_id
             )
             owner.observe_stop()
             return await refuse(**kwargs)

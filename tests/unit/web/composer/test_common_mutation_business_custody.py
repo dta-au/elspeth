@@ -221,7 +221,7 @@ async def test_existing_durable_stop_is_checked_before_mutation_mode(operation_s
     _engine, repository, authority, _service, sid = operation_store
     record, running = start(operation_store)
     context = running.session_operation_context
-    authority.request_cancel(session_id=sid, operation_id=record.operation_id, cancelled_failure=cancelled)
+    authority.request_cancel(session_id=sid, operation_id=record.operation_id)
     ceiling = ComposerMutationCeiling(str(sid), "synthetic-stopped-request", "explicit_approve")
     entered = []
     try:

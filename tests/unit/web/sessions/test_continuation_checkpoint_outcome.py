@@ -250,7 +250,7 @@ async def test_actual_p4_binds_current_checkpoint_and_refuses_a_coherent_prior_r
         monkeypatch.setattr(ContinuationLiveP4, "accept_physical", accept)
         monkeypatch.setattr(type(sessions), "persist_continuation_compose_turn", persist)
         owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+            session_id=running.claim.session_id, operation_id=running.claim.operation_id
         )
         owner.observe_stop()
         selected = owner.runtime.source.selected
@@ -307,7 +307,7 @@ async def test_actual_p4_bind_refusal_closes_only_its_unsubmitted_local_pair(ope
         monkeypatch.setattr(RequiredWorkTicket, "complete_without_submission", complete)
         monkeypatch.setattr(type(sessions), "persist_continuation_compose_turn", must_not_submit)
         owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+            session_id=running.claim.session_id, operation_id=running.claim.operation_id
         )
         owner.observe_stop()
         try:
@@ -866,7 +866,7 @@ async def test_measure_actual_stop_p4_application_evidence_excess(operation_stor
     async with _phase_case(operation_store, tmp_path, monkeypatch) as (owner, running, _primary, sdk):
         await _advance(owner)
         owner.authority.request_cancel(
-            session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+            session_id=running.claim.session_id, operation_id=running.claim.operation_id
         )
         owner.observe_stop()
         work.start()

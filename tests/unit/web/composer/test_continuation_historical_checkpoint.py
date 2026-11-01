@@ -308,7 +308,7 @@ async def _actual_p4(store, tmp_path, monkeypatch, mode):
             assert custody.call.index == 0 and custody.call.tool_call is data.calls[0] and owner.p4 is None
             monkeypatch.setattr(owner.service._require_sessions_service(), "_insert_chat_message", insert)
             owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+                session_id=running.claim.session_id, operation_id=running.claim.operation_id
             )
             owner.observe_stop()
             with pytest.raises(BaseException) as caught:

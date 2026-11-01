@@ -307,7 +307,7 @@ async def test_title_application_current_business_authority_refuses_cancelled_ow
     try:
         assert not (await application.read_current_title_application(service=service, running=running, required_work=work)).applied
         operation_store[2].request_cancel(
-            session_id=operation_store[4], operation_id=running.claim.operation_id, cancelled_failure=operations.cancelled
+            session_id=operation_store[4], operation_id=running.claim.operation_id
         )
         before = recovery_rows(operation_store[0])
         with pytest.raises(ComposerOperationCancelledDuringTurn):

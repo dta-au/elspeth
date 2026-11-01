@@ -144,7 +144,7 @@ async def test_actual_issued_feedback_preserves_rich_ordered_wire_through_cold_r
         selected, inventory, facet = runtime.source.selected, runtime.materialization.inventory, None
         if stop:
             owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+                session_id=running.claim.session_id, operation_id=running.claim.operation_id
             )
             selected, inventory = await _finish_inventory(owner, running)
             facet = ContinuationFinishRead(running, selected, inventory)
@@ -1682,7 +1682,7 @@ async def _later_feedback_source_case(store, tmp_path, monkeypatch, *, timing, c
         facet = None
         if stop:
             owner.authority.request_cancel(
-                session_id=running.claim.session_id, operation_id=running.claim.operation_id, cancelled_failure=request_cancelled_error
+                session_id=running.claim.session_id, operation_id=running.claim.operation_id
             )
             # Inventory is actual SQL/name DATA from immediately before Stop,
             # with the same head. The nominal facet now re-proves the current
@@ -2499,7 +2499,6 @@ async def test_actual_failed_prefix_terminal_uses_two_slots_and_exact_bundle(ope
                     owner.authority.request_cancel(
                         session_id=running.claim.session_id,
                         operation_id=running.claim.operation_id,
-                        cancelled_failure=request_cancelled_error,
                     )
                 raise
             if terminal and fault == "after_commit" and len(exits) == 1:
