@@ -1,32 +1,108 @@
 # Guard symmetry allowlist for Landscape loaders.
 #
-# DESIGN: Single entry with max_hits capped at the exact current finding count.
-# Any new unguarded loader will push the count above the cap and fail CI.
-#
-# NOTE: Per-file rules match by (file pattern + rule ID), not by finding
-# content. All findings are in model_loaders.py with rule GS1, so per-loader
-# granularity isn't possible with this allowlist model. The max_hits cap
-# provides the same safety: adding a new unguarded loader exceeds the cap.
+# One exact entry per loader whose dataclass __post_init__ validation fires
+# during load(), providing read-side coverage without an explicit
+# AuditIntegrityError. The GS1 fingerprint is
+# sha256("GS1|<loader file>|<loader name>|<dataclass name>"), so an entry stays
+# valid across line shifts and a new unguarded loader is always a new finding.
 #
 # Loaders with complex state validation (NodeStateLoader,
 # TokenOutcomeLoader, NodeLoader, CallLoader,
 # OperationLoader) correctly use explicit AuditIntegrityError
-# and are NOT counted in this allowlist.
+# and are NOT listed here.
 
-per_file_rules:
-  - pattern: "core/landscape/model_loaders.py"
-    rules: [GS1]
-    reason: >-
-      17 loaders where __post_init__ validation fires during load(),
-      providing read-side coverage without explicit AuditIntegrityError.
-      Lifecycle: RunLoader delegates the explicit AuditIntegrityError guard
-      to validate_run_lifecycle_row().
-      Int-only: RowLoader, TokenLoader, TokenParentLoader, ArtifactLoader,
-      BatchMemberLoader. Enum+int: EdgeLoader, BatchLoader, RoutingEventLoader,
-      SchedulerEventLoader.
-      Effect ledger: SinkEffectStreamLoader, SinkEffectLoader,
-      SinkEffectMemberLoader, AuditExportSnapshotChunkLoader,
-      SinkEffectExportSnapshotAssociationLoader, SinkEffectAttemptLoader.
-      Plugin: ValidationErrorLoader (pairs with validation.py, not audit.py).
+allow_hits:
+  # ── Lifecycle ──
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=fdb4c5c0225222b4"
+    owner: "@elspeth-maintainers"
+    reason: "RunLoader delegates the explicit AuditIntegrityError guard to validate_run_lifecycle_row(); Run.__post_init__ validation fires during load()."
+    safety: "Read-side lifecycle invariants are enforced by validate_run_lifecycle_row, which raises AuditIntegrityError."
     expires: null
-    max_hits: 17
+
+  # ── Int-only ──
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=9739141c55c892c9"
+    owner: "@elspeth-maintainers"
+    reason: "RowLoader (int-only): Row.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=f778df88f57c682a"
+    owner: "@elspeth-maintainers"
+    reason: "TokenLoader (int-only): Token.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=7d76eab5185bb548"
+    owner: "@elspeth-maintainers"
+    reason: "TokenParentLoader (int-only): TokenParent.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=3be77723ab3474fc"
+    owner: "@elspeth-maintainers"
+    reason: "ArtifactLoader (int-only): Artifact.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=71fd5109fb5d81d2"
+    owner: "@elspeth-maintainers"
+    reason: "BatchMemberLoader (int-only): BatchMember.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+
+  # ── Enum + int ──
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=99e116265aa3aba7"
+    owner: "@elspeth-maintainers"
+    reason: "EdgeLoader (enum+int): Edge.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=c672da471c5e0bce"
+    owner: "@elspeth-maintainers"
+    reason: "BatchLoader (enum+int): Batch.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=5ff357d5c29aec4d"
+    owner: "@elspeth-maintainers"
+    reason: "RoutingEventLoader (enum+int): RoutingEvent.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=461baf9b51cd9f6a"
+    owner: "@elspeth-maintainers"
+    reason: "SchedulerEventLoader (enum+int): SchedulerEvent.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+
+  # ── Effect ledger ──
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=4739627cefc3dfc2"
+    owner: "@elspeth-maintainers"
+    reason: "SinkEffectStreamLoader (effect ledger): SinkEffectStream.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=624c5b747f03d38e"
+    owner: "@elspeth-maintainers"
+    reason: "SinkEffectLoader (effect ledger): SinkEffect.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=a6b72eeeb08cd709"
+    owner: "@elspeth-maintainers"
+    reason: "SinkEffectMemberLoader (effect ledger): SinkEffectMember.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=d4c61f82973e8380"
+    owner: "@elspeth-maintainers"
+    reason: "AuditExportSnapshotChunkLoader (effect ledger): AuditExportSnapshotChunk.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=6ffa14fb56ba9944"
+    owner: "@elspeth-maintainers"
+    reason: "SinkEffectExportSnapshotAssociationLoader (effect ledger): SinkEffectExportSnapshotAssociation.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=598846ee99e1a78e"
+    owner: "@elspeth-maintainers"
+    reason: "SinkEffectAttemptLoader (effect ledger): SinkEffectAttempt.__post_init__ validation fires during load(), giving read-side coverage."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
+
+  # ── Plugin ──
+  - key: "core/landscape/model_loaders.py:GS1:_module_:fp=364a397d7b655270"
+    owner: "@elspeth-maintainers"
+    reason: "ValidationErrorLoader (plugin; pairs with plugins/infrastructure/validation.py, not contracts/audit.py): ValidationError.__post_init__ validation fires during load()."
+    safety: "Dataclass construction in load() raises on any persisted value that violates the write-side invariant."
+    expires: null
