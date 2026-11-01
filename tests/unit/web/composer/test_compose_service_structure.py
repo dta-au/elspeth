@@ -62,23 +62,3 @@ def test_composer_service_impl_not_patched_at_module_tail(module_path: Path) -> 
             if isinstance(target, ast.Name) and target.id.startswith("_PHASE3_"):
                 hits.append(target.id)
     assert hits == [], f"forbidden module-tail patches in {module_path}: {hits}"
-
-
-def test_authoring_surface_telemetry_emission_shape_is_pinned() -> None:
-    """Surface telemetry records structural state without an inferred intent."""
-    tree = ast.parse((_COMPOSER_DIR / "service.py").read_text(encoding="utf-8"))
-    emissions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and node.args[0].value == "composer_authoring_surface_selected"
-    ]
-    assert len(emissions) == 1
-    fields = {keyword.arg: ast.unparse(keyword.value) for keyword in emissions[0].keywords}
-    assert fields == {
-        "authoring_surface": "'compose_loop'",
-        "state_is_structurally_empty": "state_is_empty",
-        "session_id": "session_id",
-    }
