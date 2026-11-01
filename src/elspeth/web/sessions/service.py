@@ -2806,7 +2806,7 @@ class SessionServiceImpl:
 
     def get_session_for_stream(self, session_id: UUID) -> SessionRecord:
         """Read owned session scope synchronously for joined observer SQL custody."""
-        with self._engine.begin() as conn:
+        with self._engine.connect() as conn:
             row = conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).one_or_none()
             if row is None:
                 raise SessionNotFoundError(session_id)
@@ -2816,7 +2816,7 @@ class SessionServiceImpl:
         """Fetch a session by ID. Raises SessionNotFoundError if not found."""
 
         def _sync() -> Any:
-            with self._engine.begin() as conn:
+            with self._engine.connect() as conn:
                 return conn.execute(select(sessions_table).where(sessions_table.c.id == str(session_id))).fetchone()
 
         row = await self._run_sync(_sync)

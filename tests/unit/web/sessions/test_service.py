@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 
 import pytest
 import structlog
-from sqlalchemy import delete, event, func, insert, select, update
+from sqlalchemy import delete, event, func, insert, literal, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import StaticPool
 
@@ -995,17 +995,32 @@ class TestAdr019LegacyCounterReadCompatibility:
         )
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_gate_routed_success_counter(self, service) -> None:
+    async def test_current_epoch_refuses_legacy_gate_routed_success_shape(self, service) -> None:
+        """Epoch 80 refuses legacy disjoint counters instead of normalizing them."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
+        before = await service.get_run(run.id)
+        with pytest.raises(IntegrityError, match="ck_runs_counter_subsets"):
+            await service.update_run_status(
+                run.id,
+                "completed",
+                landscape_run_id="lscp-legacy-gate",
+                rows_processed=4,
+                rows_succeeded=0,
+                rows_failed=0,
+                rows_routed_success=4,
+                rows_routed_failure=0,
+                rows_quarantined=0,
+            )
+        assert await service.get_run(run.id) == before
         await service.update_run_status(
             run.id,
             "completed",
             landscape_run_id="lscp-legacy-gate",
             rows_processed=4,
-            rows_succeeded=0,
+            rows_succeeded=4,
             rows_failed=0,
             rows_routed_success=4,
             rows_routed_failure=0,
@@ -1018,20 +1033,43 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.rows_routed_success == 4
         response = self._status_response_from_run(fetched)
         assert response.status == "completed"
+        with service._engine.connect() as conn:
+            legacy = conn.execute(
+                select(*[literal(0).label(column.name) if column.name == "rows_succeeded" else column for column in runs_table.c]).where(
+                    runs_table.c.id == str(run.id)
+                )
+            ).one()
+        with pytest.raises(AuditIntegrityError, match="rows_routed_success must be a subset of rows_succeeded"):
+            service._row_to_run_record(legacy)
 
     @pytest.mark.asyncio
-    async def test_get_run_normalizes_legacy_quarantine_failure_counter(self, service) -> None:
+    async def test_current_epoch_refuses_legacy_quarantine_failure_shape(self, service) -> None:
+        """Keep the historical shape as a write and read refusal control."""
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, composition_state_data(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         await service.update_run_status(run.id, "running")
+        before = await service.get_run(run.id)
+        with pytest.raises(IntegrityError, match="ck_runs_counter_subsets"):
+            await service.update_run_status(
+                run.id,
+                "completed_with_failures",
+                landscape_run_id="lscp-legacy-quarantine",
+                rows_processed=3,
+                rows_succeeded=1,
+                rows_failed=0,
+                rows_routed_success=0,
+                rows_routed_failure=0,
+                rows_quarantined=2,
+            )
+        assert await service.get_run(run.id) == before
         await service.update_run_status(
             run.id,
             "completed_with_failures",
             landscape_run_id="lscp-legacy-quarantine",
             rows_processed=3,
             rows_succeeded=1,
-            rows_failed=0,
+            rows_failed=2,
             rows_routed_success=0,
             rows_routed_failure=0,
             rows_quarantined=2,
@@ -1043,6 +1081,14 @@ class TestAdr019LegacyCounterReadCompatibility:
         assert fetched.rows_quarantined == 2
         response = self._status_response_from_run(fetched)
         assert response.status == "completed_with_failures"
+        with service._engine.connect() as conn:
+            legacy = conn.execute(
+                select(*[literal(0).label(column.name) if column.name == "rows_failed" else column for column in runs_table.c]).where(
+                    runs_table.c.id == str(run.id)
+                )
+            ).one()
+        with pytest.raises(AuditIntegrityError, match="rows_quarantined must be a subset of rows_failed"):
+            service._row_to_run_record(legacy)
 
     @pytest.mark.asyncio
     async def test_get_run_leaves_current_subset_counters_unchanged(self, service) -> None:
@@ -2357,33 +2403,50 @@ class TestAddMessageWithTranscript:
 
             assert transcript[-1].id == record.id  # sanity: the outcome still holds
 
-            insert_indices = [
-                index
-                for index, (kind, _conn_id, statement) in enumerate(events)
-                if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
-            ]
-            assert len(insert_indices) == 1, [entry[2] for entry in events]
-            insert_index = insert_indices[0]
-            transcript_select_indices = [
-                index
-                for index, (kind, _conn_id, statement) in enumerate(events)
-                if kind == "execute"
-                and statement.lstrip().upper().startswith("SELECT")
-                and "chat_messages" in statement
-                and "ORDER BY chat_messages.sequence_no" in statement
-            ]
-            assert len(transcript_select_indices) == 1, [entry[2] for entry in events]
-            select_index = transcript_select_indices[0]
+            def prove_atomic_transcript(observed):
+                insert_indices = [
+                    index
+                    for index, (kind, _conn_id, statement) in enumerate(observed)
+                    if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
+                ]
+                assert len(insert_indices) == 1, [entry[2] for entry in observed]
+                insert_index = insert_indices[0]
+                commit_indices = [
+                    index for index, (kind, _conn_id, _statement) in enumerate(observed) if index > insert_index and kind == "commit"
+                ]
+                assert commit_indices, "actual ingress transaction did not commit"
+                commit_index = commit_indices[0]
+                # Continuation reads the inserted transcript, then validates
+                # it again while retaining ingress. Both reads must stay in
+                # the insert's own transaction and on its DBAPI connection.
+                transcript_select_indices = [
+                    index
+                    for index, (kind, _conn_id, statement) in enumerate(observed)
+                    if insert_index < index < commit_index
+                    and kind == "execute"
+                    and statement.lstrip().upper().startswith("SELECT")
+                    and "chat_messages" in statement
+                    and "ORDER BY chat_messages.sequence_no" in statement
+                ]
+                assert len(transcript_select_indices) == 2, {"insert": insert_index, "transcript_reads": transcript_select_indices}
+                for select_index in transcript_select_indices:
+                    assert observed[insert_index][1] == observed[select_index][1]
+                    between = observed[insert_index + 1 : select_index]
+                    assert all(kind != "commit" for kind, _conn_id, _statement in between)
+                return insert_index, transcript_select_indices
 
-            # The read follows the write...
-            assert insert_index < select_index
-            # ...on the SAME DBAPI connection...
-            assert events[insert_index][1] == events[select_index][1]
-            # ...with no commit in between: the SELECT ran inside the
-            # insert's own transaction, which is the read-your-own-write
-            # guarantee the docstring claims.
-            between = events[insert_index + 1 : select_index]
-            assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
+            insert_index, select_indices = prove_atomic_transcript(events)
+            for select_index in select_indices:
+                wrong_connection = list(events)
+                kind, connection_id, statement = wrong_connection[select_index]
+                wrong_connection[select_index] = (kind, connection_id + 1, statement)
+                early_read = [events[select_index], *events[:select_index], *events[select_index + 1 :]]
+                for opponent in (wrong_connection, early_read):
+                    with pytest.raises(AssertionError):
+                        prove_atomic_transcript(opponent)
+            early_commit = [*events[: insert_index + 1], ("commit", events[insert_index][1], "COMMIT"), *events[insert_index + 1 :]]
+            with pytest.raises(AssertionError):
+                prove_atomic_transcript(early_commit)
         finally:
             engine.dispose()
 
