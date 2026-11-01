@@ -1,7 +1,7 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 
-import { COMPOSE_CLIENT_GRACE_MS, COMPOSE_TIMEOUT_ABORT_REASON, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
+import { COMPOSE_TIMEOUT_ABORT_REASON, COMPOSE_USER_CANCEL_ABORT_REASON } from "@/config/composer";
 import { useComposer } from "@/hooks/useComposer";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
@@ -22,7 +22,7 @@ describe("shared durable authoring hook", () => {
 
   it("admits a known-empty loaded session without a health-derived timeout", async () => { const send = vi.fn().mockResolvedValue(undefined); useSessionStore.setState({ compositionStateLoaded: true, compositionState: null, sendMessage: send }); const { result } = renderHook(() => useComposer()); await result.current.sendMessage("hello"); expect(send).toHaveBeenCalledWith("hello", expect.any(AbortSignal)); });
 
-  it("does not create a mutable timeout ceiling from informational health fields", async () => { expect(COMPOSE_CLIENT_GRACE_MS).toBe(25000); const retry = vi.fn(); useSessionStore.setState({ compositionStateLoaded: false, retryMessage: retry }); const { result } = renderHook(() => useComposer()); await result.current.retryMessage("msg-1"); expect(retry).not.toHaveBeenCalled(); });
+  it("does not create a mutable timeout ceiling from informational health fields", async () => { const retry = vi.fn(); useSessionStore.setState({ compositionStateLoaded: false, retryMessage: retry }); const { result } = renderHook(() => useComposer()); await result.current.retryMessage("msg-1"); expect(retry).not.toHaveBeenCalled(); });
 
   it("keeps a durable turn pending when the informational timeout elapses", async () => {
     vi.useFakeTimers();
@@ -39,7 +39,7 @@ describe("shared durable authoring hook", () => {
     });
     const { result } = renderHook(() => useComposer());
     const sendPromise = result.current.sendMessage("hello");
-    await vi.advanceTimersByTimeAsync(300_000 + COMPOSE_CLIENT_GRACE_MS + 1);
+    await vi.advanceTimersByTimeAsync(600_000);
     expect(captured?.aborted).toBe(false);
     expect(useSessionStore.getState().isComposing).toBe(true);
     finish();

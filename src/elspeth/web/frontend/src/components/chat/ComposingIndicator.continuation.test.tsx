@@ -1,12 +1,12 @@
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposingIndicator, LIVE_UPDATES_INTERRUPTED, SUCCESSOR_NOTICE, SUCCESSOR_NOTICE_MS, continuationView } from "./ComposingIndicator";
-import type { ComposerOperationStatusV2 } from "@/types/composerOperations";
+import type { ComposerOperationStatus } from "@/types/composerOperations";
 
 const id = "22222222-2222-4222-8222-222222222222";
-function status(extra: Partial<ComposerOperationStatusV2> = {}): ComposerOperationStatusV2 {
+function status(extra: Partial<ComposerOperationStatus> = {}): ComposerOperationStatus {
   const now = new Date().toISOString();
-  return { protocol_version: 2, operation_id: id, kind: "compose_message", status: "running", phase: "executing", status_revision: 1, created_at: now, observed_at: now, poll_after_ms: 1000, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "running", deadline_at: now }, ...extra };
+  return { operation_id: id, kind: "compose_message", status: "running", phase: "executing", status_revision: 1, created_at: now, observed_at: now, poll_after_ms: 1000, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "running", deadline_at: now }, ...extra };
 }
 afterEach(() => vi.useRealTimers());
 

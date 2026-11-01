@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { advanceAuthGeneration } from "./authSession";
 import { cancelObservedComposerOperation, ComposerActiveAttachment, ComposerObservationDetached, detachComposerObservers, observeComposerOperation, submitAndObserveComposerOperation } from "./composerOperationObserver";
 import { acquireComposerOperationCustody, authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
+import { completedSnapshot, liveSnapshot, streamUnavailable } from "@/test/composerOperationWire";
 import type { ComposerOperationSnapshot, SubmittedCustody } from "@/types/composerOperations";
 vi.mock("./client", () => ({ submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(), apiErrorFromBody: vi.fn(), composerActiveOperation: vi.fn(), isDefinitiveComposerRefusal: vi.fn() }));
 import * as api from "./client";
@@ -9,14 +10,17 @@ const sid = "11111111-1111-4111-8111-111111111111", id = "22222222-2222-4222-822
 const scope = { principalId: "principal", authProvider: "local" };
 function descriptor(): SubmittedCustody { return { mode: "submitted", scope, sessionId: sid, operationId: id, kind: "compose_message", createdAt: Date.now(), body: { operation_id: id, content: "hello", state_id: null } }; }
 function snapshot(status: "running" | "completed" = "completed", operationId = id): ComposerOperationSnapshot {
-  return { operation_id: operationId, kind: "compose_message", status, cancel_requested: false, deadline_at: new Date().toISOString(), deadline_remaining_ms: status === "running" ? 1000 : 0, poll_after_ms: 1000, error: null, result: status === "running" ? null : { message: { id: other, session_id: sid, role: "assistant", content: "done", tool_calls: null, created_at: new Date().toISOString() }, state: null, proposals: [] } };
+  if (status === "running") return liveSnapshot(operationId, { poll_after_ms: 1000 });
+  const result = { message: { id: other, session_id: sid, role: "assistant", content: "done", tool_calls: null, created_at: new Date().toISOString() }, state: null, proposals: [] } as unknown as ComposerOperationSnapshot["result"] & object;
+  return completedSnapshot(operationId, result, { poll_after_ms: 1000 });
 }
 beforeEach(() => {
   vi.resetAllMocks(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope);
-  vi.mocked(api.submitComposerOperation).mockResolvedValue({ operation_id: id, kind: "compose_message", status: "queued", poll_after_ms: 1000 });
-  vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new Error("stream unavailable"));
+  vi.mocked(api.submitComposerOperation).mockResolvedValue(liveSnapshot(id, { status: "queued", phase: "queued" }));
+  // The stream is at capacity, so every round reads the durable GET.
+  vi.mocked(api.fetchComposerOperationStream).mockImplementation(async () => streamUnavailable());
   vi.mocked(api.fetchComposerOperation).mockResolvedValue(snapshot());
-  vi.mocked(api.cancelComposerOperation).mockResolvedValue(snapshot("running"));
+  vi.mocked(api.cancelComposerOperation).mockResolvedValue({ ...snapshot("running"), cancel_requested: true });
   vi.mocked(api.composerActiveOperation).mockReturnValue(null);
   vi.mocked(api.isDefinitiveComposerRefusal).mockImplementation((error) => typeof error === "object" && error !== null && "status" in error && typeof error.status === "number" && error.status >= 400 && error.status < 500);
 });
@@ -73,8 +77,7 @@ describe("one durable operation observer", () => {
     expect(api.cancelComposerOperation).not.toHaveBeenCalled();
   });
 
-  it("falls back after stream EOF and applies only the final authenticated GET", async () => {
-    vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(new Response(new ReadableStream({ start(controller) { controller.close(); } }), { headers: { "Content-Type": "text/event-stream" } }));
+  it("applies only the authenticated GET terminal after admission", async () => {
     const result = await submitAndObserveComposerOperation(descriptor());
     expect(result.message.content).toBe("done"); expect(api.submitComposerOperation).toHaveBeenCalledTimes(1); expect(api.fetchComposerOperation).toHaveBeenCalledWith(sid, id);
     expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
@@ -129,24 +132,6 @@ describe("one durable operation observer", () => {
     const record = findComposerOperationCustody(scope, sid); expect(record.unresolvedSubmissions.get(id)?.body.operation_id).toBe(id);
     expect(api.fetchComposerOperation).toHaveBeenLastCalledWith(sid, other);
     expect(vi.mocked(api.submitComposerOperation).mock.calls.every(([submission]) => submission.operationId === id)).toBe(true);
-  });
-});
-
-describe("monotonic observation budget", () => {
-  it.each([-600000, 0, 600000])("tightens only despite wall-clock skew %s", async (skew) => {
-    vi.useFakeTimers(); vi.setSystemTime(Date.now() + skew);
-    let reads = 0;
-    vi.mocked(api.fetchComposerOperation).mockImplementation(async () => ({ ...snapshot("running"), deadline_remaining_ms: reads++ === 0 ? 1000 : 100000 }));
-    const start = performance.now();
-    const observing = submitAndObserveComposerOperation(descriptor()).catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(25999);
-    expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(await observing).toBeInstanceOf(ComposerObservationDetached);
-    expect(performance.now() - start).toBeGreaterThanOrEqual(26000);
-    expect(api.cancelComposerOperation).not.toHaveBeenCalled();
-    expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-    expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
   });
 });
 

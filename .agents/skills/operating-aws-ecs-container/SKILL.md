@@ -366,7 +366,7 @@ compatibility record is pinned to them by
 `tests/unit/docs/test_release_version_surfaces.py`. Re-check after any epoch
 change. The Terraform package it describes is tracked at `deploy/aws-ecs/terraform/`.
 
-For the 0.8.10 session-epoch cut (78 → 79), follow
+For the 0.8.10 session-epoch cut (to epoch 80), follow
 `docs/release/0.8.10-upgrade-notes-draft.md`, "AWS ECS: new stores only". As on
 ACA, 0.8.10 is installed as a **separate, fresh Scenario A deployment** through
 `docs/runbooks/aws-ecs-cold-install.md`, with new Sessions and Landscape

@@ -64,12 +64,15 @@ package version do not establish combined-release qualification or publication.
 
 ### Composer
 
-- **Composer Continuation is retained durably and ships default-off.** A long
-  Compose run is held as versioned continuation segments with exact byte
-  chunks, attributed journal events and complete snapshots in the Sessions
-  store. Version-2 operation admission is refused unless continuation is
-  enabled, and it is disabled by default, so existing clients keep the version-1
-  lifecycle. The Sessions schema moves to epoch 79 (see Upgrade notes).
+- **Composer has one operation lifecycle: Continuation.** Every Compose
+  request, freeform and tutorial alike, runs as Continuation. A long run is
+  held as versioned continuation segments with exact byte chunks, attributed
+  journal events and complete snapshots in the Sessions store. The version-1
+  lifecycle and lifecycle negotiation are removed: the client sends no
+  `Composer-Operation-Version` header, and operation records, stream frames
+  and the status endpoint carry no lifecycle or protocol version. The
+  Sessions schema moves to epoch 80 and needs fresh Sessions stores, and open
+  browser tabs must be reloaded after deploying (see Upgrade notes).
 - **Full replacements support provider-authored named and plural attachment
   roots.** `set_pipeline` accepts `blob_id` or ordered `blob_ids` on its default
   or named roots. The provider must choose the plugin explicitly; plural
@@ -232,15 +235,25 @@ package version do not establish combined-release qualification or publication.
 
 ### Upgrade notes
 
-**Session epoch advances from 78 to 79 (hard cut).** Continuation adds seven tables
-and alters `composer_operations`. An existing epoch-78 Sessions store is
-refused, not migrated; deploy 0.8.10 against a fresh Sessions store and leave
-the epoch-78 database in place. Landscape epoch 50 remains unchanged. The AWS ECS and
-Azure Container Apps fresh-store procedures are in
+**Session epoch advances from 78 to 80 (hard cut).** Epoch 79 existed only on
+pre-release 0.8.10 builds. Epoch 80 adds Continuation's tables for the single
+Composer lifecycle and terminal-run database checks, removes `PLANNER` from the
+provider-family set, and drops `sessions_cleanup_claims` and
+`composition_states.source`. An existing epoch-78 Sessions store is refused,
+not migrated, and so is a pre-release epoch-79 store. Deploy 0.8.10 against a
+fresh Sessions store on ECS, ACA and the dev box, and leave the epoch-78
+database in place. Landscape epoch 50 remains unchanged. The AWS ECS and Azure Container Apps fresh-store procedures
+are in
 [docs/release/0.8.10-upgrade-notes-draft.md](docs/release/0.8.10-upgrade-notes-draft.md).
 
+**Reload open browser tabs after deploying.** A tab loaded before the deploy
+runs the previous bundle, which expects the removed lifecycle-version fields and
+cannot read the new operation responses. The reloaded client ignores the old
+tab's stored composer custody.
+
+<!-- cost-cap note: rewritten at integration from the U-40 port -->
 **`composer_planner_repair_budget` must be `2`.** Any other value now refuses
-a version-1 Compose request on an empty graph before any provider call (HTTP
+a Compose request on an empty graph before any provider call (HTTP
 503, `configuration_unsupported`). Startup does not report it. Before
 upgrading, confirm that `ELSPETH_WEB__COMPOSER_PLANNER_REPAIR_BUDGET` is unset
 or `2`.

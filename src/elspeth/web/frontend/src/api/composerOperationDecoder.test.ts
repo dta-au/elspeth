@@ -1,10 +1,14 @@
 import producerFixtures from "@/test/composerRecoveryProducerFixtures.json";
 import executorFixtures from "../../../../../../tests/fixtures/web/composer/composer_executor_failure_producer.json";
 import { describe, expect, it } from "vitest";
-import { ComposerOperationDecodeError, ComposerSseDecoder, decodeComposerOperationAck, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
+import { ComposerOperationDecodeError, ComposerSseDecoder, decodeComposerActiveOperation, decodeComposerOperationFrame, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 const sid = "11111111-1111-4111-8111-111111111111";
 const id = "22222222-2222-4222-8222-222222222222";
-const heartbeat = { schema_version: "composer-operation-stream.v1", session_id: sid, operation_id: id, sequence: 0, event: "heartbeat" };
+const heartbeat = { session_id: sid, operation_id: id, sequence: 0, event: "heartbeat" };
+/** An SSE frame as the framing decoder hands it to the DTO decoder. */
+const sse = (data: unknown, eventId: string | null = null) => ({ id: eventId, data });
+/** A settled operation envelope; cases set status, result and error. */
+const envelope = { operation_id: id, kind: "compose_message", poll_after_ms: 1000, cancel_requested: false, phase: "settled", status_revision: 9, created_at: "2026-10-06T00:00:00Z", observed_at: "2026-10-06T00:00:00Z", segment: null };
 const encode = new TextEncoder();
 
 describe.each([
@@ -135,58 +139,70 @@ describe("composer operation external admission", () => {
     const wire = encode.encode(`data: ${JSON.stringify(value)}\r\n\r\ndata: ${JSON.stringify(heartbeat)}\n\n`);
     const decoder = new ComposerSseDecoder();
     const frames = [...wire].flatMap((byte) => decoder.push(new Uint8Array([byte])));
-    expect(frames).toEqual([value, heartbeat]); expect(decoder.finish()).toEqual([]);
+    expect(frames).toEqual([sse(value), sse(heartbeat)]); expect(decoder.finish()).toEqual([]);
     // The framing positive control does not bypass strict DTO admission.
     expect(() => decodeComposerOperationFrame(frames[0], sid, id)).toThrow();
-    expect(decodeComposerOperationFrame(frames[1], sid, id)).toEqual(heartbeat);
+    expect(decodeComposerOperationFrame(frames[1], sid, id)).toEqual({ ...heartbeat, id: null });
   });
   it("admits multiline data and explicit event binding", () => {
     const decoder = new ComposerSseDecoder();
     const json = JSON.stringify(heartbeat);
     const split = json.indexOf(',');
     const frames = decoder.push(encode.encode(`event: heartbeat\ndata: ${json.slice(0, split + 1)}\ndata: ${json.slice(split + 1)}\n\n`));
-    expect(decodeComposerOperationFrame(frames[0], sid, id)).toEqual(heartbeat);
+    expect(decodeComposerOperationFrame(frames[0], sid, id)).toEqual({ ...heartbeat, id: null });
   });
   it("rejects invalid UTF-8, invalid JSON, event mismatch, unknown fields, oversized and truncated frames", () => {
     expect(() => new ComposerSseDecoder().push(new Uint8Array([0xff]))).toThrow();
     expect(() => new ComposerSseDecoder().push(encode.encode("data: nope\n\n"))).toThrow();
     expect(() => new ComposerSseDecoder().push(encode.encode(`event: status\ndata: ${JSON.stringify(heartbeat)}\n\n`))).toThrow();
     expect(() => new ComposerSseDecoder().push(encode.encode("retry: 1\ndata: {}\n\n"))).toThrow();
+    expect(() => new ComposerSseDecoder().push(encode.encode("id: 1\nid: 2\ndata: {}\n\n"))).toThrow();
+    expect(() => new ComposerSseDecoder().push(encode.encode("id: -1\ndata: {}\n\n"))).toThrow();
     expect(() => new ComposerSseDecoder(12).push(encode.encode("data: \"123456789\"\n\n"))).toThrow();
     const crlfWire = encode.encode('data: {}\r\n\r\n');
-    expect(new ComposerSseDecoder(crlfWire.length).push(crlfWire)).toEqual([{}]);
+    expect(new ComposerSseDecoder(crlfWire.length).push(crlfWire)).toEqual([sse({})]);
     expect(() => new ComposerSseDecoder(crlfWire.length - 1).push(crlfWire)).toThrow();
     const truncated = new ComposerSseDecoder(); truncated.push(encode.encode("data: {}\n")); expect(() => truncated.finish()).toThrow();
     const utf8 = new ComposerSseDecoder(); utf8.push(new Uint8Array([0xf0, 0x9f])); expect(() => utf8.finish()).toThrow();
   });
   it("rejects wrong identities, unsupported variants and heartbeat replay bodies", () => {
-    expect(() => decodeComposerOperationFrame(heartbeat, sid, sid)).toThrow();
-    expect(() => decodeComposerOperationFrame({ ...heartbeat, answer: "secret" }, sid, id)).toThrow();
-    expect(() => decodeComposerOperationFrame({ ...heartbeat, payload: {} }, sid, id)).toThrow();
-    expect(() => decodeComposerOperationFrame({ ...heartbeat, event: "answer_delta", payload: "secret" }, sid, id)).toThrow();
-    expect(() => decodeComposerOperationFrame({ ...heartbeat, sequence: -1 }, sid, id)).toThrow();
-    expect(() => decodeComposerOperationFrame({ ...heartbeat, event: "terminal", payload: { status: "running" } }, sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse(heartbeat), sid, sid)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, answer: "secret" }), sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, payload: {} }), sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, event: "answer_delta", payload: "secret" }), sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, sequence: -1 }), sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, event: "terminal", payload: { status: "running", phase: "settled", status_revision: 9 } }, "9"), sid, id)).toThrow();
+    expect(() => decodeComposerOperationFrame(sse(heartbeat, "1"), sid, id)).toThrow("Only status and terminal frames carry an id");
   });
-  it("admits closed status/terminal DTOs and rejects malformed acknowledgement", () => {
-    expect(decodeComposerOperationFrame({ ...heartbeat, event: "status", payload: { status: "running", cancel_requested: false, deadline_remaining_ms: 30 } }, sid, id).event).toBe("status");
-    expect(decodeComposerOperationFrame({ ...heartbeat, event: "terminal", payload: { status: "failed" } }, sid, id).event).toBe("terminal");
-    const ack = { operation_id: id, kind: "compose_message", status: "queued", poll_after_ms: 1000 };
-    expect(decodeComposerOperationAck(ack)).toEqual(ack);
-    expect(() => decodeComposerOperationAck({ ...ack, result: {} })).toThrow();
-    expect(() => decodeComposerOperationAck({ ...ack, poll_after_ms: 0 })).toThrow();
-    expect(() => decodeComposerOperationAck({ ...ack, status: "cancelled" })).toThrow();
+  it("admits closed status/terminal DTOs bound to their SSE id", () => {
+    const running = { ...envelope, status: "running", phase: "executing", segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null } };
+    expect(decodeComposerOperationFrame(sse({ ...heartbeat, event: "status", payload: running }, "9"), sid, id).event).toBe("status");
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, event: "status", payload: running }, "8"), sid, id)).toThrow("revision");
+    expect(decodeComposerOperationFrame(sse({ ...heartbeat, event: "terminal", payload: { status: "failed", phase: "settled", status_revision: 9 } }, "9"), sid, id).event).toBe("terminal");
+    expect(decodeComposerOperationFrame(sse({ ...heartbeat, event: "reconnect" }), sid, id).event).toBe("reconnect");
+  });
+  it("refuses the retired version fields on every record (one lifecycle)", () => {
+    const live = { ...envelope, status: "queued", phase: "queued", segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null };
+    expect(decodeComposerOperationSnapshot(live, sid, id).status).toBe("queued");
+    expect(() => decodeComposerOperationSnapshot({ ...live, protocol_version: 2 }, sid, id)).toThrow("Unexpected or missing field");
+    expect(() => decodeComposerOperationFrame(sse({ ...heartbeat, schema_version: "composer-operation-stream.v2" }), sid, id)).toThrow("Unexpected or missing field");
+    const active = { operation_id: id, kind: "compose_message", status: "running" };
+    expect(decodeComposerActiveOperation(active)).toEqual(active);
+    expect(() => decodeComposerActiveOperation({ ...active, lifecycle_version: 2 })).toThrow("Unexpected or missing field");
+    expect(() => decodeComposerActiveOperation({ ...active, status: "completed" })).toThrow("not live");
   });
 });
 
 describe("completed answer durable GET boundary", () => {
   const message = { id, operation_id: null, session_id: sid, role: "assistant", content: "done", raw_content: null, segments: [{ kind: "text", content: "done" }], tool_calls: null, created_at: "2026-10-06T00:00:00Z", composition_state_id: null, tool_call_id: null, parent_assistant_id: null, sequence_no: 1, rejection: null };
-  const complete = { operation_id: id, kind: "compose_message", status: "completed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-10-06T00:00:00Z", deadline_remaining_ms: 0, result: { message, state: null, proposals: [] }, error: null };
+  const complete = { ...envelope, status: "completed", result: { message, state: null, proposals: [] }, error: null };
   it("admits exact final response and rejects extra answer/identity/status corruption", () => {
     expect(decodeComposerOperationSnapshot(complete, sid, id).result?.message.content).toBe("done");
     expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, answer_delta: "secret" } }, sid, id)).toThrow();
     expect(() => decodeComposerOperationSnapshot({ ...complete, result: { ...complete.result, message: { ...message, session_id: id } } }, sid, id)).toThrow();
     expect(() => decodeComposerOperationSnapshot({ ...complete, cancel_requested: true }, sid, id)).toThrow();
-    expect(() => decodeComposerOperationSnapshot({ ...complete, deadline_remaining_ms: 1 }, sid, id)).toThrow();
+    expect(() => decodeComposerOperationSnapshot({ ...complete, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null } }, sid, id)).toThrow();
+    expect(() => decodeComposerOperationSnapshot({ ...complete, phase: "executing" }, sid, id)).toThrow();
     expect(() => decodeComposerOperationSnapshot({ ...complete, status: "running" }, sid, id)).toThrow();
   });
   it("rejects missing/invalid nested message fields and unknown proposals", () => {
@@ -214,7 +230,7 @@ describe("completed answer durable GET boundary", () => {
 
 describe("strict failed terminal recovery", () => {
   const failedTurn = { assistant_message_id: null, tool_calls_attempted: 1, tool_responses_persisted: 1, transcript_url: null };
-  const failed = (failed_turn: unknown) => ({ operation_id: id, kind: "compose_message", status: "failed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-10-06T00:00:00Z", deadline_remaining_ms: 0, result: null, error: { http_status: 500, failure_code: "http_error", error_type: "composer_plugin_crash", diagnostic_id: null, body: { detail: { failed_turn } } } });
+  const failed = (failed_turn: unknown) => ({ ...envelope, status: "failed", result: null, error: { http_status: 500, failure_code: "http_error", error_type: "composer_plugin_crash", diagnostic_id: null, body: { detail: { failed_turn } } } });
   it("admits producer-shaped nullable evidence and rejects field/type/count/URL mutations", () => {
     expect(decodeComposerOperationSnapshot(failed(failedTurn), sid, id).status).toBe("failed");
     for (const value of [{ ...failedTurn, assistant_message_id: 22 }, { ...failedTurn, tool_calls_attempted: {} }, { ...failedTurn, tool_responses_persisted: -3 }, { ...failedTurn, tool_responses_persisted: 2 }, { ...failedTurn, transcript_url: 5 }, { ...failedTurn, transcript_url: "//evil" }, { ...failedTurn, extra: true }, { assistant_message_id: null }]) expect(() => decodeComposerOperationSnapshot(failed(value), sid, id)).toThrow();
@@ -222,7 +238,7 @@ describe("strict failed terminal recovery", () => {
 });
 
 describe("live backend producer serialization parity", () => {
-  const base = { operation_id: id, kind: "compose_message", status: "failed", poll_after_ms: 1000, cancel_requested: false, deadline_at: "2026-10-06T00:00:00Z", deadline_remaining_ms: 0, result: null };
+  const base = { ...envelope, status: "failed", result: null };
   it("admits all serialized failure DTO variants and both actual failed-turn identity variants", () => {
     for (const error of [...producerFixtures.errors, producerFixtures.projected_audit_error]) expect(decodeComposerOperationSnapshot({ ...base, error }, sid, id).error?.failure_code).toBe(error.failure_code);
     for (const failed_turn of producerFixtures.recovery) for (const body of [{ failed_turn }, { detail: { failed_turn } }]) expect(decodeComposerOperationSnapshot({ ...base, error: { ...producerFixtures.errors[0], body } }, sid, id).status).toBe("failed");
@@ -249,23 +265,39 @@ it("retains actual saved facts for mutation authority refusal without inventing 
     expect(() => decodeComposerOperationFailurePage({ ...page, items: [{ ...outcome, ...changes }] }, sid)).toThrow();
   }
   const frame = { ...heartbeat, event: "progress", payload: {
-    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    request_id: "request",
     phase: "failed", headline: "Automatic mutation authority was revoked.", evidence: [],
     likely_next: "Review the saved session before retrying.", reason: "mutation_authority_revoked",
-    updated_at: "2026-10-22T08:00:00Z",
+    updated_at: "2026-10-22T08:00:00Z", segment_sequence: 1, segment_generation: 1,
   } };
-  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
-  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "invented_auto_proposal" } }, sid, id)).toThrow();
+  expect(decodeComposerOperationFrame(sse(frame), sid, id)).toEqual({ ...frame, id: null });
+  expect(() => decodeComposerOperationFrame(sse({ ...frame, payload: { ...frame.payload, reason: "invented_auto_proposal" } }), sid, id)).toThrow("Unknown progress vocabulary");
 });
 
 it("decodes the context-unsupported progress reason (U-22 F4)", () => {
   const frame = { ...heartbeat, event: "progress", payload: {
-    session_operation_id: id, session_operation_epoch: 1, request_token: "token", request_id: "request",
+    request_id: "request",
     phase: "failed", headline: "This request is too large to send to the model.",
     evidence: ["The current pipeline is too large to send to the model. Reduce its size and try again."],
     likely_next: "Reduce the pipeline or conversation size, then send the request again.", reason: "context_unsupported",
-    updated_at: "2026-10-25T08:00:00Z",
+    updated_at: "2026-10-25T08:00:00Z", segment_sequence: 2, segment_generation: 1,
   } };
-  expect(decodeComposerOperationFrame(frame, sid, id)).toEqual(frame);
-  expect(() => decodeComposerOperationFrame({ ...frame, payload: { ...frame.payload, reason: "context_unsupported_invented" } }, sid, id)).toThrow();
+  expect(decodeComposerOperationFrame(sse(frame), sid, id)).toEqual({ ...frame, id: null });
+  expect(() => decodeComposerOperationFrame(sse({ ...frame, payload: { ...frame.payload, reason: "context_unsupported_invented" } }), sid, id)).toThrow("Unknown progress vocabulary");
+});
+
+it("closes the progress vocabulary and bounds its text", () => {
+  const payload = { request_id: null, phase: "calling_model", headline: "Asking the model.", evidence: [], likely_next: null, reason: null, updated_at: "2026-10-25T08:00:00Z", segment_sequence: 1, segment_generation: 1 };
+  const decode = (changes: Record<string, unknown>) => decodeComposerOperationFrame(sse({ ...heartbeat, event: "progress", payload: { ...payload, ...changes } }), sid, id);
+  expect(decode({}).event).toBe("progress");
+  expect(() => decode({ phase: "thinking" })).toThrow("Unknown progress vocabulary");
+  // A failed or cancelled phase must say why.
+  expect(() => decode({ phase: "failed" })).toThrow("Unknown progress vocabulary");
+  expect(() => decode({ phase: "cancelled" })).toThrow("Unknown progress vocabulary");
+  expect(decode({ phase: "cancelled", reason: "client_cancelled" }).event).toBe("progress");
+  expect(decode({ headline: "x".repeat(180) }).event).toBe("progress");
+  expect(() => decode({ headline: "x".repeat(181) })).toThrow("Unbounded progress text");
+  expect(() => decode({ headline: "" })).toThrow("Unbounded progress text");
+  expect(() => decode({ evidence: ["a", "b", "c", "d", "e"] })).toThrow("Unbounded progress evidence");
+  expect(() => decode({ request_id: "r".repeat(129) })).toThrow("Unbounded progress text");
 });

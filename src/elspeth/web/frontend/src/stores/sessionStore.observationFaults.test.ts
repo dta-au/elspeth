@@ -2,16 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "./sessionStore";
 import { COMPOSER_STOP_KEY, acquireComposerOperationCustody, authenticateComposerCustody, composerCustodyRecoveryNotice, composerStopRequested, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
-import { decodeComposerOperationAck, decodeComposerOperationSnapshot } from "@/api/composerOperationDecoder";
-import { decodeComposerOperationSnapshotV2 } from "@/api/composerOperationDecoderV2";
+import { decodeComposerOperationSnapshot } from "@/api/composerOperationDecoder";
 import { advanceAuthGeneration } from "@/api/authSession";
-import { setComposerAdmissionVersion } from "@/config/composerProtocol";
 import type { ComposerOperationFailureNotice, ComposerOperationSnapshot, OperationKind } from "@/types/composerOperations";
 
 vi.mock("@/api/client", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/api/client")>(),
   submitComposerOperation: vi.fn(), fetchComposerOperation: vi.fn(), fetchComposerOperationFailures: vi.fn(), cancelComposerOperation: vi.fn(), fetchComposerOperationStream: vi.fn(),
-  fetchComposerOperationAnyVersion: vi.fn(), fetchComposerOperationStreamV2: vi.fn(), cancelComposerOperationV2: vi.fn(),
   fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(), fetchComposerPreferences: vi.fn(), fetchSessions: vi.fn(),
   fetchCurrentUser: vi.fn(), fetchAuthConfig: vi.fn(), listBlobs: vi.fn(), listInterpretationEvents: vi.fn(),
 }));
@@ -22,9 +19,10 @@ const scope = { principalId: "principal", authProvider: "local" };
 const iso = "2026-10-31T00:00:00Z";
 const notice = "Composer updates stopped before the outcome could be confirmed. Reload this session to check the same action, or use Stop to request cancellation. Your request is still pending.";
 const history: ComposerOperationFailureNotice[] = [{ session_id: sid, operation_id: other, kind: "compose_message", user_message_id: null, settled_at: null, failure_code: "worker_lost", error_type: null, diagnostic_id: null, request_id: null, saved_revisions: { attribution: "unavailable", count: null, latest_state_id: null, latest_version: null } }];
-function running(sessionId: string, operationId: string, kind: OperationKind = "compose_message") {
-  return decodeComposerOperationSnapshot({ operation_id: operationId, kind, status: "running", cancel_requested: false, poll_after_ms: 1000, deadline_at: iso, deadline_remaining_ms: 100000, result: null, error: null }, sessionId, operationId);
+function snapshot(sessionId: string, operationId: string, status: "queued" | "running", kind: OperationKind = "compose_message") {
+  return decodeComposerOperationSnapshot({ operation_id: operationId, kind, status, phase: status === "queued" ? "queued" : "executing", status_revision: status === "queued" ? 1 : 4, created_at: iso, observed_at: iso, cancel_requested: false, poll_after_ms: 1000, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null }, sessionId, operationId);
 }
+function running(sessionId: string, operationId: string, kind: OperationKind = "compose_message") { return snapshot(sessionId, operationId, "running", kind); }
 function opposite(sessionId: string, operationId: string) { return running(sessionId, operationId, "compose_recompose"); }
 function holdInactive() {
   return acquireComposerOperationCustody({ mode: "submitted", scope, sessionId: inactive, operationId: id, kind: "compose_message", createdAt: Date.now(), body: { operation_id: id, content: "held request", state_id: null } });
@@ -33,24 +31,21 @@ function resetSessionGeneration() {
   useSessionStore.getState().reset();
   useSessionStore.setState({ activeSessionId: sid, compositionStateLoaded: true, composerFailureOutcomes: history });
 }
-function progressResponse(sessionId: string, operationId: string, version: 1 | 2) {
-  const payload = { request_id: null, phase: "calling_model", headline: "Working", evidence: [], likely_next: null, reason: null, updated_at: iso };
-  const frame = version === 1
-    ? { schema_version: "composer-operation-stream.v1", session_id: sessionId, operation_id: operationId, sequence: 0, event: "progress", payload: { ...payload, session_operation_id: operationId, session_operation_epoch: 1, request_token: "token" } }
-    : { schema_version: "composer-operation-stream.v2", session_id: sessionId, operation_id: operationId, sequence: 0, event: "progress", payload: { ...payload, segment_sequence: 1, segment_generation: 1 } };
+function progressResponse(sessionId: string, operationId: string) {
+  const payload = { request_id: null, phase: "calling_model", headline: "Working", evidence: [], likely_next: null, reason: null, updated_at: iso, segment_sequence: 1, segment_generation: 1 };
+  const frame = { session_id: sessionId, operation_id: operationId, sequence: 0, event: "progress", payload };
   return new Response(new ReadableStream<Uint8Array>({ start(controller) {
     controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
   } }), { headers: { "Content-Type": "text/event-stream" } });
 }
 
 beforeEach(() => {
-  vi.resetAllMocks(); vi.useFakeTimers(); vi.setSystemTime(new Date(iso)); useSessionStore.getState().reset(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope); setComposerAdmissionVersion(1);
+  vi.resetAllMocks(); vi.useFakeTimers(); vi.setSystemTime(new Date(iso)); useSessionStore.getState().reset(); purgeComposerCustody(); sessionStorage.clear(); authenticateComposerCustody(scope);
   useSessionStore.setState({ activeSessionId: sid, compositionStateLoaded: true, composerFailureOutcomes: history });
-  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => ({ ...decodeComposerOperationAck({ operation_id: descriptor.operationId, kind: descriptor.kind, status: "queued", poll_after_ms: 1000 }), ...(descriptor.protocolVersion === 2 ? { protocolVersion: 2 } : {}) }));
-  vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new TypeError("offline"));
-  vi.mocked(api.fetchComposerOperationStreamV2).mockRejectedValue(new TypeError("offline"));
+  vi.mocked(api.submitComposerOperation).mockImplementation(async (descriptor) => snapshot(descriptor.sessionId, descriptor.operationId, "queued", descriptor.kind));
+  // At capacity: each round reads the durable GET.
+  vi.mocked(api.fetchComposerOperationStream).mockImplementation(async () => new Response("capacity", { status: 503 }));
   vi.mocked(api.fetchComposerOperation).mockImplementation(async (sessionId, operationId) => running(sessionId, operationId));
-  vi.mocked(api.fetchComposerOperationAnyVersion).mockImplementation(async (sessionId, operationId) => ({ protocolVersion: 2, snapshot: decodeComposerOperationSnapshotV2({ protocol_version: 2, operation_id: operationId, kind: "compose_message", status: "running", phase: "executing", status_revision: 4, created_at: iso, observed_at: iso, poll_after_ms: 1000, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null }, sessionId, operationId) }));
   vi.mocked(api.fetchCurrentUser).mockResolvedValue({ user_id: scope.principalId, username: "principal", display_name: null, email: null, groups: [], dev_admin: false });
   vi.mocked(api.fetchAuthConfig).mockResolvedValue({ provider: "local", registration_mode: "closed", sso_start_url: null });
   vi.mocked(api.fetchMessages).mockResolvedValue([]); vi.mocked(api.fetchCompositionState).mockResolvedValue(null); vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
@@ -58,11 +53,10 @@ beforeEach(() => {
   vi.mocked(api.fetchComposerPreferences).mockImplementation(async (sessionId) => ({ session_id: sessionId, trust_mode: "explicit_approve", density_default: "medium", interpretation_review_disabled: false, updated_at: iso }));
   vi.mocked(api.fetchSessions).mockResolvedValue([]); vi.mocked(api.listBlobs).mockResolvedValue([]); vi.mocked(api.listInterpretationEvents).mockResolvedValue([]);
 });
-afterEach(async () => { detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); vi.useRealTimers(); purgeComposerCustody(); setComposerAdmissionVersion(1); vi.restoreAllMocks(); });
+afterEach(async () => { detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); vi.useRealTimers(); purgeComposerCustody(); vi.restoreAllMocks(); });
 
 describe("R real observer-to-store disposition", () => {
-  it.each([[1, false], [1, true], [2, false], [2, true]] as const)("keeps the actual V%s callback fault pending (custody notice %s)", async (version, withRecoveryNotice) => {
-    setComposerAdmissionVersion(version);
+  it.each([false, true] as const)("keeps the actual callback fault pending (custody notice %s)", async (withRecoveryNotice) => {
     const diagnostics = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const privateCause = new Error("PRIVATE_CALLBACK_CAUSE_SENTINEL");
     let recoveryNotice: string | null = null, callbackRan = false;
@@ -75,8 +69,7 @@ describe("R real observer-to-store disposition", () => {
       }
       throw privateCause;
     });
-    if (version === 1) vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (sessionId, operationId) => progressResponse(sessionId, operationId, 1));
-    else vi.mocked(api.fetchComposerOperationStreamV2).mockImplementation(async (sessionId, operationId) => progressResponse(sessionId, operationId, 2));
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (sessionId, operationId) => progressResponse(sessionId, operationId));
     const before = useSessionStore.getState();
     const sending = useSessionStore.getState().sendMessage("hello");
     const held = findComposerOperationCustody(scope, sid).foreground;
@@ -98,9 +91,9 @@ describe("R real observer-to-store disposition", () => {
       expect(JSON.stringify({ error: useSessionStore.getState().error, details: useSessionStore.getState().errorDetails, messages: useSessionStore.getState().messages, diagnostics: diagnostics.mock.calls })).not.toContain("PRIVATE_CALLBACK_CAUSE_SENTINEL");
       await vi.advanceTimersByTimeAsync(180000);
       expect(api.submitComposerOperation).toHaveBeenCalledTimes(1);
-      expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(version === 1 ? 1 : 0); expect(api.fetchComposerOperationStreamV2).toHaveBeenCalledTimes(version === 2 ? 1 : 0);
-      expect(api.fetchComposerOperation).not.toHaveBeenCalled(); expect(api.fetchComposerOperationAnyVersion).not.toHaveBeenCalled();
-      expect(api.cancelComposerOperation).not.toHaveBeenCalled(); expect(api.cancelComposerOperationV2).not.toHaveBeenCalled();
+      expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(1);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      expect(api.cancelComposerOperation).not.toHaveBeenCalled();
       expect(api.fetchMessages).not.toHaveBeenCalled(); expect(api.fetchComposerOperationFailures).not.toHaveBeenCalled(); expect(vi.getTimerCount()).toBe(0);
     } finally { unsubscribe(); detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); await sending; }
   });
@@ -200,7 +193,6 @@ describe("P stale fault disposition", () => {
     expect(diagnostics).not.toHaveBeenCalled(); expect(useSessionStore.getState()).toBe(before);
     expect(findComposerOperationCustody(scope, observed.sessionId)).toEqual(custodyBefore);
     expect(api.cancelComposerOperation).not.toHaveBeenCalled();
-    expect(api.cancelComposerOperationV2).not.toHaveBeenCalled(); expect(api.fetchComposerOperationAnyVersion).not.toHaveBeenCalled();
     expect(api.fetchComposerOperation).toHaveBeenCalledExactlyOnceWith(observed.sessionId, observed.operationId);
     expect(api.fetchMessages).not.toHaveBeenCalled(); expect(api.fetchComposerOperationFailures).not.toHaveBeenCalled();
     expect(api.submitComposerOperation).toHaveBeenCalledTimes(mode === "foreground" ? 1 : 0);

@@ -1,6 +1,4 @@
-import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerOperationAck, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
-import { decodeComposerActiveOperation, decodeComposerOperationSnapshotV2 } from "./composerOperationDecoderV2";
-import { COMPOSER_OPERATION_VERSION_HEADER, echoedComposerVersion } from "@/config/composerProtocol";
+import { canonicalUuid, operationKind, validateComposerRecoveryBody, decodeComposerActiveOperation, decodeComposerOperationSnapshot, decodeComposerOperationFailurePage } from "./composerOperationDecoder";
 import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
@@ -1054,12 +1052,11 @@ export function composerActiveOperation(error: unknown): { operation_id: string;
   if (typeof error !== "object" || error === null || !("error_type" in error) || error.error_type !== "composer_operation_active" || !("operation_id" in error) || !("kind" in error)) return null;
   return { operation_id: canonicalUuid(error.operation_id), kind: operationKind(error.kind) };
 }
-export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationAck> {
+/** POST the submitted body; the 202 answer is the admitted operation's snapshot. */
+export async function submitComposerOperation(descriptor: import("@/types/composerOperations").SubmittedCustody): Promise<import("@/types/composerOperations").ComposerOperationSnapshot> {
   const path = descriptor.kind === "compose_message" ? "messages" : "recompose";
-  // A v1 submission sends exactly the bytes it always did (no version header).
-  const headers = descriptor.protocolVersion === 2 ? { ...authHeaders("application/json"), [COMPOSER_OPERATION_VERSION_HEADER]: "2" } : authHeaders("application/json");
   const response = await authFetch(`/api/sessions/${descriptor.sessionId}/${path}`, {
-    method: "POST", headers, body: JSON.stringify(descriptor.body), signal: AbortSignal.timeout(15000),
+    method: "POST", headers: authHeaders("application/json"), body: JSON.stringify(descriptor.body), signal: AbortSignal.timeout(15000),
   });
   if (!response.ok) {
     const body: unknown = await response.json();
@@ -1068,36 +1065,23 @@ export async function submitComposerOperation(descriptor: import("@/types/compos
     throw error;
   }
   if (response.status !== 202) throw new Error("Composer admission must return 202");
-  if (echoedComposerVersion(response) === 2) {
-    const snapshot = decodeComposerOperationSnapshotV2(await response.json(), descriptor.sessionId, descriptor.operationId);
-    return { operation_id: snapshot.operation_id, kind: snapshot.kind, status: snapshot.status, poll_after_ms: snapshot.poll_after_ms, protocolVersion: 2 };
-  }
-  return { ...decodeComposerOperationAck(await response.json()), protocolVersion: 1 };
+  return decodeComposerOperationSnapshot(await response.json(), descriptor.sessionId, descriptor.operationId);
 }
-const V2_READER = { [COMPOSER_OPERATION_VERSION_HEADER]: "2" };
-/** v2-capable read: the echo says which lifecycle answered. */
-export async function fetchComposerOperationAnyVersion(sessionId: string, operationId: string): Promise<
-  | { protocolVersion: 1; snapshot: import("@/types/composerOperations").ComposerOperationSnapshot }
-  | { protocolVersion: 2; snapshot: import("@/types/composerOperations").ComposerOperationSnapshotV2 }
-  | import("@/types/composerOperations").MissingOperation
-> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: { ...authHeaders(), ...V2_READER }, signal: AbortSignal.timeout(15000), cache: "no-store" });
+/** The durable read of one operation: its sealed snapshot, or the exact missing answer. */
+export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
   const missing = await exactMissing(response);
   if (missing !== null) return missing;
-  const body = await parseResponse<unknown>(response);
-  return echoedComposerVersion(response) === 2
-    ? { protocolVersion: 2, snapshot: decodeComposerOperationSnapshotV2(body, sessionId, operationId) }
-    : { protocolVersion: 1, snapshot: decodeComposerOperationSnapshot(body, sessionId, operationId) };
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
 }
-export async function cancelComposerOperationV2(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshotV2 | import("@/types/composerOperations").MissingOperation> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: { ...authHeaders(), ...V2_READER }, signal: AbortSignal.timeout(15000) });
+export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
+  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
   const missing = await exactMissing(response);
   if (missing !== null) return missing;
-  return decodeComposerOperationSnapshotV2(await parseResponse<unknown>(response), sessionId, operationId);
+  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
 }
-export function fetchComposerOperationStreamV2(sessionId: string, operationId: string, signal: AbortSignal, lastEventId: number | null): Promise<Response> {
+export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal, lastEventId: number | null): Promise<Response> {
   const headers = new Headers(authHeaders());
-  headers.set(COMPOSER_OPERATION_VERSION_HEADER, "2");
   headers.set("Accept", "text/event-stream");
   if (lastEventId !== null) headers.set("Last-Event-ID", String(lastEventId));
   return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers, signal, cache: "no-store" });
@@ -1125,33 +1109,6 @@ export async function fetchComposerOperationFailures(sessionId: string, options:
     headers: authHeaders(), signal: options.signal ?? AbortSignal.timeout(15000), cache: "no-store",
   });
   return decodeComposerOperationFailurePage(await parseResponse<unknown>(response), sessionId, options.operationId);
-}
-export async function fetchComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}`, { headers: authHeaders(), signal: AbortSignal.timeout(15000), cache: "no-store" });
-  if (response.status === 404) {
-    const body: unknown = await response.json();
-    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
-      if (body.detail === "Session not found") return { kind: "session_missing" };
-      if (body.detail === "Operation not found") return { kind: "operation_missing" };
-    }
-    throw await apiErrorFromBody(404, body as Record<string, unknown>);
-  }
-  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
-}
-export async function cancelComposerOperation(sessionId: string, operationId: string): Promise<import("@/types/composerOperations").ComposerOperationSnapshot | import("@/types/composerOperations").MissingOperation> {
-  const response = await authFetch(`/api/sessions/${sessionId}/operations/${operationId}/cancel`, { method: "POST", headers: authHeaders(), signal: AbortSignal.timeout(15000) });
-  if (response.status === 404) {
-    const body: unknown = await response.json();
-    if (typeof body === "object" && body !== null && !Array.isArray(body) && Object.keys(body).length === 1 && "detail" in body) {
-      if (body.detail === "Session not found") return { kind: "session_missing" };
-      if (body.detail === "Operation not found") return { kind: "operation_missing" };
-    }
-    throw apiErrorFromBody(404, body);
-  }
-  return decodeComposerOperationSnapshot(await parseResponse<unknown>(response), sessionId, operationId);
-}
-export function fetchComposerOperationStream(sessionId: string, operationId: string, signal: AbortSignal): Promise<Response> {
-  return authFetch(`/api/sessions/${sessionId}/operations/${operationId}/stream`, { headers: { ...authHeaders(), Accept: "text/event-stream" }, signal, cache: "no-store" });
 }
 export async function sendMessage(sessionId: string, content: string, operationId: string, stateId: string | null = null, signal?: AbortSignal): Promise<MessageWithStateResponse> {
   const { submitAndObserveComposerOperation } = await import("./composerOperationObserver");

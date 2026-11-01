@@ -2,14 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
 import { advanceAuthGeneration } from "@/api/authSession";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
-import { COMPOSER_OPERATION_VERSION_HEADER, setComposerAdmissionVersion } from "@/config/composerProtocol";
 import { authenticateComposerCustody, composerStopRequested, findComposerOperationCustody, purgeComposerCustody } from "./composerOperationCustody";
 import { useExecutionStore } from "./executionStore";
 import { useSessionStore } from "./sessionStore";
 import type { SafeRequestRejection } from "@/types";
 
 // Optional enrichment is outside these controls. Submission, HTTP error
-// admission, both durable decoders and both observers remain the real code.
+// admission, the durable decoder and the observer remain the real code.
 vi.mock("@/api/client", async (importOriginal) => ({
   ...await importOriginal<typeof import("@/api/client")>(),
   fetchMessages: vi.fn(), fetchCompositionState: vi.fn(), fetchCompositionProposals: vi.fn(),
@@ -64,25 +63,20 @@ function errorBody(category: "llm_unavailable" | "run_diagnostics_explanation_fa
   } };
 }
 
-function terminal(version: 1 | 2, operationId: string, descriptor?: SafeRequestRejection, debug = true) {
-  const common = { operation_id: operationId, kind: "compose_message", status: "failed", cancel_requested: false, poll_after_ms: 1000, result: null,
+function terminal(operationId: string, descriptor?: SafeRequestRejection, debug = true) {
+  return { operation_id: operationId, kind: "compose_message", status: "failed", phase: "settled", status_revision: 9, created_at: iso, observed_at: iso, cancel_requested: false, poll_after_ms: 1000, segment: null, result: null,
     error: { http_status: 502, error_type: "llm_unavailable", failure_code: "http_error", diagnostic_id: null, body: errorBody("llm_unavailable", descriptor, debug) } };
-  return version === 1
-    ? { ...common, deadline_at: iso, deadline_remaining_ms: 0 }
-    : { ...common, protocol_version: 2, phase: "settled", status_revision: 9, created_at: iso, observed_at: iso, segment: null };
 }
 
-function queued(version: 1 | 2, operationId: string) {
-  return version === 1
-    ? { operation_id: operationId, kind: "compose_message", status: "queued", poll_after_ms: 1000 }
-    : { protocol_version: 2, operation_id: operationId, kind: "compose_message", status: "queued", phase: "queued", status_revision: 1, created_at: iso, observed_at: iso, poll_after_ms: 1000, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null };
+function queued(operationId: string) {
+  return { operation_id: operationId, kind: "compose_message", status: "queued", phase: "queued", status_revision: 1, created_at: iso, observed_at: iso, poll_after_ms: 1000, cancel_requested: false, segment: { sequence: 1, generation: 1, state: "queued", deadline_at: null }, result: null, error: null };
 }
 
-function response(value: unknown, version: 1 | 2, status = 200) {
-  return new Response(JSON.stringify(value), { status, headers: version === 2 ? { [COMPOSER_OPERATION_VERSION_HEADER]: "2" } : {} });
+function response(value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), { status });
 }
 
-function installComposerTransport(version: 1 | 2, descriptor?: SafeRequestRejection, debug = true, delayedPoll?: () => Promise<Response>) {
+function installComposerTransport(descriptor?: SafeRequestRejection, debug = true, delayedPoll?: () => Promise<Response>) {
   let operationId = "";
   const requests: { url: string; method: string }[] = [];
   const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -93,16 +87,15 @@ function installComposerTransport(version: 1 | 2, descriptor?: SafeRequestReject
       if (typeof init?.body !== "string") throw new Error("Expected the real serialized admission body");
       const body = JSON.parse(init.body) as { operation_id: string };
       operationId = body.operation_id;
-      expect(new Headers(init.headers).get(COMPOSER_OPERATION_VERSION_HEADER)).toBe(version === 2 ? "2" : null);
-      return response(queued(version, operationId), version, 202);
+      expect(new Headers(init.headers).has("Composer-Operation-Version")).toBe(false);
+      return response(queued(operationId), 202);
     }
     if (url === `/api/sessions/${sid}/operations/${operationId}/stream`) {
-      const frame = { schema_version: `composer-operation-stream.v${version}`, session_id: sid, operation_id: operationId, sequence: 0, event: "terminal",
-        payload: version === 1 ? { status: "failed" } : { status: "failed", phase: "settled", status_revision: 9 } };
-      return new Response(`${version === 2 ? "id: 9\n" : ""}data: ${JSON.stringify(frame)}\n\n`, { headers: { "Content-Type": "text/event-stream", ...(version === 2 ? { [COMPOSER_OPERATION_VERSION_HEADER]: "2" } : {}) } });
+      const frame = { session_id: sid, operation_id: operationId, sequence: 0, event: "terminal", payload: { status: "failed", phase: "settled", status_revision: 9 } };
+      return new Response(`id: 9\ndata: ${JSON.stringify(frame)}\n\n`, { headers: { "Content-Type": "text/event-stream" } });
     }
-    if (url === `/api/sessions/${sid}/operations/${operationId}/cancel` && method === "POST") return response(terminal(version, operationId, descriptor, debug), version);
-    if (url === `/api/sessions/${sid}/operations/${operationId}`) return delayedPoll ? delayedPoll() : response(terminal(version, operationId, descriptor, debug), version);
+    if (url === `/api/sessions/${sid}/operations/${operationId}/cancel` && method === "POST") return response(terminal(operationId, descriptor, debug));
+    if (url === `/api/sessions/${sid}/operations/${operationId}`) return delayedPoll ? delayedPoll() : response(terminal(operationId, descriptor, debug));
     throw new Error(`Unexpected physical client request: ${method} ${url}`);
   });
   vi.stubGlobal("fetch", fetch);
@@ -125,14 +118,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  detachComposerObservers(); purgeComposerCustody(); setComposerAdmissionVersion(1);
+  detachComposerObservers(); purgeComposerCustody();
   vi.unstubAllGlobals(); vi.restoreAllMocks(); localStorage.clear(); sessionStorage.clear();
 });
 
-describe.each([1, 2] as const)("actual V%s Composer terminal rejection rendering", (version) => {
+describe("actual Composer terminal rejection rendering", () => {
   it.each(cases)("renders contextual safe copy for $label through the real shared client and observer", async ({ descriptor, explanation }) => {
-    setComposerAdmissionVersion(version);
-    const transport = installComposerTransport(version, descriptor);
+    const transport = installComposerTransport(descriptor);
     await useSessionStore.getState().sendMessage("Explain this primary request.");
     const expected = `The Composer request was rejected. ${explanation} Diagnostic reference: ${reference}.`;
     const state = useSessionStore.getState();
@@ -147,24 +139,21 @@ describe.each([1, 2] as const)("actual V%s Composer terminal rejection rendering
   });
 
   it("renders the same safe copy with debug exposure absent", async () => {
-    setComposerAdmissionVersion(version);
     const { descriptor, explanation } = cases[0];
-    installComposerTransport(version, descriptor, false);
+    installComposerTransport(descriptor, false);
     await useSessionStore.getState().sendMessage("Explain this primary request.");
     expect(useSessionStore.getState().error).toBe(`The Composer request was rejected. ${explanation} Diagnostic reference: ${reference}.`);
   });
 
   it("omits a diagnostic reference when the admitted descriptor has none", async () => {
-    setComposerAdmissionVersion(version);
     const { descriptor, explanation } = cases[0];
-    installComposerTransport(version, { ...descriptor, diagnostic_reference: null }, false);
+    installComposerTransport({ ...descriptor, diagnostic_reference: null }, false);
     await useSessionStore.getState().sendMessage("Explain this rejected request without a reference.");
     expect(useSessionStore.getState().error).toBe(`The Composer request was rejected. ${explanation}`);
   });
 
   it("preserves the historical primary fallback without inventing reason evidence", async () => {
-    setComposerAdmissionVersion(version);
-    installComposerTransport(version, undefined, false);
+    installComposerTransport(undefined, false);
     await useSessionStore.getState().sendMessage("Explain this historical request.");
     expect(useSessionStore.getState().error).toBe("The AI service is temporarily unavailable. Please try again in a moment.");
     expect(useSessionStore.getState().error).not.toContain("No structured reason");
@@ -172,17 +161,16 @@ describe.each([1, 2] as const)("actual V%s Composer terminal rejection rendering
   });
 
   it("does not publish a late rejection after the actual auth generation changes", async () => {
-    setComposerAdmissionVersion(version);
     let release!: (value: Response) => void;
     let reached = false;
     const waiting = new Promise<Response>(resolve => { release = resolve; });
-    const transport = installComposerTransport(version, cases[0].descriptor, true, () => { reached = true; return waiting; });
+    const transport = installComposerTransport(cases[0].descriptor, true, () => { reached = true; return waiting; });
     const sending = useSessionStore.getState().sendMessage("Keep this read scoped to its login.");
     try {
       await vi.waitFor(() => expect(reached).toBe(true));
       advanceAuthGeneration();
     } finally {
-      release(response(terminal(version, transport.operationId(), cases[0].descriptor), version));
+      release(response(terminal(transport.operationId(), cases[0].descriptor)));
       await sending;
     }
     expect(useSessionStore.getState().error).toBeNull();
@@ -191,12 +179,11 @@ describe.each([1, 2] as const)("actual V%s Composer terminal rejection rendering
   });
 
   it("keeps explicit Stop on the same custody while the already settled rejection wins the read race", async () => {
-    setComposerAdmissionVersion(version);
     let release!: (value: Response) => void;
     let reached = false;
     const waiting = new Promise<Response>(resolve => { release = resolve; });
     const { descriptor, explanation } = cases[0];
-    const transport = installComposerTransport(version, descriptor, true, () => { reached = true; return waiting; });
+    const transport = installComposerTransport(descriptor, true, () => { reached = true; return waiting; });
     const sending = useSessionStore.getState().sendMessage("Stop this same primary request.");
     try {
       await vi.waitFor(() => expect(reached).toBe(true));
@@ -208,7 +195,7 @@ describe.each([1, 2] as const)("actual V%s Composer terminal rejection rendering
       await vi.waitFor(() => expect(transport.requests.filter(request => request.url.endsWith("/cancel")).length).toBeGreaterThan(0));
       expect(transport.requests.filter(request => request.url.endsWith("/cancel")).every(request => request.url === `/api/sessions/${sid}/operations/${held.operationId}/cancel`)).toBe(true);
     } finally {
-      release(response(terminal(version, transport.operationId(), descriptor), version));
+      release(response(terminal(transport.operationId(), descriptor)));
       await sending;
     }
     expect(transport.requests.filter(request => request.method === "POST" && request.url.endsWith("/messages"))).toHaveLength(1);

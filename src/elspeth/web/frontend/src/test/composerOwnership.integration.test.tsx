@@ -11,6 +11,7 @@ import * as api from "@/api/client";
 import { useComposer } from "@/hooks/useComposer";
 import { detachComposerObservers } from "@/api/composerOperationObserver";
 import { authenticateComposerCustody, findComposerOperationCustody, purgeComposerCustody } from "@/stores/composerOperationCustody";
+import { completedSnapshot, failedSnapshot, liveSnapshot } from "@/test/composerOperationWire";
 import type { ComposerOperationSnapshot, SubmittedCustody } from "@/types/composerOperations";
 import type { CompositionState } from "@/types/api";
 
@@ -35,12 +36,10 @@ function composition(sessionId: string, version = 1): CompositionState {
   return { ...makeComposition(version), id: `55555555-5555-4555-8555-${String(version).padStart(12, "0")}`, session_id: sessionId };
 }
 function snapshot(descriptor: SubmittedCustody, status: "running" | "completed" | "failed"): ComposerOperationSnapshot {
-  return {
-    operation_id: descriptor.operationId, kind: descriptor.kind, status, poll_after_ms: 100,
-    cancel_requested: status === "failed", deadline_at: "2030-01-01T00:00:00Z", deadline_remaining_ms: status === "running" ? 60000 : 0,
-    result: status === "completed" ? { message: { id: "44444444-4444-4444-8444-444444444444", session_id: descriptor.sessionId, role: "assistant", content: `${descriptor.sessionId} completed`, tool_calls: null, created_at: "2026-10-06T00:00:00Z" }, state: composition(descriptor.sessionId, 2), proposals: [] } : null,
-    error: status === "failed" ? { http_status: 409, failure_code: "request_cancelled", error_type: "request_cancelled", diagnostic_id: null, body: { error_type: "request_cancelled", detail: "Composer request stopped." } } : null,
-  };
+  const identity = { kind: descriptor.kind, poll_after_ms: 100 };
+  if (status === "running") return liveSnapshot(descriptor.operationId, identity);
+  if (status === "completed") return completedSnapshot(descriptor.operationId, { message: { id: "44444444-4444-4444-8444-444444444444", session_id: descriptor.sessionId, role: "assistant", content: `${descriptor.sessionId} completed`, tool_calls: null, created_at: "2026-10-06T00:00:00Z" }, state: composition(descriptor.sessionId, 2), proposals: [] } as unknown as NonNullable<ComposerOperationSnapshot["result"]>, identity);
+  return failedSnapshot(descriptor.operationId, { http_status: 409, failure_code: "request_cancelled", error_type: "request_cancelled", diagnostic_id: null, body: { error_type: "request_cancelled", detail: "Composer request stopped." } }, { ...identity, cancel_requested: true });
 }
 function operation(index = 0): HeldOperation { const descriptor = vi.mocked(api.submitComposerOperation).mock.calls[index][0]; return held.get(descriptor.operationId)!; }
 async function settle(index: number, status: "completed" | "failed") { const job = operation(index); await act(async () => { job.settle(snapshot(job.descriptor, status)); }); }
@@ -57,7 +56,7 @@ describe("shared composer ownership across authoring surfaces", () => {
       let resolve!: (value: ComposerOperationSnapshot) => void;
       const result = new Promise<ComposerOperationSnapshot>((settlement) => { resolve = settlement; });
       held.set(descriptor.operationId, { descriptor, result, settle: resolve });
-      return { operation_id: descriptor.operationId, kind: descriptor.kind, status: "running", poll_after_ms: 100 };
+      return liveSnapshot(descriptor.operationId, { kind: descriptor.kind, poll_after_ms: 100 });
     });
     vi.mocked(api.fetchComposerOperation).mockImplementation(async (_session, id) => held.get(id)!.result);
     vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(new Response(null, { status: 503 }));

@@ -1,6 +1,6 @@
 import { decodeCompositionState } from "./compositionDecoder";
-import type { ChatMessage, MessageWithStateResponse } from "@/types/index";
-import type { ComposerOperationAck, ComposerOperationError, ComposerOperationSnapshot, ComposerOperationFrame, ComposerOperationFailureOutcome, ComposerOperationFailurePage, ComposerOperationPublicFailureType, OperationKind, OperationStatus } from "@/types/composerOperations";
+import type { ChatMessage, ComposerProgressPhase, ComposerProgressReason, MessageWithStateResponse } from "@/types/index";
+import type { ComposerActiveOperation, ComposerOperationError, ComposerOperationFailureOutcome, ComposerOperationFailurePage, ComposerOperationFrame, ComposerOperationPhase, ComposerOperationProgress, ComposerOperationPublicFailureType, ComposerOperationSegment, ComposerOperationSnapshot, ComposerOperationStatus, OperationKind, OperationStatus } from "@/types/composerOperations";
 
 export class ComposerOperationDecodeError extends Error {
   constructor(message: string) { super(message); this.name = "ComposerOperationDecodeError"; }
@@ -79,10 +79,6 @@ export function decodeComposerOperationFailurePage(value: unknown, sessionId: st
   const nextCursor = record.next_cursor === null ? null : text(record.next_cursor);
   if (nextCursor !== null && (nextCursor.length < 1 || nextCursor.length > 512)) throw new ComposerOperationDecodeError("Invalid failure cursor");
   return { session_id: sessionId, items, next_cursor: nextCursor };
-}
-export function decodeComposerOperationAck(value: unknown): ComposerOperationAck {
-  const record = exactRecord(value, ["operation_id", "kind", "status", "poll_after_ms"]);
-  return { operation_id: canonicalUuid(record.operation_id), kind: operationKind(record.kind), status: operationStatus(record.status), poll_after_ms: pollAfter(record.poll_after_ms) };
 }
 export function validateComposerRecoveryBody(body: unknown, sessionId?: string): void {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return;
@@ -175,24 +171,115 @@ export function decodeComposerResult(value: unknown, sessionId: string): Message
   if (recoveryNotice !== null && state !== null && recoveryNotice.composition_state_id !== state.id) throw new ComposerOperationDecodeError("Recovery receipt state mismatch");
   return { message, state, proposals: record.proposals as MessageWithStateResponse["proposals"], ...(record.recovery_notice === undefined ? {} : { recovery_notice: recoveryNotice }) };
 }
-export function decodeComposerOperationSnapshot(value: unknown, sessionId: string, operationId: string): ComposerOperationSnapshot {
-  const record = exactRecord(value, ["operation_id", "kind", "status", "poll_after_ms", "cancel_requested", "deadline_at", "deadline_remaining_ms", "result", "error"]);
+export function pollAfter(value: unknown): number { const result = integer(value, 100); if (result > 60000) throw new ComposerOperationDecodeError("Invalid poll interval"); return result; }
+
+const STATUS_KEYS = ["operation_id", "kind", "status", "phase", "status_revision", "created_at", "observed_at", "poll_after_ms", "cancel_requested", "segment"] as const;
+const PHASES: readonly ComposerOperationPhase[] = ["queued", "executing", "continuation_queued", "reconciling", "retry_waiting", "settled"];
+const ACTIVE_PHASES: readonly ComposerOperationPhase[] = ["queued", "executing", "continuation_queued", "reconciling", "retry_waiting"];
+
+function phase(value: unknown): ComposerOperationPhase {
+  const found = PHASES.find((item) => item === value);
+  if (found === undefined) throw new ComposerOperationDecodeError("Unknown operation phase");
+  return found;
+}
+function segment(value: unknown): ComposerOperationSegment | null {
+  if (value === null) return null;
+  const record = exactRecord(value, ["sequence", "generation", "state", "deadline_at"]);
+  const state = record.state === "queued" || record.state === "running" || record.state === "interrupted" ? record.state : null;
+  if (state === null) throw new ComposerOperationDecodeError("Unknown segment state");
+  const deadline_at = record.deadline_at === null ? null : timestamp(record.deadline_at);
+  if ((state === "running") !== (deadline_at !== null)) throw new ComposerOperationDecodeError("Only a running segment has a deadline");
+  return Object.freeze({ sequence: integer(record.sequence, 1), generation: integer(record.generation, 1), state, deadline_at });
+}
+function statusFields(record: Record<string, unknown>, operationId: string): ComposerOperationStatus {
   const operation_id = canonicalUuid(record.operation_id);
   if (operation_id !== operationId) throw new ComposerOperationDecodeError("Operation scope mismatch");
   const status = operationStatus(record.status);
+  const decodedPhase = phase(record.phase);
   if (typeof record.cancel_requested !== "boolean") throw new ComposerOperationDecodeError("Invalid cancel flag");
-  const deadline_at = text(record.deadline_at);
-  const remaining = integer(record.deadline_remaining_ms);
-  if ((status === "completed" || status === "failed") && remaining !== 0) throw new ComposerOperationDecodeError("Terminal deadline must be zero");
+  const live = status === "queued" || status === "running";
+  const decodedSegment = segment(record.segment);
+  if (live !== ACTIVE_PHASES.includes(decodedPhase)) throw new ComposerOperationDecodeError("Operation phase does not match status");
+  if (live !== (decodedSegment !== null)) throw new ComposerOperationDecodeError("Live segment mismatch");
   if (status === "completed" && record.cancel_requested) throw new ComposerOperationDecodeError("Completed cancellation conflict");
-  if (!Number.isFinite(Date.parse(deadline_at))) throw new ComposerOperationDecodeError("Invalid deadline");
-  if ((status === "completed" && (record.result === null || record.error !== null)) || (status === "failed" && (record.error === null || record.result !== null)) || ((status === "queued" || status === "running") && (record.result !== null || record.error !== null))) throw new ComposerOperationDecodeError("Invalid terminal payload");
+  return Object.freeze({
+    operation_id, kind: operationKind(record.kind), status, phase: decodedPhase,
+    status_revision: integer(record.status_revision), created_at: timestamp(record.created_at), observed_at: timestamp(record.observed_at),
+    poll_after_ms: pollAfter(record.poll_after_ms), cancel_requested: record.cancel_requested, segment: decodedSegment,
+  });
+}
+export function decodeComposerOperationStatus(value: unknown, operationId: string): ComposerOperationStatus {
+  return statusFields(exactRecord(value, STATUS_KEYS), operationId);
+}
+export function decodeComposerOperationSnapshot(value: unknown, sessionId: string, operationId: string): ComposerOperationSnapshot {
+  const record = exactRecord(value, [...STATUS_KEYS, "result", "error"]);
+  const fields = statusFields(record, operationId);
+  const live = fields.status === "queued" || fields.status === "running";
+  if ((live && (record.result !== null || record.error !== null)) || (fields.status === "completed" && (record.result === null || record.error !== null)) || (fields.status === "failed" && (record.error === null || record.result !== null))) {
+    throw new ComposerOperationDecodeError("Invalid terminal payload");
+  }
   const result = record.result === null ? null : decodeComposerResult(record.result, sessionId);
-  if (result?.recovery_notice != null && (result.message.operation_id !== operation_id || result.recovery_notice.operation_id !== operation_id)) throw new ComposerOperationDecodeError("Recovery receipt operation mismatch");
-  return { operation_id, kind: operationKind(record.kind), status, poll_after_ms: pollAfter(record.poll_after_ms), cancel_requested: record.cancel_requested, deadline_at, deadline_remaining_ms: integer(record.deadline_remaining_ms), result, error: record.error === null ? null : decodeError(record.error, sessionId) };
+  if (result?.recovery_notice != null && (result.message.operation_id !== fields.operation_id || result.recovery_notice.operation_id !== fields.operation_id)) throw new ComposerOperationDecodeError("Recovery receipt operation mismatch");
+  return Object.freeze({ ...fields, result, error: record.error === null ? null : decodeError(record.error, sessionId) });
+}
+export function decodeComposerActiveOperation(value: unknown): ComposerActiveOperation {
+  const record = exactRecord(value, ["operation_id", "kind", "status"]);
+  if (record.status !== "queued" && record.status !== "running") throw new ComposerOperationDecodeError("Active operation is not live");
+  return Object.freeze({ operation_id: canonicalUuid(record.operation_id), kind: operationKind(record.kind), status: record.status });
+}
+// The public progress taxonomy (ComposerProgressPhase/ComposerProgressReason in
+// types/index.ts, mirrored from contracts/composer_progress.py).
+const PROGRESS_PHASES: readonly ComposerProgressPhase[] = ["idle", "starting", "calling_model", "using_tools", "validating", "saving", "complete", "failed", "cancelled"];
+const PROGRESS_REASONS: readonly ComposerProgressReason[] = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "mutation_authority_revoked", "admission_refused", "context_unsupported", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete"];
+function boundedText(value: unknown, max: number): string {
+  const result = text(value);
+  if ([...result].length < 1 || [...result].length > max) throw new ComposerOperationDecodeError("Unbounded progress text");
+  return result;
+}
+function progress(value: unknown): ComposerOperationProgress {
+  const record = exactRecord(value, ["request_id", "phase", "headline", "evidence", "likely_next", "reason", "updated_at", "segment_sequence", "segment_generation"]);
+  const progressPhase = PROGRESS_PHASES.find((item) => item === record.phase);
+  const reason = record.reason === null ? null : PROGRESS_REASONS.find((item) => item === record.reason);
+  if (progressPhase === undefined || reason === undefined || ((progressPhase === "failed" || progressPhase === "cancelled") && reason === null)) throw new ComposerOperationDecodeError("Unknown progress vocabulary");
+  if (!Array.isArray(record.evidence) || record.evidence.length > 4) throw new ComposerOperationDecodeError("Unbounded progress evidence");
+  return {
+    request_id: record.request_id === null ? null : boundedText(record.request_id, 128),
+    phase: progressPhase,
+    headline: boundedText(record.headline, 180),
+    evidence: record.evidence.map((item) => boundedText(item, 180)),
+    likely_next: record.likely_next === null ? null : boundedText(record.likely_next, 180),
+    reason,
+    updated_at: timestamp(record.updated_at),
+    segment_sequence: integer(record.segment_sequence, 1),
+    segment_generation: integer(record.segment_generation, 1),
+  };
+}
+export function decodeComposerOperationFrame(value: { id: string | null; data: unknown }, sessionId: string, operationId: string): ComposerOperationFrame {
+  const event = typeof value.data === "object" && value.data !== null && "event" in value.data ? (value.data as { event: unknown }).event : undefined;
+  const base = ["session_id", "operation_id", "sequence", "event"];
+  const record = exactRecord(value.data, event === "heartbeat" || event === "reconnect" ? base : [...base, "payload"]);
+  if (canonicalUuid(record.session_id) !== sessionId || canonicalUuid(record.operation_id) !== operationId) throw new ComposerOperationDecodeError("Stream scope mismatch");
+  const common = { session_id: sessionId, operation_id: operationId, sequence: integer(record.sequence), id: value.id };
+  const carriesId = event === "status" || event === "terminal";
+  if (carriesId !== (value.id !== null)) throw new ComposerOperationDecodeError("Only status and terminal frames carry an id");
+  if (event === "heartbeat" || event === "reconnect") return { ...common, event };
+  if (event === "status") {
+    const payload = decodeComposerOperationStatus(record.payload, operationId);
+    if (String(payload.status_revision) !== value.id) throw new ComposerOperationDecodeError("SSE id does not match the revision");
+    return { ...common, event, payload };
+  }
+  if (event === "terminal") {
+    const payload = exactRecord(record.payload, ["status", "phase", "status_revision"]);
+    if ((payload.status !== "completed" && payload.status !== "failed") || payload.phase !== "settled") throw new ComposerOperationDecodeError("Invalid terminal frame");
+    const status_revision = integer(payload.status_revision);
+    if (String(status_revision) !== value.id) throw new ComposerOperationDecodeError("SSE id does not match the revision");
+    return { ...common, event, payload: { status: payload.status, phase: "settled", status_revision } };
+  }
+  if (event === "progress") return { ...common, event, payload: progress(record.payload) };
+  throw new ComposerOperationDecodeError("Unknown stream event");
 }
 
-/** Bounded incremental SSE framing. UTF-8 is admitted before any JSON is parsed. */
+/** Bounded incremental SSE framing: `id`, `event` and `data` fields. UTF-8 is admitted before any JSON is parsed. */
 export class ComposerSseDecoder {
   private readonly utf8 = new TextDecoder("utf-8", { fatal: true });
   private line = "";
@@ -201,19 +288,19 @@ export class ComposerSseDecoder {
   private pendingCR = false;
   private readonly encode = new TextEncoder();
   constructor(private readonly maxBytes = 64 * 1024) {}
-  push(chunk: Uint8Array): unknown[] {
-    const frames: unknown[] = [];
+  push(chunk: Uint8Array): { id: string | null; data: unknown }[] {
+    const frames: { id: string | null; data: unknown }[] = [];
     for (let offset = 0; offset < chunk.byteLength; offset += 4096) frames.push(...this.consume(this.utf8.decode(chunk.subarray(offset, offset + 4096), { stream: true })));
     return frames;
   }
-  finish(): unknown[] {
+  finish(): { id: string | null; data: unknown }[] {
     const frames = this.consume(this.utf8.decode());
     if (this.pendingCR) { this.pendingCR = false; this.endLine(frames); }
     if (this.line !== "" || this.lines.length !== 0 || this.bytes !== 0) throw new ComposerOperationDecodeError("Truncated SSE frame");
     return frames;
   }
-  private consume(input: string): unknown[] {
-    const frames: unknown[] = [];
+  private consume(input: string): { id: string | null; data: unknown }[] {
+    const frames: { id: string | null; data: unknown }[] = [];
     for (const character of input) {
       if (this.pendingCR) {
         this.pendingCR = false;
@@ -231,10 +318,11 @@ export class ComposerSseDecoder {
     this.bytes += this.encode.encode(character).byteLength;
     if (this.bytes > this.maxBytes) throw new ComposerOperationDecodeError("Oversized SSE frame");
   }
-  private endLine(frames: unknown[]): void {
+  private endLine(frames: { id: string | null; data: unknown }[]): void {
     if (this.line !== "") { this.lines.push(this.line); this.line = ""; return; }
     const data: string[] = [];
     let event: string | undefined;
+    let id: string | undefined;
     for (const line of this.lines) {
       if (line.startsWith(":")) continue;
       const colon = line.indexOf(":");
@@ -243,48 +331,17 @@ export class ComposerSseDecoder {
       if (value.startsWith(" ")) value = value.slice(1);
       if (field === "data") data.push(value);
       else if (field === "event" && event === undefined) event = value;
-      else throw new ComposerOperationDecodeError("Unknown or duplicate SSE field");
+      else if (field === "id" && id === undefined) {
+        if (!/^[0-9]{1,19}$/.test(value)) throw new ComposerOperationDecodeError("Invalid SSE id");
+        id = value;
+      } else throw new ComposerOperationDecodeError("Unknown or duplicate SSE field");
     }
     if (data.length > 0) {
       let value: unknown;
       try { value = JSON.parse(data.join("\n")); } catch { throw new ComposerOperationDecodeError("Invalid SSE JSON"); }
       if (event !== undefined && (typeof value !== "object" || value === null || !("event" in value) || value.event !== event)) throw new ComposerOperationDecodeError("SSE event mismatch");
-      frames.push(value);
-    } else if (event !== undefined) throw new ComposerOperationDecodeError("SSE event missing data");
+      frames.push({ id: id ?? null, data: value });
+    } else if (event !== undefined || id !== undefined) throw new ComposerOperationDecodeError("SSE frame missing data");
     this.lines = []; this.bytes = 0;
   }
-}
-
-export function pollAfter(value: unknown): number { const result = integer(value, 100); if (result > 60000) throw new ComposerOperationDecodeError("Invalid poll interval"); return result; }
-export function decodeComposerOperationFrame(value: unknown, sessionId: string, operationId: string): ComposerOperationFrame {
-  const base = ["schema_version", "session_id", "operation_id", "sequence", "event"];
-  const record = exactRecord(value, [...base, "payload"], base);
-  if (record.schema_version !== "composer-operation-stream.v1" || canonicalUuid(record.session_id) !== sessionId || canonicalUuid(record.operation_id) !== operationId) throw new ComposerOperationDecodeError("Stream scope mismatch");
-  const common = { schema_version: "composer-operation-stream.v1" as const, session_id: sessionId, operation_id: operationId, sequence: integer(record.sequence) };
-  if (record.event === "heartbeat") {
-    if ("payload" in record) throw new ComposerOperationDecodeError("Heartbeat payload forbidden");
-    return { ...common, event: "heartbeat" };
-  }
-  if (record.event === "status") {
-    const payload = exactRecord(record.payload, ["status", "cancel_requested", "deadline_remaining_ms"]);
-    if ((payload.status !== "queued" && payload.status !== "running") || typeof payload.cancel_requested !== "boolean") throw new ComposerOperationDecodeError("Invalid status frame");
-    return { ...common, event: "status", payload: { status: payload.status, cancel_requested: payload.cancel_requested, deadline_remaining_ms: integer(payload.deadline_remaining_ms) } };
-  }
-  if (record.event === "terminal") {
-    const payload = exactRecord(record.payload, ["status"]);
-    if (payload.status !== "completed" && payload.status !== "failed") throw new ComposerOperationDecodeError("Invalid terminal frame");
-    return { ...common, event: "terminal", payload: { status: payload.status } };
-  }
-  if (record.event !== "progress") throw new ComposerOperationDecodeError("Unknown stream event");
-  const payload = exactRecord(record.payload, ["session_operation_id", "session_operation_epoch", "request_token", "request_id", "phase", "headline", "evidence", "likely_next", "reason", "updated_at"]);
-  const phases = ["idle", "starting", "calling_model", "using_tools", "validating", "saving", "complete", "failed", "cancelled"] as const;
-  const reasons = ["convergence_composition_budget", "convergence_discovery_budget", "convergence_wall_clock_timeout", "tool_call_cap_exceeded", "provider_auth_failed", "provider_unavailable", "plugin_crash", "runtime_preflight_failed", "planner_repair_exhausted", "service_setup_failed", "admission_refused", "context_unsupported", "accounting_unavailable", "client_cancelled", "composer_idle", "composer_complete", "mutation_authority_revoked"] as const;
-  const phase = phases.find((item) => item === payload.phase);
-  const reason = payload.reason === null ? null : reasons.find((item) => item === payload.reason);
-  if (phase === undefined || reason === undefined || ((phase === "failed" || phase === "cancelled") && reason === null)) throw new ComposerOperationDecodeError("Unknown progress vocabulary");
-  const boundedText = (value: unknown, max: number): string => { const result = text(value); if ([...result].length < 1 || [...result].length > max) throw new ComposerOperationDecodeError("Unbounded progress text"); return result; };
-  if (!Array.isArray(payload.evidence) || payload.evidence.length > 4) throw new ComposerOperationDecodeError("Unbounded progress evidence");
-  const updated_at = text(payload.updated_at);
-  if (!Number.isFinite(Date.parse(updated_at))) throw new ComposerOperationDecodeError("Invalid progress timestamp");
-  return { ...common, event: "progress", payload: { session_operation_id: boundedText(payload.session_operation_id, 128), session_operation_epoch: integer(payload.session_operation_epoch, 1), request_token: boundedText(payload.request_token, 128), request_id: payload.request_id === null ? null : boundedText(payload.request_id, 128), phase, headline: boundedText(payload.headline, 180), evidence: payload.evidence.map((item) => boundedText(item, 180)), likely_next: payload.likely_next === null ? null : boundedText(payload.likely_next, 180), reason, updated_at } };
 }
