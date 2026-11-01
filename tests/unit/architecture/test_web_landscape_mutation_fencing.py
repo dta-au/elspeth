@@ -17195,8 +17195,10 @@ class _reserve_ProtectedBoundary:
         validated_transfer_calls=(),
         disjoint_compose_state_writes=(),
         audit_evidence_recoveries=(),
+        manual_allowance_calls=(),
     ):
         self.failures = tuple(failures)
+        self.manual_allowance_calls = frozenset(manual_allowance_calls)
         self.class_recovery_sites = frozenset(class_recovery_sites)
         self.audit_evidence_recoveries = frozenset(audit_evidence_recoveries)
         self.reflection_sites = frozenset(reflection_sites)
@@ -21566,6 +21568,7 @@ def _reserve_supported_boundary(units, *, origin_diagnostics=None):
         route_calls | six_calls | continuation_calls,
         (iteration["state_write"], *batch["state_writes"], *continuation_state_writes),
         audit_evidence_recoveries=audit_recoveries,
+        manual_allowance_calls=allowance_calls,
     )
 
 
@@ -23691,6 +23694,16 @@ class _reserve_ReserveProof:
                     "complete selected caller and source ownership receipt",
                     "current protected origin/effect graph",
                     "normal owned coordinator dispatch",
+                ),
+            )
+        if (unit.path, id(call)) in self.boundary.manual_allowance_calls:
+            return _reserve_Certificate(
+                "reviewed-manual-advisor-allowance",
+                (self.point(unit, call, "local ManualAdvisorAllowance counter, never required work"),),
+                (
+                    "exact manual allowance supplier source",
+                    "pinned dispatch body and nominal receiver chain",
+                    "physical dispatch and final close",
                 ),
             )
         if isinstance(value, ast.Name):
