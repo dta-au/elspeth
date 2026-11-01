@@ -11,7 +11,7 @@ import signal
 import socket
 import threading
 import time
-from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -257,7 +257,7 @@ def _sigterm_server(session_url, landscape_url, data_dir, evidence_dir, port, mo
         composer_continuation_enabled=True,
         composer_async_worker_concurrency=1,
         composer_shutdown_grace_seconds=grace,
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=port,
     )
     for key in tuple(os.environ):
@@ -678,16 +678,15 @@ def _actual_operation_rows(engine, sid, operation):
         }
 
 
+@contextmanager
 def _authenticated_process_client(host):
-    client = httpx.Client(base_url=host["url"], timeout=5, trust_env=False)
-    try:
+    # The login request opens the client, so callers must not re-enter it:
+    # own its whole lifetime here and hand the authenticated client out.
+    with httpx.Client(base_url=host["url"], timeout=5, trust_env=False) as client:
         login = client.post("/api/auth/login", json={"username": "sigterm-user", "password": "test sigterm password"})
         assert login.status_code == 200
         client.headers.update({"Authorization": f"Bearer {login.json()['access_token']}", "Composer-Operation-Version": "2"})
-    except BaseException:
-        client.close()
-        raise
-    return client
+        yield client
 
 
 def _submit_process_operation(client, host, engine, *, mode):
