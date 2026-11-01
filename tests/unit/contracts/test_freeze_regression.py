@@ -591,3 +591,62 @@ class TestDeepFreezeLeavesDataclassesDiscriminable:
 
         assert _value_transform_preserves_field(node, "amount") is False
         assert _value_transform_preserves_field(node, "untouched") is True
+
+
+# ── MappingProxyType inputs are detached, never aliased ──────────────────────
+
+
+class TestProxyInputsAreDetached:
+    """A frozen record built over ``MappingProxyType(mutable)`` must not see later writes.
+
+    A proxy is a read-only VIEW over the caller's dict, not a copy. The three
+    ``__post_init__`` freeze guards below used to skip ``deep_freeze`` when the
+    input was already a proxy, which left the record aliased to the caller's
+    mutable dict and its nested lists mutable (0.8.10 FG2 finding).
+    """
+
+    @staticmethod
+    def _mutable_payload() -> dict[str, Any]:
+        return {"items": [1], "nested": {"k": "v"}}
+
+    def test_replayed_call_response_and_error_detach_from_proxy(self) -> None:
+        from elspeth.plugins.infrastructure.clients.replayer import ReplayedCall
+
+        response = self._mutable_payload()
+        error = self._mutable_payload()
+        call = ReplayedCall(
+            response_data=MappingProxyType(response),
+            original_latency_ms=1.0,
+            request_hash="h",
+            was_error=True,
+            error_data=MappingProxyType(error),
+        )
+        response["items"].append(2)
+        response["added"] = True
+        error["nested"]["k"] = "changed"
+        assert call.response_data["items"] == (1,)
+        assert "added" not in call.response_data
+        assert call.error_data is not None
+        assert call.error_data["nested"]["k"] == "v"
+        assert isinstance(call.response_data["nested"], MappingProxyType)
+
+    def test_llm_response_raw_response_detaches_from_proxy(self) -> None:
+        from elspeth.plugins.infrastructure.clients.llm import LLMResponse
+
+        raw = self._mutable_payload()
+        response = LLMResponse(content="c", model="m", raw_response=MappingProxyType(raw))
+        raw["items"].append(2)
+        raw["added"] = True
+        assert response.raw_response is not None
+        assert response.raw_response["items"] == (1,)
+        assert "added" not in response.raw_response
+
+    def test_validation_success_data_detaches_from_proxy(self) -> None:
+        from elspeth.plugins.transforms.llm.validation import ValidationSuccess
+
+        data = self._mutable_payload()
+        success = ValidationSuccess(data=MappingProxyType(data))
+        data["items"].append(2)
+        data["added"] = True
+        assert success.data["items"] == (1,)
+        assert "added" not in success.data

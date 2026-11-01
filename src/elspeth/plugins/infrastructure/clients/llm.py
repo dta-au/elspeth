@@ -8,7 +8,6 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 import structlog
@@ -66,7 +65,9 @@ class LLMResponse:
     def __post_init__(self) -> None:
         if self.latency_ms < 0 or not math.isfinite(self.latency_ms):
             raise ValueError(f"LLMResponse.latency_ms must be non-negative and finite, got {self.latency_ms}")
-        if self.raw_response is not None and not isinstance(self.raw_response, MappingProxyType):
+        if self.raw_response is not None:
+            # deep_freeze detaches a MappingProxyType input (a proxy is a view
+            # over a possibly mutable dict), so no isinstance skip is sound.
             object.__setattr__(self, "raw_response", deep_freeze(self.raw_response))
 
     @property

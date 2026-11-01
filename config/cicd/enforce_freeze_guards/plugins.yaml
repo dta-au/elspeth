@@ -17,27 +17,3 @@ allow_hits:
     tuple elements are QuerySpec (frozen dataclasses), so no freeze is bypassed.
   safety: A tuple input is already immutable at the container level and its elements freeze themselves.
   expires: null
-- key: plugins/transforms/llm/validation.py:FG2:_module_:fp=053d4baaf8b00acd
-  owner: "@elspeth-maintainers"
-  reason: ValidationSuccess skips deep_freeze when data is already a MappingProxyType. Known gap — a proxy is a
-    view, so a proxy over a mutable dict, or with mutable nested values, is neither detached nor deep-frozen.
-  safety: Pre-existing exemption carried over from the per-file blanket; the shallow-proxy gap is reported, not fixed.
-  expires: null
-- key: plugins/infrastructure/clients/llm.py:FG2:_module_:fp=14a870f9cdb587a7
-  owner: "@elspeth-maintainers"
-  reason: LLMResponse skips deep_freeze when raw_response is already a MappingProxyType. Known gap — a proxy is a
-    view, so a proxy over a mutable dict, or with mutable nested values, is neither detached nor deep-frozen.
-  safety: Pre-existing exemption carried over from the per-file blanket; the shallow-proxy gap is reported, not fixed.
-  expires: null
-- key: plugins/infrastructure/clients/replayer.py:FG2:_module_:fp=683ae645f318f8c0
-  owner: "@elspeth-maintainers"
-  reason: ReplayedCall skips deep_freeze when response_data is already a MappingProxyType. Known gap — a proxy is a
-    view, so a proxy over a mutable dict, or with mutable nested values, is neither detached nor deep-frozen.
-  safety: Pre-existing exemption carried over from the per-file blanket; the shallow-proxy gap is reported, not fixed.
-  expires: null
-- key: plugins/infrastructure/clients/replayer.py:FG2:_module_:fp=ab7b3c072c268dda
-  owner: "@elspeth-maintainers"
-  reason: ReplayedCall skips deep_freeze when error_data is already a MappingProxyType. Known gap — a proxy is a
-    view, so a proxy over a mutable dict, or with mutable nested values, is neither detached nor deep-frozen.
-  safety: Pre-existing exemption carried over from the per-file blanket; the shallow-proxy gap is reported, not fixed.
-  expires: null
