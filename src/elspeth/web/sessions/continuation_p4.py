@@ -507,7 +507,6 @@ def _state_row_hash(row: Any) -> str:
                 "id": row.id,
                 "session_id": row.session_id,
                 "version": row.version,
-                "source": row.source,
                 "sources": row.sources,
                 "nodes": row.nodes,
                 "edges": row.edges,

@@ -1164,7 +1164,6 @@ class CompositionStateRecord:
     # ``content_publication``); the default serves unsaved test projections.
     composer_meta: Mapping[str, Any] | None = None
     sources: Mapping[str, Mapping[str, Any]] | None = None
-    source: Mapping[str, Any] | None = None
     # Effective reads retain the actual immutable row separately. Historical
     # version-list reads leave this unset and return the original snapshot.
     review_projection: CompositionStateReviewProjection | None = None
@@ -1173,8 +1172,6 @@ class CompositionStateRecord:
         require_stored_state_metadata(self, state_id=self.id)
         serialize_composition_validation_errors(self.validation_errors)
         non_none = []
-        if self.source is not None:
-            non_none.append("source")
         if self.sources is not None:
             non_none.append("sources")
         if self.nodes is not None:

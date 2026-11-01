@@ -112,7 +112,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
             table.c.id,
             table.c.session_id,
             table.c.version,
-            table.c.source,
             table.c.sources,
             table.c.nodes,
             table.c.edges,
@@ -127,7 +126,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
         id=state_id,
         session_id=session_id,
         version=row.version,
-        source=unwrap_state_column(row.source),
         sources=unwrap_state_column(row.sources),
         nodes=unwrap_state_column(row.nodes),
         edges=unwrap_state_column(row.edges),
@@ -148,10 +146,6 @@ def read_editable_checkpoint(conn: Connection, session_id: UUID, state_id: UUID)
         "outputs": deep_thaw(record.outputs) if record.outputs is not None else [],
         "metadata": deep_thaw(record.metadata_),
     }
-    if record.source is not None:
-        if record.sources is not None:
-            raise GraphRecoveryTargetUnavailable("Recovery target has ambiguous source representation")
-        original["sources"] = {"source": deep_thaw(record.source)}
     if canonical_json(original) != canonical_json(state.to_dict()):
         raise GraphRecoveryTargetUnavailable("Recovery target cannot be reconstructed without changing content")
     if not qualify_editable_checkpoint(state).eligible:

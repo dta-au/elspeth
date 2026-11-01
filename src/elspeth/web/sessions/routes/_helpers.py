@@ -1021,16 +1021,7 @@ def _plugin_policy_findings(
 
     components: list[tuple[str, PluginId]] = []
 
-    # ``source`` is the documented bridge for rows written before the
-    # multi-source ``sources`` column. New writers always persist ``sources``;
-    # accepting both at once would make the source of truth ambiguous.
-    sources = state.sources
-    if sources is None:
-        sources = {}
-        if state.source is not None:
-            sources = {"source": state.source}
-    elif state.source is not None:
-        raise AuditIntegrityError("persisted plugin policy source projection has both source and sources")
+    sources = state.sources if state.sources is not None else {}
     for source_name, source in sources.items():
         if type(source_name) is not str or source_name == "":
             raise AuditIntegrityError("persisted plugin policy source name must be a non-empty string")

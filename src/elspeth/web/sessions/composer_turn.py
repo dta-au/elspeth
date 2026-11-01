@@ -239,8 +239,6 @@ _RECOMPOSE_LABELS: Final = _ComposerTurnLabels(
 )
 
 
-
-
 async def _discard_progress(event: ComposerProgressEvent) -> None:
     """The sink of a turn whose progress claim failed: advisory UX, never the outcome (E20)."""
     del event

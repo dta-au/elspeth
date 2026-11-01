@@ -21,7 +21,6 @@ def storage_content_hash(state: CompositionStateData | CompositionStateRecord) -
         raise AuditIntegrityError("Content publication requires an owned state snapshot")
     return content_storage_digest(
         {
-            "legacy_source": deep_thaw(state.source) if type(state) is CompositionStateRecord else None,
             "sources": deep_thaw(state.sources),
             "nodes": deep_thaw(state.nodes),
             "edges": deep_thaw(state.edges),

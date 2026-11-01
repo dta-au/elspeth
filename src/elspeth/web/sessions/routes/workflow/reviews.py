@@ -106,7 +106,6 @@ def review_payload_digest(record: CompositionStateRecord) -> str:
     content = {
         "version": record.version,
         "sources": record.sources,
-        "source": record.source,
         "nodes": record.nodes,
         "edges": record.edges,
         "outputs": record.outputs,

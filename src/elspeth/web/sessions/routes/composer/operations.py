@@ -398,9 +398,7 @@ async def stream_operation(
     try:
         permit = permits.acquire(str(operation_id), user.user_id)
     except ComposerStreamCapacityError as exc:
-        raise HTTPException(
-            status_code=503, detail="Composer stream capacity is currently occupied", headers={"Retry-After": "5"}
-        ) from exc
+        raise HTTPException(status_code=503, detail="Composer stream capacity is currently occupied", headers={"Retry-After": "5"}) from exc
 
     draining = cast(threading.Event, request.app.state.instance_draining)
     v2_sequence = 0

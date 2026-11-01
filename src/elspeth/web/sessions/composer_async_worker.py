@@ -576,6 +576,7 @@ class ComposerAsyncWorker:
     async def reap_once(self) -> int:
         return await reap_continuations_once(self)
 
+
 def _failure_leaves(exc: BaseException) -> tuple[BaseException, ...]:
     return required_failure_leaves(exc)
 

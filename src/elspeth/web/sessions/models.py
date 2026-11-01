@@ -549,7 +549,6 @@ composition_states_table = Table(
         index=True,
     ),
     Column("version", Integer, nullable=False),
-    Column("source", JSON, nullable=True),
     Column("sources", JSON, nullable=True),
     Column("nodes", JSON, nullable=True),
     Column("edges", JSON, nullable=True),

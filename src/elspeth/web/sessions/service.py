@@ -1757,7 +1757,6 @@ class SessionServiceImpl:
                 id=allocated_state_id,
                 session_id=session_id,
                 version=int(next_version),
-                source=None,
                 sources=_enveloped_state_column(state.sources),
                 nodes=_enveloped_state_column(state.nodes),
                 edges=_enveloped_state_column(state.edges),
@@ -5830,7 +5829,6 @@ class SessionServiceImpl:
 
                 patched_state_record = replace(
                     state_record,
-                    source=None,
                     sources=final_sources,
                     nodes=final_nodes,
                     is_valid=False,
@@ -8426,7 +8424,6 @@ class SessionServiceImpl:
                     session_id=sid,
                     payload=StatePayload(
                         data=CompositionStateData(
-                            source=prior_record.source if prior_record.sources is None else None,
                             sources=prior_record.sources,
                             nodes=self._unwrap_envelope(prior_row.nodes),
                             edges=self._unwrap_envelope(prior_row.edges),
@@ -9073,7 +9070,6 @@ class SessionServiceImpl:
                     }
                 elif current_state_row is not None:
                     settlement_state = {
-                        "source": current_state_row.source,
                         "sources": current_state_row.sources,
                         "nodes": current_state_row.nodes,
                         "edges": current_state_row.edges,
