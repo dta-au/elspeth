@@ -5958,14 +5958,21 @@ def _reserve_fresh_two_phase_construction(call, owner_q, resolver):
     target = call.args[0]
     if not (isinstance(target, ast.Name) or (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name))):
         return False
-    statement = getattr(call, "_landscape_parent", None)
-    block = getattr(statement, "_landscape_parent", None)
+    parents = _ancestors(call)
+    statement = next(parents, None)
+    block = next(parents, None)
     if not isinstance(statement, ast.Expr) or statement.value is not call or block is None:
         return False
-    body = next((field for field in ("body", "orelse", "finalbody") if statement in getattr(block, field, ())), None)
-    if body is None:
+    statements = next(
+        (
+            value
+            for field, value in ast.iter_fields(block)
+            if field in ("body", "orelse", "finalbody") and isinstance(value, list) and statement in value
+        ),
+        None,
+    )
+    if statements is None:
         return False
-    statements = getattr(block, body)
     index = statements.index(statement)
     if index == 0:
         return False
