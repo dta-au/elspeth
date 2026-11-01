@@ -41,11 +41,13 @@ from elspeth.web.sessions.schema import (
     probe_current_schema,
 )
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stored_composer_meta, stored_default_pipeline_metadata
 from tests.helpers.run_terminal_checks import (
+    INVALID_RUN_COUNTERS,
     INVALID_RUN_FIELDS,
     RUN_CHECK_NAMES,
     RUN_CHECK_SQL,
+    VALID_RUN_COUNTERS,
     VALID_RUN_FIELDS,
     assert_run_fields,
     run_rows,
@@ -112,6 +114,7 @@ def _seed_session_state(conn) -> tuple[str, str]:
     conn.execute(
         insert(composition_states_table).values(
             metadata_=stored_default_pipeline_metadata(),
+            composer_meta=stored_composer_meta(session_id=session_id, state_id=state_id, version=1),
             id=state_id,
             session_id=session_id,
             version=1,
@@ -389,7 +392,8 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # Epoch 77 retains that authority, makes container storage optional and
     # enforces its singleton across actors; neither epoch-76 predecessor suffices.
     # Epoch 79 retains versioned continuation children and exact snapshot bytes.
-    assert SESSION_SCHEMA_EPOCH == 79
+    # Epoch 80 makes Continuation the one Composer lifecycle and adds run CHECKs.
+    assert SESSION_SCHEMA_EPOCH == 80
     assert "composition_graph_parks" in inspector.get_table_names()
     assert "creator_operation_id" in {column["name"] for column in inspector.get_columns("composition_states")}
     expected_tables = frozenset(
@@ -405,7 +409,6 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
             "composer_progress_snapshots",
             "rate_limit_buckets",
             "rate_limit_events",
-            "sessions_cleanup_claims",
         }
     )
     assert expected_tables == _COORDINATION_HARD_CUT_TABLES
@@ -424,7 +427,6 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
         "composer_progress_snapshots": {"ix_composer_progress_snapshots_expires_at"},
         "rate_limit_buckets": {"ix_rate_limit_buckets_expires_at"},
         "rate_limit_events": {"ix_rate_limit_events_expires_at", "ix_rate_limit_events_subject_occurred"},
-        "sessions_cleanup_claims": {"ix_sessions_cleanup_claims_lease_expires_at"},
     }
     for table_name, index_names in expected_indexes.items():
         assert {index["name"] for index in inspector.get_indexes(table_name)} == index_names, table_name
@@ -533,14 +535,6 @@ def test_coordination_hard_cut_check_constraints_are_exact() -> None:
         "rate_limit_events": {
             "ck_rate_limit_events_digest_sha256",
             "ck_rate_limit_events_event_id_nonblank",
-        },
-        "sessions_cleanup_claims": {
-            "ck_sessions_cleanup_claims_bounded_counts",
-            "ck_sessions_cleanup_claims_name_nonblank",
-            "ck_sessions_cleanup_claims_owner_nonblank",
-            "ck_sessions_cleanup_claims_positive_epoch",
-            "ck_sessions_cleanup_claims_token_nonblank",
-            "ck_sessions_cleanup_claims_token_not_owner",
         },
     }
     for table_name, check_names in expected_checks.items():
@@ -703,7 +697,6 @@ def test_postgres_schema_uses_postgres_non_blank_check_syntax() -> None:
         "ck_run_execution_inputs_deployment_generation_nonblank",
         "ck_websocket_tickets_run_id_nonblank",
         "ck_rate_limit_events_event_id_nonblank",
-        "ck_sessions_cleanup_claims_name_nonblank",
         "ck_user_secrets_id_nonblank",
     ):
         assert constraint_name in ddl
@@ -1461,6 +1454,35 @@ def test_runs_conditional_checks_refuse_invalid_database_rows_without_other_chan
         assert run_rows(conn) == before
 
 
+def test_runs_counter_checks_admit_the_adr019_subset_shape(engine) -> None:
+    """The positive counterpart of every counter case below."""
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status="completed_with_failures", error=None, landscape_run_id="landscape")
+        conn.execute(insert(runs_table).values(**values, **VALID_RUN_COUNTERS))
+        assert len(run_rows(conn)) == 1
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+@pytest.mark.parametrize(("counters", "constraint"), INVALID_RUN_COUNTERS)
+def test_runs_counter_checks_refuse_each_single_violation(engine, operation, counters, constraint) -> None:
+    """Epoch 80 moves ADR-019's subset rules into SQL. Control: drop the named CHECK -> red."""
+    with engine.begin() as conn:
+        session_id, state_id = seed_run_owner(conn)
+        values = run_values(session_id, state_id, status="pending", error=None, landscape_run_id=None)
+        if operation == "update":
+            conn.execute(insert(runs_table).values(**values))
+        before = run_rows(conn)
+        with pytest.raises(IntegrityError) as raised, conn.begin_nested():
+            if operation == "insert":
+                conn.execute(insert(runs_table).values(**values, **counters))
+            else:
+                conn.execute(update(runs_table).where(runs_table.c.id == values["id"]).values(**counters))
+        assert isinstance(raised.value.orig, sqlite3.IntegrityError)
+        assert str(raised.value.orig) == f"CHECK constraint failed: {constraint}"
+        assert run_rows(conn) == before
+
+
 def test_runs_terminal_update_retains_an_already_stored_landscape_identity(engine) -> None:
     with engine.begin() as conn:
         session_id, state_id = seed_run_owner(conn)
@@ -1516,8 +1538,8 @@ def test_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identit
             schema_before = conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all()
             identities_before = conn.execute(select(schema_identity_table)).all()
             rows_before = run_rows(conn)
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 79
-            assert identities_before[0].schema_epoch == 79
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == SESSION_SCHEMA_EPOCH == 80
+            assert identities_before[0].schema_epoch == 80
         with pytest.raises(SessionSchemaError) as raised:
             unexpectedly_admitted = create_session_engine(url)
             unexpectedly_admitted.dispose()
@@ -1528,7 +1550,7 @@ def test_runs_check_drift_refuses_current_epoch_without_rewriting_schema_identit
             assert conn.execute(text("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")).all() == schema_before
             assert conn.execute(select(schema_identity_table)).all() == identities_before
             assert run_rows(conn) == rows_before
-            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 79
+            assert conn.exec_driver_sql("PRAGMA user_version").scalar_one() == 80
     finally:
         stale.dispose()
 
@@ -1539,7 +1561,7 @@ def test_runs_check_reflection_is_current_idempotent_and_identity_bound(engine) 
     with engine.connect() as conn:
         before = conn.execute(select(schema_identity_table)).all()
         rows_before = run_rows(conn)
-        assert before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 79
+        assert before[0].schema_epoch == SESSION_SCHEMA_EPOCH == 80
     initialize_session_schema(engine)
     with engine.connect() as conn:
         assert conn.execute(select(schema_identity_table)).all() == before

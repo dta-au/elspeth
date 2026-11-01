@@ -8,13 +8,36 @@ from sqlalchemy import Connection, insert, select
 
 from elspeth.web.sessions.models import composition_states_table, runs_table, sessions_table
 from tests.fixtures.identities import ensure_test_identity
-from tests.helpers.composition_state import stored_default_pipeline_metadata
+from tests.helpers.composition_state import stored_composer_meta, stored_default_pipeline_metadata
 
 RUN_CHECK_SQL = {
     "ck_runs_completed_landscape_run_id": (
         "status NOT IN ('completed', 'completed_with_failures', 'empty') OR landscape_run_id IS NOT NULL"
     ),
     "ck_runs_failed_error": "status != 'failed' OR error IS NOT NULL",
+    "ck_runs_counters_nonnegative": (
+        "rows_processed >= 0 AND rows_succeeded >= 0 AND rows_failed >= 0 AND "
+        "rows_routed_success >= 0 AND rows_routed_failure >= 0 AND rows_quarantined >= 0"
+    ),
+    "ck_runs_counter_subsets": (
+        "rows_routed_success <= rows_succeeded AND rows_routed_failure <= rows_failed AND rows_quarantined <= rows_failed"
+    ),
+}
+# Each counter case breaks exactly one rule; the counterpart counters are valid.
+INVALID_RUN_COUNTERS = (
+    pytest.param({"rows_processed": -1}, "ck_runs_counters_nonnegative", id="negative-processed"),
+    pytest.param({"rows_quarantined": -1}, "ck_runs_counters_nonnegative", id="negative-quarantined"),
+    pytest.param({"rows_routed_success": 1}, "ck_runs_counter_subsets", id="routed-success-exceeds-succeeded"),
+    pytest.param({"rows_routed_failure": 1}, "ck_runs_counter_subsets", id="routed-failure-exceeds-failed"),
+    pytest.param({"rows_quarantined": 1}, "ck_runs_counter_subsets", id="quarantined-exceeds-failed"),
+)
+VALID_RUN_COUNTERS = {
+    "rows_processed": 5,
+    "rows_succeeded": 3,
+    "rows_failed": 2,
+    "rows_routed_success": 3,
+    "rows_routed_failure": 1,
+    "rows_quarantined": 1,
 }
 RUN_CHECK_NAMES = frozenset(
     {
@@ -71,6 +94,7 @@ def seed_run_owner(conn: Connection) -> tuple[str, str]:
             version=1,
             is_valid=True,
             metadata_=stored_default_pipeline_metadata(),
+            composer_meta=stored_composer_meta(session_id=session_id, state_id=state_id, version=1),
             provenance="session_seed",
             created_at=now,
         )
