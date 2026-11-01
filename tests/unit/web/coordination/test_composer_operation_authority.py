@@ -1382,10 +1382,16 @@ def test_failure_cursor_codec_retains_invalid_wire_refusal(value):
         decode_composer_failure_cursor(value)
 
 
-async def _settled_failure(store, failure=None):
-    """Start one request and seal it failed through the owner's terminal writer, then free its fence."""
-    _engine, repository, _authority, service, _sid = store
+async def _settled_failure(store, failure=None, *, stop=False):
+    """Start one request and seal it failed through the owner's terminal writer, then free its fence.
+
+    ``stop`` commits a durable Stop first, so the sealed failure is ``request_cancelled``.
+    """
+    _engine, repository, authority, service, sid = store
     record, running = start(store)
+    if stop:
+        authority.request_cancel(session_id=sid, operation_id=record.operation_id)
+        failure = cancelled(request_id=record.request_id)
     terminal = await service.fail_composer_async_operation(running, failure=failure if failure is not None else failed())
     repository.release(running.session_operation_context)
     return record, terminal

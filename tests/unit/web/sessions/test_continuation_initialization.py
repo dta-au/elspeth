@@ -20,6 +20,7 @@ from elspeth.web.composer.continuation_codec import decode_continuation_snapshot
 from elspeth.web.composer.continuation_next_action import next_continuation_action_policy
 from elspeth.web.composer.continuation_policy import decode_continuation_policy
 from elspeth.web.composer.continuation_selection import SelectedContinuationState
+from elspeth.web.coordination.composer_operation_authority import ComposerAsyncOperationAuthority
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.execution.completion_gates import CompletionGateFacts, completion_gates_meta_from_facts
 from elspeth.web.sessions import continuation_bootstrap_source as sql_owner
@@ -66,8 +67,7 @@ def seed_observed_sql_trial_policy(monkeypatch):
 async def bootstrap_case(store, *, eligible=True, bound_base=False):
     engine, repository, authority, sessions, sid = store
     # An actual settled prior job, read by the real bounded history owner.
-    prior, _ = operations.admit(authority, sid)
-    authority.request_cancel(session_id=sid, operation_id=prior.operation_id, cancelled_failure=operations.cancelled)
+    prior, _ = await operations._settled_failure(store, stop=True)
     base = None
     if bound_base:
         seed_context = repository.acquire(
@@ -116,7 +116,9 @@ async def bootstrap_case(store, *, eligible=True, bound_base=False):
         initial_action_json=policy.actions.session_sql.model_dump_json(),
         initial_trust_mode=trust_mode,
     )
-    _record, fresh = operations.admit(authority, sid, request, lifecycle_version=2, continuation_enabled=True, seed=seed)
+    # The admitting server's policy is the seed's policy (fresh admission compares them).
+    authority = ComposerAsyncOperationAuthority(engine, owner_instance_id="test-owner", claim_lease_seconds=30, continuation_policy=policy)
+    _record, fresh = operations.admit(authority, sid, request, seed=seed)
     assert fresh
     running = start_continuation(repository, authority)
     selected = authority.load_continuation_snapshot(running)
