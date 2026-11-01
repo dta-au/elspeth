@@ -108,6 +108,8 @@ function useSuccessorNotice(status: ComposerOperationStatusV2 | null | undefined
       // announced. Segment 1 is never a successor, so its baseline floor is 1.
       const baseline = segment.state === "running" ? segment.sequence : Math.max(1, segment.sequence - 1);
       seen.current = { operation, baseline, announced: baseline };
+      // A notice belongs to one operation; a new operation never inherits it.
+      setShownFor(null);
       return;
     }
     if (segment.state === "running" && segment.sequence > previous.announced && segment.sequence > previous.baseline) {

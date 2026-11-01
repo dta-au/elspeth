@@ -65,6 +65,15 @@ describe("Continuation copy (design §4.2, F-12)", () => {
     rerender(<ComposingIndicator operationStatus={status({ status_revision: 2 })} />);
     expect(screen.queryByText(SUCCESSOR_NOTICE)).toBeNull();
   });
+  it("clears a previous operation's notice when a new operation is observed", () => {
+    vi.useFakeTimers();
+    const { rerender } = render(<ComposingIndicator operationStatus={status()} />);
+    rerender(<ComposingIndicator operationStatus={status({ status_revision: 2, segment: { sequence: 2, generation: 2, state: "running", deadline_at: new Date().toISOString() } })} />);
+    expect(screen.getByText(SUCCESSOR_NOTICE)).toBeInTheDocument();
+    const next = "33333333-3333-4333-8333-333333333333";
+    rerender(<ComposingIndicator operationStatus={status({ operation_id: next })} />);
+    expect(screen.queryByText(SUCCESSOR_NOTICE)).toBeNull();
+  });
   it("does not show the notice on first attach to a request already past segment 1", () => {
     render(<ComposingIndicator operationStatus={status({ segment: { sequence: 4, generation: 4, state: "running", deadline_at: new Date().toISOString() } })} />);
     expect(screen.queryByText(SUCCESSOR_NOTICE)).toBeNull();
