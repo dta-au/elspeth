@@ -17,7 +17,7 @@ from elspeth.web.composer.protocol import ComposerHistoryMessage, RetainedOperat
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import CompletionGateFacts
-from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import _composer_chat_history, _composer_conversation_messages
 from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
@@ -111,7 +111,7 @@ def bootstrap_values(snapshot: ContinuationBootstrapSnapshot) -> ContinuationBoo
     request = request_type.model_validate_json(snapshot.request_json, strict=True)
     if (
         canonical_json(request.model_dump(mode="json")) != snapshot.request_json
-        or composer_operation_v2_request_hash(session_id=UUID(logical.session_id), kind=logical.kind, request=request)
+        or composer_operation_admission_request_hash(session_id=UUID(logical.session_id), kind=logical.kind, request=request)
         != logical.request_hash
         or str(request.operation_id) != logical.operation_id
         or (str(request.state_id) if request.state_id is not None else None) != logical.base_state_id

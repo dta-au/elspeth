@@ -292,7 +292,7 @@ def test_stream_closed_frames_and_safe_progress_exact_lease_binding() -> None:
 
 
 def queued_v2_record() -> ComposerOperationRecord:
-    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 
     request = SendMessageRequest(operation_id=OP, content="hello")
     return replace(
@@ -307,7 +307,7 @@ def queued_v2_record() -> ComposerOperationRecord:
         journal_cursor=0,
         ingress_phase="pending",
         reserved_user_message_id=SID,
-        request_hash=composer_operation_v2_request_hash(session_id=SID, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=SID, kind="compose_message", request=request),
     )
 
 
@@ -485,7 +485,7 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
     from elspeth.web.coordination.composer_operation_authority import _record_from_row
     from elspeth.web.coordination.database_clock import database_now
     from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
-    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
     from elspeth.web.sessions.engine import create_session_engine
     from elspeth.web.sessions.models import composer_async_operations_table as jobs
     from elspeth.web.sessions.schema import initialize_session_schema
@@ -510,7 +510,7 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
                     operation_id=OP,
                     kind="compose_message",
                     status="queued",
-                    request_hash=composer_operation_v2_request_hash(session_id=session.id, kind="compose_message", request=request),
+                    request_hash=composer_operation_admission_request_hash(session_id=session.id, kind="compose_message", request=request),
                     actor_user_id="alice",
                     request_id="transport",
                     request_json=request.model_dump_json(),
@@ -547,7 +547,7 @@ def test_actual_v2_parent_sql_row_decodes_every_continuation_field(tmp_path):
 
 
 def committed_v2_recompose_record(expected_user_message_id=SID):
-    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 
     request = RecomposeRequest(operation_id=OP, expected_user_message_id=expected_user_message_id)
     return replace(
@@ -556,7 +556,7 @@ def committed_v2_recompose_record(expected_user_message_id=SID):
         ingress_phase="committed",
         user_message_id=SID,
         request_json=request.model_dump_json(),
-        request_hash=composer_operation_v2_request_hash(session_id=SID, kind="compose_recompose", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=SID, kind="compose_recompose", request=request),
     )
 
 

@@ -28,12 +28,12 @@ from elspeth.web.coordination.composer_operation_authority import ComposerAsyncO
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaExceeded
 from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.middleware.rate_limit import SharedRateLimiter
-from elspeth.web.sessions.composer_operation_projection_v2 import (
+from elspeth.web.sessions.composer_operation_projection import (
     ComposerOperationProjectionUnstable,
-    project_v2_snapshot,
-    project_v2_status,
+    project_operation_snapshot,
+    project_operation_status,
     read_active_operation,
-    read_v2_projection_inputs,
+    read_projection_inputs,
 )
 from elspeth.web.sessions.composer_operation_resume import (
     COMPOSER_OPERATION_RESUME_TOKEN_INVALID,
@@ -46,25 +46,25 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationConflictError,
     ComposerOperationKind,
     ComposerOperationPreconditionRefused,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
     decode_composer_failure_cursor,
     encode_composer_failure_cursor,
 )
 from elspeth.web.sessions.schemas import (
     ComposerActiveOperationResponse,
     ComposerOperationFailurePageResponse,
-    ComposerOperationProgressV2,
-    ComposerOperationSnapshotV2,
-    ComposerOperationStreamFrameV2,
-    ComposerOperationStreamHeartbeatFrameV2,
-    ComposerOperationStreamProgressFrameV2,
-    ComposerOperationStreamReconnectFrameV2,
-    ComposerOperationStreamStatusFrameV2,
-    ComposerOperationStreamTerminalFrameV2,
-    ComposerOperationTerminalV2,
+    ComposerOperationProgress,
+    ComposerOperationSnapshot,
+    ComposerOperationStreamFrame,
+    ComposerOperationStreamHeartbeatFrame,
+    ComposerOperationStreamProgressFrame,
+    ComposerOperationStreamReconnectFrame,
+    ComposerOperationStreamStatusFrame,
+    ComposerOperationStreamTerminalFrame,
+    ComposerOperationTerminal,
     RecomposeRequest,
     SendMessageRequest,
-    encode_composer_operation_stream_frame_v2,
+    encode_composer_operation_stream_frame,
 )
 
 from .._helpers import (
@@ -116,7 +116,7 @@ async def admit(
     user: UserIdentity,
     rate_limiter: WebRateLimiter,
     kind: ComposerOperationKind,
-) -> ComposerOperationSnapshotV2:
+) -> ComposerOperationSnapshot:
     await _verify_session_ownership(session_id, user, request)
     settings = request.app.state.settings
     if isinstance(body, SendMessageRequest):
@@ -136,7 +136,7 @@ async def admit(
             session_id=session_id,
             operation_id=body.operation_id,
             kind=kind,
-            request_hash=composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=body),
+            request_hash=composer_operation_admission_request_hash(session_id=session_id, kind=kind, request=body),
             actor_user_id=user.user_id,
             request_id=request.state.request_id,
             base_state_id=body.state_id,
@@ -186,7 +186,7 @@ async def admit(
     request.app.state.composer_async_worker.notify_work()
     try:
         inputs = await run_sync_in_worker(
-            read_v2_projection_inputs,
+            read_projection_inputs,
             _authority(request),
             request.app.state.session_engine,
             session_id=session_id,
@@ -195,7 +195,7 @@ async def admit(
     except ComposerOperationProjectionUnstable:
         # Admission committed; the client observes it with GET.
         raise HTTPException(status_code=503, detail="Composer operation is changing; retry", headers={"Retry-After": "1"}) from None
-    return project_v2_snapshot(inputs, poll_after_ms=settings.composer_async_poll_after_ms)
+    return project_operation_snapshot(inputs, poll_after_ms=settings.composer_async_poll_after_ms)
 
 
 @router.get("/{session_id}/operations", response_model=ComposerOperationFailurePageResponse)
@@ -261,14 +261,14 @@ async def get_active_composer_operation(
     return JSONResponse(content=active.model_dump(mode="json"), headers={"Cache-Control": "no-store"})
 
 
-@router.get("/{session_id}/operations/{operation_id}", response_model=ComposerOperationSnapshotV2)
+@router.get("/{session_id}/operations/{operation_id}", response_model=ComposerOperationSnapshot)
 async def get_composer_operation(
     session_id: UUID,
     operation_id: UUID,
     request: Request,
     response: Response,
     user: Annotated[UserIdentity, Depends(require_pipeline_user)],
-) -> ComposerOperationSnapshotV2:
+) -> ComposerOperationSnapshot:
     try:
         await _verify_session_ownership(session_id, user, request)
     except HTTPException as exc:
@@ -277,7 +277,7 @@ async def get_composer_operation(
         ) from exc
     try:
         inputs = await run_sync_in_worker(
-            read_v2_projection_inputs,
+            read_projection_inputs,
             _authority(request),
             request.app.state.session_engine,
             session_id=session_id,
@@ -293,17 +293,17 @@ async def get_composer_operation(
     if row is None or row.actor_user_id != user.user_id:
         raise HTTPException(status_code=404, detail="Operation not found", headers={"Cache-Control": "no-store"})
     response.headers["Cache-Control"] = "no-store"
-    return project_v2_snapshot(inputs, poll_after_ms=request.app.state.settings.composer_async_poll_after_ms)
+    return project_operation_snapshot(inputs, poll_after_ms=request.app.state.settings.composer_async_poll_after_ms)
 
 
-@router.post("/{session_id}/operations/{operation_id}/cancel", response_model=ComposerOperationSnapshotV2)
+@router.post("/{session_id}/operations/{operation_id}/cancel", response_model=ComposerOperationSnapshot)
 async def cancel_composer_operation(
     session_id: UUID,
     operation_id: UUID,
     request: Request,
     response: Response,
     user: Annotated[UserIdentity, Depends(require_pipeline_user)],
-) -> ComposerOperationSnapshotV2:
+) -> ComposerOperationSnapshot:
     try:
         await _verify_session_ownership(session_id, user, request)
     except HTTPException as exc:
@@ -405,15 +405,15 @@ async def stream_operation(
     engine = request.app.state.session_engine
     poll_after_ms = request.app.state.settings.composer_async_poll_after_ms
 
-    def v2_frame(frame: ComposerOperationStreamFrameV2, *, event_id: int | None = None) -> bytes:
+    def v2_frame(frame: ComposerOperationStreamFrame, *, event_id: int | None = None) -> bytes:
         nonlocal v2_sequence
-        encoded = encode_composer_operation_stream_frame_v2(frame, event_id=event_id)
+        encoded = encode_composer_operation_stream_frame(frame, event_id=event_id)
         v2_sequence += 1
         return encoded
 
     def reconnect_frame() -> bytes:
         return v2_frame(
-            ComposerOperationStreamReconnectFrameV2(session_id=str(session_id), operation_id=str(operation_id), sequence=v2_sequence)
+            ComposerOperationStreamReconnectFrame(session_id=str(session_id), operation_id=str(operation_id), sequence=v2_sequence)
         )
 
     async def v2_frames() -> AsyncIterator[bytes]:
@@ -431,7 +431,7 @@ async def stream_operation(
         while True:
             try:
                 inputs = await run_stream_read_in_worker(
-                    read_v2_projection_inputs, authority, engine, session_id=session_id, operation_id=str(operation_id)
+                    read_projection_inputs, authority, engine, session_id=session_id, operation_id=str(operation_id)
                 )
             except ComposerOperationProjectionUnstable:
                 yield b""
@@ -446,21 +446,21 @@ async def stream_operation(
                 last_revision = record.status_revision
                 sent = True
                 yield v2_frame(
-                    ComposerOperationStreamStatusFrameV2(
+                    ComposerOperationStreamStatusFrame(
                         session_id=str(session_id),
                         operation_id=str(operation_id),
                         sequence=v2_sequence,
-                        payload=project_v2_status(inputs, poll_after_ms=poll_after_ms),
+                        payload=project_operation_status(inputs, poll_after_ms=poll_after_ms),
                     ),
                     event_id=record.status_revision,
                 )
             if record.status in ("completed", "failed"):
                 yield v2_frame(
-                    ComposerOperationStreamTerminalFrameV2(
+                    ComposerOperationStreamTerminalFrame(
                         session_id=str(session_id),
                         operation_id=str(operation_id),
                         sequence=v2_sequence,
-                        payload=ComposerOperationTerminalV2(status=record.status, status_revision=record.status_revision),
+                        payload=ComposerOperationTerminal(status=record.status, status_revision=record.status_revision),
                     ),
                     event_id=record.status_revision,
                 )
@@ -482,11 +482,11 @@ async def stream_operation(
                         sent = True
                         pending_progress_binding = (record.session_operation_id, record.session_operation_epoch, progress.request_token)
                         yield v2_frame(
-                            ComposerOperationStreamProgressFrameV2(
+                            ComposerOperationStreamProgressFrame(
                                 session_id=str(session_id),
                                 operation_id=str(operation_id),
                                 sequence=v2_sequence,
-                                payload=ComposerOperationProgressV2(
+                                payload=ComposerOperationProgress(
                                     request_id=progress.request_id,
                                     phase=progress.phase,
                                     headline=cast(str, scrub_credential_material(progress.headline)),
@@ -504,9 +504,7 @@ async def stream_operation(
             elif loop.time() - last_sent >= 10:
                 last_sent = loop.time()
                 yield v2_frame(
-                    ComposerOperationStreamHeartbeatFrameV2(
-                        session_id=str(session_id), operation_id=str(operation_id), sequence=v2_sequence
-                    )
+                    ComposerOperationStreamHeartbeatFrame(session_id=str(session_id), operation_id=str(operation_id), sequence=v2_sequence)
                 )
             else:
                 yield b""

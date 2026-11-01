@@ -133,10 +133,10 @@ def test_segment_claim_requires_both_positive_sequence_and_generation():
     ],
 )
 def test_v2_request_hash_wraps_preserved_native_v1_golden(kind, request_model, expected_v1, expected_v2):
-    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 
     assert composer_operation_request_hash(session_id=SID, kind=kind, request=request_model) == expected_v1
-    assert composer_operation_v2_request_hash(session_id=SID, kind=kind, request=request_model) == expected_v2
+    assert composer_operation_admission_request_hash(session_id=SID, kind=kind, request=request_model) == expected_v2
     changed_id = request_model.model_copy(update={"operation_id": str(SID)})
-    assert composer_operation_v2_request_hash(session_id=SID, kind=kind, request=changed_id) == expected_v2
-    assert composer_operation_v2_request_hash(session_id=UUID(OP), kind=kind, request=request_model) != expected_v2
+    assert composer_operation_admission_request_hash(session_id=SID, kind=kind, request=changed_id) == expected_v2
+    assert composer_operation_admission_request_hash(session_id=UUID(OP), kind=kind, request=request_model) != expected_v2

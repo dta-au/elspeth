@@ -16,7 +16,7 @@ from sqlalchemy import Engine, insert
 from elspeth.web.coordination.composer_operation_authority import _terminal_values
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.sessions.composer_operation_errors import request_cancelled_error
-from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.schemas import SendMessageRequest
@@ -62,7 +62,7 @@ def insert_v2_operation(
             "checkpoint_id": checkpoint_id,
             "ingress_phase": "pending",
             "reserved_user_message_id": str(uuid4()),
-            "request_hash": composer_operation_v2_request_hash(session_id=session_id, kind="compose_message", request=request),
+            "request_hash": composer_operation_admission_request_hash(session_id=session_id, kind="compose_message", request=request),
             "actor_user_id": actor_user_id,
             "request_json": request.model_dump_json(),
             "attempt": 1,

@@ -32,7 +32,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRecord,
     ComposerOperationRunning,
     composer_operation_request_hash,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_async_operations_table as jobs
@@ -148,7 +148,7 @@ def _seed_live_continuation_history(operation_store, *, parent_status="running")
 
     from sqlalchemy import insert
 
-    from elspeth.web.sessions.composer_operations import composer_operation_v2_request_hash
+    from elspeth.web.sessions.composer_operations import composer_operation_admission_request_hash
     from elspeth.web.sessions.models import composer_operation_segments_table as segments
     from elspeth.web.sessions.models import composer_segment_attempts_table as attempts
 
@@ -174,7 +174,7 @@ def _seed_live_continuation_history(operation_store, *, parent_status="running")
                 checkpoint_id=str(uuid4()),
                 ingress_phase="pending",
                 reserved_user_message_id=str(uuid4()),
-                request_hash=composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request),
+                request_hash=composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request),
                 actor_user_id="alice",
                 request_json=request.model_dump_json(),
                 attempt=1,
@@ -618,7 +618,7 @@ def admit(
         session_id=sid,
         operation_id=request.operation_id,
         kind=kind,
-        request_hash=(composer_operation_request_hash if lifecycle_version == 1 else composer_operation_v2_request_hash)(
+        request_hash=(composer_operation_request_hash if lifecycle_version == 1 else composer_operation_admission_request_hash)(
             session_id=sid, kind=kind, request=request
         ),
         actor_user_id=actor,
@@ -691,9 +691,9 @@ def test_admission_hash_branch_and_early_binding_refusals_preserve_rows(operatio
     if lifecycle_version == 1:
         request_hash = composer_operation_request_hash(session_id=sid, kind="compose_message", request=request)
     else:
-        request_hash = composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request)
+        request_hash = composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request)
     original_v1 = module.composer_operation_request_hash
-    original_v2 = module.composer_operation_v2_request_hash
+    original_v2 = module.composer_operation_admission_request_hash
     calls = []
     selected_error = None
 
@@ -712,7 +712,7 @@ def test_admission_hash_branch_and_early_binding_refusals_preserve_rows(operatio
     # Intercept the authority's bindings only. The real v2 implementation is
     # allowed to invoke its defining module's v1 helper internally.
     monkeypatch.setattr(module, "composer_operation_request_hash", observed_v1)
-    monkeypatch.setattr(module, "composer_operation_v2_request_hash", observed_v2)
+    monkeypatch.setattr(module, "composer_operation_admission_request_hash", observed_v2)
     kwargs = {
         "quota": ComposerQuotaAdmission(RepositoryRateLimitAuthority(engine, signing_key=b"operation-test-quota-key-32-bytes"), 10000),
         "session_id": sid,
@@ -839,7 +839,7 @@ def _admission_seed(sid, request, *, mode="auto_commit", policy=None):
         operation_id=request.operation_id,
         kind=kind,
         request_json=request.model_dump_json(),
-        request_hash=composer_operation_v2_request_hash(session_id=sid, kind=kind, request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=sid, kind=kind, request=request),
         base_state_id=request.state_id,
         policy_hash=policy.policy_hash,
         admission_policy_json=policy.model_dump_json(),
@@ -1104,7 +1104,7 @@ async def test_v2_admission_decoder_preconditions_and_async_forwarding_use_real_
         session_id=sid,
         operation_id=request.operation_id,
         kind="compose_message",
-        request_hash=composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request),
         actor_user_id="alice",
         request_id=None,
         base_state_id=saved.id,

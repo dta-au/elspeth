@@ -56,7 +56,7 @@ from uuid import UUID, uuid4
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.web.sessions.schemas import ComposerOperationSnapshotV2, SendMessageRequest
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot, SendMessageRequest
 
 from .errors import AcceptanceCheckError, AcceptanceInputError
 from .http_client import AcceptanceHttpClient
@@ -717,12 +717,12 @@ class ReplicaProbeDriver:
             terminal_status="completed" if terminal.status == "completed" else "failed",
         )
 
-    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationSnapshotV2:
-        def poll(client: AcceptanceHttpClient) -> ComposerOperationSnapshotV2:
+    def _poll_composer_operation(self, session_id: str, operation_id: str) -> ComposerOperationSnapshot:
+        def poll(client: AcceptanceHttpClient) -> ComposerOperationSnapshot:
             deadline = self._clock() + P1_OPERATION_TERMINAL_BOUND_SECONDS
             while True:
                 body = client.request_json("GET", f"/api/sessions/{session_id}/operations/{operation_id}", expected_statuses={200})
-                status = ComposerOperationSnapshotV2.model_validate_json(json.dumps(body))
+                status = ComposerOperationSnapshot.model_validate_json(json.dumps(body))
                 if status.operation_id != operation_id:
                     raise AcceptanceCheckError("probe_operation_identity")
                 if status.status in ("completed", "failed"):

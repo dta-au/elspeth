@@ -26,7 +26,7 @@ from elspeth.web.sessions.composer_operation_versions import (
     parse_composer_operation_version,
 )
 from elspeth.web.sessions.models import composer_async_operations_table, composer_operation_segments_table, rate_limit_events_table
-from elspeth.web.sessions.schemas import ComposerOperationSegmentV2, ComposerOperationSnapshotV2, ComposerOperationStatusV2
+from elspeth.web.sessions.schemas import ComposerOperationSegment, ComposerOperationSnapshot, ComposerOperationStatusPayload
 
 V1_ACK_KEYS = {"operation_id", "kind", "status", "poll_after_ms"}
 
@@ -264,7 +264,7 @@ async def test_v2_reader_of_a_v2_row_gets_the_v2_snapshot(tmp_path, state, statu
     assert response.status_code == 200, response.text
     assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
     assert response.headers["cache-control"] == "no-store"
-    snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+    snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
     assert (snapshot.protocol_version, snapshot.operation_id, snapshot.status, snapshot.phase) == (2, seeded.operation_id, status, phase)
     assert snapshot.status_revision == 5
     if segment_state is None:
@@ -302,7 +302,7 @@ def _status_fields(**overrides):
         "observed_at": now,
         "poll_after_ms": 1000,
         "cancel_requested": False,
-        "segment": ComposerOperationSegmentV2(sequence=1, generation=1, state="running", deadline_at=now),
+        "segment": ComposerOperationSegment(sequence=1, generation=1, state="running", deadline_at=now),
     }
     fields.update(overrides)
     return fields
@@ -312,9 +312,9 @@ _TERMINAL = {"phase": "settled", "segment": None}
 
 
 def test_v2_status_valid_counterparts_construct() -> None:
-    ComposerOperationStatusV2(**_status_fields())
-    ComposerOperationStatusV2(**_status_fields(status="failed", cancel_requested=True, **_TERMINAL))
-    ComposerOperationStatusV2(**_status_fields(status="completed", **_TERMINAL))
+    ComposerOperationStatusPayload(**_status_fields())
+    ComposerOperationStatusPayload(**_status_fields(status="failed", cancel_requested=True, **_TERMINAL))
+    ComposerOperationStatusPayload(**_status_fields(status="completed", **_TERMINAL))
 
 
 @pytest.mark.parametrize(
@@ -332,7 +332,7 @@ def test_v2_status_rejects_each_single_violation(overrides) -> None:
     """B-9: each case violates exactly one rule; the counterparts above are valid.
     Control: drop that rule or extra='forbid' -> the matching case goes red."""
     with pytest.raises(ValidationError):
-        ComposerOperationStatusV2(**_status_fields(**overrides))
+        ComposerOperationStatusPayload(**_status_fields(**overrides))
 
 
 def test_v2_snapshot_result_bundle_rejects_each_single_violation() -> None:
@@ -340,19 +340,19 @@ def test_v2_snapshot_result_bundle_rejects_each_single_violation() -> None:
 
     error = request_cancelled_error(request_id=None)
     failed = _status_fields(status="failed", cancel_requested=True, **_TERMINAL)
-    ComposerOperationSnapshotV2(**failed, error=error)
+    ComposerOperationSnapshot(**failed, error=error)
     with pytest.raises(ValidationError):
-        ComposerOperationSnapshotV2(**failed)
+        ComposerOperationSnapshot(**failed)
     with pytest.raises(ValidationError):
-        ComposerOperationSnapshotV2(**_status_fields(), error=error)
+        ComposerOperationSnapshot(**_status_fields(), error=error)
     with pytest.raises(ValidationError):
-        ComposerOperationSnapshotV2(**failed, error=error, unexpected=1)
+        ComposerOperationSnapshot(**failed, error=error, unexpected=1)
 
 
 @pytest.mark.parametrize(("state", "deadline"), [("running", None), ("queued", datetime.now(UTC))])
 def test_only_a_running_segment_has_a_deadline(state, deadline) -> None:
     with pytest.raises(ValidationError):
-        ComposerOperationSegmentV2(sequence=1, generation=1, state=state, deadline_at=deadline)
+        ComposerOperationSegment(sequence=1, generation=1, state=state, deadline_at=deadline)
 
 
 # --- step 4: discovery of the live operation -----------------------------
@@ -457,7 +457,7 @@ async def test_v2_admission_returns_the_v2_snapshot_and_echoes_2(tmp_path) -> No
         )
     assert response.status_code == 202, response.text
     assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
-    snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+    snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
     assert (snapshot.operation_id, snapshot.status, snapshot.phase, snapshot.status_revision) == (operation_id, "queued", "queued", 0)
     assert snapshot.segment is not None and (snapshot.segment.sequence, snapshot.segment.state) == (1, "queued")
     assert _lifecycle_of(setup.app, operation_id) == 2
@@ -492,7 +492,7 @@ async def test_projection_rereads_when_a_segment_start_commits_between_reads(tmp
     from sqlalchemy import update
 
     from elspeth.web.coordination.database_clock import database_now
-    from elspeth.web.sessions import composer_operation_projection_v2 as projection
+    from elspeth.web.sessions import composer_operation_projection as projection
     from elspeth.web.sessions.models import composer_operation_segments_table as segments
 
     setup = await build_composer_operation_app(tmp_path)
@@ -520,7 +520,7 @@ async def test_projection_rereads_when_a_segment_start_commits_between_reads(tmp
         return row
 
     monkeypatch.setattr(projection, "_read_segment_row", start_segment_after_reading)
-    inputs = projection.read_v2_projection_inputs(
+    inputs = projection.read_projection_inputs(
         setup.app.state.composer_async_operation_authority, engine, session_id=setup.session_id, operation_id=seeded.operation_id
     )
     assert len(calls) == 2
@@ -627,7 +627,7 @@ async def test_lifecycle2_stop_marks_once_and_returns_the_live_v2_snapshot(tmp_p
         assert response.status_code == 202, response.text
         assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
         assert response.headers["cache-control"] == "no-store"
-        snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
         assert snapshot.status == state
         assert snapshot.cancel_requested is True
         assert snapshot.status_revision == seeded.status_revision + 1
@@ -726,7 +726,7 @@ async def test_lifecycle2_stop_of_a_terminal_failure_is_read_only(tmp_path, monk
     assert response.status_code == 200, response.text
     assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == ("2" if header == "2" else "1")
     if header == "2":
-        snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
         assert snapshot.status == "failed" and snapshot.error is not None
         assert snapshot.status_revision == seeded.status_revision
     else:
@@ -834,9 +834,9 @@ async def test_lifecycle2_stop_preserves_completed_result_without_marking_or_wak
     assert response.status_code == 200, response.text
     assert response.headers[COMPOSER_OPERATION_VERSION_HEADER] == ("2" if header == "2" else "1")
     assert response.headers["cache-control"] == "no-store"
-    snapshot: ComposerOperationSnapshotV2 | ComposerOperationStatusResponse
+    snapshot: ComposerOperationSnapshot | ComposerOperationStatusResponse
     if header == "2":
-        snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
+        snapshot = ComposerOperationSnapshot.model_validate_json(response.content, strict=True)
         assert snapshot.status_revision == seeded.status_revision + 1
     else:
         snapshot = ComposerOperationStatusResponse.model_validate_json(response.content, strict=True)

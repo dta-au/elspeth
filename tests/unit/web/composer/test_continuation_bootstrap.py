@@ -27,7 +27,7 @@ from elspeth.web.execution.completion_gates import CompletionGateFacts, completi
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationFailureOutcome,
     ComposerOperationSavedRevisions,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.schemas import RecomposeRequest, SendMessageRequest
@@ -51,7 +51,7 @@ def original_bootstrap(*, recompose=False):
         original_user_message_id=str(HUMAN),
         kind=kind,
         base_state_id=None,
-        request_hash=composer_operation_v2_request_hash(session_id=SID, kind=kind, request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=SID, kind=kind, request=request),
     )
     records = (
         ChatMessageRecord(

@@ -58,8 +58,8 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationRunning,
     ComposerOperationSavedRevisions,
     ComposerOperationSettledBy,
+    composer_operation_admission_request_hash,
     composer_operation_result_hash,
-    composer_operation_v2_request_hash,
 )
 from elspeth.web.sessions.continuation import (
     ContinuationProviderBinding,
@@ -519,7 +519,7 @@ class ComposerAsyncOperationAuthority:
         if (
             request.operation_id != operation_id
             or request.state_id != base_state_id
-            or composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request) != request_hash
+            or composer_operation_admission_request_hash(session_id=session_id, kind=kind, request=request) != request_hash
         ):
             raise ValueError("composer request does not match its immutable admission binding")
         if type(quota) is not ComposerQuotaAdmission:

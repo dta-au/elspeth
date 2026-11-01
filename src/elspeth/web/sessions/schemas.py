@@ -766,13 +766,11 @@ COMPOSER_OPERATION_STREAM_FRAME_MAX_BYTES = 64 * 1024
 # SQL ``status_revision``. No claim token, lease token, fence id, checkpoint id
 # or journal cursor appears in any projection.
 
-type ComposerOperationPhaseV2 = Literal["queued", "executing", "continuation_queued", "reconciling", "retry_waiting", "settled"]
-COMPOSER_OPERATION_ACTIVE_PHASES_V2: frozenset[str] = frozenset(
-    {"queued", "executing", "continuation_queued", "reconciling", "retry_waiting"}
-)
+type ComposerOperationPhase = Literal["queued", "executing", "continuation_queued", "reconciling", "retry_waiting", "settled"]
+COMPOSER_OPERATION_ACTIVE_PHASES: frozenset[str] = frozenset({"queued", "executing", "continuation_queued", "reconciling", "retry_waiting"})
 
 
-class ComposerOperationSegmentV2(_StrictResponse):
+class ComposerOperationSegment(_StrictResponse):
     """The live segment of a v2 operation, without any custody secret."""
 
     sequence: int = Field(ge=1)
@@ -781,7 +779,7 @@ class ComposerOperationSegmentV2(_StrictResponse):
     deadline_at: datetime | None
 
     @model_validator(mode="after")
-    def _validate_deadline(self) -> ComposerOperationSegmentV2:
+    def _validate_deadline(self) -> ComposerOperationSegment:
         if (self.state == "running") != (self.deadline_at is not None):
             raise ValueError("Only a running segment has a deadline")
         if self.deadline_at is not None and self.deadline_at.utcoffset() is None:
@@ -789,19 +787,19 @@ class ComposerOperationSegmentV2(_StrictResponse):
         return self
 
 
-class ComposerOperationStatusV2(_StrictResponse):
+class ComposerOperationStatusPayload(_StrictResponse):
     """Operation state with no sealed result; the SSE ``status`` payload."""
 
     operation_id: str = Field(min_length=36, max_length=36)
     kind: ComposerOperationKind
     status: ComposerOperationStatus
-    phase: ComposerOperationPhaseV2
+    phase: ComposerOperationPhase
     status_revision: int = Field(ge=0)
     created_at: datetime
     observed_at: datetime
     poll_after_ms: int = Field(ge=100, le=60_000)
     cancel_requested: bool
-    segment: ComposerOperationSegmentV2 | None
+    segment: ComposerOperationSegment | None
 
     @field_validator("operation_id")
     @classmethod
@@ -809,11 +807,11 @@ class ComposerOperationStatusV2(_StrictResponse):
         return require_canonical_operation_id(value)
 
     @model_validator(mode="after")
-    def _validate_state_bundle(self) -> ComposerOperationStatusV2:
+    def _validate_state_bundle(self) -> ComposerOperationStatusPayload:
         if self.created_at.utcoffset() is None or self.observed_at.utcoffset() is None:
             raise ValueError("v2 projection times must be timezone-aware")
         live = self.status in ("queued", "running")
-        if live != (self.phase in COMPOSER_OPERATION_ACTIVE_PHASES_V2):
+        if live != (self.phase in COMPOSER_OPERATION_ACTIVE_PHASES):
             raise ValueError("v2 phase does not match the operation status")
         if live != (self.segment is not None):
             raise ValueError("A live v2 operation has exactly one live segment; a terminal one has none")
@@ -822,14 +820,14 @@ class ComposerOperationStatusV2(_StrictResponse):
         return self
 
 
-class ComposerOperationSnapshotV2(ComposerOperationStatusV2):
+class ComposerOperationSnapshot(ComposerOperationStatusPayload):
     """POST acknowledgement, GET and cancel body: the state plus any sealed result."""
 
     result: MessageWithStateResponse | None = None
     error: ComposerOperationError | None = None
 
     @model_validator(mode="after")
-    def _validate_result_bundle(self) -> ComposerOperationSnapshotV2:
+    def _validate_result_bundle(self) -> ComposerOperationSnapshot:
         if self.status in ("queued", "running"):
             if self.result is not None or self.error is not None:
                 raise ValueError("A live v2 operation carries no sealed result")
@@ -841,7 +839,7 @@ class ComposerOperationSnapshotV2(ComposerOperationStatusV2):
         return self
 
 
-class ComposerOperationProgressV2(_StrictResponse):
+class ComposerOperationProgress(_StrictResponse):
     """Public progress: the shared vocabulary and bounds, bound to a segment, with no fence or token."""
 
     request_id: str | None = Field(default=None, max_length=128)
@@ -862,19 +860,19 @@ class ComposerOperationProgressV2(_StrictResponse):
         return value
 
     @model_validator(mode="after")
-    def _validate_reason(self) -> ComposerOperationProgressV2:
+    def _validate_reason(self) -> ComposerOperationProgress:
         if self.phase in ("failed", "cancelled") and self.reason is None:
             raise ValueError("Failed/cancelled progress requires a reason")
         return self
 
 
-class ComposerOperationTerminalV2(_StrictResponse):
+class ComposerOperationTerminal(_StrictResponse):
     status: Literal["completed", "failed"]
     phase: Literal["settled"] = "settled"
     status_revision: int = Field(ge=0)
 
 
-class _ComposerOperationStreamFrameV2(_StrictResponse):
+class _ComposerOperationStreamFrame(_StrictResponse):
     session_id: str = Field(min_length=36, max_length=36)
     operation_id: str = Field(min_length=36, max_length=36)
     sequence: int = Field(ge=0)
@@ -885,41 +883,41 @@ class _ComposerOperationStreamFrameV2(_StrictResponse):
         return require_canonical_operation_id(value)
 
 
-class ComposerOperationStreamStatusFrameV2(_ComposerOperationStreamFrameV2):
+class ComposerOperationStreamStatusFrame(_ComposerOperationStreamFrame):
     event: Literal["status"] = "status"
-    payload: ComposerOperationStatusV2
+    payload: ComposerOperationStatusPayload
 
 
-class ComposerOperationStreamProgressFrameV2(_ComposerOperationStreamFrameV2):
+class ComposerOperationStreamProgressFrame(_ComposerOperationStreamFrame):
     event: Literal["progress"] = "progress"
-    payload: ComposerOperationProgressV2
+    payload: ComposerOperationProgress
 
 
-class ComposerOperationStreamHeartbeatFrameV2(_ComposerOperationStreamFrameV2):
+class ComposerOperationStreamHeartbeatFrame(_ComposerOperationStreamFrame):
     event: Literal["heartbeat"] = "heartbeat"
 
 
-class ComposerOperationStreamTerminalFrameV2(_ComposerOperationStreamFrameV2):
+class ComposerOperationStreamTerminalFrame(_ComposerOperationStreamFrame):
     event: Literal["terminal"] = "terminal"
-    payload: ComposerOperationTerminalV2
+    payload: ComposerOperationTerminal
 
 
-class ComposerOperationStreamReconnectFrameV2(_ComposerOperationStreamFrameV2):
+class ComposerOperationStreamReconnectFrame(_ComposerOperationStreamFrame):
     """The server is about to end a live stream (lifetime or draining); reconnect at once."""
 
     event: Literal["reconnect"] = "reconnect"
 
 
-type ComposerOperationStreamFrameV2 = (
-    ComposerOperationStreamStatusFrameV2
-    | ComposerOperationStreamProgressFrameV2
-    | ComposerOperationStreamHeartbeatFrameV2
-    | ComposerOperationStreamTerminalFrameV2
-    | ComposerOperationStreamReconnectFrameV2
+type ComposerOperationStreamFrame = (
+    ComposerOperationStreamStatusFrame
+    | ComposerOperationStreamProgressFrame
+    | ComposerOperationStreamHeartbeatFrame
+    | ComposerOperationStreamTerminalFrame
+    | ComposerOperationStreamReconnectFrame
 )
 
 
-def encode_composer_operation_stream_frame_v2(frame: ComposerOperationStreamFrameV2, *, event_id: int | None = None) -> bytes:
+def encode_composer_operation_stream_frame(frame: ComposerOperationStreamFrame, *, event_id: int | None = None) -> bytes:
     """Bound the actual UTF-8 SSE bytes.
 
     Status and terminal frames carry ``id: <status_revision>``; the caller

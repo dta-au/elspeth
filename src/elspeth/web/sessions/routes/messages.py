@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import Response
 
-from elspeth.web.sessions.schemas import ComposerOperationSnapshotV2
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
 from ._helpers import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
@@ -45,14 +45,14 @@ def _requests_audit_grade_messages_view(
 def register_message_routes(router: APIRouter) -> None:
     register_diagnostic_routes(router)
 
-    @router.post("/{session_id}/messages", response_model=ComposerOperationSnapshotV2, status_code=202)
+    @router.post("/{session_id}/messages", response_model=ComposerOperationSnapshot, status_code=202)
     async def send_message(
         session_id: UUID,
         request: Request,
         response: Response,
         user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         rate_limiter: Annotated[WebRateLimiter, Depends(get_rate_limiter)],
-    ) -> ComposerOperationSnapshotV2:
+    ) -> ComposerOperationSnapshot:
         body = await parse_message_body(request, session_id, user)
         return await admit(request, response, session_id, body, user, rate_limiter, "compose_message")
 

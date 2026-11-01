@@ -106,7 +106,7 @@ GRAMMARS = {
 }
 IMPORT_GRAMMAR = "3b442f921115a868c5b933f82f0681432b524512986f3ff1478cf65b97c2bc64"
 CONTINUATION_OWNER_GRAMMARS = {
-    "ComposerAsyncWorker._job_v2": "623b90091c8d508e154869a4d4af8dbaaf411f29ba73bec97c15cdd2a9a7e535",
+    "ComposerAsyncWorker._job": "623b90091c8d508e154869a4d4af8dbaaf411f29ba73bec97c15cdd2a9a7e535",
     "ContinuationLeaseAdoption": "6c853b51d24a4cc2d73d8adc70fa44567b25eb671141e558a2cf08b0f5c7c87f",
 }
 
@@ -189,16 +189,16 @@ def continuation_start_owner_contract(units):
         return ["worker continuation start: lifecycle source owner missing"], None
     worker, lifecycle = index[WORKER], index[LIFECYCLE]
     worker_class, _ = find(worker.tree, "ComposerAsyncWorker")
-    method, owners = find(worker.tree, "ComposerAsyncWorker._job_v2")
+    method, owners = find(worker.tree, "ComposerAsyncWorker._job")
     adoption, _ = find(lifecycle.tree, "ContinuationLeaseAdoption")
     if (
         not isinstance(method, ast.AsyncFunctionDef)
         or not isinstance(adoption, ast.ClassDef)
-        or grammar(method) != CONTINUATION_OWNER_GRAMMARS["ComposerAsyncWorker._job_v2"]
+        or grammar(method) != CONTINUATION_OWNER_GRAMMARS["ComposerAsyncWorker._job"]
         or grammar(adoption) != CONTINUATION_OWNER_GRAMMARS["ContinuationLeaseAdoption"]
     ):
         return ["worker continuation start: complete original start/adoption source changed"], None
-    expected_header = ast.parse("async def _job_v2(self, claim: ComposerOperationClaim) -> None:\n    pass").body[0]
+    expected_header = ast.parse("async def _job(self, claim: ComposerOperationClaim) -> None:\n    pass").body[0]
     if (
         method.decorator_list
         or method.type_params

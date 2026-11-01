@@ -7187,9 +7187,8 @@ class SessionServiceImpl:
                 prior = None
                 reviewed_state = state
                 if target_id is not None:
-                    # Graph eligibility remains independent of legacy gate or
-                    # validation decoding. A damaged old metadata envelope must
-                    # not prevent the existing graph-only recovery path.
+                    # Graph eligibility remains independent of validation
+                    # decoding; the gate metadata below is not.
                     try:
                         reviewed_state = read_editable_checkpoint(conn, session_id, target_id)
                     except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
@@ -7197,17 +7196,20 @@ class SessionServiceImpl:
                         # unreadable current target. A new authoritative fact,
                         # if present, still has to match below or fail closed.
                         reviewed_state = state
-                    legacy_meta = conn.execute(
+                    target_meta = conn.execute(
                         select(composition_states_table.c.composer_meta).where(
                             composition_states_table.c.id == str(target_id), composition_states_table.c.session_id == sid
                         )
                     ).scalar_one()
+                    # Every stored gate envelope comes from a current writer, so
+                    # damage is Tier-1 corruption. ``unwrap_state_column``
+                    # raises AuditIntegrityError itself; ``parse_completion_gates``
+                    # raises ValueError for a malformed envelope.
                     try:
-                        prior = parse_completion_gates(self._unwrap_envelope(legacy_meta))
-                    except (ValueError, TypeError, KeyError, RecursionError, AuditIntegrityError):
-                        prior = None
-                # This validation is outside the legacy damage handler. New
-                # fact corruption/custody loss is an integrity refusal, never
+                        prior = parse_completion_gates(self._unwrap_envelope(target_meta))
+                    except ValueError as exc:
+                        raise AuditIntegrityError("graph recovery target has malformed completion-gate metadata") from exc
+                # Fact corruption or custody loss is an integrity refusal, never
                 # silently treated as an absent review or a safe checkpoint.
                 review = self._graph_review_for_base_on_connection(
                     conn, session_id=session_id, state_id=target_id, read_state=lambda: reviewed_state

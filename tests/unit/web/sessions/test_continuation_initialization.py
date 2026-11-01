@@ -26,7 +26,7 @@ from elspeth.web.sessions import continuation_bootstrap_source as sql_owner
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationFenceLost,
     ComposerOperationRunning,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.continuation import ContinuationCASConflict
 from elspeth.web.sessions.models import chat_messages_table as messages
@@ -109,7 +109,7 @@ async def bootstrap_case(store, *, eligible=True, bound_base=False):
         operation_id=request.operation_id,
         kind="compose_message",
         request_json=request.model_dump_json(),
-        request_hash=composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request),
+        request_hash=composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request),
         base_state_id=request.state_id,
         policy_hash=policy.policy_hash,
         admission_policy_json=policy.model_dump_json(),

@@ -2305,7 +2305,7 @@ def test_authority_conditional_callee_refuses_seal_and_original_dispatch_after_d
         "            or (\n"
         "                composer_operation_request_hash(session_id=session_id, kind=kind, request=request)\n"
         "                if lifecycle_version == 1\n"
-        "                else composer_operation_v2_request_hash(session_id=session_id, kind=kind, request=request)\n"
+        "                else composer_operation_admission_request_hash(session_id=session_id, kind=kind, request=request)\n"
         "            )\n"
         "            != request_hash\n"
         "        ):\n"
@@ -2315,7 +2315,7 @@ def test_authority_conditional_callee_refuses_seal_and_original_dispatch_after_d
         "        if (\n"
         "            request.operation_id != operation_id\n"
         "            or request.state_id != base_state_id\n"
-        "            or (composer_operation_request_hash if lifecycle_version == 1 else composer_operation_v2_request_hash)(\n"
+        "            or (composer_operation_request_hash if lifecycle_version == 1 else composer_operation_admission_request_hash)(\n"
         "                session_id=session_id, kind=kind, request=request\n"
         "            )\n"
         "            != request_hash\n"
@@ -10229,7 +10229,7 @@ def test_receiving_started_owner_keeps_exact_custody_after_body_rebind(monkeypat
             ]
             call.args[0].attr = "LEASE_RELEASE"
             return
-        owner = fencing._reserve_node_at(unit, "ComposerAsyncWorker._job_v2")
+        owner = fencing._reserve_node_at(unit, "ComposerAsyncWorker._job")
         if fault == "retained":
             (stored,) = [
                 node
@@ -10254,7 +10254,7 @@ def test_receiving_started_owner_keeps_exact_custody_after_body_rebind(monkeypat
 
     mutated = _receiving_changed_units(units, path, change)
     changed = next(unit for unit in mutated if unit.path == path)
-    symbol = "ContinuationLeaseAdoption" if fault == "lease_source" else "ComposerAsyncWorker._job_v2"
+    symbol = "ContinuationLeaseAdoption" if fault == "lease_source" else "ComposerAsyncWorker._job"
     declaration = fencing._reserve_node_at(changed, symbol)
     with monkeypatch.context() as patch:
         patch.setitem(worker_six.CONTINUATION_OWNER_GRAMMARS, symbol, worker_six.grammar(declaration))

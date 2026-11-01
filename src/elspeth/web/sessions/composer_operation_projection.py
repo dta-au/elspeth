@@ -28,10 +28,10 @@ from elspeth.web.sessions.models import composer_async_operations_table as jobs
 from elspeth.web.sessions.models import composer_operation_segments_table as segments
 from elspeth.web.sessions.schemas import (
     ComposerActiveOperationResponse,
-    ComposerOperationPhaseV2,
-    ComposerOperationSegmentV2,
-    ComposerOperationSnapshotV2,
-    ComposerOperationStatusV2,
+    ComposerOperationPhase,
+    ComposerOperationSegment,
+    ComposerOperationSnapshot,
+    ComposerOperationStatusPayload,
     MessageWithStateResponse,
 )
 from elspeth.web.sessions.time_normalization import restore_utc
@@ -43,13 +43,13 @@ class _StatusFields(TypedDict):
     operation_id: str
     kind: ComposerOperationKind
     status: ComposerOperationStatus
-    phase: ComposerOperationPhaseV2
+    phase: ComposerOperationPhase
     status_revision: int
     created_at: datetime
     observed_at: datetime
     poll_after_ms: int
     cancel_requested: bool
-    segment: ComposerOperationSegmentV2 | None
+    segment: ComposerOperationSegment | None
 
 
 class ComposerOperationProjectionUnstable(Exception):
@@ -59,7 +59,7 @@ class ComposerOperationProjectionUnstable(Exception):
 @dataclass(frozen=True, slots=True)
 class ComposerOperationProjectionInputs:
     record: ComposerOperationRecord | None
-    segment: ComposerOperationSegmentV2 | None
+    segment: ComposerOperationSegment | None
     database_now: datetime
 
 
@@ -75,7 +75,7 @@ def _read_segment_row(engine: Engine, *, session_id: UUID, operation_id: str, se
         ).one_or_none()
 
 
-def _live_segment(row: Row[Any] | None, *, sequence: int, generation: int) -> ComposerOperationSegmentV2:
+def _live_segment(row: Row[Any] | None, *, sequence: int, generation: int) -> ComposerOperationSegment:
     if row is None:
         raise AuditIntegrityError("Live v2 parent points at a segment that does not exist")
     state: Literal["queued", "running", "interrupted"]
@@ -89,14 +89,14 @@ def _live_segment(row: Row[Any] | None, *, sequence: int, generation: int) -> Co
         case _:
             raise AuditIntegrityError("Live v2 parent points at a segment that is not live")
     deadline = restore_utc(row.deadline_at) if state == "running" and row.deadline_at is not None else None
-    return ComposerOperationSegmentV2(sequence=sequence, generation=generation, state=state, deadline_at=deadline)
+    return ComposerOperationSegment(sequence=sequence, generation=generation, state=state, deadline_at=deadline)
 
 
 def _identity(record: ComposerOperationRecord) -> tuple[object, ...]:
     return (record.status, record.status_revision, record.current_segment_sequence, record.ownership_generation)
 
 
-def read_v2_projection_inputs(
+def read_projection_inputs(
     authority: ComposerAsyncOperationAuthority, engine: Engine, *, session_id: UUID, operation_id: str
 ) -> ComposerOperationProjectionInputs:
     """Return a consistent parent, current segment and database time.
@@ -140,11 +140,11 @@ def _status_fields(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: 
     )
 
 
-def project_v2_status(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: int) -> ComposerOperationStatusV2:
-    return ComposerOperationStatusV2(**_status_fields(inputs, poll_after_ms=poll_after_ms))
+def project_operation_status(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: int) -> ComposerOperationStatusPayload:
+    return ComposerOperationStatusPayload(**_status_fields(inputs, poll_after_ms=poll_after_ms))
 
 
-def project_v2_snapshot(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: int) -> ComposerOperationSnapshotV2:
+def project_operation_snapshot(inputs: ComposerOperationProjectionInputs, *, poll_after_ms: int) -> ComposerOperationSnapshot:
     fields = _status_fields(inputs, poll_after_ms=poll_after_ms)
     record = inputs.record
     if record is None:
@@ -158,7 +158,7 @@ def project_v2_snapshot(inputs: ComposerOperationProjectionInputs, *, poll_after
             result = MessageWithStateResponse.model_validate_json(record.result_json, strict=True)
         else:
             error = ComposerOperationError.model_validate_json(record.result_json, strict=True)
-    return ComposerOperationSnapshotV2(**fields, result=result, error=error)
+    return ComposerOperationSnapshot(**fields, result=result, error=error)
 
 
 def read_active_operation(engine: Engine, *, session_id: UUID, actor_user_id: str) -> ComposerActiveOperationResponse | None:

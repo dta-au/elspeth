@@ -218,7 +218,7 @@ def composer_operation_request_hash(*, session_id: UUID, kind: ComposerOperation
     return session_operation_request_hash(schema=COMPOSER_OPERATION_REQUEST_SCHEMA, session_id=session_id, kind=kind, request=request)
 
 
-def composer_operation_v2_request_hash(*, session_id: UUID, kind: ComposerOperationKind, request: BaseModel) -> str:
+def composer_operation_admission_request_hash(*, session_id: UUID, kind: ComposerOperationKind, request: BaseModel) -> str:
     old_hash = composer_operation_request_hash(session_id=session_id, kind=kind, request=request)
     return stable_hash({"schema": "composer-operation-request.v2", "lifecycle_version": 2, "v1_request_hash": old_hash})
 
@@ -392,7 +392,10 @@ class ComposerOperationRecord:
                     raise ValueError("request identity/base mismatch")
                 if isinstance(request, RecomposeRequest) and request.expected_user_message_id != self.reserved_user_message_id:
                     raise ValueError("recompose request changed reserved original message")
-                if composer_operation_v2_request_hash(session_id=self.session_id, kind=self.kind, request=request) != self.request_hash:
+                if (
+                    composer_operation_admission_request_hash(session_id=self.session_id, kind=self.kind, request=request)
+                    != self.request_hash
+                ):
                     raise ValueError("request digest mismatch")
             return
         if self.phase != "settled" or self.request_json is not None or self.settled_at is None:

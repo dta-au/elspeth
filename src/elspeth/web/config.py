@@ -382,9 +382,9 @@ class WebSettings(BaseModel):
         ge=1,
         le=262_144,
         description=(
-            "Maximum complete-original bytes inspected by each current V2 attachment read, before paging. "
+            "Maximum complete-original bytes inspected by each current Continuation attachment read, before paging. "
             "Operators may tighten the existing inspection ceiling; independent response and credential limits still apply. "
-            "This setting does not configure V1 or direct-tool attachment reads."
+            "This setting does not configure direct-tool attachment reads."
         ),
     )
     composer_timeout_seconds: float = Field(..., gt=0)

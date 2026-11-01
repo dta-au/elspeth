@@ -53,7 +53,7 @@ from elspeth.web.azure_container_apps_acceptance import (
     _SqlAlchemyReader,
     acceptance_error_envelope,
 )
-from elspeth.web.sessions.schemas import ComposerOperationSnapshotV2
+from elspeth.web.sessions.schemas import ComposerOperationSnapshot
 
 _FENCE_SQL = (
     "SELECT owner_instance_id, lease_expires_at FROM session_operation_fences "
@@ -326,14 +326,14 @@ def _fresh_message_visibility(
     )
     if written.response.status != 202 or written.response.instance_id != owner_id or written.response.operation_id != operation_id:
         raise AcceptanceCheckError("probe_message_write")
-    terminal: ComposerOperationSnapshotV2 | None = None
+    terminal: ComposerOperationSnapshot | None = None
     completed_at: float | None = None
     operation_poll_deadline: float | None = None
 
     def completed() -> bool:
         nonlocal terminal, completed_at, operation_poll_deadline
         observed = _exchange(owner, "a", f"/api/sessions/{session_id}/operations/{operation_id}", capture, clock=polling.clock)
-        terminal = ComposerOperationSnapshotV2.model_validate_json(json.dumps(observed.body))
+        terminal = ComposerOperationSnapshot.model_validate_json(json.dumps(observed.body))
         if observed.response.instance_id != owner_id or terminal.operation_id != operation_id:
             raise AcceptanceCheckError("probe_operation_identity")
         if operation_poll_deadline is None:

@@ -44,7 +44,7 @@ from elspeth.web.sessions.composer_operations import (
     ComposerOperationError,
     ComposerOperationFenceLost,
     ComposerOperationRunning,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.continuation_events import CONTINUATION_EVENT_TAGS, ContinuationEventTag
 from elspeth.web.sessions.converters import state_from_record
@@ -1744,7 +1744,7 @@ def _select_segment_start_on_connection(
     if (
         request.operation_id != claim.operation_id
         or (str(request.state_id) if request.state_id is not None else None) != parent.base_state_id
-        or composer_operation_v2_request_hash(session_id=claim.session_id, kind=parent.kind, request=request) != parent.request_hash
+        or composer_operation_admission_request_hash(session_id=claim.session_id, kind=parent.kind, request=request) != parent.request_hash
         or (
             logical.session_id,
             logical.operation_id,

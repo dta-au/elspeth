@@ -20,7 +20,7 @@ from elspeth.web.composer.continuation import ContinuationFrameStack, Initialize
 from elspeth.web.composer.continuation_bootstrap import _canonical_records_json
 from elspeth.web.composer.continuation_codec import decode_continuation_snapshot, encode_continuation_snapshot
 from elspeth.web.sessions.chat_message_decoder import chat_message_record_from_row
-from elspeth.web.sessions.composer_operations import ComposerOperationRunning, composer_operation_v2_request_hash
+from elspeth.web.sessions.composer_operations import ComposerOperationRunning, composer_operation_admission_request_hash
 from elspeth.web.sessions.continuation import (
     ContinuationEvent,
     StoredContinuationSnapshot,
@@ -233,7 +233,7 @@ def _read_ingress_values_with_source_on_connection(
         or request.operation_id != operation
         or frame.request_json != parent.request_json
         or request.content != content
-        or composer_operation_v2_request_hash(session_id=running.claim.session_id, kind="compose_message", request=request)
+        or composer_operation_admission_request_hash(session_id=running.claim.session_id, kind="compose_message", request=request)
         != parent.request_hash
         or (
             root.logical.session_id,

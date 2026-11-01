@@ -250,7 +250,7 @@ class ComposerAsyncWorker:
             if key in self._jobs:
                 raise AuditIntegrityError("Composer claim duplicates locally owned work")
             self._local_cancels[key] = asyncio.Event()
-            task = asyncio.create_task(self._job_v2(claim), name="composer-operation")
+            task = asyncio.create_task(self._job(claim), name="composer-operation")
             self._jobs[key] = task
             task.add_done_callback(partial(self._job_finished, key))
             admitted += 1
@@ -339,7 +339,7 @@ class ComposerAsyncWorker:
         # drain-admitted submission (U-37; container-grace note R2).
         await _owned(run_claim_release_in_worker(QueuedClaimRelease(self._authority.release_claim, claim)))
 
-    async def _job_v2(self, claim: ComposerOperationClaim) -> None:
+    async def _job(self, claim: ComposerOperationClaim) -> None:
         services = composer_app_services(self._app)
         lock = await services.compose_locks.get_lock(str(claim.session_id))
         acquired = False

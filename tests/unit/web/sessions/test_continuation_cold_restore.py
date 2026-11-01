@@ -13,7 +13,7 @@ from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
 from elspeth.web.sessions.composer_operations import (
     ComposerOperationFenceLost,
     ComposerOperationRunning,
-    composer_operation_v2_request_hash,
+    composer_operation_admission_request_hash,
 )
 from elspeth.web.sessions.continuation import ContinuationCASConflict, load_snapshot
 from elspeth.web.sessions.models import sessions_table
@@ -28,7 +28,7 @@ operation_store = test_composer_operation_authority.operation_store
 def admit_continuation(store):
     engine, _repository, authority, _service, sid = store
     request = SendMessageRequest(operation_id=str(uuid4()), content="Preserve café and exact context")
-    request_hash = composer_operation_v2_request_hash(session_id=sid, kind="compose_message", request=request)
+    request_hash = composer_operation_admission_request_hash(session_id=sid, kind="compose_message", request=request)
     policy = minimal_continuation_policy()
     action = policy.actions.session_sql
     with engine.connect() as conn:
