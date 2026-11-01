@@ -123,24 +123,7 @@ LOCAL_SUPPLIER_SPECS = (
     ),
 )
 
-# Raw source-segment bindings for the parent-owned existing receipt only.
 # New local contracts below use the portable canonical AST serializer.
-CHANGED_BODY_SOURCE_SHA256 = {
-    "_joint": "92bad4904e369227e1fabc39e737ad61ffe02435d12b13d50255bd47b861af8c",
-    "_members": "62b565b238d533c6135eb777eb883e35ae5da638eb632e9c10f3207ec7de65fe",
-    "_construct": "9531f31f1f7414c2143974c855b00f2e6292b2212f20c47c6e17e58fe8b46888",
-    "_encode": "5ab65db4cecdbf7d4c92c9e37383f654b6ba5dd1addeb3c883f48a41e3c13f4b",
-    "_decode_graph": "2c6d5266a828ed6233231a25d5205562945e5e63a2f009fb72ec55220c8a4031",
-    "_check_prepared": "60da77a6668297af64a8020020f6b04abed39bc906667c233a3a0b679bfceb16",
-}
-NEW_BODY_SOURCE_SHA256 = {
-    "RestoredMemoryCompletionBatchData": "01dc03518187f6a5712e33c12df44e0eaa31383d3d220829d2357e83ed7e41e7",
-    "_check_memory_completion": "cd49546d331d4142f49089d9d4205b50c1e217155333066bb83ccc064eff58f4",
-    "encode_memory_completion_batch_data": "aa5c855e28a09cff112c713f9c605334c657e129cbb80a53df49f6315ae5adfe",
-    "encode_restored_memory_completion_batch_data": "769c23680df32481b754f99ea96a93ee455f731b53aa60899eba09544db10c35",
-    "decode_memory_completion_batch_data": "f51b9ae5d435a72da5e8cd5b0ca2ca23f47db97520a9d0a7290f05c6b1e08560",
-    "require_selected_memory_completion": "76004736f9ddf9608e0867330ff332ec11dfc8c9ec1eab6cfdea98dd2c55029c",
-}
 ADDITIONAL_BATCH_ROLES = frozenset(
     {
         ("RestoredMemoryCompletionBatchData", "annotation", "ContinuationBatchState"),
