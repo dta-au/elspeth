@@ -96,11 +96,32 @@ describe("one durable operation observer", () => {
     const bodies = vi.mocked(api.submitComposerOperation).mock.calls.map(([submission]) => submission.body); expect(bodies[1]).toEqual(bodies[0]);
   });
   it("Stop requests cancel and still waits for the durable terminal", async () => {
-    vi.useFakeTimers(); vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce(snapshot("running")).mockResolvedValue(snapshot());
-    const observing = submitAndObserveComposerOperation(descriptor()); await vi.advanceTimersByTimeAsync(0); cancelObservedComposerOperation(sid);
-    expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
-    await vi.advanceTimersByTimeAsync(1000); const result = await observing;
-    expect(api.cancelComposerOperation).toHaveBeenCalledWith(sid, id); expect(result.message.content).toBe("done");
+    vi.useFakeTimers();
+    const running = snapshot("running");
+    // Stop advances the real parent's revision; an earlier constructed mock
+    // acknowledgement must not masquerade as a response to this later state.
+    const stopped = { ...running, status_revision: running.status_revision + 1, cancel_requested: true };
+    const terminal = { ...snapshot(), status_revision: stopped.status_revision + 1, cancel_requested: true };
+    let releaseTerminal!: (value: ComposerOperationSnapshot) => void;
+    const retainedTerminal = new Promise<ComposerOperationSnapshot>((resolve) => { releaseTerminal = resolve; });
+    vi.mocked(api.cancelComposerOperation).mockResolvedValue(stopped);
+    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce(running).mockReturnValue(retainedTerminal);
+    let settled = false;
+    const observing = submitAndObserveComposerOperation(descriptor()).then((value) => { settled = true; return value; });
+    const caught = observing.catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cancelObservedComposerOperation(sid)).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(api.cancelComposerOperation).toHaveBeenCalledWith(sid, id);
+      expect(settled, "Stop acknowledgement cannot replace the durable terminal GET").toBe(false);
+      expect(findComposerOperationCustody(scope, sid).foreground?.operationId).toBe(id);
+      expect(api.fetchComposerOperation).toHaveBeenCalledTimes(2);
+      releaseTerminal(terminal);
+      await vi.advanceTimersByTimeAsync(0);
+      expect((await observing).message.content).toBe("done");
+      expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    } finally { detachComposerObservers(sid); releaseTerminal(terminal); await vi.advanceTimersByTimeAsync(0); await caught; }
   });
   it("an observation deadline detaches and preserves submitted custody without cancel", async () => {
     const controller = new AbortController();

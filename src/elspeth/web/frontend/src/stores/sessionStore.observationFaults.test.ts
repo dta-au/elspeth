@@ -56,6 +56,40 @@ beforeEach(() => {
 afterEach(async () => { detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); vi.useRealTimers(); purgeComposerCustody(); vi.restoreAllMocks(); });
 
 describe("R real observer-to-store disposition", () => {
+  it("keeps an actual interruption-state subscriber failure pending under the real observer", async () => {
+    const diagnostics = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const privateCause = new Error("PRIVATE_INTERRUPTION_CALLBACK_SENTINEL");
+    let callbackRan = false;
+    const unsubscribe = useSessionStore.subscribe((state) => {
+      if (callbackRan || !state.composerLiveUpdatesInterrupted) return;
+      callbackRan = true;
+      throw privateCause;
+    });
+    vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new TypeError("stream unavailable"));
+    const sending = useSessionStore.getState().sendMessage("hello");
+    const held = findComposerOperationCustody(scope, sid).foreground;
+    try {
+      expect(held).not.toBeNull();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(callbackRan).toBe(true);
+      expect(useSessionStore.getState().error).toBe(notice);
+      expect(useSessionStore.getState().errorDetails).toBeNull();
+      expect(useSessionStore.getState().isComposing).toBe(true);
+      expect(useSessionStore.getState().messages).toEqual([expect.objectContaining({ role: "user", content: "hello", local_status: "pending", local_error: undefined })]);
+      expect(useSessionStore.getState().composerFailureOutcomes).toBe(history);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(held);
+      expect(diagnostics.mock.calls).toEqual([["progress_callback_failed"]]);
+      expect(JSON.stringify({ error: useSessionStore.getState().error, details: useSessionStore.getState().errorDetails, messages: useSessionStore.getState().messages, diagnostics: diagnostics.mock.calls })).not.toContain("PRIVATE_INTERRUPTION_CALLBACK_SENTINEL");
+      await vi.advanceTimersByTimeAsync(180000);
+      expect(api.submitComposerOperation).toHaveBeenCalledOnce();
+      expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(2);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      expect(api.cancelComposerOperation).not.toHaveBeenCalled();
+      expect(api.fetchComposerOperationFailures).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { unsubscribe(); detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); await sending; }
+  });
+
   it.each([false, true] as const)("keeps the actual callback fault pending (custody notice %s)", async (withRecoveryNotice) => {
     const diagnostics = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const privateCause = new Error("PRIVATE_CALLBACK_CAUSE_SENTINEL");

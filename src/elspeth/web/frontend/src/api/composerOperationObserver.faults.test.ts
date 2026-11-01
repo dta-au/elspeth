@@ -144,6 +144,67 @@ describe("R F2 Stop status callback ownership", () => {
   });
 });
 
+describe("G6 Stop and interruption callback ownership", () => {
+  describe.each([
+    "stream Stop acknowledgement", "GET Stop acknowledgement", "Stop response acknowledgement", "terminal Stop response",
+    "Stop retry", "Stop-unavailable acknowledgement", "Stop-unavailable notice", "healthy reconnect", "terminal hint", "repeated stream failure",
+  ] as const)("%s", (route) => {
+    it.each(callbackValues)("retains exact callback-thrown %s and pending operation custody", async (_label, thrownValue) => {
+      const held = acquireComposerOperationCustody(descriptor());
+      const callback = vi.fn(() => { throw thrownValue; });
+      const stopped = { ...snapshot("running"), cancel_requested: true };
+      let wire: ReturnType<typeof stream> | undefined;
+      if (route === "stream Stop acknowledgement") {
+        wire = stream(sse({ ...statusFrame(), payload: { ...status(), cancel_requested: true } }, 4));
+        vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(wire.response);
+      } else if (route === "GET Stop acknowledgement") {
+        vi.mocked(api.fetchComposerOperation).mockResolvedValue(stopped);
+      } else if (route === "healthy reconnect") {
+        wire = stream(sse({ session_id: sid, operation_id: id, sequence: 0, event: "reconnect" }));
+        vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(wire.response);
+      } else if (route === "terminal hint") {
+        wire = stream(sse({ session_id: sid, operation_id: id, sequence: 0, event: "terminal", payload: { status: "completed", phase: "settled", status_revision: 9 } }, 9));
+        vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(wire.response);
+      } else if (route === "repeated stream failure") {
+        vi.mocked(api.fetchComposerOperationStream).mockRejectedValue(new TypeError("network failed"));
+      } else {
+        requestComposerStop(held);
+        if (route === "Stop response acknowledgement") vi.mocked(api.cancelComposerOperation).mockResolvedValue(stopped);
+        else if (route === "terminal Stop response") vi.mocked(api.cancelComposerOperation).mockResolvedValue(snapshot());
+        else if (route === "Stop retry") vi.mocked(api.cancelComposerOperation).mockRejectedValue(new TypeError("Stop network failed"));
+        else vi.mocked(api.cancelComposerOperation).mockRejectedValue({ status: 409, error_type: "composer_continuation_stop_unavailable" });
+      }
+      const options = route === "Stop-unavailable notice" ? { stopUnavailable: callback }
+        : route === "healthy reconnect" || route === "terminal hint" || route === "repeated stream failure" ? { interrupted: callback }
+          : { stopUnconfirmed: callback };
+      let settled = false;
+      const observing = observer.observeComposerOperation(held, options).catch((error: unknown) => error)
+        .then((value: unknown) => { settled = true; return value; });
+      try {
+        await vi.advanceTimersByTimeAsync(route === "repeated stream failure" ? 1000 : 0);
+        expect(callback).toHaveBeenCalledTimes(1);
+        expect(settled, "application callback failure must escape before any transport recovery").toBe(true);
+        expect(ownedFault(await observing, "progress_callback_failed").value).toBe(thrownValue);
+        expect(findComposerOperationCustody(scope, sid).foreground).toBe(held);
+        expect(composerStopRequested(held)).toBe(route.startsWith("Stop response") || route === "terminal Stop response" || route === "Stop retry");
+        const expectedReads = route === "GET Stop acknowledgement" ? 1 : 0;
+        const expectedStops = route.startsWith("Stop response") || route === "terminal Stop response" || route === "Stop retry" || route.startsWith("Stop-unavailable") ? 1 : 0;
+        expect(api.fetchComposerOperation).toHaveBeenCalledTimes(expectedReads);
+        expect(api.cancelComposerOperation).toHaveBeenCalledTimes(expectedStops);
+        if (wire !== undefined) {
+          expect(wire.cancel).toHaveBeenCalledTimes(1);
+          expect(wire.body.locked).toBe(false);
+        }
+        await vi.advanceTimersByTimeAsync(180000);
+        expect(api.fetchComposerOperation).toHaveBeenCalledTimes(expectedReads);
+        expect(api.cancelComposerOperation).toHaveBeenCalledTimes(expectedStops);
+        expect(api.submitComposerOperation).not.toHaveBeenCalled();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { observer.detachComposerObservers(); await vi.advanceTimersByTimeAsync(0); await observing; }
+    });
+  });
+});
+
 describe("R F3 bound relationship ownership", () => {
   it.each([
     ["ack", "queued", "ack_identity_mismatch", "Composer acknowledgement identity mismatch"],

@@ -27,6 +27,15 @@ function sse(...frames: string[]): Response {
 function openSse(signal: AbortSignal, ...frames: string[]): Response {
   return new Response(new ReadableStream({ start(controller) { for (const item of frames) controller.enqueue(new TextEncoder().encode(item)); signal.addEventListener("abort", () => controller.error(new Error("aborted"))); } }), { headers: { "Content-Type": "text/event-stream" } });
 }
+function controlledSse(signal: AbortSignal, ...frames: string[]) {
+  let enqueue!: (item: string) => void;
+  const response = new Response(new ReadableStream<Uint8Array>({ start(controller) {
+    enqueue = (item) => controller.enqueue(new TextEncoder().encode(item));
+    for (const item of frames) enqueue(item);
+    signal.addEventListener("abort", () => controller.error(new Error("aborted")));
+  } }), { headers: { "Content-Type": "text/event-stream" } });
+  return { response, enqueue: (item: string) => enqueue(item) };
+}
 function observer(): OperationCustody {
   const submitted: SubmittedCustody = { mode: "submitted", scope, sessionId: sid, operationId: mine, kind: "compose_message", createdAt: Date.now(), body: { operation_id: mine, content: "x", state_id: null } };
   return attachComposerObserver(acquireComposerOperationCustody(submitted), id, "compose_message", false);
@@ -166,5 +175,208 @@ describe("U-42 review regressions", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await expect(observing).resolves.toBe(done.result);
     expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("G6 accepted-state decisions", () => {
+  it.each(["completed", "failed"] as const)("ignores a lower-revision %s status without closing the stream or dropping progress", async (terminalStatus) => {
+    vi.useFakeTimers();
+    const descriptor = observer(), progress = vi.fn(), interrupted = vi.fn(), accepted = vi.fn();
+    const stale = status(9, { status: terminalStatus, phase: "settled", segment: null });
+    const progressPayload = { request_id: null, phase: "calling_model", headline: "Still working", evidence: [], likely_next: null, reason: null, updated_at: iso(), segment_sequence: 1, segment_generation: 1 };
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal,
+      frame("status", 0, status(10), 10), frame("status", 1, stale, 9), frame("progress", 2, progressPayload)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...done, status_revision: 11 });
+    const controller = new AbortController();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, progress, interrupted, status: accepted }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(accepted.mock.calls.map(([value]) => value.status_revision)).toEqual([10]);
+      expect(progress).toHaveBeenCalledOnce();
+      expect(progress).toHaveBeenCalledWith(expect.objectContaining({ headline: "Still working" }));
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      expect(interrupted).not.toHaveBeenCalled();
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it.each([
+    ["lower", "completed"], ["lower", "failed"], ["equal-conflicting", "completed"], ["equal-conflicting", "failed"],
+  ] as const)("does not seal a %s %s GET", async (revisionKind, terminalStatus) => {
+    vi.useFakeTimers();
+    const descriptor = observer(), accepted = vi.fn();
+    const revision = revisionKind === "lower" ? 9 : 10;
+    const rejected: ComposerOperationSnapshot = terminalStatus === "completed" ? { ...done, status_revision: revision } : {
+      ...status(revision, { status: "failed", phase: "settled", segment: null }), result: null,
+      error: { http_status: 500, body: { detail: "Rejected old failure" }, error_type: null, failure_code: "operation_failed", diagnostic_id: null },
+    };
+    const terminal = { ...done, status_revision: 12 };
+    vi.mocked(api.apiErrorFromBody).mockReturnValue({ status: 500, detail: "Rejected old failure" });
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async () => sse(
+      frame("status", 0, status(10), 10), frame("terminal", 1, { status: "completed", phase: "settled", status_revision: 11 }, 11)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValueOnce(rejected).mockResolvedValue(terminal);
+    let settled = false;
+    const controller = new AbortController();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, status: accepted }).catch((error: unknown) => error)
+      .then((value: unknown) => { settled = true; return value; });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled, "a rejected GET is not a sealed terminal").toBe(false);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+      expect(api.apiErrorFromBody).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await observing).toBe(terminal.result);
+      expect(accepted.mock.calls.map(([value]) => value.status_revision)).toEqual([10, 12]);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("seals an equal-identical terminal GET after its status was already accepted from SSE", async () => {
+    const descriptor = observer(), accepted = vi.fn();
+    vi.mocked(api.fetchComposerOperationStream).mockResolvedValue(sse(frame("status", 0, status(9, { status: "completed", phase: "settled", segment: null }), 9)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(done);
+    expect(await observeComposerOperation(descriptor, { status: accepted })).toBe(done.result);
+    expect(accepted).toHaveBeenCalledOnce();
+    expect(findComposerOperationCustody(scope, sid).foreground).toBeNull();
+  });
+
+  it.each(["lower", "equal-conflicting"] as const)("keeps retrying Stop after a %s apparent acknowledgement", async (revisionKind) => {
+    vi.useFakeTimers();
+    const descriptor = observer(), accepted = vi.fn((value: ComposerOperationStatus) => {
+      if (value.status_revision === 10) requestComposerStop(descriptor);
+    });
+    vi.mocked(api.cancelComposerOperation).mockResolvedValueOnce({ ...live(revisionKind === "lower" ? 9 : 10), cancel_requested: true })
+      .mockResolvedValue({ ...live(11), cancel_requested: true });
+    vi.mocked(api.fetchComposerOperationStream).mockImplementationOnce(async () => sse(frame("status", 0, status(10), 10), frame("reconnect", 1)))
+      .mockImplementation(async (_s, _o, signal) => openSse(signal));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(live(10));
+    const controller = new AbortController();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, status: accepted }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(api.cancelComposerOperation).toHaveBeenCalledOnce();
+      expect(composerStopRequested(descriptor)).toBe(true);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(api.cancelComposerOperation).toHaveBeenCalledTimes(2);
+      expect(accepted.mock.calls.map(([value]) => value.status_revision)).toEqual([10, 11]);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("ignores an older standalone terminal hint without claiming stream health", async () => {
+    vi.useFakeTimers();
+    const descriptor = observer(), interrupted = vi.fn();
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal,
+      frame("status", 0, status(10), 10), frame("terminal", 1, { status: "completed", phase: "settled", status_revision: 9 }, 9)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue(done);
+    const controller = new AbortController();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, interrupted }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      expect(interrupted).not.toHaveBeenCalled();
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("uses GET recovery for an equal-conflicting terminal hint without reporting terminal stream health", async () => {
+    vi.useFakeTimers();
+    const descriptor = observer(), interrupted = vi.fn();
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal,
+      frame("status", 0, status(10), 10), frame("terminal", 1, { status: "completed", phase: "settled", status_revision: 10 }, 10)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...done, status_revision: 11 });
+    const controller = new AbortController();
+    const observing = observeComposerOperation(descriptor, { signal: controller.signal, interrupted }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(interrupted).not.toHaveBeenCalledWith(false);
+      expect(findComposerOperationCustody(scope, sid).foreground).toBe(descriptor);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await observing).toBe(done.result);
+      expect(api.fetchComposerOperationStream).toHaveBeenCalledOnce();
+      expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+});
+
+describe("G6 accepted deadline ownership", () => {
+  it("ignores a rejected expired deadline while retaining the accepted deadline", async () => {
+    vi.useFakeTimers();
+    const accepted = status(10, { segment: { sequence: 1, generation: 1, state: "running", deadline_at: new Date(Date.now() + 10000).toISOString() } });
+    const stale = status(9, { segment: { sequence: 2, generation: 1, state: "running", deadline_at: new Date(Date.now() - 1000).toISOString() } });
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal, frame("status", 0, accepted, 10), frame("status", 1, stale, 9)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...accepted, result: null, error: null });
+    const controller = new AbortController(), observing = observeComposerOperation(observer(), { signal: controller.signal }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("does not postpone the accepted deadline using a duplicate observation timestamp", async () => {
+    vi.useFakeTimers();
+    const accepted = status(10, { segment: { sequence: 1, generation: 1, state: "running", deadline_at: new Date(Date.now() + 10000).toISOString() } });
+    let connection!: ReturnType<typeof controlledSse>;
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => {
+      connection = controlledSse(signal, frame("status", 0, accepted, 10)); return connection.response;
+    });
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...accepted, result: null, error: null });
+    const controller = new AbortController(), observing = observeComposerOperation(observer(), { signal: controller.signal }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(6000);
+      connection.enqueue(frame("status", 1, { ...accepted, observed_at: new Date(Date.now() - 7000).toISOString() }, 10));
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("cancels an earlier deadline when a fresh accepted state has no deadline", async () => {
+    vi.useFakeTimers();
+    const old = status(10, { segment: { sequence: 1, generation: 1, state: "running", deadline_at: new Date(Date.now() + 5000).toISOString() } });
+    const next = status(11);
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal, frame("status", 0, old, 10), frame("status", 1, next, 11)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...next, result: null, error: null });
+    const controller = new AbortController(), observing = observeComposerOperation(observer(), { signal: controller.signal }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("replaces an earlier deadline with the fresh accepted segment deadline", async () => {
+    vi.useFakeTimers();
+    const old = status(10, { segment: { sequence: 1, generation: 1, state: "running", deadline_at: new Date(Date.now() + 5000).toISOString() } });
+    const next = status(11, { segment: { sequence: 2, generation: 1, state: "running", deadline_at: new Date(Date.now() + 10000).toISOString() } });
+    vi.mocked(api.fetchComposerOperationStream).mockImplementation(async (_s, _o, signal) => openSse(signal, frame("status", 0, old, 10), frame("status", 1, next, 11)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...next, result: null, error: null });
+    const controller = new AbortController(), observing = observeComposerOperation(observer(), { signal: controller.signal }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(api.fetchComposerOperation).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
+  });
+
+  it("carries an unconsumed accepted deadline across reconnect without restarting its duration", async () => {
+    vi.useFakeTimers();
+    const accepted = status(10, { segment: { sequence: 1, generation: 1, state: "running", deadline_at: new Date(Date.now() + 10000).toISOString() } });
+    let first!: ReturnType<typeof controlledSse>;
+    vi.mocked(api.fetchComposerOperationStream).mockImplementationOnce(async (_s, _o, signal) => {
+      first = controlledSse(signal, frame("status", 0, accepted, 10)); return first.response;
+    }).mockImplementation(async (_s, _o, signal) => openSse(signal, frame("status", 0, accepted, 10)));
+    vi.mocked(api.fetchComposerOperation).mockResolvedValue({ ...accepted, result: null, error: null });
+    const controller = new AbortController(), observing = observeComposerOperation(observer(), { signal: controller.signal }).catch((error: unknown) => error);
+    try {
+      await vi.advanceTimersByTimeAsync(6000);
+      first.enqueue(frame("reconnect", 1));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(api.fetchComposerOperationStream).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(api.fetchComposerOperationStream).mock.calls[1][3]).toBe(10);
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(api.fetchComposerOperation).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await vi.advanceTimersByTimeAsync(0); await observing; }
   });
 });
