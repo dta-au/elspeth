@@ -36043,8 +36043,8 @@ def test_required_work_reserve_rejects_protected_instance_formal_recovery() -> N
 
 # Budget: one boundary run, measured 354-495 s serial on 3.13 (2026-11-01, host
 # load 5-18); ~2x that so a loaded host does not hit the 600 s default.
+# Ordinary partition: the long-run catalog holds exactly three cases.
 @pytest.mark.timeout(1000)
-@pytest.mark.landscape_long_run
 def test_required_work_reserve_admits_frozen_instance_transfer() -> None:
     """A frozen pydantic instance passed to an unreviewed callee needs no closure.
 
