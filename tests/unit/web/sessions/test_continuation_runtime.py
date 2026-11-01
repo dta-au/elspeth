@@ -180,6 +180,53 @@ async def runtime_case(store, *, provider_input=None):
     return arguments, historical_cache, attachment_history
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raise_after_read", [False, True], ids=["returned", "original-error"])
+async def test_runtime_sql_read_owns_a_fresh_pure_memo_and_closes_it(operation_store, monkeypatch, raise_after_read):
+    from elspeth.web.continuation_retention_memo import current_retention_stage_memo, retention_stage_memo_scope
+    from elspeth.web.sessions import continuation_runtime as sql_owner
+
+    arguments, _cache, _attachments = await runtime_case(operation_store)
+    authority = arguments["authority"]
+    running = arguments["required_work"].running
+    original_read = sql_owner.read_runtime_source_on_connection
+    original_error = RuntimeError("original actual runtime read failure")
+    observed = []
+
+    def observe_actual_read(*args, **kwargs):
+        memo = current_retention_stage_memo()
+        assert memo is not None and memo.active
+        observed.append(memo)
+        result = original_read(*args, **kwargs)
+        if raise_after_read:
+            raise original_error
+        return result
+
+    monkeypatch.setattr(sql_owner, "read_runtime_source_on_connection", observe_actual_read)
+    with retention_stage_memo_scope() as outer:
+
+        def read_in_worker():
+            assert current_retention_stage_memo() is outer
+            try:
+                return authority.read_continuation_runtime(running, selected=arguments["selected"], inventory=arguments["inventory"])
+            finally:
+                assert current_retention_stage_memo() is outer and outer.active
+
+        for _ in range(2):
+            if raise_after_read:
+                with pytest.raises(RuntimeError, match="original actual runtime read failure") as caught:
+                    await asyncio.to_thread(read_in_worker)
+                assert caught.value is original_error
+            else:
+                await asyncio.to_thread(read_in_worker)
+            assert current_retention_stage_memo() is outer and outer.active
+            assert observed[-1] is not outer
+            assert not observed[-1].active and observed[-1].cached_entry_count == 0
+    assert len(observed) == 2 and observed[0] is not observed[1]
+    assert current_retention_stage_memo() is None
+    arguments["required_work"].coordinator.assert_completed()
+
+
 async def install_capture(store, arguments, captured):
     running = arguments["inventory"].running
     with locked_session_transaction(store[0], str(store[4])) as conn:

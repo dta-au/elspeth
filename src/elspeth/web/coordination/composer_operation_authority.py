@@ -30,6 +30,7 @@ from elspeth.web.composer.continuation_policy import (
     ContinuationAdmissionPolicy,
     decode_continuation_policy,
 )
+from elspeth.web.continuation_retention_memo import retention_stage_memo_scope
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.rate_limit_authority import ComposerQuotaAdmission
@@ -965,7 +966,7 @@ class ComposerAsyncOperationAuthority:
 
         if type(running) is not ComposerOperationRunning:
             raise AuditIntegrityError("first Compose read requires its actual nominal running owner")
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_composition_initialization_source_on_connection(conn, composer, running, selected=selected, inventory=inventory)
 
     def publish_composition_initialization(
@@ -994,7 +995,7 @@ class ComposerAsyncOperationAuthority:
 
         if type(running) is not ComposerOperationRunning:
             raise AuditIntegrityError("runtime read requires its actual running owner")
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
     def read_continuation_tool_failure(
@@ -1002,7 +1003,7 @@ class ComposerAsyncOperationAuthority:
     ) -> RetainedToolFailureSource | StoredTerminalP4Preparation | StoredTerminalP4Application | None:
         from elspeth.web.sessions.continuation_tool_failure import read_tool_failure_source_on_connection
 
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_tool_failure_source_on_connection(conn, running, env_ref_names=env_ref_names)
 
     def read_continuation_owed_batch_runtime(
@@ -1010,7 +1011,7 @@ class ComposerAsyncOperationAuthority:
     ) -> ContinuationRuntimeSource:
         from elspeth.web.sessions.continuation_runtime import read_owed_batch_runtime_source_on_connection
 
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_owed_batch_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
     def read_continuation_owed_tool_runtime(
@@ -1018,7 +1019,7 @@ class ComposerAsyncOperationAuthority:
     ) -> ContinuationRuntimeSource:
         from elspeth.web.sessions.continuation_runtime import read_owed_tool_runtime_source_on_connection
 
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_owed_tool_runtime_source_on_connection(conn, running, selected=selected, inventory=inventory)
 
     def read_continuation_phase_primary(
@@ -1031,7 +1032,7 @@ class ComposerAsyncOperationAuthority:
     ) -> RetainedPrimaryPhaseData:
         from elspeth.web.sessions.continuation_primary import read_retained_primary_phase_on_connection
 
-        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn:
+        with locked_session_transaction(self._engine, str(running.claim.session_id)) as conn, retention_stage_memo_scope():
             return read_retained_primary_phase_on_connection(
                 conn, running, selected=selected, reference=reference, env_ref_names=env_ref_names
             )

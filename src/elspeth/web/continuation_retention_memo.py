@@ -1,10 +1,12 @@
-"""Pure values owned by exactly one continuation retention-stage invocation.
+"""Pure values owned by one bounded continuation read or retention invocation.
 
 The ambient variable avoids threading a memo through every required-SQL helper.
 Captured stage work enters a fresh Context containing only this variable: caller
 prompt scopes, session-lock tokens and other ContextVars must stay outside it.
 SQL/admission results, clearance objects and live application owners have no
 entry family here. The action clock opens one carrier for each retention run.
+Each supported DATA read opens a fresh carrier inside its synchronous SQL
+callable, closing it on return or error and restoring any surrounding scope.
 """
 
 from __future__ import annotations
