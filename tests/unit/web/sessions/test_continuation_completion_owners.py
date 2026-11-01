@@ -114,7 +114,7 @@ def _reply(content: str, tool_calls=None) -> ModelResponse:
     )
 
 
-async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 1500) -> ComposerOperationSnapshotV2:
+async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 240) -> ComposerOperationSnapshotV2:
     headers = {"Authorization": f"Bearer {token}", COMPOSER_OPERATION_VERSION_HEADER: "2"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test", headers=headers) as client:
         accepted = await client.post(f"/api/sessions/{session_id}/messages", json=body)
@@ -122,13 +122,18 @@ async def _submit_and_settle(app, token, session_id, body, *, rounds: int = 1500
         assert accepted.headers[COMPOSER_OPERATION_VERSION_HEADER] == "2"
         for _ in range(rounds):
             response = await client.get(f"/api/sessions/{session_id}/operations/{body['operation_id']}")
+            if response.status_code == 503 and response.json()["error_type"] == "database_unavailable":
+                # SQLite serialises writers; a poll can lose its busy wait to
+                # the owner's locked reads. The browser observer also retries.
+                await asyncio.sleep(0.25)
+                continue
             assert response.status_code == 200, response.text
             snapshot = ComposerOperationSnapshotV2.model_validate_json(response.content, strict=True)
             if snapshot.status in ("completed", "failed"):
                 # Join the owner's verified release before the lifespan ends.
                 await app.state.composer_async_worker.run_until_idle()
                 return snapshot
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.25)
     raise AssertionError("Continuation request did not settle")
 
 
@@ -225,3 +230,66 @@ async def test_text_only_reply_completes_and_publishes_the_provider_words(tmp_pa
         assert end_key.startswith("end:") and end.owner == "composer_end"
         assert end.disposition == "committed" and end.receipt_key == snapshot.result.message.id
         assert _assistant_contents(app, session_id) == [published]
+
+
+def _tool_call(app, call_id: str, name: str, arguments: dict) -> dict:
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
+
+    dialect = app.state.composer_service._planner_dialect
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": canonical_json(encode_semantic_arguments(name, dialect, arguments))},
+    }
+
+
+class _LateToolSDK(ScriptedSDK):
+    """Tool calls need the app's planner dialect, so they are built at call time."""
+
+    def __init__(self, app_ref: list, steps):
+        super().__init__("test/model", "test/advisor", steps)
+        self.app_ref = app_ref
+
+    async def __call__(self, **kwargs):
+        role, payload = self.steps[0]
+        if role == "primary" and callable(payload):
+            self.steps[0] = (role, payload(self.app_ref[0]))
+        return await super().__call__(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_tool_reply_runs_its_batch_then_a_second_primary_then_publishes(tmp_path, monkeypatch):
+    """Tool reply -> tool -> P4 -> a second PRIMARY call -> END -> published.
+
+    K-7 (a): each authoring transition has its own provider call. The second
+    PRIMARY call sees the tool result; nothing between the two calls is
+    server-authored.
+    """
+    words = "The pipeline is empty, so there is nothing to change yet."
+    app_ref: list = []
+    sdk = _LateToolSDK(
+        app_ref,
+        [
+            ("primary", lambda app: ("Reading the current state.", [_tool_call(app, "read_1", "get_pipeline_state", {})])),
+            ("primary", (words, None)),
+            ("end", _end_admit()),
+        ],
+    )
+    monkeypatch.setattr(litellm, "acompletion", sdk)
+    operation_id = str(uuid4())
+    async with _continuation_app(tmp_path, monkeypatch) as (app, token, session_id):
+        app_ref.append(app)
+        snapshot = await _submit_and_settle(
+            app, token, session_id, message_body("What does the current pipeline do?", operation_id=operation_id)
+        )
+        assert snapshot.status == "completed", snapshot.error
+        assert [request["role"] for request in sdk.requests] == ["primary", "primary", "end"] and not sdk.steps
+        second = sdk.requests[1]["messages"]
+        assert any(message.get("role") == "tool" and message.get("tool_call_id") == "read_1" for message in second)
+        effects = {row.effect_key: row for row in _effects(app, operation_id)}
+        assert {key.split(":", 1)[0] for key in effects} == {"provider", "tool", "batch", "advance", "end"}
+        assert all(row.disposition == "committed" for row in effects.values())
+        assert {key for key in effects if key.startswith("provider:")} == {"provider:0:0", "provider:0:1"}
+        published = snapshot.result.message.content
+        assert published.split("\n\n---\n\n")[0] == words

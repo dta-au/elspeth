@@ -533,20 +533,31 @@ def _published_end_review(
     published assistant row is its receipt and the retained candidate is its
     result. Every other dispatched effect still becomes ``unknown``.
     """
-    from elspeth.web.composer.continuation import ComposeFrame, EndFrame
+    from elspeth.web.composer.continuation import ComposeFrame, EndFrame, ToolBatchFrame
     from elspeth.web.composer.continuation_end_transitions import end_effect_key
+    from elspeth.web.composer.continuation_iteration_transitions import advance_effect_key, applied_batch_cut
 
     top = stack.frames[-1]
-    if type(outcome) is not MessageWithStateResponse or type(top) is not EndFrame:
+    if type(outcome) is not MessageWithStateResponse:
         return None
-    compose = stack.frames[0]
-    if type(compose) is not ComposeFrame or compose.pending_response is None:
-        raise AuditIntegrityError("END publication lost its actual paid PRIMARY response")
-    key = end_effect_key(compose.pending_response)
+    if type(top) is EndFrame:
+        compose = stack.frames[0]
+        if type(compose) is not ComposeFrame or compose.pending_response is None:
+            raise AuditIntegrityError("END publication lost its actual paid PRIMARY response")
+        key = end_effect_key(compose.pending_response)
+        result = f"value:{top.candidate.codec}:{top.candidate.digest}"
+    elif type(top) is ToolBatchFrame and top.phase == "result_retained" and top.accumulator.codec == "composer.applied-p4-batch.v2":
+        # The post-batch phase itself ended the request (source-proof stop or
+        # the last-chance reply); its one dispatched effect is the reviewer.
+        _compose, batch = applied_batch_cut(stack.frames)
+        key = advance_effect_key(batch.response)
+        result = f"value:{batch.accumulator.codec}:{batch.accumulator.digest}"
+    else:
+        return None
     matching = tuple(item for item in stack.effect_frontier if item.effect_id == key)
     if len(matching) != 1 or matching[0].disposition != "dispatched":
-        raise AuditIntegrityError("END publication lost its single dispatched review effect")
-    return key, outcome.message.id, f"value:{top.candidate.codec}:{top.candidate.digest}"
+        raise AuditIntegrityError("publication lost its single dispatched owner review effect")
+    return key, outcome.message.id, result
 
 
 def _settlement_transition(

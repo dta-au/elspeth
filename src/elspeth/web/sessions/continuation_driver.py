@@ -51,6 +51,7 @@ from elspeth.web.sessions.composer_operations import (
 from elspeth.web.sessions.continuation import ComposerSegmentRecoveryReceipt, ComposerSegmentYieldReceipt, StoredContinuationSnapshot
 from elspeth.web.sessions.continuation_end import enter_continuation_end, primary_issued_no_tools, review_continuation_end
 from elspeth.web.sessions.continuation_ingress import ContinuationIngressCheckpoint
+from elspeth.web.sessions.continuation_next_iteration import advance_continuation_iteration, is_applied_batch_cut
 from elspeth.web.sessions.continuation_tool_failure import ContinuationToolFailureRead, RetainedToolFailureSource
 from elspeth.web.sessions.schemas import SendMessageRequest
 
@@ -437,6 +438,10 @@ class _SegmentDriver:
                 runtime.live.turn_evidence.confirm_delivery(delivery, runtime.live.recorder.llm_calls)
             self.phases.accept_primary(primary_result)
             return None
+        if is_applied_batch_cut(selected):
+            # The post-batch phase either returns the next authoring
+            # transition to the provider or publishes the result it reached.
+            return await advance_continuation_iteration(self.phases, self.services, selected)
         if type(top) is EndFrame:
             # END publishes through the shared terminal owner in its own
             # transaction; the returned record is that committed terminal.

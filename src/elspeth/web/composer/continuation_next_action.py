@@ -258,6 +258,34 @@ def validate_continuation_structure_data_on_connection(
         # The review made provider calls whose outcome is not durably known.
         # It is settled as unknown, never re-run by a new owner.
         return ambiguous
+    if (
+        type(top) is ToolBatchFrame
+        and top.phase == "result_retained"
+        and top.accumulator.codec == "composer.applied-p4-batch.v2"
+        and ambiguous
+        and not tool_unresolved
+    ):
+        from elspeth.web.composer.continuation_iteration_transitions import (
+            ITERATION_EFFECT_OWNER,
+            advance_effect_key,
+            applied_batch_cut,
+        )
+
+        _compose, batch = applied_batch_cut(root.frames)
+        key = advance_effect_key(batch.response)
+        phase = tuple(row for row in actual if row.effect_key == key)
+        if (
+            ambiguous != (key,)
+            or root.pending_owner_results
+            or root.pending_settlement_ids
+            or len(phase) != 1
+            or phase[0].owner != ITERATION_EFFECT_OWNER
+            or phase[0].receipt_key is not None
+            or phase[0].result_chunk_key is not None
+        ):
+            raise AuditIntegrityError("structural admission lost the closed in-flight post-batch shape")
+        # The post-batch phase may have made Advisor calls; never re-run it.
+        return ambiguous
     if tool_unresolved:
         if (
             type(top) is ToolBatchFrame

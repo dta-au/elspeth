@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.continuation_codec import PrivateChunk
     from elspeth.web.composer.continuation_live_phases import ContinuationLivePhases
     from elspeth.web.composer.continuation_runtime import RestoredContinuationRuntime
+    from elspeth.web.composer.protocol import ComposerResult
     from elspeth.web.sessions.composer_app_services import ComposerAppServices
     from elspeth.web.sessions.composer_operations import ComposerOperationRecord
 
@@ -108,14 +109,6 @@ async def review_continuation_end(
     phases: ContinuationLivePhases, services: ComposerAppServices, selected: SelectedContinuationState
 ) -> ComposerOperationRecord:
     """Run the shared terminal gates and publish through the shared owner."""
-    from elspeth.web.sessions.composer_finalization import (
-        ComposerFinalizationInputs,
-        ContinuationFinalizationBudget,
-        settle_composer_result,
-    )
-    from elspeth.web.sessions.composer_operations import ComposerOperationRecord
-    from elspeth.web.sessions.composer_turn import _RECOMPOSE_LABELS, _SEND_LABELS, ComposerTurnObservation, _discard_progress
-
     top = selected.stack.frames[-1]
     if type(top) is not EndFrame or top.phase != "review_needed":
         raise AuditIntegrityError("END review has no landed owner for this END phase")
@@ -200,14 +193,38 @@ async def review_continuation_end(
             user_message=bindings.message,
         )
     public_result = service._completion._append_checkpoint_receipt(public_result, turn_evidence=live.turn_evidence)
+    return await publish_continuation_result(phases, services, current, runtime, public_result)
 
+
+async def publish_continuation_result(
+    phases: ContinuationLivePhases,
+    services: ComposerAppServices,
+    current: SelectedContinuationState,
+    runtime: RestoredContinuationRuntime,
+    public_result: ComposerResult,
+) -> ComposerOperationRecord:
+    """Publish one provider-authored result through the one shared finalizer.
+
+    The terminal composite (assistant row, audit cohort, proposals and the
+    V2 terminal) commits in one transaction; this owner never builds the
+    reply, graph or proposal itself.
+    """
+    from elspeth.web.sessions.composer_finalization import (
+        ComposerFinalizationInputs,
+        ContinuationFinalizationBudget,
+        settle_composer_result,
+    )
+    from elspeth.web.sessions.composer_operations import ComposerOperationRecord
+    from elspeth.web.sessions.composer_turn import _RECOMPOSE_LABELS, _SEND_LABELS, ComposerTurnObservation, _discard_progress
+
+    service, bindings = phases.service, runtime.bindings
     running = phases.work.running
     owner = phases.work.coordinator.sql_deadline_owner
     if running is None or owner is None:
-        raise AuditIntegrityError("END publication lost its actual running and SQL timing owners")
+        raise AuditIntegrityError("publication lost its actual running and SQL timing owners")
     compose = current.stack.frames[0]
     if type(compose) is not ComposeFrame:
-        raise AuditIntegrityError("END publication lost its actual Compose owner")
+        raise AuditIntegrityError("publication lost its actual Compose owner")
     bootstrap = decode_continuation_bootstrap(next(chunk for chunk in current.chunks if chunk.reference == compose.bootstrap))
     values = bootstrap_values(bootstrap)
     sessions = service._require_sessions_service()
@@ -244,5 +261,5 @@ async def review_continuation_end(
         public_result,
     )
     if type(record) is not ComposerOperationRecord:
-        raise AuditIntegrityError("END publication lost its actual terminal record")
+        raise AuditIntegrityError("publication lost its actual terminal record")
     return record
