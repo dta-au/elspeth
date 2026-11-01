@@ -442,29 +442,35 @@ def _contains_fence_refusal(error):
 
 @pytest.mark.asyncio
 async def test_terminal_p4_released_issued_fence_cannot_publish_with_live_original(operation_store, tmp_path, monkeypatch):
-    async with _issued_review_case(operation_store, tmp_path, monkeypatch) as (owner, running, sdk):
-        original, cause = _service_error("admission"), RuntimeError("released issued owner cause")
-        entered = _refuse_service(
-            operation_store[3], monkeypatch, seam="write", original=original, cause=cause, context=running.session_operation_context
-        )
-        refuse = operation_store[3].create_pending_interpretation_event
-        released = []
+    # The fence is released externally, so the case's own lease close at exit
+    # finds it already released and must refuse; it never claims a release.
+    body_completed = False
+    with pytest.raises(SessionOperationFenceLost, match="released"):
+        async with _issued_review_case(operation_store, tmp_path, monkeypatch) as (owner, running, sdk):
+            original, cause = _service_error("admission"), RuntimeError("released issued owner cause")
+            entered = _refuse_service(
+                operation_store[3], monkeypatch, seam="write", original=original, cause=cause, context=running.session_operation_context
+            )
+            refuse = operation_store[3].create_pending_interpretation_event
+            released = []
 
-        async def release_then_refuse(**kwargs):
-            # This seam runs inside the issued-tool task the lease owns, so the
-            # fence is released externally rather than by closing the lease.
-            await asyncio.to_thread(_release_fence_externally, operation_store, running)
-            released.append(stored_rows(operation_store[0]))
-            return await refuse(**kwargs)
+            async def release_then_refuse(**kwargs):
+                # This seam runs inside the issued-tool task the lease owns, so the
+                # fence is released externally rather than by closing the lease.
+                await asyncio.to_thread(_release_fence_externally, operation_store, running)
+                released.append(stored_rows(operation_store[0]))
+                return await refuse(**kwargs)
 
-        monkeypatch.setattr(operation_store[3], "create_pending_interpretation_event", release_then_refuse)
-        observed = await _finish_issued_batch(owner)
-        assert len(released) == len(entered) == len(sdk) == 1
-        assert owner.failure_custody.original is original and original.__cause__ is cause
-        assert _contains_identity(observed, original)
-        assert _contains_fence_refusal(observed), "must reach the actual lost-fence refusal, not a missing terminal API"
-        assert stored_rows(operation_store[0]) == released[0]
-        assert owner.p4 is None or owner.p4.committed_outcome is None
+            monkeypatch.setattr(operation_store[3], "create_pending_interpretation_event", release_then_refuse)
+            observed = await _finish_issued_batch(owner)
+            assert len(released) == len(entered) == len(sdk) == 1
+            assert owner.failure_custody.original is original and original.__cause__ is cause
+            assert _contains_identity(observed, original)
+            assert _contains_fence_refusal(observed), "must reach the actual lost-fence refusal, not a missing terminal API"
+            assert stored_rows(operation_store[0]) == released[0]
+            assert owner.p4 is None or owner.p4.committed_outcome is None
+            body_completed = True
+    assert body_completed, "the lost-fence refusal must come from the lease close at exit, after every check"
 
 
 @pytest.mark.asyncio
